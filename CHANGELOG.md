@@ -128,6 +128,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Managed Storage page deletion retains original block state for Restore, and
+  moving a subtree within its page preserves concurrent edits to its children.
+  Bulk edits avoid repeated page-membership reconstruction.
+
+- Managed Storage accepts independent page-path and content edits from offline
+  devices without requiring their whole path indexes to match at delivery time.
+  Exact path ownership, release ancestry, and local journal checks remain in place.
+
 - Managed Storage reuses durable writer identities across edits and restarts.
   If its writer record is lost or damaged, new edits use a fresh causal identity
   so an older offline branch can still arrive with its original edits intact.

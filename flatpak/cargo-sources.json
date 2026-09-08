@@ -118,8 +118,8 @@
     {
         "type": "git",
         "url": "https://github.com/martinkoutecky/tine-storage",
-        "commit": "998a63fc5af900d25946383dad420965c7165ce0",
-        "dest": "flatpak-cargo/git/tine-storage-998a63f"
+        "commit": "65ab8a76ef465b0846546b7a6e60b7b3578e24d8",
+        "dest": "flatpak-cargo/git/tine-storage-65ab8a7"
     },
     {
         "type": "archive",
@@ -6873,12 +6873,12 @@
     {
         "type": "shell",
         "commands": [
-            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/tine-storage-998a63f/.\" \"cargo/git-vendor/tine-storage\""
+            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/tine-storage-65ab8a7/.\" \"cargo/git-vendor/tine-storage\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"tine-storage\"\nversion = \"0.18.0\"\nedition = \"2021\"\nlicense = \"AGPL-3.0-only\"\nauthors = [\"Martin Koutecký\"]\ndescription = \"Physical persistence mechanisms for Tine\"\nrepository = \"https://github.com/martinkoutecky/tine-storage\"\nreadme = \"README.md\"\npublish = false\n\n[features]\ntest-support = []\n\n[dependencies]\ncap-std = \"4.0.2\"\nfs2 = \"0.4.3\"\nserde_json = \"1\"\nsha2 = \"0.10\"\n\n[dependencies.postcard]\nversion = \"1.1.3\"\nfeatures = [\"alloc\"]\n\n[dependencies.rusqlite]\nversion = \"0.37.0\"\nfeatures = [\"bundled\", \"functions\", \"hooks\"]\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n\n[dependencies.uuid]\nversion = \"1\"\nfeatures = [\"v4\", \"serde\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2\"\n\n[target.\"cfg(windows)\".dependencies]\ncap-fs-ext = \"=4.0.2\"\n\n[target.\"cfg(windows)\".dependencies.windows-sys]\nversion = \"0.61.2\"\nfeatures = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"]\n",
+        "contents": "[package]\nname = \"tine-storage\"\nversion = \"0.19.0\"\nedition = \"2021\"\nlicense = \"AGPL-3.0-only\"\nauthors = [\"Martin Koutecký\"]\ndescription = \"Physical persistence mechanisms for Tine\"\nrepository = \"https://github.com/martinkoutecky/tine-storage\"\nreadme = \"README.md\"\npublish = false\n\n[features]\ntest-support = []\n\n[dependencies]\ncap-std = \"4.0.2\"\nfs2 = \"0.4.3\"\nserde_json = \"1\"\nsha2 = \"0.10\"\n\n[dependencies.postcard]\nversion = \"1.1.3\"\nfeatures = [\"alloc\"]\n\n[dependencies.rusqlite]\nversion = \"0.37.0\"\nfeatures = [\"bundled\", \"functions\", \"hooks\"]\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n\n[dependencies.uuid]\nversion = \"1\"\nfeatures = [\"v4\", \"serde\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2\"\n\n[target.\"cfg(windows)\".dependencies]\ncap-fs-ext = \"=4.0.2\"\n\n[target.\"cfg(windows)\".dependencies.windows-sys]\nversion = \"0.61.2\"\nfeatures = [\"Win32_Foundation\", \"Win32_Storage_FileSystem\"]\n",
         "dest": "cargo/git-vendor/tine-storage",
         "dest-filename": "Cargo.toml"
     },
@@ -9412,7 +9412,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-registry]\ndirectory = \"cargo/vendor\"\n\n[source.vendored-git]\ndirectory = \"cargo/git-vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-registry\"\n\n[source.\"https://github.com/martinkoutecky/lsdoc\"]\ngit = \"https://github.com/martinkoutecky/lsdoc\"\nreplace-with = \"vendored-git\"\ntag = \"v0.5.7\"\n\n[source.\"https://github.com/tauri-apps/tao\"]\ngit = \"https://github.com/tauri-apps/tao\"\nreplace-with = \"vendored-git\"\nrev = \"07f3742b1833b64be27b1ef991e38d557d4276c9\"\n\n[source.\"https://github.com/martinkoutecky/tine-storage\"]\ngit = \"https://github.com/martinkoutecky/tine-storage\"\nreplace-with = \"vendored-git\"\ntag = \"v0.18.0\"\n",
+        "contents": "[source.vendored-registry]\ndirectory = \"cargo/vendor\"\n\n[source.vendored-git]\ndirectory = \"cargo/git-vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-registry\"\n\n[source.\"https://github.com/martinkoutecky/lsdoc\"]\ngit = \"https://github.com/martinkoutecky/lsdoc\"\nreplace-with = \"vendored-git\"\ntag = \"v0.5.7\"\n\n[source.\"https://github.com/tauri-apps/tao\"]\ngit = \"https://github.com/tauri-apps/tao\"\nreplace-with = \"vendored-git\"\nrev = \"07f3742b1833b64be27b1ef991e38d557d4276c9\"\n\n[source.\"https://github.com/martinkoutecky/tine-storage\"]\ngit = \"https://github.com/martinkoutecky/tine-storage\"\nreplace-with = \"vendored-git\"\ntag = \"v0.19.0\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }

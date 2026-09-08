@@ -1,6 +1,23 @@
-//! Fixed-schema retirable Loro documents. This defines the proposed current
-//! logical units; runtime admission/cutover must still bind them to accepted
-//! entity births and writer lanes. Snapshot and merge encoding remain upstream.
+//! The single current live document layout: fixed-schema retirable Loro
+//! documents.
+//!
+//! One logical fact lives in one document, so the unit the archive can retire
+//! matches the fact's lifetime. There is no UUID-keyed catalog document and no
+//! per-page map that accumulates every block that ever visited the page.
+//!
+//! * `Graph`     -- lineage/workspace metadata only.
+//! * `Page`      -- immutable page identity, one page-state register, preamble.
+//! * `Block`     -- immutable block identity plus birth provenance, one owner
+//!                  register, the stable root text, Logseq identity fields.
+//! * `Membership`-- addressed by the exact (block document, page document)
+//!                  pair, with one optional claim register.
+//!
+//! Every document also carries a checkpoint register, written only by the
+//! seal operation. Immutable identities are supplied by accepted birth
+//! evidence; a document's self-declared `identity` register is compared
+//! against that evidence and is never authority on its own.
+//!
+//! Snapshot and merge encoding remain upstream Loro.
 use loro::{ContainerTrait, ExportMode, Frontiers, LoroDoc, LoroValue, UpdateOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -63,6 +80,21 @@ impl DocumentIdentity {
         }
     }
 
+    /// The page this document's identity is permanently bound to, if any: a
+    /// page document's own page, a block document's birth page, or a pair's
+    /// page. A graph document has none.
+    pub(crate) const fn page_id(&self) -> Option<PageId> {
+        match self {
+            Self::Graph { .. } => None,
+            Self::Page { page_id, .. }
+            | Self::Membership { page_id, .. }
+            | Self::Block {
+                birth_page_id: page_id,
+                ..
+            } => Some(*page_id),
+        }
+    }
+
     fn fields(&self) -> &'static [&'static str] {
         match self {
             Self::Graph { .. } => &["schema", "identity", "checkpoint"],
@@ -118,6 +150,7 @@ fn get<T: DeserializeOwned>(document: &LoroDoc, field: &str) -> Result<T, String
 }
 
 impl RetirableDocument {
+    /// Create one live document from accepted birth evidence.
     pub(crate) fn create(
         identity: DocumentIdentity,
         peer: CrdtPeerId,
@@ -125,34 +158,8 @@ impl RetirableDocument {
     ) -> Result<Self, String> {
         let document = LoroDoc::new();
         document.set_peer_id(peer.as_u64()).map_err(error)?;
-        put(&document, "schema", &SCHEMA)?;
-        put(&document, "identity", &identity)?;
-        put(&document, "checkpoint", &Option::<BatchId>::None)?;
-        let result = Self { identity, document };
-        match state {
-            DocumentState::Graph if matches!(result.identity, DocumentIdentity::Graph { .. }) => (),
-            DocumentState::Page { state, preamble } => {
-                result.set_page_state(&state)?;
-                result.set_page_preamble(preamble.as_deref())?;
-            }
-            DocumentState::Block(block) => {
-                if !matches!(result.identity, DocumentIdentity::Block { document_id, block_id, .. }
-                    if block_id == block.block_id && document_id == block.home_document_id)
-                {
-                    return Err(
-                        "new block state does not match its immutable document identity".into(),
-                    );
-                }
-                result.set_owner(block.owner)?;
-                result.set_logseq_identity(block.logseq_uuid, block.logseq_identity_origin)?;
-                result.replace_text(&block.content)?;
-            }
-            DocumentState::Membership(claim) => result.set_membership(claim.as_ref())?,
-            DocumentState::Graph => return Err("graph state requires graph identity".into()),
-        }
-        result.document.commit();
-        result.state()?;
-        Ok(result)
+        create_in(&document, &identity, state)?;
+        Ok(Self { identity, document })
     }
 
     pub(crate) fn open(expected: DocumentIdentity, snapshot: &[u8]) -> Result<Self, String> {
@@ -182,145 +189,320 @@ impl RetirableDocument {
             .map_err(error)
     }
     pub(crate) fn seal(&self, batch_id: BatchId) -> Result<(), String> {
-        put(&self.document, "checkpoint", &Some(batch_id))
+        seal(&self.document, batch_id)
     }
     pub(crate) fn checkpoint(&self) -> Result<Option<BatchId>, String> {
-        get(&self.document, "checkpoint")
+        checkpoint(&self.document)
     }
 
     pub(crate) fn state(&self) -> Result<DocumentState, String> {
-        self.validate_shape()?;
-        if get::<u32>(&self.document, "schema")? != SCHEMA
-            || get::<DocumentIdentity>(&self.document, "identity")? != self.identity
-        {
-            return Err("retirable document schema or accepted birth identity differs".into());
-        }
-        self.checkpoint()?;
-        match &self.identity {
-            DocumentIdentity::Graph { .. } => Ok(DocumentState::Graph),
-            DocumentIdentity::Page { document_id, .. } => {
-                let state: PageState = get(&self.document, "state")?;
-                let preamble: Option<String> = get(&self.document, "preamble")?;
-                if state.home_document_id() != *document_id {
-                    return Err("page state changed its document identity".into());
-                }
-                validate_preamble(preamble.as_deref())?;
-                Ok(DocumentState::Page { state, preamble })
-            }
-            DocumentIdentity::Block {
-                document_id,
-                block_id,
-                ..
-            } => {
-                let block = BlockState {
-                    block_id: *block_id,
-                    home_document_id: *document_id,
-                    owner: get(&self.document, "owner")?,
-                    logseq_uuid: get(&self.document, "logseq_uuid")?,
-                    logseq_identity_origin: get(&self.document, "logseq_origin")?,
-                    content: self.document.get_text(TEXT).to_string(),
-                };
-                validate_logseq_identity(block.logseq_uuid, block.logseq_identity_origin)?;
-                validate_content(&block.content)?;
-                Ok(DocumentState::Block(block))
-            }
-            DocumentIdentity::Membership {
-                block_document_id, ..
-            } => {
-                let claim: Option<MembershipClaim> = get(&self.document, "claim")?;
-                validate_claim(*block_document_id, claim.as_ref())?;
-                Ok(DocumentState::Membership(claim))
-            }
-        }
-    }
-
-    fn validate_shape(&self) -> Result<(), String> {
-        let LoroValue::Map(roots) = self.document.get_value() else {
-            return Err("retirable document root directory is malformed".into());
-        };
-        let is_block = matches!(self.identity, DocumentIdentity::Block { .. });
-        if !roots.contains_key(META) || roots.len() > if is_block { 2 } else { 1 } {
-            return Err("retirable document has a missing or extra root".into());
-        }
-        for (name, value) in roots.iter() {
-            let expected = if name.as_str() == META {
-                self.document.get_map(META).id()
-            } else if is_block && name.as_str() == TEXT {
-                self.document.get_text(TEXT).id()
-            } else {
-                return Err("retirable document has an unknown root".into());
-            };
-            if value != &LoroValue::Container(expected) {
-                return Err("retirable root container type differs".into());
-            }
-        }
-        let map = self.document.get_map(META).get_value();
-        let actual: BTreeSet<_> = map
-            .as_map()
-            .ok_or("retirable metadata is not a map")?
-            .keys()
-            .map(|name| name.as_str())
-            .collect();
-        let expected: BTreeSet<_> = self.identity.fields().iter().copied().collect();
-        if actual != expected {
-            return Err("retirable document does not have its fixed register schema".into());
-        }
-        Ok(())
+        read_state(&self.identity, &self.document)
     }
 
     pub(crate) fn set_page_state(&self, state: &PageState) -> Result<(), String> {
-        if !matches!(self.identity, DocumentIdentity::Page { document_id, .. }
-            if state.home_document_id() == document_id)
-        {
-            return Err("page state requires its original page document".into());
-        }
-        put(&self.document, "state", state)
+        set_page_state(&self.identity, &self.document, state)
     }
     pub(crate) fn set_page_preamble(&self, preamble: Option<&str>) -> Result<(), String> {
-        if !matches!(self.identity, DocumentIdentity::Page { .. }) {
-            return Err("preamble requires a page document".into());
-        }
-        validate_preamble(preamble)?;
-        put(&self.document, "preamble", &preamble)
+        set_page_preamble(&self.identity, &self.document, preamble)
     }
     pub(crate) fn set_owner(&self, owner: BlockOwner) -> Result<(), String> {
-        if !matches!(self.identity, DocumentIdentity::Block { .. }) {
-            return Err("owner requires a block document".into());
-        }
-        put(&self.document, "owner", &owner)
+        set_owner(&self.identity, &self.document, owner)
     }
     pub(crate) fn replace_text(&self, content: &str) -> Result<(), String> {
-        if !matches!(self.identity, DocumentIdentity::Block { .. }) {
-            return Err("text requires a block document".into());
-        }
-        validate_content(content)?;
-        self.document
-            .get_text(TEXT)
-            .update(content, UpdateOptions::default())
-            .map_err(error)
+        replace_text(&self.identity, &self.document, content)
     }
     pub(crate) fn set_logseq_identity(
         &self,
         uuid: Option<LogseqUuid>,
         origin: Option<LogseqIdentityOrigin>,
     ) -> Result<(), String> {
-        if !matches!(self.identity, DocumentIdentity::Block { .. }) {
-            return Err("Logseq identity requires a block document".into());
-        }
-        validate_logseq_identity(uuid, origin)?;
-        put(&self.document, "logseq_uuid", &uuid)?;
-        put(&self.document, "logseq_origin", &origin)
+        set_logseq_identity(&self.identity, &self.document, uuid, origin)
     }
     pub(crate) fn set_membership(&self, claim: Option<&MembershipClaim>) -> Result<(), String> {
-        let DocumentIdentity::Membership {
-            block_document_id, ..
-        } = self.identity
-        else {
-            return Err("membership claim requires a membership document".into());
-        };
-        validate_claim(block_document_id, claim)?;
-        put(&self.document, "claim", &claim)
+        set_membership(&self.identity, &self.document, claim)
     }
+}
+
+/// Write the fixed schema of one newly born document into an empty Loro
+/// document. The caller owns peer assignment and commit batching.
+pub(crate) fn create_in(
+    document: &LoroDoc,
+    identity: &DocumentIdentity,
+    state: DocumentState,
+) -> Result<(), String> {
+    put(document, "schema", &SCHEMA)?;
+    put(document, "identity", identity)?;
+    put(document, "checkpoint", &Option::<BatchId>::None)?;
+    match state {
+        DocumentState::Graph if matches!(identity, DocumentIdentity::Graph { .. }) => (),
+        DocumentState::Page { state, preamble } => {
+            set_page_state(identity, document, &state)?;
+            set_page_preamble(identity, document, preamble.as_deref())?;
+        }
+        DocumentState::Block(block) => {
+            if !matches!(identity, DocumentIdentity::Block { document_id, block_id, .. }
+                if *block_id == block.block_id && *document_id == block.home_document_id)
+            {
+                return Err(
+                    "new block state does not match its immutable document identity".into(),
+                );
+            }
+            set_owner(identity, document, block.owner)?;
+            set_logseq_identity(
+                identity,
+                document,
+                block.logseq_uuid,
+                block.logseq_identity_origin,
+            )?;
+            replace_text(identity, document, &block.content)?;
+        }
+        DocumentState::Membership(claim) => set_membership(identity, document, claim.as_ref())?,
+        DocumentState::Graph => return Err("graph state requires graph identity".into()),
+    }
+    document.commit();
+    read_state(identity, document)?;
+    Ok(())
+}
+
+/// The immutable identity a document declares about itself.
+///
+/// This is inspected so it can be COMPARED with accepted birth evidence. It is
+/// never accepted as authority on its own: a foreign snapshot that declares an
+/// identity the accepted history did not authorize is malformed.
+pub(crate) fn declared_identity(document: &LoroDoc) -> Result<DocumentIdentity, String> {
+    if get::<u32>(document, "schema")? != SCHEMA {
+        return Err("retirable document schema differs".into());
+    }
+    get(document, "identity")
+}
+
+/// Whether this Loro document has ever been written as a live document.
+pub(crate) fn is_initialized(document: &LoroDoc) -> bool {
+    document.get_map(META).get("identity").is_some()
+}
+
+pub(crate) fn seal(document: &LoroDoc, batch_id: BatchId) -> Result<(), String> {
+    put(document, "checkpoint", &Some(batch_id))
+}
+
+pub(crate) fn checkpoint(document: &LoroDoc) -> Result<Option<BatchId>, String> {
+    get(document, "checkpoint")
+}
+
+/// Complete validated state of one live document, against the accepted
+/// identity the caller proved independently.
+pub(crate) fn read_state(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+) -> Result<DocumentState, String> {
+    validate_shape(identity, document)?;
+    if get::<u32>(document, "schema")? != SCHEMA
+        || get::<DocumentIdentity>(document, "identity")? != *identity
+    {
+        return Err("retirable document schema or accepted birth identity differs".into());
+    }
+    checkpoint(document)?;
+    match identity {
+        DocumentIdentity::Graph { .. } => Ok(DocumentState::Graph),
+        DocumentIdentity::Page { document_id, .. } => {
+            let state: PageState = get(document, "state")?;
+            let preamble: Option<String> = get(document, "preamble")?;
+            if state.home_document_id() != *document_id {
+                return Err("page state changed its document identity".into());
+            }
+            validate_preamble(preamble.as_deref())?;
+            Ok(DocumentState::Page { state, preamble })
+        }
+        DocumentIdentity::Block {
+            document_id,
+            block_id,
+            ..
+        } => {
+            let block = BlockState {
+                block_id: *block_id,
+                home_document_id: *document_id,
+                owner: get(document, "owner")?,
+                logseq_uuid: get(document, "logseq_uuid")?,
+                logseq_identity_origin: get(document, "logseq_origin")?,
+                content: document.get_text(TEXT).to_string(),
+            };
+            validate_logseq_identity(block.logseq_uuid, block.logseq_identity_origin)?;
+            validate_content(&block.content)?;
+            Ok(DocumentState::Block(block))
+        }
+        DocumentIdentity::Membership {
+            block_document_id, ..
+        } => {
+            let claim: Option<MembershipClaim> = get(document, "claim")?;
+            validate_claim(*block_document_id, claim.as_ref())?;
+            Ok(DocumentState::Membership(claim))
+        }
+    }
+}
+
+/// One page document's accepted page-state register.
+pub(crate) fn page_state(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+) -> Result<PageState, String> {
+    match read_state(identity, document)? {
+        DocumentState::Page { state, .. } => Ok(state),
+        _ => Err("page state requires a page document".into()),
+    }
+}
+
+/// One page document's optional preamble register.
+pub(crate) fn page_preamble(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+) -> Result<Option<String>, String> {
+    match read_state(identity, document)? {
+        DocumentState::Page { preamble, .. } => Ok(preamble),
+        _ => Err("page preamble requires a page document".into()),
+    }
+}
+
+/// One block document's accepted state.
+pub(crate) fn block_state(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+) -> Result<BlockState, String> {
+    match read_state(identity, document)? {
+        DocumentState::Block(state) => Ok(state),
+        _ => Err("block state requires a block document".into()),
+    }
+}
+
+/// One membership document's optional claim register. An absent membership is
+/// a null value in this fixed register; no key is added per visit.
+pub(crate) fn membership_claim(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+) -> Result<Option<MembershipClaim>, String> {
+    match read_state(identity, document)? {
+        DocumentState::Membership(claim) => Ok(claim),
+        _ => Err("membership claim requires a membership document".into()),
+    }
+}
+
+/// The block document's stable root text handle. Delete and Restore never
+/// remove or recreate it, so its ContainerID is stable for the document's life.
+pub(crate) fn root_text(document: &LoroDoc) -> loro::LoroText {
+    document.get_text(TEXT)
+}
+
+fn validate_shape(identity: &DocumentIdentity, document: &LoroDoc) -> Result<(), String> {
+    let LoroValue::Map(roots) = document.get_value() else {
+        return Err("retirable document root directory is malformed".into());
+    };
+    let is_block = matches!(identity, DocumentIdentity::Block { .. });
+    if !roots.contains_key(META) || roots.len() > if is_block { 2 } else { 1 } {
+        return Err("retirable document has a missing or extra root".into());
+    }
+    for (name, value) in roots.iter() {
+        let expected = if name.as_str() == META {
+            document.get_map(META).id()
+        } else if is_block && name.as_str() == TEXT {
+            document.get_text(TEXT).id()
+        } else {
+            return Err("retirable document has an unknown root".into());
+        };
+        if value != &LoroValue::Container(expected) {
+            return Err("retirable root container type differs".into());
+        }
+    }
+    let map = document.get_map(META).get_value();
+    let actual: BTreeSet<_> = map
+        .as_map()
+        .ok_or("retirable metadata is not a map")?
+        .keys()
+        .map(|name| name.as_str())
+        .collect();
+    let expected: BTreeSet<_> = identity.fields().iter().copied().collect();
+    if actual != expected {
+        return Err("retirable document does not have its fixed register schema".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn set_page_state(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+    state: &PageState,
+) -> Result<(), String> {
+    if !matches!(identity, DocumentIdentity::Page { document_id, .. }
+        if state.home_document_id() == *document_id)
+    {
+        return Err("page state requires its original page document".into());
+    }
+    put(document, "state", state)
+}
+
+pub(crate) fn set_page_preamble(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+    preamble: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(identity, DocumentIdentity::Page { .. }) {
+        return Err("preamble requires a page document".into());
+    }
+    validate_preamble(preamble)?;
+    put(document, "preamble", &preamble)
+}
+
+pub(crate) fn set_owner(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+    owner: BlockOwner,
+) -> Result<(), String> {
+    if !matches!(identity, DocumentIdentity::Block { .. }) {
+        return Err("owner requires a block document".into());
+    }
+    put(document, "owner", &owner)
+}
+
+pub(crate) fn replace_text(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+    content: &str,
+) -> Result<(), String> {
+    if !matches!(identity, DocumentIdentity::Block { .. }) {
+        return Err("text requires a block document".into());
+    }
+    validate_content(content)?;
+    document
+        .get_text(TEXT)
+        .update(content, UpdateOptions::default())
+        .map_err(error)
+}
+
+pub(crate) fn set_logseq_identity(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+    uuid: Option<LogseqUuid>,
+    origin: Option<LogseqIdentityOrigin>,
+) -> Result<(), String> {
+    if !matches!(identity, DocumentIdentity::Block { .. }) {
+        return Err("Logseq identity requires a block document".into());
+    }
+    validate_logseq_identity(uuid, origin)?;
+    put(document, "logseq_uuid", &uuid)?;
+    put(document, "logseq_origin", &origin)
+}
+
+pub(crate) fn set_membership(
+    identity: &DocumentIdentity,
+    document: &LoroDoc,
+    claim: Option<&MembershipClaim>,
+) -> Result<(), String> {
+    let DocumentIdentity::Membership {
+        block_document_id, ..
+    } = identity
+    else {
+        return Err("membership claim requires a membership document".into());
+    };
+    validate_claim(*block_document_id, claim)?;
+    put(document, "claim", &claim)
 }
 
 fn validate_claim(

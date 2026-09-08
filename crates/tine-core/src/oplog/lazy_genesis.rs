@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{
     BlobDescription, BlockId, ContentDigest, DeviceId, DocumentDependencies, DocumentId,
-    LineageDigest, LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
+    DocumentKey, LineageDigest, LogseqUuid, ManagedPath, ManagedTextKind, PageId, WorkspaceId,
     OPLOG_PROTOCOL_VERSION,
 };
 
@@ -305,10 +305,19 @@ pub(crate) struct LazyGenesisFrontierBindingV1 {
 
 impl LazyGenesisFrontierBindingV1 {
     fn new(candidate: &LazyGenesisCandidate) -> io::Result<Self> {
+        // A page is no longer one document: its capsule carries the page's own
+        // document, one per block and one per (block, page) pair. Count the
+        // baseline's ACTUAL documents rather than assuming one per page.
         let document_count = candidate
             .manifest
-            .page_count
-            .checked_add(u64::from(candidate.manifest.catalog_dependencies.is_some()))
+            .pages
+            .iter()
+            .try_fold(0_u64, |total, page| {
+                total.checked_add(page.document_dependencies.len() as u64)
+            })
+            .and_then(|pages| {
+                pages.checked_add(u64::from(candidate.manifest.catalog_dependencies.is_some()))
+            })
             .ok_or_else(|| invalid("lazy genesis document count overflowed"))?;
         let binding = Self {
             schema_version: LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION,
@@ -361,9 +370,22 @@ pub(crate) struct LazyGenesisPageInput {
     pub(crate) kind: ManagedTextKind,
     pub(crate) preamble: Option<String>,
     pub(crate) blocks: Vec<LazyGenesisBlockInput>,
-    pub(crate) document_checkpoint: Vec<u8>,
-    pub(crate) document_dependencies: Option<DocumentDependencies>,
+    pub(crate) document_checkpoints: Vec<LazyGenesisDocumentCheckpointV1>,
+    pub(crate) document_dependencies: Vec<DocumentDependencies>,
     pub(crate) sqlite_receipt: Option<LazyGenesisSqliteReceiptV1>,
+}
+
+/// One live document of a page's activation bundle.
+///
+/// A page is no longer one Loro document: its capsule carries the page's own
+/// document, one document per block, and one document per (block, page) pair.
+/// They travel together because they are born together, and they are addressed
+/// individually because that is the unit the archive can later retire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LazyGenesisDocumentCheckpointV1 {
+    pub(crate) document_id: DocumentKey,
+    pub(crate) snapshot: Vec<u8>,
 }
 
 /// Bounded, disposable-projection handoff carried by the authenticated
@@ -524,7 +546,7 @@ struct LazyGenesisPageCapsuleV1 {
     kind: ManagedTextKind,
     preamble: Option<String>,
     blocks: Vec<LazyGenesisBlockInput>,
-    document_checkpoint: Vec<u8>,
+    document_checkpoints: Vec<LazyGenesisDocumentCheckpointV1>,
     #[serde(default)]
     sqlite_receipt: Option<LazyGenesisSqliteReceiptV1>,
 }
@@ -542,7 +564,7 @@ impl LazyGenesisPageCapsuleV1 {
             kind: input.kind,
             preamble: input.preamble,
             blocks: input.blocks,
-            document_checkpoint: input.document_checkpoint,
+            document_checkpoints: input.document_checkpoints,
             sqlite_receipt: input.sqlite_receipt,
         };
         let mut capsule = capsule;
@@ -561,14 +583,17 @@ impl LazyGenesisPageCapsuleV1 {
     fn validate(&self) -> io::Result<()> {
         if self.schema_version != LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION
             || self.name.is_empty()
-            || self.document_checkpoint.is_empty()
+            || self.document_checkpoints.is_empty()
             || self.exact_source_bytes.len() > MAX_LAZY_GENESIS_CAPSULE_BYTES
         {
             return Err(invalid("lazy genesis page capsule has an invalid header"));
         }
         let mut block_ids = BTreeSet::new();
+        let mut block_homes = BTreeSet::new();
         for block in &self.blocks {
-            if block.home_document_id != self.home_document_id
+            // A block's home is its OWN document, never the page's.
+            if block.home_document_id == self.home_document_id
+                || !block_homes.insert(block.home_document_id)
                 || !block_ids.insert(block.block_id)
                 || block.parent.is_some_and(|parent| parent == block.block_id)
             {
@@ -628,7 +653,7 @@ struct LazyGenesisPageDescriptorV1 {
     offset: u64,
     length: u64,
     blocks: u32,
-    document_dependencies: DocumentDependencies,
+    document_dependencies: Vec<DocumentDependencies>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -914,6 +939,7 @@ pub(crate) struct LazyGenesisPackBuilder {
     segments: Vec<BlobDescription>,
     block_count: u64,
     seen_pages: BTreeSet<PageId>,
+    seen_documents: BTreeSet<DocumentKey>,
     seen_homes: BTreeSet<DocumentId>,
     seen_paths: BTreeSet<ManagedPath>,
     last_path: Option<ManagedPath>,
@@ -941,6 +967,7 @@ impl LazyGenesisPackBuilder {
             block_count: 0,
             seen_pages: BTreeSet::new(),
             seen_homes: BTreeSet::new(),
+            seen_documents: BTreeSet::new(),
             seen_paths: BTreeSet::new(),
             last_path: None,
         })
@@ -950,17 +977,38 @@ impl LazyGenesisPackBuilder {
         if self.descriptors.len() == MAX_LAZY_GENESIS_PAGES {
             return Err(invalid("lazy genesis page-count cap exceeded"));
         }
-        let document_dependencies = input
-            .document_dependencies
-            .clone()
-            .ok_or_else(|| invalid("lazy genesis page has no sealed causal dependencies"))?;
+        let document_dependencies = input.document_dependencies.clone();
+        if document_dependencies.is_empty() {
+            return Err(invalid(
+                "lazy genesis page has no sealed causal dependencies",
+            ));
+        }
         let capsule = LazyGenesisPageCapsuleV1::from_input(input)?;
-        if document_dependencies.document_id() != capsule.home_document_id
-            || !document_dependencies.direct_dependency_heads().is_empty()
+        let bundle = capsule
+            .document_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.document_id)
+            .collect::<BTreeSet<_>>();
+        if bundle.len() != capsule.document_checkpoints.len()
+            || !bundle.contains(&DocumentKey::Entity(capsule.home_document_id))
+            || document_dependencies.len() != bundle.len()
+            || document_dependencies
+                .iter()
+                .any(|dependencies| !dependencies.direct_dependency_heads().is_empty())
+            || document_dependencies
+                .iter()
+                .map(DocumentDependencies::document_id)
+                .collect::<BTreeSet<_>>()
+                != bundle
         {
             return Err(invalid(
-                "lazy genesis page dependencies do not name an unheaded home document",
+                "lazy genesis page dependencies do not name its unheaded document bundle",
             ));
+        }
+        for document_id in &bundle {
+            if !self.seen_documents.insert(*document_id) {
+                return Err(invalid("lazy genesis repeats a document identity"));
+            }
         }
         if self
             .last_path
@@ -1044,12 +1092,11 @@ impl LazyGenesisPackBuilder {
             ));
         }
         if catalog_dependencies.as_ref().is_some_and(|dependencies| {
-            dependencies.document_id() != self.catalog_document_id
+            dependencies.document_id() != DocumentKey::Entity(self.catalog_document_id)
                 || !dependencies.direct_dependency_heads().is_empty()
-                || self
-                    .descriptors
-                    .iter()
-                    .any(|page| page.home_document_id == dependencies.document_id())
+                || self.descriptors.iter().any(|page| {
+                    DocumentKey::Entity(page.home_document_id) == dependencies.document_id()
+                })
         }) {
             return Err(invalid(
                 "lazy genesis catalog dependencies are headed or alias a page home",
@@ -1086,12 +1133,7 @@ impl LazyGenesisPackBuilder {
             .enumerate()
             .map(|(index, descriptor)| (descriptor.page_id, index))
             .collect();
-        let home_index = manifest
-            .pages
-            .iter()
-            .enumerate()
-            .map(|(index, descriptor)| (descriptor.home_document_id, index))
-            .collect();
+        let home_index = lazy_genesis_document_index(&manifest)?;
         let scratch = std::mem::take(&mut self.scratch);
         let segment_seals = SegmentSealMemo::new(manifest.segments.len());
         Ok(LazyGenesisCandidate {
@@ -1121,7 +1163,10 @@ pub(crate) struct LazyGenesisCandidate {
     manifest_bytes: Vec<u8>,
     root: ContentDigest,
     index: BTreeMap<PageId, usize>,
-    home_index: BTreeMap<DocumentId, usize>,
+    /// Full immutable document-address index derived from the already
+    /// qualified manifest. Despite the historical field name, this includes
+    /// entity and membership documents, not only page-home entities.
+    home_index: BTreeMap<DocumentKey, LazyGenesisDocumentLocation>,
     cleanup_on_drop: bool,
     /// Which sealed segment packs this candidate has already proved against
     /// the manifest's segment digests, and how many such whole-pack proofs it
@@ -1139,6 +1184,17 @@ pub(crate) struct LazyGenesisCandidate {
 struct SegmentSealMemo {
     proved: Vec<AtomicBool>,
     proofs: AtomicUsize,
+    #[cfg(test)]
+    page_decodes: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyGenesisDocumentLocation {
+    Catalog,
+    Page {
+        descriptor: usize,
+        dependency: usize,
+    },
 }
 
 impl SegmentSealMemo {
@@ -1146,6 +1202,8 @@ impl SegmentSealMemo {
         Self {
             proved: (0..segments).map(|_| AtomicBool::new(false)).collect(),
             proofs: AtomicUsize::new(0),
+            #[cfg(test)]
+            page_decodes: AtomicUsize::new(0),
         }
     }
 }
@@ -1234,7 +1292,7 @@ impl LazyGenesisCandidate {
             self.manifest
                 .pages
                 .iter()
-                .map(|page| page.document_dependencies.clone()),
+                .flat_map(|page| page.document_dependencies.iter().cloned()),
         );
         documents.sort_unstable_by_key(DocumentDependencies::document_id);
         documents
@@ -1245,16 +1303,33 @@ impl LazyGenesisCandidate {
     /// this immutable baseline.
     pub(crate) fn frontier_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Option<DocumentDependencies> {
-        if let Some(dependencies) = &self.manifest.catalog_dependencies {
-            if dependencies.document_id() == document_id {
-                return Some(dependencies.clone());
-            }
+        match *self.home_index.get(&document_id)? {
+            LazyGenesisDocumentLocation::Catalog => self.manifest.catalog_dependencies.clone(),
+            LazyGenesisDocumentLocation::Page {
+                descriptor,
+                dependency,
+            } => self
+                .manifest
+                .pages
+                .get(descriptor)?
+                .document_dependencies
+                .get(dependency)
+                .cloned(),
         }
-        self.home_index
-            .get(&document_id)
-            .map(|index| self.manifest.pages[*index].document_dependencies.clone())
+    }
+
+    /// Resolve the immutable capsule that originally supplied a document.
+    /// Accepted history may have since changed its live owner or state; this
+    /// index names baseline storage only and grants no current-state authority.
+    pub(crate) fn document_checkpoint_page_id(&self, document_id: DocumentKey) -> Option<PageId> {
+        let LazyGenesisDocumentLocation::Page { descriptor, .. } =
+            *self.home_index.get(&document_id)?
+        else {
+            return None;
+        };
+        self.manifest.pages.get(descriptor).map(|page| page.page_id)
     }
 
     /// Resolve immutable page ownership without decoding its capsule or the
@@ -1320,6 +1395,10 @@ impl LazyGenesisCandidate {
         if BlobDescription::of(&bytes) != descriptor.capsule {
             return Err(invalid("lazy genesis page capsule bytes changed"));
         }
+        #[cfg(test)]
+        self.segment_seals
+            .page_decodes
+            .fetch_add(1, Ordering::Relaxed);
         let capsule = LazyGenesisPageCapsuleV1::decode(&bytes)?;
         if capsule.page_id != descriptor.page_id
             || capsule.home_document_id != descriptor.home_document_id
@@ -1338,10 +1417,18 @@ impl LazyGenesisCandidate {
             kind: capsule.kind,
             preamble: capsule.preamble,
             blocks: capsule.blocks,
-            document_checkpoint: capsule.document_checkpoint,
-            document_dependencies: Some(descriptor.document_dependencies.clone()),
+            document_checkpoints: capsule.document_checkpoints,
+            document_dependencies: descriptor.document_dependencies.clone(),
             sqlite_receipt: capsule.sqlite_receipt,
         }))
+    }
+
+    /// How many page capsules this candidate has actually sent through the
+    /// production decoder. The counter belongs to the opened candidate, so
+    /// parallel tests and unrelated engines cannot contribute to it.
+    #[cfg(test)]
+    pub(crate) fn page_capsule_decodes(&self) -> usize {
+        self.segment_seals.page_decodes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn catalog_checkpoint(&self) -> io::Result<Vec<u8>> {
@@ -1352,17 +1439,6 @@ impl LazyGenesisCandidate {
             return Err(invalid("lazy genesis catalog checkpoint bytes changed"));
         }
         Ok(bytes)
-    }
-
-    pub(crate) fn document_checkpoint(
-        &self,
-        document_id: DocumentId,
-    ) -> io::Result<Option<Vec<u8>>> {
-        let Some(&index) = self.home_index.get(&document_id) else {
-            return Ok(None);
-        };
-        let page_id = self.manifest.pages[index].page_id;
-        Ok(self.page(page_id)?.map(|page| page.document_checkpoint))
     }
 
     pub(crate) fn stage_into(
@@ -1457,12 +1533,7 @@ impl LazyGenesisCandidate {
             .enumerate()
             .map(|(index, page)| (page.page_id, index))
             .collect();
-        let home_index = manifest
-            .pages
-            .iter()
-            .enumerate()
-            .map(|(index, descriptor)| (descriptor.home_document_id, index))
-            .collect();
+        let home_index = lazy_genesis_document_index(&manifest)?;
         let segment_seals = SegmentSealMemo::new(manifest.segments.len());
         Ok(Self {
             scratch: directory.to_path_buf(),
@@ -1553,7 +1624,7 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
         .catalog_dependencies
         .as_ref()
         .is_some_and(|dependencies| {
-            dependencies.document_id() != manifest.catalog_document_id
+            dependencies.document_id() != DocumentKey::Entity(manifest.catalog_document_id)
                 || !dependencies.direct_dependency_heads().is_empty()
                 || !dependency_documents.insert(dependencies.document_id())
         })
@@ -1563,12 +1634,18 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
     for page in &manifest.pages {
         if !pages.insert(page.page_id)
             || !homes.insert(page.home_document_id)
-            || page.document_dependencies.document_id() != page.home_document_id
+            || page.document_dependencies.is_empty()
+            || !page.document_dependencies.iter().any(|dependencies| {
+                dependencies.document_id() == DocumentKey::Entity(page.home_document_id)
+            })
+            || page
+                .document_dependencies
+                .iter()
+                .any(|dependencies| !dependencies.direct_dependency_heads().is_empty())
             || !page
                 .document_dependencies
-                .direct_dependency_heads()
-                .is_empty()
-            || !dependency_documents.insert(page.document_dependencies.document_id())
+                .iter()
+                .all(|dependencies| dependency_documents.insert(dependencies.document_id()))
             || page.segment as usize >= manifest.segments.len()
             || page.length > MAX_LAZY_GENESIS_CAPSULE_BYTES as u64
         {
@@ -1576,6 +1653,33 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn lazy_genesis_document_index(
+    manifest: &LazyGenesisManifestV1,
+) -> io::Result<BTreeMap<DocumentKey, LazyGenesisDocumentLocation>> {
+    let mut index = BTreeMap::new();
+    index.insert(
+        DocumentKey::Entity(manifest.catalog_document_id),
+        LazyGenesisDocumentLocation::Catalog,
+    );
+    for (descriptor, page) in manifest.pages.iter().enumerate() {
+        for (dependency, dependencies) in page.document_dependencies.iter().enumerate() {
+            if index
+                .insert(
+                    dependencies.document_id(),
+                    LazyGenesisDocumentLocation::Page {
+                        descriptor,
+                        dependency,
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid("lazy genesis repeats a document identity"));
+            }
+        }
+    }
+    Ok(index)
 }
 
 fn segment_path(root: &Path, index: usize) -> PathBuf {
@@ -1830,10 +1934,14 @@ fn invalid(detail: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
 
+    /// One activation page in the real current layout: the page has its own
+    /// immutable document, every block has its OWN distinct document, and the
+    /// checkpoint bundle plus its unheaded dependencies are produced by the
+    /// production `LazyGenesisCheckpointBuilder`, not hand-written.
     fn page(ordinal: u128, path: &str, blocks: usize) -> LazyGenesisPageInput {
         let home = DocumentId::from_uuid(Uuid::from_u128(10_000 + ordinal));
         let source_digest = ContentDigest::of(path.as_bytes());
-        LazyGenesisPageInput {
+        let mut input = LazyGenesisPageInput {
             source_leaf: *source_digest.as_bytes(),
             exact_source_bytes: vec![b'x'; blocks * 8],
             page_id: PageId::from_uuid(Uuid::from_u128(ordinal)),
@@ -1842,37 +1950,41 @@ mod tests {
             path: ManagedPath::parse(path).unwrap(),
             kind: ManagedTextKind::Page,
             preamble: None,
-            document_checkpoint: vec![ordinal as u8, blocks as u8, 0x47],
-            document_dependencies: Some(
-                DocumentDependencies::new(
-                    home,
-                    vec![super::super::CrdtPeerCounter::new(
-                        super::super::CrdtPeerId::from_u64(7),
-                        ordinal as u64,
-                    )],
-                    Vec::new(),
-                )
-                .unwrap(),
-            ),
             blocks: (0..blocks)
                 .map(|index| LazyGenesisBlockInput {
                     block_id: BlockId::from_uuid(Uuid::from_u128(
                         100_000 + ordinal * 100 + index as u128,
                     )),
-                    home_document_id: home,
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(
+                        200_000 + ordinal * 100 + index as u128,
+                    )),
                     parent: None,
                     order: format!("{index:08}"),
                     content: format!("block {index}"),
                     external_uuid_claims: Vec::new(),
                 })
                 .collect(),
+            document_checkpoints: Vec::new(),
+            document_dependencies: Vec::new(),
             sqlite_receipt: None,
-        }
+        };
+        let mut checkpoints = super::super::hot_engine::LazyGenesisCheckpointBuilder::new(
+            DocumentId::from_uuid(Uuid::from_u128(900_000 + ordinal)),
+            WorkspaceId::from_uuid(Uuid::from_u128(90_001)),
+            LineageDigest::of(b"lazy-genesis-test-fixture"),
+        )
+        .unwrap();
+        let (document_checkpoints, document_dependencies) = checkpoints
+            .push_page(&input, &std::collections::BTreeMap::new())
+            .unwrap();
+        input.document_checkpoints = document_checkpoints;
+        input.document_dependencies = document_dependencies;
+        input
     }
 
     fn catalog_dependencies() -> DocumentDependencies {
         DocumentDependencies::new(
-            DocumentId::from_uuid(Uuid::from_u128(99_999)),
+            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(99_999))),
             vec![super::super::CrdtPeerCounter::new(
                 super::super::CrdtPeerId::from_u64(7),
                 1,
@@ -1883,7 +1995,10 @@ mod tests {
     }
 
     fn catalog_document_id() -> DocumentId {
-        catalog_dependencies().document_id()
+        catalog_dependencies()
+            .document_id()
+            .as_entity()
+            .expect("catalog is an entity document")
     }
 
     #[test]
@@ -1932,6 +2047,88 @@ mod tests {
     }
 
     #[test]
+    fn lazy_genesis_full_document_index_agrees_before_and_after_reopen() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xa180));
+        let lineage = LineageDigest::of(b"lazy-genesis-document-index-test");
+        let input = page(81, "pages/indexed.md", 2);
+        let page_id = input.page_id;
+        let expected = input
+            .document_dependencies
+            .iter()
+            .cloned()
+            .map(|dependencies| (dependencies.document_id(), dependencies))
+            .collect::<BTreeMap<_, _>>();
+        let expected_snapshots = input
+            .document_checkpoints
+            .iter()
+            .cloned()
+            .map(|checkpoint| (checkpoint.document_id, checkpoint.snapshot))
+            .collect::<BTreeMap<_, _>>();
+        assert!(expected
+            .keys()
+            .any(|key| matches!(key, DocumentKey::Entity(_))));
+        assert!(expected
+            .keys()
+            .any(|key| matches!(key, DocumentKey::Membership { .. })));
+
+        let mut builder = LazyGenesisPackBuilder::new(
+            workspace,
+            lineage,
+            catalog_document_id(),
+            BlobDescription::of(b"capture"),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        builder.push(input).unwrap();
+        let candidate = builder
+            .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
+            .unwrap();
+        let mut duplicate = candidate.manifest.clone();
+        duplicate.pages[0].document_dependencies[1] =
+            duplicate.pages[0].document_dependencies[0].clone();
+        assert!(
+            lazy_genesis_document_index(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("repeats a document identity"),
+            "the derived index must refuse duplicate full document addresses"
+        );
+        let sealed = std::env::temp_dir().join(format!(
+            "tine-lazy-genesis-document-index-{}",
+            Uuid::new_v4()
+        ));
+        let (candidate, commit) = candidate.stage_into(&sealed).unwrap();
+        let reopened = LazyGenesisCandidate::open_sealed(&sealed, commit).unwrap();
+
+        for indexed in [&candidate, &reopened] {
+            for (document_id, dependencies) in &expected {
+                assert_eq!(
+                    indexed.frontier_document(*document_id).as_ref(),
+                    Some(dependencies)
+                );
+                assert_eq!(
+                    indexed.document_checkpoint_page_id(*document_id),
+                    Some(page_id)
+                );
+                assert_eq!(
+                    indexed
+                        .page(indexed.document_checkpoint_page_id(*document_id).unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .document_checkpoints
+                        .iter()
+                        .find(|checkpoint| checkpoint.document_id == *document_id)
+                        .map(|checkpoint| &checkpoint.snapshot),
+                    expected_snapshots.get(document_id)
+                );
+            }
+            let unknown = DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xdead_beef)));
+            assert_eq!(indexed.frontier_document(unknown), None);
+            assert_eq!(indexed.document_checkpoint_page_id(unknown), None);
+        }
+    }
+
+    #[test]
     fn capsule_decoder_accepts_only_the_current_receipted_shape() {
         #[derive(Serialize)]
         struct PreviousCapsule {
@@ -1966,7 +2163,7 @@ mod tests {
             kind: current.kind,
             preamble: current.preamble.clone(),
             blocks: current.blocks.clone(),
-            document_checkpoint: current.document_checkpoint.clone(),
+            document_checkpoint: current.document_checkpoints[0].snapshot.clone(),
         };
         let bytes = postcard::to_allocvec(&previous).unwrap();
         assert!(

@@ -5755,6 +5755,7 @@ dependencies = [
  "crc32fast",
  "dirs",
  "fs2",
+ "im",
  "libc",
  "loro",
  "lsdoc",
@@ -5797,8 +5798,8 @@ dependencies = [
 
 [[package]]
 name = "tine-storage"
-version = "0.18.0"
-source = "git+https://github.com/martinkoutecky/tine-storage?tag=v0.18.0#998a63fc5af900d25946383dad420965c7165ce0"
+version = "0.19.0"
+source = "git+https://github.com/martinkoutecky/tine-storage?tag=v0.19.0#65ab8a76ef465b0846546b7a6e60b7b3578e24d8"
 dependencies = [
  "cap-fs-ext",
  "cap-std",

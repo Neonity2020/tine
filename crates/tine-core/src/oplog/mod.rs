@@ -45,8 +45,7 @@ pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
-// Qualify the replacement schema before the single live-format cutover.
-#[cfg(test)]
+/// The single current live document layout.
 pub(crate) mod retirable_document;
 pub(crate) mod semantic;
 pub(crate) mod sqlite;
@@ -188,9 +187,9 @@ pub use reference_catalog::{
 pub use refusal::ManagedStorageRefusalScenario;
 pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
-    BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,
-    LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageDeltaLifecycle,
-    PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
+    BlockBirth, BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName,
+    LogicalPageNameError, LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta,
+    PageDeltaLifecycle, PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
     PolicyGeneratedAnchorReason, SemanticEffect, SemanticError, VisibleMembership,
     CATALOG_PAGE_STATE_SCHEMA_VERSION, MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION,
     SEMANTIC_EFFECT_SCHEMA_VERSION,
@@ -259,11 +258,11 @@ mod external_surface_tests {
         let digest = Sha256::digest(public_uses.join("\n").as_bytes());
         assert_eq!(
             format!("{digest:x}"),
-            // Re-pinned for the retirable-document and writer foundations:
-            // `WriterIncarnationId` joins the identity re-exports. Extraction against
-            // the preceding foundation proves that this is the only added
-            // name, none are removed, and there are still 20 declarations.
-            "7ff09377a7cd953dfdc3c69da89923ea7a693638f3de2ffd770d508cd85f5484",
+            // Re-pinned for the one current birth-authority schema:
+            // `BlockBirth` joins the semantic re-exports because it is the
+            // public field type of `BlockDelta::birth`. No declaration was
+            // added or removed; there are still exactly 20.
+            "1074d14285efc91d1a65478dc8052cd60ec906d87d868b8f5b1255d88e9897cd",
             "the exact public oplog re-export surface changed"
         );
 

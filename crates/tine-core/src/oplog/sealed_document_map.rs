@@ -1,139 +1,48 @@
-//! Tagged document index composed from the shared UUID map. Entity UUIDs and
-//! full (block UUID, page UUID) membership pairs have separate root domains.
-//! No tuple hashing, tombstone entries, or second tree implementation.
-use super::{capsule_blob_name, SealedGenerationDirectory, SealedGenerationStagingStore};
-use crate::oplog::{ContentDigest, DocumentId, DocumentKey};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+//! Accepted document index: ONE shared authenticated map keyed by the lossless
+//! [`DocumentKey`] bytes. Entity births and full (block, page) membership pairs
+//! are rows of the same map, distinguished by the key's own domain tag. There
+//! is no tuple hashing, no group descriptor, no nested tree and no second map
+//! implementation.
+use crate::oplog::{ContentDigest, DocumentKey};
+use std::collections::BTreeSet;
 use tine_storage::sealed_accepted_index::{
-    authenticated_map_root, AuthenticatedMapLinkV1, AuthenticatedMapRootV1,
-    SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader, SealedAcceptedIndexWriter,
+    authenticated_map_root, AuthenticatedMapRootV1, SealedAcceptedIndexObjectStore,
+    SealedAcceptedIndexReader, SealedAcceptedIndexWriter,
 };
+
+use super::{SealedGenerationDirectory, SealedGenerationStagingStore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SealedDocumentMap {
-    entities: AuthenticatedMapRootV1,
-    membership_blocks: AuthenticatedMapRootV1,
-    membership_count: u64,
-}
-
-// Fixed-size root descriptor, encoded with the existing postcard serializer.
-// The outer UUID map binds the block ID to these exact root bytes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MembershipRootRecord {
-    schema: u8,
-    count: u64,
-    root: Option<([u8; 16], [u8; 32])>,
-}
-
-impl MembershipRootRecord {
-    fn bytes(root: AuthenticatedMapRootV1) -> Result<Vec<u8>, String> {
-        postcard::to_stdvec(&Self {
-            schema: 1,
-            count: root.count,
-            root: root.root.map(|link| (link.key, *link.digest.as_bytes())),
-        })
-        .map_err(|error| error.to_string())
-    }
-
-    fn decode(bytes: &[u8]) -> Result<AuthenticatedMapRootV1, String> {
-        let (record, remaining): (Self, &[u8]) =
-            postcard::take_from_bytes(bytes).map_err(|error| error.to_string())?;
-        let root = AuthenticatedMapRootV1 {
-            count: record.count,
-            root: record.root.map(|(key, digest)| AuthenticatedMapLinkV1 {
-                key,
-                digest: ContentDigest::from_bytes(digest),
-            }),
-        };
-        if record.schema != 1
-            || !remaining.is_empty()
-            || (root.count == 0) != root.root.is_none()
-            || Self::bytes(root)? != bytes
-        {
-            return Err("membership document map root is not canonical".into());
-        }
-        Ok(root)
-    }
-}
-
-// Construction reads must see the bounded unpublished batch as well as disk.
-// Reuse the staging store's sealed-node trait, including its sticky failure.
-trait DocumentMapRead: SealedAcceptedIndexObjectStore {
-    fn root_record_bytes(&self, address: ContentDigest) -> Result<Vec<u8>, String>;
-}
-impl DocumentMapRead for SealedGenerationDirectory {
-    fn root_record_bytes(&self, address: ContentDigest) -> Result<Vec<u8>, String> {
-        tine_storage::read_optional_regular(&self.directory, &capsule_blob_name(address), 128, None)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "membership document map root bytes are missing".into())
-    }
-}
-impl DocumentMapRead for SealedGenerationStagingStore {
-    fn root_record_bytes(&self, address: ContentDigest) -> Result<Vec<u8>, String> {
-        if self.failed {
-            return Err("sealed generation staging previously failed".into());
-        }
-        if let Some(bytes) = self.pending.objects.get(&(0, address)) {
-            if bytes.len() > 128 {
-                return Err("membership root exceeds its fixed codec size".into());
-            }
-            return Ok(bytes.clone());
-        }
-        self.reader.root_record_bytes(address)
-    }
+    documents: AuthenticatedMapRootV1,
 }
 
 impl SealedDocumentMap {
     pub(super) fn empty() -> Self {
         Self {
-            entities: AuthenticatedMapRootV1::empty(),
-            membership_blocks: AuthenticatedMapRootV1::empty(),
-            membership_count: 0,
+            documents: AuthenticatedMapRootV1::empty(),
         }
     }
 
     #[cfg(test)]
     pub(super) fn entity_root(self) -> AuthenticatedMapRootV1 {
-        self.entities
+        self.documents
+    }
+
+    /// The composed root, for proving that the run-local accepted document map
+    /// and this sealed one are the same map over the same full-key rows.
+    #[cfg(test)]
+    pub(crate) fn composed_root(self) -> AuthenticatedMapRootV1 {
+        self.documents
     }
 
     #[cfg(test)]
-    pub(super) fn with_entity_root_for_test(self, entities: AuthenticatedMapRootV1) -> Self {
-        Self { entities, ..self }
+    pub(super) fn with_entity_root_for_test(self, documents: AuthenticatedMapRootV1) -> Self {
+        Self { documents }
     }
 
     pub(super) fn count(self) -> u64 {
-        // Every construction update checks the combined count before returning.
-        self.entities
-            .count
-            .checked_add(self.membership_count)
-            .expect("validated document map count")
-    }
-
-    fn membership_root(
-        self,
-        store: &impl DocumentMapRead,
-        block: DocumentId,
-    ) -> Result<AuthenticatedMapRootV1, String> {
-        let Some(address) = SealedAcceptedIndexReader::new(store)
-            .map_value(self.membership_blocks, block.as_uuid().into_bytes())
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(AuthenticatedMapRootV1::empty());
-        };
-        // This fixed descriptor is at most 60 bytes; the read limit is a codec
-        // bound, independent of the number of documents or retained history.
-        let bytes = store.root_record_bytes(address)?;
-        if ContentDigest::of(&bytes) != address {
-            return Err("membership document map root digest differs".into());
-        }
-        let root = MembershipRootRecord::decode(&bytes)?;
-        if root.count == 0 {
-            return Err("document map retains an empty membership group".into());
-        }
-        Ok(root)
+        self.documents.count
     }
 
     pub(super) fn value(
@@ -141,18 +50,8 @@ impl SealedDocumentMap {
         store: &SealedGenerationDirectory,
         key: DocumentKey,
     ) -> Result<Option<ContentDigest>, String> {
-        let (root, uuid) = match key {
-            DocumentKey::Entity(id) => (self.entities, id),
-            DocumentKey::Membership {
-                block_document_id,
-                page_document_id,
-            } => (
-                self.membership_root(store, block_document_id)?,
-                page_document_id,
-            ),
-        };
         SealedAcceptedIndexReader::new(store)
-            .map_value(root, uuid.as_uuid().into_bytes())
+            .map_value(self.documents, key.authenticated_map_key())
             .map_err(|error| error.to_string())
     }
 
@@ -162,44 +61,11 @@ impl SealedDocumentMap {
         key: DocumentKey,
         value: ContentDigest,
     ) -> Result<Self, String> {
-        let next = match key {
-            DocumentKey::Entity(id) => Self {
-                entities: SealedAcceptedIndexWriter::new(store)
-                    .upsert_map(self.entities, id.as_uuid().into_bytes(), value)
-                    .map_err(|error| error.to_string())?,
-                ..self
-            },
-            DocumentKey::Membership {
-                block_document_id,
-                page_document_id,
-            } => {
-                let old = self.membership_root(store, block_document_id)?;
-                let root = SealedAcceptedIndexWriter::new(store)
-                    .upsert_map(old, page_document_id.as_uuid().into_bytes(), value)
-                    .map_err(|error| error.to_string())?;
-                let blob = store.stage_capsule_blob(&MembershipRootRecord::bytes(root)?)?;
-                let membership_blocks = SealedAcceptedIndexWriter::new(store)
-                    .upsert_map(
-                        self.membership_blocks,
-                        block_document_id.as_uuid().into_bytes(),
-                        ContentDigest::from_bytes(*blob.sha256()),
-                    )
-                    .map_err(|error| error.to_string())?;
-                Self {
-                    membership_blocks,
-                    membership_count: self
-                        .membership_count
-                        .checked_add(root.count - old.count)
-                        .ok_or("membership document count overflow")?,
-                    ..self
-                }
-            }
-        };
-        next.entities
-            .count
-            .checked_add(next.membership_count)
-            .ok_or("document map count overflow")?;
-        Ok(next)
+        Ok(Self {
+            documents: SealedAcceptedIndexWriter::new(store)
+                .upsert_map(self.documents, key.authenticated_map_key(), value)
+                .map_err(|error| error.to_string())?,
+        })
     }
 
     pub(super) fn remove(
@@ -207,62 +73,22 @@ impl SealedDocumentMap {
         store: &mut SealedGenerationStagingStore,
         key: DocumentKey,
     ) -> Result<Self, String> {
-        match key {
-            DocumentKey::Entity(id) => Ok(Self {
-                entities: SealedAcceptedIndexWriter::new(store)
-                    .remove_map(self.entities, id.as_uuid().into_bytes())
-                    .map_err(|error| error.to_string())?,
-                ..self
-            }),
-            DocumentKey::Membership {
-                block_document_id,
-                page_document_id,
-            } => {
-                let old = self.membership_root(store, block_document_id)?;
-                let root = SealedAcceptedIndexWriter::new(store)
-                    .remove_map(old, page_document_id.as_uuid().into_bytes())
-                    .map_err(|error| error.to_string())?;
-                if root == old {
-                    return Ok(self);
-                }
-                let membership_blocks = if root.count == 0 {
-                    SealedAcceptedIndexWriter::new(store)
-                        .remove_map(
-                            self.membership_blocks,
-                            block_document_id.as_uuid().into_bytes(),
-                        )
-                        .map_err(|error| error.to_string())?
-                } else {
-                    let blob = store.stage_capsule_blob(&MembershipRootRecord::bytes(root)?)?;
-                    SealedAcceptedIndexWriter::new(store)
-                        .upsert_map(
-                            self.membership_blocks,
-                            block_document_id.as_uuid().into_bytes(),
-                            ContentDigest::from_bytes(*blob.sha256()),
-                        )
-                        .map_err(|error| error.to_string())?
-                };
-                Ok(Self {
-                    membership_blocks,
-                    membership_count: self
-                        .membership_count
-                        .checked_sub(1)
-                        .ok_or("membership document count underflow")?,
-                    ..self
-                })
-            }
-        }
+        Ok(Self {
+            documents: SealedAcceptedIndexWriter::new(store)
+                .remove_map(self.documents, key.authenticated_map_key())
+                .map_err(|error| error.to_string())?,
+        })
     }
 
+    /// Prove that this census is EXACTLY the accepted document key set: every
+    /// named key resolves, and the map rebuilt from those keys is this map.
     pub(super) fn qualify_complete_keys(
         self,
         store: &SealedGenerationDirectory,
         keys: impl Iterator<Item = DocumentKey>,
     ) -> Result<(), String> {
         let mut seen = BTreeSet::new();
-        let mut entities = Vec::new();
-        let mut memberships = BTreeMap::<DocumentId, Vec<_>>::new();
-        let mut membership_count = 0u64;
+        let mut entries = Vec::new();
         for key in keys {
             if !seen.insert(key) {
                 return Err("document key census repeats an identity".into());
@@ -270,44 +96,28 @@ impl SealedDocumentMap {
             let value = self
                 .value(store, key)?
                 .ok_or("document roster omits an accepted document")?;
-            match key {
-                DocumentKey::Entity(id) => entities.push((id.as_uuid().into_bytes(), value)),
-                DocumentKey::Membership {
-                    block_document_id,
-                    page_document_id,
-                } => {
-                    memberships
-                        .entry(block_document_id)
-                        .or_default()
-                        .push((page_document_id.as_uuid().into_bytes(), value));
-                    membership_count = membership_count
-                        .checked_add(1)
-                        .ok_or("membership census count overflow")?;
-                }
-            }
+            entries.push((key.authenticated_map_key(), value));
         }
-        let mut groups = Vec::new();
-        for (block, entries) in memberships {
-            let root = authenticated_map_root(&entries).map_err(|error| error.to_string())?;
-            groups.push((
-                block.as_uuid().into_bytes(),
-                ContentDigest::of(&MembershipRootRecord::bytes(root)?),
-            ));
-        }
-        if authenticated_map_root(&entities).map_err(|error| error.to_string())? != self.entities
-            || authenticated_map_root(&groups).map_err(|error| error.to_string())?
-                != self.membership_blocks
-            || membership_count != self.membership_count
-        {
+        // The census is ordered by `DocumentKey`, which is not the map's
+        // lexicographic key order, so sort before rebuilding.
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if authenticated_map_root(&entries).map_err(|error| error.to_string())? != self.documents {
             return Err("document roster is not exactly the accepted document key set".into());
         }
         Ok(())
     }
 }
 
+/// Kept so callers that only need the sealed-node trait bound do not have to
+/// name the concrete store types.
+trait DocumentMapRead: SealedAcceptedIndexObjectStore {}
+impl DocumentMapRead for SealedGenerationDirectory {}
+impl DocumentMapRead for SealedGenerationStagingStore {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oplog::DocumentId;
 
     #[test]
     fn contract_names_shared_map_composition_and_retirement() {
@@ -318,7 +128,7 @@ mod tests {
             "DocumentKey::Membership",
             "(block_document_id, page_document_id)",
             "remove_map",
-            "128 bytes",
+            "AuthenticatedMapKey",
         ] {
             assert!(contract.contains(required), "missing contract: {required}");
         }
@@ -371,7 +181,6 @@ mod tests {
                 map = map.remove(&mut store, member(1, 2)).unwrap();
                 map = map.remove(&mut store, member(1, 3)).unwrap();
                 assert_eq!(map.count(), 3);
-                assert_eq!(map.membership_blocks.count, 1);
                 let reader = store.finish().unwrap();
                 original
                     .qualify_complete_keys(&reader, keys.into_iter())
@@ -390,6 +199,12 @@ mod tests {
                     map.value(&reader, DocumentKey::Entity(id(1))).unwrap(),
                     Some(ContentDigest::of(&[0]))
                 );
+                // A membership pair is addressed by BOTH document ids: the
+                // mirrored pair is a different row and never aliases.
+                assert_ne!(
+                    map.value(&reader, member(2, 1)).unwrap(),
+                    map.value(&reader, member(1, 2)).unwrap()
+                );
                 assert!(map
                     .qualify_complete_keys(&reader, [member(2, 1), member(2, 3)].into_iter())
                     .is_err());
@@ -399,6 +214,60 @@ mod tests {
                 drop(reader);
             });
         }
+    }
+
+    /// The running composition (`hot_engine::RunLocalDocumentMap`) and this
+    /// sealed one are the SAME map: identical roots for the exact same full-key
+    /// rows, including after the last membership row of a block is deleted and
+    /// after the last row of the whole map is deleted.
+    #[test]
+    fn running_and_sealed_document_maps_agree_on_the_same_full_key_rows() {
+        use crate::oplog::hot_engine::run_local_document_map_root;
+
+        with_directory(|directory| {
+            let rows = [
+                (DocumentKey::Entity(id(1)), ContentDigest::of(b"e1")),
+                (member(1, 2), ContentDigest::of(b"m12")),
+                (DocumentKey::Entity(id(7)), ContentDigest::of(b"e7")),
+                (member(2, 1), ContentDigest::of(b"m21")),
+                (member(1, 3), ContentDigest::of(b"m13")),
+                (member(2, 3), ContentDigest::of(b"m23")),
+            ];
+            let mut store = SealedGenerationStagingStore::open(directory).unwrap();
+            let mut sealed = SealedDocumentMap::empty();
+            for (key, value) in rows {
+                sealed = sealed.upsert(&mut store, key, value).unwrap();
+            }
+            assert_eq!(sealed.composed_root(), run_local_document_map_root(&rows));
+            assert_eq!(sealed.count(), 6);
+
+            // Deleting the last membership row of block 1 must leave exactly
+            // the root the running map builds from the remaining rows alone.
+            let mut trimmed = sealed;
+            for key in [member(1, 2), member(1, 3)] {
+                trimmed = trimmed.remove(&mut store, key).unwrap();
+            }
+            let remaining: Vec<_> = rows
+                .into_iter()
+                .filter(|(key, _)| *key != member(1, 2) && *key != member(1, 3))
+                .collect();
+            assert_eq!(
+                trimmed.composed_root(),
+                run_local_document_map_root(&remaining)
+            );
+            assert_eq!(trimmed.count(), 4);
+
+            // Removing the last entry of the shared map yields the empty root
+            // on both sides -- no residual descriptor, no empty group.
+            let mut bare = trimmed;
+            for (key, _) in remaining {
+                bare = bare.remove(&mut store, key).unwrap();
+            }
+            assert_eq!(bare.composed_root(), run_local_document_map_root(&[]));
+            assert_eq!(bare.composed_root(), AuthenticatedMapRootV1::empty());
+            assert_eq!(bare.count(), 0);
+            drop(store.finish().unwrap());
+        });
     }
 
     #[test]
@@ -423,9 +292,8 @@ mod tests {
                 map = map.remove(&mut store, key).unwrap();
                 assert_eq!(map, fixed_live_root);
             }
-            // Removing the last pair drops its outer group, not a tombstone.
+            // Removing the last pair drops the row, not a tombstone.
             map = map.remove(&mut store, member(1, 2)).unwrap();
-            assert_eq!(map.membership_blocks, AuthenticatedMapRootV1::empty());
             assert_eq!(map.count(), 1);
             let reader = store.finish().unwrap();
             fixed_live_root

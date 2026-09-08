@@ -1744,6 +1744,7 @@ pub(crate) fn assert_torn_sweep_tail_recovers_for_oracle() {
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
     use super::*;
 
     #[test]
@@ -1828,7 +1829,9 @@ mod tests {
     /// cannot pass against a default or a recomputed value.
     fn predecessor_frontier(counter: u64) -> FrontierV2 {
         FrontierV2::new(vec![super::super::DocumentDependencies::new(
-            super::super::DocumentId::from_uuid(Uuid::from_u128(0xc4_f201)),
+            DocumentKey::Entity(super::super::DocumentId::from_uuid(Uuid::from_u128(
+                0xc4_f201,
+            ))),
             vec![super::super::CrdtPeerCounter::new(
                 super::super::CrdtPeerId::from_u64(11),
                 counter,
@@ -2028,7 +2031,7 @@ mod tests {
         manager.append_record(aged).unwrap();
 
         let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentId::from_uuid(Uuid::from_u128(0xc4f003)),
+            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc4f003))),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(3), 1)],
             Vec::new(),
         )

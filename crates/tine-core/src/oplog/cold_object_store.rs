@@ -121,7 +121,7 @@ use super::checkpoint_generation::{SealedGenerationDirectory, SealedGenerationSt
 use super::object_store::{filesystem_error_without_collision, ObjectStore, StoreError};
 use super::{BatchId, ContentDigest, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES};
 use tine_storage::sealed_accepted_index::{
-    AuthenticatedMapLinkV1, AuthenticatedMapRootV1, SealedAcceptedIndexReader,
+    AuthenticatedMapKey, AuthenticatedMapLinkV1, AuthenticatedMapRootV1, SealedAcceptedIndexReader,
     SealedAcceptedIndexWriter,
 };
 
@@ -309,17 +309,30 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(bytes: &[u8]) -> R
     Ok(value)
 }
 
-fn map_root_to_wire(root: AuthenticatedMapRootV1) -> ColdMapRootWire {
-    ColdMapRootWire {
+/// Cold lookup keys are exactly 128 bits wide by construction. Reject rather
+/// than truncate if a root ever carries a wider shared key.
+fn cold_map_root_key_bytes(key: AuthenticatedMapKey) -> Result<[u8; 16], String> {
+    <[u8; 16]>::try_from(key.as_slice())
+        .map_err(|_| "cold history map root key is not a 128-bit lookup key".to_string())
+}
+
+fn map_root_to_wire(root: AuthenticatedMapRootV1) -> Result<ColdMapRootWire, String> {
+    Ok(ColdMapRootWire {
         count: root.count,
-        root_key: root.root.map(|link| link.key),
+        root_key: root
+            .root
+            .map(|link| cold_map_root_key_bytes(link.key))
+            .transpose()?,
         root_digest: root.root.map(|link| link.digest),
-    }
+    })
 }
 
 fn map_root_from_wire(wire: ColdMapRootWire) -> Result<AuthenticatedMapRootV1, String> {
     let root = match (wire.root_key, wire.root_digest) {
-        (Some(key), Some(digest)) => Some(AuthenticatedMapLinkV1 { key, digest }),
+        (Some(key), Some(digest)) => Some(AuthenticatedMapLinkV1 {
+            key: AuthenticatedMapKey::from(key),
+            digest,
+        }),
         (None, None) => None,
         _ => return Err("cold history map root is partial".into()),
     };
@@ -336,7 +349,7 @@ fn map_root_from_wire(wire: ColdMapRootWire) -> Result<AuthenticatedMapRootV1, S
 fn encode_inner_root(root: AuthenticatedMapRootV1) -> Result<Vec<u8>, String> {
     let bytes = encode_canonical(&ColdInnerRootV1 {
         schema: COLD_SCHEMA_VERSION,
-        root: map_root_to_wire(root),
+        root: map_root_to_wire(root)?,
     })?;
     if bytes.len() as u64 > MAX_COLD_INNER_ROOT_BYTES {
         return Err("cold inner-root descriptor exceeds its fixed codec size".into());
@@ -362,8 +375,10 @@ impl ColdHistoryRootsV1 {
     fn empty() -> Self {
         Self {
             schema: COLD_SCHEMA_VERSION,
-            objects: map_root_to_wire(AuthenticatedMapRootV1::empty()),
-            manifests: map_root_to_wire(AuthenticatedMapRootV1::empty()),
+            objects: map_root_to_wire(AuthenticatedMapRootV1::empty())
+                .expect("the empty map root has no key"),
+            manifests: map_root_to_wire(AuthenticatedMapRootV1::empty())
+                .expect("the empty map root has no key"),
             object_count: 0,
             manifest_count: 0,
         }
@@ -1074,8 +1089,8 @@ fn stage_cold_publication(
     Ok(StagedColdPublication {
         roots: ColdHistoryRootsV1 {
             schema: COLD_SCHEMA_VERSION,
-            objects: map_root_to_wire(object_root),
-            manifests: map_root_to_wire(manifest_root),
+            objects: map_root_to_wire(object_root).map_err(cold_index_error)?,
+            manifests: map_root_to_wire(manifest_root).map_err(cold_index_error)?,
             object_count,
             manifest_count,
         },
@@ -1556,6 +1571,7 @@ pub(crate) fn repack_cold_history(
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
     use super::*;
     use crate::oplog::{
         BatchCausalDot, BatchInspection, BatchOrigin, CausalPeerId, CrdtPeerCounter, CrdtPeerId,
@@ -1614,14 +1630,14 @@ mod tests {
         let semantic_payload = format!("semantic effect payload {seed}").into_bytes();
         let semantic = OperationObject::new(
             workspace_id,
-            DocumentId::from_uuid(uuid(0x10_0000 + seed)),
+            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x10_0000 + seed))),
             ObjectKind::SemanticEffect,
             semantic_payload.clone(),
         )
         .unwrap();
         let update = OperationObject::new(
             workspace_id,
-            DocumentId::from_uuid(uuid(0x20_0000 + seed)),
+            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x20_0000 + seed))),
             ObjectKind::CrdtUpdate,
             format!("crdt update payload {seed} {}", "x".repeat(64)).into_bytes(),
         )
@@ -1633,7 +1649,7 @@ mod tests {
             .collect();
         let device = DeviceId::from_uuid(uuid(30));
         let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentId::from_uuid(uuid(0x20_0000 + seed)),
+            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x20_0000 + seed))),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(8), 12)],
             Vec::new(),
         )

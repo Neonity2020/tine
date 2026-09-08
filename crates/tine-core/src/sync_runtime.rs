@@ -11272,6 +11272,16 @@ impl ManagedLocalPendingIndex {
     fn record(&self, batch_id: BatchId) -> Option<&ManagedLocalRecord> {
         self.records_by_batch.get(&batch_id)
     }
+
+    fn latest_projection_target(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+    ) -> Option<&Option<Vec<u8>>> {
+        self.projection_targets
+            .get(&(path.as_str().to_owned(), page_id))
+            .and_then(|targets| targets.values().next_back())
+    }
 }
 
 impl ManagedLocalSuccessorIndex for ManagedLocalPendingIndex {
@@ -12860,6 +12870,7 @@ enum ApplicationPublicationSettlement {
     Deferred(SyncEditorDeferred),
 }
 
+#[derive(Debug)]
 enum EditorNameState {
     Missing {
         name: LogicalPageName,
@@ -13356,14 +13367,43 @@ impl RuntimeActor {
         page_kind: SyncPageKind,
         format: Format,
     ) -> Result<EditorNameState, SyncEditorRequestError> {
-        editor_name_state_for_format_with_engine(
-            self.active_engine()
-                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?;
+        let logical_name = LogicalPageName::parse(name.clone()).map_err(|_| {
+            SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
+        })?;
+        let point_is_known = engine
+            .page_name_point_is_known(&logical_name)
+            .map_err(|_| {
+                SyncEditorRequestError::ActorRefusedAt("editor_name_state_point_presence")
+            })?;
+        let current = editor_name_state_for_format_with_engine(
+            engine,
             &self.graph,
-            name,
+            name.clone(),
             page_kind,
             format,
-        )
+        )?;
+        if !point_is_known
+            && matches!(
+                current,
+                EditorNameState::Missing { .. } | EditorNameState::PathOccupied
+            )
+        {
+            // Operation-free lazy genesis deliberately carries no resident
+            // page-name ownership rows. The exact-frontier SQLite projection
+            // is its bounded point index until an accepted name transition
+            // exists; pending/local owners above still win before this
+            // fallback is consulted.
+            match self.active_projected_editor_name_state(name, page_kind)? {
+                projected @ (EditorNameState::Exact(_) | EditorNameState::Ambiguous) => {
+                    return Ok(projected)
+                }
+                EditorNameState::Missing { .. } | EditorNameState::PathOccupied => {}
+            }
+        }
+        Ok(current)
     }
 
     fn load_active_preferred_application_page(
@@ -13371,6 +13411,67 @@ impl RuntimeActor {
         page_id: PageId,
         projected_available: bool,
     ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| !managed.latest_projection_frames.is_empty())
+        {
+            let path = self
+                .active_engine()
+                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
+                .current_live_page_path(page_id)
+                .map_err(|_| SyncEditorRequestError::ActorRefusedAt("pending_page_path"))?;
+            if let Some(path) = path {
+                match self
+                    .load_clean_foreground_pending_exact_ready(&path)
+                    .map_err(|error| match error {
+                        SyncApplicationPageRequestError::RequestTooLarge(size) => {
+                            SyncEditorRequestError::RequestTooLarge(size)
+                        }
+                        SyncApplicationPageRequestError::ActorUnavailable => {
+                            SyncEditorRequestError::ActorUnavailable
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedAt(stage) => {
+                            SyncEditorRequestError::ActorRefusedAt(stage)
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedWithCode(code) => {
+                            SyncEditorRequestError::ActorRefusedWithCode(code)
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code } => {
+                            SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedWithDebugDetail {
+                            code,
+                            debug_detail,
+                        } => SyncEditorRequestError::ActorRefusedWithDebugDetail {
+                            code,
+                            debug_detail,
+                        },
+                        SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+                            stage,
+                            code,
+                            debug_detail,
+                        } => SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+                            stage,
+                            code,
+                            debug_detail,
+                        },
+                        SyncApplicationPageRequestError::InvalidRequest(_)
+                        | SyncApplicationPageRequestError::ActorRefused => {
+                            SyncEditorRequestError::ActorRefusedAt("pending_page_load")
+                        }
+                    })? {
+                    Some(ApplicationExactLoad::Loaded(current))
+                        if current.editor.page.page_id == page_id =>
+                    {
+                        return Ok(Some(current));
+                    }
+                    Some(ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous)
+                    | None
+                    | Some(ApplicationExactLoad::Loaded(_)) => {}
+                }
+            }
+        }
         load_preferred_source_authenticated_application_page_from_parts(
             self.active_engine()
                 .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
@@ -13380,6 +13481,27 @@ impl RuntimeActor {
             page_id,
             projected_available,
         )
+    }
+
+    /// The exact projection bytes that an editor mutation must use as its
+    /// predecessor. A journal-durable local successor is authoritative before
+    /// its derivative filesystem projection catches up, and the pending index
+    /// answers this point query without decoding or walking the journal.
+    fn read_active_projection_input(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+    ) -> Result<Option<Vec<u8>>, SyncEditorRequestError> {
+        if let Some(target) = self.managed_local.as_ref().and_then(|managed| {
+            managed
+                .pending_index
+                .latest_projection_target(path, page_id)
+        }) {
+            return Ok(target.clone());
+        }
+        self.graph.read_projection_input(path).map_err(|_| {
+            SyncEditorRequestError::ActorRefusedAt("reading the current Markdown or Org projection")
+        })
     }
 
     fn load_active_current_source_application_page(
@@ -16660,6 +16782,9 @@ impl RuntimeActor {
                 )
             })?;
             let load = match self.load_clean_foreground_pending_exact_ready(&path)? {
+                Some(ApplicationExactLoad::Loaded(current)) => ApplicationExactLoad::Loaded(
+                    self.finish_managed_application_query_metadata_page_hydration(current),
+                ),
                 Some(load) => load,
                 None => self.load_hot_application_exact_ready(&path)?,
             };
@@ -17019,7 +17144,7 @@ impl RuntimeActor {
             )
         })?;
         if let Some(current) = self.load_clean_foreground_pending_exact_ready(&path)? {
-            return Ok(current);
+            return Ok(self.finish_managed_application_query_exact_load(current));
         }
         let read = self.application_materialized_read_ready()?;
         if let [page] = read
@@ -17124,9 +17249,7 @@ impl RuntimeActor {
             editor_current_page_from_materialized(materialized, MAX_SYNC_APPLICATION_PAGE_BLOCKS)
                 .map_err(map_editor_application_error)?;
         let current = join_application_page(parsed, editor)?;
-        Ok(Some(self.finish_managed_application_query_exact_load(
-            ApplicationExactLoad::Loaded(current),
-        )))
+        Ok(Some(ApplicationExactLoad::Loaded(current)))
     }
 
     fn load_application_save_exact_ready(
@@ -18943,14 +19066,14 @@ impl RuntimeActor {
         page_kind: SyncPageKind,
         expected_path: Option<&str>,
     ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
-        let page_id = match self
+        let name_state = self
             .active_editor_name_state_for_format(
                 name.to_owned(),
                 page_kind,
                 self.graph.preferred_format(),
             )
-            .map_err(map_editor_application_error)?
-        {
+            .map_err(map_editor_application_error)?;
+        let page_id = match name_state {
             EditorNameState::Exact(page_id) => page_id,
             // Retrying an already accepted unpinned delete is harmless.  An
             // expected path means the caller was deleting one precise loaded
@@ -20546,13 +20669,7 @@ impl RuntimeActor {
                     #[cfg(test)]
                     let exact_base_started = Instant::now();
                     let base = self
-                        .graph
-                        .read_projection_input(&current.page.path)
-                        .map_err(|_| {
-                            SyncEditorRequestError::ActorRefusedAt(
-                                "reading the current Markdown or Org projection",
-                            )
-                        })?
+                        .read_active_projection_input(&current.page.path, current.page.page_id)?
                         .ok_or(SyncEditorRequestError::ActorRefusedAt(
                             "reading the current Markdown or Org projection",
                         ))?;
@@ -22689,7 +22806,11 @@ impl RuntimeActor {
                                         pair.min_batch,
                                         pair.max_batch,
                                     ),
-                                    home_document_id: page.home_document_id,
+                                    home_document_id: DocumentId::for_conflict_sibling(
+                                        block.block_id,
+                                        pair.min_batch,
+                                        pair.max_batch,
+                                    ),
                                 },
                                 page_id,
                                 parent: original.parent,
@@ -25880,7 +26001,7 @@ fn build_existing_editor_transaction(
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: resolved[index],
-                home_document_id: current.page.home_document_id,
+                home_document_id: DocumentId::new(),
             },
             page_id: current.page.page_id,
             parent: desired[index].0,
@@ -26109,7 +26230,7 @@ fn build_new_editor_transaction(
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: resolved[index],
-                home_document_id,
+                home_document_id: DocumentId::new(),
             },
             page_id,
             parent: desired[index].0,
@@ -26348,4 +26469,4 @@ fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
 
 #[cfg(test)]
 #[path = "sync_runtime_tests.rs"]
-mod tests;
+pub(crate) mod tests;

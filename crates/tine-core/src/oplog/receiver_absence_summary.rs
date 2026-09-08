@@ -4,7 +4,7 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
 use tine_storage::sealed_accepted_index::{
-    AuthenticatedMapLinkV1, AuthenticatedMapRootV1, SealedAcceptedIndexError,
+    AuthenticatedMapKey, AuthenticatedMapLinkV1, AuthenticatedMapRootV1, SealedAcceptedIndexError,
     SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader, SealedAcceptedIndexWriter,
     SealedAcceptedObjectKind,
 };
@@ -763,7 +763,7 @@ proved the derived index damaged and must not republish it"
             previous_digest: self.tail_digest,
             coverage: self.coverage,
             cursor_coverage: self.cursor_coverage,
-            history_root: self.history.root().into(),
+            history_root: PersistedHistoryRoot::encode(self.history.root())?,
             incomplete_intents: self.incomplete_intents.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&object).map_err(|error| error.to_string())?;
@@ -1111,13 +1111,22 @@ struct PersistedHistoryRoot {
     digest: Option<[u8; 32]>,
 }
 
-impl From<AuthenticatedMapRootV1> for PersistedHistoryRoot {
-    fn from(value: AuthenticatedMapRootV1) -> Self {
-        Self {
+impl PersistedHistoryRoot {
+    /// Receiver absence keys are exactly 128 bits wide by construction. Reject
+    /// rather than truncate if a root ever carries a wider shared key.
+    fn encode(value: AuthenticatedMapRootV1) -> Result<Self, String> {
+        Ok(Self {
             count: value.count,
-            key: value.root.map(|link| link.key),
+            key: value
+                .root
+                .map(|link| {
+                    <[u8; 16]>::try_from(link.key.as_slice()).map_err(|_| {
+                        "receiver absence history root key is not a 128-bit key".to_string()
+                    })
+                })
+                .transpose()?,
             digest: value.root.map(|link| *link.digest.as_bytes()),
-        }
+        })
     }
 }
 
@@ -1125,7 +1134,7 @@ impl PersistedHistoryRoot {
     fn decode(self) -> Result<AuthenticatedMapRootV1, String> {
         let root = match (self.key, self.digest) {
             (Some(key), Some(digest)) => Some(AuthenticatedMapLinkV1 {
-                key,
+                key: AuthenticatedMapKey::from(key),
                 digest: ContentDigest::from_bytes(digest),
             }),
             (None, None) => None,
@@ -1467,7 +1476,7 @@ fn upsert_row(
         workspace_id,
         page_id,
         key_high: high,
-        rows: rows.into(),
+        rows: PersistedHistoryRoot::encode(rows)?,
     })?;
     counters.note_write(bucket_bytes.len());
     published.insert(
@@ -1487,7 +1496,7 @@ fn upsert_row(
         schema_version: ROW_RECORD_SCHEMA_VERSION,
         workspace_id,
         page_id,
-        paths: paths.into(),
+        paths: PersistedHistoryRoot::encode(paths)?,
     })?;
     counters.note_write(page_bytes.len());
     published.insert(record_object_name(PAGE_PREFIX, page_address), page_bytes);
@@ -1705,6 +1714,7 @@ fn clear_rows(directory: &Dir) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
     use std::path::PathBuf;
 
     use uuid::Uuid;
@@ -1788,7 +1798,7 @@ mod tests {
             target: &[u8],
         ) -> ProjectionIntent {
             let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-                DocumentId::from_uuid(Uuid::from_u128(0xc6_1001)),
+                DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc6_1001))),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(7), counter)],
                 Vec::new(),
             )
@@ -1841,7 +1851,7 @@ mod tests {
             document: u128,
         ) -> ProjectionIntent {
             let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-                DocumentId::from_uuid(Uuid::from_u128(document)),
+                DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(document))),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(7), counter)],
                 Vec::new(),
             )

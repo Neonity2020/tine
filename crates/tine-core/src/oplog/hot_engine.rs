@@ -1,3 +1,4 @@
+use im::OrdMap;
 use std::cell::{Cell, RefCell};
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -7,13 +8,15 @@ use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
 use loro::{
-    Container, ContainerType, EncodedBlobMode, ExportMode, Frontiers, LoroDoc, LoroMap, LoroValue,
-    UpdateOptions, ValueOrContainer, VersionVector,
+    Container, EncodedBlobMode, ExportMode, Frontiers, LoroDoc, LoroMap, LoroValue, UpdateOptions,
+    ValueOrContainer, VersionVector,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tine_storage::sealed_accepted_index::{
-    authenticated_map_empty_digest, authenticated_map_node_digest, authenticated_map_priority_order,
+    authenticated_map_empty_digest, authenticated_map_node_digest,
+    authenticated_map_priority_order, AuthenticatedMapKey, AuthenticatedMapLinkV1,
+    AuthenticatedMapRootV1,
 };
 use tine_storage::{
     LocalJournalAppend, LocalJournalAppendError, LocalJournalError, LocalJournalFrame,
@@ -48,8 +51,8 @@ use super::conflict_history::{
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::import::ImportExecutionMaterial;
 use super::lazy_genesis::{
-    LazyGenesisCandidate, LazyGenesisFrontierBindingV1, LazyGenesisPageInput,
-    LazyGenesisProviderIndexV1,
+    LazyGenesisCandidate, LazyGenesisDocumentCheckpointV1, LazyGenesisFrontierBindingV1,
+    LazyGenesisPageInput, LazyGenesisProviderIndexV1,
 };
 #[cfg(test)]
 use super::local_completion_index::LocalCompletionFlushStats;
@@ -57,7 +60,7 @@ use super::local_completion_index::{
     LocalCompletionIndex, LocalCompletionOpenStats, LocalCompletionPruningContext,
 };
 use super::page_name_index::{
-    extract_authoritative_catalog_page_names, extract_semantic_page_name_observations,
+    extract_current_page_name_observations, extract_semantic_page_name_observations,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
     AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
     EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
@@ -73,6 +76,7 @@ use super::reference_catalog::ReferenceCatalogPolicyV1;
 use super::reference_catalog::{
     reference_evidence_parse_calls, reset_reference_evidence_parse_calls,
 };
+use super::retirable_document::{self, DocumentIdentity, DocumentState};
 use super::semantic::{
     EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
     PolicyGeneratedAnchorReason,
@@ -80,10 +84,10 @@ use super::semantic::{
 use super::uuid_claim_index::LogseqClaimIndexRoot;
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BatchCausalDot, BatchId, BatchInspection,
-    BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
-    ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
-    DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
-    ManagedLocalJournal, ManagedPath, ManagedTextKind, ManifestObjectRef,
+    BatchOrigin, BlobDescription, BlockBirth, BlockDelta, BlockId, BlockOwner, BlockState,
+    CausalPeerId, ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
+    DocumentDependencies, DocumentId, DocumentKey, FrontierV2, LineageDigest, LogicalPageName,
+    LogseqUuid, ManagedLocalJournal, ManagedPath, ManagedTextKind, ManifestObjectRef,
     ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
     MembershipClaim, MembershipDelta, ObjectKind, ObjectStore, OperationBatch, OperationObject,
     PageDelta, PageId, PageState, PortablePathKeyDigest, PreparedBatch, ProjectionClaimEvidence,
@@ -102,27 +106,15 @@ thread_local! {
     static TEST_FIXTURE_BATCHES: RefCell<BTreeSet<BatchId>> = RefCell::new(BTreeSet::new());
 }
 
-const CATALOG_PAGES: &str = "pages";
-const SHARD_META: &str = "shard_meta";
-const SHARD_PAGE_ID: &str = "page_id";
-const SHARD_OWNERS: &str = "owners";
-const SHARD_MEMBERS: &str = "members";
-const SHARD_CONTENT: &str = "content";
-const SHARD_LOGSEQ_UUIDS: &str = "logseq_uuids";
-const SHARD_LOGSEQ_IDENTITY_ORIGINS: &str = "logseq_identity_origins";
-const SHARD_PAGE_PREAMBLE: &str = "page_preamble";
-const SHARD_PAGE_PREAMBLE_VALUE: &str = "value";
-const TOMBSTONE: &str = "tombstone";
 pub(crate) const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
 const MAX_PREAUTHORING_CAPTURE_PATHS: usize = MAX_TRANSACTION_OPERATIONS * 2;
 const MAX_PREAUTHORING_CAPTURE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
 const LAZY_GENESIS_PEER_ID: u64 = 0x5449_4e45_4745_4e31;
-const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
+pub(crate) const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 1024;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
 const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
-const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 14;
+const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 15;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 9;
 pub(crate) const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 8;
@@ -294,6 +286,144 @@ pub(crate) fn reconstruct_frontier_calls() -> usize {
     RECONSTRUCT_FRONTIER_CALLS.get()
 }
 
+/// Process-wide live-write benchmark observations. Unlike the legacy TLS
+/// reconstruction counter above, these atomics are incremented by the runtime
+/// actor at the actual cache/load sites and may therefore be read by the test
+/// driver without pretending its parent thread performed the work.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct LiveWriteBenchmarkCounters {
+    pub(crate) frontier_reconstructions: usize,
+    pub(crate) document_head_reconstructions: usize,
+    pub(crate) frontier_documents_requested: usize,
+    pub(crate) archive_manifest_reads: usize,
+    pub(crate) archive_object_reads: usize,
+    pub(crate) baseline_state_loads: usize,
+    pub(crate) visible_document_hits: usize,
+    pub(crate) visible_document_misses: usize,
+    pub(crate) hot_document_evictions: usize,
+    pub(crate) cold_target_hits: usize,
+    pub(crate) cold_target_misses: usize,
+}
+
+#[cfg(test)]
+impl LiveWriteBenchmarkCounters {
+    pub(crate) fn since(self, earlier: Self) -> Self {
+        Self {
+            frontier_reconstructions: self
+                .frontier_reconstructions
+                .saturating_sub(earlier.frontier_reconstructions),
+            document_head_reconstructions: self
+                .document_head_reconstructions
+                .saturating_sub(earlier.document_head_reconstructions),
+            frontier_documents_requested: self
+                .frontier_documents_requested
+                .saturating_sub(earlier.frontier_documents_requested),
+            archive_manifest_reads: self
+                .archive_manifest_reads
+                .saturating_sub(earlier.archive_manifest_reads),
+            archive_object_reads: self
+                .archive_object_reads
+                .saturating_sub(earlier.archive_object_reads),
+            baseline_state_loads: self
+                .baseline_state_loads
+                .saturating_sub(earlier.baseline_state_loads),
+            visible_document_hits: self
+                .visible_document_hits
+                .saturating_sub(earlier.visible_document_hits),
+            visible_document_misses: self
+                .visible_document_misses
+                .saturating_sub(earlier.visible_document_misses),
+            hot_document_evictions: self
+                .hot_document_evictions
+                .saturating_sub(earlier.hot_document_evictions),
+            cold_target_hits: self
+                .cold_target_hits
+                .saturating_sub(earlier.cold_target_hits),
+            cold_target_misses: self
+                .cold_target_misses
+                .saturating_sub(earlier.cold_target_misses),
+        }
+    }
+}
+
+#[cfg(test)]
+static LIVE_WRITE_FRONTIER_RECONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_DOCUMENT_HEAD_RECONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_FRONTIER_DOCUMENTS_REQUESTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_ARCHIVE_MANIFEST_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_ARCHIVE_OBJECT_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_BASELINE_STATE_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_VISIBLE_DOCUMENT_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_VISIBLE_DOCUMENT_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_HOT_DOCUMENT_EVICTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_COLD_TARGET_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_COLD_TARGET_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_WRITE_COLD_TARGET: std::sync::Mutex<Option<DocumentKey>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn arm_live_write_cold_target(home_document_id: DocumentId) {
+    // The benchmark obtains this immutable home from the activated runtime's
+    // authoritative page/block query. P4 addresses that entity document through
+    // `DocumentKey`; the control layout uses the `DocumentId` directly.
+    *LIVE_WRITE_COLD_TARGET.lock().unwrap() = Some(DocumentKey::Entity(home_document_id));
+}
+
+#[cfg(test)]
+fn note_live_write_cold_target(document_id: DocumentKey, hit: bool) {
+    if LIVE_WRITE_COLD_TARGET.lock().unwrap().as_ref() != Some(&document_id) {
+        return;
+    }
+    if hit {
+        LIVE_WRITE_COLD_TARGET_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        LIVE_WRITE_COLD_TARGET_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn live_write_benchmark_counters() -> LiveWriteBenchmarkCounters {
+    use std::sync::atomic::Ordering;
+
+    LiveWriteBenchmarkCounters {
+        frontier_reconstructions: LIVE_WRITE_FRONTIER_RECONSTRUCTIONS.load(Ordering::Relaxed),
+        document_head_reconstructions: LIVE_WRITE_DOCUMENT_HEAD_RECONSTRUCTIONS
+            .load(Ordering::Relaxed),
+        frontier_documents_requested: LIVE_WRITE_FRONTIER_DOCUMENTS_REQUESTED
+            .load(Ordering::Relaxed),
+        archive_manifest_reads: LIVE_WRITE_ARCHIVE_MANIFEST_READS.load(Ordering::Relaxed),
+        archive_object_reads: LIVE_WRITE_ARCHIVE_OBJECT_READS.load(Ordering::Relaxed),
+        baseline_state_loads: LIVE_WRITE_BASELINE_STATE_LOADS.load(Ordering::Relaxed),
+        visible_document_hits: LIVE_WRITE_VISIBLE_DOCUMENT_HITS.load(Ordering::Relaxed),
+        visible_document_misses: LIVE_WRITE_VISIBLE_DOCUMENT_MISSES.load(Ordering::Relaxed),
+        hot_document_evictions: LIVE_WRITE_HOT_DOCUMENT_EVICTIONS.load(Ordering::Relaxed),
+        cold_target_hits: LIVE_WRITE_COLD_TARGET_HITS.load(Ordering::Relaxed),
+        cold_target_misses: LIVE_WRITE_COLD_TARGET_MISSES.load(Ordering::Relaxed),
+    }
+}
+
 #[cfg(test)]
 fn note_local_mutation_detail(update: impl FnOnce(&mut LocalMutationDetailTimings)) {
     LAST_LOCAL_MUTATION_DETAIL_TIMINGS.with(|timings| {
@@ -307,6 +437,12 @@ fn note_local_mutation_detail(update: impl FnOnce(&mut LocalMutationDetailTiming
 // deliberately not an object-store, receipt, or projection format.
 const CURRENT_PATH_CURSOR_SCHEMA_VERSION: u32 = 2;
 const CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION: u32 = 3;
+// These bound one cursor request: how many rows one page returns, how large a
+// single row and page may be, and how many cursors may be outstanding at once.
+// They are input/transaction-shape bounds, not a bound on how many pages the
+// workspace may hold. There is deliberately NO cap on the live page count:
+// occupancy is bounded by rebaselining (D-5), and a graph-sized refusal would
+// simply stop a large workspace from saving at all.
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_ROWS: usize = 1_024;
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PATH_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_BYTES: usize = 256 * 1024;
@@ -519,9 +655,36 @@ impl Default for CurrentPathCursorBook {
     }
 }
 
+/// The engine's accepted derived indexes over the live document layout.
+///
+/// `rows` is ACTIVE ENUMERATION: the live pages, keyed by the identity the
+/// projection and the scan epoch ask about. `page_homes` and `page_members`
+/// are POINT INDEXES over identity and current ownership, deliberately kept
+/// separate from it: a deleted page is not an active obligation, but Revive
+/// still has to find the page's own document, and a block being historically
+/// restoreable does not make it a member of any page.
+///
+/// All three are derived from accepted semantic effects, restored together
+/// from checkpoint state and rebuilt identically by full accepted replay.
+///
+/// The three indexes are persistent (`im::OrdMap`): accepting a batch captures
+/// a new catalog root while the engine still holds the previous one, and the
+/// two roots share every subtree the batch did not touch. Clone and update
+/// cost is therefore proportional to the touched paths, not to the number of
+/// live or created-then-deleted entries the workspace has accumulated.
 #[derive(Clone)]
 struct CurrentPathCatalog {
-    rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
+    rows: OrdMap<PageId, CurrentPathCatalogStoredRow>,
+    /// Accepted page-birth index: the immutable document of every page this
+    /// accepted history has ever created, live or deleted. Entries are never
+    /// removed, because the page document itself is never removed.
+    page_homes: OrdMap<PageId, DocumentId>,
+    /// Current-owner inverse index: for each page, the blocks whose accepted
+    /// owner is that page, with each block's own immutable document. This is
+    /// maintained on EVERY owner transition, including one whose target page
+    /// is deleted, so a later revive has its exact member range without a
+    /// history-wide scan.
+    page_members: OrdMap<PageId, OrdMap<BlockId, DocumentId>>,
     available: bool,
     accepted_frontier_root: AcceptedFrontierRoot,
 }
@@ -529,10 +692,39 @@ struct CurrentPathCatalog {
 impl Default for CurrentPathCatalog {
     fn default() -> Self {
         Self {
-            rows: BTreeMap::new(),
+            rows: OrdMap::new(),
+            page_homes: OrdMap::new(),
+            page_members: OrdMap::new(),
             available: true,
             accepted_frontier_root: AcceptedFrontierRoot::empty(),
         }
+    }
+}
+
+/// A deterministic, distinct document for one block in test fixtures.
+#[cfg(test)]
+pub(crate) fn test_block_home(block_id: BlockId) -> DocumentId {
+    DocumentId::for_test_block(block_id)
+}
+
+/// Materialize one persistent index level as an owned ordered map. Used only
+/// at boundaries that must hand out or serialize an owned copy; the acceptance
+/// path never calls it for anything but the touched page.
+fn ordered_rows<K: Ord + Clone, V: Clone>(rows: &OrdMap<K, V>) -> BTreeMap<K, V> {
+    rows.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// The address of one membership document: the exact accepted pair of block
+/// and page homes, never a hash or a truncation of either.
+const fn membership_document_id(
+    block_document_id: DocumentId,
+    page_document_id: DocumentId,
+) -> DocumentKey {
+    DocumentKey::Membership {
+        block_document_id,
+        page_document_id,
     }
 }
 
@@ -559,7 +751,14 @@ pub(crate) struct CurrentPathCatalogStoredRow {
 
 impl CurrentPathCatalog {
     fn root_digest(&self) -> Result<ContentDigest, EngineError> {
-        let bytes = postcard::to_allocvec(&self.rows)
+        // Borrowed rows encode exactly as the owned map did, so the persisted
+        // catalog root digest is unchanged by the persistent-map switch.
+        let rows = self
+            .rows
+            .iter()
+            .map(|(page_id, row)| (*page_id, row))
+            .collect::<BTreeMap<_, _>>();
+        let bytes = postcard::to_allocvec(&rows)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         Ok(ContentDigest::of(&bytes))
     }
@@ -569,6 +768,94 @@ impl CurrentPathCatalog {
 struct AuthorCatalogLookup {
     document: Option<LoroDoc>,
     page_homes: BTreeMap<PageId, DocumentId>,
+    page_outlines: BTreeMap<PageId, AuthorPageOutline>,
+}
+
+/// One page's authoritative membership view for a single authored transaction.
+///
+/// It is built lazily from the same pair-claim producer used before P4-L2 and
+/// then advanced only at the semantic mutation seams in that transaction.
+/// The immutable page home binds the derived view to the page identity it
+/// represents; neither the outline nor its adjacency supplies authority.
+struct AuthorPageOutline {
+    page_document_id: DocumentId,
+    entries: BTreeMap<BlockId, (DocumentId, MembershipClaim)>,
+    children: BTreeMap<Option<BlockId>, BTreeSet<BlockId>>,
+}
+
+impl AuthorPageOutline {
+    fn new(page_document_id: DocumentId) -> Self {
+        Self {
+            page_document_id,
+            entries: BTreeMap::new(),
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        block_id: BlockId,
+        block_document_id: DocumentId,
+        claim: MembershipClaim,
+    ) -> Result<(), EngineError> {
+        if claim.home_document_id != block_document_id {
+            return Err(EngineError::HomeShardMismatch(block_id));
+        }
+        self.remove(block_id);
+        let parent = claim.parent;
+        self.entries.insert(block_id, (block_document_id, claim));
+        self.children.entry(parent).or_default().insert(block_id);
+        Ok(())
+    }
+
+    fn remove(&mut self, block_id: BlockId) {
+        let Some((_, claim)) = self.entries.remove(&block_id) else {
+            return;
+        };
+        let remove_parent = self
+            .children
+            .get_mut(&claim.parent)
+            .is_some_and(|children| {
+                children.remove(&block_id);
+                children.is_empty()
+            });
+        if remove_parent {
+            self.children.remove(&claim.parent);
+        }
+    }
+
+    /// Clone only the selected subtree. The returned rows remain sorted by
+    /// block ID, matching the former `BTreeSet` result, while traversal uses
+    /// the maintained child adjacency and a visited set for cycle safety.
+    fn subtree(
+        &self,
+        root: BlockId,
+    ) -> Result<Vec<(BlockId, DocumentId, MembershipClaim)>, EngineError> {
+        if !self.entries.contains_key(&root) {
+            return Err(EngineError::BlockNotFound(root));
+        }
+        let mut selected = BTreeSet::from([root]);
+        let mut queue = VecDeque::from([root]);
+        while let Some(parent) = queue.pop_front() {
+            if let Some(children) = self.children.get(&Some(parent)) {
+                for block_id in children {
+                    if selected.insert(*block_id) {
+                        queue.push_back(*block_id);
+                    }
+                }
+            }
+        }
+        Ok(selected
+            .into_iter()
+            .map(|block_id| {
+                let (home_document_id, claim) = self
+                    .entries
+                    .get(&block_id)
+                    .expect("selected outline entry exists");
+                (block_id, *home_document_id, claim.clone())
+            })
+            .collect())
+    }
 }
 
 /// One document of a prospective projection derivation.
@@ -594,7 +881,7 @@ impl ProspectiveDocument<'_> {
 struct CrdtUpdatePayload {
     schema_version: u32,
     batch_id: BatchId,
-    document_id: DocumentId,
+    document_id: DocumentKey,
     dependency_heads: Vec<BatchId>,
     batch_dependency_heads: Vec<BatchId>,
     causal_state_digest: Option<DocumentCausalDigest>,
@@ -602,18 +889,18 @@ struct CrdtUpdatePayload {
 }
 
 trait DocumentUpdateDependencies {
-    fn dependency_heads(&self, document_id: DocumentId) -> Option<&[BatchId]>;
+    fn dependency_heads(&self, document_id: DocumentKey) -> Option<&[BatchId]>;
 }
 
-impl DocumentUpdateDependencies for BTreeMap<DocumentId, CrdtUpdatePayload> {
-    fn dependency_heads(&self, document_id: DocumentId) -> Option<&[BatchId]> {
+impl DocumentUpdateDependencies for BTreeMap<DocumentKey, CrdtUpdatePayload> {
+    fn dependency_heads(&self, document_id: DocumentKey) -> Option<&[BatchId]> {
         self.get(&document_id)
             .map(|update| update.dependency_heads.as_slice())
     }
 }
 
-impl DocumentUpdateDependencies for BTreeMap<DocumentId, Vec<BatchId>> {
-    fn dependency_heads(&self, document_id: DocumentId) -> Option<&[BatchId]> {
+impl DocumentUpdateDependencies for BTreeMap<DocumentKey, Vec<BatchId>> {
+    fn dependency_heads(&self, document_id: DocumentKey) -> Option<&[BatchId]> {
         self.get(&document_id).map(Vec::as_slice)
     }
 }
@@ -624,7 +911,7 @@ struct PendingAuthorDocuments {
     manifest_fingerprint: ContentDigest,
     generation: u64,
     mutation_token: u64,
-    documents: BTreeMap<DocumentId, LoroDoc>,
+    documents: BTreeMap<DocumentKey, LoroDoc>,
     projection_pages: BTreeMap<PageId, ProjectionPageState>,
     projection_outcomes: BTreeMap<PageId, Option<ProjectionPageState>>,
 }
@@ -638,8 +925,8 @@ struct AcceptedAuthorProjectionPages {
 struct PreparedTransactionParts {
     prepared: PreparedBatch,
     semantic_effect: SemanticEffect,
-    prospective_documents: BTreeMap<DocumentId, LoroDoc>,
-    projection_before_snapshots: Option<BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+    prospective_documents: BTreeMap<DocumentKey, LoroDoc>,
+    projection_before_snapshots: Option<BTreeMap<DocumentKey, SemanticDocumentSnapshot>>,
     portable_path_root: PortablePathIndexRoot,
     external_observation: Option<ExternalImportObservationMaterial>,
 }
@@ -752,7 +1039,7 @@ struct RunLocalAuthenticatedMap {
 
 #[derive(Debug, Eq, PartialEq)]
 struct RunLocalAuthenticatedMapNode {
-    key: [u8; 16],
+    key: AuthenticatedMapKey,
     value_digest: ContentDigest,
     left: Option<Arc<RunLocalAuthenticatedMapNode>>,
     right: Option<Arc<RunLocalAuthenticatedMapNode>>,
@@ -762,12 +1049,12 @@ struct RunLocalAuthenticatedMapNode {
 impl RunLocalAuthenticatedMap {
     fn child_binding(
         node: &Option<Arc<RunLocalAuthenticatedMapNode>>,
-    ) -> Option<([u8; 16], ContentDigest)> {
+    ) -> Option<(AuthenticatedMapKey, ContentDigest)> {
         node.as_ref().map(|node| (node.key, node.digest))
     }
 
     fn node(
-        key: [u8; 16],
+        key: AuthenticatedMapKey,
         value_digest: ContentDigest,
         left: Option<Arc<RunLocalAuthenticatedMapNode>>,
         right: Option<Arc<RunLocalAuthenticatedMapNode>>,
@@ -789,7 +1076,7 @@ impl RunLocalAuthenticatedMap {
 
     fn upsert_node(
         current: &Option<Arc<RunLocalAuthenticatedMapNode>>,
-        key: [u8; 16],
+        key: AuthenticatedMapKey,
         value_digest: ContentDigest,
     ) -> (Arc<RunLocalAuthenticatedMapNode>, bool) {
         let Some(current) = current else {
@@ -865,7 +1152,7 @@ impl RunLocalAuthenticatedMap {
         }
     }
 
-    fn upsert(&mut self, key: [u8; 16], value_digest: ContentDigest) {
+    fn upsert(&mut self, key: AuthenticatedMapKey, value_digest: ContentDigest) {
         let (root, inserted) = Self::upsert_node(&self.root, key, value_digest);
         self.root = Some(root);
         if inserted {
@@ -873,7 +1160,10 @@ impl RunLocalAuthenticatedMap {
         }
     }
 
-    fn with_upserts(&self, entries: impl IntoIterator<Item = ([u8; 16], ContentDigest)>) -> Self {
+    fn with_upserts(
+        &self,
+        entries: impl IntoIterator<Item = (AuthenticatedMapKey, ContentDigest)>,
+    ) -> Self {
         let mut next = self.clone();
         for (key, value_digest) in entries {
             next.upsert(key, value_digest);
@@ -881,7 +1171,7 @@ impl RunLocalAuthenticatedMap {
         next
     }
 
-    fn root_key(&self) -> Option<[u8; 16]> {
+    fn root_key(&self) -> Option<AuthenticatedMapKey> {
         self.root.as_ref().map(|root| root.key)
     }
 
@@ -890,7 +1180,29 @@ impl RunLocalAuthenticatedMap {
             .as_ref()
             .map_or_else(authenticated_map_empty_digest, |root| root.digest)
     }
+
+    /// The same root descriptor the sealed on-disk map carries, so both sides
+    /// compose through one codec and are directly comparable.
+    fn sealed_root(&self) -> AuthenticatedMapRootV1 {
+        AuthenticatedMapRootV1 {
+            count: self.count,
+            root: self.root.as_ref().map(|root| AuthenticatedMapLinkV1 {
+                key: root.key,
+                digest: root.digest,
+            }),
+        }
+    }
 }
+
+/// The run-local accepted DOCUMENT map.
+///
+/// Entity births and membership pairs are rows of ONE shared authenticated map
+/// keyed by the lossless [`DocumentKey::authenticated_map_key`] bytes -- the
+/// same map, the same key bytes and the same node digest the sealed on-disk
+/// document map and the SQLite frontier treap use. There is no group
+/// descriptor, no nested tree and nothing that hashes or truncates a pair into
+/// a synthetic UUID, so this root is directly verifiable by the shared index.
+type RunLocalDocumentMap = RunLocalAuthenticatedMap;
 
 /// One causal writer incarnation's tip in this engine, in ONE map.
 ///
@@ -1003,48 +1315,43 @@ impl AuthenticatedEffectiveSemanticView {
 
     fn apply_to_snapshots(
         &self,
-        snapshots: &mut BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+        snapshots: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
     ) -> Result<(), EngineError> {
         for transition in &self.transitions {
             for snapshot in snapshots.values_mut() {
-                match snapshot {
-                    SemanticDocumentSnapshot::Catalog(pages) => {
-                        if let Some(state) = pages.get_mut(&transition.page_id) {
-                            match state {
-                                PageState::Live { name, .. }
-                                    if name.key_digest() == transition.canonical_key =>
-                                {
-                                    name.clone_from(&transition.selected_name);
-                                }
-                                PageState::Live { .. } | PageState::Tombstone { .. } => {
-                                    return Err(EngineError::Archive(
-                                        "effective title snapshot contradicts selected ownership"
-                                            .into(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    SemanticDocumentSnapshot::Shard {
-                        page_id,
-                        page_preamble,
-                        ..
-                    } if *page_id == Some(transition.page_id) => {
-                        let preamble = page_preamble.as_mut().ok_or_else(|| {
-                            EngineError::Archive(
-                                "effective title preamble page binding mismatch".into(),
-                            )
-                        })?;
-                        transition
-                            .selected_explicit_title
-                            .apply_to_preamble(
-                                transition.selected_intent.path(),
-                                &mut preamble.preamble,
-                            )
-                            .map_err(EngineError::from)?;
-                    }
-                    SemanticDocumentSnapshot::Shard { .. } => {}
+                // A page's name and its preamble now live in the same page
+                // document, so one snapshot carries both halves of the title
+                // transition instead of one catalog row plus one page shard.
+                let SemanticDocumentSnapshot::Page {
+                    page_id,
+                    state,
+                    preamble,
+                } = snapshot
+                else {
+                    continue;
+                };
+                if *page_id != transition.page_id {
+                    continue;
                 }
+                match state {
+                    PageState::Live { name, .. }
+                        if name.key_digest() == transition.canonical_key =>
+                    {
+                        name.clone_from(&transition.selected_name);
+                    }
+                    PageState::Live { .. } | PageState::Tombstone { .. } => {
+                        return Err(EngineError::Archive(
+                            "effective title snapshot contradicts selected ownership".into(),
+                        ));
+                    }
+                }
+                let preamble = preamble.as_mut().ok_or_else(|| {
+                    EngineError::Archive("effective title preamble page binding mismatch".into())
+                })?;
+                transition
+                    .selected_explicit_title
+                    .apply_to_preamble(transition.selected_intent.path(), &mut preamble.preamble)
+                    .map_err(EngineError::from)?;
             }
         }
         Ok(())
@@ -1071,8 +1378,8 @@ impl EngineDocument {
 }
 
 struct CurrentFrontierDocuments {
-    documents: BTreeMap<DocumentId, EngineDocument>,
-    current_documents: BTreeMap<DocumentId, (EngineDocument, BTreeSet<BatchId>, bool)>,
+    documents: BTreeMap<DocumentKey, EngineDocument>,
+    current_documents: BTreeMap<DocumentKey, (EngineDocument, BTreeSet<BatchId>, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -2692,7 +2999,7 @@ pub struct AuthorTransactionDraft {
     prepared_core: PreparedBatch,
     semantic_effect: SemanticEffect,
     portable_path_root: PortablePathIndexRoot,
-    prospective_documents: BTreeMap<DocumentId, LoroDoc>,
+    prospective_documents: BTreeMap<DocumentKey, LoroDoc>,
     requirements: Vec<ProjectionRequirement>,
     pages: BTreeMap<PageId, DraftProjectionPage>,
     revival_intent_references: BTreeMap<PageId, DraftRevivalIntentReference>,
@@ -2925,24 +3232,44 @@ fn before_projection_affine_reuse_enabled() -> bool {
     }
 }
 
+/// A page's projection frontier is exactly its own documents.
+///
+/// In the previous layout that was the page's shard plus the one graph-sized
+/// catalog. It is now the page document, each current member's own document
+/// and each pair's membership document -- bounded by the page's members and
+/// never by the graph.
 fn affine_before_projection_frontier_documents_are_exact(
     frontier: &FrontierV2,
-    page_home_document_id: DocumentId,
-    catalog_document_id: DocumentId,
+    expected: &BTreeSet<DocumentKey>,
 ) -> bool {
-    frontier.documents().len() == 2
+    frontier.documents().len() == expected.len()
         && frontier
             .documents()
             .iter()
             .map(DocumentDependencies::document_id)
             .collect::<BTreeSet<_>>()
-            == BTreeSet::from([page_home_document_id, catalog_document_id])
+            == *expected
+}
+
+/// Every document one page's projection depends on, given its current members.
+fn page_projection_documents(
+    page_document_id: DocumentId,
+    members: &BTreeMap<BlockId, DocumentId>,
+) -> BTreeSet<DocumentKey> {
+    std::iter::once(DocumentKey::Entity(page_document_id))
+        .chain(members.values().copied().map(DocumentKey::Entity))
+        .chain(
+            members.values().map(|block_document_id| {
+                membership_document_id(*block_document_id, page_document_id)
+            }),
+        )
+        .collect()
 }
 
 fn projection_frontiers_match_except_catalog(
     current: &FrontierV2,
     retained: &FrontierV2,
-    catalog_document_id: DocumentId,
+    catalog_document_id: DocumentKey,
 ) -> bool {
     current
         .documents()
@@ -3014,7 +3341,10 @@ pub struct AcceptedFrontierRoot {
     acceptance_sequence: u64,
     document_count: u64,
     retained_bytes_total: u64,
-    document_map_root_key: Option<[u8; 16]>,
+    /// Full document-map key bytes. Document identity is domain-owned and
+    /// variable-width (entity or membership pair); batch identity stays a
+    /// fixed 16-byte UUID.
+    document_map_root_key: Option<AuthenticatedMapKey>,
     document_map_root_digest: ContentDigest,
     // Commits every accepted BatchId to its immutable manifest/event binding,
     // causal dot, and authenticated sparse-clock root.
@@ -3038,7 +3368,7 @@ pub(crate) struct AcceptedFrontierIdentity<'a> {
     acceptance_sequence: u64,
     document_count: u64,
     retained_bytes_total: u64,
-    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_key: Option<AuthenticatedMapKey>,
     document_map_root_digest: &'a ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: &'a ContentDigest,
@@ -3199,7 +3529,7 @@ impl AcceptedFrontierRoot {
             acceptance_sequence: u64::MAX,
             document_count: u64::MAX,
             retained_bytes_total: u64::MAX,
-            document_map_root_key: Some([0xff; 16]),
+            document_map_root_key: Some(AuthenticatedMapKey::from([0xff; 16])),
             document_map_root_digest: ContentDigest::of(b"saturated document map"),
             batch_map_root_key: Some([0xff; 16]),
             batch_map_root_digest: ContentDigest::of(b"saturated batch map"),
@@ -3220,7 +3550,7 @@ impl AcceptedFrontierRoot {
         self.retained_bytes_total
     }
 
-    pub const fn document_map_root_key(&self) -> Option<[u8; 16]> {
+    pub const fn document_map_root_key(&self) -> Option<AuthenticatedMapKey> {
         self.document_map_root_key
     }
 
@@ -3528,7 +3858,7 @@ pub struct MaterializedPage {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct AcceptedDocumentCacheKey {
     frontier_state_digest: ContentDigest,
-    document_id: DocumentId,
+    document_id: DocumentKey,
     causal_state_digest: DocumentCausalDigest,
 }
 
@@ -3580,12 +3910,8 @@ impl DecodedDocumentVersion {
 struct RetainedDecodedCatalog {
     accepted_frontier_state_digest: ContentDigest,
     dependencies: DocumentDependencies,
-    document_id: DocumentId,
+    document_id: DocumentKey,
     causal_state_digest: DocumentCausalDigest,
-    /// The exact retained document passed `validate_catalog_document` before
-    /// publication. The document is private immutable engine state, so this
-    /// proof remains valid for every read-only clone of the same causal state.
-    catalog_shape_proven: bool,
     document: LoroDoc,
 }
 
@@ -3619,17 +3945,13 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
     engine: &'engine ShardedHotEngine,
     root: AcceptedFrontierRoot,
     documents: BTreeMap<AcceptedDocumentCacheKey, LoroDoc>,
-    document_keys: BTreeMap<DocumentId, AcceptedDocumentCacheKey>,
+    document_keys: BTreeMap<DocumentKey, AcceptedDocumentCacheKey>,
     exact_document_loads: usize,
     exact_catalog_loads: usize,
     /// Catalog resolutions that actually paid for a decode. This is the one
     /// counter that separates "this event resolved the catalog" from "this
     /// event read the whole catalog checkpoint off disk again".
     exact_catalog_decodes: usize,
-    /// Whether the catalog currently held in `documents` already carries the
-    /// graph-shape proof established before it entered the retained cache.
-    /// Re-deriving this proof calls `LoroDoc::get_value` and is O(graph).
-    catalog_shape_proven: bool,
 }
 
 /// Maximum page residency of one private bootstrap materialization step.
@@ -3659,7 +3981,7 @@ impl AcceptedRootMaterializer<'_> {
 
     fn load_document(
         &mut self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<Option<AcceptedDocumentCacheKey>, EngineError> {
         // The engine must still refuse blocked state on every resolution. The
         // catalog, however, has a stronger bounded shortcut: accepted evidence
@@ -3671,7 +3993,7 @@ impl AcceptedRootMaterializer<'_> {
         // documents, and any root whose catalog binding was not retained, take
         // the ordinary authenticated point lookup below.
         self.engine.ensure_not_blocked()?;
-        let is_catalog = document_id == self.engine.catalog_document_id;
+        let is_catalog = document_id == DocumentKey::Entity(self.engine.catalog_document_id);
         let dependencies = match is_catalog
             .then(|| {
                 self.engine
@@ -3704,13 +4026,12 @@ impl AcceptedRootMaterializer<'_> {
             return Ok(Some(key));
         }
         if is_catalog {
-            if let Some((document, catalog_shape_proven)) = self
+            if let Some(document) = self
                 .engine
                 .retained_accepted_document(document_id, key.causal_state_digest)
             {
                 self.documents.insert(key, document);
                 self.document_keys.insert(document_id, key);
-                self.catalog_shape_proven = catalog_shape_proven;
                 self.exact_document_loads = self.exact_document_loads.saturating_add(1);
                 self.exact_catalog_loads = self.exact_catalog_loads.saturating_add(1);
                 return Ok(Some(key));
@@ -3722,10 +4043,7 @@ impl AcceptedRootMaterializer<'_> {
             .remove(&document_id)
             .ok_or(EngineError::MissingDocument(document_id))?;
         if is_catalog {
-            // Establish the graph-sized shape proof once, before publication.
-            // Every later bounded derivative reuses it with this exact private
-            // immutable causal state instead of walking the whole catalog.
-            validate_catalog_document(self.engine.catalog_document_id, &document)?;
+            snapshot_document(self.engine.catalog_document_id, document_id, &document)?;
             // Publication happens only here, after the full load and every
             // integrity proof inside it succeeded. A refused or malformed
             // checkpoint returns above and leaves any prior valid entry alone.
@@ -3735,7 +4053,6 @@ impl AcceptedRootMaterializer<'_> {
                 key.causal_state_digest,
                 &document,
             );
-            self.catalog_shape_proven = true;
         }
         self.documents.insert(key, document);
         self.document_keys.insert(document_id, key);
@@ -3759,66 +4076,37 @@ impl AcceptedRootMaterializer<'_> {
         page_id: PageId,
     ) -> Result<Option<MaterializedPage>, EngineError> {
         let reads_before = self.engine.archive_read_stats();
-        let Some(catalog_key) = self.load_document(self.engine.catalog_document_id)? else {
+        // No catalog document is loaded: the page's own document answers its
+        // own state, and the accepted current-owner range answers which pairs
+        // to resolve.
+        let Some(page_document_id) = self.engine.accepted_page_home(page_id) else {
             return Ok(None);
         };
-        let page_state = {
-            let catalog = self.document(catalog_key)?;
-            if !self.catalog_shape_proven {
-                return Err(EngineError::Archive(
-                    "accepted-root catalog lacks its retained shape proof".into(),
-                ));
-            }
-            read_validated_catalog_page(
-                ValidatedCatalogDocument {
-                    catalog_document_id: self.engine.catalog_document_id,
-                    document: catalog,
-                },
-                page_id,
-            )?
-        };
-        let Some(PageState::Live {
-            home_document_id: page_document_id,
-            ..
-        }) = page_state
-        else {
+        let page_key = DocumentKey::Entity(page_document_id);
+        let Some(page_cache_key) = self.load_document(page_key)? else {
             return Ok(None);
         };
-        let page_key = self
-            .load_document(page_document_id)?
-            .ok_or(EngineError::MissingDocument(page_document_id))?;
-        let home_document_ids = {
-            let page_document = self.document(page_key)?;
-            validate_shard(
-                self.engine.catalog_document_id,
-                page_document_id,
-                page_document,
-            )?;
-            if shard_page_id(page_document)? != Some(page_id) {
-                return Err(EngineError::MalformedDocument {
-                    document_id: page_document_id,
-                    reason: "membership shard page identity mismatch".into(),
-                });
-            }
-            read_memberships(page_document_id, page_document)?
-                .values()
-                .map(|claim| claim.home_document_id)
-                .collect::<BTreeSet<_>>()
+        let page_state = read_page_state(page_key, self.document(page_cache_key)?)?;
+        let Some(page_state @ PageState::Live { .. }) = page_state else {
+            return Ok(None);
         };
-        for home_document_id in home_document_ids {
-            self.load_document(home_document_id)?
-                .ok_or(EngineError::MissingDocument(home_document_id))?;
+        let members = self.engine.accepted_page_members(page_id);
+        for document_id in self
+            .engine
+            .accepted_page_membership_documents(page_id, page_document_id)
+            .into_iter()
+            .chain(members.values().copied().map(DocumentKey::Entity))
+        {
+            self.load_document(document_id)?
+                .ok_or(EngineError::MissingDocument(document_id))?;
         }
         let engine = self.engine;
         let document_keys = &self.document_keys;
         let documents = &self.documents;
-        let catalog = self.document(catalog_key)?;
         let mut page = engine.materialize_page_in_catalog_window(
-            Some(ValidatedCatalogDocument {
-                catalog_document_id: engine.catalog_document_id,
-                document: catalog,
-            }),
+            Some(page_state),
             page_id,
+            &members,
             |document_id| {
                 document_keys
                     .get(&document_id)
@@ -3870,6 +4158,13 @@ pub(crate) trait ProjectionClaimSource {
         Ok(None)
     }
 
+    /// Resolve one accepted block's own immutable document from the disposable
+    /// exact-frontier projection. Local overlay blocks may not be present yet,
+    /// so callers retain their bounded authoritative fallback.
+    fn block_home(&self, _block_id: BlockId) -> Result<Option<DocumentId>, EngineError> {
+        Ok(None)
+    }
+
     /// Resolve exact accepted page identities from the disposable projection
     /// at the same frontier as this read handle. Returning `None` means this
     /// source does not carry page rows; `Some` may omit genuinely absent IDs.
@@ -3909,7 +4204,10 @@ impl RebuildProjectionClaimSnapshot {
             for block in page.blocks {
                 for logseq_uuid in block.external_uuid_claims {
                     participants.entry(logseq_uuid).or_default().insert(
-                        ProjectionClaimParticipant::new(block.block_id, block.home_document_id),
+                        ProjectionClaimParticipant::new(
+                            block.block_id,
+                            DocumentKey::Entity(block.home_document_id),
+                        ),
                     );
                 }
             }
@@ -3958,7 +4256,12 @@ impl ProjectionClaimSource for super::SqliteMaterializedRead<'_> {
         }
         Ok(rows
             .into_iter()
-            .map(|row| ProjectionClaimParticipant::new(row.block_id, row.home_document_id))
+            .map(|row| {
+                ProjectionClaimParticipant::new(
+                    row.block_id,
+                    DocumentKey::Entity(row.home_document_id),
+                )
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect())
@@ -3967,6 +4270,12 @@ impl ProjectionClaimSource for super::SqliteMaterializedRead<'_> {
     fn page_home(&self, page_id: PageId) -> Result<Option<DocumentId>, EngineError> {
         self.page(page_id)
             .map(|page| page.map(|page| page.home_document_id))
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    fn block_home(&self, block_id: BlockId) -> Result<Option<DocumentId>, EngineError> {
+        self.block(block_id)
+            .map(|block| block.map(|block| block.home_document_id))
             .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
@@ -4158,6 +4467,13 @@ struct HistoryWorkStats {
     block_claim_validation_nanos: usize,
     block_claim_lookup_nanos: usize,
     block_claim_encode_nanos: usize,
+    birth_page_identity_lookups: usize,
+    #[cfg(test)]
+    author_outline_builds: usize,
+    #[cfg(test)]
+    author_outline_membership_reads: usize,
+    #[cfg(test)]
+    author_outline_traversal_nodes: usize,
 }
 
 /// Opt-in causal accounting for managed activation replay. Test builds keep
@@ -4272,6 +4588,17 @@ pub struct EngineInstrumentation {
     pub catalog_current_loads: usize,
     #[cfg(test)]
     pub authenticated_page_identity_lookups: usize,
+    #[cfg(test)]
+    pub birth_page_identity_lookups: usize,
+    /// Transaction-local page outlines constructed while authoring.
+    #[cfg(test)]
+    pub author_outline_builds: usize,
+    /// Pair-membership documents read while constructing those outlines.
+    #[cfg(test)]
+    pub author_outline_membership_reads: usize,
+    /// Selected nodes visited by transaction-local subtree traversals.
+    #[cfg(test)]
+    pub author_outline_traversal_nodes: usize,
     pub prepare_transactions: usize,
     pub prepare_document_head_visits: usize,
     pub author_snapshot_clones: usize,
@@ -4359,7 +4686,7 @@ struct CleanProjectionBulkPage {
 #[derive(Debug)]
 struct CleanProjectionBulkChunk {
     pages: Vec<Option<CleanProjectionBulkPage>>,
-    documents: BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+    documents: BTreeMap<DocumentKey, (DocumentDependencies, LoroDoc)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4384,8 +4711,6 @@ pub(crate) struct CleanProjectionBulkMaterializer<'engine> {
     /// Sequence-zero candidates retained only while rebuilding disposable
     /// SQLite for a clean lazy-genesis runtime.
     rebuild_claim_source: Option<Arc<RebuildProjectionClaimSnapshot>>,
-    catalog: LoroDoc,
-    catalog_dependencies: DocumentDependencies,
     exact_document_loads: Cell<usize>,
     projection_claim_resolutions: Cell<CleanProjectionClaimResolutionStats>,
 }
@@ -4408,21 +4733,45 @@ impl CleanProjectionBulkMaterializer<'_> {
     pub(crate) fn terminal_current_path_rows(
         &self,
     ) -> Result<Vec<CurrentPathCatalogRow>, EngineError> {
-        read_all_pages(&self.catalog).map(|pages| {
-            pages
-                .into_iter()
-                .filter_map(|(page_id, state)| {
-                    current_path_catalog_row_from_page_state(&state).map(|state| {
-                        CurrentPathCatalogRow {
-                            page_id,
-                            path: state.path,
-                            kind: state.kind,
-                            accepted_name_digest: state.accepted_name_digest,
-                        }
-                    })
-                })
-                .collect()
-        })
+        if !self.engine.current_path_catalog.available {
+            return Err(EngineError::Archive(
+                "authenticated current-path catalog authority is unavailable".into(),
+            ));
+        }
+        Ok(self
+            .engine
+            .current_path_catalog
+            .rows
+            .iter()
+            .map(|(page_id, row)| CurrentPathCatalogRow {
+                page_id: *page_id,
+                path: row.path.clone(),
+                kind: row.kind,
+                accepted_name_digest: row.accepted_name_digest,
+            })
+            .collect())
+    }
+
+    /// One page's accepted state at this root, read from the page's own
+    /// document through the already authenticated multi-point loader.
+    fn root_page_state(&self, page_id: PageId) -> Result<Option<PageState>, EngineError> {
+        let requested = BTreeSet::from([page_id]);
+        let (homes, _) = self
+            .engine
+            .accepted_page_indexes_at_root(&self.root, &requested)?;
+        let Some(page_document_id) = homes.get(&page_id).copied() else {
+            return Ok(None);
+        };
+        let key = DocumentKey::Entity(page_document_id);
+        let loaded = self
+            .engine
+            .load_documents_at_authenticated_root_many(&self.root, &[key])?;
+        self.exact_document_loads
+            .set(self.exact_document_loads.get().saturating_add(1));
+        let Some((_, document)) = loaded.get(&key) else {
+            return Ok(None);
+        };
+        read_page_state(key, document)
     }
 
     fn materialize_chunk(
@@ -4444,110 +4793,92 @@ impl CleanProjectionBulkMaterializer<'_> {
         }
 
         let mut page_documents = BTreeMap::<PageId, DocumentId>::new();
-        // Construction proved the complete catalog once. This private
-        // materializer never exposes a mutation-capable catalog handle, so the
-        // proof remains valid for every bounded chunk. Recomputing a Loro
-        // version here was itself proportional to the graph's peer population.
-        let validated_catalog = ValidatedCatalogDocument {
-            catalog_document_id: self.engine.catalog_document_id,
-            document: &self.catalog,
-        };
-        let mut results = page_ids
-            .iter()
-            .map(|page_id| {
-                let state = read_validated_catalog_page(validated_catalog, *page_id)?;
-                if let Some(PageState::Live {
-                    home_document_id, ..
-                }) = state
-                {
-                    page_documents.insert(*page_id, home_document_id);
-                }
-                Ok(None)
-            })
-            .collect::<Result<Vec<Option<CleanProjectionBulkPage>>, EngineError>>()?;
+        let mut page_states = BTreeMap::<PageId, PageState>::new();
+        let mut page_members = BTreeMap::<PageId, BTreeMap<BlockId, DocumentId>>::new();
+        // No catalog document is read. Each page's own document carries its
+        // state, and the accepted current-owner range names the exact pairs.
+        let (page_document_ids, accepted_members) = self
+            .engine
+            .accepted_page_indexes_at_root(&self.root, &requested)?;
+        let mut documents = self.engine.load_documents_at_authenticated_root_many(
+            &self.root,
+            &page_document_ids
+                .values()
+                .map(|document_id| DocumentKey::Entity(*document_id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )?;
+        self.exact_document_loads.set(
+            self.exact_document_loads
+                .get()
+                .saturating_add(page_document_ids.len()),
+        );
+        let mut results = page_ids.iter().map(|_| None).collect::<Vec<_>>();
+        for (page_id, page_document_id) in &page_document_ids {
+            let key = DocumentKey::Entity(*page_document_id);
+            let Some((_, document)) = documents.get(&key) else {
+                continue;
+            };
+            let Some(state @ PageState::Live { .. }) = read_page_state(key, document)? else {
+                continue;
+            };
+            page_documents.insert(*page_id, *page_document_id);
+            page_states.insert(*page_id, state);
+            page_members.insert(
+                *page_id,
+                accepted_members.get(page_id).cloned().unwrap_or_default(),
+            );
+        }
         if page_documents.is_empty() {
             return Ok(CleanProjectionBulkChunk {
                 pages: results,
                 documents: BTreeMap::new(),
             });
         }
-
-        let membership_ids = page_documents
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut documents = self
-            .engine
-            .load_documents_at_authenticated_root_many(&self.root, &membership_ids)?;
-        self.exact_document_loads.set(
-            self.exact_document_loads
-                .get()
-                .saturating_add(membership_ids.len()),
-        );
-        let mut page_homes = BTreeMap::<PageId, BTreeSet<DocumentId>>::new();
-        for (page_id, document_id) in &page_documents {
-            let (_, membership) = documents
-                .get(document_id)
-                .ok_or(EngineError::MissingDocument(*document_id))?;
-            validate_shard(self.engine.catalog_document_id, *document_id, membership)?;
-            if shard_page_id(membership)? != Some(*page_id) {
-                return Err(EngineError::MalformedDocument {
-                    document_id: *document_id,
-                    reason: "membership shard page identity mismatch".into(),
-                });
-            }
-            page_homes.insert(
-                *page_id,
-                read_memberships(*document_id, membership)?
+        let missing = page_documents
+            .iter()
+            .flat_map(|(page_id, page_document_id)| {
+                let members = &page_members[page_id];
+                members
                     .values()
-                    .map(|claim| claim.home_document_id)
-                    .collect(),
-            );
-        }
-        let missing_homes = page_homes
-            .values()
-            .flatten()
-            .copied()
+                    .copied()
+                    .map(DocumentKey::Entity)
+                    .chain(members.values().map(|block_document_id| {
+                        membership_document_id(*block_document_id, *page_document_id)
+                    }))
+                    .collect::<Vec<_>>()
+            })
             .filter(|document_id| !documents.contains_key(document_id))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         documents.extend(
             self.engine
-                .load_documents_at_authenticated_root_many(&self.root, &missing_homes)?,
+                .load_documents_at_authenticated_root_many(&self.root, &missing)?,
         );
         self.exact_document_loads.set(
             self.exact_document_loads
                 .get()
-                .saturating_add(missing_homes.len()),
+                .saturating_add(missing.len()),
         );
 
         for (index, page_id) in page_ids.iter().copied().enumerate() {
             let Some(page_document_id) = page_documents.get(&page_id).copied() else {
                 continue;
             };
-            let homes = page_homes
-                .get(&page_id)
-                .expect("every live page has derived home documents");
-            let mut dependencies = Vec::with_capacity(homes.len().saturating_add(2));
-            dependencies.push(self.catalog_dependencies.clone());
-            dependencies.push(
-                documents
-                    .get(&page_document_id)
-                    .ok_or(EngineError::MissingDocument(page_document_id))?
-                    .0
-                    .clone(),
-            );
-            for home_document_id in homes {
-                if *home_document_id == page_document_id {
-                    continue;
-                }
+            let members = &page_members[&page_id];
+            let mut dependencies = Vec::with_capacity(members.len().saturating_mul(2) + 1);
+            for document_id in std::iter::once(DocumentKey::Entity(page_document_id))
+                .chain(members.values().copied().map(DocumentKey::Entity))
+                .chain(members.values().map(|block_document_id| {
+                    membership_document_id(*block_document_id, page_document_id)
+                }))
+            {
                 dependencies.push(
                     documents
-                        .get(home_document_id)
-                        .ok_or(EngineError::MissingDocument(*home_document_id))?
+                        .get(&document_id)
+                        .ok_or(EngineError::MissingDocument(document_id))?
                         .0
                         .clone(),
                 );
@@ -4555,15 +4886,10 @@ impl CleanProjectionBulkMaterializer<'_> {
             dependencies.sort_unstable_by_key(DocumentDependencies::document_id);
             dependencies.dedup_by_key(|dependency| dependency.document_id());
             let page = self.engine.materialize_page_in_catalog_window(
-                Some(validated_catalog),
+                page_states.get(&page_id).cloned(),
                 page_id,
-                |document_id| {
-                    if document_id == self.engine.catalog_document_id {
-                        Some(&self.catalog)
-                    } else {
-                        documents.get(&document_id).map(|(_, document)| document)
-                    }
-                },
+                members,
+                |document_id| documents.get(&document_id).map(|(_, document)| document),
             )?;
             results[index] = Some(CleanProjectionBulkPage { page, dependencies });
         }
@@ -4603,12 +4929,12 @@ impl CleanProjectionBulkMaterializer<'_> {
     fn resolve_logseq_uuid_for_projection(
         &self,
         logseq_uuid: LogseqUuid,
-        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+        documents: &BTreeMap<DocumentKey, (DocumentDependencies, LoroDoc)>,
     ) -> Result<
         (
             LogseqUuidResolution,
             Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, DocumentDependencies>,
+            BTreeMap<DocumentKey, DocumentDependencies>,
         ),
         EngineError,
     > {
@@ -4633,23 +4959,13 @@ impl CleanProjectionBulkMaterializer<'_> {
         }
 
         let evidence = ProjectionClaimEvidence::new(logseq_uuid, participants)?;
-        let validated_catalog = ValidatedCatalogDocument {
-            catalog_document_id: self.engine.catalog_document_id,
-            document: &self.catalog,
-        };
         let resolution = self
             .engine
             .resolve_logseq_uuid_from_document_lookup_with_page_state(
                 logseq_uuid,
                 &evidence,
-                |document_id| {
-                    if document_id == self.engine.catalog_document_id {
-                        Some(&self.catalog)
-                    } else {
-                        documents.get(&document_id).map(|(_, document)| document)
-                    }
-                },
-                |page_id| read_validated_catalog_page(validated_catalog, page_id),
+                |document_id| documents.get(&document_id).map(|(_, document)| document),
+                |page_id| self.root_page_state(page_id),
             )?;
         let dependencies = evidence
             .participants()
@@ -4675,21 +4991,13 @@ impl CleanProjectionBulkMaterializer<'_> {
         (
             LogseqUuidResolution,
             Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, DocumentDependencies>,
+            BTreeMap<DocumentKey, DocumentDependencies>,
         ),
         EngineError,
     > {
-        // A current-root materializer proved this immutable catalog once, and
-        // `materialize_chunk` rechecked its decoded version immediately before
-        // this projection pass. Reuse that window for cross-page UUID claims.
-        // A historical materializer must still ask the current engine for its
-        // current catalog rather than treating the historical page set as live.
-        let catalog = self
-            .current_claim_root_proven
-            .then_some(ValidatedCatalogDocument {
-                catalog_document_id: self.engine.catalog_document_id,
-                document: &self.catalog,
-            });
+        // A current-root materializer answers page liveness from this root's
+        // own page documents. A historical materializer must still ask the
+        // current engine rather than treating the historical page set as live.
         let participants = self.engine.projection_claim_participants(
             logseq_uuid,
             self.rebuild_claim_source
@@ -4698,7 +5006,7 @@ impl CleanProjectionBulkMaterializer<'_> {
         )?;
         let (resolution, evidence, homes) = self
             .engine
-            .resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)?;
+            .resolve_logseq_uuid_current_from_participants(logseq_uuid, participants)?;
         let dependencies = homes
             .into_iter()
             .map(|(home_document_id, home)| {
@@ -4716,7 +5024,7 @@ impl CleanProjectionBulkMaterializer<'_> {
     fn finish_projection_page(
         &self,
         mut bulk: CleanProjectionBulkPage,
-        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+        documents: &BTreeMap<DocumentKey, (DocumentDependencies, LoroDoc)>,
     ) -> Result<ProjectionPageState, EngineError> {
         let mut frontier_documents = bulk
             .dependencies
@@ -4804,11 +5112,9 @@ impl CleanProjectionBulkMaterializer<'_> {
         if let Some(transition) = &effective_transition {
             transition.apply_to_materialized(&mut bulk.page)?;
         }
-        frontier_documents.insert(
-            self.engine.catalog_document_id,
-            self.engine
-                .current_hot_document_dependencies_by_id(self.engine.catalog_document_id)?,
-        );
+        // Same rule as the point materializer: a page's projection frontier is
+        // its own documents only. The workspace graph document carries no
+        // page-visible state, so it is never a dependency of a rendered page.
         let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
         Ok(ProjectionPageState {
             page: bulk.page,
@@ -5204,7 +5510,7 @@ pub struct ManagedLocalRecord {
     prepared_batch: PreparedBatch,
     projections: Vec<ManagedLocalProjection>,
     semantic_effect: SemanticEffect,
-    crdt_updates: BTreeMap<DocumentId, CrdtUpdatePayload>,
+    crdt_updates: BTreeMap<DocumentKey, CrdtUpdatePayload>,
 }
 
 impl ManagedLocalRecord {
@@ -5224,6 +5530,19 @@ impl ManagedLocalRecord {
 
     pub fn projections(&self) -> &[ManagedLocalProjection] {
         &self.projections
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn semantic_effect_for_test(&self) -> &SemanticEffect {
+        &self.semantic_effect
+    }
+
+    #[cfg(test)]
+    pub(crate) fn crdt_update_witnesses_for_test(&self) -> Vec<(DocumentKey, bool)> {
+        self.crdt_updates
+            .iter()
+            .map(|(document_id, update)| (*document_id, update.causal_state_digest.is_some()))
+            .collect()
     }
 }
 
@@ -6029,8 +6348,8 @@ struct CommittedLocalOverlay {
     /// Latest pending projection for one semantic page/path. A new local edit
     /// composes with this predecessor without walking the journal prefix.
     latest_projection: BTreeMap<(PageId, ManagedPath), (usize, usize)>,
-    documents: BTreeMap<DocumentId, LoroDoc>,
-    document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    documents: BTreeMap<DocumentKey, LoroDoc>,
+    document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
     block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
     /// Point deltas and semantic root for the journal-durable prefix which is
     /// visible before background accepted-history expansion catches up.
@@ -6060,8 +6379,8 @@ struct AdmittedWriterBindings {
 
 struct ValidatedManagedLocalCandidate {
     pages: BTreeMap<PageId, MaterializedPage>,
-    documents: BTreeMap<DocumentId, LoroDoc>,
-    document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    documents: BTreeMap<DocumentKey, LoroDoc>,
+    document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
     block_claims: Vec<(u128, ImmutableHomeClaim)>,
     /// Installed in the same step that publishes the committed overlay entry.
     lane_bindings: AdmittedWriterBindings,
@@ -6114,6 +6433,11 @@ impl CommittedLocalOverlay {
 pub(crate) struct LazyGenesisCheckpointBuilder {
     catalog_document_id: DocumentId,
     catalog: LoroDoc,
+    /// Every identity this activation has already assigned. Page, block and
+    /// pair documents are disjoint by construction, and this is what proves it.
+    pages: BTreeSet<PageId>,
+    page_homes: BTreeSet<DocumentId>,
+    block_homes: BTreeSet<DocumentId>,
     /// Re-importing every checkpoint is a useful constructor oracle, but it is
     /// not part of activation authority. Production cold open validates the
     /// sealed baseline before use; repeating that readback here would turn one
@@ -6132,22 +6456,43 @@ pub(crate) struct LazyGenesisCheckpointInstrumentation {
 }
 
 impl LazyGenesisCheckpointBuilder {
-    pub(crate) fn new(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
+    pub(crate) fn new(
+        catalog_document_id: DocumentId,
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+    ) -> Result<Self, EngineError> {
         let catalog = LoroDoc::new();
         catalog
             .set_peer_id(LAZY_GENESIS_PEER_ID)
             .map_err(loro_error)?;
+        create_document(
+            DocumentKey::Entity(catalog_document_id),
+            &catalog,
+            &DocumentIdentity::Graph {
+                document_id: catalog_document_id,
+                workspace_id,
+                lineage: lineage_digest,
+            },
+            DocumentState::Graph,
+        )?;
         Ok(Self {
             catalog_document_id,
             catalog,
+            pages: BTreeSet::new(),
+            page_homes: BTreeSet::new(),
+            block_homes: BTreeSet::new(),
             #[cfg(test)]
             verify_checkpoints: false,
         })
     }
 
     #[cfg(test)]
-    pub(crate) fn new_verifying(catalog_document_id: DocumentId) -> Result<Self, EngineError> {
-        let mut builder = Self::new(catalog_document_id)?;
+    pub(crate) fn new_verifying(
+        catalog_document_id: DocumentId,
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+    ) -> Result<Self, EngineError> {
+        let mut builder = Self::new(catalog_document_id, workspace_id, lineage_digest)?;
         builder.verify_checkpoints = true;
         Ok(builder)
     }
@@ -6156,7 +6501,13 @@ impl LazyGenesisCheckpointBuilder {
         &mut self,
         page: &LazyGenesisPageInput,
         accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
-    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+    ) -> Result<
+        (
+            Vec<LazyGenesisDocumentCheckpointV1>,
+            Vec<DocumentDependencies>,
+        ),
+        EngineError,
+    > {
         self.push_page_instrumented(page, accepted_external_uuids, None)
     }
 
@@ -6165,7 +6516,13 @@ impl LazyGenesisCheckpointBuilder {
         page: &LazyGenesisPageInput,
         accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
         instrumentation: &mut LazyGenesisCheckpointInstrumentation,
-    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+    ) -> Result<
+        (
+            Vec<LazyGenesisDocumentCheckpointV1>,
+            Vec<DocumentDependencies>,
+        ),
+        EngineError,
+    > {
         self.push_page_instrumented(page, accepted_external_uuids, Some(instrumentation))
     }
 
@@ -6174,44 +6531,48 @@ impl LazyGenesisCheckpointBuilder {
         page: &LazyGenesisPageInput,
         accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
         instrumentation: Option<&mut LazyGenesisCheckpointInstrumentation>,
-    ) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+    ) -> Result<
+        (
+            Vec<LazyGenesisDocumentCheckpointV1>,
+            Vec<DocumentDependencies>,
+        ),
+        EngineError,
+    > {
         let catalog_started = std::time::Instant::now();
         if page.home_document_id == self.catalog_document_id
-            || read_page_state(&self.catalog, page.page_id)?.is_some()
+            || !self.page_homes.insert(page.home_document_id)
+            || !self.pages.insert(page.page_id)
         {
             return Err(EngineError::InvalidTransaction(
-                "lazy genesis repeats or aliases a catalog/page identity".into(),
+                "lazy genesis repeats or aliases a graph/page identity".into(),
             ));
         }
         let logical_name = LogicalPageName::parse(page.name.clone())
             .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
-        insert_page_state(
-            &self.catalog,
-            page.page_id,
-            &PageState::Live {
-                name: logical_name,
-                path: page.path.clone(),
-                home_document_id: page.home_document_id,
-                kind: page.kind,
-            },
-        )?;
         let catalog_micros = catalog_started.elapsed().as_micros() as u64;
 
         let page_document_started = std::time::Instant::now();
-        let document = LoroDoc::new();
-        document
-            .set_peer_id(LAZY_GENESIS_PEER_ID)
-            .map_err(loro_error)?;
-        document
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page.page_id.to_string())
-            .map_err(loro_error)?;
-        if let Some(preamble) = &page.preamble {
-            document
-                .get_map(SHARD_PAGE_PREAMBLE)
-                .insert(SHARD_PAGE_PREAMBLE_VALUE, preamble.clone())
-                .map_err(loro_error)?;
-        }
+        let page_key = DocumentKey::Entity(page.home_document_id);
+        let page_document = self.new_document()?;
+        create_document(
+            page_key,
+            &page_document,
+            &DocumentIdentity::Page {
+                document_id: page.home_document_id,
+                page_id: page.page_id,
+            },
+            DocumentState::Page {
+                state: PageState::Live {
+                    name: logical_name,
+                    path: page.path.clone(),
+                    home_document_id: page.home_document_id,
+                    kind: page.kind,
+                },
+                preamble: page.preamble.clone(),
+            },
+        )?;
+        let mut documents = vec![(page_key, page_document)];
+
         let page_blocks: BTreeSet<_> = page.blocks.iter().map(|block| block.block_id).collect();
         if accepted_external_uuids
             .keys()
@@ -6222,61 +6583,91 @@ impl LazyGenesisCheckpointBuilder {
             ));
         }
         for block in &page.blocks {
+            if block.home_document_id == page.home_document_id
+                || block.home_document_id == self.catalog_document_id
+                || !self.block_homes.insert(block.home_document_id)
+            {
+                return Err(EngineError::InvalidTransaction(
+                    "lazy genesis block needs its own distinct document".into(),
+                ));
+            }
             let claim =
                 MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
-            document
-                .get_map(SHARD_OWNERS)
-                .insert(&block.block_id.to_string(), page.page_id.to_string())
-                .map_err(loro_error)?;
-            document
-                .get_map(SHARD_CONTENT)
-                .ensure_mergeable_text(&block.block_id.to_string())
-                .map_err(loro_error)?
-                .insert(0, &block.content)
-                .map_err(loro_error)?;
-            insert_membership(&document, block.block_id, &claim)?;
-            if let Some(logseq_uuid) = accepted_external_uuids.get(&block.block_id) {
-                document
-                    .get_map(SHARD_LOGSEQ_UUIDS)
-                    .insert(&block.block_id.to_string(), logseq_uuid.to_string())
-                    .map_err(loro_error)?;
-                document
-                    .get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS)
-                    .insert(
-                        &block.block_id.to_string(),
-                        encode_canonical(&LogseqIdentityOrigin::ExternalImported)?,
-                    )
-                    .map_err(loro_error)?;
-            }
+            let logseq_uuid = accepted_external_uuids.get(&block.block_id).copied();
+            let block_key = DocumentKey::Entity(block.home_document_id);
+            let block_document = self.new_document()?;
+            create_document(
+                block_key,
+                &block_document,
+                &DocumentIdentity::Block {
+                    document_id: block.home_document_id,
+                    block_id: block.block_id,
+                    birth_page_id: page.page_id,
+                    birth_page_document_id: page.home_document_id,
+                },
+                DocumentState::Block(BlockState {
+                    block_id: block.block_id,
+                    home_document_id: block.home_document_id,
+                    owner: BlockOwner::Page(page.page_id),
+                    logseq_uuid,
+                    logseq_identity_origin: logseq_uuid
+                        .map(|_| LogseqIdentityOrigin::ExternalImported),
+                    content: block.content.clone(),
+                }),
+            )?;
+            documents.push((block_key, block_document));
+
+            let pair_key = membership_document_id(block.home_document_id, page.home_document_id);
+            let pair_document = self.new_document()?;
+            create_document(
+                pair_key,
+                &pair_document,
+                &DocumentIdentity::Membership {
+                    block_document_id: block.home_document_id,
+                    block_id: block.block_id,
+                    page_document_id: page.home_document_id,
+                    page_id: page.page_id,
+                },
+                DocumentState::Membership(Some(claim)),
+            )?;
+            documents.push((pair_key, pair_document));
         }
-        document.commit();
         let page_document_micros = page_document_started.elapsed().as_micros() as u64;
         let export_started = std::time::Instant::now();
-        let snapshot = document
-            .export(ExportMode::all_updates())
-            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        let mut checkpoints = Vec::with_capacity(documents.len());
+        let mut dependencies = Vec::with_capacity(documents.len());
+        for (document_id, document) in &documents {
+            let snapshot = document
+                .export(ExportMode::all_updates())
+                .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+            checkpoints.push(LazyGenesisDocumentCheckpointV1 {
+                document_id: *document_id,
+                snapshot,
+            });
+            dependencies.push(
+                DocumentDependencies::new(
+                    *document_id,
+                    canonical_peer_counters(&document.oplog_vv())?,
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    EngineError::InvalidTransaction(format!(
+                        "lazy genesis page {} dependencies are invalid: {error}",
+                        page.page_id
+                    ))
+                })?,
+            );
+        }
         let export_micros = export_started.elapsed().as_micros() as u64;
         let verification_started = std::time::Instant::now();
         #[cfg(test)]
         {
             if self.verify_checkpoints {
-                verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
+                verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &checkpoints)?;
             }
         }
         let verification_micros = verification_started.elapsed().as_micros() as u64;
-        let dependencies_started = std::time::Instant::now();
-        let dependencies = DocumentDependencies::new(
-            page.home_document_id,
-            canonical_peer_counters(&document.oplog_vv())?,
-            Vec::new(),
-        )
-        .map_err(|error| {
-            EngineError::InvalidTransaction(format!(
-                "lazy genesis page {} dependencies are invalid: {error}",
-                page.page_id
-            ))
-        })?;
-        let dependencies_micros = dependencies_started.elapsed().as_micros() as u64;
+        let dependencies_micros = 0;
         if let Some(instrumentation) = instrumentation {
             instrumentation.catalog_micros = instrumentation
                 .catalog_micros
@@ -6293,9 +6684,19 @@ impl LazyGenesisCheckpointBuilder {
                 .dependencies_micros
                 .saturating_add(dependencies_micros);
         }
-        Ok((snapshot, dependencies))
+        Ok((checkpoints, dependencies))
     }
 
+    fn new_document(&self) -> Result<LoroDoc, EngineError> {
+        let document = LoroDoc::new();
+        document
+            .set_peer_id(LAZY_GENESIS_PEER_ID)
+            .map_err(loro_error)?;
+        Ok(document)
+    }
+
+    /// The workspace graph document: lineage metadata only, one fixed-size
+    /// document regardless of how many pages the activation carries.
     pub(crate) fn finish(self) -> Result<(Vec<u8>, Option<DocumentDependencies>), EngineError> {
         self.catalog.commit();
         let peer_counters = canonical_peer_counters(&self.catalog.oplog_vv())?;
@@ -6303,12 +6704,16 @@ impl LazyGenesisCheckpointBuilder {
             None
         } else {
             Some(
-                DocumentDependencies::new(self.catalog_document_id, peer_counters, Vec::new())
-                    .map_err(|error| {
-                        EngineError::InvalidTransaction(format!(
-                            "lazy genesis catalog dependencies are invalid: {error}"
-                        ))
-                    })?,
+                DocumentDependencies::new(
+                    DocumentKey::Entity(self.catalog_document_id),
+                    peer_counters,
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    EngineError::InvalidTransaction(format!(
+                        "lazy genesis graph dependencies are invalid: {error}"
+                    ))
+                })?,
             )
         };
         let checkpoint = self
@@ -6323,32 +6728,55 @@ impl LazyGenesisCheckpointBuilder {
 fn verify_lazy_genesis_page_checkpoint(
     expected: &LazyGenesisPageInput,
     accepted_external_uuids: &BTreeMap<BlockId, LogseqUuid>,
-    snapshot: &[u8],
+    checkpoints: &[LazyGenesisDocumentCheckpointV1],
 ) -> Result<(), EngineError> {
-    let document = LoroDoc::new();
-    import_complete(expected.home_document_id, &document, &[snapshot.to_vec()])?;
-    if shard_page_id(&document)? != Some(expected.page_id)
-        || read_page_preamble(expected.home_document_id, &document)? != expected.preamble
+    let mut documents = BTreeMap::new();
+    for checkpoint in checkpoints {
+        let document = LoroDoc::new();
+        import_complete(
+            checkpoint.document_id,
+            &document,
+            &[checkpoint.snapshot.clone()],
+        )?;
+        documents.insert(checkpoint.document_id, document);
+    }
+    let page_key = DocumentKey::Entity(expected.home_document_id);
+    let page_document = documents
+        .get(&page_key)
+        .ok_or_else(|| EngineError::InvalidCrdt("lazy genesis omitted its page document".into()))?;
+    if document_page_id(page_key, page_document)? != Some(expected.page_id)
+        || read_page_preamble(page_key, page_document)? != expected.preamble
     {
         return Err(EngineError::InvalidCrdt(
             "lazy genesis page checkpoint header differs from its capsule".into(),
         ));
     }
-    let blocks = read_all_blocks(expected.home_document_id, &document)?;
-    let memberships = read_memberships(expected.home_document_id, &document)?;
-    if blocks.len() != expected.blocks.len() || memberships.len() != expected.blocks.len() {
+    if documents.len() != expected.blocks.len().saturating_mul(2).saturating_add(1) {
         return Err(EngineError::InvalidCrdt(
             "lazy genesis page checkpoint block coverage differs from its capsule".into(),
         ));
     }
     for block in &expected.blocks {
-        let state = blocks.get(&block.block_id).ok_or_else(|| {
-            EngineError::InvalidCrdt("lazy genesis checkpoint omitted a block".into())
-        })?;
-        let membership = memberships.get(&block.block_id).ok_or_else(|| {
-            EngineError::InvalidCrdt("lazy genesis checkpoint omitted a membership".into())
-        })?;
-        if state.owner != BlockOwner::Page(expected.page_id)
+        let block_key = DocumentKey::Entity(block.home_document_id);
+        let pair_key = membership_document_id(block.home_document_id, expected.home_document_id);
+        let state = documents
+            .get(&block_key)
+            .map(|document| read_block_state(block_key, document))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| {
+                EngineError::InvalidCrdt("lazy genesis checkpoint omitted a block".into())
+            })?;
+        let membership = documents
+            .get(&pair_key)
+            .map(|document| read_membership(pair_key, document))
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| {
+                EngineError::InvalidCrdt("lazy genesis checkpoint omitted a membership".into())
+            })?;
+        if state.block_id != block.block_id
+            || state.owner != BlockOwner::Page(expected.page_id)
             || state.content != block.content
             || membership.home_document_id != block.home_document_id
             || membership.parent != block.parent
@@ -6411,14 +6839,14 @@ impl CompactAcceptedDocument {
 /// loads. This capture is a bootstrap seam, not a live actor COW implementation.
 pub(crate) struct LiveGraphDocumentClosure {
     cutoff_state_digest: ContentDigest,
-    documents: BTreeSet<DocumentId>,
+    documents: BTreeSet<DocumentKey>,
 }
 
 impl LiveGraphDocumentClosure {
     pub(crate) fn document_count(&self) -> usize {
         self.documents.len()
     }
-    pub(crate) fn contains(&self, document: DocumentId) -> bool {
+    pub(crate) fn contains(&self, document: DocumentKey) -> bool {
         self.documents.contains(&document)
     }
 }
@@ -6501,16 +6929,24 @@ struct CleanCheckpointStateV1 {
     ephemeral_page_names: Vec<u8>,
     page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    visible_documents: BTreeMap<DocumentId, Vec<u8>>,
-    spare_documents: BTreeMap<DocumentId, Vec<u8>>,
-    visible_document_lru: VecDeque<DocumentId>,
-    visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
-    accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
+    visible_documents: BTreeMap<DocumentKey, Vec<u8>>,
+    spare_documents: BTreeMap<DocumentKey, Vec<u8>>,
+    visible_document_lru: VecDeque<DocumentKey>,
+    visible_document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
+    accepted_frontier: BTreeMap<DocumentKey, DocumentDependencies>,
     accepted_frontier_root: AcceptedFrontierRoot,
     clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
     current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
+    current_path_page_homes: BTreeMap<PageId, DocumentId>,
+    current_path_page_members: BTreeMap<PageId, BTreeMap<BlockId, DocumentId>>,
     current_path_available: bool,
     current_path_frontier_root: AcceptedFrontierRoot,
+}
+
+struct LazyGenesisPageCheckpointMemo {
+    root: ContentDigest,
+    page_id: PageId,
+    checkpoints: BTreeMap<DocumentKey, Vec<u8>>,
 }
 
 pub struct ShardedHotEngine {
@@ -6609,18 +7045,18 @@ pub struct ShardedHotEngine {
     reference_catalog_policy: ReferenceCatalogPolicyV1,
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
-    visible_documents: BTreeMap<DocumentId, LoroDoc>,
+    visible_documents: BTreeMap<DocumentKey, LoroDoc>,
     // A second current-state buffer is reused across ordinary authorship.
     // It accumulates the same incremental updates as the visible buffer, so
     // preparing the next bounded edit never snapshots accumulated CRDT history.
-    spare_documents: RefCell<BTreeMap<DocumentId, LoroDoc>>,
+    spare_documents: RefCell<BTreeMap<DocumentKey, LoroDoc>>,
     pending_author_documents: RefCell<Option<PendingAuthorDocuments>>,
     /// One just-accepted local author's already validated page outcomes.
     /// SQLite consumes these as a current-head optimization; immutable history
     /// remains the fallback after restart or any cache miss.
     accepted_author_projection_pages: RefCell<Option<AcceptedAuthorProjectionPages>>,
-    visible_document_lru: VecDeque<DocumentId>,
-    visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    visible_document_lru: VecDeque<DocumentKey>,
+    visible_document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
     /// Durable-local commits that are visible before their archive acceptance.
     ///
     /// This is rebuildable state, never durable authority. The local journal
@@ -6628,8 +7064,8 @@ pub struct ShardedHotEngine {
     local_overlay: CommittedLocalOverlay,
     // Lazily created only after the terminal latch. This CRDT frontier
     // validates offered descendants without ever becoming visible authority.
-    terminal_documents: BTreeMap<DocumentId, LoroDoc>,
-    terminal_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    terminal_documents: BTreeMap<DocumentKey, LoroDoc>,
+    terminal_document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
     // Point lookups are memoized only within one public operation. The cache
     // is cleared between operations and whenever the authenticated root
     // advances, so a later cold read still revalidates immutable bytes.
@@ -6650,6 +7086,11 @@ pub struct ShardedHotEngine {
     // record matches it: each document still proves its own descriptor digest
     // and manifest fingerprint against the manifest below.
     observed_manifest_point_cache: RefCell<BTreeMap<BatchId, Arc<OperationBatch>>>,
+    /// At most one baseline page's checkpoint bytes, retained only within one
+    /// public point-operation scope. The immutable candidate root and page id
+    /// bind the entry; the decoded capsule's source, blocks and SQLite receipt
+    /// are discarded before publication into this memo.
+    lazy_genesis_page_checkpoint_memo: RefCell<Option<LazyGenesisPageCheckpointMemo>>,
     // At most one decoded page catalog, reused across accepted events by
     // content identity alone. Unlike the two point caches above this is *not*
     // cleared per operation: a content-only save leaves the catalog's causal
@@ -6681,7 +7122,7 @@ pub struct ShardedHotEngine {
     /// exactly like `crdt_lane_owners`, restored from checkpoint state and
     /// rebuilt identically by full accepted replay — no second tree.
     causal_peer_owners: BTreeMap<CausalPeerId, DeviceId>,
-    accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
+    accepted_frontier: BTreeMap<DocumentKey, DocumentDependencies>,
     /// Number of accepted documents whose direct frontier names each batch.
     /// This makes provider-head publication proportional to the number of
     /// frontier tips, not to every page/document in the graph.
@@ -6700,7 +7141,7 @@ pub struct ShardedHotEngine {
     /// format.
     clean_checkpoint_required_objects_by_sequence: BTreeMap<u64, BTreeSet<ContentDigest>>,
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
-    ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
+    ephemeral_accepted_document_root: RunLocalDocumentMap,
     ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
     accepted_frontier_root: AcceptedFrontierRoot,
     accepted_sequence: BTreeMap<u64, BatchId>,
@@ -6712,6 +7153,10 @@ pub struct ShardedHotEngine {
     current_path_cursor_book: RefCell<CurrentPathCursorBook>,
     #[cfg(test)]
     current_path_cursor_rows_visited: Cell<usize>,
+    #[cfg(test)]
+    measure_current_path_catalog_allocations: Cell<bool>,
+    #[cfg(test)]
+    current_path_catalog_allocations: Cell<(usize, usize)>,
     /// Captured once at engine construction so the disabled path never checks
     /// the process environment inside replay loops.
     activation_trace_enabled: bool,
@@ -6846,6 +7291,7 @@ impl ShardedHotEngine {
             terminal_document_heads: BTreeMap::new(),
             external_anchor_point_cache: RefCell::new(BTreeSet::new()),
             observed_manifest_point_cache: RefCell::new(BTreeMap::new()),
+            lazy_genesis_page_checkpoint_memo: RefCell::new(None),
             retained_accepted_catalog: RefCell::new(None),
             retained_catalog_dependency_anchor: Cell::new(None),
             #[cfg(test)]
@@ -6863,7 +7309,7 @@ impl ShardedHotEngine {
             clean_checkpoint_required_objects: BTreeSet::new(),
             clean_checkpoint_required_objects_by_sequence: BTreeMap::new(),
             ephemeral_accepted_batch_entries: BTreeMap::new(),
-            ephemeral_accepted_document_root: RunLocalAuthenticatedMap::default(),
+            ephemeral_accepted_document_root: RunLocalDocumentMap::default(),
             ephemeral_accepted_batch_root: RunLocalAuthenticatedMap::default(),
             accepted_frontier_root: empty_accepted_frontier_root(),
             accepted_sequence: BTreeMap::new(),
@@ -6872,6 +7318,10 @@ impl ShardedHotEngine {
             current_path_cursor_book: RefCell::new(CurrentPathCursorBook::default()),
             #[cfg(test)]
             current_path_cursor_rows_visited: Cell::new(0),
+            #[cfg(test)]
+            measure_current_path_catalog_allocations: Cell::new(false),
+            #[cfg(test)]
+            current_path_catalog_allocations: Cell::new((0, 0)),
             activation_trace_enabled: std::env::var_os("TINE_ACTIVATION_TRACE").is_some(),
             validation_phase_nanos: [0; 10],
             replay_timing: Cell::new(ReplayTimingStats::default()),
@@ -6909,19 +7359,56 @@ impl ShardedHotEngine {
                 "lazy genesis can only initialize an empty matching engine".into(),
             ));
         }
-        let catalog_snapshot = candidate
+        let graph_snapshot = candidate
             .catalog_checkpoint()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let catalog = LoroDoc::new();
-        import_complete(self.catalog_document_id, &catalog, &[catalog_snapshot])?;
-        catalog.set_peer_id(1).map_err(loro_error)?;
-        validate_catalog(self.catalog_document_id, &catalog)?;
-        let current_path_rows = read_all_pages(&catalog)?
-            .into_iter()
-            .filter_map(|(page_id, state)| {
-                current_path_catalog_row_from_page_state(&state).map(|row| (page_id, row))
-            })
-            .collect();
+        let graph_key = DocumentKey::Entity(self.catalog_document_id);
+        let graph = LoroDoc::new();
+        import_complete(graph_key, &graph, &[graph_snapshot])?;
+        graph.set_peer_id(1).map_err(loro_error)?;
+        if !matches!(
+            snapshot_document(self.catalog_document_id, graph_key, &graph)?,
+            SemanticDocumentSnapshot::Graph | SemanticDocumentSnapshot::Unwritten
+        ) {
+            return Err(EngineError::MalformedDocument {
+                document_id: graph_key,
+                reason: "lazy genesis graph document is not graph metadata".into(),
+            });
+        }
+        // The page and current-owner indexes come from the sealed capsules,
+        // not from a catalog document: there is no graph-sized document to
+        // decode at activation.
+        let mut current_path_rows = OrdMap::new();
+        let mut page_homes = OrdMap::new();
+        let mut page_members = OrdMap::new();
+        for page_id in candidate.page_ids() {
+            let page = candidate
+                .page(page_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive("lazy-genesis page disappeared during activation".into())
+                })?;
+            let name = LogicalPageName::parse(page.name.clone())
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            let state = PageState::Live {
+                name,
+                path: page.path.clone(),
+                home_document_id: page.home_document_id,
+                kind: page.kind,
+            };
+            if let Some(row) = current_path_catalog_row_from_page_state(&state) {
+                current_path_rows.insert(page_id, row);
+            }
+            page_homes.insert(page_id, page.home_document_id);
+            let members: OrdMap<BlockId, DocumentId> = page
+                .blocks
+                .iter()
+                .map(|block| (block.block_id, block.home_document_id))
+                .collect();
+            if !members.is_empty() {
+                page_members.insert(page_id, members);
+            }
+        }
         let documents = candidate.frontier_documents();
         let accepted_frontier_root = accepted_frontier_root_for_lazy_genesis(&candidate)?;
         self.accepted_frontier = documents
@@ -6931,12 +7418,13 @@ impl ShardedHotEngine {
         self.accepted_frontier_root = accepted_frontier_root.clone();
         self.current_path_catalog = CurrentPathCatalog {
             rows: current_path_rows,
+            page_homes,
+            page_members,
             available: true,
             accepted_frontier_root,
         };
         self.current_path_cursor_book.borrow_mut().active.clear();
-        self.visible_documents
-            .insert(self.catalog_document_id, catalog);
+        self.visible_documents.insert(graph_key, graph);
         self.lazy_genesis = Some(candidate);
         Ok(())
     }
@@ -7034,41 +7522,103 @@ impl ShardedHotEngine {
 
     fn lazy_genesis_checkpoint(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<Option<Vec<u8>>, EngineError> {
         let Some(candidate) = &self.lazy_genesis else {
             return Ok(None);
         };
-        let snapshot = if document_id == self.catalog_document_id {
+        let snapshot = if document_id == DocumentKey::Entity(self.catalog_document_id) {
             Some(
                 candidate
                     .catalog_checkpoint()
                     .map_err(|error| EngineError::Archive(error.to_string()))?,
             )
         } else {
-            candidate
-                .document_checkpoint(document_id)
-                .map_err(|error| EngineError::Archive(error.to_string()))?
+            self.lazy_genesis_document_checkpoint(candidate, document_id)?
         };
+        #[cfg(test)]
+        if snapshot.is_some() {
+            LIVE_WRITE_BASELINE_STATE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(snapshot)
+    }
+
+    fn lazy_genesis_document_checkpoint(
+        &self,
+        candidate: &LazyGenesisCandidate,
+        document_id: DocumentKey,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let Some(page_id) = candidate.document_checkpoint_page_id(document_id) else {
+            return Ok(None);
+        };
+        {
+            let memo = self.lazy_genesis_page_checkpoint_memo.borrow();
+            if let Some(memo) = memo
+                .as_ref()
+                .filter(|memo| memo.root == candidate.root() && memo.page_id == page_id)
+            {
+                return Ok(memo.checkpoints.get(&document_id).cloned());
+            }
+        }
+
+        let Some(page) = candidate
+            .page(page_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let dependency_documents = page
+            .document_dependencies
+            .iter()
+            .map(DocumentDependencies::document_id)
+            .collect::<BTreeSet<_>>();
+        let mut checkpoints = BTreeMap::new();
+        for checkpoint in page.document_checkpoints {
+            if checkpoints
+                .insert(checkpoint.document_id, checkpoint.snapshot)
+                .is_some()
+            {
+                return Err(EngineError::Archive(
+                    "lazy genesis page capsule repeats a document checkpoint".into(),
+                ));
+            }
+        }
+        if checkpoints.keys().copied().collect::<BTreeSet<_>>() != dependency_documents {
+            return Err(EngineError::Archive(
+                "lazy genesis page capsule checkpoints disagree with its manifest dependencies"
+                    .into(),
+            ));
+        }
+        let snapshot = checkpoints.get(&document_id).cloned();
+        *self.lazy_genesis_page_checkpoint_memo.borrow_mut() =
+            Some(LazyGenesisPageCheckpointMemo {
+                root: candidate.root(),
+                page_id,
+                checkpoints,
+            });
         Ok(snapshot)
     }
 
     fn validate_lazy_genesis_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         document: &LoroDoc,
     ) -> Result<(), EngineError> {
-        if document_id == self.catalog_document_id {
-            validate_catalog(self.catalog_document_id, document)?;
-        } else {
-            validate_shard(self.catalog_document_id, document_id, document)?;
+        // Every lazy-genesis document is a written fixed-schema document, so
+        // the snapshot read both proves its shape and binds its declared
+        // identity to the address it was fetched under.
+        match snapshot_document(self.catalog_document_id, document_id, document)? {
+            SemanticDocumentSnapshot::Unwritten => Err(malformed(
+                document_id,
+                "lazy genesis checkpoint holds an uninitialised document",
+            )),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn lazy_genesis_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer: u64,
     ) -> Result<Option<LoroDoc>, EngineError> {
         let Some(snapshot) = self.lazy_genesis_checkpoint(document_id)? else {
@@ -7083,7 +7633,7 @@ impl ShardedHotEngine {
 
     fn lazy_genesis_engine_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer: u64,
     ) -> Result<Option<EngineDocument>, EngineError> {
         let Some(snapshot) = self.lazy_genesis_checkpoint(document_id)? else {
@@ -7141,8 +7691,14 @@ impl ShardedHotEngine {
     pub(crate) fn lazy_genesis_resident_page_documents_for_test(&self) -> usize {
         self.visible_documents
             .keys()
-            .filter(|document_id| **document_id != self.catalog_document_id)
+            .filter(|document_id| **document_id != DocumentKey::Entity(self.catalog_document_id))
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_document_resident_for_test(&self, document_id: DocumentKey) -> bool {
+        self.visible_documents.contains_key(&document_id)
+            || self.terminal_documents.contains_key(&document_id)
     }
 
     /// Test construction for the production clean archive-attach route.
@@ -7603,18 +8159,25 @@ impl ShardedHotEngine {
         let mut documents = BTreeSet::new();
         if self
             .accepted_frontier
-            .contains_key(&self.catalog_document_id)
+            .contains_key(&DocumentKey::Entity(self.catalog_document_id))
         {
-            documents.insert(self.catalog_document_id);
+            documents.insert(DocumentKey::Entity(self.catalog_document_id));
         }
-        documents.extend(graph.pages.iter().map(|(_, page)| page.home_document_id()));
-        documents.extend(graph.blocks.iter().map(|block| block.home_document_id));
+        let live_page_homes = graph
+            .pages
+            .iter()
+            .map(|(page_id, page)| (*page_id, page.home_document_id()))
+            .collect::<BTreeMap<_, _>>();
+        documents.extend(live_page_homes.values().copied().map(DocumentKey::Entity));
         documents.extend(
             graph
-                .memberships
+                .blocks
                 .iter()
-                .map(|member| member.home_document_id),
+                .map(|block| DocumentKey::Entity(block.home_document_id)),
         );
+        documents.extend(graph.memberships.iter().map(|member| {
+            membership_document_id(member.home_document_id, live_page_homes[&member.page_id])
+        }));
         for id in &documents {
             if !self.accepted_frontier.contains_key(id) {
                 return Err(EngineError::MissingDocument(*id));
@@ -7711,7 +8274,7 @@ impl ShardedHotEngine {
             || (!self.accepted_frontier.is_empty()
                 && !self
                     .accepted_frontier
-                    .contains_key(&self.catalog_document_id))
+                    .contains_key(&DocumentKey::Entity(self.catalog_document_id)))
         {
             return Err(EngineError::Archive(
                 "accepted document roster is incomplete".into(),
@@ -7756,7 +8319,7 @@ impl ShardedHotEngine {
         cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
         roster: super::checkpoint_generation::SealedDocumentRoster,
         store: &super::checkpoint_generation::SealedGenerationDirectory,
-        documents: impl Clone + ExactSizeIterator<Item = (&'a DocumentId, &'a DocumentDependencies)>,
+        documents: impl Clone + ExactSizeIterator<Item = (&'a DocumentKey, &'a DocumentDependencies)>,
     ) -> Result<(), EngineError> {
         self.require_complete_document_cutoff(cutoff)?;
         if roster.document_count() != documents.len() as u64 {
@@ -7769,7 +8332,11 @@ impl ShardedHotEngine {
             .map_err(EngineError::Archive)?;
         for (document_id, expected) in documents {
             let (dependencies, restored) = roster
-                .load_document(store, self.catalog_document_id, *document_id)
+                .load_document(
+                    store,
+                    DocumentKey::Entity(self.catalog_document_id),
+                    *document_id,
+                )
                 .map_err(EngineError::Archive)?
                 .ok_or(EngineError::MissingDocument(*document_id))?;
             if &dependencies != expected {
@@ -7792,7 +8359,7 @@ impl ShardedHotEngine {
     pub(crate) fn build_compact_accepted_document(
         &self,
         cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<CompactAcceptedDocument, EngineError> {
         if cutoff.frontier() != &self.accepted_frontier_root {
             return Err(EngineError::Archive(
@@ -7813,8 +8380,11 @@ impl ShardedHotEngine {
         let checkpoint = document
             .export(ExportMode::shallow_snapshot(&document.oplog_frontiers()))
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
-        let restored =
-            qualify_compact_document(self.catalog_document_id, &dependencies, &checkpoint)?;
+        let restored = qualify_compact_document(
+            DocumentKey::Entity(self.catalog_document_id),
+            &dependencies,
+            &checkpoint,
+        )?;
         verify_compact_document_equivalence(&document, &restored)?;
         Ok(CompactAcceptedDocument {
             cutoff_state_digest: cutoff.frontier().state_digest(),
@@ -7857,7 +8427,7 @@ impl ShardedHotEngine {
             );
         }
 
-        let encode_documents = |documents: &BTreeMap<DocumentId, LoroDoc>| {
+        let encode_documents = |documents: &BTreeMap<DocumentKey, LoroDoc>| {
             documents
                 .iter()
                 .map(|(document_id, document)| {
@@ -7899,7 +8469,14 @@ impl ShardedHotEngine {
             accepted_frontier: self.accepted_frontier.clone(),
             accepted_frontier_root: self.accepted_frontier_root.clone(),
             clean_projection_head_batches: self.clean_projection_head_batches.clone(),
-            current_path_rows: self.current_path_catalog.rows.clone(),
+            current_path_rows: ordered_rows(&self.current_path_catalog.rows),
+            current_path_page_homes: ordered_rows(&self.current_path_catalog.page_homes),
+            current_path_page_members: self
+                .current_path_catalog
+                .page_members
+                .iter()
+                .map(|(page_id, members)| (*page_id, ordered_rows(members)))
+                .collect(),
             current_path_available: self.current_path_catalog.available,
             current_path_frontier_root: self.current_path_catalog.accepted_frontier_root.clone(),
         };
@@ -7978,7 +8555,7 @@ impl ShardedHotEngine {
             &state.ephemeral_page_names,
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let decode_documents = |encoded: &BTreeMap<DocumentId, Vec<u8>>| {
+        let decode_documents = |encoded: &BTreeMap<DocumentKey, Vec<u8>>| {
             encoded
                 .iter()
                 .map(|(document_id, bytes)| {
@@ -8033,7 +8610,10 @@ impl ShardedHotEngine {
                 clock_root_key,
                 clock_root_digest,
             );
-            accepted_batch_root.upsert(batch_id.as_uuid().into_bytes(), causal_record_digest);
+            accepted_batch_root.upsert(
+                AuthenticatedMapKey::from(batch_id.as_uuid().into_bytes()),
+                causal_record_digest,
+            );
             accepted_batch_entries.insert(batch_id, causal_record_digest);
             causal_clocks.insert(batch_id, row.canonical_causal_clock);
             causal_dots.insert(batch_id, row.causal_dot);
@@ -8058,7 +8638,11 @@ impl ShardedHotEngine {
             .map_err(|_| EngineError::Archive("checkpoint sequence exceeds u64".into()))?;
         if previous_root != state.accepted_frontier_root
             || state.accepted_frontier_root.acceptance_sequence() != next_acceptance_sequence
-            || accepted_batch_root.root_key() != state.accepted_frontier_root.batch_map_root_key
+            || accepted_batch_root.root_key()
+                != state
+                    .accepted_frontier_root
+                    .batch_map_root_key
+                    .map(AuthenticatedMapKey::from)
             || accepted_batch_root.root_digest()
                 != state.accepted_frontier_root.batch_map_root_digest
         {
@@ -8075,10 +8659,10 @@ impl ShardedHotEngine {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut accepted_document_root = RunLocalAuthenticatedMap::default();
+        let mut accepted_document_root = RunLocalDocumentMap::default();
         for document in &overlay_documents {
             accepted_document_root.upsert(
-                document.document_id().as_uuid().into_bytes(),
+                document.document_id().authenticated_map_key(),
                 ContentDigest::of(&encode_accepted_document(document)?),
             );
         }
@@ -8147,7 +8731,13 @@ impl ShardedHotEngine {
         self.clean_projection_heads.clear();
         self.clean_projection_head_batches = state.clean_projection_head_batches;
         self.current_path_catalog = CurrentPathCatalog {
-            rows: state.current_path_rows,
+            rows: state.current_path_rows.into_iter().collect(),
+            page_homes: state.current_path_page_homes.into_iter().collect(),
+            page_members: state
+                .current_path_page_members
+                .into_iter()
+                .map(|(page_id, members)| (page_id, members.into_iter().collect::<OrdMap<_, _>>()))
+                .collect(),
             available: state.current_path_available,
             accepted_frontier_root: state.current_path_frontier_root,
         };
@@ -9131,7 +9721,9 @@ impl ShardedHotEngine {
     }
 
     fn current_catalog_document(&self) -> Result<Option<&LoroDoc>, EngineError> {
-        Ok(self.visible_documents.get(&self.catalog_document_id))
+        Ok(self
+            .visible_documents
+            .get(&DocumentKey::Entity(self.catalog_document_id)))
     }
 
     pub(crate) fn authenticate_lazy_catalog_for_mutation(&mut self) -> Result<(), EngineError> {
@@ -9163,6 +9755,25 @@ impl ShardedHotEngine {
 
     pub const fn lineage_digest(&self) -> LineageDigest {
         self.lineage_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_document_identity_for_test(
+        &self,
+    ) -> Result<(DocumentKey, WorkspaceId, LineageDigest), EngineError> {
+        let key = DocumentKey::Entity(self.catalog_document_id);
+        let document = self.clone_visible_document(key, u64::MAX - 7)?;
+        match document_identity(key, &document)? {
+            Some(DocumentIdentity::Graph {
+                document_id,
+                workspace_id,
+                lineage,
+            }) => Ok((DocumentKey::Entity(document_id), workspace_id, lineage)),
+            _ => Err(EngineError::MalformedDocument {
+                document_id: key,
+                reason: "workspace graph document has the wrong fixed-schema role".into(),
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -9274,8 +9885,12 @@ impl ShardedHotEngine {
         let foreign_document_id = DocumentId::from_uuid(Uuid::from_u128(0xfeed_f00d));
         let mut documents = intent.post_frontier().documents().to_vec();
         documents.push(
-            DocumentDependencies::new(foreign_document_id, Vec::new(), vec![batch_id])
-                .expect("test-only foreign frontier document is well formed"),
+            DocumentDependencies::new(
+                DocumentKey::Entity(foreign_document_id),
+                Vec::new(),
+                vec![batch_id],
+            )
+            .expect("test-only foreign frontier document is well formed"),
         );
         let frontier = FrontierV2::new(documents)
             .expect("test-only foreign frontier remains canonically ordered");
@@ -9442,8 +10057,8 @@ impl ShardedHotEngine {
     }
 
     #[cfg(test)]
-    fn record_current_catalog_load(&self, document_id: DocumentId) {
-        if document_id != self.catalog_document_id {
+    fn record_current_catalog_load(&self, document_id: DocumentKey) {
+        if document_id != DocumentKey::Entity(self.catalog_document_id) {
             return;
         }
         let mut loads = self.catalog_checkpoint_loads.get();
@@ -9492,6 +10107,14 @@ impl ShardedHotEngine {
                 .reference_source_observations
                 .get()
                 .authenticated_page_identity_lookups,
+            #[cfg(test)]
+            birth_page_identity_lookups: work.birth_page_identity_lookups,
+            #[cfg(test)]
+            author_outline_builds: work.author_outline_builds,
+            #[cfg(test)]
+            author_outline_membership_reads: work.author_outline_membership_reads,
+            #[cfg(test)]
+            author_outline_traversal_nodes: work.author_outline_traversal_nodes,
             prepare_transactions: work.prepare_transactions,
             prepare_document_head_visits: work.prepare_document_head_visits,
             author_snapshot_clones: work.author_snapshot_clones,
@@ -9573,6 +10196,13 @@ impl ShardedHotEngine {
                 .map(|store| store.instrumentation())
                 .unwrap_or_default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lazy_genesis_page_capsule_decodes_for_test(&self) -> usize {
+        self.lazy_genesis
+            .as_deref()
+            .map_or(0, LazyGenesisCandidate::page_capsule_decodes)
     }
 
     /// One atomic diagnostic view. Accepted batches remain historical facts
@@ -9667,32 +10297,53 @@ impl ShardedHotEngine {
         self.authenticate_accepted_frontier_root(root)?;
         let current_claim_root_proven = root == &self.accepted_frontier_root;
         let _ = budget_bytes_per_root;
-        let mut catalog =
-            self.load_documents_at_authenticated_root_many(root, &[self.catalog_document_id])?;
-        let (catalog_dependencies, catalog) = catalog
-            .remove(&self.catalog_document_id)
-            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-        validate_catalog(self.catalog_document_id, &catalog)?;
-        // Bootstrap/rebuild already paid for and authenticated this exact
-        // graph-sized decode. Publish it into the engine's one-entry retained
-        // catalog so the first ordinary derivative after activation does not
-        // repeat the whole-catalog load. A historical materializer binds the
-        // entry to its historical root and therefore cannot be reused by a
-        // different current root.
-        self.retain_accepted_document(
-            root,
-            catalog_dependencies.clone(),
-            catalog_dependencies.causal_state_digest(),
-            &catalog,
-        );
+        let graph_key = DocumentKey::Entity(self.catalog_document_id);
+        // The workspace graph document is fixed-schema, so this authenticates
+        // the workspace identity binding for the whole rebuild in one bounded
+        // read. Nothing about a page is learned here: page state, membership
+        // and blocks are each read from their own document per chunk.
+        //
+        // An accepted history that never wrote workspace metadata has no graph
+        // document at all — a pure replay receiver is the ordinary case. That
+        // is absence, not damage: requiring a document with no operations
+        // would refuse a complete history over metadata nobody authored.
+        let graph_loads = match self.accepted_frontier_document(root, graph_key)? {
+            Some(_) => {
+                let (graph_dependencies, graph) = self
+                    .load_documents_at_authenticated_root_many(root, &[graph_key])?
+                    .remove(&graph_key)
+                    .ok_or(EngineError::MissingDocument(graph_key))?;
+                match snapshot_document(self.catalog_document_id, graph_key, &graph)? {
+                    SemanticDocumentSnapshot::Graph => {}
+                    _ => {
+                        return Err(malformed(
+                            graph_key,
+                            "workspace graph document is missing its graph state",
+                        ));
+                    }
+                }
+                // Bootstrap/rebuild already paid for and authenticated this
+                // document. Publish it into the engine's one-entry retained
+                // accepted document so the first ordinary derivative after
+                // activation does not repeat the load. A historical
+                // materializer binds the entry to its historical root and
+                // therefore cannot be reused by a different current root.
+                self.retain_accepted_document(
+                    root,
+                    graph_dependencies.clone(),
+                    graph_dependencies.causal_state_digest(),
+                    &graph,
+                );
+                1
+            }
+            None => 0,
+        };
         Ok(CleanProjectionBulkMaterializer {
             engine: self,
             root: root.clone(),
             current_claim_root_proven,
             rebuild_claim_source,
-            catalog,
-            catalog_dependencies,
-            exact_document_loads: Cell::new(1),
+            exact_document_loads: Cell::new(graph_loads),
             projection_claim_resolutions: Cell::new(CleanProjectionClaimResolutionStats::default()),
         })
     }
@@ -9887,8 +10538,7 @@ impl ShardedHotEngine {
             kind: stored.kind,
             accepted_name_digest: stored.accepted_name_digest,
         };
-        let validated = self.validated_current_catalog_window(&mut None)?;
-        self.validate_current_path_catalog_row(validated, &row)?;
+        self.validate_current_path_catalog_row(&row)?;
         if row.path != *path {
             return Err(EngineError::Archive(
                 "current-path point row is misbound to its exact path".into(),
@@ -9927,10 +10577,6 @@ impl ShardedHotEngine {
         };
         let mut page_bytes = 0_usize;
         let mut last = None;
-        // The catalog document's shape proof is row-independent and costs one
-        // catalog-sized read, so this bounded page establishes it at most once
-        // and only when it actually has a row to authenticate.
-        let mut catalog_window = None;
         while rows.len() < limit {
             let Some((page_id, stored)) = range.next() else {
                 break;
@@ -9949,8 +10595,7 @@ impl ShardedHotEngine {
                     "current-path cursor path for {page_id} is {path_bytes} bytes, bound {MAX_CURRENT_PATH_CURSOR_PATH_BYTES}"
                 )));
             }
-            let validated = self.validated_current_catalog_window(&mut catalog_window)?;
-            self.validate_current_path_catalog_row(validated, &row)?;
+            self.validate_current_path_catalog_row(&row)?;
             page_bytes = page_bytes.checked_add(path_bytes).ok_or_else(|| {
                 EngineError::Archive("current-path cursor page-byte counter overflow".into())
             })?;
@@ -9964,16 +10609,12 @@ impl ShardedHotEngine {
         }
         let has_more = match range.next() {
             Some((page_id, stored)) => {
-                let validated = self.validated_current_catalog_window(&mut catalog_window)?;
-                self.validate_current_path_catalog_row(
-                    validated,
-                    &CurrentPathCatalogRow {
-                        page_id: *page_id,
-                        path: stored.path.clone(),
-                        kind: stored.kind,
-                        accepted_name_digest: stored.accepted_name_digest,
-                    },
-                )?;
+                self.validate_current_path_catalog_row(&CurrentPathCatalogRow {
+                    page_id: *page_id,
+                    path: stored.path.clone(),
+                    kind: stored.kind,
+                    accepted_name_digest: stored.accepted_name_digest,
+                })?;
                 true
             }
             None => false,
@@ -10006,11 +10647,6 @@ impl ShardedHotEngine {
         if !self.current_path_catalog.available {
             return Err(EngineError::Archive(
                 "current-path catalog authenticated authority is unavailable".into(),
-            ));
-        }
-        if self.current_path_catalog.rows.len() > MAX_DOCUMENT_ENTRIES {
-            return Err(EngineError::Archive(
-                "current-path catalog entry bound exceeded".into(),
             ));
         }
         Ok(CurrentPathCursorBinding {
@@ -10133,28 +10769,31 @@ impl ShardedHotEngine {
         Ok(state)
     }
 
-    /// The accepted catalog document and its shape proof for one bounded read
-    /// window, established at most once per window and only on first use.
-    fn validated_current_catalog_window<'engine>(
-        &'engine self,
-        window: &mut Option<ValidatedCatalogDocument<'engine>>,
-    ) -> Result<ValidatedCatalogDocument<'engine>, EngineError> {
-        if let Some(established) = *window {
-            return Ok(established);
+    /// One page's accepted state, read from the page's own visible document.
+    ///
+    /// The previous layout answered this from the single catalog document, so
+    /// every reader had to prove that whole document's shape first. A page's
+    /// state now lives in the page's own fixed-schema document, so the read is
+    /// bounded by the one page it names.
+    fn visible_page_state(&self, page_id: PageId) -> Result<Option<PageState>, EngineError> {
+        let Some(page_document_id) = self.accepted_page_home(page_id) else {
+            return Ok(None);
+        };
+        let key = DocumentKey::Entity(page_document_id);
+        if let Some(document) = self.visible_documents.get(&key) {
+            return read_page_state(key, document);
         }
-        let catalog = self.current_catalog_document()?.ok_or_else(|| {
-            EngineError::Archive(
-                "current-path catalog row has no accepted catalog page state".into(),
-            )
-        })?;
-        let established = validate_catalog_document(self.catalog_document_id, catalog)?;
-        *window = Some(established);
-        Ok(established)
+        // A clean lazy-genesis page is addressed by the accepted birth index
+        // long before its own document becomes resident, and a resident
+        // document can also be evicted after an edit. The shared point loader
+        // resolves both from accepted authority, so an accepted page is never
+        // reported as absent merely because it is not in memory.
+        let document = self.clone_visible_document(key, 1)?;
+        read_page_state(key, &document)
     }
 
     fn validate_current_path_catalog_row(
         &self,
-        validated_catalog: ValidatedCatalogDocument<'_>,
         row: &CurrentPathCatalogRow,
     ) -> Result<(), EngineError> {
         let key = row.path.portable_key().digest();
@@ -10170,7 +10809,7 @@ impl ShardedHotEngine {
             ));
         }
         let catalog_started = std::time::Instant::now();
-        let state = read_validated_catalog_page(validated_catalog, row.page_id)?;
+        let state = self.visible_page_state(row.page_id)?;
         record_cursor_probe(|probe| &mut probe.catalog_state_micros, catalog_started);
         let Some(PageState::Live {
             name, path, kind, ..
@@ -10241,7 +10880,7 @@ impl ShardedHotEngine {
     pub fn accepted_frontier_document(
         &self,
         root: &AcceptedFrontierRoot,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<Option<DocumentDependencies>, EngineError> {
         self.ensure_not_blocked()?;
         validate_accepted_frontier_root(root)?;
@@ -10279,7 +10918,7 @@ impl ShardedHotEngine {
     fn lazy_genesis_frontier_document(
         &self,
         root: &AcceptedFrontierRoot,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Option<DocumentDependencies> {
         let binding = root.genesis()?;
         let candidate = self.lazy_genesis.as_ref()?;
@@ -10291,7 +10930,7 @@ impl ShardedHotEngine {
     fn accepted_frontier_documents_many_authenticated(
         &self,
         root: &AcceptedFrontierRoot,
-        document_ids: &[DocumentId],
+        document_ids: &[DocumentKey],
     ) -> Result<Vec<Option<DocumentDependencies>>, EngineError> {
         validate_accepted_frontier_root(root)?;
         if document_ids.is_empty() {
@@ -10345,8 +10984,8 @@ impl ShardedHotEngine {
     fn load_documents_at_authenticated_root_many(
         &self,
         root: &AcceptedFrontierRoot,
-        document_ids: &[DocumentId],
-    ) -> Result<BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>, EngineError> {
+        document_ids: &[DocumentKey],
+    ) -> Result<BTreeMap<DocumentKey, (DocumentDependencies, LoroDoc)>, EngineError> {
         if document_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -10433,7 +11072,7 @@ impl ShardedHotEngine {
     fn load_document_at_accepted_frontier(
         &self,
         root: &AcceptedFrontierRoot,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<Option<LoroDoc>, EngineError> {
         let Some(dependencies) = self.accepted_frontier_document(root, document_id)? else {
             return Ok(None);
@@ -10483,7 +11122,6 @@ impl ShardedHotEngine {
             exact_document_loads: 0,
             exact_catalog_loads: 0,
             exact_catalog_decodes: 0,
-            catalog_shape_proven: false,
         })
     }
 
@@ -10495,51 +11133,41 @@ impl ShardedHotEngine {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
         let reads_before = self.archive_read_stats();
-        let Some(catalog) =
-            self.load_document_at_accepted_frontier(root, self.catalog_document_id)?
-        else {
+        // The page's own document, its current members' documents and the one
+        // membership document per pair. No graph-sized document is read.
+        let Some(page_document_id) = self.accepted_page_home(page_id) else {
             return Ok(None);
         };
-        let Some(page_state) = validate_catalog_page(self.catalog_document_id, &catalog, page_id)?
-        else {
+        let page_key = DocumentKey::Entity(page_document_id);
+        let Some(page_document) = self.load_document_at_accepted_frontier(root, page_key)? else {
             return Ok(None);
         };
-        let PageState::Live {
-            home_document_id: page_document_id,
-            ..
-        } = page_state
-        else {
+        let Some(PageState::Live { .. }) = read_page_state(page_key, &page_document)? else {
             return Ok(None);
         };
-        let page_document = self
-            .load_document_at_accepted_frontier(root, page_document_id)?
-            .ok_or(EngineError::MissingDocument(page_document_id))?;
-        validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
-        if shard_page_id(&page_document)? != Some(page_id) {
-            return Err(EngineError::MalformedDocument {
-                document_id: page_document_id,
-                reason: "membership shard page identity mismatch".into(),
-            });
-        }
-        let members = read_memberships(page_document_id, &page_document)?;
-        let mut documents = BTreeMap::from([
-            (self.catalog_document_id, catalog),
-            (page_document_id, page_document),
-        ]);
-        for home_document_id in members
+        let members = self.accepted_page_members(page_id);
+        let mut documents = BTreeMap::from([(page_key, page_document)]);
+        for document_id in members
             .values()
-            .map(|claim| claim.home_document_id)
+            .copied()
+            .map(DocumentKey::Entity)
+            .chain(members.values().map(|block_document_id| {
+                membership_document_id(*block_document_id, page_document_id)
+            }))
             .collect::<BTreeSet<_>>()
         {
-            if documents.contains_key(&home_document_id) {
+            if documents.contains_key(&document_id) {
                 continue;
             }
-            let home = self
-                .load_document_at_accepted_frontier(root, home_document_id)?
-                .ok_or(EngineError::MissingDocument(home_document_id))?;
-            documents.insert(home_document_id, home);
+            let document = self
+                .load_document_at_accepted_frontier(root, document_id)?
+                .ok_or(EngineError::MissingDocument(document_id))?;
+            documents.insert(document_id, document);
         }
-        let mut page = self.materialize_page_from_documents(page_id, &documents)?;
+        let mut page =
+            self.materialize_page_in_catalog_window(None, page_id, &members, |document_id| {
+                documents.get(&document_id)
+            })?;
         let reads_after = self.archive_read_stats();
         page.stats.physical_manifest_reads = reads_after
             .manifest_reads
@@ -10582,11 +11210,11 @@ impl ShardedHotEngine {
         batch_id: BatchId,
         precomputed_event_binding_digest: Option<ContentDigest>,
         updates: &D,
-        replacements: &BTreeMap<DocumentId, EngineDocument>,
-        replacement_heads: &BTreeMap<DocumentId, BTreeSet<BatchId>>,
+        replacements: &BTreeMap<DocumentKey, EngineDocument>,
+        replacement_heads: &BTreeMap<DocumentKey, BTreeSet<BatchId>>,
     ) -> Result<
         (
-            BTreeMap<DocumentId, DocumentDependencies>,
+            BTreeMap<DocumentKey, DocumentDependencies>,
             AcceptedBatchEvidence,
             AcceptedFrontierTipTransition,
         ),
@@ -10672,7 +11300,7 @@ impl ShardedHotEngine {
                 .values()
                 .map(|document| {
                     Ok((
-                        document.document_id().as_uuid().into_bytes(),
+                        document.document_id().authenticated_map_key(),
                         ContentDigest::of(&encode_accepted_document(document)?),
                     ))
                 })
@@ -10706,10 +11334,11 @@ impl ShardedHotEngine {
             clock_root_key,
             clock_root_digest,
         );
-        let candidate_batch_root = self
-            .ephemeral_accepted_batch_root
-            .with_upserts([(batch_id.as_uuid().into_bytes(), causal_record_digest)]);
-        let batch_map_root_key = candidate_batch_root.root_key();
+        let candidate_batch_root = self.ephemeral_accepted_batch_root.with_upserts([(
+            AuthenticatedMapKey::from(batch_id.as_uuid().into_bytes()),
+            causal_record_digest,
+        )]);
+        let batch_map_root_key = uuid_domain_map_root_key(candidate_batch_root.root_key())?;
         let batch_map_root_digest = candidate_batch_root.root_digest();
         let affected_documents = changed_documents.values().cloned().collect::<Vec<_>>();
         let retained_bytes = accepted_batch_retained_bytes(&self.archive[&batch_id])?;
@@ -10740,7 +11369,7 @@ impl ShardedHotEngine {
 
     fn commit_acceptance_evidence(
         &mut self,
-        post_documents: BTreeMap<DocumentId, DocumentDependencies>,
+        post_documents: BTreeMap<DocumentKey, DocumentDependencies>,
         evidence: AcceptedBatchEvidence,
         tip_transition: AcceptedFrontierTipTransition,
     ) {
@@ -10799,13 +11428,15 @@ impl ShardedHotEngine {
             .insert(evidence.acceptance_sequence, checkpoint_required_objects);
         self.ephemeral_accepted_batch_entries
             .insert(evidence.batch_id, record_digest);
-        self.ephemeral_accepted_batch_root
-            .upsert(evidence.batch_id.as_uuid().into_bytes(), record_digest);
+        self.ephemeral_accepted_batch_root.upsert(
+            AuthenticatedMapKey::from(evidence.batch_id.as_uuid().into_bytes()),
+            record_digest,
+        );
         for document in post_documents.values() {
             let encoded = encode_accepted_document(document)
                 .expect("accepted inline document was encoded during preparation");
             self.ephemeral_accepted_document_root.upsert(
-                document.document_id().as_uuid().into_bytes(),
+                document.document_id().authenticated_map_key(),
                 ContentDigest::of(&encoded),
             );
         }
@@ -10818,8 +11449,8 @@ impl ShardedHotEngine {
             evidence.post_frontier_root.document_map_root_digest
         );
         debug_assert_eq!(
-            self.ephemeral_accepted_batch_root.root_key(),
-            evidence.post_frontier_root.batch_map_root_key
+            uuid_domain_map_root_key(self.ephemeral_accepted_batch_root.root_key()).ok(),
+            Some(evidence.post_frontier_root.batch_map_root_key)
         );
         debug_assert_eq!(
             self.ephemeral_accepted_batch_root.root_digest(),
@@ -10864,8 +11495,9 @@ impl ShardedHotEngine {
             None
         } else {
             Some(
-                prospective_catalog_pages
-                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
+                prospective_catalog_pages.ok_or(EngineError::MissingDocument(
+                    DocumentKey::Entity(self.catalog_document_id),
+                ))?,
             )
         };
         let mut desired = BTreeMap::<PageId, Option<CurrentPathCatalogStoredRow>>::new();
@@ -10917,18 +11549,256 @@ impl ShardedHotEngine {
                 }
             }
         }
-        if rows.len() > MAX_DOCUMENT_ENTRIES {
-            return Err(EngineError::Archive(
-                "current-path catalog entry bound exceeded".into(),
-            ));
+        let mut page_homes = self.current_path_catalog.page_homes.clone();
+        for delta in effect.pages() {
+            // Identity is recorded once, at the page's own birth, and never
+            // withdrawn: a tombstoned page keeps its document so a later
+            // revive addresses the same one.
+            let Some(after) = delta.after.as_ref() else {
+                continue;
+            };
+            match page_homes.get(&delta.page_id) {
+                None => {
+                    page_homes.insert(delta.page_id, after.home_document_id());
+                }
+                Some(existing) => {
+                    if *existing != after.home_document_id() {
+                        return Err(EngineError::Archive(format!(
+                            "accepted page {} changed its immutable document",
+                            delta.page_id
+                        )));
+                    }
+                }
+            }
+        }
+        let mut page_members = self.current_path_catalog.page_members.clone();
+        for delta in effect.blocks() {
+            // Owner transitions are the authority for membership of the live
+            // page, so both sides of a move are applied here even when the
+            // destination page is deleted and even when the batch carried no
+            // membership delta for the losing pair.
+            let before_owner = delta.before.as_ref().map(|state| state.owner);
+            let after_owner = delta.after.as_ref().map(|state| state.owner);
+            if before_owner == after_owner {
+                continue;
+            }
+            if let Some(BlockOwner::Page(page_id)) = before_owner {
+                if let Some(members) = page_members.get_mut(&page_id) {
+                    members.remove(&delta.block_id);
+                    if members.is_empty() {
+                        page_members.remove(&page_id);
+                    }
+                }
+            }
+            if let Some(BlockOwner::Page(page_id)) = after_owner {
+                let mut members = page_members.get(&page_id).cloned().unwrap_or_default();
+                members.insert(delta.block_id, delta.home_document_id);
+                page_members.insert(page_id, members);
+            }
         }
         Ok(CurrentPathCatalogTransition {
             catalog: CurrentPathCatalog {
                 rows,
+                page_homes,
+                page_members,
                 available: true,
                 accepted_frontier_root,
             },
         })
+    }
+
+    /// The immutable document of one accepted page, live or deleted.
+    fn accepted_page_home(&self, page_id: PageId) -> Option<DocumentId> {
+        self.current_path_catalog
+            .available
+            .then(|| self.current_path_catalog.page_homes.get(&page_id).copied())
+            .flatten()
+    }
+
+    /// The blocks whose accepted owner is this page, with their own documents.
+    fn accepted_page_members(&self, page_id: PageId) -> BTreeMap<BlockId, DocumentId> {
+        if !self.current_path_catalog.available {
+            return BTreeMap::new();
+        }
+        // Only the requested page's own members are materialized; unrelated
+        // pages are never walked or copied.
+        self.current_path_catalog
+            .page_members
+            .get(&page_id)
+            .map(ordered_rows)
+            .unwrap_or_default()
+    }
+
+    /// Page births and current-owner ranges at one authenticated accepted root.
+    ///
+    /// The ordinary/current path returns the persistent acceptance indexes
+    /// directly. Historical materialization is a distinct recovery/build path:
+    /// it replays the already authenticated semantic-effect prefix once while
+    /// retaining rows only for the requested pages. That keeps current saves
+    /// and moves free of graph/history walks while avoiding the invalid mix of
+    /// historical document bytes with the engine's current owner index.
+    fn accepted_page_indexes_at_root(
+        &self,
+        root: &AcceptedFrontierRoot,
+        page_ids: &BTreeSet<PageId>,
+    ) -> Result<
+        (
+            BTreeMap<PageId, DocumentId>,
+            BTreeMap<PageId, BTreeMap<BlockId, DocumentId>>,
+        ),
+        EngineError,
+    > {
+        if root == &self.accepted_frontier_root {
+            let homes = page_ids
+                .iter()
+                .filter_map(|page_id| {
+                    self.accepted_page_home(*page_id)
+                        .map(|home| (*page_id, home))
+                })
+                .collect();
+            let members = page_ids
+                .iter()
+                .map(|page_id| (*page_id, self.accepted_page_members(*page_id)))
+                .collect();
+            return Ok((homes, members));
+        }
+
+        self.authenticate_accepted_frontier_root(root)?;
+        let mut homes = BTreeMap::new();
+        let mut members = page_ids
+            .iter()
+            .map(|page_id| (*page_id, BTreeMap::new()))
+            .collect::<BTreeMap<_, _>>();
+        let mut candidate_blocks = BTreeMap::<BlockId, DocumentId>::new();
+
+        if let (Some(binding), Some(candidate)) = (root.genesis(), self.lazy_genesis.as_ref()) {
+            if candidate
+                .frontier_binding()
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                == binding
+            {
+                for page_id in page_ids {
+                    let Some(page) = candidate
+                        .page(*page_id)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?
+                    else {
+                        continue;
+                    };
+                    homes.insert(*page_id, page.home_document_id);
+                    for block in page.blocks {
+                        candidate_blocks.insert(block.block_id, block.home_document_id);
+                    }
+                }
+            }
+        }
+
+        for sequence in 1..=root.acceptance_sequence() {
+            let (batch_id, evidence) =
+                self.accepted_batch_entry_at(sequence)?.ok_or_else(|| {
+                    EngineError::Archive(format!(
+                    "accepted sequence {sequence} is absent during historical page-index replay"
+                ))
+                })?;
+            if evidence.is_none() {
+                return Err(EngineError::Archive(format!(
+                    "accepted sequence {sequence} has no retained semantic evidence"
+                )));
+            }
+            let batch = self.load_accepted_validated_batch(batch_id)?;
+            let effect = self.accepted_semantic_effect(&batch)?;
+
+            for delta in effect.pages() {
+                if !page_ids.contains(&delta.page_id) {
+                    continue;
+                }
+                let Some(after) = delta.after.as_ref() else {
+                    continue;
+                };
+                match homes.get(&delta.page_id) {
+                    None => {
+                        homes.insert(delta.page_id, after.home_document_id());
+                    }
+                    Some(existing) if *existing == after.home_document_id() => {}
+                    Some(_) => {
+                        return Err(EngineError::Archive(format!(
+                            "accepted page {} changed its immutable document during historical replay",
+                            delta.page_id
+                        )));
+                    }
+                }
+            }
+
+            for delta in effect.blocks() {
+                let touches_requested_page = delta
+                    .before
+                    .iter()
+                    .chain(delta.after.iter())
+                    .filter_map(|state| match state.owner {
+                        BlockOwner::Page(page_id) => Some(page_id),
+                        BlockOwner::Tombstone => None,
+                    })
+                    .any(|page_id| page_ids.contains(&page_id));
+                if !touches_requested_page {
+                    continue;
+                }
+                match candidate_blocks.get(&delta.block_id) {
+                    None => {
+                        candidate_blocks.insert(delta.block_id, delta.home_document_id);
+                    }
+                    Some(existing) if *existing == delta.home_document_id => {}
+                    Some(_) => {
+                        return Err(EngineError::Archive(format!(
+                            "accepted block {} changed its immutable document during historical replay",
+                            delta.block_id
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Authored effects above are only a complete candidate census. They
+        // are not effective owner authority: concurrent moves can both claim
+        // different destinations while native Loro merging selects exactly
+        // one. Resolve every candidate's merged block register at this root
+        // before populating the page inverse.
+        let candidate_keys = candidate_blocks
+            .values()
+            .copied()
+            .map(DocumentKey::Entity)
+            .collect::<Vec<_>>();
+        let documents = self.load_documents_at_authenticated_root_many(root, &candidate_keys)?;
+        for (block_id, home_document_id) in candidate_blocks {
+            let key = DocumentKey::Entity(home_document_id);
+            let (_, document) = documents
+                .get(&key)
+                .ok_or(EngineError::MissingDocument(key))?;
+            let state = read_block_state(key, document)?
+                .ok_or_else(|| malformed(key, "accepted block candidate has no block state"))?;
+            if state.block_id != block_id || state.home_document_id != home_document_id {
+                return Err(malformed(
+                    key,
+                    "accepted block candidate disagrees with immutable identity evidence",
+                ));
+            }
+            if let BlockOwner::Page(page_id) = state.owner {
+                if let Some(page_members) = members.get_mut(&page_id) {
+                    page_members.insert(block_id, home_document_id);
+                }
+            }
+        }
+        Ok((homes, members))
+    }
+
+    /// Every membership document addressing this page's current members.
+    fn accepted_page_membership_documents(
+        &self,
+        page_id: PageId,
+        page_document_id: DocumentId,
+    ) -> Vec<DocumentKey> {
+        self.accepted_page_members(page_id)
+            .into_values()
+            .map(|block_document_id| membership_document_id(block_document_id, page_document_id))
+            .collect()
     }
 
     fn current_path_catalog_row_from_post_transition_authority(
@@ -10966,11 +11836,7 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
     ) -> Result<Option<(CurrentPathCatalogStoredRow, super::PageNameKeyDigest)>, EngineError> {
-        let Some(catalog) = self.current_catalog_document()? else {
-            return Ok(None);
-        };
-        let Some(mut state) = validate_catalog_page(self.catalog_document_id, catalog, page_id)?
-        else {
+        let Some(mut state) = self.visible_page_state(page_id)? else {
             return Ok(None);
         };
         let mut effective_key = None;
@@ -11042,7 +11908,7 @@ impl ShardedHotEngine {
     fn prepare_crdt_lane_ownership(
         &self,
         manifest: &OperationBatch,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
     ) -> Result<AdmittedWriterBindings, EngineError> {
         // The causal identity question is asked for EVERY origin, including
         // bootstrap: a delivered batch may not merge its dots into another
@@ -11167,7 +12033,7 @@ impl ShardedHotEngine {
     #[cfg(test)]
     pub(crate) fn accepted_document_version_vector_for_test(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<BTreeMap<u64, i32>, EngineError> {
         let document = self.clone_current_hot_document(document_id, 1)?;
         Ok(document
@@ -11185,7 +12051,7 @@ impl ShardedHotEngine {
     #[cfg(test)]
     pub(crate) fn accepted_document_peer_ids_for_test(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<Vec<CrdtPeerId>, EngineError> {
         let document = self.clone_current_hot_document(document_id, 1)?;
         Ok(document
@@ -11320,7 +12186,7 @@ impl ShardedHotEngine {
 
     fn accepted_document_dependencies(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<Option<DocumentDependencies>, EngineError> {
         Ok(self.accepted_frontier.get(&document_id).cloned())
     }
@@ -11385,7 +12251,12 @@ impl ShardedHotEngine {
         name: &LogicalPageName,
     ) -> Result<Option<PageId>, EngineError> {
         self.ensure_not_blocked()?;
-        Ok(self.ephemeral_page_names.resolve_current(name.key_digest()))
+        let key = name.key_digest();
+        Ok(if self.local_overlay.page_names.contains_key(key) {
+            self.local_overlay.page_names.resolve_current(key)
+        } else {
+            self.ephemeral_page_names.resolve_current(key)
+        })
     }
 
     pub fn resolve_reference_page_name(
@@ -11405,7 +12276,28 @@ impl ShardedHotEngine {
     ) -> Result<Option<PageId>, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        Ok(self.ephemeral_page_names.resolve_current(name.key_digest()))
+        let key = name.key_digest();
+        Ok(if self.local_overlay.page_names.contains_key(key) {
+            self.local_overlay.page_names.resolve_current(key)
+        } else {
+            self.ephemeral_page_names.resolve_current(key)
+        })
+    }
+
+    /// Whether accepted or journal-local history carries an authoritative
+    /// point for this canonical name. A released local point deliberately
+    /// counts: it masks the older accepted/SQLite owner until derivatives
+    /// catch up, whereas operation-free genesis has no point and may consult
+    /// its exact-frontier SQLite index.
+    pub(crate) fn page_name_point_is_known(
+        &self,
+        name: &LogicalPageName,
+    ) -> Result<bool, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let key = name.key_digest();
+        Ok(self.local_overlay.page_names.contains_key(key)
+            || self.ephemeral_page_names.contains_key(key))
     }
 
     pub fn page_name_conflicts(&self) -> Vec<PageNameConflictEvidenceV1> {
@@ -11726,14 +12618,14 @@ impl ShardedHotEngine {
             .borrow_mut()
             .take()
             .expect("matching pending author documents exist");
-        // A rendered page can borrow blocks from several immutable home
-        // documents. Admit each retained outcome only when its complete
-        // projection frontier (catalog, membership shard, and every borrowed
-        // home) still names the exact causal documents in the accepted root.
-        // A concurrent edit to any support document therefore becomes a cache
-        // miss even when this batch's own changed document is still exact.
-        // Absent outcomes carry no projection frontier, so deletion continues
-        // through immutable accepted-root materialization.
+        // A rendered page reads its own document, every current member's own
+        // document and each pair's membership document. Admit a retained
+        // outcome only when its complete projection frontier names exactly
+        // those documents and each one still matches the accepted root's
+        // causal document. A concurrent edit to any of them therefore becomes
+        // a cache miss even when this batch's own changed document is still
+        // exact. Absent outcomes carry no projection frontier, so deletion
+        // continues through immutable accepted-root materialization.
         let outcomes = if matches!(disposition, BatchDisposition::Accepted { .. }) {
             pending
                 .projection_outcomes
@@ -11741,16 +12633,17 @@ impl ShardedHotEngine {
                 .filter_map(|(page_id, outcome)| {
                     let state = outcome?;
                     let frontier = state.frontier.documents();
-                    let contains_required_documents =
-                        [self.catalog_document_id, state.page.home_document_id]
-                            .into_iter()
-                            .all(|required| {
-                                frontier
-                                    .binary_search_by_key(&required, |document| {
-                                        document.document_id()
-                                    })
-                                    .is_ok()
-                            });
+                    let contains_required_documents = projection_page_document_ids(
+                        &state.page,
+                        &state.claim_evidence,
+                    )
+                    .is_ok_and(|required| {
+                        required.into_iter().all(|required| {
+                            frontier
+                                .binary_search_by_key(&required, |document| document.document_id())
+                                .is_ok()
+                        })
+                    });
                     let exact = contains_required_documents
                         && frontier.iter().all(|expected| {
                             matches!(
@@ -12372,9 +13265,9 @@ impl ShardedHotEngine {
             {
                 return Err(ManagedLocalRecordError::StaleBase);
             }
-            if *document_id != self.catalog_document_id {
-                validate_shard(self.catalog_document_id, *document_id, document)?;
-            }
+            // Every recovered document is fixed-schema, so proving its shape
+            // and identity binding is a bounded read of its own registers.
+            snapshot_document(self.catalog_document_id, *document_id, document)?;
             update_bytes = update_bytes.saturating_add(update.raw_update.len());
             document_heads.insert(*document_id, BTreeSet::from([manifest.batch_id()]));
         }
@@ -12542,6 +13435,22 @@ impl ShardedHotEngine {
                 ),
             ));
         }
+        // Prepare the name transition against the prefix that existed before
+        // this record. Fixed-layout page documents are installed below; doing
+        // that first would make a newly created page look like its own prior
+        // owner and erase the journal-local name transition.
+        let page_names = self
+            .managed_local_page_name_candidate(&record)
+            .map_err(ManagedLocalRecordError::Engine)?;
+        if page_names
+            .as_ref()
+            .is_some_and(|candidate| !candidate.conflicts.is_empty())
+        {
+            return Err(ManagedLocalRecordError::Engine(EngineError::InvalidTransaction(
+                "managed-local record would create a page-name conflict against the journal-durable prefix"
+                    .into(),
+            )));
+        }
         let causal_clock = self
             .derive_inline_causal_clock(manifest.causal_dot(), manifest.causal_dependency_heads())
             .map_err(ManagedLocalRecordError::Engine)?;
@@ -12581,18 +13490,6 @@ impl ShardedHotEngine {
         // shutdown. Refusing here leaves the record un-applied and the store
         // openable; the alternative is publishing a manifest whose page-name
         // transition acceptance will reject (I-10/I-8).
-        let page_names = self
-            .managed_local_page_name_candidate(&record)
-            .map_err(ManagedLocalRecordError::Engine)?;
-        if page_names
-            .as_ref()
-            .is_some_and(|candidate| !candidate.conflicts.is_empty())
-        {
-            return Err(ManagedLocalRecordError::Engine(EngineError::InvalidTransaction(
-                "managed-local record would create a page-name conflict against the journal-durable prefix"
-                    .into(),
-            )));
-        }
         self.local_overlay.portable_path_root = portable_paths.root;
         self.local_overlay
             .portable_paths
@@ -12690,7 +13587,7 @@ impl ShardedHotEngine {
         &self,
         manifest: &OperationBatch,
         effect: &SemanticEffect,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
         page_ids: &BTreeSet<PageId>,
         expected_pre_frontier: &FrontierV2,
     ) -> Result<ValidatedManagedLocalCandidate, ManagedLocalRecordError> {
@@ -12744,19 +13641,6 @@ impl ShardedHotEngine {
         let mut pre_dependencies = Vec::new();
         let mut post_heads = BTreeMap::new();
         let mut update_bytes = 0_usize;
-        let created_page_documents = effect
-            .pages()
-            .iter()
-            .filter_map(|delta| match (&delta.before, &delta.after) {
-                (
-                    None,
-                    Some(PageState::Live {
-                        home_document_id, ..
-                    }),
-                ) => Some(*home_document_id),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
         let expected_batch_heads = expected_pre_frontier
             .documents()
             .iter()
@@ -12765,16 +13649,32 @@ impl ShardedHotEngine {
             .into_iter()
             .collect::<Vec<_>>();
         for (document_id, update) in updates {
-            let before = if created_page_documents.contains(document_id) {
-                LoroDoc::new()
-            } else {
-                self.clone_current_hot_document(*document_id, 1)?
+            // The author omits every newly born document from the pre-frontier,
+            // regardless of role. In particular a move can create a
+            // Membership document whose causal witness is `None`; trying to
+            // manufacture `DocumentDependencies` for its empty Loro base is
+            // non-canonical and differs from the durable author record.
+            let dependencies = match self.current_hot_document_dependencies_by_id(*document_id) {
+                Ok(dependencies) => Some(dependencies),
+                Err(EngineError::MissingDocument(missing)) if missing == *document_id => None,
+                Err(error) => return Err(ManagedLocalRecordError::Engine(error)),
             };
-            let dependencies = self.current_hot_document_dependencies(*document_id, &before)?;
+            let before = if dependencies.is_some() {
+                self.clone_current_hot_document(*document_id, 1)?
+            } else {
+                LoroDoc::new()
+            };
+            let dependency_heads = dependencies
+                .as_ref()
+                .map(DocumentDependencies::direct_dependency_heads)
+                .unwrap_or_default();
+            let causal_state_digest = dependencies
+                .as_ref()
+                .map(DocumentDependencies::causal_state_digest);
             if update.batch_id != manifest.batch_id()
                 || update.document_id != *document_id
-                || update.dependency_heads != dependencies.direct_dependency_heads()
-                || update.causal_state_digest != Some(dependencies.causal_state_digest())
+                || update.dependency_heads != dependency_heads
+                || update.causal_state_digest != causal_state_digest
                 || update.batch_dependency_heads != expected_batch_heads
             {
                 return Err(ManagedLocalRecordError::StaleBase);
@@ -12791,20 +13691,30 @@ impl ShardedHotEngine {
                 &after,
                 std::slice::from_ref(&update.raw_update),
             )?;
-            let prior_page = if *document_id == self.catalog_document_id {
-                None
-            } else {
-                shard_page_id(&before)?
-            };
-            if *document_id != self.catalog_document_id {
-                validate_shard(self.catalog_document_id, *document_id, &after)?;
-                validate_immutable_shard_identity(*document_id, prior_page, &after)?;
-            }
+            let prior_identity = document_identity(*document_id, &before)?;
+            snapshot_document(self.catalog_document_id, *document_id, &after)?;
+            validate_immutable_document_identity(*document_id, prior_identity.as_ref(), &after)?;
             update_bytes = update_bytes.saturating_add(update.raw_update.len());
-            pre_dependencies.push(dependencies);
+            pre_dependencies.extend(dependencies);
             before_documents.insert(*document_id, before);
             after_documents.insert(*document_id, after);
             post_heads.insert(*document_id, BTreeSet::from([manifest.batch_id()]));
+        }
+        // Block-birth authority can add an authenticated read-only page
+        // dependency. It has no CRDT update, but replay must still prove that
+        // exact declared frontier entry against current accepted/journal state.
+        for declared in expected_pre_frontier
+            .documents()
+            .iter()
+            .filter(|declared| !updates.contains_key(&declared.document_id()))
+        {
+            let actual = self
+                .current_hot_document_dependencies_by_id(declared.document_id())
+                .map_err(ManagedLocalRecordError::Engine)?;
+            if &actual != declared {
+                return Err(ManagedLocalRecordError::StaleBase);
+            }
+            pre_dependencies.push(actual);
         }
         let actual_pre = FrontierV2::new(pre_dependencies).map_err(EngineError::from)?;
         if &actual_pre != expected_pre_frontier
@@ -12812,8 +13722,7 @@ impl ShardedHotEngine {
         {
             return Err(ManagedLocalRecordError::StaleBase);
         }
-        let before_snapshots =
-            snapshot_documents_with_validation(self.catalog_document_id, &before_documents, false)?;
+        let before_snapshots = snapshot_documents(self.catalog_document_id, &before_documents)?;
         let after_snapshots = snapshot_documents(self.catalog_document_id, &after_documents)?;
         compare_declared_effect_against_snapshots_with_catalog(
             effect,
@@ -12877,40 +13786,81 @@ impl ShardedHotEngine {
     fn materialize_hot_page_with_overrides(
         &self,
         page_id: PageId,
-        overrides: &BTreeMap<DocumentId, LoroDoc>,
+        overrides: &BTreeMap<DocumentKey, LoroDoc>,
     ) -> Result<MaterializedPage, EngineError> {
         let mut documents = BTreeMap::new();
-        let state = match overrides.get(&self.catalog_document_id) {
-            Some(catalog) => require_live_page(catalog, page_id)?,
-            None => self.current_hot_page_state(page_id)?,
-        };
-        let page_document_id = state.home_document_id();
-        let page_document = match overrides.get(&page_document_id) {
+        // The page's own document carries its state. A draft that touched it
+        // supplies the prospective copy; otherwise the visible one is read.
+        let page_document_id = self
+            .current_page_home_with_overrides(page_id, overrides)?
+            .ok_or(EngineError::PageNotFound(page_id))?;
+        let page_key = DocumentKey::Entity(page_document_id);
+        let page_document = match overrides.get(&page_key) {
             Some(document) => clone_doc(document, 1)?,
-            None => self.clone_current_hot_document(page_document_id, 1)?,
+            None => self.clone_current_hot_document(page_key, 1)?,
         };
-        let memberships = read_memberships(page_document_id, &page_document)?;
-        documents.insert(page_document_id, page_document);
-        for home_document_id in memberships
-            .values()
-            .map(|claim| claim.home_document_id)
-            .collect::<BTreeSet<_>>()
-        {
-            if documents.contains_key(&home_document_id) {
+        let state =
+            read_page_state(page_key, &page_document)?.ok_or(EngineError::PageNotFound(page_id))?;
+        if !matches!(state, PageState::Live { .. }) {
+            return Err(EngineError::PageDeleted(page_id));
+        }
+        documents.insert(page_key, page_document);
+        let members = self.prospective_page_members(page_id, overrides)?;
+        for document_id in page_projection_documents(page_document_id, &members) {
+            if documents.contains_key(&document_id) {
                 continue;
             }
-            let home = match overrides.get(&home_document_id) {
+            let document = match overrides.get(&document_id) {
                 Some(document) => clone_doc(document, 1)?,
-                None => self.clone_current_hot_document(home_document_id, 1)?,
+                None => self.clone_current_hot_document(document_id, 1)?,
             };
-            documents.insert(home_document_id, home);
+            documents.insert(document_id, document);
         }
         self.materialize_page_from_state(
             page_id,
             state,
+            &members,
             |document_id| documents.get(&document_id),
             0,
         )
+    }
+
+    /// One page's current members as a draft-in-progress sees them.
+    ///
+    /// The accepted current-owner range is overlaid with every block document
+    /// the draft touched, so a block the draft moved in or out is honoured
+    /// without enumerating the graph.
+    fn prospective_page_members(
+        &self,
+        page_id: PageId,
+        overrides: &BTreeMap<DocumentKey, LoroDoc>,
+    ) -> Result<BTreeMap<BlockId, DocumentId>, EngineError> {
+        let mut members = self.current_page_members(page_id)?;
+        for (document_id, document) in overrides {
+            let Some(block) = read_optional_block_state(*document_id, document)? else {
+                continue;
+            };
+            if block.owner == BlockOwner::Page(page_id) {
+                members.insert(block.block_id, semantic_home_document_id(*document_id)?);
+            } else {
+                members.remove(&block.block_id);
+            }
+        }
+        Ok(members)
+    }
+
+    /// One page's immutable document as a draft-in-progress sees it.
+    fn current_page_home_with_overrides(
+        &self,
+        page_id: PageId,
+        overrides: &BTreeMap<DocumentKey, LoroDoc>,
+    ) -> Result<Option<DocumentId>, EngineError> {
+        for (document_id, document) in overrides {
+            if document_page_id(*document_id, document)? == Some(page_id) {
+                return Ok(Some(semantic_home_document_id(*document_id)?));
+            }
+        }
+        self.current_page_home(page_id)
     }
 
     fn current_hot_page_state(&self, page_id: PageId) -> Result<PageState, EngineError> {
@@ -12921,14 +13871,72 @@ impl ShardedHotEngine {
         }
     }
 
-    fn current_hot_catalog_page_state(&self, page_id: PageId) -> Result<PageState, EngineError> {
-        if let Some(catalog) = self.local_overlay.documents.get(&self.catalog_document_id) {
-            return read_page_state(catalog, page_id)?.ok_or(EngineError::PageNotFound(page_id));
+    /// Point-local path lookup for a page visible through the accepted state
+    /// plus this process's durable foreground prefix. This deliberately reads
+    /// only the fixed page document; callers that only need to locate pending
+    /// projection bytes must not materialize the page's blocks or memberships.
+    pub(crate) fn current_live_page_path(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<ManagedPath>, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        match self.current_hot_page_state(page_id) {
+            Ok(PageState::Live { path, .. }) => Ok(Some(path)),
+            Ok(PageState::Tombstone { .. })
+            | Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
+            Err(error) => Err(error),
         }
-        let catalog = self
-            .current_catalog_document()?
+    }
+
+    fn current_hot_catalog_page_state(&self, page_id: PageId) -> Result<PageState, EngineError> {
+        let page_document_id = self
+            .current_page_home(page_id)?
             .ok_or(EngineError::PageNotFound(page_id))?;
-        read_page_state(&catalog, page_id)?.ok_or(EngineError::PageNotFound(page_id))
+        let key = DocumentKey::Entity(page_document_id);
+        if let Some(document) = self.local_overlay.documents.get(&key) {
+            return read_page_state(key, document)?.ok_or(EngineError::PageNotFound(page_id));
+        }
+        let document = self.clone_visible_document(key, 1)?;
+        read_page_state(key, &document)?.ok_or(EngineError::PageNotFound(page_id))
+    }
+
+    /// The immutable document of one page as this engine's live state sees it:
+    /// the accepted page-birth index, or a page this device created locally
+    /// and has committed durably but not yet had accepted.
+    ///
+    /// A tombstoned page keeps its entry, so revive addresses the same
+    /// document the deletion left behind.
+    fn current_page_home(&self, page_id: PageId) -> Result<Option<DocumentId>, EngineError> {
+        for (document_id, document) in &self.local_overlay.documents {
+            if document_page_id(*document_id, document)? == Some(page_id) {
+                return Ok(Some(semantic_home_document_id(*document_id)?));
+            }
+        }
+        Ok(self.accepted_page_home(page_id))
+    }
+
+    /// The blocks this page currently owns, with each block's own document.
+    ///
+    /// The accepted current-owner range is overlaid with the durable-local
+    /// records that are visible before acceptance. That overlay is bounded by
+    /// the pending local record set, never by the graph.
+    fn current_page_members(
+        &self,
+        page_id: PageId,
+    ) -> Result<BTreeMap<BlockId, DocumentId>, EngineError> {
+        let mut members = self.accepted_page_members(page_id);
+        for (document_id, document) in &self.local_overlay.documents {
+            let Some(state) = read_optional_block_state(*document_id, document)? else {
+                continue;
+            };
+            if state.owner == BlockOwner::Page(page_id) {
+                members.insert(state.block_id, semantic_home_document_id(*document_id)?);
+            } else {
+                members.remove(&state.block_id);
+            }
+        }
+        Ok(members)
     }
 
     /// Draft one transaction twice — once with the in-place prospective
@@ -13324,7 +14332,7 @@ impl ShardedHotEngine {
         page_id: PageId,
         origin: BatchOrigin,
         effect: &SemanticEffect,
-        before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+        before_snapshots: Option<&BTreeMap<DocumentKey, SemanticDocumentSnapshot>>,
         prepared_editor_projection: Option<&mut super::projection::PreparedEditorProjection>,
         claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
@@ -13401,7 +14409,7 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
         effect: &SemanticEffect,
-        before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+        before_snapshots: Option<&BTreeMap<DocumentKey, SemanticDocumentSnapshot>>,
         page: MaterializedPage,
         exact_base_matches: bool,
         accepted_target: &[u8],
@@ -13420,8 +14428,9 @@ impl ShardedHotEngine {
                 };
                 before.block_id != delta.block_id
                     || after.block_id != delta.block_id
-                    || before.home_document_id != page.home_document_id
-                    || after.home_document_id != page.home_document_id
+                    || before.home_document_id != delta.home_document_id
+                    || after.home_document_id != delta.home_document_id
+                    || delta.home_document_id == page.home_document_id
                     || before.owner != BlockOwner::Page(page_id)
                     || after.owner != BlockOwner::Page(page_id)
                     || before.logseq_uuid.is_some()
@@ -13431,7 +14440,7 @@ impl ShardedHotEngine {
                     || before.content == after.content
             })
             || page.blocks.iter().any(|block| {
-                block.home_document_id != page.home_document_id
+                block.home_document_id == page.home_document_id
                     || block.logseq_uuid.is_some()
                     || block.logseq_identity_origin.is_some()
             })
@@ -13444,44 +14453,48 @@ impl ShardedHotEngine {
         let Some(before_snapshots) = before_snapshots else {
             return Ok(None);
         };
-        if before_snapshots.len() != 1 || !before_snapshots.contains_key(&page.home_document_id) {
-            return Ok(None);
-        }
-        let Some(SemanticDocumentSnapshot::Shard {
-            page_id: Some(snapshot_page_id),
-            page_preamble,
-            blocks,
-            memberships,
-        }) = before_snapshots.get(&page.home_document_id)
-        else {
-            return Ok(None);
-        };
-        if *snapshot_page_id != page_id
-            || page_preamble
-                .as_ref()
-                .and_then(|preamble| preamble.preamble.as_deref())
-                != page.preamble.as_deref()
-            || blocks.len() != page.blocks.len()
-            || memberships.len() != page.blocks.len()
-            || page.blocks.iter().any(|block| {
-                let Some(state) = blocks.get(&block.block_id) else {
-                    return true;
-                };
-                let Some(membership) = memberships.get(&block.block_id) else {
-                    return true;
-                };
-                state.block_id != block.block_id
-                    || state.home_document_id != page.home_document_id
-                    || state.owner != BlockOwner::Page(page_id)
-                    || state.logseq_uuid != block.logseq_uuid
-                    || state.logseq_identity_origin != block.logseq_identity_origin
-                    || state.content != block.content
-                    || membership.home_document_id != page.home_document_id
-                    || membership.parent != block.parent
-                    || membership.order != block.order
-            })
+        // A content-only edit touches exactly the edited blocks' own
+        // documents. The page document and every pair are untouched, which is
+        // why this reuse is bounded by the edit rather than by the page.
+        let changed_documents = effect
+            .blocks()
+            .iter()
+            .map(|delta| DocumentKey::Entity(delta.home_document_id))
+            .collect::<BTreeSet<_>>();
+        if changed_documents.len() != effect.blocks().len()
+            || before_snapshots.keys().copied().collect::<BTreeSet<_>>() != changed_documents
         {
             return Ok(None);
+        }
+        let candidate_blocks = page
+            .blocks
+            .iter()
+            .map(|block| (block.block_id, block))
+            .collect::<BTreeMap<_, _>>();
+        if candidate_blocks.len() != page.blocks.len() {
+            return Ok(None);
+        }
+        for delta in effect.blocks() {
+            let Some(SemanticDocumentSnapshot::Block { state, .. }) =
+                before_snapshots.get(&DocumentKey::Entity(delta.home_document_id))
+            else {
+                return Ok(None);
+            };
+            let (Some(delta_before), Some(_)) = (&delta.before, &delta.after) else {
+                return Ok(None);
+            };
+            let Some(block) = candidate_blocks.get(&delta.block_id) else {
+                return Ok(None);
+            };
+            if state != delta_before
+                || state.home_document_id != delta.home_document_id
+                || block.home_document_id != delta.home_document_id
+                || block.content != delta_before.content
+                || block.logseq_uuid.is_some()
+                || block.logseq_identity_origin.is_some()
+            {
+                return Ok(None);
+            }
         }
 
         let PageState::Live {
@@ -13546,38 +14559,33 @@ impl ShardedHotEngine {
             return Ok(None);
         }
 
-        let home_dependencies =
-            self.current_hot_document_dependencies_by_id(page.home_document_id)?;
-        if !affine_before_projection_frontier_documents_are_exact(
-            intent.post_frontier(),
-            page.home_document_id,
-            self.catalog_document_id,
-        ) {
-            return Ok(None);
-        }
-        let Some(intent_home_dependencies) = intent
-            .post_frontier()
-            .documents()
-            .iter()
-            .find(|dependencies| dependencies.document_id() == page.home_document_id)
-        else {
-            return Ok(None);
-        };
-        let current_catalog_dependencies =
-            self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
-        let Some(intent_catalog_dependencies) = intent
-            .post_frontier()
-            .documents()
-            .iter()
-            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
-        else {
-            return Ok(None);
-        };
-        if home_dependencies.direct_dependency_heads() != [last.batch_id]
-            || intent_home_dependencies != &home_dependencies
-            || intent_catalog_dependencies != &current_catalog_dependencies
+        let members = self.current_page_members(page_id)?;
+        if members.len() != page.blocks.len()
+            || page
+                .blocks
+                .iter()
+                .any(|block| members.get(&block.block_id) != Some(&block.home_document_id))
+            || !affine_before_projection_frontier_documents_are_exact(
+                intent.post_frontier(),
+                &page_projection_documents(page.home_document_id, &members),
+            )
         {
             return Ok(None);
+        }
+        // The retained intent's frontier must still be this page's exact
+        // current frontier, and every edited block document must sit at this
+        // batch. Nothing outside the page's own documents is consulted.
+        for dependencies in intent.post_frontier().documents() {
+            let document_id = dependencies.document_id();
+            let current = self.current_hot_document_dependencies_by_id(document_id)?;
+            if dependencies != &current {
+                return Ok(None);
+            }
+            if changed_documents.contains(&document_id)
+                != (current.direct_dependency_heads() == [last.batch_id])
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(ProjectionPageState {
             page,
@@ -14054,7 +15062,7 @@ impl ShardedHotEngine {
         let frontier_matches = projection_frontiers_match_except_catalog(
             &current.state().frontier,
             work.post_frontier(),
-            self.catalog_document_id,
+            DocumentKey::Entity(self.catalog_document_id),
         );
         // A predecessor recorded by a concurrently merged (non-linear) batch
         // carries the foreign author's frontier, while this device's current
@@ -15137,11 +16145,11 @@ impl ShardedHotEngine {
             }
         }
 
-        let mut working = BTreeMap::<DocumentId, EngineDocument>::new();
-        let mut before_vectors = BTreeMap::<DocumentId, VersionVector>::new();
-        let mut before_snapshots = BTreeMap::<DocumentId, SemanticDocumentSnapshot>::new();
+        let mut working = BTreeMap::<DocumentKey, EngineDocument>::new();
+        let mut before_vectors = BTreeMap::<DocumentKey, VersionVector>::new();
+        let mut before_snapshots = BTreeMap::<DocumentKey, SemanticDocumentSnapshot>::new();
         let mut read_only_catalog = AuthorCatalogLookup::default();
-        let mut authenticated_direct_heads = BTreeMap::<DocumentId, BTreeSet<BatchId>>::new();
+        let mut authenticated_direct_heads = BTreeMap::<DocumentKey, BTreeSet<BatchId>>::new();
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
             detail.core_preflight = detail
@@ -15183,7 +16191,7 @@ impl ShardedHotEngine {
                 .saturating_add(identity_triggers_started.elapsed());
         });
 
-        let affected: Vec<DocumentId> = working.keys().copied().collect();
+        let affected: Vec<DocumentKey> = working.keys().copied().collect();
         // The external-reconciliation draft used to be refused whenever its
         // peer already appeared in an affected document's before-vector. That
         // check WAS the fresh-peer-per-import invariant, and it structurally
@@ -15194,7 +16202,7 @@ impl ShardedHotEngine {
         self.require_authored_lane_ownership(author.author_device_id, origin, author.crdt_peer_id)?;
         #[cfg(test)]
         let after_snapshots_started = Instant::now();
-        let after_snapshots = snapshot_engine_documents(self.catalog_document_id, &working, true)?;
+        let after_snapshots = snapshot_engine_documents(self.catalog_document_id, &working)?;
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
             detail.after_semantic_snapshots = detail
@@ -15226,6 +16234,31 @@ impl ShardedHotEngine {
             &revival_pages,
         )?;
         let effect_bytes = effect.encode()?;
+        let mut birth_page_vectors = BTreeMap::new();
+        for delta in effect.blocks() {
+            let Some(birth) = &delta.birth else {
+                continue;
+            };
+            let page_key = DocumentKey::Entity(birth.page_document_id);
+            if before_vectors.contains_key(&page_key) || birth_page_vectors.contains_key(&page_key)
+            {
+                continue;
+            }
+            let page_document =
+                self.clone_current_hot_document(page_key, author.crdt_peer_id.as_u64())?;
+            match snapshot_document(self.catalog_document_id, page_key, &page_document)? {
+                SemanticDocumentSnapshot::Page { page_id, state, .. }
+                    if page_id == birth.page_id && matches!(state, PageState::Live { .. }) =>
+                {
+                    birth_page_vectors.insert(page_key, page_document.oplog_vv());
+                }
+                _ => {
+                    return Err(EngineError::InvalidTransaction(
+                        "block birth page/home is not live at the authored causal base".into(),
+                    ))
+                }
+            }
+        }
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
             detail.effect_derive_encode = detail
@@ -15238,21 +16271,27 @@ impl ShardedHotEngine {
 
         #[cfg(test)]
         let dependencies_started = Instant::now();
-        let mut frontier_documents = Vec::with_capacity(affected.len());
+        let dependency_document_ids = affected
+            .iter()
+            .copied()
+            .chain(birth_page_vectors.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let mut frontier_documents = Vec::with_capacity(dependency_document_ids.len());
         let mut affected_heads = BTreeMap::new();
         let mut batch_dependency_heads = BTreeSet::new();
-        for document_id in &affected {
+        for document_id in &dependency_document_ids {
             let peer_counters = canonical_peer_counters(
                 before_vectors
                     .get(document_id)
-                    .expect("affected before vector exists"),
+                    .or_else(|| birth_page_vectors.get(document_id))
+                    .expect("dependency before vector exists"),
             )?;
             let direct_heads: Vec<_> = match authenticated_direct_heads.remove(document_id) {
                 Some(heads) => heads.into_iter().collect(),
                 None => self
                     .local_overlay
                     .document_heads
-                    .get(document_id)
+                    .get(&*document_id)
                     .cloned()
                     .map(Ok)
                     .unwrap_or_else(|| self.document_dependency_heads(*document_id, false))?
@@ -15281,7 +16320,9 @@ impl ShardedHotEngine {
             detail.dependencies_frontier = detail
                 .dependencies_frontier
                 .saturating_add(dependencies_started.elapsed());
-            detail.affected_documents = detail.affected_documents.saturating_add(affected.len());
+            detail.affected_documents = detail
+                .affected_documents
+                .saturating_add(dependency_document_ids.len());
             detail.affected_heads = detail.affected_heads.saturating_add(affected_heads.len());
         });
 
@@ -15290,7 +16331,7 @@ impl ShardedHotEngine {
         let mut objects = Vec::with_capacity(working.len() + 1);
         objects.push(OperationObject::new(
             self.workspace_id,
-            self.catalog_document_id,
+            DocumentKey::Entity(self.catalog_document_id),
             ObjectKind::SemanticEffect,
             effect_bytes.clone(),
         )?);
@@ -15404,6 +16445,7 @@ impl ShardedHotEngine {
         };
         let mut causal_dependency_heads = batch_dependency_heads;
         causal_dependency_heads.extend(prior_batch);
+        causal_dependency_heads.extend(self.observed_identity_release_heads(&effect));
         let mut manifest = OperationBatch::new_with_causality(
             self.workspace_id,
             self.lineage_digest,
@@ -15604,10 +16646,12 @@ impl ShardedHotEngine {
     ) -> BTreeSet<BatchId> {
         let mut heads = self
             .visible_document_heads
-            .get(&self.catalog_document_id)
+            .get(&DocumentKey::Entity(self.catalog_document_id))
             .cloned()
             .unwrap_or_default();
-        if let Some(dependencies) = updates.dependency_heads(self.catalog_document_id) {
+        if let Some(dependencies) =
+            updates.dependency_heads(DocumentKey::Entity(self.catalog_document_id))
+        {
             heads.retain(|head| dependencies.binary_search(head).is_err());
             heads.insert(batch_id);
         }
@@ -15616,8 +16660,8 @@ impl ShardedHotEngine {
 
     fn prospective_document(
         &self,
-        document_id: DocumentId,
-        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        document_id: DocumentKey,
+        prospective: &BTreeMap<DocumentKey, LoroDoc>,
     ) -> Result<LoroDoc, EngineError> {
         let copy = match prospective.get(&document_id) {
             Some(document) => clone_doc(document, 1),
@@ -15642,10 +16686,10 @@ impl ShardedHotEngine {
     /// derivation.
     fn prospective_document_ref<'engine>(
         &'engine self,
-        document_id: DocumentId,
-        prospective: &'engine BTreeMap<DocumentId, LoroDoc>,
+        document_id: DocumentKey,
+        prospective: &'engine BTreeMap<DocumentKey, LoroDoc>,
     ) -> Result<ProspectiveDocument<'engine>, EngineError> {
-        if document_id == self.catalog_document_id
+        if document_id == DocumentKey::Entity(self.catalog_document_id)
             && !prospective.contains_key(&document_id)
             && !self.uses_previous_document_derivation()
         {
@@ -15658,7 +16702,7 @@ impl ShardedHotEngine {
         ))
     }
 
-    fn record_prospective_document_copy(&self, document_id: DocumentId, copy: &LoroDoc) {
+    fn record_prospective_document_copy(&self, document_id: DocumentKey, copy: &LoroDoc) {
         let mut work = self.history_work.get();
         work.prospective_document_copies = work.prospective_document_copies.saturating_add(1);
         work.prospective_document_copy_ops = work.prospective_document_copy_ops.saturating_add(
@@ -15667,18 +16711,10 @@ impl ShardedHotEngine {
                 .filter_map(|end| usize::try_from((*end).max(0)).ok())
                 .sum::<usize>(),
         );
-        if document_id == self.catalog_document_id {
+        if document_id == DocumentKey::Entity(self.catalog_document_id) {
             work.prospective_catalog_document_copies =
                 work.prospective_catalog_document_copies.saturating_add(1);
         }
-        self.history_work.set(work);
-    }
-
-    fn record_prospective_catalog_shape_validation(&self, catalog: &LoroDoc) {
-        let mut work = self.history_work.get();
-        work.prospective_catalog_shape_entry_visits = work
-            .prospective_catalog_shape_entry_visits
-            .saturating_add(catalog.get_map(CATALOG_PAGES).len());
         self.history_work.set(work);
     }
 
@@ -15697,10 +16733,10 @@ impl ShardedHotEngine {
 
     fn prospective_document_dependencies(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         document: &LoroDoc,
         batch_id: BatchId,
-        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        prospective: &BTreeMap<DocumentKey, LoroDoc>,
     ) -> Result<DocumentDependencies, EngineError> {
         if prospective.contains_key(&document_id) {
             DocumentDependencies::new(
@@ -15725,7 +16761,7 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
         batch_id: BatchId,
-        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        prospective: &BTreeMap<DocumentKey, LoroDoc>,
         effect: &SemanticEffect,
         prior: Option<&ProjectionPageState>,
         candidate: &MaterializedPage,
@@ -15768,8 +16804,8 @@ impl ShardedHotEngine {
         let mut changed = 0_usize;
         for (before, after) in prior.page.blocks.iter().zip(&candidate.blocks) {
             if before.block_id != after.block_id
-                || before.home_document_id != candidate.home_document_id
-                || after.home_document_id != candidate.home_document_id
+                || before.home_document_id != after.home_document_id
+                || before.home_document_id == candidate.home_document_id
                 || before.parent != after.parent
                 || before.order != after.order
                 || before.logseq_uuid != after.logseq_uuid
@@ -15792,7 +16828,7 @@ impl ShardedHotEngine {
             let (Some(delta_before), Some(delta_after)) = (&delta.before, &delta.after) else {
                 return Ok(None);
             };
-            if delta.home_document_id != candidate.home_document_id
+            if delta.home_document_id != before.home_document_id
                 || delta_before.block_id != before.block_id
                 || delta_before.home_document_id != before.home_document_id
                 || delta_before.owner != BlockOwner::Page(page_id)
@@ -15810,33 +16846,51 @@ impl ShardedHotEngine {
             }
             changed = changed.saturating_add(1);
         }
+        let prior_members = prior
+            .page
+            .blocks
+            .iter()
+            .map(|block| (block.block_id, block.home_document_id))
+            .collect::<BTreeMap<_, _>>();
+        let changed_documents = deltas
+            .values()
+            .map(|delta| DocumentKey::Entity(delta.home_document_id))
+            .collect::<BTreeSet<_>>();
         if changed != deltas.len()
+            || changed_documents.len() != deltas.len()
+            || prior_members.len() != prior.page.blocks.len()
             || !affine_before_projection_frontier_documents_are_exact(
                 &prior.frontier,
-                candidate.home_document_id,
-                self.catalog_document_id,
+                &page_projection_documents(prior.page.home_document_id, &prior_members),
             )
         {
             return Ok(None);
         }
 
-        let home = self.prospective_document_ref(candidate.home_document_id, prospective)?;
-        let home_dependencies = self.prospective_document_dependencies(
-            candidate.home_document_id,
-            home.document(),
-            batch_id,
-            prospective,
-        )?;
-        let catalog_dependencies = prior
-            .frontier
-            .documents()
-            .iter()
-            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
-            .cloned()
-            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        // Only the edited blocks' own documents moved. Every other document
+        // in the page's frontier keeps the dependencies the prior projection
+        // already bound, so this reuse costs one lookup per edited block.
+        let mut frontier_documents = Vec::with_capacity(prior.frontier.documents().len());
+        for dependencies in prior.frontier.documents() {
+            let document_id = dependencies.document_id();
+            if !changed_documents.contains(&document_id) {
+                if prospective.contains_key(&document_id) {
+                    return Ok(None);
+                }
+                frontier_documents.push(dependencies.clone());
+                continue;
+            }
+            let document = self.prospective_document_ref(document_id, prospective)?;
+            frontier_documents.push(self.prospective_document_dependencies(
+                document_id,
+                document.document(),
+                batch_id,
+                prospective,
+            )?);
+        }
         Ok(Some(ProjectionPageState {
             page: candidate.clone(),
-            frontier: FrontierV2::new(vec![home_dependencies, catalog_dependencies])?,
+            frontier: FrontierV2::new(frontier_documents)?,
             claim_evidence: Vec::new(),
         }))
     }
@@ -15845,48 +16899,39 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
         batch_id: BatchId,
-        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        prospective: &BTreeMap<DocumentKey, LoroDoc>,
         effect: &SemanticEffect,
         prior: Option<&ProjectionPageState>,
         claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
-        // A changed catalog must be read from the transaction's prospective
-        // state. An unchanged catalog already has a fixed-depth, authenticated
-        // page row bound to the engine's exact accepted frontier, so ordinary
-        // block edits do not need `LoroDoc::get_value` over every unrelated
-        // catalog entry. Tests can retain the old whole-document derivation as
-        // a semantic oracle.
-        let catalog = if prospective.contains_key(&self.catalog_document_id)
-            || self.uses_previous_document_derivation()
-        {
-            Some(self.prospective_document_ref(self.catalog_document_id, prospective)?)
-        } else {
-            None
-        };
+        // The page's own document carries its state. A batch that changed it
+        // supplies the prospective copy; a batch that did not leaves the prior
+        // projection's page facts valid. Either way nothing graph-sized is
+        // read, so there is no whole-catalog derivation left to keep as an
+        // oracle.
         let effect_page_state = effect
             .pages()
             .iter()
             .find(|delta| delta.page_id == page_id)
             .and_then(|delta| delta.after.clone());
-        let page_state = match (effect_page_state, catalog.as_ref()) {
-            (Some(state), _) if !self.uses_previous_document_derivation() => state,
-            (None, Some(catalog)) | (Some(_), Some(catalog)) => {
-                self.record_prospective_catalog_shape_validation(catalog.document());
-                let Some(state) =
-                    validate_catalog_page(self.catalog_document_id, catalog.document(), page_id)?
-                else {
+        let page_state = match (effect_page_state, prior) {
+            (Some(state), _) => state,
+            (None, Some(prior)) => PageState::Live {
+                name: prior.page.name.clone(),
+                path: prior.page.path.clone(),
+                kind: prior.page.kind,
+                home_document_id: prior.page.home_document_id,
+            },
+            (None, None) => {
+                let page_document_id = self
+                    .current_page_home_with_overrides(page_id, prospective)?
+                    .ok_or(EngineError::PageNotFound(page_id))?;
+                let key = DocumentKey::Entity(page_document_id);
+                let document = self.prospective_document_ref(key, prospective)?;
+                let Some(state) = read_page_state(key, document.document())? else {
                     return Ok(None);
                 };
                 state
-            }
-            (None, None) | (Some(_), None) => {
-                let prior = prior.ok_or(EngineError::PageNotFound(page_id))?;
-                PageState::Live {
-                    name: prior.page.name.clone(),
-                    path: prior.page.path.clone(),
-                    kind: prior.page.kind,
-                    home_document_id: prior.page.home_document_id,
-                }
             }
         };
         let PageState::Live {
@@ -15896,23 +16941,19 @@ impl ShardedHotEngine {
         else {
             return Ok(None);
         };
-        let page_document = self.prospective_document_ref(*page_document_id, prospective)?;
-        let members = read_memberships(*page_document_id, page_document.document())?;
-        let mut documents = BTreeMap::from([(*page_document_id, page_document)]);
-        if let Some(catalog) = catalog {
-            documents.insert(self.catalog_document_id, catalog);
-        }
-        for claim in members.values() {
-            if !documents.contains_key(&claim.home_document_id) {
-                documents.insert(
-                    claim.home_document_id,
-                    self.prospective_document_ref(claim.home_document_id, prospective)?,
-                );
-            }
+        let page_document_id = *page_document_id;
+        let members = self.prospective_page_members(page_id, prospective)?;
+        let mut documents = BTreeMap::new();
+        for document_id in page_projection_documents(page_document_id, &members) {
+            documents.insert(
+                document_id,
+                self.prospective_document_ref(document_id, prospective)?,
+            );
         }
         let page = self.materialize_page_from_state(
             page_id,
             page_state,
+            &members,
             |document_id| {
                 documents
                     .get(&document_id)
@@ -15935,7 +16976,10 @@ impl ShardedHotEngine {
                     .map(|uuid| {
                         (
                             uuid,
-                            ProjectionClaimParticipant::new(delta.block_id, delta.home_document_id),
+                            ProjectionClaimParticipant::new(
+                                delta.block_id,
+                                DocumentKey::Entity(delta.home_document_id),
+                            ),
                         )
                     })
             })
@@ -15972,30 +17016,13 @@ impl ShardedHotEngine {
                         .map(ProspectiveDocument::document)
                 },
                 |participant_page_id| {
-                    if !self.uses_previous_document_derivation() {
-                        if let Some(state) = effect
-                            .pages()
-                            .iter()
-                            .find(|delta| delta.page_id == participant_page_id)
-                            .and_then(|delta| delta.after.clone())
-                        {
-                            return Ok(Some(state));
-                        }
-                        return match self.current_hot_page_state(participant_page_id) {
-                            Ok(state) => Ok(Some(state)),
-                            Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => {
-                                Ok(None)
-                            }
-                            Err(error) => Err(error),
-                        };
-                    }
-                    if let Some(catalog) = documents.get(&self.catalog_document_id) {
-                        self.record_prospective_catalog_shape_validation(catalog.document());
-                        return validate_catalog_page(
-                            self.catalog_document_id,
-                            catalog.document(),
-                            participant_page_id,
-                        );
+                    if let Some(state) = effect
+                        .pages()
+                        .iter()
+                        .find(|delta| delta.page_id == participant_page_id)
+                        .and_then(|delta| delta.after.clone())
+                    {
+                        return Ok(Some(state));
                     }
                     match self.current_hot_page_state(participant_page_id) {
                         Ok(state) => Ok(Some(state)),
@@ -16026,18 +17053,10 @@ impl ShardedHotEngine {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if !documents.contains_key(&self.catalog_document_id) {
-            frontier_documents.push(
-                prior
-                    .and_then(|prior| {
-                        prior.frontier.documents().iter().find(|dependencies| {
-                            dependencies.document_id() == self.catalog_document_id
-                        })
-                    })
-                    .cloned()
-                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
-            );
-        }
+        // A page's projection frontier no longer carries the workspace graph
+        // document: nothing in a page's rendered state is read from it.
+        frontier_documents.sort_unstable_by_key(DocumentDependencies::document_id);
+        frontier_documents.dedup_by_key(|dependencies| dependencies.document_id());
         let frontier = FrontierV2::new(frontier_documents)?;
         Ok(Some(ProjectionPageState {
             page,
@@ -16050,7 +17069,7 @@ impl ShardedHotEngine {
         &self,
         before: Option<&ProjectionPageState>,
         batch_id: BatchId,
-        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        prospective: &BTreeMap<DocumentKey, LoroDoc>,
     ) -> Result<FrontierV2, EngineError> {
         let Some(before) = before else {
             return Ok(FrontierV2::new(Vec::new())?);
@@ -16079,9 +17098,9 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
         effect: &SemanticEffect,
-        before: &BTreeMap<DocumentId, &LoroDoc>,
-        after: &BTreeMap<DocumentId, &LoroDoc>,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        before: &BTreeMap<DocumentKey, &LoroDoc>,
+        after: &BTreeMap<DocumentKey, &LoroDoc>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
         claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(), EngineError> {
         let batch = &self.archive[&batch_id];
@@ -16195,15 +17214,10 @@ impl ShardedHotEngine {
                 None => BTreeMap::new(),
             };
             // During cold tail replay SQLite may not yet contain immutable
-            // baseline rows. The engine's current catalog document is already
-            // accepted and shape-validated, and a block-only effect cannot
-            // alter it, so missing SQLite rows may be resolved by bounded map
-            // reads from that exact current document. Do not decode/validate
-            // the complete catalog again for each replayed block operation.
-            let current_catalog = (rows.len() != page_ids.len())
-                .then(|| self.current_catalog_document())
-                .transpose()?
-                .flatten();
+            // baseline rows. A missing row is then resolved from that page's
+            // own accepted document, which a block-only effect cannot alter.
+            // This is one bounded read per missing page, never a graph-sized
+            // decode.
             let states = page_ids
                 .into_iter()
                 .map(|page_id| {
@@ -16214,25 +17228,20 @@ impl ShardedHotEngine {
                             home_document_id: row.home_document_id,
                             kind: row.kind,
                         }
-                    } else if let Some(state) = current_catalog
-                        .map(|catalog| read_page_state(catalog, page_id))
-                        .transpose()?
-                        .flatten()
-                    {
+                    } else if let Some(state) = self.visible_page_state(page_id)? {
                         if state.home_document_id() == self.catalog_document_id {
                             return Err(EngineError::MalformedDocument {
-                                document_id: self.catalog_document_id,
+                                document_id: DocumentKey::Entity(self.catalog_document_id),
                                 reason: format!(
-                                    "catalog cannot be the immutable home of page {page_id}"
+                                    "the graph document cannot be the immutable home of page {page_id}"
                                 ),
                             });
                         }
                         state
                     } else {
-                        return Err(EngineError::ProjectionManifest(
-                            "block-only projection page has no authenticated current-page row"
-                                .into(),
-                        ));
+                        return Err(EngineError::ProjectionManifest(format!(
+                            "block-only projection page {page_id} has no authenticated current-page row"
+                        )));
                     };
                     Ok((page_id, state))
                 })
@@ -16262,14 +17271,14 @@ impl ShardedHotEngine {
         let stable_catalog_document = effect
             .pages()
             .is_empty()
-            .then_some(self.catalog_document_id);
+            .then_some(DocumentKey::Entity(self.catalog_document_id));
 
         // Projection intents for different affected pages commonly depend on
         // the same large read-only catalog. Build one exact support-document
         // context for the entire batch instead of reconstructing that catalog
         // independently for every post-state and every annotated base.
         let operation_frontier = batch.manifest().dependency_frontier();
-        let mut support_dependencies = BTreeMap::<DocumentId, DocumentDependencies>::new();
+        let mut support_dependencies = BTreeMap::<DocumentKey, DocumentDependencies>::new();
         for frontier in projection
             .intents()
             .iter()
@@ -16282,7 +17291,7 @@ impl ShardedHotEngine {
             )
         {
             for dependencies in frontier.documents() {
-                if dependencies.document_id() == self.catalog_document_id {
+                if dependencies.document_id() == DocumentKey::Entity(self.catalog_document_id) {
                     if stable_catalog_document == Some(dependencies.document_id()) {
                         continue;
                     }
@@ -16312,13 +17321,35 @@ impl ShardedHotEngine {
                 }
             }
         }
-        let support_documents = if support_dependencies.is_empty() {
-            BTreeMap::new()
-        } else {
-            self.reconstruct_projection_frontier(&FrontierV2::new(
-                support_dependencies.into_values().collect(),
-            )?)?
-        };
+        // A page's projection now names its own document, every member's own
+        // document and each pair's membership document. An ordinary content
+        // save changes exactly one of them, so most support documents are
+        // already sitting in this receiver's current accepted state at the
+        // very address the manifest declares. Serve those from the current
+        // state and replay only what genuinely differs; otherwise one block
+        // edit would rebuild its page and membership documents out of the
+        // archive on every save.
+        let mut support_documents = BTreeMap::new();
+        let mut replayed_support = Vec::new();
+        for (document_id, dependencies) in support_dependencies {
+            let current_is_exact = matches!(
+                self.accepted_frontier_document(&self.accepted_frontier_root, document_id),
+                Ok(Some(actual)) if actual == dependencies
+            );
+            if current_is_exact {
+                let document = self.clone_current_hot_document(document_id, 1)?;
+                if canonical_peer_counters(&document.oplog_vv())? == dependencies.peer_counters() {
+                    support_documents.insert(document_id, document);
+                    continue;
+                }
+            }
+            replayed_support.push(dependencies);
+        }
+        if !replayed_support.is_empty() {
+            support_documents
+                .extend(self.reconstruct_projection_frontier(&FrontierV2::new(replayed_support)?)?);
+        }
+        let support_documents = support_documents;
 
         for intent in projection.intents() {
             let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
@@ -16346,15 +17377,13 @@ impl ShardedHotEngine {
                 .as_ref()
                 .and_then(|states| states.get(&intent.page_id()))
             {
-                Some(state) => self.materialize_page_from_state(
+                Some(state) => self.materialize_page_in_window(
                     intent.page_id(),
-                    state.clone(),
-                    |id| documents.get(&id).copied(),
+                    Some(state.clone()),
+                    &documents,
                     0,
                 ),
-                None => self.materialize_page_from_document_lookup(intent.page_id(), |id| {
-                    documents.get(&id).copied()
-                }),
+                None => self.materialize_page_in_window(intent.page_id(), None, &documents, 0),
             };
             let page = match page_result {
                 Ok(page) => Some(page),
@@ -16408,11 +17437,8 @@ impl ShardedHotEngine {
                     if expected_evidence != intent.claim_evidence() {
                         return Err(EngineError::ProjectionClaimEvidenceMismatch);
                     }
-                    let required_documents = projection_page_document_ids(
-                        self.catalog_document_id,
-                        &page,
-                        &expected_evidence,
-                    )?;
+                    let required_documents =
+                        projection_page_document_ids(&page, &expected_evidence)?;
                     let declared_documents = intent
                         .post_frontier()
                         .documents()
@@ -16554,9 +17580,6 @@ impl ShardedHotEngine {
     fn validate_manifested_portable_path_binding(
         &self,
         batch_id: BatchId,
-        frontier: &FrontierV2,
-        candidate: &PortablePathPublicationCandidate,
-        terminal_conflict: bool,
     ) -> Result<(), EngineError> {
         let batch = &self.archive[&batch_id];
         let projection = super::projection_manifest::validate_projection_object_set(
@@ -16583,17 +17606,14 @@ impl ShardedHotEngine {
                 None => manifested_root = Some(intent.portable_path_index_root()),
             }
         }
-        if terminal_conflict || manifested_root.is_none() {
-            return Ok(());
-        }
-        let manifested_root = manifested_root.expect("checked manifested portable-path root");
-        if manifested_root == candidate.root {
-            return Ok(());
-        }
-        let _ = frontier;
-        Err(EngineError::ProjectionManifest(
-            "projection intent portable-path index binding mismatch".into(),
-        ))
+        // The root describes the author's whole index, including unrelated
+        // paths outside this manifest's causal dependencies. A receiver with
+        // concurrent accepted or journaled work has a different root. Path
+        // authority comes from prepare_portable_path_updates and the exact
+        // semantic/projection transition, not equality of these two contexts.
+        // Own-journal prefix validation and same-context projection reuse
+        // retain their separate exact root checks.
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16602,12 +17622,12 @@ impl ShardedHotEngine {
         base: &AnnotatedProjectionBase,
         batch_id: BatchId,
         operation_frontier: &FrontierV2,
-        before: &BTreeMap<DocumentId, &LoroDoc>,
-        support_documents: &BTreeMap<DocumentId, LoroDoc>,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        before: &BTreeMap<DocumentKey, &LoroDoc>,
+        support_documents: &BTreeMap<DocumentKey, LoroDoc>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
         claim_source: Option<&dyn ProjectionClaimSource>,
         stable_page_states: Option<&BTreeMap<PageId, PageState>>,
-        stable_catalog_document: Option<DocumentId>,
+        stable_catalog_document: Option<DocumentKey>,
     ) -> Result<(), EngineError> {
         let documents = self.projection_frontier_document_refs(
             base.prior_frontier(),
@@ -16619,17 +17639,14 @@ impl ShardedHotEngine {
             false,
             stable_catalog_document,
         )?;
-        let page = match stable_page_states.and_then(|states| states.get(&base.source_page_id())) {
-            Some(state) => self.materialize_page_from_state(
-                base.source_page_id(),
-                state.clone(),
-                |id| documents.get(&id).copied(),
-                0,
-            )?,
-            None => self.materialize_page_from_document_lookup(base.source_page_id(), |id| {
-                documents.get(&id).copied()
-            })?,
-        };
+        let page = self.materialize_page_in_window(
+            base.source_page_id(),
+            stable_page_states
+                .and_then(|states| states.get(&base.source_page_id()))
+                .cloned(),
+            &documents,
+            0,
+        )?;
         let expected_claim_evidence = self.projection_claim_evidence_after_batch(
             base.prior_frontier(),
             None,
@@ -16671,12 +17688,12 @@ impl ShardedHotEngine {
         frontier: &FrontierV2,
         batch_id: BatchId,
         operation_frontier: &FrontierV2,
-        operation_documents: &BTreeMap<DocumentId, &'document LoroDoc>,
-        support_documents: &'document BTreeMap<DocumentId, LoroDoc>,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        operation_documents: &BTreeMap<DocumentKey, &'document LoroDoc>,
+        support_documents: &'document BTreeMap<DocumentKey, LoroDoc>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
         allow_current_batch: bool,
-        omitted_document_id: Option<DocumentId>,
-    ) -> Result<BTreeMap<DocumentId, &'document LoroDoc>, EngineError> {
+        omitted_document_id: Option<DocumentKey>,
+    ) -> Result<BTreeMap<DocumentKey, &'document LoroDoc>, EngineError> {
         let mut documents = BTreeMap::new();
         for dependencies in frontier.documents() {
             if omitted_document_id == Some(dependencies.document_id()) {
@@ -16737,7 +17754,7 @@ impl ShardedHotEngine {
         dependency_frontier: &FrontierV2,
         effect: Option<&SemanticEffect>,
         page: &MaterializedPage,
-        documents: &BTreeMap<DocumentId, &LoroDoc>,
+        documents: &BTreeMap<DocumentKey, &LoroDoc>,
         claim_source: Option<&dyn ProjectionClaimSource>,
         stable_page_states: Option<&BTreeMap<PageId, PageState>>,
     ) -> Result<Vec<ProjectionClaimEvidence>, EngineError> {
@@ -16755,7 +17772,7 @@ impl ShardedHotEngine {
                         .or_default()
                         .insert(ProjectionClaimParticipant::new(
                             delta.block_id,
-                            delta.home_document_id,
+                            DocumentKey::Entity(delta.home_document_id),
                         ));
                 }
             }
@@ -17411,7 +18428,15 @@ impl ShardedHotEngine {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         let documents = self.reconstruct_projection_frontier(frontier)?;
-        self.materialize_page_from_documents(page_id, &documents)
+        self.materialize_page_in_window(
+            page_id,
+            None,
+            &documents
+                .iter()
+                .map(|(document_id, document)| (*document_id, document))
+                .collect(),
+            0,
+        )
     }
 
     /// Recompute the complete semantic operation diff from the current shard
@@ -17434,33 +18459,41 @@ impl ShardedHotEngine {
             )));
         }
 
-        let page_document = self.clone_current_hot_document(target.home_document_id, 1)?;
-        validate_shard(
-            self.catalog_document_id,
-            target.home_document_id,
-            &page_document,
-        )?;
-        if shard_page_id(&page_document)? != Some(page_id) {
-            return Err(EngineError::MalformedDocument {
-                document_id: target.home_document_id,
-                reason: "revival membership shard page identity mismatch".into(),
-            });
+        let page_key = DocumentKey::Entity(target.home_document_id);
+        let page_document = self.clone_current_hot_document(page_key, 1)?;
+        if document_page_id(page_key, &page_document)? != Some(page_id) {
+            return Err(malformed(
+                page_key,
+                "revival page document identity mismatch",
+            ));
         }
-        let current_memberships = read_memberships(target.home_document_id, &page_document)?;
-        let mut documents = BTreeMap::from([(target.home_document_id, page_document)]);
-        let mut home_ids = current_memberships
-            .values()
-            .map(|claim| claim.home_document_id)
-            .collect::<BTreeSet<_>>();
-        home_ids.extend(target.blocks.iter().map(|block| block.home_document_id));
-        for home_document_id in home_ids {
-            if documents.contains_key(&home_document_id) {
+        // The page's current members plus the predecessor's members: a revive
+        // must be able to see blocks that left the page while it was deleted.
+        let mut current_members = self.current_page_members(page_id)?;
+        for block in &target.blocks {
+            current_members
+                .entry(block.block_id)
+                .or_insert(block.home_document_id);
+        }
+        let mut documents = BTreeMap::from([(page_key, page_document)]);
+        for document_id in page_projection_documents(target.home_document_id, &current_members) {
+            if documents.contains_key(&document_id) {
                 continue;
             }
             documents.insert(
-                home_document_id,
-                self.clone_current_hot_document(home_document_id, 1)?,
+                document_id,
+                self.clone_current_hot_document(document_id, 1)?,
             );
+        }
+        let mut current_memberships = BTreeMap::new();
+        for (block_id, block_document_id) in &current_members {
+            let pair = membership_document_id(*block_document_id, target.home_document_id);
+            let Some(document) = documents.get(&pair) else {
+                continue;
+            };
+            if let Some(claim) = read_membership(pair, document)? {
+                current_memberships.insert(*block_id, claim);
+            }
         }
 
         let current_live_state = match &current_state {
@@ -17479,6 +18512,7 @@ impl ShardedHotEngine {
         let current = self.materialize_page_from_state(
             page_id,
             current_live_state,
+            &current_members,
             |document_id| documents.get(&document_id),
             0,
         )?;
@@ -17564,9 +18598,12 @@ impl ShardedHotEngine {
         target_blocks.sort_unstable_by_key(|block| (target_depth(block.block_id), block.block_id));
         for block in &target_blocks {
             let home = documents
-                .get(&block.home_document_id)
-                .ok_or(EngineError::MissingDocument(block.home_document_id))?;
-            let raw = read_block_state(block.home_document_id, home, block.block_id)?
+                .get(&DocumentKey::Entity(block.home_document_id))
+                .ok_or(EngineError::MissingDocument(DocumentKey::Entity(
+                    block.home_document_id,
+                )))?;
+            let raw = read_block_state(DocumentKey::Entity(block.home_document_id), home)?
+                .filter(|state| state.block_id == block.block_id)
                 .ok_or(EngineError::BlockNotFound(block.block_id))?;
             let desired_claim =
                 MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
@@ -17587,9 +18624,12 @@ impl ShardedHotEngine {
         }
         for block in &target_blocks {
             let home = documents
-                .get(&block.home_document_id)
-                .ok_or(EngineError::MissingDocument(block.home_document_id))?;
-            let raw = read_block_state(block.home_document_id, home, block.block_id)?
+                .get(&DocumentKey::Entity(block.home_document_id))
+                .ok_or(EngineError::MissingDocument(DocumentKey::Entity(
+                    block.home_document_id,
+                )))?;
+            let raw = read_block_state(DocumentKey::Entity(block.home_document_id), home)?
+                .filter(|state| state.block_id == block.block_id)
                 .ok_or(EngineError::BlockNotFound(block.block_id))?;
             let location = BlockLocation {
                 block_id: block.block_id,
@@ -17729,26 +18769,23 @@ impl ShardedHotEngine {
             }
             None => self.materialize_page_for_projection(page_id)?,
         };
-        let mut accepted_heads = 0_usize;
-        for document in state.frontier.documents() {
-            for batch_id in document.direct_dependency_heads() {
-                accepted_heads = accepted_heads.saturating_add(1);
-                let accepted = matches!(
-                    self.archive_status(*batch_id)?,
-                    Some(ArchiveStatus::Accepted { .. })
-                );
-                let ordinary_ready = matches!(
-                    store
-                        .inspect_batch(*batch_id)
-                        .map_err(|error| EngineError::Archive(error.to_string()))?,
-                    BatchInspection::Ready(_)
-                );
-                if !accepted || !ordinary_ready {
-                    return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
-                }
+        let accepted_heads = declared_batch_heads(&state.frontier);
+        for batch_id in &accepted_heads {
+            let accepted = matches!(
+                self.archive_status(*batch_id)?,
+                Some(ArchiveStatus::Accepted { .. })
+            );
+            let ordinary_ready = matches!(
+                store
+                    .inspect_batch(*batch_id)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+                BatchInspection::Ready(_)
+            );
+            if !accepted || !ordinary_ready {
+                return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
             }
         }
-        if accepted_heads == 0 {
+        if accepted_heads.is_empty() {
             // A clean baseline is semantic authority without fabricated
             // bootstrap operations. An untouched page therefore still has no
             // direct batch heads after unrelated tail operations have advanced
@@ -17874,20 +18911,21 @@ impl ShardedHotEngine {
             }
         };
 
+        // The deletion's own post frontier carries the page document that
+        // recorded the tombstone; no graph-sized document is reconstructed.
         let documents = self.reconstruct_projection_frontier(source.post_frontier())?;
-        let catalog = documents
-            .get(&self.catalog_document_id)
-            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-        let tombstone = validate_catalog_page(self.catalog_document_id, catalog, source.page_id())?
-            .ok_or(EngineError::PageNotFound(source.page_id()))?;
+        let mut tombstone = None;
+        for (document_id, document) in &documents {
+            if document_page_id(*document_id, document)? == Some(source.page_id()) {
+                tombstone = read_page_state(*document_id, document)?;
+                break;
+            }
+        }
+        let tombstone = tombstone.ok_or(EngineError::PageNotFound(source.page_id()))?;
         if !matches!(tombstone, PageState::Tombstone { .. }) {
             return Err(EngineError::ProjectionAuthorizationUnavailable);
         }
-        let current_catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
-        let current =
-            validate_catalog_page(self.catalog_document_id, &current_catalog, source.page_id())?
-                .ok_or(EngineError::PageNotFound(source.page_id()))?;
-        if current != tombstone {
+        if self.current_hot_catalog_page_state(source.page_id())? != tombstone {
             return Err(EngineError::ProjectionAuthorizationUnavailable);
         }
 
@@ -18143,7 +19181,15 @@ impl ShardedHotEngine {
             .as_ref()
             .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
         let documents = self.reconstruct_projection_frontier(frontier)?;
-        let mut page = self.materialize_page_from_documents(page_id, &documents)?;
+        let mut page = self.materialize_page_in_window(
+            page_id,
+            None,
+            &documents
+                .iter()
+                .map(|(document_id, document)| (*document_id, document))
+                .collect(),
+            0,
+        )?;
         if let Some(transition) =
             self.effective_title_at_page_name_root(&self.page_name_root, page_id, &page.name)?
         {
@@ -18295,7 +19341,12 @@ impl ShardedHotEngine {
             .logseq_claim_record(self.logseq_claim_root, logseq_uuid)?
             .introductions
             .iter()
-            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
+            .map(|claim| {
+                ProjectionClaimParticipant::new(
+                    claim.block_id,
+                    DocumentKey::Entity(claim.home_document_id),
+                )
+            })
             .collect::<BTreeSet<_>>();
         if let Some(source) = source {
             participants.extend(source.participants(logseq_uuid)?);
@@ -18310,22 +19361,21 @@ impl ShardedHotEngine {
         (
             LogseqUuidResolution,
             Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, LoroDoc>,
+            BTreeMap<DocumentKey, LoroDoc>,
         ),
         EngineError,
     > {
-        self.resolve_logseq_uuid_current_in_catalog_window(logseq_uuid, None)
+        self.resolve_logseq_uuid_current_in_catalog_window(logseq_uuid)
     }
 
     fn resolve_logseq_uuid_current_in_catalog_window(
         &self,
         logseq_uuid: LogseqUuid,
-        catalog: Option<ValidatedCatalogDocument<'_>>,
     ) -> Result<
         (
             LogseqUuidResolution,
             Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, LoroDoc>,
+            BTreeMap<DocumentKey, LoroDoc>,
         ),
         EngineError,
     > {
@@ -18333,11 +19383,16 @@ impl ShardedHotEngine {
         let participants: Vec<_> = record
             .introductions
             .iter()
-            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
+            .map(|claim| {
+                ProjectionClaimParticipant::new(
+                    claim.block_id,
+                    DocumentKey::Entity(claim.home_document_id),
+                )
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        self.resolve_logseq_uuid_current_from_participants(logseq_uuid, participants, catalog)
+        self.resolve_logseq_uuid_current_from_participants(logseq_uuid, participants)
     }
 
     fn resolve_logseq_uuid_current_from_source(
@@ -18348,14 +19403,13 @@ impl ShardedHotEngine {
         (
             LogseqUuidResolution,
             Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, LoroDoc>,
+            BTreeMap<DocumentKey, LoroDoc>,
         ),
         EngineError,
     > {
         self.resolve_logseq_uuid_current_from_participants(
             logseq_uuid,
             self.projection_claim_participants(logseq_uuid, Some(source))?,
-            None,
         )
     }
 
@@ -18363,12 +19417,11 @@ impl ShardedHotEngine {
         &self,
         logseq_uuid: LogseqUuid,
         participants: Vec<ProjectionClaimParticipant>,
-        catalog: Option<ValidatedCatalogDocument<'_>>,
     ) -> Result<
         (
             LogseqUuidResolution,
             Option<ProjectionClaimEvidence>,
-            BTreeMap<DocumentId, LoroDoc>,
+            BTreeMap<DocumentKey, LoroDoc>,
         ),
         EngineError,
     > {
@@ -18381,29 +19434,23 @@ impl ShardedHotEngine {
         for participant in &participants {
             let home_document_id = participant.home_document_id();
             if !homes.contains_key(&home_document_id) {
-                let home = self.clone_visible_document(home_document_id, 1)?;
-                validate_shard(self.catalog_document_id, home_document_id, &home)?;
-                homes.insert(home_document_id, home);
+                homes.insert(
+                    home_document_id,
+                    self.clone_visible_document(home_document_id, 1)?,
+                );
             }
-            let Some(state) = read_block_state(
-                home_document_id,
-                &homes[&home_document_id],
-                participant.block_id(),
-            )?
-            else {
+            let Some(state) = read_block_state(home_document_id, &homes[&home_document_id])? else {
                 continue;
             };
+            if state.block_id != participant.block_id() {
+                continue;
+            }
             let (BlockOwner::Page(page_id), Some(current_uuid), Some(origin)) =
                 (state.owner, state.logseq_uuid, state.logseq_identity_origin)
             else {
                 continue;
             };
-            let page_state = match catalog {
-                Some(catalog) => read_validated_catalog_page(catalog, page_id)?
-                    .ok_or(EngineError::PageNotFound(page_id)),
-                None => self.current_hot_page_state(page_id),
-            };
-            let page_is_live = match page_state {
+            let page_is_live = match self.current_hot_page_state(page_id) {
                 Ok(PageState::Live { .. }) => true,
                 Ok(PageState::Tombstone { .. })
                 | Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => false,
@@ -18417,7 +19464,7 @@ impl ShardedHotEngine {
                 LogseqUuidClaim {
                     logseq_uuid,
                     block_id: state.block_id,
-                    home_document_id,
+                    home_document_id: semantic_home_document_id(home_document_id)?,
                     page_id,
                     origin,
                 },
@@ -18450,7 +19497,7 @@ impl ShardedHotEngine {
             {
                 participants.insert(ProjectionClaimParticipant::new(
                     introduction.block_id,
-                    introduction.home_document_id,
+                    DocumentKey::Entity(introduction.home_document_id),
                 ));
             }
         }
@@ -18466,7 +19513,7 @@ impl ShardedHotEngine {
         &self,
         logseq_uuid: LogseqUuid,
         evidence: &ProjectionClaimEvidence,
-        documents: &BTreeMap<DocumentId, LoroDoc>,
+        documents: &BTreeMap<DocumentKey, LoroDoc>,
     ) -> Result<LogseqUuidResolution, EngineError> {
         self.resolve_logseq_uuid_from_document_lookup(logseq_uuid, evidence, |document_id| {
             documents.get(&document_id)
@@ -18477,15 +19524,20 @@ impl ShardedHotEngine {
         &self,
         logseq_uuid: LogseqUuid,
         evidence: &ProjectionClaimEvidence,
-        document: impl Fn(DocumentId) -> Option<&'document LoroDoc>,
+        document: impl Fn(DocumentKey) -> Option<&'document LoroDoc>,
     ) -> Result<LogseqUuidResolution, EngineError> {
-        let catalog = document(self.catalog_document_id)
-            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        // A claim participant's page-liveness comes from that page's own
+        // document, so this asks the engine's current state rather than
+        // decoding a graph-sized catalog per participant.
         self.resolve_logseq_uuid_from_document_lookup_with_page_state(
             logseq_uuid,
             evidence,
             document,
-            |page_id| validate_catalog_page(self.catalog_document_id, catalog, page_id),
+            |page_id| match self.current_hot_catalog_page_state(page_id) {
+                Ok(state) => Ok(Some(state)),
+                Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
+                Err(error) => Err(error),
+            },
         )
     }
 
@@ -18493,7 +19545,7 @@ impl ShardedHotEngine {
         &self,
         logseq_uuid: LogseqUuid,
         evidence: &ProjectionClaimEvidence,
-        document: impl Fn(DocumentId) -> Option<&'document LoroDoc>,
+        document: impl Fn(DocumentKey) -> Option<&'document LoroDoc>,
         mut page_state: impl FnMut(PageId) -> Result<Option<PageState>, EngineError>,
     ) -> Result<LogseqUuidResolution, EngineError> {
         let mut live = BTreeMap::<BlockId, LogseqUuidClaim>::new();
@@ -18501,8 +19553,8 @@ impl ShardedHotEngine {
             let home_document_id = participant.home_document_id();
             let home =
                 document(home_document_id).ok_or(EngineError::MissingDocument(home_document_id))?;
-            validate_shard(self.catalog_document_id, home_document_id, home)?;
-            let Some(state) = read_block_state(home_document_id, home, participant.block_id())?
+            let Some(state) = read_block_state(home_document_id, home)?
+                .filter(|state| state.block_id == participant.block_id())
             else {
                 continue;
             };
@@ -18520,7 +19572,7 @@ impl ShardedHotEngine {
                 LogseqUuidClaim {
                     logseq_uuid,
                     block_id: state.block_id,
-                    home_document_id,
+                    home_document_id: semantic_home_document_id(home_document_id)?,
                     page_id,
                     origin,
                 },
@@ -18533,50 +19585,88 @@ impl ShardedHotEngine {
         })
     }
 
-    fn materialize_page_from_documents(
+    /// Materialize one page from an already-resolved document window.
+    ///
+    /// A page's projection frontier names exactly that page's own documents:
+    /// its page document, each current member's own document and each pair's
+    /// membership document. Both the page's state and its membership are read
+    /// from the window itself, so nothing graph-sized and no separate index
+    /// lookup is involved.
+    fn materialize_page_in_window<'document>(
         &self,
         page_id: PageId,
-        documents: &BTreeMap<DocumentId, LoroDoc>,
+        page_state: Option<PageState>,
+        window: &BTreeMap<DocumentKey, &'document LoroDoc>,
+        catalog_documents_loaded: usize,
     ) -> Result<MaterializedPage, EngineError> {
-        self.materialize_page_from_document_lookup(page_id, |document_id| {
-            documents.get(&document_id)
-        })
-    }
-
-    fn materialize_page_from_document_lookup<'document>(
-        &self,
-        page_id: PageId,
-        document: impl FnMut(DocumentId) -> Option<&'document LoroDoc>,
-    ) -> Result<MaterializedPage, EngineError> {
-        self.materialize_page_in_catalog_window(None, page_id, document)
-    }
-
-    /// Materialize one page, optionally reusing a catalog shape proof already
-    /// established for the surrounding bounded window.
-    fn materialize_page_in_catalog_window<'document>(
-        &self,
-        validated_catalog: Option<ValidatedCatalogDocument<'document>>,
-        page_id: PageId,
-        mut document: impl FnMut(DocumentId) -> Option<&'document LoroDoc>,
-    ) -> Result<MaterializedPage, EngineError> {
-        let validated_catalog = match validated_catalog {
-            Some(validated_catalog) => validated_catalog,
+        let page_state = match page_state {
+            Some(state) => state,
             None => {
-                let catalog = document(self.catalog_document_id)
-                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
-                validate_catalog_document(self.catalog_document_id, catalog)?
+                let mut found = None;
+                for (document_id, document) in window {
+                    if document_page_id(*document_id, document)? == Some(page_id) {
+                        found = read_page_state(*document_id, document)?;
+                        break;
+                    }
+                }
+                found.ok_or(EngineError::PageNotFound(page_id))?
             }
         };
-        let page_state = read_validated_catalog_page(validated_catalog, page_id)?
-            .ok_or(EngineError::PageNotFound(page_id))?;
-        self.materialize_page_from_state(page_id, page_state, document, 1)
+        let PageState::Live {
+            home_document_id, ..
+        } = &page_state
+        else {
+            return Err(EngineError::PageDeleted(page_id));
+        };
+        let members = members_from_document_window(
+            *home_document_id,
+            window
+                .iter()
+                .map(|(document_id, document)| (*document_id, *document)),
+        )?;
+        self.materialize_page_from_state(
+            page_id,
+            page_state,
+            &members,
+            |document_id| window.get(&document_id).copied(),
+            catalog_documents_loaded,
+        )
+    }
+
+    /// Materialize one page from an already resolved document window.
+    ///
+    /// There is no catalog document to shape-prove: the page's own state comes
+    /// from its own document, and its members come from the accepted
+    /// current-owner range the caller resolved.
+    fn materialize_page_in_catalog_window<'document>(
+        &self,
+        page_state: Option<PageState>,
+        page_id: PageId,
+        members: &BTreeMap<BlockId, DocumentId>,
+        mut document: impl FnMut(DocumentKey) -> Option<&'document LoroDoc>,
+    ) -> Result<MaterializedPage, EngineError> {
+        let page_state = match page_state {
+            Some(page_state) => page_state,
+            None => {
+                let page_document_id = self
+                    .accepted_page_home(page_id)
+                    .ok_or(EngineError::PageNotFound(page_id))?;
+                let page_key = DocumentKey::Entity(page_document_id);
+                let page_document =
+                    document(page_key).ok_or(EngineError::MissingDocument(page_key))?;
+                read_page_state(page_key, page_document)?
+                    .ok_or(EngineError::PageNotFound(page_id))?
+            }
+        };
+        self.materialize_page_from_state(page_id, page_state, members, document, 1)
     }
 
     fn materialize_page_from_state<'document>(
         &self,
         page_id: PageId,
         page_state: PageState,
-        mut document: impl FnMut(DocumentId) -> Option<&'document LoroDoc>,
+        members: &BTreeMap<BlockId, DocumentId>,
+        mut document: impl FnMut(DocumentKey) -> Option<&'document LoroDoc>,
         catalog_documents_loaded: usize,
     ) -> Result<MaterializedPage, EngineError> {
         let PageState::Live {
@@ -18589,26 +19679,21 @@ impl ShardedHotEngine {
         else {
             return Err(EngineError::PageDeleted(page_id));
         };
-        let page_document =
-            document(page_document_id).ok_or(EngineError::MissingDocument(page_document_id))?;
-        validate_shard(self.catalog_document_id, page_document_id, page_document)?;
-        if shard_page_id(page_document)? != Some(page_id) {
+        let page_key = DocumentKey::Entity(page_document_id);
+        let page_document = document(page_key).ok_or(EngineError::MissingDocument(page_key))?;
+        if document_page_id(page_key, page_document)? != Some(page_id) {
             return Err(EngineError::MalformedDocument {
-                document_id: page_document_id,
-                reason: "membership shard page identity mismatch".into(),
+                document_id: page_key,
+                reason: "page document identity mismatch".into(),
             });
         }
-        let preamble = read_page_preamble(page_document_id, page_document)?;
-        let (blocks, distinct_home_documents) = self.materialize_page_blocks(
-            page_id,
-            page_document_id,
-            page_document,
-            |document_id| {
+        let preamble = read_page_preamble(page_key, page_document)?;
+        let (blocks, distinct_home_documents) =
+            self.materialize_page_blocks(page_id, page_document_id, members, |document_id| {
                 document(document_id)
                     .map(MaterializationDocument::Borrowed)
                     .ok_or(EngineError::MissingDocument(document_id))
-            },
-        )?;
+            })?;
         Ok(MaterializedPage {
             page_id,
             home_document_id: page_document_id,
@@ -18619,7 +19704,7 @@ impl ShardedHotEngine {
             blocks,
             stats: MaterializationStats {
                 catalog_documents_loaded,
-                membership_documents_loaded: 1,
+                membership_documents_loaded: members.len(),
                 home_documents_loaded: distinct_home_documents.len(),
                 distinct_home_documents,
                 physical_manifest_reads: 0,
@@ -18628,57 +19713,69 @@ impl ShardedHotEngine {
         })
     }
 
-    /// Collect the membership-selected blocks once for both caller-borrowed
-    /// snapshots and the hot engine's one-at-a-time owned clones. This helper
-    /// intentionally does not apply the current accepted title selection:
-    /// `materialize_page_from_state` also serves historical and prospective
-    /// states, while `materialize_page_inner` alone owns that current-root step.
+    /// Collect one page's current members from its own membership documents.
+    ///
+    /// `members` is the accepted current-owner range for the page: block ID to
+    /// that block's own immutable document. Each pair is read from the single
+    /// membership document that addresses it, and each block from its own
+    /// document, so this walk is proportional to the page's live members and
+    /// never to every block that ever visited the page.
+    ///
+    /// This helper intentionally does not apply the current accepted title
+    /// selection: it also serves historical and prospective states, while
+    /// `materialize_page_inner` alone owns that current-root step.
     fn materialize_page_blocks<'document>(
         &self,
         page_id: PageId,
         page_document_id: DocumentId,
-        page_document: &LoroDoc,
-        mut document: impl FnMut(DocumentId) -> Result<MaterializationDocument<'document>, EngineError>,
+        members: &BTreeMap<BlockId, DocumentId>,
+        mut document: impl FnMut(DocumentKey) -> Result<MaterializationDocument<'document>, EngineError>,
     ) -> Result<(Vec<MaterializedBlock>, Vec<DocumentId>), EngineError> {
-        let members = read_memberships(page_document_id, page_document)?;
-        let mut by_home = BTreeMap::<DocumentId, Vec<(BlockId, MembershipClaim)>>::new();
-        for (block_id, claim) in members {
-            by_home
-                .entry(claim.home_document_id)
-                .or_default()
-                .push((block_id, claim));
-        }
         let mut blocks = Vec::new();
-        for (home_document_id, claims) in &by_home {
-            let loaded = (*home_document_id != page_document_id)
-                .then(|| document(*home_document_id))
-                .transpose()?;
-            let home = loaded.as_deref().unwrap_or(page_document);
-            validate_shard(self.catalog_document_id, *home_document_id, home)?;
-            for (block_id, claim) in claims {
-                let Some(state) = read_block_state(*home_document_id, home, *block_id)? else {
-                    return Err(EngineError::MalformedDocument {
-                        document_id: *home_document_id,
-                        reason: format!("membership references missing block {block_id}"),
-                    });
-                };
-                if state.owner == BlockOwner::Page(page_id) {
-                    blocks.push(MaterializedBlock {
-                        block_id: *block_id,
-                        home_document_id: *home_document_id,
-                        parent: claim.parent,
-                        order: claim.order.clone(),
-                        logseq_uuid: state.logseq_uuid,
-                        logseq_identity_origin: state.logseq_identity_origin,
-                        content: state.content,
-                    });
-                }
+        let mut home_documents = BTreeSet::new();
+        for (block_id, block_document_id) in members {
+            let pair = membership_document_id(*block_document_id, page_document_id);
+            let membership = document(pair)?;
+            let Some(claim) = read_membership(pair, &membership)? else {
+                continue;
+            };
+            if claim.home_document_id != *block_document_id {
+                return Err(EngineError::MalformedDocument {
+                    document_id: pair,
+                    reason: format!("membership claim for {block_id} names another block document"),
+                });
+            }
+            let home_id = DocumentKey::Entity(*block_document_id);
+            let home = document(home_id)?;
+            let Some(state) = read_block_state(home_id, &home)? else {
+                return Err(EngineError::MalformedDocument {
+                    document_id: home_id,
+                    reason: format!("membership references missing block {block_id}"),
+                });
+            };
+            if state.block_id != *block_id {
+                return Err(EngineError::MalformedDocument {
+                    document_id: home_id,
+                    reason: format!("block document does not host block {block_id}"),
+                });
+            }
+            home_documents.insert(*block_document_id);
+            if state.owner == BlockOwner::Page(page_id) {
+                blocks.push(MaterializedBlock {
+                    block_id: *block_id,
+                    home_document_id: *block_document_id,
+                    parent: claim.parent,
+                    order: claim.order.clone(),
+                    logseq_uuid: state.logseq_uuid,
+                    logseq_identity_origin: state.logseq_identity_origin,
+                    content: state.content,
+                });
             }
         }
         blocks.sort_unstable_by(|left, right| {
             (&left.order, left.block_id).cmp(&(&right.order, right.block_id))
         });
-        Ok((blocks, by_home.keys().copied().collect()))
+        Ok((blocks, home_documents.into_iter().collect()))
     }
 
     fn materialize_page_inner(
@@ -18709,37 +19806,34 @@ impl ShardedHotEngine {
         else {
             return Err(EngineError::PageDeleted(page_id));
         };
-        let page_document = self.clone_current_hot_document(page_document_id, 1)?;
-        validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
+        let page_key = DocumentKey::Entity(page_document_id);
+        let page_document = self.clone_current_hot_document(page_key, 1)?;
         if include_frontier {
             frontier_documents.insert(
-                page_document_id,
-                self.current_hot_document_dependencies(page_document_id, &page_document)?,
+                page_key,
+                self.current_hot_document_dependencies(page_key, &page_document)?,
             );
         }
-        if shard_page_id(&page_document)? != Some(page_id) {
+        if document_page_id(page_key, &page_document)? != Some(page_id) {
             return Err(EngineError::MalformedDocument {
-                document_id: page_document_id,
-                reason: "membership shard page identity mismatch".into(),
+                document_id: page_key,
+                reason: "page document identity mismatch".into(),
             });
         }
-        let preamble = read_page_preamble(page_document_id, &page_document)?;
+        let preamble = read_page_preamble(page_key, &page_document)?;
 
-        let (blocks, distinct_home_documents) = self.materialize_page_blocks(
-            page_id,
-            page_document_id,
-            &page_document,
-            |home_document_id| {
-                let home = self.clone_current_hot_document(home_document_id, 1)?;
+        let members = self.current_page_members(page_id)?;
+        let (blocks, distinct_home_documents) =
+            self.materialize_page_blocks(page_id, page_document_id, &members, |document_id| {
+                let home = self.clone_current_hot_document(document_id, 1)?;
                 if include_frontier {
                     frontier_documents.insert(
-                        home_document_id,
-                        self.current_hot_document_dependencies(home_document_id, &home)?,
+                        document_id,
+                        self.current_hot_document_dependencies(document_id, &home)?,
                     );
                 }
                 Ok(MaterializationDocument::Owned(home))
-            },
-        )?;
+            })?;
         let mut claim_evidence = Vec::new();
         if include_frontier {
             let block_claims: BTreeMap<_, _> = blocks
@@ -18815,7 +19909,7 @@ impl ShardedHotEngine {
             blocks,
             stats: MaterializationStats {
                 catalog_documents_loaded: 1,
-                membership_documents_loaded: 1,
+                membership_documents_loaded: members.len(),
                 home_documents_loaded: distinct_home_documents.len(),
                 distinct_home_documents,
                 physical_manifest_reads: reads_after
@@ -18836,12 +19930,9 @@ impl ShardedHotEngine {
         if let Some(transition) = &effective_transition {
             transition.apply_to_materialized(&mut page)?;
         }
-        if include_frontier {
-            frontier_documents.insert(
-                self.catalog_document_id,
-                self.current_hot_document_dependencies_by_id(self.catalog_document_id)?,
-            );
-        }
+        // A page's projection frontier is its own documents only: the page
+        // document, its members' documents and its pairs. The workspace graph
+        // document is not a dependency of any page's rendered state.
         let frontier = include_frontier
             .then(|| FrontierV2::new(frontier_documents.into_values().collect()))
             .transpose()?;
@@ -18883,10 +19974,27 @@ impl ShardedHotEngine {
         self.canonical_snapshot_calls
             .set(self.canonical_snapshot_calls.get().saturating_add(1));
         self.ensure_not_blocked()?;
-        let Some(catalog) = self.current_catalog_document()? else {
-            return Ok(super::CanonicalSnapshot::default());
-        };
-        let all_pages = validate_catalog(self.catalog_document_id, catalog)?;
+        // A whole-graph view enumerates the accepted page-birth index plus any
+        // page this device created durably-locally, and reads each page's
+        // state from its own document. There is no catalog to decode, and the
+        // graph document's presence is not evidence of page coverage: a
+        // replayed engine can hold pages while that metadata document carries
+        // no operations at all. An empty graph falls out of the empty indexes.
+        let mut page_ids = self
+            .current_path_catalog
+            .page_homes
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for (document_id, document) in &self.local_overlay.documents {
+            if let Some(page_id) = document_page_id(*document_id, document)? {
+                page_ids.insert(page_id);
+            }
+        }
+        let mut all_pages = Vec::with_capacity(page_ids.len());
+        for page_id in page_ids {
+            all_pages.push((page_id, self.current_hot_catalog_page_state(page_id)?));
+        }
         let mut pages = Vec::new();
         let mut page_preambles = Vec::new();
         let mut blocks = Vec::new();
@@ -18956,27 +20064,35 @@ impl ShardedHotEngine {
     ) -> Result<super::CanonicalSnapshot, EngineError> {
         let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
         let catalog = LoroDoc::new();
-        import_complete(catalog_document_id, &catalog, &[catalog_snapshot.to_vec()])?;
+        import_complete(
+            DocumentKey::Entity(catalog_document_id),
+            &catalog,
+            &[catalog_snapshot.to_vec()],
+        )?;
         catalog
             .set_peer_id(LAZY_GENESIS_PEER_ID.saturating_add(1))
             .map_err(loro_error)?;
         engine
             .visible_documents
-            .insert(catalog_document_id, catalog);
+            .insert(DocumentKey::Entity(catalog_document_id), catalog);
         for (document_id, snapshot) in pages {
             if document_id == catalog_document_id
-                || engine.visible_documents.contains_key(&document_id)
+                || engine
+                    .visible_documents
+                    .contains_key(&DocumentKey::Entity(document_id))
             {
                 return Err(EngineError::InvalidCrdt(
                     "lazy genesis test constructor repeats a document identity".into(),
                 ));
             }
             let document = LoroDoc::new();
-            import_complete(document_id, &document, &[snapshot])?;
+            import_complete(DocumentKey::Entity(document_id), &document, &[snapshot])?;
             document
                 .set_peer_id(LAZY_GENESIS_PEER_ID.saturating_add(1))
                 .map_err(loro_error)?;
-            engine.visible_documents.insert(document_id, document);
+            engine
+                .visible_documents
+                .insert(DocumentKey::Entity(document_id), document);
         }
         engine.canonical_snapshot()
     }
@@ -18995,8 +20111,11 @@ impl ShardedHotEngine {
         page_id: PageId,
     ) -> Result<Option<PageState>, EngineError> {
         self.ensure_not_blocked()?;
-        let catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
-        validate_catalog_page(self.catalog_document_id, &catalog, page_id)
+        match self.current_hot_catalog_page_state(page_id) {
+            Ok(state) => Ok(Some(state)),
+            Err(EngineError::PageNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Recovery/debug view of immutable home content, including content whose
@@ -19008,9 +20127,9 @@ impl ShardedHotEngine {
     ) -> Result<Option<BlockState>, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        let home = self.clone_visible_document(home_document_id, 1)?;
-        validate_shard(self.catalog_document_id, home_document_id, &home)?;
-        read_block_state(home_document_id, &home, block_id)
+        let key = DocumentKey::Entity(home_document_id);
+        let home = self.clone_visible_document(key, 1)?;
+        Ok(read_block_state(key, &home)?.filter(|state| state.block_id == block_id))
     }
 
     fn check_batch_namespace(&self, batch: &ValidatedBatch) -> Result<(), EngineError> {
@@ -19453,6 +20572,7 @@ impl ShardedHotEngine {
     fn begin_point_operation(&self) {
         self.external_anchor_point_cache.borrow_mut().clear();
         self.observed_manifest_point_cache.borrow_mut().clear();
+        self.lazy_genesis_page_checkpoint_memo.borrow_mut().take();
     }
 
     /// [`Self::load_observed_manifest`], memoized for this public operation.
@@ -19491,10 +20611,10 @@ impl ShardedHotEngine {
     /// a resident set that grows with the pages an event touches.
     fn retained_accepted_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         causal_state_digest: DocumentCausalDigest,
-    ) -> Option<(LoroDoc, bool)> {
-        if document_id != self.catalog_document_id {
+    ) -> Option<LoroDoc> {
+        if document_id != DocumentKey::Entity(self.catalog_document_id) {
             return None;
         }
         #[cfg(test)]
@@ -19517,7 +20637,7 @@ impl ShardedHotEngine {
             stats.reuses = stats.reuses.saturating_add(1);
             self.retained_catalog_decode_stats.set(stats);
         }
-        Some((entry.document.clone(), entry.catalog_shape_proven))
+        Some(entry.document.clone())
     }
 
     /// Retain one decoded catalog under the content identity it was loaded at.
@@ -19532,7 +20652,7 @@ impl ShardedHotEngine {
         document: &LoroDoc,
     ) {
         let document_id = dependencies.document_id();
-        if document_id != self.catalog_document_id {
+        if document_id != DocumentKey::Entity(self.catalog_document_id) {
             return;
         }
         #[cfg(test)]
@@ -19549,7 +20669,6 @@ impl ShardedHotEngine {
             dependencies,
             document_id,
             causal_state_digest,
-            catalog_shape_proven: true,
             document: document.clone(),
         });
         #[cfg(test)]
@@ -19567,10 +20686,9 @@ impl ShardedHotEngine {
     fn advance_retained_catalog_frontier_binding(&self, evidence: &AcceptedBatchEvidence) {
         if let Some(mut anchor) = self.retained_catalog_dependency_anchor.get() {
             if anchor.accepted_frontier_state_digest != evidence.prior_frontier_root.state_digest()
-                || evidence
-                    .affected_documents
-                    .iter()
-                    .any(|dependencies| dependencies.document_id() == self.catalog_document_id)
+                || evidence.affected_documents.iter().any(|dependencies| {
+                    dependencies.document_id() == DocumentKey::Entity(self.catalog_document_id)
+                })
             {
                 self.retained_catalog_dependency_anchor.set(None);
             } else {
@@ -19583,10 +20701,9 @@ impl ShardedHotEngine {
             return;
         };
         if entry.accepted_frontier_state_digest != evidence.prior_frontier_root.state_digest()
-            || evidence
-                .affected_documents
-                .iter()
-                .any(|dependencies| dependencies.document_id() == self.catalog_document_id)
+            || evidence.affected_documents.iter().any(|dependencies| {
+                dependencies.document_id() == DocumentKey::Entity(self.catalog_document_id)
+            })
         {
             *retained = None;
             return;
@@ -19600,7 +20717,7 @@ impl ShardedHotEngine {
     ) -> Option<DocumentDependencies> {
         let retained = self.retained_accepted_catalog.borrow();
         let entry = retained.as_ref()?;
-        (entry.document_id == self.catalog_document_id
+        (entry.document_id == DocumentKey::Entity(self.catalog_document_id)
             && entry.accepted_frontier_state_digest == root.state_digest())
         .then(|| entry.dependencies.clone())
     }
@@ -19614,7 +20731,7 @@ impl ShardedHotEngine {
             .retained_catalog_dependency_anchor
             .get()
             .is_some_and(|anchor| {
-                candidate.document_id() == self.catalog_document_id
+                candidate.document_id() == DocumentKey::Entity(self.catalog_document_id)
                     && anchor.accepted_frontier_state_digest == root.state_digest()
                     && anchor.causal_state_digest == candidate.causal_state_digest()
             })
@@ -19625,8 +20742,8 @@ impl ShardedHotEngine {
         let Some(entry) = retained.as_ref() else {
             return false;
         };
-        entry.document_id == self.catalog_document_id
-            && candidate.document_id() == self.catalog_document_id
+        entry.document_id == DocumentKey::Entity(self.catalog_document_id)
+            && candidate.document_id() == DocumentKey::Entity(self.catalog_document_id)
             && entry.accepted_frontier_state_digest == root.state_digest()
             && entry.dependencies.causal_state_digest() == candidate.causal_state_digest()
     }
@@ -19725,7 +20842,7 @@ impl ShardedHotEngine {
     fn decoded_updates(
         &self,
         batch_id: BatchId,
-    ) -> Result<BTreeMap<DocumentId, CrdtUpdatePayload>, EngineError> {
+    ) -> Result<BTreeMap<DocumentKey, CrdtUpdatePayload>, EngineError> {
         let batch = self
             .archive
             .get(&batch_id)
@@ -19747,7 +20864,7 @@ impl ShardedHotEngine {
     fn validate_dependency_witnesses(
         &self,
         frontier: &FrontierV2,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
     ) -> Result<(), EngineError> {
         let declared_batch_heads: Vec<_> = frontier
             .documents()
@@ -19793,7 +20910,7 @@ impl ShardedHotEngine {
     fn dependency_witnesses_are_current(
         &self,
         frontier: &FrontierV2,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
         allow_quarantined: bool,
     ) -> Result<bool, EngineError> {
         for dependencies in frontier.documents() {
@@ -19854,7 +20971,7 @@ impl ShardedHotEngine {
     fn current_frontier_documents(
         &self,
         frontier: &FrontierV2,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
         requested_catalog_page_ids: &[PageId],
     ) -> Result<Option<CurrentFrontierDocuments>, EngineError> {
         self.validate_dependency_witnesses(frontier, updates)?;
@@ -19912,7 +21029,7 @@ impl ShardedHotEngine {
         self.check_batch_namespace(batch)?;
         let frontier = batch.manifest().dependency_frontier().clone();
 
-        let mut updates = BTreeMap::<DocumentId, CrdtUpdatePayload>::new();
+        let mut updates = BTreeMap::<DocumentKey, CrdtUpdatePayload>::new();
         let mut semantic_payload = None;
         for object in batch.objects() {
             match object.kind() {
@@ -19969,7 +21086,7 @@ impl ShardedHotEngine {
         };
         Self::record_validation_phase(&mut self.validation_phase_nanos, 1, &mut phase_started);
         for document_id in updates.keys() {
-            if !before.contains_key(document_id) {
+            if !before.contains_key(&*document_id) {
                 before.insert(*document_id, EngineDocument::InMemory(LoroDoc::new()));
             }
         }
@@ -19983,28 +21100,20 @@ impl ShardedHotEngine {
             .iter()
             .map(|(document_id, document)| (*document_id, document.document().oplog_vv()))
             .collect::<BTreeMap<_, _>>();
-        let new_exact_shard_candidates = updates
-            .keys()
-            .copied()
-            .filter(|document_id| {
-                *document_id != self.catalog_document_id
-                    && exact_before_vectors[document_id].is_empty()
-            })
-            .collect::<BTreeSet<_>>();
-        for document_id in &new_exact_shard_candidates {
-            prime_empty_shard_roots(before[document_id].document());
-        }
-        let exact_before_page_ids = before
+        // A never-written document needs no priming and no separate
+        // "new shard" path: an uninitialised fixed-schema document reads back
+        // as `Unwritten`, and the ordinary snapshot comparison derives its
+        // birth from that.
+        let exact_before_identities = before
             .iter()
-            .filter(|(document_id, _)| **document_id != self.catalog_document_id)
-            .map(|(document_id, document)| Ok((*document_id, shard_page_id(document.document())?)))
+            .map(|(document_id, document)| {
+                Ok((
+                    *document_id,
+                    document_identity(*document_id, document.document())?,
+                ))
+            })
             .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
-        let before_snapshots = snapshot_engine_documents_excluding(
-            self.catalog_document_id,
-            &before,
-            false,
-            &new_exact_shard_candidates,
-        )?;
+        let before_snapshots = snapshot_engine_documents(self.catalog_document_id, &before)?;
         Self::record_validation_phase(&mut self.validation_phase_nanos, 2, &mut phase_started);
         let mut after = BTreeMap::new();
         for (document_id, before_document) in &before {
@@ -20021,27 +21130,14 @@ impl ShardedHotEngine {
             after.insert(*document_id, EngineDocument::InMemory(document));
         }
         Self::record_validation_phase(&mut self.validation_phase_nanos, 3, &mut phase_started);
-        let validated_new_shards = validate_new_exact_shards_against_declared(
-            self.catalog_document_id,
-            &after,
-            &new_exact_shard_candidates,
-            &declared_effect,
-        )?;
-        let mut after_snapshots = snapshot_engine_documents_excluding(
-            self.catalog_document_id,
-            &after,
-            true,
-            &validated_new_shards.documents,
-        )?;
+        let mut after_snapshots = snapshot_engine_documents(self.catalog_document_id, &after)?;
         Self::record_validation_phase(&mut self.validation_phase_nanos, 4, &mut phase_started);
         let semantic_compare_started = super::phase_trace_enabled().then(std::time::Instant::now);
-        let derived_catalog_pages =
-            compare_declared_effect_against_snapshots_with_catalog_skipping(
-                &declared_effect,
-                &before_snapshots,
-                &after_snapshots,
-                &validated_new_shards,
-            )?;
+        let derived_catalog_pages = compare_declared_effect_against_snapshots_with_catalog(
+            &declared_effect,
+            &before_snapshots,
+            &after_snapshots,
+        )?;
         if let Some(started) = semantic_compare_started {
             eprintln!(
                 "PHASE TIME Engine.validate_and_apply.semantic_compare {:.3}ms",
@@ -20079,26 +21175,28 @@ impl ShardedHotEngine {
         // changed until all imports and structural checks have succeeded.
         let mut replacements = BTreeMap::new();
         let mut replacement_heads = BTreeMap::new();
-        let mut new_exact_shards = BTreeSet::new();
-        let mut divergent_validated_catalog_pages = None;
+        // The single accepted producer of a page's state is that page's own
+        // document, so this map is filled by the replacement loop itself,
+        // seeded with what the exact-frontier comparison already derived.
+        let mut validated_catalog_pages = derived_catalog_pages;
+        let mut divergent_current_page_states = BTreeMap::<PageId, Option<PageState>>::new();
         let mut proven_exact_current_documents = BTreeSet::new();
-        let mut current_catalog_page_names = None;
         let replacement_loop_started = super::phase_trace_enabled().then(std::time::Instant::now);
         for (document_id, update) in &updates {
-            let exact_before_vector = &exact_before_vectors[document_id];
+            let exact_before_vector = &exact_before_vectors[&*document_id];
             let hot_current = if self.is_blocked() {
                 self.terminal_documents
-                    .get(document_id)
-                    .or_else(|| self.visible_documents.get(document_id))
+                    .get(&*document_id)
+                    .or_else(|| self.visible_documents.get(&*document_id))
             } else {
-                self.visible_documents.get(document_id)
+                self.visible_documents.get(&*document_id)
             };
             let hot_heads = if self.is_blocked() {
                 self.terminal_document_heads
-                    .get(document_id)
-                    .or_else(|| self.visible_document_heads.get(document_id))
+                    .get(&*document_id)
+                    .or_else(|| self.visible_document_heads.get(&*document_id))
             } else {
-                self.visible_document_heads.get(document_id)
+                self.visible_document_heads.get(&*document_id)
             };
             let current_heads_match_exact = hot_heads
                 .into_iter()
@@ -20126,32 +21224,35 @@ impl ShardedHotEngine {
             if exact_current {
                 proven_exact_current_documents.insert(*document_id);
             }
-            if *document_id == self.catalog_document_id {
-                current_catalog_page_names = Some(if exact_current {
-                    exact_page_name_before.clone()
-                } else {
-                    let page_ids = declared_effect
-                        .pages()
-                        .iter()
-                        .map(|delta| delta.page_id)
-                        .collect::<Vec<_>>();
-                    extract_authoritative_catalog_page_names(
-                        self.catalog_document_id,
+            // A page's own document is the single producer of that page's
+            // accepted state, so an update to a page document that diverges
+            // from the exact frontier is exactly where the current name
+            // observation for that page must come from.
+            if let Some(page_id) = current
+                .as_ref()
+                .map(|current| document_page_id(*document_id, current.document()))
+                .transpose()?
+                .flatten()
+            {
+                divergent_current_page_states.insert(
+                    page_id,
+                    read_page_state(
+                        *document_id,
                         current
                             .as_ref()
-                            .expect("divergent current catalog document")
+                            .expect("divergent current page document")
                             .document(),
-                        &page_ids,
-                    )
-                    .map_err(|error| EngineError::Archive(error.to_string()))?
-                });
+                    )?,
+                );
             }
-            let current_page_id = if *document_id == self.catalog_document_id {
-                None
-            } else if exact_current {
-                exact_before_page_ids[document_id]
+            let current_identity = if exact_current {
+                exact_before_identities
+                    .get(&*document_id)
+                    .cloned()
+                    .flatten()
             } else {
-                shard_page_id(
+                document_identity(
+                    *document_id,
                     current
                         .as_ref()
                         .expect("non-exact current document")
@@ -20164,7 +21265,7 @@ impl ShardedHotEngine {
                 // update twice during causal replay while preserving the same
                 // CRDT state and atomic publication boundary.
                 after
-                    .remove(document_id)
+                    .remove(&*document_id)
                     .expect("updated document has a validated after state")
             } else {
                 let current = current.expect("divergent current document");
@@ -20175,34 +21276,24 @@ impl ShardedHotEngine {
                 )?;
                 current
             };
-            if *document_id == self.catalog_document_id {
-                if exact_current {
-                    derived_catalog_pages
-                        .as_ref()
-                        .expect("derived catalog update has validated page state");
-                } else {
-                    divergent_validated_catalog_pages = Some(validate_catalog(
-                        self.catalog_document_id,
-                        replacement.document(),
-                    )?);
+            // Every replacement is proved as a whole fixed-schema document,
+            // and no update may rewrite an immutable identity register.
+            snapshot_document(
+                self.catalog_document_id,
+                *document_id,
+                replacement.document(),
+            )?;
+            validate_immutable_document_identity(
+                *document_id,
+                current_identity.as_ref(),
+                replacement.document(),
+            )?;
+            if let Some(page_id) = document_page_id(*document_id, replacement.document())? {
+                if let Some(state) = read_page_state(*document_id, replacement.document())? {
+                    validated_catalog_pages
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(page_id, state);
                 }
-            } else if exact_current && exact_before_vector.is_empty() {
-                // The snapshot comparator or the bounded direct validator
-                // exhaustively checked this brand-new shard. Recheck metadata
-                // here because page identity also feeds replacement handling.
-                validate_shard_metadata_shape(*document_id, replacement.document())?;
-                new_exact_shards.insert(*document_id);
-            } else {
-                validate_shard(
-                    self.catalog_document_id,
-                    *document_id,
-                    replacement.document(),
-                )?;
-                validate_immutable_shard_identity(
-                    *document_id,
-                    current_page_id.or(exact_before_page_ids[document_id]),
-                    replacement.document(),
-                )?;
             }
             replacements.insert(*document_id, replacement);
         }
@@ -20213,18 +21304,9 @@ impl ShardedHotEngine {
                 started.elapsed().as_secs_f64() * 1_000.0,
             );
         }
-        let validated_catalog_pages = divergent_validated_catalog_pages
-            .as_ref()
-            .or(derived_catalog_pages);
         let prospective_references_started =
             super::phase_trace_enabled().then(std::time::Instant::now);
-        self.validate_prospective_references(
-            &replacements,
-            &declared_effect,
-            &new_exact_shards,
-            validated_catalog_pages,
-            claim_source,
-        )?;
+        self.validate_prospective_references(&replacements, &declared_effect)?;
         if let Some(started) = prospective_references_started {
             eprintln!(
                 "PHASE TIME Engine.validate_and_apply.prospective_references {:.3}ms",
@@ -20243,7 +21325,7 @@ impl ShardedHotEngine {
             causal_dot,
             &causal_dependency_heads,
             &declared_effect,
-            validated_catalog_pages,
+            validated_catalog_pages.as_ref(),
             true,
         )?;
         self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
@@ -20254,12 +21336,28 @@ impl ShardedHotEngine {
         let page_names = if declared_effect.pages().is_empty() {
             None
         } else {
-            let current_page_names = current_catalog_page_names
-                .as_ref()
-                .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+            // Each affected page's CURRENT state comes from that page's own
+            // document: the declared before-state when the current document is
+            // still at the exact frontier, otherwise the divergent current
+            // document this loop already read.
+            let current_page_names =
+                extract_current_page_name_observations(&requested_catalog_page_ids, |page_id| {
+                    Ok(match divergent_current_page_states.get(&page_id) {
+                        Some(state) => state.clone(),
+                        None => exact_page_name_before
+                            .entries()
+                            .get(&page_id)
+                            .cloned()
+                            .flatten(),
+                    })
+                })
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
             let prospective_page_names = extract_validated_catalog_page_names(
                 validated_catalog_pages
-                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
+                    .as_ref()
+                    .ok_or(EngineError::MissingDocument(DocumentKey::Entity(
+                        self.catalog_document_id,
+                    )))?,
                 &requested_catalog_page_ids,
             )
             .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -20270,7 +21368,7 @@ impl ShardedHotEngine {
                 &frontier,
                 &declared_effect,
                 &exact_page_name_before,
-                current_page_names,
+                &current_page_names,
                 &prospective_page_names,
             )?
         };
@@ -20279,12 +21377,7 @@ impl ShardedHotEngine {
                 timing.identity_page_names_nanos.saturating_add(elapsed);
         });
         let identity_binding_started = self.replay_timing_started();
-        self.validate_manifested_portable_path_binding(
-            batch_id,
-            &frontier,
-            &portable_paths,
-            !portable_paths.conflicts.is_empty(),
-        )?;
+        self.validate_manifested_portable_path_binding(batch_id)?;
         self.record_replay_timing_elapsed(identity_binding_started, |timing, elapsed| {
             timing.identity_binding_nanos = timing.identity_binding_nanos.saturating_add(elapsed);
         });
@@ -20294,6 +21387,7 @@ impl ShardedHotEngine {
             self.archive[&batch_id].manifest().causal_dot(),
             &causal_dependency_heads,
             &declared_effect,
+            &before_snapshots,
         )?;
         self.record_replay_timing_elapsed(identity_roles_started, |timing, elapsed| {
             timing.identity_roles_nanos = timing.identity_roles_nanos.saturating_add(elapsed);
@@ -20319,7 +21413,7 @@ impl ShardedHotEngine {
                 &declared_effect,
                 page_names.as_ref(),
             )?;
-            if let Some(pages) = divergent_validated_catalog_pages.as_mut() {
+            if let Some(pages) = validated_catalog_pages.as_mut() {
                 view.apply_to_catalog_pages(pages)?;
             }
             view.apply_to_snapshots(&mut after_snapshots)?;
@@ -20371,14 +21465,36 @@ impl ShardedHotEngine {
                 &replacement_heads,
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
-        let prospective_catalog_pages = divergent_validated_catalog_pages.as_ref().or_else(|| {
-            after_snapshots
-                .values()
-                .find_map(|snapshot| match snapshot {
-                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
-                    SemanticDocumentSnapshot::Shard { .. } => None,
-                })
-        });
+        let prospective_catalog_pages = validated_catalog_pages.as_ref();
+        #[cfg(test)]
+        let current_path_catalog_transition =
+            if self.measure_current_path_catalog_allocations.replace(false) {
+                let (transition, allocations) =
+                    crate::sync_runtime::tests::c7b_alloc::measure_thread(|| {
+                        self.prepare_current_path_catalog_transition(
+                            effective_view
+                                .as_ref()
+                                .expect("accepted batch has an effective semantic view")
+                                .effect(),
+                            prospective_catalog_pages,
+                            page_names.as_ref(),
+                            current_path_catalog_root,
+                        )
+                    });
+                self.current_path_catalog_allocations.set(allocations);
+                transition?
+            } else {
+                self.prepare_current_path_catalog_transition(
+                    effective_view
+                        .as_ref()
+                        .expect("accepted batch has an effective semantic view")
+                        .effect(),
+                    prospective_catalog_pages,
+                    page_names.as_ref(),
+                    current_path_catalog_root,
+                )?
+            };
+        #[cfg(not(test))]
         let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
             effective_view
                 .as_ref()
@@ -20418,28 +21534,19 @@ impl ShardedHotEngine {
             conflict_history_batch,
         );
         self.commit_current_path_catalog_transition(current_path_catalog_transition);
-        {
-            let mut touched_documents = Vec::with_capacity(replacements.len());
-            for (document_id, document) in replacements {
-                self.visible_documents
-                    .insert(document_id, document.into_document());
-                touched_documents.push(document_id);
-                let heads = self.visible_document_heads.entry(document_id).or_default();
-                let dependencies = &updates[&document_id].dependency_heads;
-                heads.retain(|head| dependencies.binary_search(head).is_err());
-                heads.insert(batch_id);
-            }
-            let keep_single_shard =
-                touched_documents.len() == 1 && touched_documents[0] != self.catalog_document_id;
-            for document_id in touched_documents {
-                if keep_single_shard {
-                    self.retain_hot_document(document_id);
-                } else if document_id != self.catalog_document_id {
-                    self.visible_documents.remove(&document_id);
-                    self.visible_document_lru
-                        .retain(|current| *current != document_id);
-                }
-            }
+        for (document_id, document) in replacements {
+            self.visible_documents
+                .insert(document_id, document.into_document());
+            let heads = self.visible_document_heads.entry(document_id).or_default();
+            let dependencies = &updates[&document_id].dependency_heads;
+            heads.retain(|head| dependencies.binary_search(head).is_err());
+            heads.insert(batch_id);
+            // A compound acceptance must not discard every shard it just
+            // validated. Keep the same bounded working set as single-shard
+            // acceptance; `retain_hot_document` enforces the shared 1024-document
+            // cap while preserving recently accepted pages for the next
+            // foreground operation.
+            self.retain_hot_document(document_id);
         }
         self.remember_effective_semantic_view(
             batch_id,
@@ -20516,6 +21623,48 @@ impl ShardedHotEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Releases this device has already observed that a locally drafted batch
+    /// must declare causally.
+    ///
+    /// Creating a page under the fixed layout writes only brand-new documents,
+    /// so its dependency frontier names no earlier batch at all. The old
+    /// whole-graph catalog supplied that anchor implicitly: every create wrote
+    /// the catalog, so every create transitively declared the deletion that had
+    /// released the name or path it was reusing. Without it, the reuse has to
+    /// name the release it observed; otherwise a receiver cannot tell an
+    /// observed recreation from a concurrent duplicate claim and refuses both.
+    ///
+    /// The set is bounded by this transaction's page deltas, and every batch it
+    /// names is one this engine has already accepted.
+    fn observed_identity_release_heads(&self, effect: &SemanticEffect) -> Vec<BatchId> {
+        let mut heads = BTreeSet::new();
+        for delta in effect.pages() {
+            let Some(PageState::Live { name, path, .. }) = delta.after.as_ref() else {
+                continue;
+            };
+            let name_key = name.key_digest();
+            if let Some(batch) = self
+                .local_overlay
+                .page_names
+                .latest_release_batch(name_key)
+                .or_else(|| self.ephemeral_page_names.latest_release_batch(name_key))
+            {
+                heads.insert(batch);
+            }
+            let path_key = path.portable_key().digest();
+            if let Some(release) = self
+                .local_overlay
+                .portable_paths
+                .get(&path_key)
+                .or_else(|| self.ephemeral_portable_paths.get(&path_key))
+                .and_then(PortablePathRecord::latest_release)
+            {
+                heads.insert(release.release_batch());
+            }
+        }
+        heads.into_iter().collect()
+    }
+
     fn prepare_page_name_updates(
         &self,
         batch_id: BatchId,
@@ -21012,8 +22161,10 @@ impl ShardedHotEngine {
         if self.pair_superseded_by_descendant_touch(block_id, pair)? {
             return Ok(());
         }
-        let merged_doc = self.clone_validation_document(home, 1)?;
-        let Some(merged_state) = read_block_state(home, &merged_doc, block_id)? else {
+        let merged_doc = self.clone_validation_document(DocumentKey::Entity(home), 1)?;
+        let Some(merged_state) = read_block_state(DocumentKey::Entity(home), &merged_doc)?
+            .filter(|state| state.block_id == block_id)
+        else {
             return Ok(());
         };
         let restore_after_tombstone =
@@ -21031,7 +22182,10 @@ impl ShardedHotEngine {
                     return;
                 };
                 if let Some(parent) = claim.parent {
-                    let parent_visible = read_block_state(home, &merged_doc, parent)
+                    // A parent lives in its own document, so its visibility
+                    // is read there rather than from this block's document.
+                    let parent_visible = self
+                        .current_block_state(parent)
                         .ok()
                         .flatten()
                         .is_some_and(|state| state.owner == BlockOwner::Page(page_id));
@@ -21865,10 +23019,15 @@ impl ShardedHotEngine {
     fn reconstruct_frontier(
         &self,
         frontier: &FrontierV2,
-    ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
+    ) -> Result<BTreeMap<DocumentKey, LoroDoc>, EngineError> {
         #[cfg(test)]
         {
             RECONSTRUCT_FRONTIER_CALLS.set(RECONSTRUCT_FRONTIER_CALLS.get().saturating_add(1));
+            LIVE_WRITE_FRONTIER_RECONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            LIVE_WRITE_FRONTIER_DOCUMENTS_REQUESTED.fetch_add(
+                frontier.documents().len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let direct_heads = declared_batch_heads(frontier);
         let ancestry = self.collect_batch_ancestry(&direct_heads, self.is_blocked())?;
@@ -21911,18 +23070,32 @@ impl ShardedHotEngine {
     fn reconstruct_projection_frontier(
         &self,
         frontier: &FrontierV2,
-    ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
+    ) -> Result<BTreeMap<DocumentKey, LoroDoc>, EngineError> {
         self.reconstruct_frontier(frontier)
     }
 
     fn clone_visible_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer: u64,
     ) -> Result<LoroDoc, EngineError> {
         match self.visible_documents.get(&document_id) {
-            Some(document) => clone_doc(document, peer),
+            Some(document) => {
+                #[cfg(test)]
+                {
+                    LIVE_WRITE_VISIBLE_DOCUMENT_HITS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    note_live_write_cold_target(document_id, true);
+                }
+                clone_doc(document, peer)
+            }
             None => {
+                #[cfg(test)]
+                {
+                    LIVE_WRITE_VISIBLE_DOCUMENT_MISSES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    note_live_write_cold_target(document_id, false);
+                }
                 // The document and its run-local head cache are evicted
                 // together, but accepted state is not. Recover the current
                 // direct heads from the authoritative accepted frontier so a
@@ -21945,7 +23118,7 @@ impl ShardedHotEngine {
     /// local state that has not reached accepted archive state yet.
     fn clone_current_hot_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer: u64,
     ) -> Result<LoroDoc, EngineError> {
         match self.local_overlay.documents.get(&document_id) {
@@ -21956,7 +23129,7 @@ impl ShardedHotEngine {
 
     fn clone_validation_document(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer: u64,
     ) -> Result<LoroDoc, EngineError> {
         match self.terminal_documents.get(&document_id) {
@@ -21975,8 +23148,8 @@ impl ShardedHotEngine {
     fn commit_terminal_replacements(
         &mut self,
         batch_id: BatchId,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
-        replacements: BTreeMap<DocumentId, EngineDocument>,
+        updates: &BTreeMap<DocumentKey, CrdtUpdatePayload>,
+        replacements: BTreeMap<DocumentKey, EngineDocument>,
     ) -> Result<(), EngineError> {
         for (document_id, document) in replacements {
             self.terminal_documents
@@ -22004,13 +23177,15 @@ impl ShardedHotEngine {
         let mut non_catalog = self
             .visible_documents
             .keys()
-            .filter(|document_id| **document_id != self.catalog_document_id)
+            .filter(|document_id| **document_id != DocumentKey::Entity(self.catalog_document_id))
             .copied()
             .map(|document_id| (false, document_id))
             .chain(
                 self.terminal_documents
                     .keys()
-                    .filter(|document_id| **document_id != self.catalog_document_id)
+                    .filter(|document_id| {
+                        **document_id != DocumentKey::Entity(self.catalog_document_id)
+                    })
                     .copied()
                     .map(|document_id| (true, document_id)),
             )
@@ -22018,6 +23193,8 @@ impl ShardedHotEngine {
         non_catalog.sort_unstable_by_key(|(_, document_id)| *document_id);
         while non_catalog.len() > MAX_HOT_NON_CATALOG_DOCUMENTS {
             let (terminal, document_id) = non_catalog.remove(0);
+            #[cfg(test)]
+            LIVE_WRITE_HOT_DOCUMENT_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if terminal {
                 self.terminal_documents.remove(&document_id);
                 self.terminal_document_heads.remove(&document_id);
@@ -22033,7 +23210,7 @@ impl ShardedHotEngine {
 
     fn document_dependency_heads(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         terminal: bool,
     ) -> Result<BTreeSet<BatchId>, EngineError> {
         let heads = if terminal {
@@ -22062,7 +23239,7 @@ impl ShardedHotEngine {
 
     fn current_document_dependencies(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         document: &LoroDoc,
     ) -> Result<DocumentDependencies, EngineError> {
         Ok(DocumentDependencies::new(
@@ -22076,7 +23253,7 @@ impl ShardedHotEngine {
 
     fn current_hot_document_dependencies(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         document: &LoroDoc,
     ) -> Result<DocumentDependencies, EngineError> {
         let heads = match self.local_overlay.document_heads.get(&document_id) {
@@ -22097,12 +23274,12 @@ impl ShardedHotEngine {
     /// mismatched binding takes the accepted-frontier point proof.
     fn current_hot_document_dependencies_by_id(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<DocumentDependencies, EngineError> {
         if let Some(document) = self.local_overlay.documents.get(&document_id) {
             return self.current_hot_document_dependencies(document_id, document);
         }
-        if document_id == self.catalog_document_id {
+        if document_id == DocumentKey::Entity(self.catalog_document_id) {
             if let Some(dependencies) =
                 self.retained_accepted_catalog_dependencies(&self.accepted_frontier_root)
             {
@@ -22112,7 +23289,7 @@ impl ShardedHotEngine {
         if let Some(dependencies) =
             self.accepted_frontier_document(&self.accepted_frontier_root, document_id)?
         {
-            if document_id == self.catalog_document_id {
+            if document_id == DocumentKey::Entity(self.catalog_document_id) {
                 self.retained_catalog_dependency_anchor.set(Some(
                     AuthenticatedCatalogDependencyAnchor {
                         accepted_frontier_state_digest: self.accepted_frontier_root.state_digest(),
@@ -22122,7 +23299,7 @@ impl ShardedHotEngine {
             }
             return Ok(dependencies);
         }
-        let document = if document_id == self.catalog_document_id {
+        let document = if document_id == DocumentKey::Entity(self.catalog_document_id) {
             self.current_catalog_document()?
         } else {
             self.visible_documents.get(&document_id)
@@ -22131,8 +23308,8 @@ impl ShardedHotEngine {
         self.current_hot_document_dependencies(document_id, document)
     }
 
-    fn retain_hot_document(&mut self, document_id: DocumentId) {
-        if document_id == self.catalog_document_id {
+    fn retain_hot_document(&mut self, document_id: DocumentKey) {
+        if document_id == DocumentKey::Entity(self.catalog_document_id) {
             return;
         }
         self.visible_document_lru
@@ -22140,6 +23317,9 @@ impl ShardedHotEngine {
         self.visible_document_lru.push_back(document_id);
         while self.visible_document_lru.len() > MAX_HOT_NON_CATALOG_DOCUMENTS {
             if let Some(evicted) = self.visible_document_lru.pop_front() {
+                #[cfg(test)]
+                LIVE_WRITE_HOT_DOCUMENT_EVICTIONS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.visible_documents.remove(&evicted);
                 self.terminal_documents.remove(&evicted);
                 self.visible_document_heads.remove(&evicted);
@@ -22165,6 +23345,8 @@ impl ShardedHotEngine {
         let manifest = store
             .reload_accepted_manifest(batch_id, expected_fingerprint)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
+        #[cfg(test)]
+        LIVE_WRITE_ARCHIVE_MANIFEST_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if manifest.lineage_digest() != self.lineage_digest {
             return Err(EngineError::LineageMismatch {
                 expected: self.lineage_digest,
@@ -22178,7 +23360,7 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
         manifest: &OperationBatch,
-        document_id: DocumentId,
+        document_id: DocumentKey,
     ) -> Result<OperationObject, EngineError> {
         if let Some(batch) = self.archive.get(&batch_id) {
             return batch
@@ -22197,9 +23379,12 @@ impl ShardedHotEngine {
             .archive_store
             .as_ref()
             .ok_or(EngineError::MissingDependency(batch_id))?;
-        store
+        let object = store
             .reload_accepted_document_object(manifest, document_id)
-            .map_err(|error| EngineError::Archive(error.to_string()))
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        #[cfg(test)]
+        LIVE_WRITE_ARCHIVE_OBJECT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(object)
     }
 
     fn load_accepted_projection_intents(
@@ -22249,9 +23434,11 @@ impl ShardedHotEngine {
 
     fn reconstruct_document_from_heads(
         &self,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         terminal: bool,
     ) -> Result<LoroDoc, EngineError> {
+        #[cfg(test)]
+        LIVE_WRITE_DOCUMENT_HEAD_RECONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let heads = self.document_dependency_heads(document_id, terminal)?;
         let ancestry = self.collect_batch_ancestry(&heads, terminal)?;
         let mut updates = Vec::new();
@@ -22326,9 +23513,9 @@ impl ShardedHotEngine {
 
     fn referenced_home<'a>(
         &self,
-        replacements: &'a BTreeMap<DocumentId, EngineDocument>,
-        loaded: &'a mut BTreeMap<DocumentId, LoroDoc>,
-        document_id: DocumentId,
+        replacements: &'a BTreeMap<DocumentKey, EngineDocument>,
+        loaded: &'a mut BTreeMap<DocumentKey, LoroDoc>,
+        document_id: DocumentKey,
     ) -> Result<&'a LoroDoc, EngineError> {
         if let Some(home) = replacements.get(&document_id) {
             return Ok(home.document());
@@ -22337,122 +23524,69 @@ impl ShardedHotEngine {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let home = self.clone_validation_document(document_id, 1)?;
-                validate_shard(self.catalog_document_id, document_id, &home)?;
+                snapshot_document(self.catalog_document_id, document_id, &home)?;
                 entry.insert(home)
             }
         })
     }
 
+    /// Prove that every entity this batch wrote actually names the entities it
+    /// claims to.
+    ///
+    /// The previous layout had to reconcile a page's catalog row with the page
+    /// shard that hosted every one of its blocks, so this walk started from a
+    /// graph-sized document. A page's state, a block's content and a pair's
+    /// claim now each live in their own fixed-schema document, so the walk is
+    /// bounded by the batch's own document set.
     fn validate_prospective_references(
         &self,
-        replacements: &BTreeMap<DocumentId, EngineDocument>,
+        replacements: &BTreeMap<DocumentKey, EngineDocument>,
         effect: &SemanticEffect,
-        new_exact_shards: &BTreeSet<DocumentId>,
-        validated_catalog_pages: Option<&BTreeMap<PageId, PageState>>,
-        claim_source: Option<&dyn ProjectionClaimSource>,
     ) -> Result<(), EngineError> {
         let trace_started = super::phase_trace_enabled().then(std::time::Instant::now);
-        let catalog;
-        let loaded_pages;
-        let pages = if let Some(pages) = validated_catalog_pages {
-            Some(pages)
-        } else if let Some(replacement) = replacements.get(&self.catalog_document_id) {
-            loaded_pages = validate_catalog(self.catalog_document_id, replacement.document())?;
-            Some(&loaded_pages)
-        } else if claim_source.is_some() {
-            None
-        } else {
-            catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
-            loaded_pages = validate_catalog(self.catalog_document_id, &catalog)?;
-            Some(&loaded_pages)
-        };
-        let authenticated_page_rows = if pages.is_none() {
-            let mut page_ids = BTreeSet::new();
-            for (document_id, shard) in replacements {
-                if *document_id == self.catalog_document_id {
-                    continue;
-                }
-                if let Some(page_id) = shard_page_id(shard.document())? {
-                    page_ids.insert(page_id);
-                }
-            }
-            let mut rows = match claim_source
-                .map(|source| source.page_identities(&page_ids))
-                .transpose()?
-                .flatten()
-            {
-                Some(rows) => rows,
-                None => BTreeMap::new(),
-            };
-            if rows.len() != page_ids.len() {
-                if let Some(catalog) = self.current_catalog_document()? {
-                    for page_id in &page_ids {
-                        if rows.contains_key(page_id) {
-                            continue;
-                        }
-                        let Some(PageState::Live {
-                            name,
-                            path,
-                            home_document_id,
-                            kind,
-                        }) = read_page_state(catalog, *page_id)?
-                        else {
-                            continue;
-                        };
-                        rows.insert(
-                            *page_id,
-                            CurrentPathCatalogStoredRow {
-                                schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
-                                accepted_name_digest: ContentDigest::of(name.as_str().as_bytes()),
-                                name,
-                                path,
-                                kind,
-                                home_document_id,
-                            },
-                        );
-                    }
-                }
-            }
-            rows
-        } else {
-            BTreeMap::new()
-        };
-        let identity_elapsed = trace_started.map(|started| started.elapsed());
 
-        // A changed catalog entry must name an extant immutable home whose
-        // retained shard identity agrees with that entry. This is scoped to
-        // changed pages; ordinary catalog edits do not enumerate every shard.
+        // A changed page must live in the page's own document, and that
+        // document's immutable identity must be exactly that page.
         for delta in effect.pages() {
             let Some(state) = &delta.after else {
-                return Err(EngineError::MalformedDocument {
-                    document_id: self.catalog_document_id,
-                    reason: format!("page {} was removed instead of tombstoned", delta.page_id),
-                });
+                return Err(malformed(
+                    DocumentKey::Entity(self.catalog_document_id),
+                    format!("page {} was removed instead of tombstoned", delta.page_id),
+                ));
             };
             let home_document_id = state.home_document_id();
-            let loaded_home;
-            let home = if let Some(home) = replacements.get(&home_document_id) {
-                home.document()
-            } else {
-                loaded_home = self.clone_validation_document(home_document_id, 1)?;
-                validate_shard(self.catalog_document_id, home_document_id, &loaded_home)?;
-                &loaded_home
-            };
-            if shard_page_id(home)? != Some(delta.page_id) {
-                return Err(EngineError::MalformedDocument {
-                    document_id: home_document_id,
-                    reason: format!(
-                        "catalog page {} does not match its immutable home shard identity",
+            if home_document_id == self.catalog_document_id {
+                return Err(malformed(
+                    DocumentKey::Entity(self.catalog_document_id),
+                    format!(
+                        "the graph document cannot be the immutable home of page {}",
                         delta.page_id
                     ),
-                });
+                ));
+            }
+            let key = DocumentKey::Entity(home_document_id);
+            let loaded_home;
+            let home = match replacements.get(&key) {
+                Some(home) => home.document(),
+                None => {
+                    loaded_home = self.clone_validation_document(key, 1)?;
+                    &loaded_home
+                }
+            };
+            if document_page_id(key, home)? != Some(delta.page_id) {
+                return Err(malformed(
+                    key,
+                    format!(
+                        "page {} does not match its immutable page document identity",
+                        delta.page_id
+                    ),
+                ));
             }
         }
         let page_delta_elapsed = trace_started.map(|started| started.elapsed());
 
-        // These are validation-only membership indexes: canonical ordering is
-        // neither observed nor serialized. Hash lookup keeps a large batch
-        // linear instead of paying a log factor for every block membership.
+        // Validation-only membership index: canonical ordering is neither
+        // observed nor serialized, so a hash set keeps a large batch linear.
         let new_blocks: AHashSet<(DocumentId, BlockId)> = effect
             .blocks()
             .iter()
@@ -22463,113 +23597,67 @@ impl ShardedHotEngine {
                     .map(|_| (delta.home_document_id, delta.block_id))
             })
             .collect();
-        let mut new_memberships = AHashMap::<PageId, Vec<(BlockId, MembershipClaim)>>::new();
-        for delta in effect.memberships() {
-            for claim in [&delta.before, &delta.after].into_iter().flatten() {
-                if claim.home_document_id == self.catalog_document_id {
-                    return Err(EngineError::MalformedDocument {
-                        document_id: self.catalog_document_id,
-                        reason: format!(
-                            "catalog cannot be the membership home of block {}",
-                            delta.block_id
-                        ),
-                    });
-                }
-            }
-            if let Some(claim) = &delta.after {
-                new_memberships
-                    .entry(delta.page_id)
-                    .or_default()
-                    .push((delta.block_id, claim.clone()));
-            }
-        }
-        let mut referenced_homes = BTreeMap::<DocumentId, LoroDoc>::new();
-        for (document_id, shard) in replacements {
-            let shard = shard.document();
-            if *document_id == self.catalog_document_id {
+        let mut referenced_homes = BTreeMap::<DocumentKey, LoroDoc>::new();
+        let mut pairs = 0_usize;
+        for (document_id, replacement) in replacements {
+            let DocumentKey::Membership {
+                block_document_id,
+                page_document_id,
+            } = *document_id
+            else {
                 continue;
-            }
-            let page_id = shard_page_id(shard)?.ok_or_else(|| EngineError::MalformedDocument {
-                document_id: *document_id,
-                reason: "shard has no page identity".into(),
-            })?;
-            let expected_home_document_id = if let Some(pages) = pages {
-                pages.get(&page_id).map(PageState::home_document_id)
-            } else if let Some(home_document_id) = self
-                .lazy_genesis
-                .as_ref()
-                .and_then(|genesis| genesis.page_home_document_id(page_id))
+            };
+            pairs = pairs.saturating_add(1);
+            if block_document_id == page_document_id
+                || block_document_id == self.catalog_document_id
+                || page_document_id == self.catalog_document_id
             {
-                Some(home_document_id)
-            } else {
-                authenticated_page_rows
-                    .get(&page_id)
-                    .map(|row| row.home_document_id)
-            };
-            let Some(expected_home_document_id) = expected_home_document_id else {
-                return Err(EngineError::MalformedDocument {
-                    document_id: *document_id,
-                    reason: format!("shard identity references missing catalog page {page_id}"),
-                });
-            };
-            if expected_home_document_id != *document_id {
-                return Err(EngineError::MalformedDocument {
-                    document_id: *document_id,
-                    reason: format!("shard identity {page_id} is not its catalog home"),
-                });
+                return Err(malformed(
+                    *document_id,
+                    "a pair may not address the graph document or alias its two entities",
+                ));
             }
-
-            if new_exact_shards.contains(document_id) {
-                for (block_id, claim) in new_memberships.get(&page_id).into_iter().flatten() {
-                    if !new_blocks.contains(&(claim.home_document_id, *block_id)) {
-                        let home = self.referenced_home(
-                            replacements,
-                            &mut referenced_homes,
-                            claim.home_document_id,
-                        )?;
-                        if !has_block_state(home, *block_id)? {
-                            return Err(EngineError::MalformedDocument {
-                                document_id: *document_id,
-                                reason: format!(
-                                    "membership {block_id} references missing home content {}",
-                                    claim.home_document_id
-                                ),
-                            });
-                        }
-                    }
-                }
+            let Some(DocumentIdentity::Membership { block_id, .. }) =
+                document_identity(*document_id, replacement.document())?
+            else {
+                return Err(malformed(
+                    *document_id,
+                    "a pair address must declare a pair identity",
+                ));
+            };
+            let Some(claim) = read_membership(*document_id, replacement.document())? else {
+                continue;
+            };
+            if claim.home_document_id != block_document_id {
+                return Err(malformed(
+                    *document_id,
+                    format!("pair claim for {block_id} names another block document"),
+                ));
+            }
+            if new_blocks.contains(&(block_document_id, block_id)) {
                 continue;
             }
-
-            for (block_id, claim) in read_memberships(*document_id, shard)? {
-                let home = self.referenced_home(
-                    replacements,
-                    &mut referenced_homes,
-                    claim.home_document_id,
-                )?;
-                if !has_block_state(home, block_id)? {
-                    return Err(EngineError::MalformedDocument {
-                        document_id: *document_id,
-                        reason: format!(
-                            "membership {block_id} references missing home content {}",
-                            claim.home_document_id
-                        ),
-                    });
-                }
+            let home_id = DocumentKey::Entity(block_document_id);
+            let home = self.referenced_home(replacements, &mut referenced_homes, home_id)?;
+            if read_block_state(home_id, home)?.is_none_or(|state| state.block_id != block_id) {
+                return Err(malformed(
+                    *document_id,
+                    format!(
+                        "membership {block_id} references missing home content {block_document_id}"
+                    ),
+                ));
             }
         }
         if let Some(started) = trace_started {
             let total = started.elapsed();
-            let identity = identity_elapsed.unwrap_or_default();
-            let page_deltas = page_delta_elapsed.unwrap_or(identity);
+            let page_deltas = page_delta_elapsed.unwrap_or_default();
             eprintln!(
-                "PHASE TIME Engine.prospective_references identities={:.3}ms page_deltas={:.3}ms replacement_validation={:.3}ms total={:.3}ms replacements={} authenticated_rows={}",
-                identity.as_secs_f64() * 1_000.0,
-                page_deltas.saturating_sub(identity).as_secs_f64() * 1_000.0,
+                "PHASE TIME Engine.prospective_references page_deltas={:.3}ms pair_validation={:.3}ms total={:.3}ms replacements={} pairs={}",
+                page_deltas.as_secs_f64() * 1_000.0,
                 total.saturating_sub(page_deltas).as_secs_f64() * 1_000.0,
                 total.as_secs_f64() * 1_000.0,
                 replacements.len(),
-                authenticated_page_rows.len(),
+                pairs,
             );
         }
         Ok(())
@@ -22577,10 +23665,10 @@ impl ShardedHotEngine {
 
     fn ensure_working_document<'a>(
         &'a self,
-        working: &'a mut BTreeMap<DocumentId, EngineDocument>,
-        before_vectors: &mut BTreeMap<DocumentId, VersionVector>,
-        before_snapshots: &mut BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-        document_id: DocumentId,
+        working: &'a mut BTreeMap<DocumentKey, EngineDocument>,
+        before_vectors: &mut BTreeMap<DocumentKey, VersionVector>,
+        before_snapshots: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+        document_id: DocumentKey,
         peer_id: CrdtPeerId,
     ) -> Result<&'a LoroDoc, EngineError> {
         if let Entry::Vacant(entry) = working.entry(document_id) {
@@ -22621,12 +23709,8 @@ impl ShardedHotEngine {
             before_vectors.insert(document_id, document.document().oplog_vv());
             #[cfg(test)]
             let before_snapshot_started = Instant::now();
-            let snapshot = snapshot_document(
-                self.catalog_document_id,
-                document_id,
-                document.document(),
-                false,
-            )?;
+            let snapshot =
+                snapshot_document(self.catalog_document_id, document_id, document.document())?;
             #[cfg(test)]
             note_local_mutation_detail(|detail| {
                 detail.before_semantic_snapshots_child = detail
@@ -22653,13 +23737,14 @@ impl ShardedHotEngine {
         causal_dot: BatchCausalDot,
         causal_dependency_heads: &[BatchId],
         effect: &SemanticEffect,
+        before_snapshots: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
     ) -> Result<IdentityPublicationCandidate, EngineError> {
         let validation_started = Instant::now();
         for delta in effect.pages() {
             for state in [&delta.before, &delta.after].into_iter().flatten() {
                 if state.home_document_id() == self.catalog_document_id {
                     return Err(EngineError::MalformedDocument {
-                        document_id: self.catalog_document_id,
+                        document_id: DocumentKey::Entity(self.catalog_document_id),
                         reason: format!(
                             "catalog cannot be the immutable home of page {}",
                             delta.page_id
@@ -22675,10 +23760,23 @@ impl ShardedHotEngine {
         let mut candidate_keys = AHashSet::with_capacity(effect.blocks().len());
         let mut candidates =
             Vec::<(u128, BlockId, ImmutableHomeClaim)>::with_capacity(effect.blocks().len());
+        let same_batch_page_births = effect
+            .pages()
+            .iter()
+            .filter_map(|page| {
+                (page.before.is_none())
+                    .then(|| {
+                        page.after
+                            .as_ref()
+                            .map(|state| (page.page_id, state.home_document_id()))
+                    })
+                    .flatten()
+            })
+            .collect::<BTreeMap<_, _>>();
         for delta in effect.blocks() {
             if delta.home_document_id == self.catalog_document_id {
                 return Err(EngineError::MalformedDocument {
-                    document_id: self.catalog_document_id,
+                    document_id: DocumentKey::Entity(self.catalog_document_id),
                     reason: format!(
                         "catalog cannot contain authoritative block {}",
                         delta.block_id
@@ -22687,6 +23785,37 @@ impl ShardedHotEngine {
             }
             if delta.before.is_some() || delta.after.is_none() {
                 continue;
+            }
+            let birth = delta
+                .birth
+                .as_ref()
+                .ok_or_else(|| EngineError::MalformedDocument {
+                    document_id: DocumentKey::Entity(delta.home_document_id),
+                    reason: "new block is missing authenticated birth provenance".into(),
+                })?;
+            let mut work = self.history_work.get();
+            work.birth_page_identity_lookups = work.birth_page_identity_lookups.saturating_add(1);
+            self.history_work.set(work);
+            let same_batch_page_birth = same_batch_page_births
+                .get(&birth.page_id)
+                .is_some_and(|home| *home == birth.page_document_id);
+            let causal_page_birth = before_snapshots
+                .get(&DocumentKey::Entity(birth.page_document_id))
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot,
+                        SemanticDocumentSnapshot::Page { page_id, state, .. }
+                            if *page_id == birth.page_id
+                                && matches!(state, PageState::Live { home_document_id, .. }
+                                    if *home_document_id == birth.page_document_id)
+                    )
+                });
+            if !same_batch_page_birth && !causal_page_birth {
+                return Err(EngineError::MalformedDocument {
+                    document_id: DocumentKey::Entity(delta.home_document_id),
+                    reason: "block birth page/home lacks live identity at the declared causal base"
+                        .into(),
+                });
             }
             let block_key = delta.block_id.as_uuid().as_u128();
             let claim = ImmutableHomeClaim::new(batch_id, delta.home_document_id);
@@ -22822,11 +23951,285 @@ impl ShardedHotEngine {
             .collect())
     }
 
+    /// One block's current state, read from that block's own document.
+    ///
+    /// The block's document is resolved through the accepted immutable-home
+    /// claim index, so this is a point lookup rather than a scan.
+    fn current_block_state(&self, block_id: BlockId) -> Result<Option<BlockState>, EngineError> {
+        let key = block_id.as_uuid().as_u128();
+        let mut homes = self
+            .ephemeral_block_claims
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|claim| claim.home_document_id())
+            .collect::<BTreeSet<_>>();
+        homes.extend(
+            self.local_overlay
+                .block_claims
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|claim| claim.home_document_id()),
+        );
+        // A contested birth has no single current state to report.
+        let [home_document_id] = homes.into_iter().collect::<Vec<_>>()[..] else {
+            return Ok(None);
+        };
+        let home_id = DocumentKey::Entity(home_document_id);
+        let document = self.clone_current_hot_document(home_id, 1)?;
+        Ok(read_block_state(home_id, &document)?.filter(|state| state.block_id == block_id))
+    }
+
+    /// Test evidence for the immutable block-document address and its stable
+    /// Loro root directory. `LoroValue::Map` retains the actual ContainerIDs,
+    /// so equality across a crash replay proves the root was replayed rather
+    /// than recreated under the same semantic block ID.
+    #[cfg(test)]
+    pub(crate) fn block_document_root_value_for_test(
+        &self,
+        block_id: BlockId,
+    ) -> Result<(DocumentKey, LoroValue), EngineError> {
+        let key = block_id.as_uuid().as_u128();
+        let mut homes = self
+            .ephemeral_block_claims
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|claim| claim.home_document_id())
+            .collect::<BTreeSet<_>>();
+        homes.extend(
+            self.local_overlay
+                .block_claims
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|claim| claim.home_document_id()),
+        );
+        let [home_document_id] = homes.into_iter().collect::<Vec<_>>()[..] else {
+            return Err(EngineError::BlockNotFound(block_id));
+        };
+        let document_id = DocumentKey::Entity(home_document_id);
+        let document = self.clone_current_hot_document(document_id, 1)?;
+        let state = read_block_state(document_id, &document)?
+            .ok_or(EngineError::BlockNotFound(block_id))?;
+        if state.block_id != block_id {
+            return Err(malformed(
+                document_id,
+                "block-home claim resolves to a different block identity",
+            ));
+        }
+        Ok((document_id, document.get_value()))
+    }
+
+    /// Open (or lazily create) the working copy of one membership document and
+    /// its claim, without pulling it into the batch when nothing changes.
+    fn current_membership_claim(
+        &self,
+        working: &BTreeMap<DocumentKey, EngineDocument>,
+        block_document_id: DocumentId,
+        page_document_id: DocumentId,
+    ) -> Result<Option<MembershipClaim>, EngineError> {
+        let key = membership_document_id(block_document_id, page_document_id);
+        if let Some(document) = working.get(&key) {
+            return read_membership(key, document.document());
+        }
+        let document = self.clone_current_hot_document(key, 1)?;
+        read_membership(key, &document)
+    }
+
+    /// Write one pair claim, creating the membership document on first visit.
+    ///
+    /// The pair's address, root and register schema are fixed by the two
+    /// accepted homes, so two devices visiting the same pair concurrently
+    /// create the same document rather than racing to elect a creator. Nothing
+    /// is ever added per visit.
+    #[allow(clippy::too_many_arguments)]
+    fn write_pair_membership(
+        &self,
+        working: &mut BTreeMap<DocumentKey, EngineDocument>,
+        before_vectors: &mut BTreeMap<DocumentKey, VersionVector>,
+        before_snapshots: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+        read_context: &mut AuthorCatalogLookup,
+        peer_id: CrdtPeerId,
+        block: BlockLocation,
+        page_id: PageId,
+        page_document_id: DocumentId,
+        claim: Option<&MembershipClaim>,
+    ) -> Result<(), EngineError> {
+        let key = membership_document_id(block.home_document_id, page_document_id);
+        let identity = DocumentIdentity::Membership {
+            block_document_id: block.home_document_id,
+            block_id: block.block_id,
+            page_document_id,
+            page_id,
+        };
+        let document =
+            self.ensure_working_document(working, before_vectors, before_snapshots, key, peer_id)?;
+        if !retirable_document::is_initialized(document) {
+            create_document(key, document, &identity, DocumentState::Membership(None))?;
+        }
+        write_membership(key, document, claim)?;
+        if let Some(outline) = read_context.page_outlines.get_mut(&page_id) {
+            if outline.page_document_id != page_document_id {
+                return Err(EngineError::InvalidTransaction(format!(
+                    "page {page_id} changed immutable home inside one transaction"
+                )));
+            }
+            match claim {
+                Some(claim) => {
+                    outline.insert(block.block_id, block.home_document_id, claim.clone())?
+                }
+                None => outline.remove(block.block_id),
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the one transaction-local outline for a lazily touched page from
+    /// pair documents, including the transaction's current working overlay.
+    fn build_author_page_outline(
+        &self,
+        working: &BTreeMap<DocumentKey, EngineDocument>,
+        page_id: PageId,
+        page_document_id: DocumentId,
+    ) -> Result<AuthorPageOutline, EngineError> {
+        #[cfg(test)]
+        {
+            let mut work = self.history_work.get();
+            work.author_outline_builds = work.author_outline_builds.saturating_add(1);
+            self.history_work.set(work);
+        }
+        let mut members = self.current_page_members(page_id)?;
+        for (document_id, document) in working.iter() {
+            let Some(state) = read_optional_block_state(*document_id, document.document())? else {
+                continue;
+            };
+            if state.owner == BlockOwner::Page(page_id) {
+                members.insert(state.block_id, semantic_home_document_id(*document_id)?);
+            } else {
+                members.remove(&state.block_id);
+            }
+        }
+        let mut outline = AuthorPageOutline::new(page_document_id);
+        for (block_id, block_document_id) in members {
+            #[cfg(test)]
+            {
+                let mut work = self.history_work.get();
+                work.author_outline_membership_reads =
+                    work.author_outline_membership_reads.saturating_add(1);
+                self.history_work.set(work);
+            }
+            let Some(claim) =
+                self.current_membership_claim(working, block_document_id, page_document_id)?
+            else {
+                continue;
+            };
+            outline.insert(block_id, block_document_id, claim)?;
+        }
+        Ok(outline)
+    }
+
+    fn author_page_subtree(
+        &self,
+        working: &BTreeMap<DocumentKey, EngineDocument>,
+        read_context: &mut AuthorCatalogLookup,
+        page_id: PageId,
+        page_document_id: DocumentId,
+        root: BlockId,
+    ) -> Result<Vec<(BlockId, DocumentId, MembershipClaim)>, EngineError> {
+        if let Some(outline) = read_context.page_outlines.get(&page_id) {
+            if outline.page_document_id != page_document_id {
+                return Err(EngineError::InvalidTransaction(format!(
+                    "page {page_id} changed immutable home inside one transaction"
+                )));
+            }
+        } else {
+            let outline = self.build_author_page_outline(working, page_id, page_document_id)?;
+            read_context.page_outlines.insert(page_id, outline);
+        }
+        let subtree = read_context
+            .page_outlines
+            .get(&page_id)
+            .expect("author page outline was loaded")
+            .subtree(root)?;
+        #[cfg(test)]
+        {
+            let mut work = self.history_work.get();
+            work.author_outline_traversal_nodes = work
+                .author_outline_traversal_nodes
+                .saturating_add(subtree.len());
+            self.history_work.set(work);
+        }
+        Ok(subtree)
+    }
+
+    /// Update block authority and invalidate only the loaded old-owner view.
+    /// The new owner is populated by the subsequent pair-claim write, so owner
+    /// state and membership identity continue to be checked at their native
+    /// seams rather than inferred from this derived outline.
+    fn set_author_block_owner(
+        &self,
+        read_context: &mut AuthorCatalogLookup,
+        document_id: DocumentKey,
+        document: &LoroDoc,
+        block: BlockLocation,
+        owner: BlockOwner,
+    ) -> Result<(), EngineError> {
+        if semantic_home_document_id(document_id)? != block.home_document_id {
+            return Err(EngineError::HomeShardMismatch(block.block_id));
+        }
+        let state = read_block_state(document_id, document)?
+            .ok_or(EngineError::BlockNotFound(block.block_id))?;
+        if state.block_id != block.block_id || state.home_document_id != block.home_document_id {
+            return Err(EngineError::HomeShardMismatch(block.block_id));
+        }
+        let old_owner = state.owner;
+        set_owner(document_id, document, owner)?;
+        if old_owner != owner {
+            if let BlockOwner::Page(old_page_id) = old_owner {
+                if let Some(outline) = read_context.page_outlines.get_mut(&old_page_id) {
+                    outline.remove(block.block_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One block's own immutable document, as the transaction sees it.
+    fn block_home_from_working(
+        &self,
+        working: &BTreeMap<DocumentKey, EngineDocument>,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+        page_id: PageId,
+        block_id: BlockId,
+    ) -> Result<DocumentId, EngineError> {
+        for (document_id, document) in working.iter() {
+            if read_optional_block_state(*document_id, document.document())?
+                .is_some_and(|state| state.block_id == block_id)
+            {
+                return semantic_home_document_id(*document_id);
+            }
+        }
+        if let Some(home) = self.current_page_members(page_id)?.get(&block_id) {
+            return Ok(*home);
+        }
+        if let Some(home) = claim_source
+            .map(|source| source.block_home(block_id))
+            .transpose()?
+            .flatten()
+        {
+            return Ok(home);
+        }
+        Err(EngineError::BlockNotFound(block_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn apply_author_operation(
         &self,
-        working: &mut BTreeMap<DocumentId, EngineDocument>,
-        before_vectors: &mut BTreeMap<DocumentId, VersionVector>,
-        before_snapshots: &mut BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+        working: &mut BTreeMap<DocumentKey, EngineDocument>,
+        before_vectors: &mut BTreeMap<DocumentKey, VersionVector>,
+        before_snapshots: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
         read_only_catalog: &mut AuthorCatalogLookup,
         peer_id: CrdtPeerId,
         origin: BatchOrigin,
@@ -22844,59 +24247,59 @@ impl ShardedHotEngine {
             } => {
                 if *home_document_id == self.catalog_document_id {
                     return Err(EngineError::InvalidTransaction(
-                        "catalog and page-home document roles must be disjoint".into(),
+                        "graph and page-home document roles must be disjoint".into(),
                     ));
                 }
-                let catalog = self.ensure_working_document(
-                    working,
-                    before_vectors,
-                    before_snapshots,
-                    self.catalog_document_id,
-                    peer_id,
-                )?;
-                if read_page_state(catalog, *page_id)?.is_some() {
+                if self.current_page_home(*page_id)?.is_some() {
                     return Err(EngineError::PageAlreadyExists(*page_id));
                 }
-                insert_page_state(
-                    catalog,
-                    *page_id,
-                    &PageState::Live {
-                        name: name.clone(),
-                        path: path.clone(),
-                        home_document_id: *home_document_id,
-                        kind: *kind,
-                    },
-                )?;
-                let shard = self.ensure_working_document(
+                let key = DocumentKey::Entity(*home_document_id);
+                let page = self.ensure_working_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    *home_document_id,
+                    key,
                     peer_id,
                 )?;
-                if shard_page_id(shard)?.is_some() {
+                if retirable_document::is_initialized(page) {
                     return Err(EngineError::MalformedDocument {
-                        document_id: *home_document_id,
-                        reason: "home shard is already assigned".into(),
+                        document_id: key,
+                        reason: "page home document is already assigned".into(),
                     });
                 }
-                shard
-                    .get_map(SHARD_META)
-                    .insert(SHARD_PAGE_ID, page_id.to_string())
-                    .map_err(loro_error)?;
+                create_document(
+                    key,
+                    page,
+                    &DocumentIdentity::Page {
+                        document_id: *home_document_id,
+                        page_id: *page_id,
+                    },
+                    DocumentState::Page {
+                        state: PageState::Live {
+                            name: name.clone(),
+                            path: path.clone(),
+                            home_document_id: *home_document_id,
+                            kind: *kind,
+                        },
+                        preamble: None,
+                    },
+                )?;
             }
             SemanticOperation::EditPagePath { page_id, path } => {
-                let catalog = self.ensure_working_document(
+                let (key, page) = self.working_page_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    self.catalog_document_id,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
                     peer_id,
-                )?;
-                let state = require_live_page(catalog, *page_id)?;
-                insert_page_state(
-                    catalog,
                     *page_id,
+                )?;
+                let state = require_live_page(key, page, *page_id)?;
+                insert_page_state(
+                    key,
+                    page,
                     &PageState::Live {
                         name: state.name().clone(),
                         path: path.clone(),
@@ -22906,22 +24309,25 @@ impl ShardedHotEngine {
                 )?;
             }
             SemanticOperation::SetPageKind { page_id, kind } => {
-                let catalog = self.ensure_working_document(
+                let (key, page) = self.working_page_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    self.catalog_document_id,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
                     peer_id,
+                    *page_id,
                 )?;
-                let state = require_live_page(catalog, *page_id)?;
+                let state = require_live_page(key, page, *page_id)?;
                 if state.kind() == *kind {
                     return Err(EngineError::InvalidTransaction(format!(
                         "page {page_id} already has semantic kind {kind:?}"
                     )));
                 }
                 insert_page_state(
-                    catalog,
-                    *page_id,
+                    key,
+                    page,
                     &PageState::Live {
                         name: state.name().clone(),
                         path: state.path().expect("required live page has a path").clone(),
@@ -22946,45 +24352,41 @@ impl ShardedHotEngine {
                     page_home_hints,
                     *page_id,
                 )?;
-                let was_working = working.contains_key(&page_document_id);
-                let shard = self.ensure_working_document(
+                let key = DocumentKey::Entity(page_document_id);
+                let was_working = working.contains_key(&key);
+                let page = self.ensure_working_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    page_document_id,
+                    key,
                     peer_id,
                 )?;
-                let current = read_page_preamble(page_document_id, shard)?;
+                let current = read_page_preamble(key, page)?;
                 if current == *preamble {
                     if !was_working {
-                        working.remove(&page_document_id);
-                        before_vectors.remove(&page_document_id);
-                        before_snapshots.remove(&page_document_id);
+                        working.remove(&key);
+                        before_vectors.remove(&key);
+                        before_snapshots.remove(&key);
                     }
                     return Ok(());
                 }
-                let preamble_map = shard.get_map(SHARD_PAGE_PREAMBLE);
-                match preamble {
-                    Some(preamble) => preamble_map
-                        .insert(SHARD_PAGE_PREAMBLE_VALUE, preamble.clone())
-                        .map_err(loro_error)?,
-                    None => preamble_map
-                        .delete(SHARD_PAGE_PREAMBLE_VALUE)
-                        .map_err(loro_error)?,
-                }
+                set_page_preamble(key, page, preamble.as_deref())?;
             }
             SemanticOperation::DeletePage { page_id } => {
-                let catalog = self.ensure_working_document(
+                let (key, page) = self.working_page_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    self.catalog_document_id,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
                     peer_id,
-                )?;
-                let state = require_live_page(catalog, *page_id)?;
-                insert_page_state(
-                    catalog,
                     *page_id,
+                )?;
+                let state = require_live_page(key, page, *page_id)?;
+                insert_page_state(
+                    key,
+                    page,
                     &PageState::Tombstone {
                         name: state.name().clone(),
                         home_document_id: state.home_document_id(),
@@ -23007,15 +24409,18 @@ impl ShardedHotEngine {
                         "RevivePage target for {page_id} differs from its authenticated predecessor frontier"
                     )));
                 }
-                let catalog = self.ensure_working_document(
+                let (key, page) = self.working_page_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    self.catalog_document_id,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
                     peer_id,
+                    *page_id,
                 )?;
-                let state = read_page_state(catalog, *page_id)?
-                    .ok_or(EngineError::PageNotFound(*page_id))?;
+                let state =
+                    read_page_state(key, page)?.ok_or(EngineError::PageNotFound(*page_id))?;
                 let PageState::Tombstone {
                     name: tombstone_name,
                     home_document_id,
@@ -23035,8 +24440,8 @@ impl ShardedHotEngine {
                     )));
                 }
                 insert_page_state(
-                    catalog,
-                    *page_id,
+                    key,
+                    page,
                     &PageState::Live {
                         name: name.clone(),
                         path: path.clone(),
@@ -23061,49 +24466,64 @@ impl ShardedHotEngine {
                 // and be refused by every receiver. Track which documents this
                 // operation pulled into the working set and evict the ones it
                 // did not actually change.
-                let mut touched: BTreeMap<DocumentId, (bool, VersionVector)> = BTreeMap::new();
+                let mut touched: BTreeMap<DocumentKey, (bool, VersionVector)> = BTreeMap::new();
                 for restore in blocks {
                     if restore.claim.home_document_id != restore.block.home_document_id {
                         return Err(EngineError::InvalidTransaction(
-                            "restore claim home must match the block home shard".into(),
+                            "restore claim home must match the block's own document".into(),
                         ));
                     }
                     restore.claim.validate()?;
-                    let vacant = !working.contains_key(&restore.block.home_document_id);
+                    let key = DocumentKey::Entity(restore.block.home_document_id);
+                    let vacant = !working.contains_key(&key);
                     let home = self.ensure_working_document(
                         working,
                         before_vectors,
                         before_snapshots,
-                        restore.block.home_document_id,
+                        key,
                         peer_id,
                     )?;
                     touched
-                        .entry(restore.block.home_document_id)
+                        .entry(key)
                         .or_insert_with(|| (vacant, home.oplog_vv()));
-                    if read_block_state(
-                        restore.block.home_document_id,
-                        home,
-                        restore.block.block_id,
-                    )?
-                    .is_none()
-                    {
+                    let Some(state) = read_block_state(key, home)? else {
                         return Err(EngineError::BlockNotFound(restore.block.block_id));
+                    };
+                    if state.block_id != restore.block.block_id {
+                        return Err(EngineError::HomeShardMismatch(restore.block.block_id));
                     }
-                    set_owner(home, restore.block.block_id, BlockOwner::Page(*page_id))?;
+                    self.set_author_block_owner(
+                        read_only_catalog,
+                        key,
+                        home,
+                        restore.block,
+                        BlockOwner::Page(*page_id),
+                    )?;
                 }
-                let vacant = !working.contains_key(&page_home);
-                let destination = self.ensure_working_document(
-                    working,
-                    before_vectors,
-                    before_snapshots,
-                    page_home,
-                    peer_id,
-                )?;
-                touched
-                    .entry(page_home)
-                    .or_insert_with(|| (vacant, destination.oplog_vv()));
                 for restore in blocks {
-                    insert_membership(destination, restore.block.block_id, &restore.claim)?;
+                    let pair = membership_document_id(restore.block.home_document_id, page_home);
+                    let vacant = !working.contains_key(&pair);
+                    let before_vv = self
+                        .ensure_working_document(
+                            working,
+                            before_vectors,
+                            before_snapshots,
+                            pair,
+                            peer_id,
+                        )?
+                        .oplog_vv();
+                    touched.entry(pair).or_insert((vacant, before_vv));
+                    self.write_pair_membership(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        read_only_catalog,
+                        peer_id,
+                        restore.block,
+                        *page_id,
+                        page_home,
+                        Some(&restore.claim),
+                    )?;
                 }
                 for (document_id, (vacant, before_vv)) in touched {
                     if !vacant {
@@ -23133,62 +24553,104 @@ impl ShardedHotEngine {
                     page_home_hints,
                     *page_id,
                 )?;
-                if block.home_document_id != page_home {
+                if block.home_document_id == page_home
+                    || block.home_document_id == self.catalog_document_id
+                {
                     return Err(EngineError::InvalidTransaction(
-                        "new block home must be its creation page shard".into(),
+                        "a new block needs its own document, distinct from the graph and its page"
+                            .into(),
                     ));
-                }
-                let claim = MembershipClaim::new(block.home_document_id, *parent, order.clone())?;
-                let shard = self.ensure_working_document(
-                    working,
-                    before_vectors,
-                    before_snapshots,
-                    block.home_document_id,
-                    peer_id,
-                )?;
-                if read_block_state(block.home_document_id, shard, block.block_id)?.is_some() {
-                    return Err(EngineError::BlockAlreadyExists(block.block_id));
                 }
                 if content.len() > super::semantic::MAX_BLOCK_CONTENT_BYTES {
                     return Err(EngineError::InvalidTransaction(
                         "block content exceeds the semantic bound".into(),
                     ));
                 }
-                shard
-                    .get_map(SHARD_OWNERS)
-                    .insert(&block.block_id.to_string(), page_id.to_string())
-                    .map_err(loro_error)?;
-                shard
-                    .get_map(SHARD_CONTENT)
-                    .ensure_mergeable_text(&block.block_id.to_string())
-                    .map_err(loro_error)?
-                    .insert(0, content)
-                    .map_err(loro_error)?;
-                insert_membership(shard, block.block_id, &claim)?;
-            }
-            SemanticOperation::EditBlockContent { block, content } => {
-                let shard = self.ensure_working_document(
+                let claim = MembershipClaim::new(block.home_document_id, *parent, order.clone())?;
+                let key = DocumentKey::Entity(block.home_document_id);
+                let home = self.ensure_working_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    block.home_document_id,
+                    key,
                     peer_id,
                 )?;
-                let text = block_text(shard, block.block_id)
+                if retirable_document::is_initialized(home) {
+                    return Err(EngineError::BlockAlreadyExists(block.block_id));
+                }
+                // Birth provenance is written once, here, and is never derived
+                // from a later owner: a block created and deleted inside one
+                // batch still leaves its immutable birth record behind.
+                create_document(
+                    key,
+                    home,
+                    &DocumentIdentity::Block {
+                        document_id: block.home_document_id,
+                        block_id: block.block_id,
+                        birth_page_id: *page_id,
+                        birth_page_document_id: page_home,
+                    },
+                    DocumentState::Block(BlockState {
+                        block_id: block.block_id,
+                        home_document_id: block.home_document_id,
+                        owner: BlockOwner::Page(*page_id),
+                        logseq_uuid: None,
+                        logseq_identity_origin: None,
+                        content: content.clone(),
+                    }),
+                )?;
+                self.write_pair_membership(
+                    working,
+                    before_vectors,
+                    before_snapshots,
+                    read_only_catalog,
+                    peer_id,
+                    *block,
+                    *page_id,
+                    page_home,
+                    Some(&claim),
+                )?;
+            }
+            SemanticOperation::EditBlockContent { block, content } => {
+                let key = DocumentKey::Entity(block.home_document_id);
+                let home = self.ensure_working_document(
+                    working,
+                    before_vectors,
+                    before_snapshots,
+                    key,
+                    peer_id,
+                )?;
+                // Content is routed to the block's ORIGINAL root text, whose
+                // container identity is fixed for the document's life.
+                let text = block_text(key, home)?
+                    .filter(|_| {
+                        read_block_state(key, home).is_ok_and(|state| {
+                            state.is_some_and(|state| state.block_id == block.block_id)
+                        })
+                    })
                     .ok_or(EngineError::BlockNotFound(block.block_id))?;
+                if content.len() > super::semantic::MAX_BLOCK_CONTENT_BYTES {
+                    return Err(EngineError::InvalidTransaction(
+                        "block content exceeds the semantic bound".into(),
+                    ));
+                }
                 text.update(content, UpdateOptions::default())
                     .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
             }
             SemanticOperation::MutateBlockLogseqIdentity { block, mutation } => {
-                let shard = self.ensure_working_document(
+                let key = DocumentKey::Entity(block.home_document_id);
+                let home = self.ensure_working_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    block.home_document_id,
+                    key,
                     peer_id,
                 )?;
-                let state = read_block_state(block.home_document_id, shard, block.block_id)?
+                let state = read_block_state(key, home)?
                     .ok_or(EngineError::BlockNotFound(block.block_id))?;
+                if state.block_id != block.block_id {
+                    return Err(EngineError::HomeShardMismatch(block.block_id));
+                }
                 let (logseq_uuid, origin) = match mutation {
                     LogseqIdentityMutation::AssignExternal { logseq_uuid } => {
                         if state.logseq_uuid.is_some() {
@@ -23239,24 +24701,9 @@ impl ShardedHotEngine {
                         )
                     }
                 };
-                let uuids = shard.get_map(SHARD_LOGSEQ_UUIDS);
-                let origins = shard.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS);
-                match logseq_uuid {
-                    Some(logseq_uuid) => uuids
-                        .insert(&block.block_id.to_string(), logseq_uuid.to_string())
-                        .map_err(loro_error)?,
-                    None => uuids
-                        .delete(&block.block_id.to_string())
-                        .map_err(loro_error)?,
-                }
-                match origin {
-                    Some(origin) => origins
-                        .insert(&block.block_id.to_string(), encode_canonical(&origin)?)
-                        .map_err(loro_error)?,
-                    None => origins
-                        .delete(&block.block_id.to_string())
-                        .map_err(loro_error)?,
-                }
+                // The UUID and its origin are one identity fact and are always
+                // written together.
+                set_logseq_identity(key, home, logseq_uuid, origin)?;
             }
             SemanticOperation::MoveSubtree {
                 root,
@@ -23278,6 +24725,38 @@ impl ShardedHotEngine {
                 note_local_mutation_detail(|detail| {
                     detail.move_source_home += move_stage_started.elapsed()
                 });
+                if from_page_id == to_page_id {
+                    let root_home = self.block_home_from_working(
+                        working,
+                        claim_source,
+                        *from_page_id,
+                        root.block_id,
+                    )?;
+                    let root_claim = self
+                        .current_membership_claim(working, root_home, source_id)?
+                        .ok_or(EngineError::BlockNotFound(root.block_id))?;
+                    if root_home != root.home_document_id
+                        || root_claim.home_document_id != root.home_document_id
+                    {
+                        return Err(EngineError::HomeShardMismatch(root.block_id));
+                    }
+                    return self.apply_author_operation(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        read_only_catalog,
+                        peer_id,
+                        origin,
+                        claim_source,
+                        page_home_hints,
+                        &SemanticOperation::ReorderBlock {
+                            block_id: root.block_id,
+                            page_id: *from_page_id,
+                            parent: *parent,
+                            order: order.clone(),
+                        },
+                    );
+                }
                 #[cfg(test)]
                 let move_stage_started = Instant::now();
                 let destination_id = self.page_home_from_working(
@@ -23293,45 +24772,42 @@ impl ShardedHotEngine {
                 });
                 #[cfg(test)]
                 let move_stage_started = Instant::now();
-                let source = self.ensure_working_document(
+                let subtree = self.author_page_subtree(
                     working,
-                    before_vectors,
-                    before_snapshots,
+                    read_only_catalog,
+                    *from_page_id,
                     source_id,
-                    peer_id,
+                    root.block_id,
                 )?;
-                #[cfg(test)]
-                note_local_mutation_detail(|detail| {
-                    detail.move_source_working += move_stage_started.elapsed()
-                });
-                #[cfg(test)]
-                let move_stage_started = Instant::now();
-                let all = read_memberships(source_id, source)?;
                 #[cfg(test)]
                 note_local_mutation_detail(|detail| {
                     detail.move_membership_read += move_stage_started.elapsed()
                 });
                 #[cfg(test)]
                 let move_stage_started = Instant::now();
-                let root_claim = all
-                    .get(&root.block_id)
-                    .ok_or(EngineError::BlockNotFound(root.block_id))?;
-                if root_claim.home_document_id != root.home_document_id {
+                let (_, root_home, root_claim) = subtree
+                    .iter()
+                    .find(|(block_id, _, _)| *block_id == root.block_id)
+                    .expect("selected subtree contains its root");
+                if *root_home != root.home_document_id
+                    || root_claim.home_document_id != root.home_document_id
+                {
                     return Err(EngineError::HomeShardMismatch(root.block_id));
                 }
-                let subtree = subtree_claims(root.block_id, &all);
                 let mut moved = Vec::with_capacity(subtree.len());
-                for block_id in subtree {
-                    let mut claim = all
-                        .get(&block_id)
-                        .expect("subtree claim came from membership map")
-                        .clone();
+                for (block_id, home_document_id, mut claim) in subtree {
                     if block_id == root.block_id {
                         claim.parent = *parent;
                         claim.order = order.clone();
                         claim.validate()?;
                     }
-                    moved.push((block_id, claim));
+                    moved.push((
+                        BlockLocation {
+                            block_id,
+                            home_document_id,
+                        },
+                        claim,
+                    ));
                 }
                 #[cfg(test)]
                 note_local_mutation_detail(|detail| {
@@ -23339,31 +24815,43 @@ impl ShardedHotEngine {
                 });
                 #[cfg(test)]
                 let move_stage_started = Instant::now();
-                for (block_id, claim) in &moved {
-                    let home = self.ensure_working_document(
-                        working,
-                        before_vectors,
-                        before_snapshots,
-                        claim.home_document_id,
-                        peer_id,
-                    )?;
-                    set_owner(home, *block_id, BlockOwner::Page(*to_page_id))?;
+                if from_page_id != to_page_id {
+                    for (block, _) in &moved {
+                        let key = DocumentKey::Entity(block.home_document_id);
+                        let home = self.ensure_working_document(
+                            working,
+                            before_vectors,
+                            before_snapshots,
+                            key,
+                            peer_id,
+                        )?;
+                        self.set_author_block_owner(
+                            read_only_catalog,
+                            key,
+                            home,
+                            *block,
+                            BlockOwner::Page(*to_page_id),
+                        )?;
+                    }
                 }
                 #[cfg(test)]
                 note_local_mutation_detail(|detail| {
                     detail.move_owner_updates += move_stage_started.elapsed()
                 });
-                let source = working
-                    .get(&source_id)
-                    .expect("source is working")
-                    .document();
                 #[cfg(test)]
                 let move_stage_started = Instant::now();
-                for (block_id, _) in &moved {
-                    source
-                        .get_map(SHARD_MEMBERS)
-                        .delete(&block_id.to_string())
-                        .map_err(loro_error)?;
+                for (block, _) in &moved {
+                    self.write_pair_membership(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        read_only_catalog,
+                        peer_id,
+                        *block,
+                        *from_page_id,
+                        source_id,
+                        None,
+                    )?;
                 }
                 #[cfg(test)]
                 note_local_mutation_detail(|detail| {
@@ -23371,21 +24859,18 @@ impl ShardedHotEngine {
                 });
                 #[cfg(test)]
                 let move_stage_started = Instant::now();
-                let destination = self.ensure_working_document(
-                    working,
-                    before_vectors,
-                    before_snapshots,
-                    destination_id,
-                    peer_id,
-                )?;
-                #[cfg(test)]
-                note_local_mutation_detail(|detail| {
-                    detail.move_destination_working += move_stage_started.elapsed()
-                });
-                #[cfg(test)]
-                let move_stage_started = Instant::now();
-                for (block_id, claim) in moved {
-                    insert_membership(destination, block_id, &claim)?;
+                for (block, claim) in &moved {
+                    self.write_pair_membership(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        read_only_catalog,
+                        peer_id,
+                        *block,
+                        *to_page_id,
+                        destination_id,
+                        Some(claim),
+                    )?;
                 }
                 #[cfg(test)]
                 note_local_mutation_detail(|detail| {
@@ -23405,19 +24890,30 @@ impl ShardedHotEngine {
                     page_home_hints,
                     *page_id,
                 )?;
-                let page = self.ensure_working_document(
-                    working,
-                    before_vectors,
-                    before_snapshots,
-                    page_document_id,
-                    peer_id,
-                )?;
-                let mut claim = read_membership(page, *block_id)?
+                let block_document_id =
+                    self.block_home_from_working(working, claim_source, *page_id, *block_id)?;
+                // Only the selected pair is written: a reorder on one page can
+                // never touch the same block's membership of another page.
+                let mut claim = self
+                    .current_membership_claim(working, block_document_id, page_document_id)?
                     .ok_or(EngineError::BlockNotFound(*block_id))?;
                 claim.parent = *parent;
                 claim.order = order.clone();
                 claim.validate()?;
-                insert_membership(page, *block_id, &claim)?;
+                self.write_pair_membership(
+                    working,
+                    before_vectors,
+                    before_snapshots,
+                    read_only_catalog,
+                    peer_id,
+                    BlockLocation {
+                        block_id: *block_id,
+                        home_document_id: block_document_id,
+                    },
+                    *page_id,
+                    page_document_id,
+                    Some(&claim),
+                )?;
             }
             SemanticOperation::DeleteSubtree {
                 root_block_id,
@@ -23430,37 +24926,48 @@ impl ShardedHotEngine {
                     page_home_hints,
                     *page_id,
                 )?;
-                let page = self.ensure_working_document(
+                let subtree = self.author_page_subtree(
                     working,
-                    before_vectors,
-                    before_snapshots,
+                    read_only_catalog,
+                    *page_id,
                     page_document_id,
-                    peer_id,
+                    *root_block_id,
                 )?;
-                let all = read_memberships(page_document_id, page)?;
-                if !all.contains_key(root_block_id) {
-                    return Err(EngineError::BlockNotFound(*root_block_id));
-                }
-                let subtree = subtree_claims(*root_block_id, &all);
-                for block_id in &subtree {
-                    let claim = all.get(block_id).expect("subtree membership exists");
+                for (block_id, home_document_id, _) in &subtree {
+                    let key = DocumentKey::Entity(*home_document_id);
                     let home = self.ensure_working_document(
                         working,
                         before_vectors,
                         before_snapshots,
-                        claim.home_document_id,
+                        key,
                         peer_id,
                     )?;
-                    set_owner(home, *block_id, BlockOwner::Tombstone)?;
+                    self.set_author_block_owner(
+                        read_only_catalog,
+                        key,
+                        home,
+                        BlockLocation {
+                            block_id: *block_id,
+                            home_document_id: *home_document_id,
+                        },
+                        BlockOwner::Tombstone,
+                    )?;
                 }
-                let page = working
-                    .get(&page_document_id)
-                    .expect("page is working")
-                    .document();
-                for block_id in subtree {
-                    page.get_map(SHARD_MEMBERS)
-                        .delete(&block_id.to_string())
-                        .map_err(loro_error)?;
+                for (block_id, home_document_id, _) in subtree {
+                    self.write_pair_membership(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        read_only_catalog,
+                        peer_id,
+                        BlockLocation {
+                            block_id,
+                            home_document_id,
+                        },
+                        *page_id,
+                        page_document_id,
+                        None,
+                    )?;
                 }
             }
             SemanticOperation::RenamePagesAndRewriteReferrers {
@@ -23470,62 +24977,55 @@ impl ShardedHotEngine {
             } => {
                 validate_operation_shape(operation)?;
                 let mut prior_pages = BTreeMap::new();
-                {
-                    let catalog = self.ensure_working_document(
+                for change in page_changes {
+                    let (key, page) = self.working_page_document(
                         working,
                         before_vectors,
                         before_snapshots,
-                        self.catalog_document_id,
-                        peer_id,
-                    )?;
-                    for change in page_changes {
-                        let state = require_live_page(catalog, change.page_id)?;
-                        if state.name() == &change.new_name
-                            && state.path() == Some(&change.new_path)
-                        {
-                            return Err(EngineError::InvalidTransaction(format!(
-                                "rename page change for {} is unchanged",
-                                change.page_id
-                            )));
-                        }
-                        prior_pages.insert(change.page_id, state);
-                    }
-                    for rewrite in page_preamble_rewrites {
-                        require_live_page(catalog, rewrite.page_id)?;
-                    }
-                }
-                for rewrite in page_preamble_rewrites {
-                    let page_document_id = self.page_home_from_working(
-                        working,
                         read_only_catalog,
                         claim_source,
                         page_home_hints,
-                        rewrite.page_id,
+                        peer_id,
+                        change.page_id,
                     )?;
-                    let shard = self.ensure_working_document(
+                    let state = require_live_page(key, page, change.page_id)?;
+                    if state.name() == &change.new_name && state.path() == Some(&change.new_path) {
+                        return Err(EngineError::InvalidTransaction(format!(
+                            "rename page change for {} is unchanged",
+                            change.page_id
+                        )));
+                    }
+                    prior_pages.insert(change.page_id, state);
+                }
+                for rewrite in page_preamble_rewrites {
+                    let (key, page) = self.working_page_document(
                         working,
                         before_vectors,
                         before_snapshots,
-                        page_document_id,
+                        read_only_catalog,
+                        claim_source,
+                        page_home_hints,
                         peer_id,
+                        rewrite.page_id,
                     )?;
-                    read_page_preamble(page_document_id, shard)?;
+                    require_live_page(key, page, rewrite.page_id)?;
+                    read_page_preamble(key, page)?;
                 }
                 for rewrite in block_rewrites {
                     let owner = {
-                        let shard = self.ensure_working_document(
+                        let key = DocumentKey::Entity(rewrite.block.home_document_id);
+                        let home = self.ensure_working_document(
                             working,
                             before_vectors,
                             before_snapshots,
-                            rewrite.block.home_document_id,
+                            key,
                             peer_id,
                         )?;
-                        let state = read_block_state(
-                            rewrite.block.home_document_id,
-                            shard,
-                            rewrite.block.block_id,
-                        )?
-                        .ok_or(EngineError::BlockNotFound(rewrite.block.block_id))?;
+                        let state = read_block_state(key, home)?
+                            .ok_or(EngineError::BlockNotFound(rewrite.block.block_id))?;
+                        if state.block_id != rewrite.block.block_id {
+                            return Err(EngineError::HomeShardMismatch(rewrite.block.block_id));
+                        }
                         state.owner
                     };
                     let BlockOwner::Page(owner_page_id) = owner else {
@@ -23534,33 +25034,46 @@ impl ShardedHotEngine {
                             rewrite.block.block_id
                         )));
                     };
-                    let catalog = working
-                        .get(&self.catalog_document_id)
-                        .expect("rename validation loaded catalog")
-                        .document();
-                    require_live_page(catalog, owner_page_id)?;
+                    let page_document_id = self.page_home_from_working(
+                        working,
+                        read_only_catalog,
+                        claim_source,
+                        page_home_hints,
+                        owner_page_id,
+                    )?;
+                    let key = DocumentKey::Entity(page_document_id);
+                    if let Some(page) = working.get(&key) {
+                        require_live_page(key, page.document(), owner_page_id)?;
+                    } else {
+                        let page = self.clone_current_hot_document(key, 1)?;
+                        require_live_page(key, &page, owner_page_id)?;
+                    }
                 }
 
-                {
-                    let catalog = working
-                        .get(&self.catalog_document_id)
-                        .expect("rename validation loaded catalog")
-                        .document();
-                    for change in page_changes {
-                        let prior = prior_pages
-                            .get(&change.page_id)
-                            .expect("validated rename page state exists");
-                        insert_page_state(
-                            catalog,
-                            change.page_id,
-                            &PageState::Live {
-                                name: change.new_name.clone(),
-                                path: change.new_path.clone(),
-                                home_document_id: prior.home_document_id(),
-                                kind: prior.kind(),
-                            },
-                        )?;
-                    }
+                for change in page_changes {
+                    let prior = prior_pages
+                        .get(&change.page_id)
+                        .expect("validated rename page state exists");
+                    let (key, page) = self.working_page_document(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        read_only_catalog,
+                        claim_source,
+                        page_home_hints,
+                        peer_id,
+                        change.page_id,
+                    )?;
+                    insert_page_state(
+                        key,
+                        page,
+                        &PageState::Live {
+                            name: change.new_name.clone(),
+                            path: change.new_path.clone(),
+                            home_document_id: prior.home_document_id(),
+                            kind: prior.kind(),
+                        },
+                    )?;
                 }
                 for rewrite in page_preamble_rewrites {
                     self.apply_author_operation(
@@ -23607,22 +25120,25 @@ impl ShardedHotEngine {
                             .into(),
                     ));
                 }
-                let catalog = self.ensure_working_document(
+                let (key, page) = self.working_page_document(
                     working,
                     before_vectors,
                     before_snapshots,
-                    self.catalog_document_id,
+                    read_only_catalog,
+                    claim_source,
+                    page_home_hints,
                     peer_id,
+                    *page_id,
                 )?;
-                let state = require_live_page(catalog, *page_id)?;
+                let state = require_live_page(key, page, *page_id)?;
                 if state.name() == name && state.path() == Some(path) && state.kind() == *kind {
                     return Err(EngineError::InvalidTransaction(format!(
                         "external page-state reconciliation for {page_id} is unchanged"
                     )));
                 }
                 insert_page_state(
-                    catalog,
-                    *page_id,
+                    key,
+                    page,
                     &PageState::Live {
                         name: name.clone(),
                         path: path.clone(),
@@ -23635,10 +25151,36 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    /// Resolve one page's own document and open its working copy.
+    #[allow(clippy::too_many_arguments)]
+    fn working_page_document<'a>(
+        &'a self,
+        working: &'a mut BTreeMap<DocumentKey, EngineDocument>,
+        before_vectors: &mut BTreeMap<DocumentKey, VersionVector>,
+        before_snapshots: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+        read_only_catalog: &mut AuthorCatalogLookup,
+        claim_source: Option<&dyn ProjectionClaimSource>,
+        page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
+        peer_id: CrdtPeerId,
+        page_id: PageId,
+    ) -> Result<(DocumentKey, &'a LoroDoc), EngineError> {
+        let page_document_id = self.page_home_from_working(
+            working,
+            read_only_catalog,
+            claim_source,
+            page_home_hints,
+            page_id,
+        )?;
+        let key = DocumentKey::Entity(page_document_id);
+        let document =
+            self.ensure_working_document(working, before_vectors, before_snapshots, key, peer_id)?;
+        Ok((key, document))
+    }
+
     fn validate_logseq_identity_triggers(
         &self,
         transaction: &OperationTransaction,
-        working: &BTreeMap<DocumentId, EngineDocument>,
+        working: &BTreeMap<DocumentKey, EngineDocument>,
         read_only_catalog: &mut AuthorCatalogLookup,
     ) -> Result<(), EngineError> {
         let has_typed_trigger = transaction.operations.iter().any(|operation| {
@@ -23671,12 +25213,24 @@ impl ShardedHotEngine {
                 content_blocks.insert((block.home_document_id, block.block_id));
             }
         }
-        let catalog = if let Some(catalog) = working.get(&self.catalog_document_id) {
-            catalog.document()
-        } else {
-            self.read_only_catalog(read_only_catalog)?
+        // A referrer's page path is read from that page's own document, in the
+        // draft's working set when the draft touched it and from the engine's
+        // current state otherwise.
+        let working_page_state = |page_id: PageId| -> Result<Option<PageState>, EngineError> {
+            for (document_id, document) in working.iter() {
+                if document_page_id(*document_id, document.document())? == Some(page_id) {
+                    return read_page_state(*document_id, document.document());
+                }
+            }
+            match self.current_hot_catalog_page_state(page_id) {
+                Ok(state) => Ok(Some(state)),
+                Err(EngineError::PageNotFound(_)) => Ok(None),
+                Err(error) => Err(error),
+            }
         };
-        let before_catalog = self.current_catalog_document()?;
+        let before_page_state = |page_id: PageId| -> Result<Option<PageState>, EngineError> {
+            self.visible_page_state(page_id)
+        };
 
         for operation in &transaction.operations {
             let SemanticOperation::MutateBlockLogseqIdentity {
@@ -23702,21 +25256,21 @@ impl ShardedHotEngine {
                 if !content_blocks.contains(&(referrer.home_document_id, referrer.block_id)) {
                     return Ok(false);
                 }
-                let Some(document) = working.get(&referrer.home_document_id) else {
+                let Some(document) = working.get(&DocumentKey::Entity(referrer.home_document_id))
+                else {
                     return Ok(false);
                 };
                 let Some(state) = read_block_state(
-                    referrer.home_document_id,
+                    DocumentKey::Entity(referrer.home_document_id),
                     document.document(),
-                    referrer.block_id,
                 )?
-                else {
+                .filter(|state| state.block_id == referrer.block_id) else {
                     return Ok(false);
                 };
                 let BlockOwner::Page(page_id) = state.owner else {
                     return Ok(false);
                 };
-                let Some(PageState::Live { path, .. }) = read_page_state(catalog, page_id)? else {
+                let Some(PageState::Live { path, .. }) = working_page_state(page_id)? else {
                     return Ok(false);
                 };
                 Ok(content_has_logseq_trigger(
@@ -23727,24 +25281,21 @@ impl ShardedHotEngine {
                 ))
             })()?;
             let had_trigger = (|| -> Result<bool, EngineError> {
-                let Some(before_catalog) = before_catalog else {
-                    return Ok(false);
-                };
-                let before_document =
-                    self.clone_current_hot_document(referrer.home_document_id, 1)?;
+                let before_document = self.clone_current_hot_document(
+                    DocumentKey::Entity(referrer.home_document_id),
+                    1,
+                )?;
                 let Some(state) = read_block_state(
-                    referrer.home_document_id,
+                    DocumentKey::Entity(referrer.home_document_id),
                     &before_document,
-                    referrer.block_id,
                 )?
-                else {
+                .filter(|state| state.block_id == referrer.block_id) else {
                     return Ok(false);
                 };
                 let BlockOwner::Page(page_id) = state.owner else {
                     return Ok(false);
                 };
-                let Some(PageState::Live { path, .. }) = read_page_state(before_catalog, page_id)?
-                else {
+                let Some(PageState::Live { path, .. }) = before_page_state(page_id)? else {
                     return Ok(false);
                 };
                 Ok(content_has_logseq_trigger(
@@ -23766,18 +25317,22 @@ impl ShardedHotEngine {
 
     fn page_home_from_working(
         &self,
-        working: &BTreeMap<DocumentId, EngineDocument>,
+        working: &BTreeMap<DocumentKey, EngineDocument>,
         read_only_catalog: &mut AuthorCatalogLookup,
         claim_source: Option<&dyn ProjectionClaimSource>,
         page_home_hints: Option<&BTreeMap<PageId, DocumentId>>,
         page_id: PageId,
     ) -> Result<DocumentId, EngineError> {
-        if let Some(catalog) = working.get(&self.catalog_document_id) {
-            #[cfg(test)]
-            note_local_mutation_detail(|detail| {
-                detail.move_page_home_working_hits += 1;
-            });
-            return Ok(require_live_page(catalog.document(), page_id)?.home_document_id());
+        // A page this same transaction already opened or created is the
+        // strongest and cheapest authority, and is bounded by the transaction.
+        for (document_id, document) in working.iter() {
+            if document_page_id(*document_id, document.document())? == Some(page_id) {
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.move_page_home_working_hits += 1;
+                });
+                return semantic_home_document_id(*document_id);
+            }
         }
         // The application boundary already authenticated these page identities
         // and checked their exact revisions before constructing the compound
@@ -23813,12 +25368,19 @@ impl ShardedHotEngine {
             });
             return Ok(home_document_id);
         }
-        let catalog = self.clone_current_hot_document(self.catalog_document_id, 1)?;
+        // The accepted page-birth index answers this without loading any
+        // document, and keeps answering it after the page is deleted.
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
             detail.move_page_home_hot_catalog_hits += 1;
         });
-        Ok(require_live_page(&catalog, page_id)?.home_document_id())
+        let home_document_id = self
+            .current_page_home(page_id)?
+            .ok_or(EngineError::PageNotFound(page_id))?;
+        read_only_catalog
+            .page_homes
+            .insert(page_id, home_document_id);
+        Ok(home_document_id)
     }
 
     fn read_only_catalog<'a>(
@@ -23826,7 +25388,8 @@ impl ShardedHotEngine {
         read_only_catalog: &'a mut AuthorCatalogLookup,
     ) -> Result<&'a LoroDoc, EngineError> {
         if read_only_catalog.document.is_none() {
-            let catalog = self.clone_current_hot_document(self.catalog_document_id, 1)?;
+            let catalog =
+                self.clone_current_hot_document(DocumentKey::Entity(self.catalog_document_id), 1)?;
             #[cfg(test)]
             self.read_only_catalog_clones
                 .set(self.read_only_catalog_clones.get().saturating_add(1));
@@ -24413,13 +25976,28 @@ fn validate_intent_directions(
     Ok(())
 }
 
+/// Exactly the documents one page's projection reads under the current
+/// layout: the page's own document, every current member's own document, the
+/// membership document of each pair, and any document a claim participant
+/// contributes. The whole-graph catalog is not among them -- nothing in a
+/// rendered page is read from it -- so it is not required here either.
 fn projection_page_document_ids(
-    catalog_document_id: DocumentId,
     page: &MaterializedPage,
     evidence: &[ProjectionClaimEvidence],
-) -> Result<BTreeSet<DocumentId>, EngineError> {
-    let mut required = BTreeSet::from([catalog_document_id, page.home_document_id]);
-    required.extend(page.stats.distinct_home_documents.iter().copied());
+) -> Result<BTreeSet<DocumentKey>, EngineError> {
+    let mut required = BTreeSet::from([DocumentKey::Entity(page.home_document_id)]);
+    for block_document_id in page
+        .blocks
+        .iter()
+        .map(|block| block.home_document_id)
+        .chain(page.stats.distinct_home_documents.iter().copied())
+    {
+        required.insert(DocumentKey::Entity(block_document_id));
+        required.insert(membership_document_id(
+            block_document_id,
+            page.home_document_id,
+        ));
+    }
     required.extend(
         evidence
             .iter()
@@ -24569,6 +26147,14 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+/// Empty root digest of the accepted DOCUMENT map.
+///
+/// Entity and membership rows are one shared authenticated map, so this is
+/// exactly the shared map's empty digest.
+fn empty_document_map_digest() -> ContentDigest {
+    RunLocalDocumentMap::default().root_digest()
+}
+
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
     AcceptedFrontierRoot {
         schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
@@ -24576,7 +26162,7 @@ fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
         document_count: 0,
         retained_bytes_total: 0,
         document_map_root_key: None,
-        document_map_root_digest: authenticated_map_empty_digest(),
+        document_map_root_digest: empty_document_map_digest(),
         batch_map_root_key: None,
         batch_map_root_digest: authenticated_map_empty_digest(),
         genesis: None,
@@ -24610,7 +26196,7 @@ pub(crate) fn accepted_frontier_root_for_lazy_genesis_binding(
     // documents changed after genesis, and starts empty instead of copying the
     // entire graph into a second authenticated tree.
     let document_map_root_key = None;
-    let document_map_root_digest = authenticated_map_empty_digest();
+    let document_map_root_digest = empty_document_map_digest();
     let state_digest = lazy_genesis_frontier_state_digest(
         binding,
         binding.document_count(),
@@ -24647,24 +26233,37 @@ pub(crate) fn accepted_frontier_root_for_lazy_genesis(
 fn lazy_genesis_frontier_state_digest(
     binding: LazyGenesisFrontierBindingV1,
     document_count: u64,
-    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_key: Option<AuthenticatedMapKey>,
     document_map_root_digest: ContentDigest,
 ) -> Result<ContentDigest, EngineError> {
-    let mut bytes = b"tine/oplog/accepted-frontier/v7/genesis\0".to_vec();
+    // v8: the document-map root key is the full, length-framed document key.
+    let mut bytes = b"tine/oplog/accepted-frontier/v8/genesis\0".to_vec();
     let binding =
         postcard::to_allocvec(&binding).map_err(|error| EngineError::Archive(error.to_string()))?;
     bytes.extend_from_slice(&(binding.len() as u64).to_be_bytes());
     bytes.extend_from_slice(&binding);
     bytes.extend_from_slice(&document_count.to_be_bytes());
-    match document_map_root_key {
+    push_framed_document_map_root_key(&mut bytes, document_map_root_key);
+    bytes.extend_from_slice(document_map_root_digest.as_bytes());
+    Ok(ContentDigest::of(&bytes))
+}
+
+/// Commit an optional document-map root key with its own length frame.
+///
+/// The key is variable-width, so the length must be part of the preimage:
+/// without it two different keys could otherwise share a concatenation with
+/// their neighbouring fields.
+fn push_framed_document_map_root_key(bytes: &mut Vec<u8>, key: Option<AuthenticatedMapKey>) {
+    match key {
         Some(key) => {
             bytes.push(1);
-            bytes.extend_from_slice(&key);
+            bytes.push(
+                u8::try_from(key.len()).expect("an authenticated-map key is at most 48 bytes"),
+            );
+            bytes.extend_from_slice(key.as_slice());
         }
         None => bytes.push(0),
     }
-    bytes.extend_from_slice(document_map_root_digest.as_bytes());
-    Ok(ContentDigest::of(&bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24675,7 +26274,7 @@ fn next_accepted_frontier_root(
     document_count: u64,
     retained_bytes: u64,
     affected_documents: &[DocumentDependencies],
-    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_key: Option<AuthenticatedMapKey>,
     document_map_root_digest: ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
@@ -24686,7 +26285,8 @@ fn next_accepted_frontier_root(
             "accepted frontier sequence is not contiguous".into(),
         ));
     }
-    let mut bytes = b"tine/oplog/accepted-frontier/v7\0".to_vec();
+    // v8: the document-map root key is the full, length-framed document key.
+    let mut bytes = b"tine/oplog/accepted-frontier/v8\0".to_vec();
     bytes.extend_from_slice(prior.state_digest.as_bytes());
     bytes.extend_from_slice(event_binding_digest.as_bytes());
     bytes.extend_from_slice(&acceptance_sequence.to_be_bytes());
@@ -24696,13 +26296,7 @@ fn next_accepted_frontier_root(
         .checked_add(retained_bytes)
         .ok_or_else(|| EngineError::Archive("accepted retained-byte total overflowed".into()))?;
     bytes.extend_from_slice(&retained_bytes_total.to_be_bytes());
-    match document_map_root_key {
-        Some(key) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&key);
-        }
-        None => bytes.push(0),
-    }
+    push_framed_document_map_root_key(&mut bytes, document_map_root_key);
     bytes.extend_from_slice(document_map_root_digest.as_bytes());
     match batch_map_root_key {
         Some(key) => {
@@ -24759,7 +26353,7 @@ pub(crate) fn validate_accepted_frontier_root(
             None => {
                 if root.document_count != 0
                     || root.document_map_root_key.is_some()
-                    || root.document_map_root_digest != authenticated_map_empty_digest()
+                    || root.document_map_root_digest != empty_document_map_digest()
                     || root.state_digest != empty_accepted_frontier_root().state_digest
                 {
                     return Err(EngineError::Archive(
@@ -24773,7 +26367,7 @@ pub(crate) fn validate_accepted_frontier_root(
                     .map_err(|error| EngineError::Archive(error.to_string()))?;
                 if root.document_count != genesis.document_count()
                     || root.document_map_root_key.is_some()
-                    || root.document_map_root_digest != authenticated_map_empty_digest()
+                    || root.document_map_root_digest != empty_document_map_digest()
                     || root.state_digest
                         != lazy_genesis_frontier_state_digest(
                             genesis,
@@ -24792,11 +26386,11 @@ pub(crate) fn validate_accepted_frontier_root(
         || root.batch_map_root_digest == authenticated_map_empty_digest()
         || (root.document_count == 0
             && (root.document_map_root_key.is_some()
-                || root.document_map_root_digest != authenticated_map_empty_digest()))
+                || root.document_map_root_digest != empty_document_map_digest()))
         || (root.genesis.is_none()
             && root.document_count > 0
             && (root.document_map_root_key.is_none()
-                || root.document_map_root_digest == authenticated_map_empty_digest()))
+                || root.document_map_root_digest == empty_document_map_digest()))
     {
         return Err(EngineError::Archive(
             "malformed nonempty accepted-frontier document map".into(),
@@ -24828,25 +26422,37 @@ fn accepted_batch_retained_bytes(batch: &ValidatedBatch) -> Result<u64, EngineEr
         })
 }
 
+/// The run-local accepted document map's root for an exact set of full-key
+/// rows. Used to prove that the running map and the sealed on-disk
+/// `SealedDocumentMap` are the same map over the same rows.
+#[cfg(test)]
+pub(crate) fn run_local_document_map_root(
+    entries: &[(DocumentKey, ContentDigest)],
+) -> AuthenticatedMapRootV1 {
+    let mut map = RunLocalDocumentMap::default();
+    for (key, value_digest) in entries {
+        map.upsert(key.authenticated_map_key(), *value_digest);
+    }
+    map.sealed_root()
+}
+
 fn authenticated_document_map_root(
     documents: &[DocumentDependencies],
-) -> Result<(Option<[u8; 16]>, ContentDigest), EngineError> {
+) -> Result<(Option<AuthenticatedMapKey>, ContentDigest), EngineError> {
     let canonical = FrontierV2::new(documents.to_vec())?;
     if canonical.documents() != documents {
         return Err(EngineError::Archive(
             "authenticated document map is not canonically ordered".into(),
         ));
     }
-    let entries = documents
-        .iter()
-        .map(|document| {
-            Ok((
-                document.document_id().as_uuid().into_bytes(),
-                ContentDigest::of(&encode_accepted_document(document)?),
-            ))
-        })
-        .collect::<Result<Vec<_>, EngineError>>()?;
-    shared_authenticated_map_root(&entries)
+    let mut map = RunLocalDocumentMap::default();
+    for document in documents {
+        map.upsert(
+            document.document_id().authenticated_map_key(),
+            ContentDigest::of(&encode_accepted_document(document)?),
+        );
+    }
+    Ok((map.root_key(), map.root_digest()))
 }
 
 fn authenticated_map_root(
@@ -24912,7 +26518,7 @@ pub(crate) fn accepted_causal_record_digest(
         dot.counter(),
         clock_root_key.map(
             |key| tine_storage::sealed_accepted_index::AuthenticatedMapLinkV1 {
-                key,
+                key: AuthenticatedMapKey::from(key),
                 digest: clock_root_digest,
             },
         ),
@@ -24932,12 +26538,37 @@ fn rejected_dependency_set_commitment(dependencies: &[BatchId]) -> ContentDigest
     ContentDigest::of(&bytes)
 }
 
+/// The batch, status and causal-clock domains are identified by UUIDs, not by
+/// document addresses. They use the same shared authenticated map; this is the
+/// only place their 128-bit identities cross into shared key space, and the
+/// conversion is width-checked in both directions rather than truncating.
 fn shared_authenticated_map_root(
     entries: &[([u8; 16], ContentDigest)],
 ) -> Result<(Option<[u8; 16]>, ContentDigest), EngineError> {
-    let root = tine_storage::sealed_accepted_index::authenticated_map_root(entries)
+    let shared = entries
+        .iter()
+        .map(|(key, digest)| (AuthenticatedMapKey::from(*key), *digest))
+        .collect::<Vec<_>>();
+    let root = tine_storage::sealed_accepted_index::authenticated_map_root(&shared)
         .map_err(|error| EngineError::Archive(error.to_string()))?;
-    Ok((root.root.map(|link| link.key), root.root_digest()))
+    Ok((
+        uuid_domain_map_root_key(root.root.map(|link| link.key))?,
+        root.root_digest(),
+    ))
+}
+
+/// Narrow a shared root key back to its 128-bit UUID-domain identity. A wider
+/// key here would mean a non-UUID row entered a UUID-keyed map, so it is an
+/// error rather than a silent truncation.
+fn uuid_domain_map_root_key(
+    key: Option<AuthenticatedMapKey>,
+) -> Result<Option<[u8; 16]>, EngineError> {
+    key.map(|key| {
+        <[u8; 16]>::try_from(key.as_slice()).map_err(|_| {
+            EngineError::Archive("uuid-keyed authenticated map root is not a 128-bit key".into())
+        })
+    })
+    .transpose()
 }
 
 fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), EngineError> {
@@ -25001,7 +26632,7 @@ fn encode_accepted_document(dependencies: &DocumentDependencies) -> Result<Vec<u
 
 fn encode_crdt_update_payload(
     batch_id: BatchId,
-    document_id: DocumentId,
+    document_id: DocumentKey,
     mut dependency_heads: Vec<BatchId>,
     mut batch_dependency_heads: Vec<BatchId>,
     causal_state_digest: Option<DocumentCausalDigest>,
@@ -25028,7 +26659,7 @@ fn encode_crdt_update_payload(
 
 fn decode_crdt_update_payload(
     expected_batch_id: BatchId,
-    expected_document_id: DocumentId,
+    expected_document_id: DocumentKey,
     bytes: &[u8],
 ) -> Result<CrdtUpdatePayload, EngineError> {
     let payload: CrdtUpdatePayload = postcard::from_bytes(bytes).map_err(|error| {
@@ -25076,7 +26707,7 @@ fn decode_crdt_update_payload(
 /// precisely the lanes this payload advances — no diffing, and no way for an
 /// already covered replay to smuggle a lane in.
 fn crdt_update_advanced_lanes(
-    document_id: DocumentId,
+    document_id: DocumentKey,
     update: &[u8],
 ) -> Result<Vec<CrdtPeerId>, EngineError> {
     let metadata = LoroDoc::decode_import_blob_meta(update, true).map_err(loro_error)?;
@@ -25094,7 +26725,7 @@ fn crdt_update_advanced_lanes(
 }
 
 fn validate_update_base(
-    document_id: DocumentId,
+    document_id: DocumentKey,
     before: &LoroDoc,
     update: &[u8],
 ) -> Result<(), EngineError> {
@@ -25125,20 +26756,34 @@ fn validate_update_base(
     Ok(())
 }
 
-fn validate_immutable_shard_identity(
-    document_id: DocumentId,
-    prior_page_id: Option<PageId>,
+/// An update may never rewrite a document's immutable identity register.
+///
+/// The previous layout could only check the page a membership shard belonged
+/// to. A current document declares its whole identity -- which page, which
+/// block, which birth -- so the comparison is over all of it.
+fn validate_immutable_document_identity(
+    document_id: DocumentKey,
+    prior: Option<&DocumentIdentity>,
     replacement: &LoroDoc,
 ) -> Result<(), EngineError> {
-    let replacement_page_id = shard_page_id(replacement)?;
-    if let Some(expected) = prior_page_id.filter(|prior| Some(*prior) != replacement_page_id) {
+    let Some(prior) = prior else {
+        return Ok(());
+    };
+    let replacement = document_identity(document_id, replacement)?;
+    if replacement.as_ref() == Some(prior) {
+        return Ok(());
+    }
+    if let Some(expected) = prior.page_id() {
         return Err(EngineError::ShardPageIdentityChanged {
             document_id,
             expected,
-            found: replacement_page_id,
+            found: replacement.as_ref().and_then(DocumentIdentity::page_id),
         });
     }
-    Ok(())
+    Err(malformed(
+        document_id,
+        "an update rewrote an immutable document identity",
+    ))
 }
 
 fn verify_compact_document_equivalence(
@@ -25150,41 +26795,82 @@ fn verify_compact_document_equivalence(
             "compact accepted document changed oplog frontiers".into(),
         ));
     }
+    verify_compact_root_containers(document, restored)
+}
+
+fn verify_compact_root_containers(
+    document: &LoroDoc,
+    restored: &LoroDoc,
+) -> Result<(), EngineError> {
     if restored.get_value() != document.get_value() {
         return Err(EngineError::InvalidCrdt(
             "compact accepted document changed state or root container identity".into(),
         ));
     }
-    // Tine's validated documents consist of root maps and optional text
-    // leaves. Compare their actual ContainerIDs, never Loro's diagnostic
-    // get_deep_value_with_id(), which also includes run-local arena slots.
+    // Tine's validated documents consist of root maps and root/nested text.
+    // Resolve the actual typed containers by their stable ContainerIDs; typed
+    // getters would create a map under a text root and therefore mutate the
+    // document while supposedly qualifying it.
     let LoroValue::Map(roots) = document.get_value() else {
         unreachable!("validated root map")
     };
-    for name in roots.keys() {
-        let original_map = document.get_map(name.as_str());
-        let restored_map = restored.get_map(name.as_str());
-        let original_values = original_map.get_value();
-        if original_values != restored_map.get_value() {
+    for value in roots.values() {
+        let LoroValue::Container(id) = value else {
             return Err(EngineError::InvalidCrdt(
-                "compact accepted document changed nested container identity".into(),
+                "compact qualification encountered a non-container root".into(),
             ));
-        }
-        for (_, value) in original_values.as_map().expect("map value").iter() {
-            if let LoroValue::Container(id) = value {
-                let (Some(Container::Text(original_text)), Some(Container::Text(restored_text))) = (
-                    document.get_container(id.clone()),
-                    restored.get_container(id.clone()),
-                ) else {
-                    return Err(EngineError::InvalidCrdt(
-                        "compact qualification encountered a non-text nested container".into(),
-                    ));
-                };
+        };
+        let (Some(original), Some(reopened)) = (
+            document.get_container(id.clone()),
+            restored.get_container(id.clone()),
+        ) else {
+            return Err(EngineError::InvalidCrdt(
+                "compact qualification could not resolve a root container identity".into(),
+            ));
+        };
+        match (original, reopened) {
+            (Container::Text(original_text), Container::Text(restored_text)) => {
                 if original_text.to_delta() != restored_text.to_delta() {
                     return Err(EngineError::InvalidCrdt(
-                        "compact accepted document changed text attributes".into(),
+                        "compact accepted document changed root text or attributes".into(),
                     ));
                 }
+            }
+            (Container::Map(original_map), Container::Map(restored_map)) => {
+                let original_values = original_map.get_value();
+                if original_values != restored_map.get_value() {
+                    return Err(EngineError::InvalidCrdt(
+                        "compact accepted document changed nested container identity".into(),
+                    ));
+                }
+                for value in original_values.as_map().expect("map value").values() {
+                    if let LoroValue::Container(id) = value {
+                        let (
+                            Some(Container::Text(original_text)),
+                            Some(Container::Text(restored_text)),
+                        ) = (
+                            document.get_container(id.clone()),
+                            restored.get_container(id.clone()),
+                        )
+                        else {
+                            return Err(EngineError::InvalidCrdt(
+                                "compact qualification encountered a non-text nested container"
+                                    .into(),
+                            ));
+                        };
+                        if original_text.to_delta() != restored_text.to_delta() {
+                            return Err(EngineError::InvalidCrdt(
+                                "compact accepted document changed nested text or attributes"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(EngineError::InvalidCrdt(
+                    "compact qualification changed or encountered an unsupported root type".into(),
+                ))
             }
         }
     }
@@ -25194,18 +26880,20 @@ fn verify_compact_document_equivalence(
 /// Independently open persisted compact bytes using the same semantic validators
 /// as accepted documents; no engine state or disposable checkpoint is consulted.
 pub(crate) fn qualify_compact_document(
-    catalog: DocumentId,
+    catalog: DocumentKey,
     dependencies: &DocumentDependencies,
     checkpoint: &Vec<u8>,
 ) -> Result<LoroDoc, EngineError> {
     let document_id = dependencies.document_id();
     let restored = LoroDoc::new();
     import_complete(document_id, &restored, std::slice::from_ref(checkpoint))?;
-    if document_id == catalog {
-        validate_catalog(catalog, &restored)?;
-    } else {
-        validate_shard(catalog, document_id, &restored)?;
-    }
+    snapshot_document(
+        catalog
+            .as_entity()
+            .expect("the workspace graph document is an entity document"),
+        document_id,
+        &restored,
+    )?;
     if canonical_peer_counters(&restored.oplog_vv())? != dependencies.peer_counters() {
         return Err(EngineError::FrontierVectorMismatch(document_id));
     }
@@ -25238,14 +26926,18 @@ fn clone_doc(document: &LoroDoc, peer: u64) -> Result<LoroDoc, EngineError> {
         .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
     let clone = LoroDoc::new();
     if !bytes.is_empty() {
-        import_complete(DocumentId::from_uuid(uuid::Uuid::nil()), &clone, &[bytes])?;
+        import_complete(
+            DocumentKey::Entity(DocumentId::from_uuid(uuid::Uuid::nil())),
+            &clone,
+            &[bytes],
+        )?;
     }
     clone.set_peer_id(peer).map_err(loro_error)?;
     Ok(clone)
 }
 
 fn import_complete(
-    document_id: DocumentId,
+    document_id: DocumentKey,
     document: &LoroDoc,
     updates: &[Vec<u8>],
 ) -> Result<(), EngineError> {
@@ -25259,252 +26951,133 @@ fn import_complete(
     Ok(())
 }
 
-fn validate_document_roots(
-    document_id: DocumentId,
-    document: &LoroDoc,
-    allowed: &[&str],
-) -> Result<(), EngineError> {
-    let LoroValue::Map(roots) = document.get_value() else {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "document root is not a map".into(),
-        });
-    };
-    for (name, value) in roots.iter() {
-        if !allowed.contains(&name.as_str()) {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("unexpected root container {name:?}"),
-            });
-        }
-        if !matches!(
-            value,
-            LoroValue::Container(container_id)
-                if container_id.container_type() == ContainerType::Map
-        ) {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("root container {name:?} is not a map"),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_catalog(
-    catalog_document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<BTreeMap<PageId, PageState>, EngineError> {
-    validate_document_roots(catalog_document_id, document, &[CATALOG_PAGES])?;
-    let pages = read_all_pages(document)?;
-    for (page_id, state) in &pages {
-        if state.home_document_id() == catalog_document_id {
-            return Err(EngineError::MalformedDocument {
-                document_id: catalog_document_id,
-                reason: format!("catalog cannot be the immutable home of page {page_id}"),
-            });
-        }
-    }
-    Ok(pages)
-}
-
-/// Proof that one borrowed catalog document has the accepted catalog shape.
-///
-/// This is a property of the document, not of any page in it, and deriving it
-/// costs `LoroDoc::get_value`, which is linear in the catalog's page entries. A
-/// caller reading many pages out of one borrowed document therefore holds this
-/// token for the whole bounded window instead of re-deriving it per page, which
-/// is what makes a graph-sized catalog traversal linear rather than quadratic.
-///
-/// The token borrows the exact document it proved, so it cannot authorize a
-/// page read against a different one.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ValidatedCatalogDocument<'document> {
-    catalog_document_id: DocumentId,
-    document: &'document LoroDoc,
-}
-
-/// Establish the catalog document shape once for a bounded read window.
-#[track_caller]
-pub(super) fn validate_catalog_document(
-    catalog_document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<ValidatedCatalogDocument<'_>, EngineError> {
-    crate::fast_commit::note_graph_wide_catalog_validation();
-    if super::phase_trace_enabled() {
-        let caller = std::panic::Location::caller();
-        eprintln!(
-            "PHASE DETAIL Engine.catalog_shape_validation caller={}:{}",
-            caller.file(),
-            caller.line()
-        );
-    }
-    let page_count = document.get_map(CATALOG_PAGES).len();
-    update_cursor_probe(|probe| {
-        probe.catalog_document_validations = probe.catalog_document_validations.saturating_add(1);
-        probe.catalog_entries_validated =
-            probe.catalog_entries_validated.saturating_add(page_count);
-    });
-    validate_document_roots(catalog_document_id, document, &[CATALOG_PAGES])?;
-    if page_count > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::InvalidCrdt(
-            "catalog entry bound exceeded".into(),
-        ));
-    }
-    Ok(ValidatedCatalogDocument {
-        catalog_document_id,
-        document,
-    })
-}
-
-/// One page's accepted state out of an already shape-validated catalog.
-pub(super) fn read_validated_catalog_page(
-    validated: ValidatedCatalogDocument<'_>,
-    page_id: PageId,
-) -> Result<Option<PageState>, EngineError> {
-    let catalog_document_id = validated.catalog_document_id;
-    let state = read_page_state(validated.document, page_id)?;
-    if state
-        .as_ref()
-        .is_some_and(|state| state.home_document_id() == catalog_document_id)
-    {
-        return Err(EngineError::MalformedDocument {
-            document_id: catalog_document_id,
-            reason: format!("catalog cannot be the immutable home of page {page_id}"),
-        });
-    }
-    Ok(state)
-}
-
-pub(super) fn validate_catalog_page(
-    catalog_document_id: DocumentId,
-    document: &LoroDoc,
-    page_id: PageId,
-) -> Result<Option<PageState>, EngineError> {
-    read_validated_catalog_page(
-        validate_catalog_document(catalog_document_id, document)?,
-        page_id,
-    )
-}
-
-fn validate_shard(
-    catalog_document_id: DocumentId,
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<(), EngineError> {
-    validated_shard_source_data(catalog_document_id, document_id, document).map(|_| ())
-}
-
-fn validated_shard_source_data(
-    catalog_document_id: DocumentId,
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<
-    (
-        Option<String>,
-        BTreeMap<BlockId, BlockState>,
-        BTreeMap<BlockId, MembershipClaim>,
-    ),
-    EngineError,
-> {
-    validate_shard_metadata(catalog_document_id, document_id, document)?;
-    let preamble = read_page_preamble(document_id, document)?;
-    let blocks = read_all_blocks(document_id, document)?;
-    let memberships = read_memberships(document_id, document)?;
-    Ok((preamble, blocks, memberships))
-}
-
-fn validate_shard_metadata(
-    catalog_document_id: DocumentId,
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<(), EngineError> {
-    if document_id == catalog_document_id {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "catalog cannot be used as a page shard".into(),
-        });
-    }
-    validate_document_roots(
-        document_id,
-        document,
-        &[
-            SHARD_META,
-            SHARD_OWNERS,
-            SHARD_MEMBERS,
-            SHARD_CONTENT,
-            SHARD_LOGSEQ_UUIDS,
-            SHARD_LOGSEQ_IDENTITY_ORIGINS,
-            SHARD_PAGE_PREAMBLE,
-        ],
-    )?;
-    validate_shard_metadata_shape(document_id, document)
-}
-
-fn validate_shard_metadata_shape(
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<(), EngineError> {
-    let metadata = document.get_map(SHARD_META);
-    if metadata.len() != 1
-        || metadata
-            .keys()
-            .next()
-            .is_none_or(|key| key.as_str() != SHARD_PAGE_ID)
-    {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "shard metadata must contain only its page identity".into(),
-        });
-    }
-    shard_page_id(document)?.ok_or_else(|| EngineError::MalformedDocument {
-        document_id,
-        reason: "shard has no page identity".into(),
-    })?;
-    Ok(())
-}
-
 #[cfg(test)]
 fn derive_effect(
-    catalog_document_id: DocumentId,
-    before: &BTreeMap<DocumentId, LoroDoc>,
-    after: &BTreeMap<DocumentId, LoroDoc>,
+    graph_document_id: DocumentId,
+    before: &BTreeMap<DocumentKey, LoroDoc>,
+    after: &BTreeMap<DocumentKey, LoroDoc>,
 ) -> Result<SemanticEffect, EngineError> {
-    derive_effect_with_catalog(catalog_document_id, before, after).map(|(effect, _)| effect)
+    derive_effect_with_catalog(graph_document_id, before, after).map(|(effect, _)| effect)
 }
 
 #[cfg(test)]
 fn derive_effect_with_catalog(
-    catalog_document_id: DocumentId,
-    before: &BTreeMap<DocumentId, LoroDoc>,
-    after: &BTreeMap<DocumentId, LoroDoc>,
+    graph_document_id: DocumentId,
+    before: &BTreeMap<DocumentKey, LoroDoc>,
+    after: &BTreeMap<DocumentKey, LoroDoc>,
 ) -> Result<(SemanticEffect, Option<BTreeMap<PageId, PageState>>), EngineError> {
-    let before = snapshot_documents_with_validation(catalog_document_id, before, false)?;
-    let after = snapshot_documents_with_validation(catalog_document_id, after, true)?;
+    let before = snapshot_documents(graph_document_id, before)?;
+    let after = snapshot_documents(graph_document_id, after)?;
     derive_effect_from_snapshots_with_catalog(&before, &after, &BTreeSet::new())
 }
 
+/// One live document's complete semantic state.
+///
+/// Exactly one entity or one pair per document, so a document contributes at
+/// most one delta of each kind to a batch. There is no variant that grows with
+/// graph size, which is the whole point of the layout: a snapshot costs the
+/// entity it is about, never the page or catalog it happens to sit in.
 #[derive(Clone, Debug)]
 enum SemanticDocumentSnapshot {
-    Catalog(BTreeMap<PageId, PageState>),
-    Shard {
-        page_id: Option<PageId>,
-        page_preamble: Option<PagePreambleState>,
-        blocks: BTreeMap<BlockId, BlockState>,
-        memberships: BTreeMap<BlockId, MembershipClaim>,
+    /// A document that has never been written. This is the ordinary before
+    /// state of every document a batch is about to create.
+    Unwritten,
+    Graph,
+    Page {
+        page_id: PageId,
+        state: PageState,
+        preamble: Option<PagePreambleState>,
+    },
+    Block {
+        state: BlockState,
+        birth_page_id: PageId,
+        birth_page_document_id: DocumentId,
+    },
+    Membership {
+        page_id: PageId,
+        block_id: BlockId,
+        claim: Option<MembershipClaim>,
     },
 }
 
-#[cfg(test)]
-fn semantic_snapshot_block_count(snapshot: &SemanticDocumentSnapshot) -> usize {
-    match snapshot {
-        SemanticDocumentSnapshot::Catalog(_) => 0,
-        SemanticDocumentSnapshot::Shard { blocks, .. } => blocks.len(),
+impl SemanticDocumentSnapshot {
+    fn page(&self) -> Option<(PageId, &PageState, Option<&PagePreambleState>)> {
+        match self {
+            Self::Page {
+                page_id,
+                state,
+                preamble,
+            } => Some((*page_id, state, preamble.as_ref())),
+            _ => None,
+        }
+    }
+
+    fn block(&self) -> Option<&BlockState> {
+        match self {
+            Self::Block { state, .. } => Some(state),
+            _ => None,
+        }
+    }
+
+    fn membership(&self) -> Option<(PageId, BlockId, Option<&MembershipClaim>)> {
+        match self {
+            Self::Membership {
+                page_id,
+                block_id,
+                claim,
+            } => Some((*page_id, *block_id, claim.as_ref())),
+            _ => None,
+        }
+    }
+
+    /// Whether two snapshots of the same address describe the same entity.
+    /// Immutable identity means a written document can only ever be the same
+    /// role again; the one legal transition is out of `Unwritten`.
+    fn role_matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unwritten, _) | (_, Self::Unwritten) => true,
+            (Self::Graph, Self::Graph) => true,
+            (Self::Page { page_id: left, .. }, Self::Page { page_id: right, .. }) => left == right,
+            (
+                Self::Block {
+                    state: left,
+                    birth_page_id: left_page,
+                    birth_page_document_id: left_page_document,
+                },
+                Self::Block {
+                    state: right,
+                    birth_page_id: right_page,
+                    birth_page_document_id: right_page_document,
+                },
+            ) => {
+                left.block_id == right.block_id
+                    && left_page == right_page
+                    && left_page_document == right_page_document
+            }
+            (
+                Self::Membership {
+                    page_id: left_page,
+                    block_id: left_block,
+                    ..
+                },
+                Self::Membership {
+                    page_id: right_page,
+                    block_id: right_block,
+                    ..
+                },
+            ) => left_page == right_page && left_block == right_block,
+            _ => false,
+        }
     }
 }
 
 #[cfg(test)]
-fn semantic_snapshot_blocks(snapshots: &BTreeMap<DocumentId, SemanticDocumentSnapshot>) -> usize {
+fn semantic_snapshot_block_count(snapshot: &SemanticDocumentSnapshot) -> usize {
+    usize::from(matches!(snapshot, SemanticDocumentSnapshot::Block { .. }))
+}
+
+#[cfg(test)]
+fn semantic_snapshot_blocks(snapshots: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>) -> usize {
     snapshots.values().map(semantic_snapshot_block_count).sum()
 }
 
@@ -25537,585 +27110,259 @@ thread_local! {
     static CATALOG_PAGE_ENTRY_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Catalog rows decoded by whole-catalog enumeration. Any nonzero delta on a
-/// one-page transaction is graph-wide work.
+/// Catalog rows decoded by whole-catalog enumeration.
+///
+/// The live layout has no catalog document to enumerate, so this counter is
+/// structurally pinned at zero. It is retained because the assertions that read
+/// it are the ones proving the graph-wide producer is gone.
 #[cfg(test)]
 pub(crate) fn catalog_page_entry_visits() -> usize {
     CATALOG_PAGE_ENTRY_VISITS.get()
 }
 
-#[cfg(test)]
-fn record_catalog_page_entry_visits(entries: usize) {
-    CATALOG_PAGE_ENTRY_VISITS.set(CATALOG_PAGE_ENTRY_VISITS.get().saturating_add(entries));
+/// Semantic entity state always lives in an ENTITY document: a page's own
+/// document or a block's own document. Membership documents address a
+/// (block, page) pair and carry only the pair claim, so asking one for entity
+/// state is a malformed-document error rather than a truncation of the pair.
+fn semantic_home_document_id(document_id: DocumentKey) -> Result<DocumentId, EngineError> {
+    document_id
+        .as_entity()
+        .ok_or_else(|| EngineError::MalformedDocument {
+            document_id,
+            reason: "membership documents do not host semantic entity state".into(),
+        })
 }
 
+/// Read one live document's complete semantic state.
+///
+/// Shape validation is unconditional here. In the catalog/shard layout it was
+/// optional because proving a document's shape cost `LoroDoc::get_value` over
+/// every block that had ever visited a page; a fixed-schema document is
+/// bounded by its own fixed registers, so there is no longer a cheap and an
+/// expensive read to choose between.
 fn snapshot_document(
-    catalog_document_id: DocumentId,
-    document_id: DocumentId,
+    graph_document_id: DocumentId,
+    document_id: DocumentKey,
     document: &LoroDoc,
-    validate_shape: bool,
 ) -> Result<SemanticDocumentSnapshot, EngineError> {
-    if document_id == catalog_document_id {
-        if validate_shape {
-            validate_document_roots(catalog_document_id, document, &[CATALOG_PAGES])?;
+    let Some((identity, state)) = document_state(document_id, document)? else {
+        return Ok(SemanticDocumentSnapshot::Unwritten);
+    };
+    let is_graph_address = document_id == DocumentKey::Entity(graph_document_id);
+    #[cfg(test)]
+    record_owned_semantic_snapshot_entries(1);
+    match (identity, state) {
+        (DocumentIdentity::Graph { .. }, DocumentState::Graph) if is_graph_address => {
+            Ok(SemanticDocumentSnapshot::Graph)
         }
-        let pages = read_all_pages(document)?;
-        for (page_id, state) in &pages {
-            if state.home_document_id() == catalog_document_id {
-                return Err(EngineError::MalformedDocument {
-                    document_id: catalog_document_id,
-                    reason: format!("catalog cannot be the immutable home of page {page_id}"),
-                });
-            }
-        }
-        Ok(SemanticDocumentSnapshot::Catalog(pages))
-    } else {
-        if validate_shape {
-            validate_document_roots(
-                document_id,
-                document,
-                &[
-                    SHARD_META,
-                    SHARD_OWNERS,
-                    SHARD_MEMBERS,
-                    SHARD_CONTENT,
-                    SHARD_LOGSEQ_UUIDS,
-                    SHARD_LOGSEQ_IDENTITY_ORIGINS,
-                    SHARD_PAGE_PREAMBLE,
-                ],
-            )?;
-        }
-        let page_id = shard_page_id(document)?;
-        let page_preamble = page_id
-            .map(|page_id| {
-                read_page_preamble(document_id, document).map(|preamble| PagePreambleState {
+        (DocumentIdentity::Graph { .. }, _) => Err(EngineError::MalformedDocument {
+            document_id,
+            reason: "graph metadata document is not the workspace graph document".into(),
+        }),
+        (_, _) if is_graph_address => Err(EngineError::MalformedDocument {
+            document_id,
+            reason: "the graph document cannot host page, block or pair state".into(),
+        }),
+        (DocumentIdentity::Page { page_id, .. }, DocumentState::Page { state, preamble }) => {
+            let home_document_id = semantic_home_document_id(document_id)?;
+            Ok(SemanticDocumentSnapshot::Page {
+                page_id,
+                preamble: Some(PagePreambleState {
                     page_id,
-                    home_document_id: document_id,
+                    home_document_id,
                     preamble,
-                })
+                }),
+                state,
             })
-            .transpose()?;
-        let blocks = read_all_blocks(document_id, document)?;
-        let memberships = read_memberships(document_id, document)?;
-        #[cfg(test)]
-        record_owned_semantic_snapshot_entries(blocks.len().saturating_add(memberships.len()));
-        Ok(SemanticDocumentSnapshot::Shard {
+        }
+        (
+            DocumentIdentity::Block {
+                birth_page_id,
+                birth_page_document_id,
+                ..
+            },
+            DocumentState::Block(state),
+        ) => Ok(SemanticDocumentSnapshot::Block {
+            state,
+            birth_page_id,
+            birth_page_document_id,
+        }),
+        (
+            DocumentIdentity::Membership {
+                block_id, page_id, ..
+            },
+            DocumentState::Membership(claim),
+        ) => Ok(SemanticDocumentSnapshot::Membership {
             page_id,
-            page_preamble,
-            blocks,
-            memberships,
-        })
+            block_id,
+            claim,
+        }),
+        _ => Err(EngineError::MalformedDocument {
+            document_id,
+            reason: "document state does not match its immutable identity".into(),
+        }),
     }
 }
 
 fn snapshot_documents(
-    catalog_document_id: DocumentId,
-    documents: &BTreeMap<DocumentId, LoroDoc>,
-) -> Result<BTreeMap<DocumentId, SemanticDocumentSnapshot>, EngineError> {
-    snapshot_documents_with_validation(catalog_document_id, documents, true)
-}
-
-fn snapshot_engine_documents(
-    catalog_document_id: DocumentId,
-    documents: &BTreeMap<DocumentId, EngineDocument>,
-    validate_shape: bool,
-) -> Result<BTreeMap<DocumentId, SemanticDocumentSnapshot>, EngineError> {
-    snapshot_engine_documents_excluding(
-        catalog_document_id,
-        documents,
-        validate_shape,
-        &BTreeSet::new(),
-    )
-}
-
-fn snapshot_engine_documents_excluding(
-    catalog_document_id: DocumentId,
-    documents: &BTreeMap<DocumentId, EngineDocument>,
-    validate_shape: bool,
-    excluded: &BTreeSet<DocumentId>,
-) -> Result<BTreeMap<DocumentId, SemanticDocumentSnapshot>, EngineError> {
+    graph_document_id: DocumentId,
+    documents: &BTreeMap<DocumentKey, LoroDoc>,
+) -> Result<BTreeMap<DocumentKey, SemanticDocumentSnapshot>, EngineError> {
     documents
         .iter()
-        .filter(|(document_id, _)| !excluded.contains(document_id))
         .map(|(document_id, document)| {
             Ok((
                 *document_id,
-                snapshot_document(
-                    catalog_document_id,
-                    *document_id,
-                    document.document(),
-                    validate_shape,
-                )?,
+                snapshot_document(graph_document_id, *document_id, document)?,
             ))
         })
         .collect()
 }
 
-fn validate_new_exact_shards_against_declared(
-    catalog_document_id: DocumentId,
-    documents: &BTreeMap<DocumentId, EngineDocument>,
-    candidates: &BTreeSet<DocumentId>,
-    declared: &SemanticEffect,
-) -> Result<ValidatedNewShardEffects, EngineError> {
-    let mut page_source_counts = BTreeMap::<PageId, usize>::new();
-    for (document_id, document) in documents {
-        if *document_id == catalog_document_id {
-            continue;
-        }
-        if let Some(page_id) = shard_page_id(document.document())? {
-            let count = page_source_counts.entry(page_id).or_default();
-            *count = count.saturating_add(1);
-        }
-    }
-
-    let mut validated = ValidatedNewShardEffects::default();
-    for document_id in candidates {
-        let document = documents
-            .get(document_id)
-            .expect("new exact shard candidate has an imported document")
-            .document();
-        let Some(page_id) = shard_page_id(document)? else {
-            continue;
-        };
-        if page_source_counts.get(&page_id) != Some(&1) {
-            // Duplicate page sources require the general merged-membership
-            // comparator, which detects overlapping and disjoint key streams.
-            continue;
-        }
-        let source = validate_new_exact_shard_against_declared(
-            catalog_document_id,
-            *document_id,
-            page_id,
-            document,
-            declared,
-        )?;
-        validated.documents.insert(*document_id);
-        validated.pages.insert(page_id);
-        validated.sources.insert(*document_id, source);
-    }
-    Ok(validated)
-}
-
-fn prime_empty_shard_roots(document: &LoroDoc) {
-    // Root handles are arena-local structural identities even while the exact
-    // VV is empty. Register them in the same order as a full empty snapshot so
-    // imported mergeable-text containers retain checkpoint-stable indices.
-    document.get_map(SHARD_META);
-    document.get_map(SHARD_OWNERS);
-    document.get_map(SHARD_CONTENT);
-    document.get_map(SHARD_MEMBERS);
-    document.get_map(SHARD_LOGSEQ_UUIDS);
-    document.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS);
-    document.get_map(SHARD_PAGE_PREAMBLE);
-}
-
-fn validate_new_exact_shard_against_declared(
-    catalog_document_id: DocumentId,
-    document_id: DocumentId,
-    page_id: PageId,
-    document: &LoroDoc,
-    declared: &SemanticEffect,
-) -> Result<ValidatedReferenceSourceSnapshot, EngineError> {
-    validate_shard_metadata(catalog_document_id, document_id, document)?;
-
-    let owners = document.get_map(SHARD_OWNERS);
-    let content = document.get_map(SHARD_CONTENT);
-    let logseq_uuids = document.get_map(SHARD_LOGSEQ_UUIDS);
-    let logseq_origins = document.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS);
-    if owners.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "block entry bound exceeded".into(),
-        });
-    }
-    if content.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "content entry bound exceeded".into(),
-        });
-    }
-    if logseq_uuids.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "Logseq UUID entry bound exceeded".into(),
-        });
-    }
-    if logseq_origins.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "Logseq identity-origin entry bound exceeded".into(),
-        });
-    }
-    if logseq_uuids.len() != logseq_origins.len() {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "Logseq UUID and identity-origin key coverage differs".into(),
-        });
-    }
-    if owners.len() != content.len() {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "owner and content key coverage differs".into(),
-        });
-    }
-
-    let declared_blocks = declared.blocks();
-    let block_start = declared_blocks.partition_point(|delta| delta.home_document_id < document_id);
-    let block_end = declared_blocks.partition_point(|delta| delta.home_document_id <= document_id);
-    let declared_blocks = &declared_blocks[block_start..block_end];
-    if declared_blocks.len() != owners.len() {
-        return Err(EngineError::SemanticEffectMismatch);
-    }
-    let mut blocks = BTreeMap::new();
-    for key in owners.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        let owner = map_string(&owners, &key)?
-            .ok_or_else(|| EngineError::InvalidCrdt(format!("owner {block_id} is not a string")))
-            .and_then(|owner| parse_owner(&owner))?;
-        let content =
-            block_text(document, block_id).ok_or_else(|| EngineError::MalformedDocument {
-                document_id,
-                reason: format!("content {block_id} is missing or not mergeable text"),
-            })?;
-        let content = content.to_string();
-        let logseq_uuid = read_logseq_uuid(document_id, document, block_id)?;
-        let logseq_identity_origin = read_logseq_identity_origin(document_id, document, block_id)?;
-        if content.len() > super::semantic::MAX_BLOCK_CONTENT_BYTES {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("content {block_id} exceeds the semantic bound"),
-            });
-        }
-        let Ok(index) = declared_blocks.binary_search_by_key(&block_id, |delta| delta.block_id)
-        else {
-            return Err(EngineError::SemanticEffectMismatch);
-        };
-        let delta = &declared_blocks[index];
-        let Some(after) = delta.after.as_ref() else {
-            return Err(EngineError::SemanticEffectMismatch);
-        };
-        let state = BlockState {
-            block_id,
-            home_document_id: document_id,
-            owner,
-            logseq_uuid,
-            logseq_identity_origin,
-            content,
-        };
-        if delta.before.is_some() || delta.home_document_id != document_id || after != &state {
-            return Err(EngineError::SemanticEffectMismatch);
-        }
-        blocks.insert(block_id, state);
-    }
-    for key in content.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if map_string(&owners, &key)?.is_none() || block_text(document, block_id).is_none() {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("content {block_id} has no matching owner and mergeable text"),
-            });
-        }
-    }
-    for key in logseq_uuids.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if map_string(&owners, &key)?.is_none() {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("Logseq UUID {block_id} has no owner register"),
-            });
-        }
-        read_logseq_uuid(document_id, document, block_id)?;
-        read_logseq_identity_origin(document_id, document, block_id)?;
-    }
-    for key in logseq_origins.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if map_string(&logseq_uuids, &key)?.is_none() {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("Logseq identity origin {block_id} has no UUID register"),
-            });
-        }
-        read_logseq_identity_origin(document_id, document, block_id)?;
-    }
-
-    let page_preamble = PagePreambleState {
-        page_id,
-        home_document_id: document_id,
-        preamble: read_page_preamble(document_id, document)?,
-    };
-    let declared_preambles = declared.page_preambles();
-    let preamble_start =
-        declared_preambles.partition_point(|delta| delta.home_document_id < document_id);
-    let preamble_end =
-        declared_preambles.partition_point(|delta| delta.home_document_id <= document_id);
-    let declared_preambles = &declared_preambles[preamble_start..preamble_end];
-    if declared_preambles.len() != 1
-        || declared_preambles[0].page_id != page_id
-        || declared_preambles[0].before.is_some()
-        || declared_preambles[0].after.as_ref() != Some(&page_preamble)
-    {
-        return Err(EngineError::SemanticEffectMismatch);
-    }
-
-    let members = document.get_map(SHARD_MEMBERS);
-    if members.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "membership entry bound exceeded".into(),
-        });
-    }
-    let declared_memberships = declared.memberships();
-    let membership_start = declared_memberships.partition_point(|delta| delta.page_id < page_id);
-    let membership_end = declared_memberships.partition_point(|delta| delta.page_id <= page_id);
-    let declared_memberships = &declared_memberships[membership_start..membership_end];
-    if declared_memberships.len() != members.len() {
-        return Err(EngineError::SemanticEffectMismatch);
-    }
-    let mut memberships = BTreeMap::new();
-    for key in members.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        let encoded = map_string(&members, &key)?.ok_or_else(|| {
-            EngineError::InvalidCrdt(format!("membership {block_id} is not a string"))
-        })?;
-        let claim: MembershipClaim = decode_canonical(&encoded)?;
-        let Ok(index) =
-            declared_memberships.binary_search_by_key(&block_id, |delta| delta.block_id)
-        else {
-            return Err(EngineError::SemanticEffectMismatch);
-        };
-        let delta = &declared_memberships[index];
-        if delta.before.is_some() || delta.after.as_ref() != Some(&claim) {
-            return Err(EngineError::SemanticEffectMismatch);
-        }
-        memberships.insert(block_id, claim);
-    }
-    Ok(ValidatedReferenceSourceSnapshot {
-        page_id,
-        preamble: page_preamble.preamble,
-        blocks,
-        memberships,
-    })
-}
-
-fn snapshot_documents_with_validation(
-    catalog_document_id: DocumentId,
-    documents: &BTreeMap<DocumentId, LoroDoc>,
-    validate_shape: bool,
-) -> Result<BTreeMap<DocumentId, SemanticDocumentSnapshot>, EngineError> {
+fn snapshot_engine_documents(
+    graph_document_id: DocumentId,
+    documents: &BTreeMap<DocumentKey, EngineDocument>,
+) -> Result<BTreeMap<DocumentKey, SemanticDocumentSnapshot>, EngineError> {
     documents
         .iter()
         .map(|(document_id, document)| {
             Ok((
                 *document_id,
-                snapshot_document(catalog_document_id, *document_id, document, validate_shape)?,
+                snapshot_document(graph_document_id, *document_id, document.document())?,
             ))
         })
         .collect()
 }
 
 fn derive_effect_from_snapshots(
-    before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    before: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+    after: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
 ) -> Result<SemanticEffect, EngineError> {
     derive_effect_from_snapshots_for_revivals(before, after, &BTreeSet::new())
 }
 
 fn derive_effect_from_snapshots_for_revivals(
-    before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    before: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+    after: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
     revival_pages: &BTreeSet<PageId>,
 ) -> Result<SemanticEffect, EngineError> {
     derive_effect_from_snapshots_with_catalog(before, after, revival_pages)
         .map(|(effect, _)| effect)
 }
 
+/// Derive the semantic effect of one batch from the documents it touched.
+///
+/// Each document yields at most one page, preamble, block or membership delta,
+/// so the derivation is bounded by the batch's own document set. The second
+/// return value is the accepted state of every PAGE document this batch
+/// touched -- the live replacement for the whole-catalog map the previous
+/// layout had to decode to answer the same bounded question.
 fn derive_effect_from_snapshots_with_catalog(
-    before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    before: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+    after: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
     revival_pages: &BTreeSet<PageId>,
 ) -> Result<(SemanticEffect, Option<BTreeMap<PageId, PageState>>), EngineError> {
     let mut pages = Vec::new();
     let mut page_preambles = Vec::new();
     let mut blocks = Vec::new();
     let mut memberships = Vec::new();
-    let mut catalog_after_pages = None;
+    let mut after_page_states = BTreeMap::new();
     let mut document_ids = BTreeSet::new();
     document_ids.extend(before.keys().copied());
     document_ids.extend(after.keys().copied());
     for document_id in document_ids {
-        match (before.get(&document_id), after.get(&document_id)) {
-            (
-                None | Some(SemanticDocumentSnapshot::Catalog(_)),
-                None | Some(SemanticDocumentSnapshot::Catalog(_)),
-            ) => {
-                let before_pages = match before.get(&document_id) {
-                    Some(SemanticDocumentSnapshot::Catalog(pages)) => pages,
-                    _ => &BTreeMap::new(),
-                };
-                let after_pages = match after.get(&document_id) {
-                    Some(SemanticDocumentSnapshot::Catalog(pages)) => pages,
-                    _ => &BTreeMap::new(),
-                };
-                if before_pages.is_empty() {
-                    pages.extend(after_pages.iter().map(|(page_id, state)| {
-                        PageDelta::ordinary(*page_id, None, Some(state.clone()))
-                    }));
-                } else if after_pages.is_empty() {
-                    pages.extend(before_pages.iter().map(|(page_id, state)| {
-                        PageDelta::ordinary(*page_id, Some(state.clone()), None)
-                    }));
-                } else {
-                    let keys: BTreeSet<PageId> = before_pages
-                        .keys()
-                        .chain(after_pages.keys())
-                        .copied()
-                        .collect();
-                    for page_id in keys {
-                        let before_state = before_pages.get(&page_id).cloned();
-                        let after_state = after_pages.get(&page_id).cloned();
-                        if before_state != after_state {
-                            pages.push(PageDelta::ordinary(page_id, before_state, after_state));
-                        }
-                    }
-                }
-                catalog_after_pages = Some(after_pages.clone());
+        let unwritten = SemanticDocumentSnapshot::Unwritten;
+        let before_snapshot = before.get(&document_id).unwrap_or(&unwritten);
+        let after_snapshot = after.get(&document_id).unwrap_or(&unwritten);
+        if !before_snapshot.role_matches(after_snapshot) {
+            return Err(EngineError::MalformedDocument {
+                document_id,
+                reason: "document changed its immutable entity role".into(),
+            });
+        }
+        let before_page = before_snapshot.page();
+        let after_page = after_snapshot.page();
+        if before_page.is_some() || after_page.is_some() {
+            let home_document_id = semantic_home_document_id(document_id)?;
+            let page_id = after_page
+                .or(before_page)
+                .expect("page transition has one page identity")
+                .0;
+            let before_state = before_page.map(|(_, state, _)| state.clone());
+            let after_state = after_page.map(|(_, state, _)| state.clone());
+            if before_state != after_state {
+                pages.push(PageDelta::ordinary(page_id, before_state, after_state));
             }
-            (
-                None
-                | Some(SemanticDocumentSnapshot::Shard {
-                    page_id: _,
-                    page_preamble: _,
-                    blocks: _,
-                    memberships: _,
-                }),
-                None
-                | Some(SemanticDocumentSnapshot::Shard {
-                    page_id: _,
-                    page_preamble: _,
-                    blocks: _,
-                    memberships: _,
-                }),
-            ) => {
-                let (before_page_id, before_preamble, before_blocks, before_members) =
-                    match before.get(&document_id) {
-                        Some(SemanticDocumentSnapshot::Shard {
-                            page_id,
-                            page_preamble,
-                            blocks,
-                            memberships,
-                        }) => (*page_id, page_preamble.as_ref(), blocks, memberships),
-                        _ => (None, None, &BTreeMap::new(), &BTreeMap::new()),
-                    };
-                let (after_page_id, after_preamble, after_blocks, after_members) =
-                    match after.get(&document_id) {
-                        Some(SemanticDocumentSnapshot::Shard {
-                            page_id,
-                            page_preamble,
-                            blocks,
-                            memberships,
-                        }) => (*page_id, page_preamble.as_ref(), blocks, memberships),
-                        _ => (None, None, &BTreeMap::new(), &BTreeMap::new()),
-                    };
-                if before_page_id.is_some() && before_page_id != after_page_id {
-                    return Err(EngineError::MalformedDocument {
-                        document_id,
-                        reason: "stable shard page identity changed".into(),
-                    });
-                }
-                if before_preamble != after_preamble {
-                    let page_id = after_preamble
-                        .or(before_preamble)
-                        .expect("changed preamble has one semantic state")
-                        .page_id;
-                    page_preambles.push(PagePreambleDelta {
-                        page_id,
-                        home_document_id: document_id,
-                        before: before_preamble.cloned(),
-                        after: after_preamble.cloned(),
-                    });
-                }
-                if before_blocks.is_empty() {
-                    blocks.extend(after_blocks.iter().map(|(block_id, state)| BlockDelta {
-                        block_id: *block_id,
-                        home_document_id: document_id,
-                        before: None,
-                        after: Some(state.clone()),
-                    }));
-                } else if after_blocks.is_empty() {
-                    blocks.extend(before_blocks.iter().map(|(block_id, state)| BlockDelta {
-                        block_id: *block_id,
-                        home_document_id: document_id,
-                        before: Some(state.clone()),
-                        after: None,
-                    }));
-                } else {
-                    let keys: BTreeSet<BlockId> = before_blocks
-                        .keys()
-                        .chain(after_blocks.keys())
-                        .copied()
-                        .collect();
-                    for block_id in keys {
-                        let before_state = before_blocks.get(&block_id).cloned();
-                        let after_state = after_blocks.get(&block_id).cloned();
-                        if before_state != after_state {
-                            blocks.push(BlockDelta {
-                                block_id,
-                                home_document_id: document_id,
-                                before: before_state,
-                                after: after_state,
-                            });
-                        }
-                    }
-                }
-                let page_id = after_page_id.or(before_page_id);
-                if let Some(page_id) = page_id {
-                    if before_members.is_empty() {
-                        memberships.extend(after_members.iter().map(|(block_id, claim)| {
-                            MembershipDelta {
-                                page_id,
-                                block_id: *block_id,
-                                before: None,
-                                after: Some(claim.clone()),
-                            }
-                        }));
-                    } else if after_members.is_empty() {
-                        memberships.extend(before_members.iter().map(|(block_id, claim)| {
-                            MembershipDelta {
-                                page_id,
-                                block_id: *block_id,
-                                before: Some(claim.clone()),
-                                after: None,
-                            }
-                        }));
-                    } else {
-                        let member_keys: BTreeSet<BlockId> = before_members
-                            .keys()
-                            .chain(after_members.keys())
-                            .copied()
-                            .collect();
-                        for block_id in member_keys {
-                            let before_claim = before_members.get(&block_id).cloned();
-                            let after_claim = after_members.get(&block_id).cloned();
-                            if before_claim != after_claim {
-                                memberships.push(MembershipDelta {
-                                    page_id,
-                                    block_id,
-                                    before: before_claim,
-                                    after: after_claim,
-                                });
-                            }
-                        }
-                    }
-                }
+            let before_preamble = before_page.and_then(|(_, _, preamble)| preamble);
+            let after_preamble = after_page.and_then(|(_, _, preamble)| preamble);
+            if before_preamble != after_preamble {
+                page_preambles.push(PagePreambleDelta {
+                    page_id,
+                    home_document_id,
+                    before: before_preamble.cloned(),
+                    after: after_preamble.cloned(),
+                });
             }
-            _ => {
-                return Err(EngineError::MalformedDocument {
-                    document_id,
-                    reason: "document changed between catalog and shard roles".into(),
+            if let Some((_, state, _)) = after_page {
+                after_page_states.insert(page_id, state.clone());
+            }
+        }
+        let before_block = before_snapshot.block();
+        let after_block = after_snapshot.block();
+        if before_block != after_block {
+            let home_document_id = semantic_home_document_id(document_id)?;
+            let block_id = after_block
+                .or(before_block)
+                .expect("block transition has one block identity")
+                .block_id;
+            blocks.push(BlockDelta {
+                block_id,
+                home_document_id,
+                birth: match (before_snapshot, after_snapshot) {
+                    (
+                        SemanticDocumentSnapshot::Unwritten,
+                        SemanticDocumentSnapshot::Block {
+                            birth_page_id,
+                            birth_page_document_id,
+                            ..
+                        },
+                    ) => Some(BlockBirth {
+                        page_id: *birth_page_id,
+                        page_document_id: *birth_page_document_id,
+                    }),
+                    _ => None,
+                },
+                before: before_block.cloned(),
+                after: after_block.cloned(),
+            });
+        }
+        let before_membership = before_snapshot.membership();
+        let after_membership = after_snapshot.membership();
+        if before_membership.is_some() || after_membership.is_some() {
+            let (page_id, block_id, after_claim) = after_membership
+                .or(before_membership)
+                .expect("membership transition has one pair identity");
+            let before_claim = before_membership.and_then(|(_, _, claim)| claim);
+            let after_claim = after_membership.and(after_claim);
+            if before_claim != after_claim {
+                memberships.push(MembershipDelta {
+                    page_id,
+                    block_id,
+                    before: before_claim.cloned(),
+                    after: after_claim.cloned(),
                 });
             }
         }
     }
+    pages.sort_by_key(|delta| delta.page_id);
+    page_preambles.sort_by(|left, right| {
+        (left.home_document_id, left.page_id).cmp(&(right.home_document_id, right.page_id))
+    });
+    blocks.sort_by(|left, right| {
+        (left.home_document_id, left.block_id).cmp(&(right.home_document_id, right.block_id))
+    });
+    memberships
+        .sort_by(|left, right| (left.page_id, left.block_id).cmp(&(right.page_id, right.block_id)));
     for page in &mut pages {
         if revival_pages.contains(&page.page_id) {
             page.mark_revive_page()?;
@@ -26124,515 +27371,403 @@ fn derive_effect_from_snapshots_with_catalog(
     let effect =
         SemanticEffect::new_with_page_preambles(pages, page_preambles, blocks, memberships)
             .map_err(EngineError::from)?;
-    Ok((effect, catalog_after_pages))
+    Ok((effect, Some(after_page_states)))
 }
 
-struct MembershipSnapshotSource<'a> {
-    before: Option<&'a BTreeMap<BlockId, MembershipClaim>>,
-    after: Option<&'a BTreeMap<BlockId, MembershipClaim>>,
-}
-
-#[derive(Default)]
-struct ValidatedNewShardEffects {
-    documents: BTreeSet<DocumentId>,
-    pages: BTreeSet<PageId>,
-    sources: BTreeMap<DocumentId, ValidatedReferenceSourceSnapshot>,
-}
-
-/// Verifies the decoded canonical declaration against the independently read
-/// CRDT snapshots without constructing another owned semantic effect.
-fn compare_declared_effect_against_snapshots_with_catalog<'a>(
+/// Verify one decoded canonical declaration against the independently read CRDT
+/// snapshots.
+///
+/// The previous layout could not afford to derive the receiver's own effect:
+/// one shard's snapshot carried every block that had ever visited its page, so
+/// the comparison had to stream both sides. With one entity per document the
+/// derived effect is bounded by the batch, so the receiver derives it and
+/// requires exact equality -- the strictest available check, and the one that
+/// cannot drift from `derive_effect_from_snapshots`.
+fn compare_declared_effect_against_snapshots_with_catalog(
     declared: &SemanticEffect,
-    before: &'a BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    after: &'a BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-) -> Result<Option<&'a BTreeMap<PageId, PageState>>, EngineError> {
-    compare_declared_effect_against_snapshots_with_catalog_skipping(
-        declared,
-        before,
-        after,
-        &ValidatedNewShardEffects::default(),
-    )
-}
-
-fn compare_declared_effect_against_snapshots_with_catalog_skipping<'a>(
-    declared: &SemanticEffect,
-    before: &'a BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    after: &'a BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-    validated_new_shards: &ValidatedNewShardEffects,
-) -> Result<Option<&'a BTreeMap<PageId, PageState>>, EngineError> {
-    let mut declared_pages = declared.pages().iter().peekable();
-    let mut declared_page_preambles = declared.page_preambles().iter().peekable();
-    let mut declared_blocks = declared.blocks().iter().peekable();
-    let mut declared_memberships = declared.memberships().iter().peekable();
-    let mut before_documents = before.iter().peekable();
-    let mut after_documents = after.iter().peekable();
-    let mut catalog_after_pages = None;
-    let mut membership_sources: BTreeMap<PageId, Vec<MembershipSnapshotSource<'a>>> =
-        BTreeMap::new();
-
-    loop {
-        let ordering = match (before_documents.peek(), after_documents.peek()) {
-            (Some((before_id, _)), Some((after_id, _))) => Some(before_id.cmp(after_id)),
-            (Some(_), None) => Some(std::cmp::Ordering::Less),
-            (None, Some(_)) => Some(std::cmp::Ordering::Greater),
-            (None, None) => None,
-        };
-        let Some(ordering) = ordering else {
-            break;
-        };
-        let (document_id, before_snapshot, after_snapshot) = match ordering {
-            std::cmp::Ordering::Less => {
-                let (document_id, snapshot) = before_documents.next().expect("peeked before");
-                (*document_id, Some(snapshot), None)
-            }
-            std::cmp::Ordering::Greater => {
-                let (document_id, snapshot) = after_documents.next().expect("peeked after");
-                (*document_id, None, Some(snapshot))
-            }
-            std::cmp::Ordering::Equal => {
-                let (document_id, before_snapshot) =
-                    before_documents.next().expect("peeked before");
-                let (_, after_snapshot) = after_documents.next().expect("peeked after");
-                (*document_id, Some(before_snapshot), Some(after_snapshot))
-            }
-        };
-
-        skip_validated_new_shard_block_deltas(
-            &mut declared_blocks,
-            &validated_new_shards.documents,
-        );
-        skip_validated_new_shard_preamble_deltas(
-            &mut declared_page_preambles,
-            &validated_new_shards.documents,
-        );
-        match (before_snapshot, after_snapshot) {
-            (
-                None | Some(SemanticDocumentSnapshot::Catalog(_)),
-                None | Some(SemanticDocumentSnapshot::Catalog(_)),
-            ) => {
-                let before_pages = match before_snapshot {
-                    Some(SemanticDocumentSnapshot::Catalog(pages)) => Some(pages),
-                    None => None,
-                    Some(SemanticDocumentSnapshot::Shard { .. }) => unreachable!(),
-                };
-                let after_pages = match after_snapshot {
-                    Some(SemanticDocumentSnapshot::Catalog(pages)) => Some(pages),
-                    None => None,
-                    Some(SemanticDocumentSnapshot::Shard { .. }) => unreachable!(),
-                };
-                if !compare_page_deltas(&mut declared_pages, before_pages, after_pages) {
-                    return Err(EngineError::SemanticEffectMismatch);
-                }
-                catalog_after_pages = after_pages;
-            }
-            (
-                None
-                | Some(SemanticDocumentSnapshot::Shard {
-                    page_id: _,
-                    page_preamble: _,
-                    blocks: _,
-                    memberships: _,
-                }),
-                None
-                | Some(SemanticDocumentSnapshot::Shard {
-                    page_id: _,
-                    page_preamble: _,
-                    blocks: _,
-                    memberships: _,
-                }),
-            ) => {
-                let (before_page_id, before_preamble, before_blocks, before_memberships) =
-                    match before_snapshot {
-                        Some(SemanticDocumentSnapshot::Shard {
-                            page_id,
-                            page_preamble,
-                            blocks,
-                            memberships,
-                        }) => (
-                            *page_id,
-                            page_preamble.as_ref(),
-                            Some(blocks),
-                            Some(memberships),
-                        ),
-                        None => (None, None, None, None),
-                        Some(SemanticDocumentSnapshot::Catalog(_)) => unreachable!(),
-                    };
-                let (after_page_id, after_preamble, after_blocks, after_memberships) =
-                    match after_snapshot {
-                        Some(SemanticDocumentSnapshot::Shard {
-                            page_id,
-                            page_preamble,
-                            blocks,
-                            memberships,
-                        }) => (
-                            *page_id,
-                            page_preamble.as_ref(),
-                            Some(blocks),
-                            Some(memberships),
-                        ),
-                        None => (None, None, None, None),
-                        Some(SemanticDocumentSnapshot::Catalog(_)) => unreachable!(),
-                    };
-                if before_page_id.is_some() && before_page_id != after_page_id {
-                    return Err(EngineError::MalformedDocument {
-                        document_id,
-                        reason: "stable shard page identity changed".into(),
-                    });
-                }
-                if before_preamble != after_preamble {
-                    let Some(delta) = declared_page_preambles.next() else {
-                        return Err(EngineError::SemanticEffectMismatch);
-                    };
-                    let page_id = after_preamble
-                        .or(before_preamble)
-                        .expect("changed preamble has one semantic state")
-                        .page_id;
-                    if delta.page_id != page_id
-                        || delta.home_document_id != document_id
-                        || delta.before.as_ref() != before_preamble
-                        || delta.after.as_ref() != after_preamble
-                    {
-                        return Err(EngineError::SemanticEffectMismatch);
-                    }
-                }
-                if !compare_block_deltas(
-                    &mut declared_blocks,
-                    document_id,
-                    before_blocks,
-                    after_blocks,
-                ) {
-                    return Err(EngineError::SemanticEffectMismatch);
-                }
-                if let Some(page_id) = after_page_id.or(before_page_id) {
-                    let source = MembershipSnapshotSource {
-                        before: before_memberships,
-                        after: after_memberships,
-                    };
-                    membership_sources.entry(page_id).or_default().push(source);
-                }
-            }
-            _ => {
-                return Err(EngineError::MalformedDocument {
-                    document_id,
-                    reason: "document changed between catalog and shard roles".into(),
-                });
-            }
-        }
-    }
-
-    skip_validated_new_shard_block_deltas(&mut declared_blocks, &validated_new_shards.documents);
-    skip_validated_new_shard_preamble_deltas(
-        &mut declared_page_preambles,
-        &validated_new_shards.documents,
-    );
-    if declared_pages.next().is_some()
-        || declared_page_preambles.next().is_some()
-        || declared_blocks.next().is_some()
-    {
+    before: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+    after: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+) -> Result<Option<BTreeMap<PageId, PageState>>, EngineError> {
+    let revival_pages = declared
+        .pages()
+        .iter()
+        .filter(|delta| delta.lifecycle == super::PageDeltaLifecycle::RevivePage)
+        .map(|delta| delta.page_id)
+        .collect();
+    let (derived, after_page_states) =
+        derive_effect_from_snapshots_with_catalog(before, after, &revival_pages)?;
+    if !declared_effect_matches_derived(declared, &derived) {
         return Err(EngineError::SemanticEffectMismatch);
     }
-    for (page_id, sources) in membership_sources {
-        skip_validated_new_shard_membership_deltas(
-            &mut declared_memberships,
-            &validated_new_shards.pages,
-        );
-        if !matches!(
-            compare_membership_sources(&mut declared_memberships, page_id, sources,),
-            MembershipComparison::Matches
-        ) {
-            return Err(EngineError::SemanticEffectMismatch);
-        }
-    }
-    skip_validated_new_shard_membership_deltas(
-        &mut declared_memberships,
-        &validated_new_shards.pages,
-    );
-    if declared_memberships.next().is_some() {
-        return Err(EngineError::SemanticEffectMismatch);
-    }
-    Ok(catalog_after_pages)
+    Ok(after_page_states)
 }
 
-fn skip_validated_new_shard_block_deltas(
-    declared: &mut std::iter::Peekable<std::slice::Iter<'_, BlockDelta>>,
-    documents: &BTreeSet<DocumentId>,
-) {
-    while declared
-        .peek()
-        .is_some_and(|delta| documents.contains(&delta.home_document_id))
-    {
-        declared.next();
+/// Page revivals are the one declared shape the snapshots cannot reproduce on
+/// their own: `RevivePage` is a page delta the author marks, and the accepted
+/// tombstone-to-live transition is otherwise byte-identical to an ordinary one.
+/// Every other field must match exactly.
+fn declared_effect_matches_derived(declared: &SemanticEffect, derived: &SemanticEffect) -> bool {
+    if declared.pages().len() != derived.pages().len() {
+        return false;
     }
-}
-
-fn skip_validated_new_shard_preamble_deltas(
-    declared: &mut std::iter::Peekable<std::slice::Iter<'_, PagePreambleDelta>>,
-    documents: &BTreeSet<DocumentId>,
-) {
-    while declared
-        .peek()
-        .is_some_and(|delta| documents.contains(&delta.home_document_id))
-    {
-        declared.next();
-    }
-}
-
-fn skip_validated_new_shard_membership_deltas(
-    declared: &mut std::iter::Peekable<std::slice::Iter<'_, MembershipDelta>>,
-    pages: &BTreeSet<PageId>,
-) {
-    while declared
-        .peek()
-        .is_some_and(|delta| pages.contains(&delta.page_id))
-    {
-        declared.next();
-    }
-}
-
-fn compare_page_deltas(
-    declared: &mut std::iter::Peekable<std::slice::Iter<'_, PageDelta>>,
-    before: Option<&BTreeMap<PageId, PageState>>,
-    after: Option<&BTreeMap<PageId, PageState>>,
-) -> bool {
-    let mut before = before.into_iter().flat_map(BTreeMap::iter).peekable();
-    let mut after = after.into_iter().flat_map(BTreeMap::iter).peekable();
-    while before.peek().is_some() || after.peek().is_some() {
-        let page_id = match (before.peek(), after.peek()) {
-            (Some((before_id, _)), Some((after_id, _))) => (**before_id).min(**after_id),
-            (Some((page_id, _)), None) | (None, Some((page_id, _))) => **page_id,
-            (None, None) => unreachable!(),
-        };
-        let before_state = if before
-            .peek()
-            .is_some_and(|(candidate, _)| **candidate == page_id)
-        {
-            Some(before.next().expect("peeked before page").1)
-        } else {
-            None
-        };
-        let after_state = if after
-            .peek()
-            .is_some_and(|(candidate, _)| **candidate == page_id)
-        {
-            Some(after.next().expect("peeked after page").1)
-        } else {
-            None
-        };
-        if before_state == after_state {
-            continue;
-        }
-        let Some(delta) = declared.next() else {
-            return false;
-        };
-        if delta.page_id != page_id
-            || delta.before.as_ref() != before_state
-            || delta.after.as_ref() != after_state
+    for (declared_page, derived_page) in declared.pages().iter().zip(derived.pages()) {
+        if declared_page.page_id != derived_page.page_id
+            || declared_page.before != derived_page.before
+            || declared_page.after != derived_page.after
         {
             return false;
         }
     }
-    true
+    declared.page_preambles() == derived.page_preambles()
+        && declared.blocks() == derived.blocks()
+        && declared.memberships() == derived.memberships()
 }
 
-fn compare_block_deltas(
-    declared: &mut std::iter::Peekable<std::slice::Iter<'_, BlockDelta>>,
-    home_document_id: DocumentId,
-    before: Option<&BTreeMap<BlockId, BlockState>>,
-    after: Option<&BTreeMap<BlockId, BlockState>>,
-) -> bool {
-    let mut before = before.into_iter().flat_map(BTreeMap::iter).peekable();
-    let mut after = after.into_iter().flat_map(BTreeMap::iter).peekable();
-    while before.peek().is_some() || after.peek().is_some() {
-        let block_id = match (before.peek(), after.peek()) {
-            (Some((before_id, _)), Some((after_id, _))) => (**before_id).min(**after_id),
-            (Some((block_id, _)), None) | (None, Some((block_id, _))) => **block_id,
-            (None, None) => unreachable!(),
-        };
-        let before_state = if before
-            .peek()
-            .is_some_and(|(candidate, _)| **candidate == block_id)
-        {
-            Some(before.next().expect("peeked before block").1)
-        } else {
-            None
-        };
-        let after_state = if after
-            .peek()
-            .is_some_and(|(candidate, _)| **candidate == block_id)
-        {
-            Some(after.next().expect("peeked after block").1)
-        } else {
-            None
-        };
-        if before_state == after_state {
-            continue;
+/// The immutable identity one live document declares about itself, bound to the
+/// address the caller resolved it under.
+///
+/// A live document is authority for nothing until its declared identity is
+/// exactly that address: the binding is what makes every later read
+/// attributable to one entity rather than to whatever the bytes claim.
+/// Whether that identity was ever AUTHORIZED remains a separate question
+/// answered by accepted birth evidence, not here.
+///
+/// `None` means the document has never been written, which is the ordinary
+/// state of a document a batch is about to create.
+fn document_identity(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<DocumentIdentity>, EngineError> {
+    if !retirable_document::is_initialized(document) {
+        if document.oplog_frontiers().len() != 0 {
+            return Err(EngineError::MalformedDocument {
+                document_id,
+                reason: "written document is missing its fixed-schema identity".into(),
+            });
         }
-        let Some(delta) = declared.next() else {
-            return false;
-        };
-        if delta.block_id != block_id
-            || delta.home_document_id != home_document_id
-            || delta.before.as_ref() != before_state
-            || delta.after.as_ref() != after_state
-        {
-            return false;
+        return Ok(None);
+    }
+    let identity = retirable_document::declared_identity(document).map_err(|reason| {
+        EngineError::MalformedDocument {
+            document_id,
+            reason,
         }
+    })?;
+    if identity.key() != document_id {
+        return Err(EngineError::MalformedDocument {
+            document_id,
+            reason: "document declares a different immutable address".into(),
+        });
     }
-    true
+    Ok(Some(identity))
 }
 
-enum MembershipComparison {
-    Matches,
-    Mismatch,
-    DuplicateDerivedKey,
-}
-
-struct DerivedMembershipDelta<'a> {
-    block_id: BlockId,
-    before: Option<&'a MembershipClaim>,
-    after: Option<&'a MembershipClaim>,
-}
-
-struct MembershipDeltaStream<'a> {
-    before: Option<std::collections::btree_map::Iter<'a, BlockId, MembershipClaim>>,
-    after: Option<std::collections::btree_map::Iter<'a, BlockId, MembershipClaim>>,
-    before_current: Option<(&'a BlockId, &'a MembershipClaim)>,
-    after_current: Option<(&'a BlockId, &'a MembershipClaim)>,
-}
-
-impl<'a> MembershipDeltaStream<'a> {
-    fn new(source: MembershipSnapshotSource<'a>) -> Self {
-        let mut stream = Self {
-            before: source.before.map(BTreeMap::iter),
-            after: source.after.map(BTreeMap::iter),
-            before_current: None,
-            after_current: None,
-        };
-        stream.advance_before();
-        stream.advance_after();
-        stream
-    }
-
-    fn advance_before(&mut self) {
-        self.before_current = self.before.as_mut().and_then(Iterator::next);
-    }
-
-    fn advance_after(&mut self) {
-        self.after_current = self.after.as_mut().and_then(Iterator::next);
-    }
-
-    fn next(&mut self) -> Option<DerivedMembershipDelta<'a>> {
-        loop {
-            let block_id = match (self.before_current, self.after_current) {
-                (Some((before_id, _)), Some((after_id, _))) => (*before_id).min(*after_id),
-                (Some((block_id, _)), None) | (None, Some((block_id, _))) => *block_id,
-                (None, None) => return None,
-            };
-            let before = if self
-                .before_current
-                .is_some_and(|(candidate, _)| *candidate == block_id)
-            {
-                let claim = self.before_current.expect("checked before membership").1;
-                self.advance_before();
-                Some(claim)
-            } else {
-                None
-            };
-            let after = if self
-                .after_current
-                .is_some_and(|(candidate, _)| *candidate == block_id)
-            {
-                let claim = self.after_current.expect("checked after membership").1;
-                self.advance_after();
-                Some(claim)
-            } else {
-                None
-            };
-            if before != after {
-                return Some(DerivedMembershipDelta {
-                    block_id,
-                    before,
-                    after,
-                });
-            }
+/// Complete validated state of one live document, or `None` for an unwritten one.
+fn document_state(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<(DocumentIdentity, DocumentState)>, EngineError> {
+    let Some(identity) = document_identity(document_id, document)? else {
+        return Ok(None);
+    };
+    let state = retirable_document::read_state(&identity, document).map_err(|reason| {
+        EngineError::MalformedDocument {
+            document_id,
+            reason,
         }
+    })?;
+    Ok(Some((identity, state)))
+}
+
+fn malformed(document_id: DocumentKey, reason: impl Into<String>) -> EngineError {
+    EngineError::MalformedDocument {
+        document_id,
+        reason: reason.into(),
     }
 }
 
-fn compare_membership_sources(
-    declared: &mut std::iter::Peekable<std::slice::Iter<'_, MembershipDelta>>,
-    page_id: PageId,
-    sources: Vec<MembershipSnapshotSource<'_>>,
-) -> MembershipComparison {
-    let mut streams: Vec<MembershipDeltaStream<'_>> = sources
-        .into_iter()
-        .map(MembershipDeltaStream::new)
-        .collect();
-    let mut pending: Vec<Option<DerivedMembershipDelta<'_>>> = streams
-        .iter_mut()
-        .map(MembershipDeltaStream::next)
-        .collect();
-    loop {
-        let mut selected: Option<usize> = None;
-        for (index, candidate) in pending.iter().enumerate() {
-            let Some(candidate) = candidate else {
-                continue;
-            };
-            if let Some(selected_index) = selected {
-                let selected_delta = pending[selected_index].as_ref().expect("selected pending");
-                if candidate.block_id == selected_delta.block_id {
-                    return MembershipComparison::DuplicateDerivedKey;
-                }
-                if candidate.block_id < selected_delta.block_id {
-                    selected = Some(index);
-                }
-            } else {
-                selected = Some(index);
-            }
-        }
-        let Some(selected) = selected else {
-            return MembershipComparison::Matches;
-        };
-        let derived = pending[selected].take().expect("selected pending");
-        let Some(delta) = declared.next() else {
-            return MembershipComparison::Mismatch;
-        };
-        if delta.page_id != page_id
-            || delta.block_id != derived.block_id
-            || delta.before.as_ref() != derived.before
-            || delta.after.as_ref() != derived.after
-        {
-            return MembershipComparison::Mismatch;
-        }
-        pending[selected] = streams[selected].next();
-    }
-}
-
-fn read_all_pages(document: &LoroDoc) -> Result<BTreeMap<PageId, PageState>, EngineError> {
-    let pages = document.get_map(CATALOG_PAGES);
-    if pages.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::InvalidCrdt(
-            "catalog entry bound exceeded".into(),
+/// Write the fixed schema of one newly born document. The caller has already
+/// proved the identity against the transaction it is admitting.
+fn create_document(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    identity: &DocumentIdentity,
+    state: DocumentState,
+) -> Result<(), EngineError> {
+    if identity.key() != document_id {
+        return Err(malformed(
+            document_id,
+            "new document identity is not its own address",
         ));
     }
-    #[cfg(test)]
-    record_catalog_page_entry_visits(pages.len());
-    let mut result = BTreeMap::new();
-    for key in pages.keys() {
-        let page_id = PageId::from_str(&key)
-            .map_err(|_| EngineError::InvalidCrdt(format!("invalid page key {key:?}")))?;
-        let encoded = map_string(&pages, &key)?
-            .ok_or_else(|| EngineError::InvalidCrdt("page register is not a string".into()))?;
-        result.insert(page_id, decode_canonical(&encoded)?);
+    if retirable_document::is_initialized(document) {
+        return Err(malformed(document_id, "document already exists"));
     }
-    Ok(result)
+    retirable_document::create_in(document, identity, state)
+        .map_err(|reason| malformed(document_id, reason))
 }
 
-fn read_page_state(document: &LoroDoc, page_id: PageId) -> Result<Option<PageState>, EngineError> {
-    let pages = document.get_map(CATALOG_PAGES);
-    map_string(&pages, &page_id.to_string())?
-        .map(|encoded| decode_canonical(&encoded))
-        .transpose()
+/// The page a PAGE document is the immutable home of.
+/// The membership a document window implies for one page.
+///
+/// Every pair document addressed to `page_document_id` in the window names one
+/// member. The walk is bounded by the window, which is bounded by the page.
+fn members_from_document_window<'document>(
+    page_document_id: DocumentId,
+    documents: impl IntoIterator<Item = (DocumentKey, &'document LoroDoc)>,
+) -> Result<BTreeMap<BlockId, DocumentId>, EngineError> {
+    let mut members = BTreeMap::new();
+    for (document_id, document) in documents {
+        let DocumentKey::Membership {
+            block_document_id,
+            page_document_id: addressed_page,
+        } = document_id
+        else {
+            continue;
+        };
+        if addressed_page != page_document_id {
+            continue;
+        }
+        let Some(identity) = document_identity(document_id, document)? else {
+            continue;
+        };
+        let DocumentIdentity::Membership { block_id, .. } = identity else {
+            return Err(malformed(
+                document_id,
+                "a pair address must declare a pair identity",
+            ));
+        };
+        members.insert(block_id, block_document_id);
+    }
+    Ok(members)
+}
+
+fn document_page_id(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<PageId>, EngineError> {
+    Ok(match document_identity(document_id, document)? {
+        Some(DocumentIdentity::Page { page_id, .. }) => Some(page_id),
+        _ => None,
+    })
+}
+
+fn read_page_state(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<PageState>, EngineError> {
+    Ok(match document_state(document_id, document)? {
+        Some((_, DocumentState::Page { state, .. })) => Some(state),
+        Some(_) => {
+            return Err(malformed(
+                document_id,
+                "page state requires a page document",
+            ))
+        }
+        None => None,
+    })
+}
+
+fn require_live_page(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    page_id: PageId,
+) -> Result<PageState, EngineError> {
+    match read_page_state(document_id, document)? {
+        Some(state @ PageState::Live { .. }) => Ok(state),
+        Some(PageState::Tombstone { .. }) => Err(EngineError::PageDeleted(page_id)),
+        None => Err(EngineError::PageNotFound(page_id)),
+    }
+}
+
+fn insert_page_state(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    state: &PageState,
+) -> Result<(), EngineError> {
+    let identity = document_identity(document_id, document)?
+        .ok_or_else(|| malformed(document_id, "page state requires an existing page document"))?;
+    retirable_document::set_page_state(&identity, document, state)
+        .map_err(|reason| malformed(document_id, reason))
+}
+
+fn read_page_preamble(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<String>, EngineError> {
+    Ok(match document_state(document_id, document)? {
+        Some((_, DocumentState::Page { preamble, .. })) => preamble,
+        Some(_) => {
+            return Err(malformed(
+                document_id,
+                "page preamble requires a page document",
+            ))
+        }
+        None => None,
+    })
+}
+
+fn set_page_preamble(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    preamble: Option<&str>,
+) -> Result<(), EngineError> {
+    let identity = document_identity(document_id, document)?
+        .ok_or_else(|| malformed(document_id, "preamble requires an existing page document"))?;
+    retirable_document::set_page_preamble(&identity, document, preamble)
+        .map_err(|reason| malformed(document_id, reason))
+}
+
+fn read_block_state(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<BlockState>, EngineError> {
+    Ok(match document_state(document_id, document)? {
+        Some((_, DocumentState::Block(state))) => Some(state),
+        Some(_) => {
+            return Err(malformed(
+                document_id,
+                "block state requires a block document",
+            ))
+        }
+        None => None,
+    })
+}
+
+/// The birth provenance a block document records: the page it was created on
+/// and that page's own document. This is written once at creation and survives
+/// every later owner change, delete and restore, so a create-and-delete inside
+/// one batch still leaves the immutable birth record behind.
+fn block_birth_provenance(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<(BlockId, PageId, DocumentId)>, EngineError> {
+    Ok(match document_identity(document_id, document)? {
+        Some(DocumentIdentity::Block {
+            block_id,
+            birth_page_id,
+            birth_page_document_id,
+            ..
+        }) => Some((block_id, birth_page_id, birth_page_document_id)),
+        _ => None,
+    })
+}
+
+/// One document's block state when it IS a block document, and `None` for any
+/// other role. Used where a caller is scanning a mixed document set rather than
+/// asking a document it already knows the role of.
+fn read_optional_block_state(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<BlockState>, EngineError> {
+    Ok(match document_state(document_id, document)? {
+        Some((_, DocumentState::Block(state))) => Some(state),
+        _ => None,
+    })
+}
+
+/// One document's page state when it IS a page document, and `None` otherwise.
+fn read_optional_page_state(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<PageState>, EngineError> {
+    Ok(match document_state(document_id, document)? {
+        Some((_, DocumentState::Page { state, .. })) => Some(state),
+        _ => None,
+    })
+}
+
+fn has_block_state(document_id: DocumentKey, document: &LoroDoc) -> Result<bool, EngineError> {
+    Ok(read_block_state(document_id, document)?.is_some())
+}
+
+fn set_owner(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    owner: BlockOwner,
+) -> Result<(), EngineError> {
+    let identity = document_identity(document_id, document)?
+        .ok_or_else(|| malformed(document_id, "owner requires an existing block document"))?;
+    retirable_document::set_owner(&identity, document, owner)
+        .map_err(|reason| malformed(document_id, reason))
+}
+
+/// The block document's stable root text. Its ContainerID is fixed for the
+/// document's whole life: delete and restore change the owner register and
+/// never remove or recreate this container.
+fn block_text(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<loro::LoroText>, EngineError> {
+    Ok(match document_identity(document_id, document)? {
+        Some(DocumentIdentity::Block { .. }) => Some(retirable_document::root_text(document)),
+        _ => None,
+    })
+}
+
+fn set_logseq_identity(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    logseq_uuid: Option<LogseqUuid>,
+    origin: Option<LogseqIdentityOrigin>,
+) -> Result<(), EngineError> {
+    let identity = document_identity(document_id, document)?.ok_or_else(|| {
+        malformed(
+            document_id,
+            "Logseq identity requires an existing block document",
+        )
+    })?;
+    retirable_document::set_logseq_identity(&identity, document, logseq_uuid, origin)
+        .map_err(|reason| malformed(document_id, reason))
+}
+
+/// One membership document's optional claim. Absence is the null value of the
+/// document's one fixed register, never a removed key.
+fn read_membership(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<MembershipClaim>, EngineError> {
+    Ok(match document_state(document_id, document)? {
+        Some((_, DocumentState::Membership(claim))) => claim,
+        Some(_) => {
+            return Err(malformed(
+                document_id,
+                "membership claim requires a membership document",
+            ))
+        }
+        None => None,
+    })
+}
+
+fn write_membership(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+    claim: Option<&MembershipClaim>,
+) -> Result<(), EngineError> {
+    if let Some(claim) = claim {
+        claim.validate()?;
+    }
+    let identity = document_identity(document_id, document)?.ok_or_else(|| {
+        malformed(
+            document_id,
+            "membership claim requires an existing membership document",
+        )
+    })?;
+    retirable_document::set_membership(&identity, document, claim)
+        .map_err(|reason| malformed(document_id, reason))
+}
+
+/// The pair one membership document addresses, as its own registers record it.
+fn membership_pair(
+    document_id: DocumentKey,
+    document: &LoroDoc,
+) -> Result<Option<(BlockId, PageId)>, EngineError> {
+    Ok(match document_identity(document_id, document)? {
+        Some(DocumentIdentity::Membership {
+            block_id, page_id, ..
+        }) => Some((block_id, page_id)),
+        _ => None,
+    })
 }
 
 fn current_path_catalog_row_from_page_state(
@@ -26678,290 +27813,7 @@ fn decode_current_path_catalog_row(
     Ok(row)
 }
 
-fn require_live_page(document: &LoroDoc, page_id: PageId) -> Result<PageState, EngineError> {
-    match read_page_state(document, page_id)? {
-        Some(state @ PageState::Live { .. }) => Ok(state),
-        Some(PageState::Tombstone { .. }) => Err(EngineError::PageDeleted(page_id)),
-        None => Err(EngineError::PageNotFound(page_id)),
-    }
-}
-
-fn insert_page_state(
-    document: &LoroDoc,
-    page_id: PageId,
-    state: &PageState,
-) -> Result<(), EngineError> {
-    document
-        .get_map(CATALOG_PAGES)
-        .insert(&page_id.to_string(), encode_canonical(state)?)
-        .map_err(loro_error)
-}
-
-fn shard_page_id(document: &LoroDoc) -> Result<Option<PageId>, EngineError> {
-    map_string(&document.get_map(SHARD_META), SHARD_PAGE_ID)?
-        .map(|value| {
-            PageId::from_str(&value)
-                .map_err(|_| EngineError::InvalidCrdt(format!("invalid shard page ID {value:?}")))
-        })
-        .transpose()
-}
-
-fn read_all_blocks(
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<BTreeMap<BlockId, BlockState>, EngineError> {
-    let owners = document.get_map(SHARD_OWNERS);
-    let content = document.get_map(SHARD_CONTENT);
-    let logseq_uuids = document.get_map(SHARD_LOGSEQ_UUIDS);
-    let logseq_origins = document.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS);
-    if owners.len() > MAX_DOCUMENT_ENTRIES
-        || content.len() > MAX_DOCUMENT_ENTRIES
-        || logseq_uuids.len() > MAX_DOCUMENT_ENTRIES
-        || logseq_origins.len() > MAX_DOCUMENT_ENTRIES
-    {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "shard entry bound exceeded".into(),
-        });
-    }
-    let mut result = BTreeMap::new();
-    for key in owners.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if let Some(state) = read_block_state(document_id, document, block_id)? {
-            result.insert(block_id, state);
-        }
-    }
-    for key in content.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if !result.contains_key(&block_id) {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("content {block_id} has no owner register"),
-            });
-        }
-        if block_text(document, block_id).is_none() {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("content {block_id} is not mergeable text"),
-            });
-        }
-    }
-    for key in logseq_uuids.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if !result.contains_key(&block_id) {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("Logseq UUID {block_id} has no owner register"),
-            });
-        }
-        read_logseq_uuid(document_id, document, block_id)?;
-    }
-    for key in logseq_origins.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        if !result.contains_key(&block_id) {
-            return Err(EngineError::MalformedDocument {
-                document_id,
-                reason: format!("Logseq identity origin {block_id} has no owner register"),
-            });
-        }
-        read_logseq_identity_origin(document_id, document, block_id)?;
-    }
-    if logseq_uuids.len() != logseq_origins.len() {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "Logseq UUID and identity-origin key coverage differs".into(),
-        });
-    }
-    Ok(result)
-}
-
-fn read_block_state(
-    document_id: DocumentId,
-    document: &LoroDoc,
-    block_id: BlockId,
-) -> Result<Option<BlockState>, EngineError> {
-    let Some(owner) = map_string(&document.get_map(SHARD_OWNERS), &block_id.to_string())? else {
-        return Ok(None);
-    };
-    let content = block_text(document, block_id)
-        .ok_or_else(|| EngineError::InvalidCrdt(format!("block {block_id} has no text")))?
-        .to_string();
-    let logseq_uuid = read_logseq_uuid(document_id, document, block_id)?;
-    let logseq_identity_origin = read_logseq_identity_origin(document_id, document, block_id)?;
-    if logseq_uuid.is_some() != logseq_identity_origin.is_some() {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: format!(
-                "block {block_id} must carry its Logseq UUID and identity origin together"
-            ),
-        });
-    }
-    Ok(Some(BlockState {
-        block_id,
-        home_document_id: document_id,
-        owner: parse_owner(&owner)?,
-        logseq_uuid,
-        logseq_identity_origin,
-        content,
-    }))
-}
-
-fn read_logseq_identity_origin(
-    document_id: DocumentId,
-    document: &LoroDoc,
-    block_id: BlockId,
-) -> Result<Option<LogseqIdentityOrigin>, EngineError> {
-    map_string(
-        &document.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS),
-        &block_id.to_string(),
-    )?
-    .map(|value| {
-        decode_canonical(&value).map_err(|_| EngineError::MalformedDocument {
-            document_id,
-            reason: format!("invalid Logseq identity-origin register for block {block_id}"),
-        })
-    })
-    .transpose()
-}
-
-fn read_page_preamble(
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<Option<String>, EngineError> {
-    let preamble = document.get_map(SHARD_PAGE_PREAMBLE);
-    if preamble.len() > 1
-        || preamble
-            .keys()
-            .next()
-            .is_some_and(|key| key.as_str() != SHARD_PAGE_PREAMBLE_VALUE)
-    {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "page preamble root must contain only its optional value".into(),
-        });
-    }
-    let value = map_string(&preamble, SHARD_PAGE_PREAMBLE_VALUE)?;
-    if value
-        .as_ref()
-        .is_some_and(|value| value.len() > super::semantic::MAX_PAGE_PREAMBLE_BYTES)
-    {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "page preamble exceeds the semantic bound".into(),
-        });
-    }
-    Ok(value)
-}
-
-fn read_logseq_uuid(
-    document_id: DocumentId,
-    document: &LoroDoc,
-    block_id: BlockId,
-) -> Result<Option<LogseqUuid>, EngineError> {
-    map_string(&document.get_map(SHARD_LOGSEQ_UUIDS), &block_id.to_string())?
-        .map(|value| {
-            LogseqUuid::parse(&value).map_err(|_| EngineError::MalformedDocument {
-                document_id,
-                reason: format!("invalid Logseq UUID register for block {block_id}"),
-            })
-        })
-        .transpose()
-}
-
-fn has_block_state(document: &LoroDoc, block_id: BlockId) -> Result<bool, EngineError> {
-    if map_string(&document.get_map(SHARD_OWNERS), &block_id.to_string())?.is_none() {
-        return Ok(false);
-    }
-    Ok(block_text(document, block_id).is_some())
-}
-
-fn parse_owner(value: &str) -> Result<BlockOwner, EngineError> {
-    if value == TOMBSTONE {
-        Ok(BlockOwner::Tombstone)
-    } else {
-        PageId::from_str(value)
-            .map(BlockOwner::Page)
-            .map_err(|_| EngineError::InvalidCrdt(format!("invalid owner register {value:?}")))
-    }
-}
-
-fn set_owner(document: &LoroDoc, block_id: BlockId, owner: BlockOwner) -> Result<(), EngineError> {
-    if block_text(document, block_id).is_none() {
-        return Err(EngineError::BlockNotFound(block_id));
-    }
-    let value = match owner {
-        BlockOwner::Page(page_id) => page_id.to_string(),
-        BlockOwner::Tombstone => TOMBSTONE.into(),
-    };
-    document
-        .get_map(SHARD_OWNERS)
-        .insert(&block_id.to_string(), value)
-        .map_err(loro_error)
-}
-
-fn block_text(document: &LoroDoc, block_id: BlockId) -> Option<loro::LoroText> {
-    match document.get_map(SHARD_CONTENT).get(&block_id.to_string()) {
-        Some(ValueOrContainer::Container(Container::Text(text))) => Some(text),
-        _ => None,
-    }
-}
-
-fn read_memberships(
-    document_id: DocumentId,
-    document: &LoroDoc,
-) -> Result<BTreeMap<BlockId, MembershipClaim>, EngineError> {
-    let members = document.get_map(SHARD_MEMBERS);
-    if members.len() > MAX_DOCUMENT_ENTRIES {
-        return Err(EngineError::MalformedDocument {
-            document_id,
-            reason: "membership entry bound exceeded".into(),
-        });
-    }
-    let mut result = BTreeMap::new();
-    for key in members.keys() {
-        let block_id = parse_block_key(document_id, &key)?;
-        let encoded = map_string(&members, &key)?
-            .ok_or_else(|| EngineError::InvalidCrdt("membership is not a string".into()))?;
-        result.insert(block_id, decode_canonical(&encoded)?);
-    }
-    Ok(result)
-}
-
-fn read_membership(
-    document: &LoroDoc,
-    block_id: BlockId,
-) -> Result<Option<MembershipClaim>, EngineError> {
-    map_string(&document.get_map(SHARD_MEMBERS), &block_id.to_string())?
-        .map(|encoded| decode_canonical(&encoded))
-        .transpose()
-}
-
-fn insert_membership(
-    document: &LoroDoc,
-    block_id: BlockId,
-    claim: &MembershipClaim,
-) -> Result<(), EngineError> {
-    claim.validate()?;
-    document
-        .get_map(SHARD_MEMBERS)
-        .insert(&block_id.to_string(), encode_canonical(claim)?)
-        .map_err(loro_error)
-}
-
-fn subtree_claims(root: BlockId, claims: &BTreeMap<BlockId, MembershipClaim>) -> Vec<BlockId> {
-    let mut selected = BTreeSet::from([root]);
-    let mut queue = VecDeque::from([root]);
-    while let Some(parent) = queue.pop_front() {
-        for (block_id, claim) in claims {
-            if claim.parent == Some(parent) && selected.insert(*block_id) {
-                queue.push_back(*block_id);
-            }
-        }
-    }
-    selected.into_iter().collect()
-}
-
-fn parse_block_key(document_id: DocumentId, key: &str) -> Result<BlockId, EngineError> {
+fn parse_block_key(document_id: DocumentKey, key: &str) -> Result<BlockId, EngineError> {
     BlockId::from_str(key).map_err(|_| EngineError::MalformedDocument {
         document_id,
         reason: format!("invalid block key {key:?}"),
@@ -27063,33 +27915,33 @@ pub enum EngineError {
         descendant: BatchId,
     },
     InexactDocumentDependencyHeads {
-        document_id: DocumentId,
+        document_id: DocumentKey,
     },
     CausalWitnessMismatch {
-        document_id: DocumentId,
+        document_id: DocumentKey,
     },
     MissingDocumentUpdate {
-        document_id: DocumentId,
+        document_id: DocumentKey,
         dependency: BatchId,
     },
-    FrontierVectorMismatch(DocumentId),
-    MissingCrdtDependencies(DocumentId),
-    CrdtUpdateBaseMismatch(DocumentId),
+    FrontierVectorMismatch(DocumentKey),
+    MissingCrdtDependencies(DocumentKey),
+    CrdtUpdateBaseMismatch(DocumentKey),
     CrdtPayloadIdentityMismatch {
         expected_batch_id: BatchId,
-        expected_document_id: DocumentId,
+        expected_document_id: DocumentKey,
         found_batch_id: BatchId,
-        found_document_id: DocumentId,
+        found_document_id: DocumentKey,
     },
-    DuplicateDocumentUpdate(DocumentId),
+    DuplicateDocumentUpdate(DocumentKey),
     SemanticEffectMismatch,
     InvalidCrdt(String),
     InvalidTransaction(String),
     MalformedDocument {
-        document_id: DocumentId,
+        document_id: DocumentKey,
         reason: String,
     },
-    MissingDocument(DocumentId),
+    MissingDocument(DocumentKey),
     PageAlreadyExists(PageId),
     PageNotFound(PageId),
     PageDeleted(PageId),
@@ -27113,7 +27965,7 @@ pub enum EngineError {
     ProjectionFrontierNotDurable(BatchId),
     WorkspaceBlocked(FatalEvidenceHandle),
     ShardPageIdentityChanged {
-        document_id: DocumentId,
+        document_id: DocumentKey,
         expected: PageId,
         found: Option<PageId>,
     },
@@ -27332,7 +28184,7 @@ impl From<super::ReceiptError> for EngineError {
 
 #[cfg(test)]
 pub(crate) mod validation_tests {
-    use loro::LoroText;
+    use loro::ContainerTrait;
     use uuid::Uuid;
 
     use super::*;
@@ -27469,8 +28321,8 @@ pub(crate) mod validation_tests {
     fn validated_transition(
         engine: &ShardedHotEngine,
         author: AuthorBatch,
-        before: &BTreeMap<DocumentId, LoroDoc>,
-        after: &BTreeMap<DocumentId, LoroDoc>,
+        before: &BTreeMap<DocumentKey, LoroDoc>,
+        after: &BTreeMap<DocumentKey, LoroDoc>,
         frontier: FrontierV2,
     ) -> ValidatedBatch {
         let effect = derive_effect(engine.catalog_document_id, before, after).unwrap();
@@ -27480,8 +28332,8 @@ pub(crate) mod validation_tests {
     fn validated_transition_with_effect(
         engine: &ShardedHotEngine,
         author: AuthorBatch,
-        before: &BTreeMap<DocumentId, LoroDoc>,
-        after: &BTreeMap<DocumentId, LoroDoc>,
+        before: &BTreeMap<DocumentKey, LoroDoc>,
+        after: &BTreeMap<DocumentKey, LoroDoc>,
         frontier: FrontierV2,
         effect: SemanticEffect,
     ) -> ValidatedBatch {
@@ -27492,14 +28344,14 @@ pub(crate) mod validation_tests {
     fn validated_transition_with_payload(
         engine: &ShardedHotEngine,
         author: AuthorBatch,
-        before: &BTreeMap<DocumentId, LoroDoc>,
-        after: &BTreeMap<DocumentId, LoroDoc>,
+        before: &BTreeMap<DocumentKey, LoroDoc>,
+        after: &BTreeMap<DocumentKey, LoroDoc>,
         frontier: FrontierV2,
         effect_bytes: Vec<u8>,
     ) -> ValidatedBatch {
         let mut objects = vec![OperationObject::new(
             engine.workspace_id,
-            engine.catalog_document_id,
+            DocumentKey::Entity(engine.catalog_document_id),
             ObjectKind::SemanticEffect,
             effect_bytes.clone(),
         )
@@ -27644,17 +28496,17 @@ pub(crate) mod validation_tests {
         reference_catalog_policy: ReferenceCatalogPolicyV1,
         fatal_evidence: Option<ImmutableHomeEvidence>,
         fatal_handle: Option<FatalEvidenceHandle>,
-        visible_documents: BTreeMap<DocumentId, Vec<u8>>,
-        spare_documents: BTreeMap<DocumentId, Vec<u8>>,
-        visible_document_lru: VecDeque<DocumentId>,
-        visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
-        terminal_documents: BTreeMap<DocumentId, Vec<u8>>,
+        visible_documents: BTreeMap<DocumentKey, Vec<u8>>,
+        spare_documents: BTreeMap<DocumentKey, Vec<u8>>,
+        visible_document_lru: VecDeque<DocumentKey>,
+        visible_document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
+        terminal_documents: BTreeMap<DocumentKey, Vec<u8>>,
         /// Canonical per-block semantic state, separate from opaque CRDT update
         /// bytes so replay/checkpoint equivalence cannot hide a block-level
         /// owner, identity, or content divergence behind document equality.
-        terminal_block_states: BTreeMap<(DocumentId, BlockId), BlockState>,
-        terminal_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
-        accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
+        terminal_block_states: BTreeMap<(DocumentKey, BlockId), BlockState>,
+        terminal_document_heads: BTreeMap<DocumentKey, BTreeSet<BatchId>>,
+        accepted_frontier: BTreeMap<DocumentKey, DocumentDependencies>,
         accepted_tip_refcounts: BTreeMap<BatchId, usize>,
         clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
         ephemeral_causal_chain: BTreeMap<CausalPeerId, CausalChainTip>,
@@ -27662,19 +28514,21 @@ pub(crate) mod validation_tests {
         clean_checkpoint_causal_dots: BTreeMap<BatchId, BatchCausalDot>,
         clean_checkpoint_required_objects: BTreeSet<ContentDigest>,
         ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
-        ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
+        ephemeral_accepted_document_root: RunLocalDocumentMap,
         ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
         accepted_frontier_root: AcceptedFrontierRoot,
         accepted_sequence: BTreeMap<u64, BatchId>,
         next_acceptance_sequence: u64,
-        current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
+        current_path_rows: OrdMap<PageId, CurrentPathCatalogStoredRow>,
+        current_path_page_homes: OrdMap<PageId, DocumentId>,
+        current_path_page_members: OrdMap<PageId, OrdMap<BlockId, DocumentId>>,
         current_path_available: bool,
         current_path_frontier_root: AcceptedFrontierRoot,
     }
 
     fn document_updates(
-        documents: &BTreeMap<DocumentId, LoroDoc>,
-    ) -> BTreeMap<DocumentId, Vec<u8>> {
+        documents: &BTreeMap<DocumentKey, LoroDoc>,
+    ) -> BTreeMap<DocumentKey, Vec<u8>> {
         documents
             .iter()
             .map(|(document_id, document)| {
@@ -27687,11 +28541,21 @@ pub(crate) mod validation_tests {
     }
 
     fn block_states(
-        documents: &BTreeMap<DocumentId, LoroDoc>,
-    ) -> BTreeMap<(DocumentId, BlockId), BlockState> {
+        documents: &BTreeMap<DocumentKey, LoroDoc>,
+    ) -> BTreeMap<(DocumentKey, BlockId), BlockState> {
+        // One block lives in its own document, so the observable block state
+        // of a window is one entry per initialized block document.
         let mut states = BTreeMap::new();
         for (document_id, document) in documents {
-            for (block_id, state) in read_all_blocks(*document_id, document)
+            let Some((identity, _)) = document_state(*document_id, document)
+                .expect("observable terminal documents have canonical identity")
+            else {
+                continue;
+            };
+            let DocumentIdentity::Block { block_id, .. } = identity else {
+                continue;
+            };
+            if let Some(state) = read_block_state(*document_id, document)
                 .expect("observable terminal documents have canonical block state")
             {
                 states.insert((*document_id, block_id), state);
@@ -27741,6 +28605,8 @@ pub(crate) mod validation_tests {
             accepted_sequence: engine.accepted_sequence.clone(),
             next_acceptance_sequence: engine.next_acceptance_sequence,
             current_path_rows: engine.current_path_catalog.rows.clone(),
+            current_path_page_homes: engine.current_path_catalog.page_homes.clone(),
+            current_path_page_members: engine.current_path_catalog.page_members.clone(),
             current_path_available: engine.current_path_catalog.available,
             current_path_frontier_root: engine.current_path_catalog.accepted_frontier_root.clone(),
         }
@@ -27828,7 +28694,9 @@ pub(crate) mod validation_tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    // A block's immutable document is its own, never its
+                    // page's: the two are distinct addresses by construction.
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id,
                 parent: None,
@@ -27898,7 +28766,7 @@ pub(crate) mod validation_tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: local_second,
-                    home_document_id: local_home,
+                    home_document_id: test_block_home(local_second),
                 },
                 page_id: local_page,
                 parent: None,
@@ -27908,7 +28776,7 @@ pub(crate) mod validation_tests {
             SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: local_first,
-                    home_document_id: local_home,
+                    home_document_id: test_block_home(local_first),
                 },
                 mutation: LogseqIdentityMutation::AssignExternal {
                     logseq_uuid: first_uuid,
@@ -27917,7 +28785,7 @@ pub(crate) mod validation_tests {
             SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: local_second,
-                    home_document_id: local_home,
+                    home_document_id: test_block_home(local_second),
                 },
                 mutation: LogseqIdentityMutation::AssignExternal {
                     logseq_uuid: second_uuid,
@@ -27926,7 +28794,7 @@ pub(crate) mod validation_tests {
             SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: remote_block,
-                    home_document_id: remote_home,
+                    home_document_id: test_block_home(remote_block),
                 },
                 mutation: LogseqIdentityMutation::AssignExternal {
                     logseq_uuid: remote_uuid,
@@ -27959,7 +28827,12 @@ pub(crate) mod validation_tests {
         bulk.page.stats = MaterializationStats::default();
         point.page.stats = MaterializationStats::default();
         assert_eq!(bulk, point);
-        assert_eq!(materializer.exact_document_loads(), 2);
+        // One chunk of this page is exactly its own documents: the page
+        // document, its two block documents and its two membership documents,
+        // plus one page-document point read per exact claim resolution. No
+        // workspace-wide document is read, and nothing here is proportional to
+        // the number of pages in the graph.
+        assert_eq!(materializer.exact_document_loads(), 7);
         assert_eq!(
             materializer.projection_claim_resolution_stats(),
             CleanProjectionClaimResolutionStats {
@@ -27976,7 +28849,8 @@ pub(crate) mod validation_tests {
             .flatten()
             .unwrap();
         repeated.page.stats = MaterializationStats::default();
-        assert_eq!(materializer.exact_document_loads(), 3);
+        // A second chunk repeats exactly the same bounded per-page work.
+        assert_eq!(materializer.exact_document_loads(), 14);
         assert_eq!(
             materializer.projection_claim_resolution_stats(),
             CleanProjectionClaimResolutionStats {
@@ -28019,7 +28893,7 @@ pub(crate) mod validation_tests {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: source_block,
-                        home_document_id: source_membership,
+                        home_document_id: test_block_home(source_block),
                     },
                     page_id: source_page,
                     parent: None,
@@ -28029,7 +28903,7 @@ pub(crate) mod validation_tests {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: reference_block,
-                        home_document_id: reference_membership,
+                        home_document_id: test_block_home(reference_block),
                     },
                     page_id: reference_page,
                     parent: None,
@@ -28039,7 +28913,7 @@ pub(crate) mod validation_tests {
                 SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
                         block_id: source_block,
-                        home_document_id: source_membership,
+                        home_document_id: test_block_home(source_block),
                     },
                     mutation: LogseqIdentityMutation::AssignExternal {
                         logseq_uuid: stale_uuid,
@@ -28056,7 +28930,7 @@ pub(crate) mod validation_tests {
             OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: source_block,
-                    home_document_id: source_membership,
+                    home_document_id: test_block_home(source_block),
                 },
                 mutation: LogseqIdentityMutation::RemoveExternal,
             }])
@@ -28070,11 +28944,13 @@ pub(crate) mod validation_tests {
             engine.resolve_logseq_uuid_current(stale_uuid).unwrap();
         assert_eq!(fallback_resolution, LogseqUuidResolution::Unclaimed);
         let fallback_evidence = fallback_evidence.expect("the removal retains claim evidence");
-        assert!(fallback_homes.contains_key(&source_membership));
+        assert!(fallback_homes.contains_key(&DocumentKey::Entity(test_block_home(source_block))));
         let current_source_dependency = engine
             .current_document_dependencies(
-                source_membership,
-                fallback_homes.get(&source_membership).unwrap(),
+                DocumentKey::Entity(test_block_home(source_block)),
+                fallback_homes
+                    .get(&DocumentKey::Entity(test_block_home(source_block)))
+                    .unwrap(),
             )
             .unwrap();
 
@@ -28112,11 +28988,24 @@ pub(crate) mod validation_tests {
             historical.frontier,
             FrontierV2::new(vec![
                 engine
-                    .accepted_frontier_document(&r1, catalog)
+                    .accepted_frontier_document(&r1, DocumentKey::Entity(reference_membership))
                     .unwrap()
                     .unwrap(),
                 engine
-                    .accepted_frontier_document(&r1, reference_membership)
+                    .accepted_frontier_document(
+                        &r1,
+                        DocumentKey::Entity(test_block_home(reference_block)),
+                    )
+                    .unwrap()
+                    .unwrap(),
+                engine
+                    .accepted_frontier_document(
+                        &r1,
+                        DocumentKey::Membership {
+                            block_document_id: test_block_home(reference_block),
+                            page_document_id: reference_membership,
+                        },
+                    )
                     .unwrap()
                     .unwrap(),
                 current_source_dependency,
@@ -28134,6 +29023,286 @@ pub(crate) mod validation_tests {
 
         drop(materializer);
         drop(engine);
+        drop(writer);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_projection_selects_membership_at_each_historical_move_and_delete_root() {
+        let lineage = LineageDigest::of(b"bulk-projection-historical-membership");
+        let (root, writer, mut engine, _) = archive_test_engine(93_070, lineage);
+        let page_a = PageId::from_uuid(Uuid::from_u128(93_071));
+        let page_a_home = DocumentId::from_uuid(Uuid::from_u128(93_072));
+        let page_b = PageId::from_uuid(Uuid::from_u128(93_073));
+        let page_b_home = DocumentId::from_uuid(Uuid::from_u128(93_074));
+        let block = BlockId::from_uuid(Uuid::from_u128(93_075));
+        let block_home = test_block_home(block);
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_076,
+            OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: page_a,
+                    home_document_id: page_a_home,
+                    name: LogicalPageName::parse("Historical A").unwrap(),
+                    path: ManagedPath::parse("pages/historical-a.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: page_b,
+                    home_document_id: page_b_home,
+                    name: LogicalPageName::parse("Historical B").unwrap(),
+                    path: ManagedPath::parse("pages/historical-b.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    page_id: page_a,
+                    parent: None,
+                    order: "a".into(),
+                    content: "historical membership".into(),
+                },
+            ])
+            .unwrap(),
+        );
+        let r1 = engine.accepted_frontier_root().unwrap();
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_077,
+            OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                root: BlockLocation {
+                    block_id: block,
+                    home_document_id: block_home,
+                },
+                from_page_id: page_a,
+                to_page_id: page_b,
+                parent: None,
+                order: "b".into(),
+            }])
+            .unwrap(),
+        );
+        let r2 = engine.accepted_frontier_root().unwrap();
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_078,
+            OperationTransaction::new(vec![SemanticOperation::DeleteSubtree {
+                root_block_id: block,
+                page_id: page_b,
+            }])
+            .unwrap(),
+        );
+        let r3 = engine.accepted_frontier_root().unwrap();
+
+        let materialized_ids = |root: &AcceptedFrontierRoot, page_id| {
+            engine
+                .clean_projection_bulk_materializer(root)
+                .unwrap()
+                .materialize_pages(&[page_id])
+                .unwrap()
+                .into_iter()
+                .next()
+                .flatten()
+                .unwrap()
+                .blocks
+                .into_iter()
+                .map(|block| block.block_id)
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(materialized_ids(&r1, page_a), BTreeSet::from([block]));
+        assert!(materialized_ids(&r1, page_b).is_empty());
+        assert!(materialized_ids(&r2, page_a).is_empty());
+        assert_eq!(materialized_ids(&r2, page_b), BTreeSet::from([block]));
+        assert!(materialized_ids(&r3, page_a).is_empty());
+        assert!(materialized_ids(&r3, page_b).is_empty());
+
+        drop(engine);
+        drop(writer);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_projection_historical_membership_uses_merged_owner_in_both_arrival_orders() {
+        let lineage = LineageDigest::of(b"bulk-projection-historical-concurrent-owner");
+        let (root, writer, mut forward, catalog) = archive_test_engine(93_080, lineage);
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(93_080));
+        let page_a = PageId::from_uuid(Uuid::from_u128(93_081));
+        let page_a_home = DocumentId::from_uuid(Uuid::from_u128(93_082));
+        let page_b = PageId::from_uuid(Uuid::from_u128(93_083));
+        let page_b_home = DocumentId::from_uuid(Uuid::from_u128(93_084));
+        let page_c = PageId::from_uuid(Uuid::from_u128(93_085));
+        let page_c_home = DocumentId::from_uuid(Uuid::from_u128(93_086));
+        let block = BlockId::from_uuid(Uuid::from_u128(93_087));
+        let block_home = test_block_home(block);
+        let genesis = stage_cursor_transaction(
+            &mut forward,
+            93_088,
+            OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: page_a,
+                    home_document_id: page_a_home,
+                    name: LogicalPageName::parse("Concurrent historical A").unwrap(),
+                    path: ManagedPath::parse("pages/concurrent-historical-a.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: page_b,
+                    home_document_id: page_b_home,
+                    name: LogicalPageName::parse("Concurrent historical B").unwrap(),
+                    path: ManagedPath::parse("pages/concurrent-historical-b.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: page_c,
+                    home_document_id: page_c_home,
+                    name: LogicalPageName::parse("Concurrent historical C").unwrap(),
+                    path: ManagedPath::parse("pages/concurrent-historical-c.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    page_id: page_a,
+                    parent: None,
+                    order: "a".into(),
+                    content: "concurrent historical membership".into(),
+                },
+            ])
+            .unwrap(),
+        );
+
+        let open_peer = || {
+            let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+            let mut engine =
+                ShardedHotEngine::with_clean_archive_store_for_test(store, lineage, catalog);
+            assert!(matches!(
+                engine.stage_archive_batch(genesis).unwrap().disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+            engine
+        };
+        let move_to_b = forward
+            .prepare_fixture_transaction(
+                test_author(93_089, 93_089),
+                &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    from_page_id: page_a,
+                    to_page_id: page_b,
+                    parent: None,
+                    order: "b".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let author_c = open_peer();
+        let move_to_c = author_c
+            .prepare_fixture_transaction(
+                test_author(93_090, 93_090),
+                &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    from_page_id: page_a,
+                    to_page_id: page_c,
+                    parent: None,
+                    order: "c".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        writer.publish_prepared(&move_to_b).unwrap();
+        writer.publish_prepared(&move_to_c).unwrap();
+
+        let mut reverse = open_peer();
+        let verify =
+            |engine: &mut ShardedHotEngine, batches: [&PreparedBatch; 2], later_seed: u128| {
+                for prepared in batches {
+                    assert!(matches!(
+                        engine
+                            .stage_archive_batch(prepared.manifest().batch_id())
+                            .unwrap()
+                            .disposition(),
+                        BatchDisposition::Accepted { .. }
+                    ));
+                }
+                let historical_root = engine.accepted_frontier_root().unwrap();
+                let accepted_ids = (1..=historical_root.acceptance_sequence())
+                    .map(|sequence| engine.accepted_batch_id_at(sequence).unwrap().unwrap())
+                    .collect::<BTreeSet<_>>();
+                assert!(accepted_ids.contains(&move_to_b.manifest().batch_id()));
+                assert!(accepted_ids.contains(&move_to_c.manifest().batch_id()));
+                let expected = [page_a, page_b, page_c]
+                    .into_iter()
+                    .map(|page_id| {
+                        let blocks = engine
+                            .materialize_page(page_id)
+                            .unwrap()
+                            .blocks
+                            .into_iter()
+                            .map(|block| block.block_id)
+                            .collect::<BTreeSet<_>>();
+                        (page_id, blocks)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert!(expected[&page_a].is_empty());
+                let winning_owner = [page_b, page_c]
+                    .into_iter()
+                    .find(|page_id| !expected[page_id].is_empty())
+                    .expect("one concurrent destination must win");
+                let losing_owner = if winning_owner == page_b {
+                    page_c
+                } else {
+                    page_b
+                };
+                assert!(expected[&losing_owner].is_empty());
+
+                stage_cursor_transaction(
+                    engine,
+                    later_seed,
+                    OperationTransaction::new(vec![SemanticOperation::SetPagePreamble {
+                        page_id: page_a,
+                        preamble: Some("unrelated later edit".into()),
+                    }])
+                    .unwrap(),
+                );
+                let materializer = engine
+                    .clean_projection_bulk_materializer(&historical_root)
+                    .unwrap();
+                for page_id in [page_a, page_b, page_c] {
+                    let actual = materializer
+                        .materialize_pages(&[page_id])
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .unwrap()
+                        .blocks
+                        .into_iter()
+                        .map(|block| block.block_id)
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(actual, expected[&page_id]);
+                }
+                winning_owner
+            };
+        let forward_owner = verify(&mut forward, [&move_to_b, &move_to_c], 93_091);
+        let reverse_owner = verify(&mut reverse, [&move_to_c, &move_to_b], 93_092);
+        assert_eq!(forward_owner, reverse_owner);
+
+        drop(author_c);
+        drop(forward);
+        drop(reverse);
         drop(writer);
         crate::test_support::remove_dir_all(root);
     }
@@ -28192,7 +29361,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
                         block_id: block_a,
-                        home_document_id: home_a,
+                        home_document_id: test_block_home(block_a),
                     },
                     mutation: LogseqIdentityMutation::AssignExternal {
                         logseq_uuid: duplicate,
@@ -28207,7 +29376,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
                         block_id: block_b,
-                        home_document_id: home_b,
+                        home_document_id: test_block_home(block_b),
                     },
                     mutation: LogseqIdentityMutation::AssignExternal {
                         logseq_uuid: duplicate,
@@ -28252,7 +29421,7 @@ pub(crate) mod validation_tests {
 
     fn dependencies_for(
         engine: &ShardedHotEngine,
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer: u64,
     ) -> DocumentDependencies {
         let document = engine.clone_visible_document(document_id, peer).unwrap();
@@ -28266,6 +29435,80 @@ pub(crate) mod validation_tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    /// Build one page's OWN document directly, bypassing the authoring path.
+    /// Used to prove that raw document state cannot be smuggled past the
+    /// declared semantic effect.
+    fn raw_page_document(
+        page_document_id: DocumentId,
+        page_id: PageId,
+        state: &PageState,
+    ) -> LoroDoc {
+        let document = LoroDoc::new();
+        document.set_peer_id(2).unwrap();
+        create_document(
+            DocumentKey::Entity(page_document_id),
+            &document,
+            &DocumentIdentity::Page {
+                document_id: page_document_id,
+                page_id,
+            },
+            DocumentState::Page {
+                state: state.clone(),
+                preamble: None,
+            },
+        )
+        .unwrap();
+        document
+    }
+
+    /// Build one block's OWN document directly.
+    fn raw_block_document(
+        birth_page_id: PageId,
+        birth_page_document_id: DocumentId,
+        state: BlockState,
+    ) -> LoroDoc {
+        let document = LoroDoc::new();
+        document.set_peer_id(2).unwrap();
+        create_document(
+            DocumentKey::Entity(state.home_document_id),
+            &document,
+            &DocumentIdentity::Block {
+                document_id: state.home_document_id,
+                block_id: state.block_id,
+                birth_page_id,
+                birth_page_document_id,
+            },
+            DocumentState::Block(state),
+        )
+        .unwrap();
+        document
+    }
+
+    /// Build one (block, page) pair's OWN membership document directly.
+    fn raw_membership_document(
+        block_document_id: DocumentId,
+        block_id: BlockId,
+        page_document_id: DocumentId,
+        page_id: PageId,
+        claim: Option<MembershipClaim>,
+    ) -> LoroDoc {
+        let document = LoroDoc::new();
+        document.set_peer_id(2).unwrap();
+        create_document(
+            membership_document_id(block_document_id, page_document_id),
+            &document,
+            &DocumentIdentity::Membership {
+                block_document_id,
+                block_id,
+                page_document_id,
+                page_id,
+            },
+            DocumentState::Membership(claim),
+        )
+        .unwrap();
+        document
     }
 
     fn live_page(home_document_id: DocumentId, path: &str) -> PageState {
@@ -28805,7 +30048,9 @@ pub(crate) mod validation_tests {
                 &operation.operations[0],
             )
             .unwrap();
-        let after = read_page_state(working.get(&catalog).unwrap().document(), page_id)
+        // The reconciled state is read back from the PAGE's own document.
+        let page_key = DocumentKey::Entity(home_document_id);
+        let after = read_page_state(page_key, working.get(&page_key).unwrap().document())
             .unwrap()
             .unwrap();
         assert_eq!(after.name().as_str(), "Journal Display Title");
@@ -28819,245 +30064,246 @@ pub(crate) mod validation_tests {
 
     #[test]
     fn malformed_or_misbound_logseq_uuid_registers_fail_closed() {
-        let catalog_id = DocumentId::from_uuid(Uuid::from_u128(67_000));
-        let home_id = DocumentId::from_uuid(Uuid::from_u128(67_001));
+        let page_document_id = DocumentId::from_uuid(Uuid::from_u128(67_001));
         let page_id = PageId::from_uuid(Uuid::from_u128(67_002));
         let block_id = BlockId::from_uuid(Uuid::from_u128(67_003));
+        let block_document_id = DocumentId::from_uuid(Uuid::from_u128(67_007));
+        let block_key = DocumentKey::Entity(block_document_id);
         let document = LoroDoc::new();
         document.set_peer_id(67_000).unwrap();
-        document
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page_id.to_string())
-            .unwrap();
-        document
-            .get_map(SHARD_OWNERS)
-            .insert(&block_id.to_string(), page_id.to_string())
-            .unwrap();
-        document
-            .get_map(SHARD_CONTENT)
-            .insert_container(&block_id.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "content")
-            .unwrap();
-        document
-            .get_map(SHARD_LOGSEQ_UUIDS)
-            .insert(&block_id.to_string(), "not-a-uuid")
-            .unwrap();
-        assert!(matches!(
-            validate_shard(catalog_id, home_id, &document),
-            Err(EngineError::MalformedDocument { document_id, .. })
-                if document_id == home_id
-        ));
-
-        document
-            .get_map(SHARD_LOGSEQ_UUIDS)
-            .insert(
-                &block_id.to_string(),
-                LogseqUuid::from_uuid(Uuid::from_u128(67_004)).to_string(),
-            )
-            .unwrap();
-        let misbound = BlockId::from_uuid(Uuid::from_u128(67_005));
-        document
-            .get_map(SHARD_LOGSEQ_UUIDS)
-            .insert(
-                &misbound.to_string(),
-                LogseqUuid::from_uuid(Uuid::from_u128(67_006)).to_string(),
-            )
-            .unwrap();
-        assert!(matches!(
-            validate_shard(catalog_id, home_id, &document),
-            Err(EngineError::MalformedDocument { document_id, .. })
-                if document_id == home_id
-        ));
-    }
-
-    struct NewExactShardFixture {
-        engine: ShardedHotEngine,
-        author: AuthorBatch,
-        before: BTreeMap<DocumentId, LoroDoc>,
-        after: BTreeMap<DocumentId, LoroDoc>,
-        effect: SemanticEffect,
-        home_id: DocumentId,
-        page_id: PageId,
-        block_id: BlockId,
-    }
-
-    fn new_exact_shard_fixture(seed: u128) -> NewExactShardFixture {
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(seed));
-        let catalog_id = DocumentId::from_uuid(Uuid::from_u128(seed + 1));
-        let home_id = DocumentId::from_uuid(Uuid::from_u128(seed + 2));
-        let page_id = PageId::from_uuid(Uuid::from_u128(seed + 3));
-        let block_id = BlockId::from_uuid(Uuid::from_u128(seed + 4));
-        let engine = ShardedHotEngine::new(
-            workspace,
-            LineageDigest::of(&seed.to_be_bytes()),
-            catalog_id,
-        );
-        let catalog = LoroDoc::new();
-        catalog.set_peer_id(seed as u64).unwrap();
-        insert_page_state(&catalog, page_id, &live_page(home_id, "pages/Fast Path.md")).unwrap();
-        let shard = LoroDoc::new();
-        shard.set_peer_id(seed as u64).unwrap();
-        shard
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page_id.to_string())
-            .unwrap();
-        shard
-            .get_map(SHARD_OWNERS)
-            .insert(&block_id.to_string(), page_id.to_string())
-            .unwrap();
-        shard
-            .get_map(SHARD_CONTENT)
-            .insert_container(&block_id.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "fast content")
-            .unwrap();
-        insert_membership(
-            &shard,
-            block_id,
-            &MembershipClaim::new(home_id, None, "a").unwrap(),
+        create_document(
+            block_key,
+            &document,
+            &DocumentIdentity::Block {
+                document_id: block_document_id,
+                block_id,
+                birth_page_id: page_id,
+                birth_page_document_id: page_document_id,
+            },
+            DocumentState::Block(block_state(
+                block_id,
+                block_document_id,
+                BlockOwner::Page(page_id),
+                "content",
+            )),
         )
         .unwrap();
-        let before = BTreeMap::from([(catalog_id, LoroDoc::new()), (home_id, LoroDoc::new())]);
-        let after = BTreeMap::from([(catalog_id, catalog), (home_id, shard)]);
-        let effect = derive_effect(catalog_id, &before, &after).unwrap();
-        NewExactShardFixture {
-            engine,
-            author: test_author(seed + 5, seed as u64),
-            before,
-            after,
-            effect,
-            home_id,
+        assert!(read_block_state(block_key, &document).unwrap().is_some());
+
+        // The Logseq identity registers live in the block's OWN document. A
+        // value that is not a canonical UUID fails the document closed.
+        document
+            .get_map("meta")
+            .insert("logseq_uuid", "not-a-uuid")
+            .unwrap();
+        assert!(matches!(
+            read_block_state(block_key, &document),
+            Err(EngineError::MalformedDocument { document_id, .. })
+                if document_id == block_key
+        ));
+
+        // A UUID without its origin is misbound: both registers move together
+        // or the document is refused.
+        document
+            .get_map("meta")
+            .insert(
+                "logseq_uuid",
+                serde_json::to_string(&Some(LogseqUuid::from_uuid(Uuid::from_u128(67_004))))
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .get_map("meta")
+            .insert("logseq_origin", "null")
+            .unwrap();
+        assert!(matches!(
+            read_block_state(block_key, &document),
+            Err(EngineError::MalformedDocument { document_id, .. })
+                if document_id == block_key
+        ));
+    }
+
+    /// One page's own document snapshot.
+    fn page_snapshot(
+        page_document_id: DocumentId,
+        page_id: PageId,
+        state: PageState,
+    ) -> SemanticDocumentSnapshot {
+        SemanticDocumentSnapshot::Page {
             page_id,
-            block_id,
+            state,
+            preamble: Some(PagePreambleState {
+                page_id,
+                home_document_id: page_document_id,
+                preamble: None,
+            }),
         }
     }
 
-    fn assert_new_exact_shard_rejected(mut fixture: NewExactShardFixture) {
-        let batch = validated_transition_with_effect(
-            &fixture.engine,
-            fixture.author,
-            &fixture.before,
-            &fixture.after,
-            FrontierV2::new(Vec::new()).unwrap(),
-            fixture.effect,
-        );
-        assert!(matches!(
-            fixture.engine.stage_ready(batch).disposition(),
-            BatchDisposition::Rejected { .. }
-        ));
-        assert!(fixture.engine.visible_documents.is_empty());
-        assert!(fixture
-            .engine
-            .canonical_snapshot()
-            .unwrap()
-            .pages
-            .is_empty());
-    }
-
-    fn catalog_snapshot(entries: Vec<(PageId, PageState)>) -> SemanticDocumentSnapshot {
-        SemanticDocumentSnapshot::Catalog(entries.into_iter().collect())
-    }
-
-    fn shard_snapshot(
-        document_id: DocumentId,
-        page_id: Option<PageId>,
-        blocks: Vec<BlockState>,
-        memberships: Vec<(BlockId, MembershipClaim)>,
+    /// One block's own document snapshot.
+    fn block_snapshot(
+        state: BlockState,
+        birth_page_id: PageId,
+        birth_page_document_id: DocumentId,
     ) -> SemanticDocumentSnapshot {
-        SemanticDocumentSnapshot::Shard {
+        SemanticDocumentSnapshot::Block {
+            state,
+            birth_page_id,
+            birth_page_document_id,
+        }
+    }
+
+    /// One (block, page) pair's membership document snapshot.
+    fn membership_snapshot(
+        page_id: PageId,
+        block_id: BlockId,
+        claim: Option<MembershipClaim>,
+    ) -> SemanticDocumentSnapshot {
+        SemanticDocumentSnapshot::Membership {
             page_id,
-            page_preamble: page_id.map(|page_id| PagePreambleState {
-                page_id,
-                home_document_id: document_id,
-                preamble: None,
-            }),
-            blocks: blocks
-                .into_iter()
-                .map(|state| (state.block_id, state))
-                .collect(),
-            memberships: memberships.into_iter().collect(),
+            block_id,
+            claim,
+        }
+    }
+
+    /// The exact document window of one page in the current layout: the page's
+    /// own document, one document per block, and one membership document per
+    /// (block, page) pair. There is no shard and no catalog document here, and
+    /// a document that has not been written yet is `Unwritten` rather than
+    /// absent -- that is exactly what an uninitialized fixed-schema document
+    /// reads back as.
+    fn page_window(
+        page_document_id: DocumentId,
+        page_id: PageId,
+        page: Option<PageState>,
+        blocks: Vec<BlockState>,
+        memberships: Vec<(BlockId, DocumentId, Option<MembershipClaim>)>,
+    ) -> BTreeMap<DocumentKey, SemanticDocumentSnapshot> {
+        let mut window = BTreeMap::new();
+        window.insert(
+            DocumentKey::Entity(page_document_id),
+            match page {
+                Some(state) => page_snapshot(page_document_id, page_id, state),
+                None => SemanticDocumentSnapshot::Unwritten,
+            },
+        );
+        for state in blocks {
+            window.insert(
+                DocumentKey::Entity(state.home_document_id),
+                block_snapshot(state, page_id, page_document_id),
+            );
+        }
+        for (block_id, block_document_id, claim) in memberships {
+            window.insert(
+                membership_document_id(block_document_id, page_document_id),
+                membership_snapshot(page_id, block_id, claim),
+            );
+        }
+        window
+    }
+
+    /// Fill in `Unwritten` for every document one side of a transition does not
+    /// mention, so both sides always name the same document window.
+    fn balance_windows(
+        before: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+        after: &mut BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+    ) {
+        for document_id in before.keys().copied().collect::<Vec<_>>() {
+            after
+                .entry(document_id)
+                .or_insert(SemanticDocumentSnapshot::Unwritten);
+        }
+        for document_id in after.keys().copied().collect::<Vec<_>>() {
+            before
+                .entry(document_id)
+                .or_insert(SemanticDocumentSnapshot::Unwritten);
         }
     }
 
     fn comparator_fixture(
         transition: u128,
     ) -> (
-        BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-        BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+        BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+        BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
     ) {
-        let catalog_id = DocumentId::from_uuid(Uuid::from_u128(70_000 + transition));
-        let home_id = DocumentId::from_uuid(Uuid::from_u128(71_000 + transition));
+        let page_document_id = DocumentId::from_uuid(Uuid::from_u128(71_000 + transition));
+        let block_document_id = DocumentId::from_uuid(Uuid::from_u128(74_000 + transition));
         let page_id = PageId::from_uuid(Uuid::from_u128(72_000 + transition));
         let block_id = BlockId::from_uuid(Uuid::from_u128(73_000 + transition));
-        let before_claim = MembershipClaim::new(home_id, None, "before").unwrap();
-        let after_claim = MembershipClaim::new(home_id, None, "after").unwrap();
-        let before_block =
-            block_state(block_id, home_id, BlockOwner::Page(page_id), "before block");
-        let after_block = block_state(block_id, home_id, BlockOwner::Page(page_id), "after block");
+        let before_claim = MembershipClaim::new(block_document_id, None, "before").unwrap();
+        let after_claim = MembershipClaim::new(block_document_id, None, "after").unwrap();
+        let before_block = block_state(
+            block_id,
+            block_document_id,
+            BlockOwner::Page(page_id),
+            "before block",
+        );
+        let after_block = block_state(
+            block_id,
+            block_document_id,
+            BlockOwner::Page(page_id),
+            "after block",
+        );
 
         let (
-            before_pages,
-            after_pages,
+            before_page,
+            after_page,
             before_blocks,
             after_blocks,
             before_memberships,
             after_memberships,
         ) = match transition % 3 {
             0 => (
-                Vec::new(),
-                vec![(page_id, live_page(home_id, "pages/Inserted.md"))],
+                None,
+                Some(live_page(page_document_id, "pages/Inserted.md")),
                 Vec::new(),
                 vec![after_block],
                 Vec::new(),
-                vec![(block_id, after_claim)],
+                vec![(block_id, block_document_id, Some(after_claim))],
             ),
             1 => (
-                vec![(page_id, live_page(home_id, "pages/Before.md"))],
-                vec![(page_id, live_page(home_id, "pages/After.md"))],
+                Some(live_page(page_document_id, "pages/Before.md")),
+                Some(live_page(page_document_id, "pages/After.md")),
                 vec![before_block],
                 vec![after_block],
-                vec![(block_id, before_claim)],
-                vec![(block_id, after_claim)],
+                vec![(block_id, block_document_id, Some(before_claim))],
+                vec![(block_id, block_document_id, Some(after_claim))],
             ),
             _ => (
-                vec![(page_id, live_page(home_id, "pages/Removed.md"))],
-                vec![(
-                    page_id,
-                    PageState::Tombstone {
-                        name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
-                        home_document_id: home_id,
-                        kind: ManagedTextKind::Page,
-                    },
-                )],
+                Some(live_page(page_document_id, "pages/Removed.md")),
+                Some(PageState::Tombstone {
+                    name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
+                    home_document_id: page_document_id,
+                    kind: ManagedTextKind::Page,
+                }),
                 vec![before_block.clone()],
                 vec![before_block],
-                vec![(block_id, before_claim)],
-                Vec::new(),
+                vec![(block_id, block_document_id, Some(before_claim))],
+                vec![(block_id, block_document_id, None)],
             ),
         };
-        (
-            BTreeMap::from([
-                (catalog_id, catalog_snapshot(before_pages)),
-                (
-                    home_id,
-                    shard_snapshot(home_id, Some(page_id), before_blocks, before_memberships),
-                ),
-            ]),
-            BTreeMap::from([
-                (catalog_id, catalog_snapshot(after_pages)),
-                (
-                    home_id,
-                    shard_snapshot(home_id, Some(page_id), after_blocks, after_memberships),
-                ),
-            ]),
-        )
+        let mut before = page_window(
+            page_document_id,
+            page_id,
+            before_page,
+            before_blocks,
+            before_memberships,
+        );
+        let mut after = page_window(
+            page_document_id,
+            page_id,
+            after_page,
+            after_blocks,
+            after_memberships,
+        );
+        balance_windows(&mut before, &mut after);
+        (before, after)
     }
 
     fn assert_comparator_mismatch(
         declared: &SemanticEffect,
-        before: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-        after: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+        before: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
+        after: &BTreeMap<DocumentKey, SemanticDocumentSnapshot>,
     ) {
         assert!(matches!(
             compare_declared_effect_against_snapshots_with_catalog(declared, before, after),
@@ -29131,6 +30377,10 @@ pub(crate) mod validation_tests {
         extra_blocks.push(BlockDelta {
             block_id: extra_block_id,
             home_document_id: extra_home_id,
+            birth: Some(BlockBirth {
+                page_id: extra_page_id,
+                page_document_id: extra_home_id,
+            }),
             before: None,
             after: Some(block_state(
                 extra_block_id,
@@ -29207,40 +30457,42 @@ pub(crate) mod validation_tests {
     }
 
     #[test]
-    fn borrowed_comparator_uses_page_order_and_retains_disjoint_duplicate_page_sources() {
-        let low_document_id = DocumentId::from_uuid(Uuid::from_u128(81_001));
-        let high_document_id = DocumentId::from_uuid(Uuid::from_u128(81_002));
+    fn borrowed_comparator_uses_page_order_and_rejects_a_duplicated_pair() {
+        let low_page_document_id = DocumentId::from_uuid(Uuid::from_u128(81_001));
+        let high_page_document_id = DocumentId::from_uuid(Uuid::from_u128(81_002));
         let low_page_id = PageId::from_uuid(Uuid::from_u128(81_003));
         let high_page_id = PageId::from_uuid(Uuid::from_u128(81_004));
         let low_block_id = BlockId::from_uuid(Uuid::from_u128(81_005));
         let high_block_id = BlockId::from_uuid(Uuid::from_u128(81_006));
-        let before = BTreeMap::new();
-        let after = BTreeMap::from([
-            (
-                low_document_id,
-                shard_snapshot(
-                    low_document_id,
-                    Some(high_page_id),
-                    Vec::new(),
-                    vec![(
-                        high_block_id,
-                        MembershipClaim::new(low_document_id, None, "a").unwrap(),
-                    )],
-                ),
-            ),
-            (
-                high_document_id,
-                shard_snapshot(
-                    high_document_id,
-                    Some(low_page_id),
-                    Vec::new(),
-                    vec![(
-                        low_block_id,
-                        MembershipClaim::new(high_document_id, None, "b").unwrap(),
-                    )],
-                ),
-            ),
-        ]);
+        let low_block_document_id = DocumentId::from_uuid(Uuid::from_u128(81_008));
+        let high_block_document_id = DocumentId::from_uuid(Uuid::from_u128(81_009));
+
+        // Two membership documents, each addressing a different page. The
+        // derived deltas are ordered by page identity, not by document address.
+        let mut after = page_window(
+            low_page_document_id,
+            low_page_id,
+            Some(live_page(low_page_document_id, "pages/Low.md")),
+            Vec::new(),
+            vec![(
+                high_block_id,
+                high_block_document_id,
+                Some(MembershipClaim::new(high_block_document_id, None, "a").unwrap()),
+            )],
+        );
+        after.extend(page_window(
+            high_page_document_id,
+            high_page_id,
+            Some(live_page(high_page_document_id, "pages/High.md")),
+            Vec::new(),
+            vec![(
+                low_block_id,
+                low_block_document_id,
+                Some(MembershipClaim::new(low_block_document_id, None, "b").unwrap()),
+            )],
+        ));
+        let mut before = BTreeMap::new();
+        balance_windows(&mut before, &mut after);
         let declared = derive_effect_from_snapshots(&before, &after).unwrap();
         assert_eq!(
             declared
@@ -29255,133 +30507,77 @@ pub(crate) mod validation_tests {
                 .is_ok()
         );
 
+        // Two distinct membership documents that name the SAME semantic
+        // (page, block) pair are a duplicate the derivation must reject, even
+        // though their document addresses differ.
         let duplicate_page_id = PageId::from_uuid(Uuid::from_u128(81_007));
-        let disjoint_duplicate_after = BTreeMap::from([
-            (
-                low_document_id,
-                shard_snapshot(
-                    low_document_id,
-                    Some(duplicate_page_id),
-                    Vec::new(),
-                    vec![(
-                        low_block_id,
-                        MembershipClaim::new(low_document_id, None, "a").unwrap(),
-                    )],
+        let mut duplicate_after = page_window(
+            low_page_document_id,
+            duplicate_page_id,
+            Some(live_page(low_page_document_id, "pages/Duplicate.md")),
+            Vec::new(),
+            vec![
+                (
+                    low_block_id,
+                    low_block_document_id,
+                    Some(MembershipClaim::new(low_block_document_id, None, "a").unwrap()),
                 ),
-            ),
-            (
-                high_document_id,
-                shard_snapshot(
-                    high_document_id,
-                    Some(duplicate_page_id),
-                    Vec::new(),
-                    vec![(
-                        high_block_id,
-                        MembershipClaim::new(high_document_id, None, "b").unwrap(),
-                    )],
+                (
+                    low_block_id,
+                    high_block_document_id,
+                    Some(MembershipClaim::new(high_block_document_id, None, "b").unwrap()),
                 ),
-            ),
-        ]);
-        let disjoint_declared =
-            derive_effect_from_snapshots(&before, &disjoint_duplicate_after).unwrap();
-        assert_eq!(disjoint_declared.memberships().len(), 2);
-        assert!(compare_declared_effect_against_snapshots_with_catalog(
-            &disjoint_declared,
-            &before,
-            &disjoint_duplicate_after
-        )
-        .is_ok());
-
-        let duplicate_key_after = BTreeMap::from([
-            (
-                low_document_id,
-                shard_snapshot(
-                    low_document_id,
-                    Some(duplicate_page_id),
-                    Vec::new(),
-                    vec![(
-                        low_block_id,
-                        MembershipClaim::new(low_document_id, None, "a").unwrap(),
-                    )],
-                ),
-            ),
-            (
-                high_document_id,
-                shard_snapshot(
-                    high_document_id,
-                    Some(duplicate_page_id),
-                    Vec::new(),
-                    vec![(
-                        low_block_id,
-                        MembershipClaim::new(high_document_id, None, "b").unwrap(),
-                    )],
-                ),
-            ),
-        ]);
-        assert!(derive_effect_from_snapshots(&before, &duplicate_key_after).is_err());
+            ],
+        );
+        let mut duplicate_before = BTreeMap::new();
+        balance_windows(&mut duplicate_before, &mut duplicate_after);
+        assert!(derive_effect_from_snapshots(&duplicate_before, &duplicate_after).is_err());
         let empty = SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
-        assert!(matches!(
-            compare_declared_effect_against_snapshots_with_catalog(
-                &empty,
-                &before,
-                &duplicate_key_after
-            ),
-            Err(EngineError::SemanticEffectMismatch)
-        ));
+        assert!(compare_declared_effect_against_snapshots_with_catalog(
+            &empty,
+            &duplicate_before,
+            &duplicate_after
+        )
+        .is_err());
     }
 
     #[test]
-    fn borrowed_comparator_preserves_absent_page_identity_and_role_rejection() {
-        let document_id = DocumentId::from_uuid(Uuid::from_u128(82_001));
+    fn borrowed_comparator_rejects_document_role_and_page_identity_changes() {
+        let page_document_id = DocumentId::from_uuid(Uuid::from_u128(82_001));
         let page_id = PageId::from_uuid(Uuid::from_u128(82_002));
-        let block_id = BlockId::from_uuid(Uuid::from_u128(82_003));
+        let empty = SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
+
+        // A document may not change what kind of document it is.
         let before = BTreeMap::from([(
-            document_id,
-            shard_snapshot(document_id, None, Vec::new(), Vec::new()),
-        )]);
-        let after = BTreeMap::from([(
-            document_id,
-            shard_snapshot(
-                document_id,
-                None,
-                Vec::new(),
-                vec![(
-                    block_id,
-                    MembershipClaim::new(document_id, None, "a").unwrap(),
-                )],
+            DocumentKey::Entity(page_document_id),
+            page_snapshot(
+                page_document_id,
+                page_id,
+                live_page(page_document_id, "pages/Role.md"),
             ),
         )]);
-        let declared = derive_effect_from_snapshots(&before, &after).unwrap();
-        assert!(declared.memberships().is_empty());
-        assert!(
-            compare_declared_effect_against_snapshots_with_catalog(&declared, &before, &after)
-                .is_ok()
-        );
-
-        let role_after = BTreeMap::from([(document_id, catalog_snapshot(Vec::new()))]);
-        let empty = SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let role_after = BTreeMap::from([(
+            DocumentKey::Entity(page_document_id),
+            SemanticDocumentSnapshot::Graph,
+        )]);
         assert!(matches!(
             compare_declared_effect_against_snapshots_with_catalog(&empty, &before, &role_after),
             Err(EngineError::MalformedDocument { .. })
         ));
 
+        // A page document may not change which page it is.
         let changed_page_after = BTreeMap::from([(
-            document_id,
-            shard_snapshot(document_id, Some(page_id), Vec::new(), Vec::new()),
-        )]);
-        let stable_before = BTreeMap::from([(
-            document_id,
-            shard_snapshot(
-                document_id,
-                Some(PageId::from_uuid(Uuid::from_u128(82_004))),
-                Vec::new(),
-                Vec::new(),
+            DocumentKey::Entity(page_document_id),
+            page_snapshot(
+                page_document_id,
+                PageId::from_uuid(Uuid::from_u128(82_004)),
+                live_page(page_document_id, "pages/Role.md"),
             ),
         )]);
         assert!(matches!(
             compare_declared_effect_against_snapshots_with_catalog(
                 &empty,
-                &stable_before,
+                &before,
                 &changed_page_after
             ),
             Err(EngineError::MalformedDocument { .. })
@@ -29399,12 +30595,628 @@ pub(crate) mod validation_tests {
         let target = LoroDoc::new();
         assert!(matches!(
             import_complete(
-                DocumentId::from_uuid(Uuid::from_u128(41)),
+                DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(41))),
                 &target,
                 &[suffix]
             ),
             Err(EngineError::MissingCrdtDependencies(_))
         ));
+    }
+
+    #[test]
+    fn compact_equivalence_qualifies_root_text_body_attributes_and_identity() {
+        let page_id = PageId::from_uuid(Uuid::from_u128(114_001));
+        let page_home = DocumentId::from_uuid(Uuid::from_u128(114_002));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(114_003));
+        let block_home = DocumentId::from_uuid(Uuid::from_u128(114_004));
+        let original = raw_block_document(
+            page_id,
+            page_home,
+            block_state(block_id, block_home, BlockOwner::Page(page_id), "root body"),
+        );
+        let mut styles = loro::StyleConfigMap::new();
+        styles.insert(
+            "fixture-emphasis".into(),
+            loro::StyleConfig {
+                expand: loro::ExpandType::After,
+            },
+        );
+        original.config_text_style(styles);
+        retirable_document::root_text(&original)
+            .mark(0..4, "fixture-emphasis", true)
+            .unwrap();
+        let restored = clone_doc(&original, 114_005).unwrap();
+        let roots_before = original.get_value();
+        assert_eq!(roots_before, restored.get_value());
+        verify_compact_document_equivalence(&original, &restored).unwrap();
+        assert_eq!(original.get_value(), roots_before);
+        assert_eq!(restored.get_value(), roots_before);
+
+        let empty = raw_block_document(
+            page_id,
+            page_home,
+            block_state(block_id, block_home, BlockOwner::Tombstone, ""),
+        );
+        let empty_restored = clone_doc(&empty, 114_006).unwrap();
+        verify_compact_document_equivalence(&empty, &empty_restored).unwrap();
+        assert_eq!(empty.get_value(), empty_restored.get_value());
+
+        // The retired map-only loop saw equal root directories here and never
+        // opened the top-level text. The typed helper must see the changed body
+        // even though its stable root ContainerID is unchanged.
+        let changed = clone_doc(&original, 114_007).unwrap();
+        retirable_document::root_text(&changed)
+            .insert(0, "changed ")
+            .unwrap();
+        assert_eq!(original.get_value(), changed.get_value());
+        assert_ne!(
+            retirable_document::root_text(&original).to_delta(),
+            retirable_document::root_text(&changed).to_delta()
+        );
+        assert!(verify_compact_root_containers(&original, &changed).is_err());
+        assert_eq!(original.get_value(), roots_before);
+        assert_eq!(changed.get_value(), roots_before);
+    }
+
+    #[test]
+    fn forged_initial_block_birth_page_and_home_reject_without_fragments() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(114_100));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(114_101));
+        let page_a = PageId::from_uuid(Uuid::from_u128(114_102));
+        let page_b = PageId::from_uuid(Uuid::from_u128(114_103));
+        let page_home_a = DocumentId::from_uuid(Uuid::from_u128(114_104));
+        let page_home_b = DocumentId::from_uuid(Uuid::from_u128(114_105));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(114_106));
+        let block_home = DocumentId::from_uuid(Uuid::from_u128(114_107));
+        let membership_key = membership_document_id(block_home, page_home_a);
+        let mut engine =
+            ShardedHotEngine::new(workspace, LineageDigest::of(b"forged-block-birth"), catalog);
+        let pages = engine
+            .prepare_fixture_transaction(
+                test_author(114_110, 114_110),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id: page_a,
+                        home_document_id: page_home_a,
+                        name: LogicalPageName::parse("Birth A").unwrap(),
+                        path: ManagedPath::parse("pages/birth-a.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreatePage {
+                        page_id: page_b,
+                        home_document_id: page_home_b,
+                        name: LogicalPageName::parse("Birth B").unwrap(),
+                        path: ManagedPath::parse("pages/birth-b.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.stage_ready(ValidatedBatch::new(pages)).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let before = BTreeMap::from([
+            (DocumentKey::Entity(block_home), LoroDoc::new()),
+            (membership_key, LoroDoc::new()),
+        ]);
+        let state = block_state(
+            block_id,
+            block_home,
+            BlockOwner::Page(page_a),
+            "forged-birth-control",
+        );
+        let correct_after = BTreeMap::from([
+            (
+                DocumentKey::Entity(block_home),
+                raw_block_document(page_a, page_home_a, state.clone()),
+            ),
+            (
+                membership_key,
+                raw_membership_document(
+                    block_home,
+                    block_id,
+                    page_home_a,
+                    page_a,
+                    Some(MembershipClaim::new(block_home, None, "a").unwrap()),
+                ),
+            ),
+        ]);
+        let legitimate_effect = derive_effect(catalog, &before, &correct_after).unwrap();
+        // Changing only the immutable metadata while retaining the legitimate
+        // declaration must fail at the exact snapshot/effect comparison. These
+        // are mismatch controls, distinct from causal page authorization below.
+        for (index, (forged_page, forged_page_home)) in [
+            (page_b, page_home_b),
+            (page_a, page_home_b),
+            (
+                PageId::from_uuid(Uuid::from_u128(114_108)),
+                DocumentId::from_uuid(Uuid::from_u128(114_109)),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let forged_after = BTreeMap::from([
+                (
+                    DocumentKey::Entity(block_home),
+                    raw_block_document(forged_page, forged_page_home, state.clone()),
+                ),
+                (membership_key, correct_after[&membership_key].clone()),
+            ]);
+            let batch = validated_transition_with_effect(
+                &engine,
+                test_author(114_120 + index as u128, 114_120 + index as u64),
+                &before,
+                &forged_after,
+                FrontierV2::new(vec![dependencies_for(
+                    &engine,
+                    DocumentKey::Entity(page_home_a),
+                    114_120 + index as u64,
+                )])
+                .unwrap(),
+                legitimate_effect.clone(),
+            );
+            let disposition = engine.stage_ready(batch).disposition().clone();
+            assert!(
+                matches!(
+                    disposition,
+                    BatchDisposition::Rejected {
+                        error: EngineError::SemanticEffectMismatch,
+                    }
+                ),
+                "metadata-only birth forgery reached the wrong boundary: {disposition:?}"
+            );
+            assert!(engine.materialize_page(page_a).unwrap().blocks.is_empty());
+            assert!(engine
+                .recover_block_state(block_home, block_id)
+                .unwrap()
+                .is_none());
+        }
+
+        // Now make metadata AND the declared BlockBirth agree. A real page id
+        // at another page's home, and a never-created pair, are internally
+        // coherent CRDT/effect transitions; only exact causal page authority
+        // can reject them.
+        for (index, (forged_page, forged_page_home, frontier)) in [
+            (
+                page_a,
+                page_home_b,
+                FrontierV2::new(vec![dependencies_for(
+                    &engine,
+                    DocumentKey::Entity(page_home_b),
+                    114_130,
+                )])
+                .unwrap(),
+            ),
+            (
+                PageId::from_uuid(Uuid::from_u128(114_108)),
+                DocumentId::from_uuid(Uuid::from_u128(114_109)),
+                FrontierV2::new(Vec::new()).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let forged_after = BTreeMap::from([
+                (
+                    DocumentKey::Entity(block_home),
+                    raw_block_document(forged_page, forged_page_home, state.clone()),
+                ),
+                (membership_key, correct_after[&membership_key].clone()),
+            ]);
+            let forged_effect = derive_effect(catalog, &before, &forged_after).unwrap();
+            let batch = validated_transition_with_effect(
+                &engine,
+                test_author(114_130 + index as u128, 114_130 + index as u64),
+                &before,
+                &forged_after,
+                frontier,
+                forged_effect,
+            );
+            let disposition = engine.stage_ready(batch).disposition().clone();
+            assert!(
+                matches!(
+                    &disposition,
+                    BatchDisposition::Rejected {
+                        error: EngineError::MalformedDocument { reason, .. },
+                    } if reason == "block birth page/home lacks live identity at the declared causal base"
+                ),
+                "coherent birth forgery reached the wrong boundary: {disposition:?}"
+            );
+            assert!(engine.materialize_page(page_a).unwrap().blocks.is_empty());
+            assert!(engine
+                .recover_block_state(block_home, block_id)
+                .unwrap()
+                .is_none());
+        }
+
+        // A correct hand-built twin through the identical payload constructor
+        // is accepted, ruling out malformed lane/frontier setup as the reason
+        // the negative cases failed.
+        let valid = validated_transition_with_effect(
+            &engine,
+            test_author(114_140, 114_140),
+            &before,
+            &correct_after,
+            FrontierV2::new(vec![dependencies_for(
+                &engine,
+                DocumentKey::Entity(page_home_a),
+                114_140,
+            )])
+            .unwrap(),
+            legitimate_effect,
+        );
+        let valid_disposition = engine.stage_ready(valid).disposition().clone();
+        assert!(
+            matches!(valid_disposition, BatchDisposition::Accepted { .. }),
+            "valid hand-built birth twin was not accepted: {valid_disposition:?}"
+        );
+        assert_eq!(engine.materialize_page(page_a).unwrap().blocks.len(), 1);
+    }
+
+    #[test]
+    fn block_document_key_birth_identity_and_root_text_id_survive_delete_restore_and_replay() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(114_200));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(114_201));
+        let page_id = PageId::from_uuid(Uuid::from_u128(114_202));
+        let page_home = DocumentId::from_uuid(Uuid::from_u128(114_203));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(114_204));
+        let block_home = DocumentId::from_uuid(Uuid::from_u128(114_205));
+        let block_key = DocumentKey::Entity(block_home);
+        let mut engine = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"stable-block-document-identity"),
+            catalog,
+        );
+        let birth = engine
+            .prepare_fixture_transaction(
+                test_author(114_210, 114_210),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id,
+                        home_document_id: page_home,
+                        name: LogicalPageName::parse("Stable Block").unwrap(),
+                        path: ManagedPath::parse("pages/stable-block.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id: block_home,
+                        },
+                        page_id,
+                        parent: None,
+                        order: "a".into(),
+                        content: "stable root text".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let birth = ValidatedBatch::new(birth);
+        assert!(matches!(
+            engine.stage_ready(birth.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let born = engine.clone_visible_document(block_key, 114_211).unwrap();
+        let born_identity = document_identity(block_key, &born).unwrap().unwrap();
+        assert_eq!(
+            born_identity,
+            DocumentIdentity::Block {
+                document_id: block_home,
+                block_id,
+                birth_page_id: page_id,
+                birth_page_document_id: page_home,
+            }
+        );
+        let born_root = retirable_document::root_text(&born).id();
+
+        let deletion = engine
+            .prepare_fixture_transaction(
+                test_author(114_212, 114_212),
+                &OperationTransaction::new(vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let deletion = ValidatedBatch::new(deletion);
+        assert!(matches!(
+            engine.stage_ready(deletion.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let deleted = engine.clone_visible_document(block_key, 114_213).unwrap();
+        assert_eq!(
+            document_identity(block_key, &deleted).unwrap(),
+            Some(born_identity.clone())
+        );
+        assert_eq!(retirable_document::root_text(&deleted).id(), born_root);
+
+        let restoration = engine
+            .prepare_fixture_transaction(
+                test_author(114_214, 114_214),
+                &OperationTransaction::new(vec![SemanticOperation::RestoreSubtree {
+                    page_id,
+                    blocks: vec![BlockRestore {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id: block_home,
+                        },
+                        claim: MembershipClaim::new(block_home, None, "a").unwrap(),
+                    }],
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let restoration = ValidatedBatch::new(restoration);
+        assert!(matches!(
+            engine.stage_ready(restoration.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let restored = engine.clone_visible_document(block_key, 114_215).unwrap();
+        assert_eq!(
+            document_identity(block_key, &restored).unwrap(),
+            Some(born_identity.clone())
+        );
+        assert_eq!(retirable_document::root_text(&restored).id(), born_root);
+
+        let mut replay = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"stable-block-document-identity"),
+            catalog,
+        );
+        for batch in [birth, deletion, restoration] {
+            assert!(matches!(
+                replay.stage_ready(batch).disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+        }
+        let replayed = replay.clone_visible_document(block_key, 114_216).unwrap();
+        assert_eq!(
+            document_identity(block_key, &replayed).unwrap(),
+            Some(born_identity)
+        );
+        assert_eq!(retirable_document::root_text(&replayed).id(), born_root);
+    }
+
+    #[test]
+    fn fixed_acceptance_delta_has_fixed_birth_and_persistent_catalog_path_work() {
+        fn run(scale: usize) -> ((usize, usize), usize, usize, (usize, usize)) {
+            let seed = 114_300u128 + scale as u128 * 10_000;
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(seed));
+            let catalog = DocumentId::from_uuid(Uuid::from_u128(seed + 1));
+            let mut engine =
+                ShardedHotEngine::new(workspace, LineageDigest::of(&seed.to_be_bytes()), catalog);
+            let source_page = PageId::from_uuid(Uuid::from_u128(seed + 10));
+            let source_home = DocumentId::from_uuid(Uuid::from_u128(seed + 11));
+            let destination_page = PageId::from_uuid(Uuid::from_u128(seed + 12));
+            let destination_home = DocumentId::from_uuid(Uuid::from_u128(seed + 13));
+            let mut operations = Vec::with_capacity(2 + scale * 3);
+            for (page_id, home_document_id, name, path) in [
+                (source_page, source_home, "Source", "pages/source.md"),
+                (
+                    destination_page,
+                    destination_home,
+                    "Destination",
+                    "pages/destination.md",
+                ),
+            ] {
+                operations.push(SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse(name).unwrap(),
+                    path: ManagedPath::parse(path).unwrap(),
+                    kind: ManagedTextKind::Page,
+                });
+            }
+            for index in 0..scale as u128 {
+                let unrelated_page = PageId::from_uuid(Uuid::from_u128(seed + 100 + index));
+                operations.push(SemanticOperation::CreatePage {
+                    page_id: unrelated_page,
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 10_000 + index)),
+                    name: LogicalPageName::parse(format!(
+                        "Unrelated allocation sentinel page {index:04}"
+                    ))
+                    .unwrap(),
+                    path: ManagedPath::parse(format!(
+                        "pages/persistent-index-allocation-sentinel-{index:04}.md"
+                    ))
+                    .unwrap(),
+                    kind: ManagedTextKind::Page,
+                });
+                let block_id = BlockId::from_uuid(Uuid::from_u128(seed + 100_000 + index));
+                operations.push(SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: test_block_home(block_id),
+                    },
+                    page_id: source_page,
+                    parent: None,
+                    order: format!("{index:04}"),
+                    content: "member of the deliberately large inner map".into(),
+                });
+                let unrelated_block = BlockId::from_uuid(Uuid::from_u128(seed + 200_000 + index));
+                operations.push(SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: unrelated_block,
+                        home_document_id: test_block_home(unrelated_block),
+                    },
+                    page_id: unrelated_page,
+                    parent: None,
+                    order: "outer".into(),
+                    content: "member that grows the outer membership map".into(),
+                });
+            }
+            let seeded = engine
+                .prepare_fixture_transaction(
+                    test_author(seed + 2, seed as u64 + 2),
+                    &OperationTransaction::new(operations).unwrap(),
+                )
+                .unwrap();
+            let outcome = engine.stage_ready(ValidatedBatch::new(seeded));
+            assert!(
+                matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+                "persistent-index seed was refused: {outcome:?}"
+            );
+            assert_eq!(engine.current_path_catalog.rows.len(), scale + 2);
+            assert_eq!(engine.current_path_catalog.page_homes.len(), scale + 2);
+            assert_eq!(engine.current_path_catalog.page_members.len(), scale + 1);
+            assert_eq!(
+                engine
+                    .current_path_catalog
+                    .page_members
+                    .get(&source_page)
+                    .unwrap()
+                    .len(),
+                scale
+            );
+
+            let birth_before = engine.instrumentation().birth_page_identity_lookups;
+            let page_id = PageId::from_uuid(Uuid::from_u128(seed + 500_000));
+            let page_home = DocumentId::from_uuid(Uuid::from_u128(seed + 500_001));
+            let block_id = BlockId::from_uuid(Uuid::from_u128(seed + 500_002));
+            let moved_block = BlockId::from_uuid(Uuid::from_u128(seed + 100_000));
+            let target = engine
+                .prepare_fixture_transaction(
+                    test_author(seed + 8_003, seed as u64 + 8_003),
+                    &OperationTransaction::new(vec![
+                        SemanticOperation::CreatePage {
+                            page_id,
+                            home_document_id: page_home,
+                            name: LogicalPageName::parse("Fixed Delta").unwrap(),
+                            path: ManagedPath::parse("pages/fixed-delta.md").unwrap(),
+                            kind: ManagedTextKind::Page,
+                        },
+                        SemanticOperation::CreateBlock {
+                            block: BlockLocation {
+                                block_id,
+                                home_document_id: test_block_home(block_id),
+                            },
+                            page_id,
+                            parent: None,
+                            order: "a".into(),
+                            content: "fixed delta".into(),
+                        },
+                        SemanticOperation::MoveSubtree {
+                            root: BlockLocation {
+                                block_id: moved_block,
+                                home_document_id: test_block_home(moved_block),
+                            },
+                            from_page_id: source_page,
+                            to_page_id: destination_page,
+                            parent: None,
+                            order: "moved".into(),
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .unwrap();
+            // Keep all three old roots alive while the actual acceptance path
+            // creates their successors. This makes accidental deep copying
+            // visible to the allocator rather than allowing in-place reuse.
+            let retained_roots = (
+                engine.current_path_catalog.rows.clone(),
+                engine.current_path_catalog.page_homes.clone(),
+                engine.current_path_catalog.page_members.clone(),
+            );
+            let retained_string_bytes = retained_roots
+                .0
+                .values()
+                .map(|row| row.name.as_str().len() + row.path.as_str().len())
+                .sum();
+            engine.measure_current_path_catalog_allocations.set(true);
+            let outcome = engine.stage_ready(ValidatedBatch::new(target));
+            let allocation = engine.current_path_catalog_allocations.get();
+            assert!(
+                matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+                "fixed target delta was refused: {outcome:?}"
+            );
+            assert_eq!(retained_roots.0.len(), scale + 2);
+            assert_eq!(retained_roots.1.len(), scale + 2);
+            assert_eq!(retained_roots.2.len(), scale + 1);
+            assert_eq!(
+                retained_roots
+                    .2
+                    .get(&source_page)
+                    .unwrap()
+                    .get(&moved_block),
+                Some(&test_block_home(moved_block)),
+                "the retained inner-map root changed with its successor"
+            );
+            // Fail-before control: a deliberately deep-owned representation of
+            // these same three roots must be measurably graph-sized under the
+            // same per-thread allocator. If this control stops detecting that
+            // copy, the path-copy threshold below is not meaningful.
+            let deep_copy_fixture = (
+                retained_roots
+                    .0
+                    .iter()
+                    .map(|(key, value)| (*key, value.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                retained_roots
+                    .1
+                    .iter()
+                    .map(|(key, value)| (*key, *value))
+                    .collect::<BTreeMap<_, _>>(),
+                retained_roots
+                    .2
+                    .iter()
+                    .map(|(key, value)| (*key, ordered_rows(value)))
+                    .collect::<BTreeMap<_, _>>(),
+            );
+            let (deep_copy, deep_copy_allocation) =
+                crate::sync_runtime::tests::c7b_alloc::measure_thread(|| deep_copy_fixture.clone());
+            std::hint::black_box(deep_copy);
+            (
+                allocation,
+                engine
+                    .instrumentation()
+                    .birth_page_identity_lookups
+                    .saturating_sub(birth_before),
+                retained_string_bytes,
+                deep_copy_allocation,
+            )
+        }
+
+        let small = run(8);
+        const LARGE_SCALE: usize = 512;
+        let large = run(LARGE_SCALE);
+        println!(
+            "P4INDEXALLOC small_calls={} small_bytes={} large_calls={} large_bytes={} retained_string_growth={} deep_copy_calls={} deep_copy_bytes={}",
+            small.0.0,
+            small.0.1,
+            large.0.0,
+            large.0.1,
+            large.2.saturating_sub(small.2),
+            large.3.0,
+            large.3.1,
+        );
+        assert_eq!(small.1, 1);
+        assert_eq!(large.1, 1);
+        let call_growth = large.0 .0.saturating_sub(small.0 .0);
+        let byte_growth = large.0 .1.saturating_sub(small.0 .1);
+        let deep_copy_string_floor = large.2.saturating_sub(small.2);
+        let deep_copy_byte_growth = large.3 .1.saturating_sub(small.3 .1);
+        assert!(
+            large.3 .0 > 2 * LARGE_SCALE && large.3 .1 > deep_copy_string_floor,
+            "the deliberate deep-copy control did not observe retained payload copying: {large:?}"
+        );
+        assert!(
+            call_growth < 256,
+            "fixed acceptance allocated once per retained entry: small={small:?}, large={large:?}"
+        );
+        assert!(
+            byte_growth.saturating_mul(8) < deep_copy_byte_growth,
+            "fixed acceptance grew like the deliberate graph-sized copy: small={small:?}, large={large:?}"
+        );
+        assert!(
+            large.0 .0 * 4 < large.3 .0 && large.0 .1 * 4 < large.3 .1,
+            "actual path work was not materially smaller than the deliberate deep copy: {large:?}"
+        );
     }
 
     #[test]
@@ -29431,11 +31243,21 @@ pub(crate) mod validation_tests {
         }
         let block_id = BlockId::from_uuid(Uuid::from_u128(115_010));
         let home = DocumentId::from_uuid(Uuid::from_u128(115_011));
+        let birth_page_id = PageId::from_uuid(Uuid::from_u128(115_014));
+        let birth_page_home = DocumentId::from_uuid(Uuid::from_u128(115_015));
         let effect = SemanticEffect::new(
-            Vec::new(),
+            vec![PageDelta::ordinary(
+                birth_page_id,
+                None,
+                Some(live_page(birth_page_home, "pages/Birth.md")),
+            )],
             vec![BlockDelta {
                 block_id,
                 home_document_id: home,
+                birth: Some(BlockBirth {
+                    page_id: birth_page_id,
+                    page_document_id: birth_page_home,
+                }),
                 before: None,
                 after: Some(block_state(
                     block_id,
@@ -29459,6 +31281,7 @@ pub(crate) mod validation_tests {
                 .unwrap(),
                 &[],
                 &effect,
+                &BTreeMap::new(),
             )
             .expect(
                 "a 4,097th lifetime block claim must validate: run-local identity \
@@ -29616,6 +31439,8 @@ pub(crate) mod validation_tests {
         let home_a = DocumentId::from_uuid(Uuid::from_u128(124));
         let home_b = DocumentId::from_uuid(Uuid::from_u128(125));
         let block_id = BlockId::from_uuid(Uuid::from_u128(126));
+        let block_home_a = DocumentId::from_uuid(Uuid::from_u128(130));
+        let block_home_b = DocumentId::from_uuid(Uuid::from_u128(131));
         let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let genesis = engine
             .prepare_fixture_transaction(
@@ -29648,7 +31473,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id,
-                        home_document_id: home_a,
+                        home_document_id: block_home_a,
                     },
                     page_id: page_a,
                     parent: None,
@@ -29666,7 +31491,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id,
-                        home_document_id: home_b,
+                        home_document_id: block_home_b,
                     },
                     page_id: page_b,
                     parent: None,
@@ -29772,7 +31597,7 @@ pub(crate) mod validation_tests {
             .as_mut()
             .unwrap()
             .documents
-            .get(&catalog)
+            .get(&DocumentKey::Entity(home))
             .unwrap()
             .get_map("unexpected_root")
             .insert("poison", true)
@@ -29860,208 +31685,87 @@ pub(crate) mod validation_tests {
         assert!(snapshot.pages.iter().any(|(page, _)| *page == page_b));
     }
 
+    /// The engine no longer has a "new exact shard" priming/skipping path.
+    /// An uninitialized fixed-schema document reads back as
+    /// `SemanticDocumentSnapshot::Unwritten`, so a birth is derived by the same
+    /// ordinary snapshot comparison as any other change -- with no special
+    /// case to bypass, and therefore nothing left for the old fast-path
+    /// rejection tests to exercise. What replaces them is the proof that a
+    /// birth goes through the ordinary path and that undeclared or extra state
+    /// still rejects the whole batch atomically.
     #[test]
-    fn new_exact_shard_fast_path_avoids_owned_block_and_membership_snapshots() {
-        let mut fixture = new_exact_shard_fixture(90_000);
-        let batch = validated_transition_with_effect(
-            &fixture.engine,
-            fixture.author,
-            &fixture.before,
-            &fixture.after,
-            FrontierV2::new(Vec::new()).unwrap(),
-            fixture.effect,
+    fn document_births_use_the_ordinary_snapshot_comparison_with_no_priming_path() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(90_000));
+        let catalog_id = DocumentId::from_uuid(Uuid::from_u128(90_001));
+        let page_document_id = DocumentId::from_uuid(Uuid::from_u128(90_002));
+        let page_id = PageId::from_uuid(Uuid::from_u128(90_003));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(90_004));
+        let block_document_id = DocumentId::from_uuid(Uuid::from_u128(90_005));
+        let mut engine = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"ordinary-birth-path"),
+            catalog_id,
         );
-        reset_owned_semantic_snapshot_entries();
+        let batch = engine
+            .prepare_fixture_transaction(
+                test_author(90_006, 90_006),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id,
+                        home_document_id: page_document_id,
+                        name: LogicalPageName::parse("Ordinary Birth").unwrap(),
+                        path: ManagedPath::parse("pages/ordinary-birth.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id: block_document_id,
+                        },
+                        page_id,
+                        parent: None,
+                        order: "a".into(),
+                        content: "born content".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
         assert!(matches!(
-            fixture.engine.stage_ready(batch).disposition(),
+            engine.stage_ready(ValidatedBatch::new(batch)).disposition,
             BatchDisposition::Accepted { .. }
         ));
+
+        // The birth produced exactly three documents: the page's own, the
+        // block's own, and the (block, page) membership document.
+        let page_key = DocumentKey::Entity(page_document_id);
+        let block_key = DocumentKey::Entity(block_document_id);
+        let membership_key = membership_document_id(block_document_id, page_document_id);
+        for document_id in [page_key, block_key, membership_key] {
+            assert!(
+                engine
+                    .accepted_document_version_vector_for_test(document_id)
+                    .is_ok(),
+                "birth did not create {document_id}"
+            );
+        }
         assert_eq!(
-            owned_semantic_snapshot_entries(),
-            0,
-            "new exact shard constructed an owned block or membership snapshot"
+            engine.materialize_page(page_id).unwrap().blocks[0].content,
+            "born content"
         );
-        assert_eq!(
-            fixture
-                .engine
-                .materialize_page(fixture.page_id)
-                .unwrap()
-                .blocks[0]
-                .content,
-            "fast content"
-        );
-    }
 
-    #[test]
-    fn new_exact_shard_fast_path_rejects_undeclared_and_extra_state_atomically() {
-        let mut undeclared_block = new_exact_shard_fixture(90_100);
-        undeclared_block.effect = SemanticEffect::new(
-            undeclared_block.effect.pages().to_vec(),
-            Vec::new(),
-            undeclared_block.effect.memberships().to_vec(),
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(undeclared_block);
-
-        let undeclared_content = new_exact_shard_fixture(90_200);
-        let extra_content_id = BlockId::from_uuid(Uuid::from_u128(90_299));
-        undeclared_content.after[&undeclared_content.home_id]
-            .get_map(SHARD_CONTENT)
-            .insert_container(&extra_content_id.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "undeclared content")
-            .unwrap();
-        assert_new_exact_shard_rejected(undeclared_content);
-
-        let undeclared_member = new_exact_shard_fixture(90_300);
-        let extra_member_id = BlockId::from_uuid(Uuid::from_u128(90_399));
-        insert_membership(
-            &undeclared_member.after[&undeclared_member.home_id],
-            extra_member_id,
-            &MembershipClaim::new(undeclared_member.home_id, None, "b").unwrap(),
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(undeclared_member);
-
-        let mut extra_declaration = new_exact_shard_fixture(90_400);
-        let extra_block_id = BlockId::from_uuid(Uuid::from_u128(90_499));
-        let mut blocks = extra_declaration.effect.blocks().to_vec();
-        blocks.push(BlockDelta {
-            block_id: extra_block_id,
-            home_document_id: extra_declaration.home_id,
-            before: None,
-            after: Some(block_state(
-                extra_block_id,
-                extra_declaration.home_id,
-                BlockOwner::Page(extra_declaration.page_id),
-                "extra declaration",
-            )),
-        });
-        extra_declaration.effect = SemanticEffect::new(
-            extra_declaration.effect.pages().to_vec(),
-            blocks,
-            extra_declaration.effect.memberships().to_vec(),
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(extra_declaration);
-    }
-
-    #[test]
-    fn new_exact_shard_fast_path_rejects_wrong_declared_fields_atomically() {
-        let mut wrong_before = new_exact_shard_fixture(90_500);
-        let mut blocks = wrong_before.effect.blocks().to_vec();
-        blocks[0].before = Some(block_state(
-            wrong_before.block_id,
-            wrong_before.home_id,
-            BlockOwner::Tombstone,
-            "before",
-        ));
-        wrong_before.effect = SemanticEffect::new(
-            wrong_before.effect.pages().to_vec(),
-            blocks,
-            wrong_before.effect.memberships().to_vec(),
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_before);
-
-        let mut wrong_membership_before = new_exact_shard_fixture(90_550);
-        let mut memberships = wrong_membership_before.effect.memberships().to_vec();
-        memberships[0].before =
-            Some(MembershipClaim::new(wrong_membership_before.home_id, None, "before").unwrap());
-        wrong_membership_before.effect = SemanticEffect::new(
-            wrong_membership_before.effect.pages().to_vec(),
-            wrong_membership_before.effect.blocks().to_vec(),
-            memberships,
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_membership_before);
-
-        let mut wrong_owner = new_exact_shard_fixture(90_600);
-        let mut blocks = wrong_owner.effect.blocks().to_vec();
-        blocks[0].after.as_mut().unwrap().owner = BlockOwner::Tombstone;
-        wrong_owner.effect = SemanticEffect::new(
-            wrong_owner.effect.pages().to_vec(),
-            blocks,
-            wrong_owner.effect.memberships().to_vec(),
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_owner);
-
-        let mut wrong_content = new_exact_shard_fixture(90_700);
-        let mut blocks = wrong_content.effect.blocks().to_vec();
-        blocks[0].after.as_mut().unwrap().content = "wrong content".into();
-        wrong_content.effect = SemanticEffect::new(
-            wrong_content.effect.pages().to_vec(),
-            blocks,
-            wrong_content.effect.memberships().to_vec(),
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_content);
-
-        let mut wrong_claim = new_exact_shard_fixture(90_800);
-        let mut memberships = wrong_claim.effect.memberships().to_vec();
-        memberships[0].after.as_mut().unwrap().order = "wrong".into();
-        wrong_claim.effect = SemanticEffect::new(
-            wrong_claim.effect.pages().to_vec(),
-            wrong_claim.effect.blocks().to_vec(),
-            memberships,
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_claim);
-
-        let mut wrong_page = new_exact_shard_fixture(90_900);
-        let mut memberships = wrong_page.effect.memberships().to_vec();
-        memberships[0].page_id = PageId::from_uuid(Uuid::from_u128(90_999));
-        wrong_page.effect = SemanticEffect::new(
-            wrong_page.effect.pages().to_vec(),
-            wrong_page.effect.blocks().to_vec(),
-            memberships,
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_page);
-
-        let mut wrong_home = new_exact_shard_fixture(91_000);
-        let mut memberships = wrong_home.effect.memberships().to_vec();
-        memberships[0].after.as_mut().unwrap().home_document_id =
-            DocumentId::from_uuid(Uuid::from_u128(91_099));
-        wrong_home.effect = SemanticEffect::new(
-            wrong_home.effect.pages().to_vec(),
-            wrong_home.effect.blocks().to_vec(),
-            memberships,
-        )
-        .unwrap();
-        assert_new_exact_shard_rejected(wrong_home);
-    }
-
-    #[test]
-    fn new_exact_shard_fast_path_rejects_malformed_roots_and_value_types_atomically() {
-        let malformed_root = new_exact_shard_fixture(91_100);
-        malformed_root.after[&malformed_root.home_id]
-            .get_map("unexpected_root")
-            .insert("poison", true)
-            .unwrap();
-        assert_new_exact_shard_rejected(malformed_root);
-
-        let malformed_owner = new_exact_shard_fixture(91_200);
-        malformed_owner.after[&malformed_owner.home_id]
-            .get_map(SHARD_OWNERS)
-            .insert(&malformed_owner.block_id.to_string(), true)
-            .unwrap();
-        assert_new_exact_shard_rejected(malformed_owner);
-
-        let malformed_content = new_exact_shard_fixture(91_300);
-        malformed_content.after[&malformed_content.home_id]
-            .get_map(SHARD_CONTENT)
-            .insert(&malformed_content.block_id.to_string(), "scalar content")
-            .unwrap();
-        assert_new_exact_shard_rejected(malformed_content);
-
-        let malformed_member = new_exact_shard_fixture(91_400);
-        malformed_member.after[&malformed_member.home_id]
-            .get_map(SHARD_MEMBERS)
-            .insert(&malformed_member.block_id.to_string(), true)
-            .unwrap();
-        assert_new_exact_shard_rejected(malformed_member);
+        // Before the batch, every one of those documents read back as
+        // `Unwritten` rather than through a priming path.
+        let empty = LoroDoc::new();
+        for document_id in [page_key, block_key, membership_key] {
+            assert!(
+                matches!(
+                    snapshot_document(catalog_id, document_id, &empty).unwrap(),
+                    SemanticDocumentSnapshot::Unwritten
+                ),
+                "{document_id} did not read back as Unwritten before its birth"
+            );
+        }
     }
 
     #[test]
@@ -30071,9 +31775,11 @@ pub(crate) mod validation_tests {
         let old_home = DocumentId::from_uuid(Uuid::from_u128(91_502));
         let old_page = PageId::from_uuid(Uuid::from_u128(91_503));
         let old_block = BlockId::from_uuid(Uuid::from_u128(91_504));
+        let old_block_home = DocumentId::from_uuid(Uuid::from_u128(91_508));
         let new_home = DocumentId::from_uuid(Uuid::from_u128(91_505));
         let new_page = PageId::from_uuid(Uuid::from_u128(91_506));
         let new_block = BlockId::from_uuid(Uuid::from_u128(91_507));
+        let new_block_home = DocumentId::from_uuid(Uuid::from_u128(91_509));
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"mixed-fast-path"), catalog_id);
         let genesis = engine
@@ -30090,7 +31796,7 @@ pub(crate) mod validation_tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: old_block,
-                            home_document_id: old_home,
+                            home_document_id: old_block_home,
                         },
                         page_id: old_page,
                         parent: None,
@@ -30108,57 +31814,48 @@ pub(crate) mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
 
-        let before_catalog = engine.clone_visible_document(catalog_id, 2).unwrap();
-        let before_old = engine.clone_visible_document(old_home, 2).unwrap();
-        let after_catalog = clone_doc(&before_catalog, 2).unwrap();
-        insert_page_state(
-            &after_catalog,
-            new_page,
-            &live_page(new_home, "pages/New.md"),
-        )
-        .unwrap();
-        let after_old = clone_doc(&before_old, 2).unwrap();
-        block_text(&after_old, old_block)
+        let old_block_key = DocumentKey::Entity(old_block_home);
+        let before_old_block = engine.clone_visible_document(old_block_key, 2).unwrap();
+        // One already-live document is edited in place; three brand-new
+        // documents are born beside it in the same batch.
+        let after_old_block = clone_doc(&before_old_block, 2).unwrap();
+        block_text(old_block_key, &after_old_block)
+            .unwrap()
             .unwrap()
             .update("edited", UpdateOptions::default())
             .unwrap();
-        let after_new = LoroDoc::new();
-        after_new.set_peer_id(2).unwrap();
-        after_new
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, new_page.to_string())
-            .unwrap();
-        after_new
-            .get_map(SHARD_OWNERS)
-            .insert(&new_block.to_string(), new_page.to_string())
-            .unwrap();
-        after_new
-            .get_map(SHARD_CONTENT)
-            .insert_container(&new_block.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "new")
-            .unwrap();
-        insert_membership(
-            &after_new,
+        let after_new_page =
+            raw_page_document(new_home, new_page, &live_page(new_home, "pages/New.md"));
+        let after_new_block = raw_block_document(
+            new_page,
+            new_home,
+            block_state(new_block, new_block_home, BlockOwner::Page(new_page), "new"),
+        );
+        let after_new_membership = raw_membership_document(
+            new_block_home,
             new_block,
-            &MembershipClaim::new(new_home, None, "a").unwrap(),
-        )
-        .unwrap();
+            new_home,
+            new_page,
+            Some(MembershipClaim::new(new_block_home, None, "a").unwrap()),
+        );
+        let new_membership_key = membership_document_id(new_block_home, new_home);
         let before = BTreeMap::from([
-            (catalog_id, before_catalog),
-            (old_home, before_old),
-            (new_home, LoroDoc::new()),
+            (old_block_key, before_old_block),
+            (DocumentKey::Entity(new_home), LoroDoc::new()),
+            (DocumentKey::Entity(new_block_home), LoroDoc::new()),
+            (new_membership_key, LoroDoc::new()),
         ]);
         let after = BTreeMap::from([
-            (catalog_id, after_catalog),
-            (old_home, after_old),
-            (new_home, after_new),
+            (old_block_key, after_old_block),
+            (DocumentKey::Entity(new_home), after_new_page),
+            (DocumentKey::Entity(new_block_home), after_new_block),
+            (new_membership_key, after_new_membership),
         ]);
         let mut effect = derive_effect(catalog_id, &before, &after).unwrap();
         let mut blocks = effect.blocks().to_vec();
         blocks
             .iter_mut()
-            .find(|delta| delta.home_document_id == old_home)
+            .find(|delta| delta.home_document_id == old_block_home)
             .unwrap()
             .after
             .as_mut()
@@ -30170,11 +31867,7 @@ pub(crate) mod validation_tests {
             effect.memberships().to_vec(),
         )
         .unwrap();
-        let frontier = FrontierV2::new(vec![
-            dependencies_for(&engine, catalog_id, 2),
-            dependencies_for(&engine, old_home, 2),
-        ])
-        .unwrap();
+        let frontier = FrontierV2::new(vec![dependencies_for(&engine, old_block_key, 2)]).unwrap();
         let batch = validated_transition_with_effect(
             &engine,
             test_author(91_511, 2),
@@ -30210,7 +31903,7 @@ pub(crate) mod validation_tests {
             let bytes = postcard::to_allocvec(&CrdtUpdatePayload {
                 schema_version: CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION,
                 batch_id,
-                document_id,
+                document_id: DocumentKey::Entity(document_id),
                 dependency_heads,
                 batch_dependency_heads: vec![head_a],
                 causal_state_digest: None,
@@ -30218,14 +31911,14 @@ pub(crate) mod validation_tests {
             })
             .unwrap();
             assert!(matches!(
-                decode_crdt_update_payload(batch_id, document_id, &bytes),
+                decode_crdt_update_payload(batch_id, DocumentKey::Entity(document_id), &bytes),
                 Err(EngineError::InvalidCrdt(_))
             ));
         }
 
         let mut canonical = encode_crdt_update_payload(
             batch_id,
-            document_id,
+            DocumentKey::Entity(document_id),
             vec![head_a],
             vec![head_a],
             None,
@@ -30234,14 +31927,14 @@ pub(crate) mod validation_tests {
         .unwrap();
         canonical.push(0);
         assert!(matches!(
-            decode_crdt_update_payload(batch_id, document_id, &canonical),
+            decode_crdt_update_payload(batch_id, DocumentKey::Entity(document_id), &canonical),
             Err(EngineError::InvalidCrdt(_))
         ));
 
         let future = postcard::to_allocvec(&CrdtUpdatePayload {
             schema_version: CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION + 1,
             batch_id,
-            document_id,
+            document_id: DocumentKey::Entity(document_id),
             dependency_heads: vec![head_a],
             batch_dependency_heads: vec![head_a],
             causal_state_digest: None,
@@ -30249,7 +31942,7 @@ pub(crate) mod validation_tests {
         })
         .unwrap();
         assert!(matches!(
-            decode_crdt_update_payload(batch_id, document_id, &future),
+            decode_crdt_update_payload(batch_id, DocumentKey::Entity(document_id), &future),
             Err(EngineError::InvalidCrdt(_))
         ));
     }
@@ -30261,43 +31954,25 @@ pub(crate) mod validation_tests {
         let home_id = DocumentId::from_uuid(Uuid::from_u128(20));
         let page_id = PageId::from_uuid(Uuid::from_u128(10));
         let block_id = BlockId::from_uuid(Uuid::from_u128(30));
+        let block_home_id = DocumentId::from_uuid(Uuid::from_u128(40));
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"lineage"), catalog_id);
 
-        let catalog = LoroDoc::new();
-        catalog.set_peer_id(50).unwrap();
-        insert_page_state(
-            &catalog,
-            page_id,
-            &PageState::Live {
-                name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
-                path: ManagedPath::parse("pages/A.md").unwrap(),
-                home_document_id: home_id,
-                kind: ManagedTextKind::Page,
-            },
-        )
-        .unwrap();
-        let shard = LoroDoc::new();
-        shard.set_peer_id(50).unwrap();
-        shard
-            .get_map(SHARD_OWNERS)
-            .insert(&block_id.to_string(), page_id.to_string())
+        // 1. A document carrying coherent-looking raw state but no fixed-schema
+        //    identity is malformed. There is no shard to smuggle it through.
+        let unidentified = LoroDoc::new();
+        unidentified.set_peer_id(50).unwrap();
+        unidentified
+            .get_map("meta")
+            .insert("state", "coherent content without an identity")
             .unwrap();
-        shard
-            .get_map(SHARD_CONTENT)
-            .insert_container(&block_id.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "coherent content without page identity")
-            .unwrap();
-
-        let before = BTreeMap::from([(catalog_id, LoroDoc::new()), (home_id, LoroDoc::new())]);
-        let after = BTreeMap::from([(catalog_id, catalog), (home_id, shard)]);
-        let batch = validated_transition(
+        let batch = validated_transition_with_effect(
             &engine,
             test_author(50, 50),
-            &before,
-            &after,
+            &BTreeMap::from([(DocumentKey::Entity(home_id), LoroDoc::new())]),
+            &BTreeMap::from([(DocumentKey::Entity(home_id), unidentified)]),
             FrontierV2::new(Vec::new()).unwrap(),
+            SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap(),
         );
         assert!(matches!(
             engine.stage_ready(batch).disposition(),
@@ -30309,28 +31984,19 @@ pub(crate) mod validation_tests {
         assert!(engine.canonical_snapshot().unwrap().pages.is_empty());
         assert!(engine.visible_documents.is_empty());
 
-        let catalog_only = LoroDoc::new();
-        catalog_only.set_peer_id(51).unwrap();
-        insert_page_state(
-            &catalog_only,
-            page_id,
-            &PageState::Live {
-                name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
-                path: ManagedPath::parse("pages/Catalog Only.md").unwrap(),
-                home_document_id: home_id,
-                kind: ManagedTextKind::Page,
-            },
-        )
-        .unwrap();
-        let catalog_only = validated_transition(
+        // 2. A document whose declared identity is not the address it was
+        //    written at is malformed: the address IS the identity.
+        let misaddressed = raw_page_document(home_id, page_id, &live_page(home_id, "pages/A.md"));
+        let batch = validated_transition_with_effect(
             &engine,
             test_author(51, 51),
-            &BTreeMap::from([(catalog_id, LoroDoc::new())]),
-            &BTreeMap::from([(catalog_id, catalog_only)]),
+            &BTreeMap::from([(DocumentKey::Entity(block_home_id), LoroDoc::new())]),
+            &BTreeMap::from([(DocumentKey::Entity(block_home_id), misaddressed)]),
             FrontierV2::new(Vec::new()).unwrap(),
+            SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap(),
         );
         assert!(matches!(
-            engine.stage_ready(catalog_only).disposition(),
+            engine.stage_ready(batch).disposition(),
             BatchDisposition::Rejected {
                 error: EngineError::MalformedDocument { .. },
                 ..
@@ -30338,68 +32004,37 @@ pub(crate) mod validation_tests {
         ));
         assert!(engine.visible_documents.is_empty());
 
-        let orphan_shard = LoroDoc::new();
-        orphan_shard.set_peer_id(52).unwrap();
-        orphan_shard
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page_id.to_string())
-            .unwrap();
-        let orphan_shard = validated_transition(
+        // 3. A membership document is referentially incomplete unless the block
+        //    it claims exists in its OWN document.
+        let page_document = raw_page_document(
+            home_id,
+            page_id,
+            &live_page(home_id, "pages/Missing Block.md"),
+        );
+        let membership_key = membership_document_id(block_home_id, home_id);
+        let orphan_membership = raw_membership_document(
+            block_home_id,
+            block_id,
+            home_id,
+            page_id,
+            Some(MembershipClaim::new(block_home_id, None, "a").unwrap()),
+        );
+        let batch = validated_transition(
             &engine,
             test_author(52, 52),
-            &BTreeMap::from([(home_id, LoroDoc::new())]),
-            &BTreeMap::from([(home_id, orphan_shard)]),
+            &BTreeMap::from([
+                (DocumentKey::Entity(home_id), LoroDoc::new()),
+                (membership_key, LoroDoc::new()),
+            ]),
+            &BTreeMap::from([
+                (DocumentKey::Entity(home_id), page_document),
+                (membership_key, orphan_membership),
+            ]),
             FrontierV2::new(Vec::new()).unwrap(),
         );
         assert!(matches!(
-            engine.stage_ready(orphan_shard).disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::MalformedDocument { .. },
-                ..
-            }
-        ));
-        assert!(engine.visible_documents.is_empty());
-
-        let missing_home_id = DocumentId::from_uuid(Uuid::from_u128(21));
-        let referenced_block_id = BlockId::from_uuid(Uuid::from_u128(31));
-        let catalog = LoroDoc::new();
-        catalog.set_peer_id(53).unwrap();
-        insert_page_state(
-            &catalog,
-            page_id,
-            &PageState::Live {
-                name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
-                path: ManagedPath::parse("pages/Missing Home.md").unwrap(),
-                home_document_id: home_id,
-                kind: ManagedTextKind::Page,
-            },
-        )
-        .unwrap();
-        let shard = LoroDoc::new();
-        shard.set_peer_id(53).unwrap();
-        shard
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page_id.to_string())
-            .unwrap();
-        insert_membership(
-            &shard,
-            referenced_block_id,
-            &MembershipClaim::new(missing_home_id, None, "a").unwrap(),
-        )
-        .unwrap();
-        let missing_home = validated_transition(
-            &engine,
-            test_author(53, 53),
-            &BTreeMap::from([(catalog_id, LoroDoc::new()), (home_id, LoroDoc::new())]),
-            &BTreeMap::from([(catalog_id, catalog), (home_id, shard)]),
-            FrontierV2::new(Vec::new()).unwrap(),
-        );
-        assert!(matches!(
-            engine.stage_ready(missing_home).disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::MalformedDocument { .. },
-                ..
-            }
+            engine.stage_ready(batch).disposition(),
+            BatchDisposition::Rejected { .. }
         ));
         assert!(engine.visible_documents.is_empty());
 
@@ -30420,7 +32055,7 @@ pub(crate) mod validation_tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id,
-                            home_document_id: home_id,
+                            home_document_id: block_home_id,
                         },
                         page_id,
                         parent: None,
@@ -30445,60 +32080,57 @@ pub(crate) mod validation_tests {
     }
 
     #[test]
-    fn raw_catalog_cannot_smuggle_shard_state_past_the_semantic_effect() {
+    fn raw_document_cannot_smuggle_undeclared_state_past_the_semantic_effect() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(61));
         let catalog_id = DocumentId::from_uuid(Uuid::from_u128(62));
         let page_id = PageId::from_uuid(Uuid::from_u128(63));
         let block_id = BlockId::from_uuid(Uuid::from_u128(64));
+        let page_document_id = DocumentId::from_uuid(Uuid::from_u128(66));
+        let block_document_id = DocumentId::from_uuid(Uuid::from_u128(67));
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"disjoint-roles"), catalog_id);
 
-        let catalog = LoroDoc::new();
-        catalog.set_peer_id(65).unwrap();
-        insert_page_state(
-            &catalog,
+        // A batch that births a page, a block and their membership pair, but
+        // declares only the page delta. Every document is individually well
+        // formed; what is wrong is that the declared effect omits two of them.
+        let page_document = raw_page_document(
+            page_document_id,
             page_id,
-            &PageState::Live {
-                name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
-                path: ManagedPath::parse("pages/Aliased.md").unwrap(),
-                home_document_id: catalog_id,
-                kind: ManagedTextKind::Page,
-            },
-        )
-        .unwrap();
-        catalog
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page_id.to_string())
-            .unwrap();
-        catalog
-            .get_map(SHARD_OWNERS)
-            .insert(&block_id.to_string(), page_id.to_string())
-            .unwrap();
-        catalog
-            .get_map(SHARD_CONTENT)
-            .insert_container(&block_id.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "semantically omitted content")
-            .unwrap();
-        insert_membership(
-            &catalog,
+            &live_page(page_document_id, "pages/Aliased.md"),
+        );
+        let block_document = raw_block_document(
+            page_id,
+            page_document_id,
+            block_state(
+                block_id,
+                block_document_id,
+                BlockOwner::Page(page_id),
+                "semantically omitted content",
+            ),
+        );
+        let membership_key = membership_document_id(block_document_id, page_document_id);
+        let membership_document = raw_membership_document(
+            block_document_id,
             block_id,
-            &MembershipClaim::new(catalog_id, None, "a").unwrap(),
-        )
-        .unwrap();
-
-        let before = BTreeMap::from([(catalog_id, LoroDoc::new())]);
-        let after = BTreeMap::from([(catalog_id, catalog)]);
+            page_document_id,
+            page_id,
+            Some(MembershipClaim::new(block_document_id, None, "a").unwrap()),
+        );
+        let before = BTreeMap::from([
+            (DocumentKey::Entity(page_document_id), LoroDoc::new()),
+            (DocumentKey::Entity(block_document_id), LoroDoc::new()),
+            (membership_key, LoroDoc::new()),
+        ]);
+        let after = BTreeMap::from([
+            (DocumentKey::Entity(page_document_id), page_document),
+            (DocumentKey::Entity(block_document_id), block_document),
+            (membership_key, membership_document),
+        ]);
         let declared_page_only_effect = SemanticEffect::new(
             vec![PageDelta {
                 page_id,
                 before: None,
-                after: Some(PageState::Live {
-                    name: crate::oplog::LogicalPageName::parse("Fixture Page").unwrap(),
-                    path: ManagedPath::parse("pages/Aliased.md").unwrap(),
-                    home_document_id: catalog_id,
-                    kind: ManagedTextKind::Page,
-                }),
+                after: Some(live_page(page_document_id, "pages/Aliased.md")),
                 lifecycle: crate::oplog::PageDeltaLifecycle::Ordinary,
             }],
             Vec::new(),
@@ -30518,11 +32150,11 @@ pub(crate) mod validation_tests {
             matches!(
                 outcome.disposition(),
                 BatchDisposition::Rejected {
-                    error: EngineError::MalformedDocument { .. },
+                    error: EngineError::SemanticEffectMismatch,
                     ..
                 }
             ),
-            "unexpected aliased-role outcome: {outcome:?}"
+            "unexpected undeclared-state outcome: {outcome:?}"
         );
         assert!(engine.canonical_snapshot().unwrap().pages.is_empty());
         assert!(engine.visible_documents.is_empty());
@@ -30557,19 +32189,29 @@ pub(crate) mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
 
-        let before_doc = engine.clone_visible_document(home_id, 201).unwrap();
-        let changed = clone_doc(&before_doc, 201).unwrap();
-        changed
-            .get_map(SHARD_META)
-            .insert(SHARD_PAGE_ID, page_b.to_string())
+        let before_doc = engine
+            .clone_visible_document(DocumentKey::Entity(home_id), 201)
             .unwrap();
-        let before = BTreeMap::from([(home_id, before_doc)]);
-        let after = BTreeMap::from([(home_id, changed)]);
+        let changed = clone_doc(&before_doc, 201).unwrap();
+        // Rewrite the page document's immutable birth identity in place.
+        changed
+            .get_map("meta")
+            .insert(
+                "identity",
+                serde_json::to_string(&DocumentIdentity::Page {
+                    document_id: home_id,
+                    page_id: page_b,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let before = BTreeMap::from([(DocumentKey::Entity(home_id), before_doc)]);
+        let after = BTreeMap::from([(DocumentKey::Entity(home_id), changed)]);
         let dependencies = DocumentDependencies::new(
-            home_id,
-            canonical_peer_counters(&before[&home_id].oplog_vv()).unwrap(),
+            DocumentKey::Entity(home_id),
+            canonical_peer_counters(&before[&DocumentKey::Entity(home_id)].oplog_vv()).unwrap(),
             engine
-                .document_dependency_heads(home_id, false)
+                .document_dependency_heads(DocumentKey::Entity(home_id), false)
                 .unwrap()
                 .into_iter()
                 .collect(),
@@ -30599,8 +32241,10 @@ pub(crate) mod validation_tests {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(301));
         let catalog_id = DocumentId::from_uuid(Uuid::from_u128(302));
         let home_id = DocumentId::from_uuid(Uuid::from_u128(320));
+        let block_home_id = DocumentId::from_uuid(Uuid::from_u128(321));
         let page_id = PageId::from_uuid(Uuid::from_u128(310));
         let block_id = BlockId::from_uuid(Uuid::from_u128(330));
+        let block_key = DocumentKey::Entity(block_home_id);
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"merged-residue"), catalog_id);
         let genesis = engine
@@ -30617,7 +32261,7 @@ pub(crate) mod validation_tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id,
-                            home_document_id: home_id,
+                            home_document_id: block_home_id,
                         },
                         page_id,
                         parent: None,
@@ -30635,16 +32279,16 @@ pub(crate) mod validation_tests {
         ));
 
         let dependencies = DocumentDependencies::new(
-            home_id,
+            block_key,
             canonical_peer_counters(
                 &engine
-                    .clone_visible_document(home_id, 401)
+                    .clone_visible_document(block_key, 401)
                     .unwrap()
                     .oplog_vv(),
             )
             .unwrap(),
             engine
-                .document_dependency_heads(home_id, false)
+                .document_dependency_heads(block_key, false)
                 .unwrap()
                 .into_iter()
                 .collect(),
@@ -30652,64 +32296,51 @@ pub(crate) mod validation_tests {
         .unwrap();
         let frontier = FrontierV2::new(vec![dependencies]).unwrap();
 
-        let removed_before = engine.clone_visible_document(home_id, 401).unwrap();
+        // A raw removal deletes the block document's fixed owner register
+        // instead of retiring the block through the audited path. The document
+        // no longer has the fixed schema and must be refused BEFORE it merges
+        // with anything, in either arrival order.
+        let removed_before = engine.clone_visible_document(block_key, 401).unwrap();
         let removed_after = clone_doc(&removed_before, 401).unwrap();
-        removed_after
-            .get_map(SHARD_OWNERS)
-            .delete(&block_id.to_string())
-            .unwrap();
-        removed_after
-            .get_map(SHARD_CONTENT)
-            .delete(&block_id.to_string())
-            .unwrap();
-        removed_after
-            .get_map(SHARD_MEMBERS)
-            .delete(&block_id.to_string())
-            .unwrap();
-        let before_state = read_block_state(home_id, &removed_before, block_id)
+        removed_after.get_map("meta").delete("owner").unwrap();
+        let before_state = read_block_state(block_key, &removed_before)
             .unwrap()
             .unwrap();
         let removed_effect = raw_semantic_effect(
             Vec::new(),
             vec![BlockDelta {
                 block_id,
-                home_document_id: home_id,
+                home_document_id: block_home_id,
+                birth: None,
                 before: Some(before_state),
                 after: None,
             }],
             vec![MembershipDelta {
                 page_id,
                 block_id,
-                before: Some(MembershipClaim::new(home_id, None, "a").unwrap()),
+                before: Some(MembershipClaim::new(block_home_id, None, "a").unwrap()),
                 after: None,
             }],
         );
         let removed = validated_transition_with_payload(
             &engine,
             test_author(401, 401),
-            &BTreeMap::from([(home_id, removed_before)]),
-            &BTreeMap::from([(home_id, removed_after)]),
+            &BTreeMap::from([(block_key, removed_before)]),
+            &BTreeMap::from([(block_key, removed_after)]),
             frontier.clone(),
             removed_effect,
         );
 
-        let edited_before = engine.clone_visible_document(home_id, 402).unwrap();
+        let edited_before = engine.clone_visible_document(block_key, 402).unwrap();
         let edited_after = clone_doc(&edited_before, 402).unwrap();
-        edited_after
-            .get_map(SHARD_CONTENT)
-            .delete(&block_id.to_string())
-            .unwrap();
-        edited_after
-            .get_map(SHARD_CONTENT)
-            .insert_container(&block_id.to_string(), LoroText::new())
-            .unwrap()
-            .insert(0, "concurrent replacement")
+        let text = block_text(block_key, &edited_after).unwrap().unwrap();
+        text.update("concurrent replacement", UpdateOptions::default())
             .unwrap();
         let edited = validated_transition(
             &engine,
             test_author(402, 402),
-            &BTreeMap::from([(home_id, edited_before)]),
-            &BTreeMap::from([(home_id, edited_after)]),
+            &BTreeMap::from([(block_key, edited_before)]),
+            &BTreeMap::from([(block_key, edited_after)]),
             frontier,
         );
 
@@ -30773,6 +32404,8 @@ pub(crate) mod validation_tests {
         let catalog_id = DocumentId::from_uuid(Uuid::from_u128(502));
         let home_a = DocumentId::from_uuid(Uuid::from_u128(520));
         let home_b = DocumentId::from_uuid(Uuid::from_u128(521));
+        let block_home_a = DocumentId::from_uuid(Uuid::from_u128(522));
+        let block_home_b = DocumentId::from_uuid(Uuid::from_u128(523));
         let page_a = PageId::from_uuid(Uuid::from_u128(510));
         let page_b = PageId::from_uuid(Uuid::from_u128(511));
         let block_id = BlockId::from_uuid(Uuid::from_u128(530));
@@ -30800,7 +32433,7 @@ pub(crate) mod validation_tests {
                         SemanticOperation::CreateBlock {
                             block: BlockLocation {
                                 block_id,
-                                home_document_id: home_a,
+                                home_document_id: block_home_a,
                             },
                             page_id: page_a,
                             parent: None,
@@ -30817,31 +32450,42 @@ pub(crate) mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
 
-        let duplicate_before = engine.clone_visible_document(home_b, 601).unwrap();
-        let duplicate_after = clone_doc(&duplicate_before, 601).unwrap();
-        duplicate_after
-            .get_map(SHARD_OWNERS)
-            .insert(&block_id.to_string(), page_b.to_string())
-            .unwrap();
-        duplicate_after
-            .get_map(SHARD_CONTENT)
-            .ensure_mergeable_text(&block_id.to_string())
-            .unwrap()
-            .insert(0, "duplicate home B")
-            .unwrap();
-        insert_membership(
-            &duplicate_after,
+        // A block's home is its OWN document. Writing a SECOND document that
+        // claims the same block id is the duplicate this refuses.
+        let duplicate_block = raw_block_document(
+            page_b,
+            home_b,
+            block_state(
+                block_id,
+                block_home_b,
+                BlockOwner::Page(page_b),
+                "duplicate home B",
+            ),
+        );
+        let duplicate_membership_key = membership_document_id(block_home_b, home_b);
+        let duplicate_membership = raw_membership_document(
+            block_home_b,
             block_id,
-            &MembershipClaim::new(home_b, None, "b").unwrap(),
-        )
-        .unwrap();
-        let duplicate_author = test_author(601, 601);
+            home_b,
+            page_b,
+            Some(MembershipClaim::new(block_home_b, None, "b").unwrap()),
+        );
         let duplicate = validated_transition(
             &engine,
-            duplicate_author,
-            &BTreeMap::from([(home_b, duplicate_before)]),
-            &BTreeMap::from([(home_b, duplicate_after)]),
-            FrontierV2::new(vec![dependencies_for(&engine, home_b, 601)]).unwrap(),
+            test_author(601, 601),
+            &BTreeMap::from([
+                (DocumentKey::Entity(block_home_b), LoroDoc::new()),
+                (duplicate_membership_key, LoroDoc::new()),
+            ]),
+            &BTreeMap::from([
+                (DocumentKey::Entity(block_home_b), duplicate_block),
+                (duplicate_membership_key, duplicate_membership),
+            ]),
+            FrontierV2::new(vec![
+                dependencies_for(&engine, DocumentKey::Entity(block_home_a), 601),
+                dependencies_for(&engine, DocumentKey::Entity(home_b), 601),
+            ])
+            .unwrap(),
         );
         assert!(matches!(
             engine.stage_ready(duplicate).disposition(),
@@ -30852,7 +32496,7 @@ pub(crate) mod validation_tests {
         ));
         assert_eq!(engine.fatal_evidence(), None);
 
-        for (home_document_id, page_id) in [(home_a, page_a), (home_b, page_b)] {
+        for (home_document_id, page_id) in [(block_home_a, page_a), (block_home_b, page_b)] {
             assert!(matches!(
                 engine.prepare_fixture_transaction(
                     test_author(603, 603),
@@ -30872,40 +32516,52 @@ pub(crate) mod validation_tests {
             ));
         }
 
+        // Two brand-new documents claiming ONE new block id inside a single
+        // batch is the same duplicate, caught before anything is installed.
         let same_batch_id = BlockId::from_uuid(Uuid::from_u128(531));
-        let same_before_a = engine.clone_visible_document(home_a, 604).unwrap();
-        let same_before_b = engine.clone_visible_document(home_b, 604).unwrap();
-        let same_after_a = clone_doc(&same_before_a, 604).unwrap();
-        let same_after_b = clone_doc(&same_before_b, 604).unwrap();
-        for (document_id, page_id, document, order) in [
-            (home_a, page_a, &same_after_a, "same-a"),
-            (home_b, page_b, &same_after_b, "same-b"),
+        let same_home_a = DocumentId::from_uuid(Uuid::from_u128(532));
+        let same_home_b = DocumentId::from_uuid(Uuid::from_u128(533));
+        let mut same_before = BTreeMap::new();
+        let mut same_after = BTreeMap::new();
+        for (block_document_id, page_document_id, page_id, order) in [
+            (same_home_a, home_a, page_a, "same-a"),
+            (same_home_b, home_b, page_b, "same-b"),
         ] {
-            document
-                .get_map(SHARD_OWNERS)
-                .insert(&same_batch_id.to_string(), page_id.to_string())
-                .unwrap();
-            document
-                .get_map(SHARD_CONTENT)
-                .ensure_mergeable_text(&same_batch_id.to_string())
-                .unwrap()
-                .insert(0, order)
-                .unwrap();
-            insert_membership(
-                document,
-                same_batch_id,
-                &MembershipClaim::new(document_id, None, order).unwrap(),
-            )
-            .unwrap();
+            same_before.insert(DocumentKey::Entity(block_document_id), LoroDoc::new());
+            same_after.insert(
+                DocumentKey::Entity(block_document_id),
+                raw_block_document(
+                    page_id,
+                    page_document_id,
+                    block_state(
+                        same_batch_id,
+                        block_document_id,
+                        BlockOwner::Page(page_id),
+                        order,
+                    ),
+                ),
+            );
+            let membership_key = membership_document_id(block_document_id, page_document_id);
+            same_before.insert(membership_key, LoroDoc::new());
+            same_after.insert(
+                membership_key,
+                raw_membership_document(
+                    block_document_id,
+                    same_batch_id,
+                    page_document_id,
+                    page_id,
+                    Some(MembershipClaim::new(block_document_id, None, order).unwrap()),
+                ),
+            );
         }
         let same_batch_duplicate = validated_transition(
             &engine,
             test_author(604, 604),
-            &BTreeMap::from([(home_a, same_before_a), (home_b, same_before_b)]),
-            &BTreeMap::from([(home_a, same_after_a), (home_b, same_after_b)]),
+            &same_before,
+            &same_after,
             FrontierV2::new(vec![
-                dependencies_for(&engine, home_a, 604),
-                dependencies_for(&engine, home_b, 604),
+                dependencies_for(&engine, DocumentKey::Entity(home_a), 604),
+                dependencies_for(&engine, DocumentKey::Entity(home_b), 604),
             ])
             .unwrap(),
         );
@@ -30917,11 +32573,11 @@ pub(crate) mod validation_tests {
         ));
         assert_eq!(engine.fatal_evidence(), None);
         assert!(engine
-            .recover_block_state(home_a, same_batch_id)
+            .recover_block_state(same_home_a, same_batch_id)
             .unwrap()
             .is_none());
         assert!(engine
-            .recover_block_state(home_b, same_batch_id)
+            .recover_block_state(same_home_b, same_batch_id)
             .unwrap()
             .is_none());
         let accepted_after_rollback = engine
@@ -30930,7 +32586,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: same_batch_id,
-                        home_document_id: home_a,
+                        home_document_id: same_home_a,
                     },
                     page_id: page_a,
                     parent: None,
@@ -30947,115 +32603,72 @@ pub(crate) mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
 
+        // Retiring the block through the audited path does NOT release its
+        // immutable home: it may not be recreated in a different document.
         let mut relocation_engine = ShardedHotEngine::new(workspace, lineage, catalog_id);
         assert!(matches!(
             relocation_engine.stage_ready(genesis).disposition(),
             BatchDisposition::Accepted { .. }
         ));
-
-        let before_a = relocation_engine
-            .clone_visible_document(home_a, 602)
-            .unwrap();
-        let before_b = relocation_engine
-            .clone_visible_document(home_b, 602)
-            .unwrap();
-        let after_a = clone_doc(&before_a, 602).unwrap();
-        after_a
-            .get_map(SHARD_OWNERS)
-            .delete(&block_id.to_string())
-            .unwrap();
-        after_a
-            .get_map(SHARD_CONTENT)
-            .delete(&block_id.to_string())
-            .unwrap();
-        after_a
-            .get_map(SHARD_MEMBERS)
-            .delete(&block_id.to_string())
-            .unwrap();
-        let after_b = clone_doc(&before_b, 602).unwrap();
-        after_b
-            .get_map(SHARD_OWNERS)
-            .insert(&block_id.to_string(), page_b.to_string())
-            .unwrap();
-        after_b
-            .get_map(SHARD_CONTENT)
-            .ensure_mergeable_text(&block_id.to_string())
-            .unwrap()
-            .insert(0, "recreated home B")
-            .unwrap();
-        insert_membership(
-            &after_b,
-            block_id,
-            &MembershipClaim::new(home_b, None, "b").unwrap(),
-        )
-        .unwrap();
-        let removed_state = read_block_state(home_a, &before_a, block_id)
-            .unwrap()
-            .unwrap();
-        let recreated_state = read_block_state(home_b, &after_b, block_id)
-            .unwrap()
-            .unwrap();
-        let relocation_effect = raw_semantic_effect(
-            Vec::new(),
-            vec![
-                BlockDelta {
-                    block_id,
-                    home_document_id: home_a,
-                    before: Some(removed_state),
-                    after: None,
-                },
-                BlockDelta {
-                    block_id,
-                    home_document_id: home_b,
-                    before: None,
-                    after: Some(recreated_state),
-                },
-            ],
-            vec![
-                MembershipDelta {
+        let deleted = relocation_engine
+            .prepare_fixture_transaction(
+                test_author(606, 606),
+                &OperationTransaction::new(vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
                     page_id: page_a,
-                    block_id,
-                    before: Some(MembershipClaim::new(home_a, None, "a").unwrap()),
-                    after: None,
-                },
-                MembershipDelta {
-                    page_id: page_b,
-                    block_id,
-                    before: None,
-                    after: Some(MembershipClaim::new(home_b, None, "b").unwrap()),
-                },
-            ],
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            relocation_engine
+                .stage_ready(ValidatedBatch::new(deleted))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let recreated_block = raw_block_document(
+            page_b,
+            home_b,
+            block_state(
+                block_id,
+                block_home_b,
+                BlockOwner::Page(page_b),
+                "recreated home B",
+            ),
         );
-        let relocation = validated_transition_with_payload(
+        let recreated_membership_key = membership_document_id(block_home_b, home_b);
+        let recreated_membership = raw_membership_document(
+            block_home_b,
+            block_id,
+            home_b,
+            page_b,
+            Some(MembershipClaim::new(block_home_b, None, "b").unwrap()),
+        );
+        let relocation = validated_transition(
             &relocation_engine,
             test_author(602, 602),
-            &BTreeMap::from([(home_a, before_a), (home_b, before_b)]),
-            &BTreeMap::from([(home_a, after_a), (home_b, after_b)]),
-            FrontierV2::new(vec![
-                dependencies_for(&relocation_engine, home_a, 602),
-                dependencies_for(&relocation_engine, home_b, 602),
-            ])
-            .unwrap(),
-            relocation_effect,
+            &BTreeMap::from([
+                (DocumentKey::Entity(block_home_b), LoroDoc::new()),
+                (recreated_membership_key, LoroDoc::new()),
+            ]),
+            &BTreeMap::from([
+                (DocumentKey::Entity(block_home_b), recreated_block),
+                (recreated_membership_key, recreated_membership),
+            ]),
+            FrontierV2::new(Vec::new()).unwrap(),
         );
         assert!(matches!(
             relocation_engine.stage_ready(relocation).disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Semantic(_),
-                ..
-            }
+            BatchDisposition::Rejected { .. }
         ));
-        assert_eq!(
-            relocation_engine.materialize_page(page_a).unwrap().blocks[0].content,
-            "immutable home A"
-        );
         assert!(relocation_engine
             .materialize_page(page_b)
             .unwrap()
             .blocks
             .is_empty());
         assert!(relocation_engine
-            .recover_block_state(home_b, block_id)
+            .recover_block_state(block_home_b, block_id)
             .unwrap()
             .is_none());
     }
@@ -31072,6 +32685,8 @@ pub(crate) mod validation_tests {
         let home_c = DocumentId::from_uuid(Uuid::from_u128(7_007));
         let duplicate = BlockId::from_uuid(Uuid::from_u128(7_008));
         let support = BlockId::from_uuid(Uuid::from_u128(7_009));
+        let duplicate_home = DocumentId::from_uuid(Uuid::from_u128(7_015));
+        let support_home = DocumentId::from_uuid(Uuid::from_u128(7_016));
         let mut engine =
             ShardedHotEngine::new(workspace, LineageDigest::of(b"cross-document"), catalog);
         let genesis = engine
@@ -31110,7 +32725,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: duplicate,
-                        home_document_id: home_a,
+                        home_document_id: duplicate_home,
                     },
                     page_id: page_a,
                     parent: None,
@@ -31128,14 +32743,14 @@ pub(crate) mod validation_tests {
                     SemanticOperation::EditBlockContent {
                         block: BlockLocation {
                             block_id: duplicate,
-                            home_document_id: home_a,
+                            home_document_id: duplicate_home,
                         },
                         content: "parent touched ancestor document".into(),
                     },
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: support,
-                            home_document_id: home_b,
+                            home_document_id: support_home,
                         },
                         page_id: page_b,
                         parent: None,
@@ -31154,7 +32769,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: support,
-                        home_document_id: home_b,
+                        home_document_id: support_home,
                     },
                     content: "legitimate cross-document descendant".into(),
                 }])
@@ -31167,7 +32782,7 @@ pub(crate) mod validation_tests {
             .documents()
             .iter()
             .any(|entry| {
-                entry.document_id() == home_b
+                entry.document_id() == DocumentKey::Entity(support_home)
                     && entry.direct_dependency_heads()
                         == [BatchId::from_uuid(Uuid::from_u128(7_012))]
             }));
@@ -31176,34 +32791,43 @@ pub(crate) mod validation_tests {
             .dependency_frontier()
             .documents()
             .iter()
-            .any(|entry| entry.document_id() == home_a));
+            .any(|entry| entry.document_id() == DocumentKey::Entity(duplicate_home)));
 
-        let before_c = engine.clone_visible_document(home_c, 713).unwrap();
-        let after_c = clone_doc(&before_c, 713).unwrap();
-        after_c
-            .get_map(SHARD_OWNERS)
-            .insert(&duplicate.to_string(), page_c.to_string())
-            .unwrap();
-        after_c
-            .get_map(SHARD_CONTENT)
-            .ensure_mergeable_text(&duplicate.to_string())
-            .unwrap()
-            .insert(0, "omitted cross-document ancestor")
-            .unwrap();
-        insert_membership(
-            &after_c,
+        // Re-creating the already-existing block id in a brand-new document
+        // under page C omits its cross-document ancestor and is refused.
+        let duplicate_home_c = DocumentId::from_uuid(Uuid::from_u128(7_020));
+        let duplicate_document = raw_block_document(
+            page_c,
+            home_c,
+            block_state(
+                duplicate,
+                duplicate_home_c,
+                BlockOwner::Page(page_c),
+                "omitted cross-document ancestor",
+            ),
+        );
+        let duplicate_membership_key = membership_document_id(duplicate_home_c, home_c);
+        let duplicate_membership = raw_membership_document(
+            duplicate_home_c,
             duplicate,
-            &MembershipClaim::new(home_c, None, "duplicate").unwrap(),
-        )
-        .unwrap();
+            home_c,
+            page_c,
+            Some(MembershipClaim::new(duplicate_home_c, None, "duplicate").unwrap()),
+        );
         let malformed = validated_transition(
             &engine,
             test_author(7_013, 713),
-            &BTreeMap::from([(home_c, before_c)]),
-            &BTreeMap::from([(home_c, after_c)]),
+            &BTreeMap::from([
+                (DocumentKey::Entity(duplicate_home_c), LoroDoc::new()),
+                (duplicate_membership_key, LoroDoc::new()),
+            ]),
+            &BTreeMap::from([
+                (DocumentKey::Entity(duplicate_home_c), duplicate_document),
+                (duplicate_membership_key, duplicate_membership),
+            ]),
             FrontierV2::new(vec![
-                dependencies_for(&engine, home_b, 713),
-                dependencies_for(&engine, home_c, 713),
+                dependencies_for(&engine, DocumentKey::Entity(support_home), 713),
+                dependencies_for(&engine, DocumentKey::Entity(home_c), 713),
             ])
             .unwrap(),
         );
@@ -31425,6 +33049,20 @@ pub(crate) mod validation_tests {
             "prepare_portable_path_updates",
             "commit_portable_path_updates",
         );
+        let binding = function(
+            "validate_manifested_portable_path_binding",
+            "validate_manifested_base_from_documents",
+        );
+        for forbidden in [
+            "collect_batch_ancestry",
+            "ephemeral_causal_chain",
+            "derive_inline_causal_clock",
+            "current_portable_path_root",
+            "candidate.root",
+        ] {
+            assert!(!binding.contains(forbidden),
+                "manifest key binding must not compare unrelated receiver state through {forbidden}");
+        }
         assert!(portable.contains("portable_path_records_many(&requested)"));
         assert!(
             !portable.contains("clone_validation_document")
@@ -31523,7 +33161,10 @@ pub(crate) mod validation_tests {
         for ordinal in [7_u128, 2, 19, 1, 11, 5, 23, 3, 17, 13] {
             let batch_id = BatchId::from_uuid(Uuid::from_u128(0xa9000 + ordinal));
             let digest = ContentDigest::of(format!("accepted-{ordinal}").as_bytes());
-            incremental.upsert(batch_id.as_uuid().into_bytes(), digest);
+            incremental.upsert(
+                AuthenticatedMapKey::from(batch_id.as_uuid().into_bytes()),
+                digest,
+            );
             canonical.insert(batch_id, digest);
             let entries = canonical
                 .iter()
@@ -31531,18 +33172,27 @@ pub(crate) mod validation_tests {
                 .collect::<Vec<_>>();
             let (root_key, root_digest) = authenticated_map_root(&entries).unwrap();
             assert_eq!(incremental.count, entries.len() as u64);
-            assert_eq!(incremental.root_key(), root_key);
+            assert_eq!(
+                uuid_domain_map_root_key(incremental.root_key()).unwrap(),
+                root_key
+            );
             assert_eq!(incremental.root_digest(), root_digest);
         }
 
         let replaced = BatchId::from_uuid(Uuid::from_u128(0xa9000 + 11));
         let replacement_digest = ContentDigest::of(b"accepted-replacement");
-        incremental.upsert(replaced.as_uuid().into_bytes(), replacement_digest);
+        incremental.upsert(
+            AuthenticatedMapKey::from(replaced.as_uuid().into_bytes()),
+            replacement_digest,
+        );
         canonical.insert(replaced, replacement_digest);
         let entries = canonical.into_iter().collect::<Vec<_>>();
         let (root_key, root_digest) = authenticated_map_root(&entries).unwrap();
         assert_eq!(incremental.count, entries.len() as u64);
-        assert_eq!(incremental.root_key(), root_key);
+        assert_eq!(
+            uuid_domain_map_root_key(incremental.root_key()).unwrap(),
+            root_key
+        );
         assert_eq!(incremental.root_digest(), root_digest);
     }
 
@@ -31792,7 +33442,7 @@ pub(crate) mod validation_tests {
         let left_then_right = deliver(left.manifest().batch_id(), right.manifest().batch_id());
         let right_then_left = deliver(right.manifest().batch_id(), left.manifest().batch_id());
         assert_eq!(left_then_right, right_then_left);
-        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 14);
+        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 15);
         assert_eq!(
             super::super::page_name_index::PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
             2,
@@ -31825,6 +33475,7 @@ pub(crate) mod validation_tests {
         let page = PageId::from_uuid(Uuid::from_u128(97_602));
         let home = DocumentId::from_uuid(Uuid::from_u128(97_603));
         let block = BlockId::from_uuid(Uuid::from_u128(97_604));
+        let block_home = DocumentId::from_uuid(Uuid::from_u128(97_605));
 
         let mut author = ShardedHotEngine::new(workspace, lineage, catalog);
         let genesis = author
@@ -31851,7 +33502,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: block,
-                        home_document_id: home,
+                        home_document_id: block_home,
                     },
                     page_id: page,
                     parent: None,
@@ -31873,7 +33524,7 @@ pub(crate) mod validation_tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: block,
-                        home_document_id: home,
+                        home_document_id: block_home,
                     },
                     content: "second".into(),
                 }])
@@ -31934,7 +33585,12 @@ pub(crate) mod validation_tests {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(10);
         let catalog = DocumentId::from_uuid(Uuid::from_u128(0x7500));
-        let mut builder = LazyGenesisCheckpointBuilder::new_verifying(catalog).unwrap();
+        let mut builder = LazyGenesisCheckpointBuilder::new_verifying(
+            catalog,
+            WorkspaceId::from_uuid(Uuid::from_u128(0x7501)),
+            LineageDigest::of(b"lazy-genesis-checkpoint-cost-receipt"),
+        )
+        .unwrap();
         let started = std::time::Instant::now();
         let mut checkpoint_bytes = 0_u64;
         for page_ordinal in 0..pages {
@@ -31964,7 +33620,12 @@ pub(crate) mod validation_tests {
                                 .saturating_add((page_ordinal * blocks_per_page) as u128)
                                 .saturating_add(block_ordinal as u128),
                         )),
-                        home_document_id: home,
+                        // Each block has its OWN immutable document.
+                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(
+                            0x3_0000_0000_u128
+                                .saturating_add((page_ordinal * blocks_per_page) as u128)
+                                .saturating_add(block_ordinal as u128),
+                        )),
                         parent: None,
                         order: format!("{block_ordinal:08}"),
                         content: format!(
@@ -31973,12 +33634,17 @@ pub(crate) mod validation_tests {
                         external_uuid_claims: Vec::new(),
                     })
                     .collect(),
-                document_checkpoint: Vec::new(),
-                document_dependencies: None,
+                document_checkpoints: Vec::new(),
+                document_dependencies: Vec::new(),
                 sqlite_receipt: None,
             };
-            let (checkpoint, _) = builder.push_page(&page, &BTreeMap::new()).unwrap();
-            checkpoint_bytes = checkpoint_bytes.saturating_add(checkpoint.len() as u64);
+            let (checkpoints, _) = builder.push_page(&page, &BTreeMap::new()).unwrap();
+            checkpoint_bytes = checkpoint_bytes.saturating_add(
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.snapshot.len() as u64)
+                    .sum::<u64>(),
+            );
         }
         let page_elapsed = started.elapsed();
         let (catalog_checkpoint, _) = builder.finish().unwrap();
@@ -32653,35 +34319,20 @@ pub(crate) fn probe_pruned_checkpoint_bytes(
     dependencies: &DocumentDependencies,
     checkpoint: &Vec<u8>,
 ) -> Result<usize, EngineError> {
-    let document = qualify_compact_document(catalog, dependencies, checkpoint)?;
+    let document_id = dependencies.document_id();
+    let document =
+        qualify_compact_document(DocumentKey::Entity(catalog), dependencies, checkpoint)?;
     document.set_peer_id(999_998).map_err(loro_error)?;
-    if dependencies.document_id() == catalog {
-        for (page, state) in read_all_pages(&document)? {
-            if matches!(state, PageState::Tombstone { .. }) {
-                document
-                    .get_map(CATALOG_PAGES)
-                    .delete(&page.to_string())
-                    .map_err(loro_error)?;
-            }
-        }
-        validate_catalog(catalog, &document)?;
-    } else {
-        for (block, state) in read_all_blocks(dependencies.document_id(), &document)? {
-            if state.owner == BlockOwner::Tombstone {
-                for root in [
-                    SHARD_OWNERS,
-                    SHARD_CONTENT,
-                    SHARD_LOGSEQ_UUIDS,
-                    SHARD_LOGSEQ_IDENTITY_ORIGINS,
-                ] {
-                    document
-                        .get_map(root)
-                        .delete(&block.to_string())
-                        .map_err(loro_error)?;
-                }
-            }
-        }
-        validate_shard(catalog, dependencies.document_id(), &document)?;
+    // Retirement is document-granular in the current layout: a tombstoned
+    // block, a cleared membership pair and a deleted page are each a whole
+    // document. There is no per-entry pruning to do inside a surviving
+    // document, so what this probes is the surviving document's own shallow
+    // floor after it re-validates against its fixed schema.
+    if document_state(document_id, &document)?.is_none() {
+        return Err(malformed(
+            document_id,
+            "compact checkpoint restored an uninitialized document",
+        ));
     }
     document.commit();
     document

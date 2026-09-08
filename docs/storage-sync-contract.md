@@ -43,10 +43,10 @@ Readiness never compares against a cached Direct Files inventory captured before
 the transition or the actor's live current-path catalog: filesystem delivery may
 legitimately change either while startup catch-up is settling. The accepted
 frontier's raw document count is not a page count because it also includes
-non-page managed documents. An empty graph
-legitimately proves readiness with an empty inventory. Its untouched lazy catalog
-has no causal dependencies, so the immutable baseline and SQLite genesis bind
-zero documents; the catalog contributes one document once pages exist.
+non-page managed documents. An empty graph legitimately proves readiness with an
+empty page inventory. Its immutable baseline and SQLite genesis still bind the
+one fixed graph-metadata document carrying workspace and lineage identity; they
+bind zero page, block, or membership documents.
 
 Explicit activation is never an unexplained spinner. Before native activation,
 the frontend names pending-save flush, confirmation, and progress-listener
@@ -1233,13 +1233,76 @@ arm clones at most one non-page home at a time (no all-home arena), preserves
 the existing distinct-home statistics, and alone applies the current accepted
 exact-title selection; historical and prospective state materialization does
 not consult that later root.
-The single catalog checkpoint is constructed by the same direct terminal-state
-builder, and the sealed manifest binds its non-derivable catalog document ID.
+The single graph-metadata checkpoint is constructed by the same direct
+terminal-state builder, and the sealed manifest binds its non-derivable graph
+document ID. That checkpoint is the fixed **graph metadata document**, not a UUID-keyed
+page/block catalog. It is created for every baseline, including an empty graph,
+and binds the exact workspace, lineage, and graph document address. Therefore an
+empty activation has exactly one accepted document (graph metadata) and zero
+page, block, and membership documents; SQLite construction and cold reopen must
+preserve that same root rather than treating the baseline as a zero-document
+special case.
+
+Interactive state uses one fixed document layout. A page has its immutable
+`DocumentIdentity::Page`, one live-or-tombstone page-state register, preamble,
+and checkpoint. A block has its own immutable entity document, a stable root
+text container, fixed identity fields, owner register, and immutable
+`BlockBirth { page_id, page_document_id }`. A membership is the exact
+`(block_document_id,page_document_id)` document with an optional claim register.
+The block birth is authenticated in semantic-effect schema 7 against the page
+identity at the batch's declared causal base; deletion, Restore, replay, and
+owner moves never rewrite it or the root text `ContainerID`. Page and membership
+state no longer live in a whole-graph catalog document.
+
+Authored multi-operation transactions use one transaction-local page outline,
+initialized lazily from the existing current-owner and pair-claim producer. The
+same owner and membership write seams advance that outline after each operation;
+there is no second authority or fixture-only producer. Its adjacency is a
+`BTreeSet<BlockId>` per parent. Subtree selection therefore returns canonical
+BlockId-sorted rows without repeatedly sorting wide sibling lists, while every
+row retains the complete block identity, immutable entity home, exact page home,
+and native membership claim. A cross-page `MoveSubtree` updates every selected
+owner and source/destination pair in transaction order. A same-page
+`MoveSubtree` is only the existing root `ReorderBlock` mutation after the exact
+root-home check: it changes that root pair and never rewrites descendant pairs
+or entity owners, so an independent child reorder remains independent.
+
+Whole-file external deletion is represented by `DeletePage` alone. It
+tombstones page state and leaves the original block entity documents, root text,
+owners, and membership-pair documents available to historical materialization
+and Restore; page liveness is what hides them. Moving a subtree to another live
+or newly created page still occurs before the source page tombstone and keeps its
+identity. Removing only part of a still-live page remains `DeleteSubtree` and
+does change the selected block owners and membership pairs. Deferred pages keep
+their existing behavior. A path rename preserves its matched `PageId` and is
+therefore not a whole-file page deletion.
+
+Every `PreparedBatch` constructor proves that the existing canonical manifest
+encoder accepts the manifest before returning the publishable value. Oversize
+uses the existing typed `ManifestTooLarge` error and unchanged 1 MiB limit; it
+does not cache another encoding or define a second serializer. Whole-batch
+pending/error handling remains the existing route. This contract does not add
+chunking or promise support for an arbitrary oversized atomic batch.
+
 These checkpoints are baseline semantic/causal state, not fabricated interactive
 history: their construction authors no `SemanticOperation`, batch, ordinary
 mutation receipt, partition, or detached bootstrap part. Untouched page
 checkpoints remain unopened in the lazy pack until a page read or first ordinary
 operation needs one.
+
+Within one top-level point-operation read scope, the engine may retain the raw
+checkpoint bytes from at most one decoded baseline page, bound to the exact
+baseline root and original `PageId`. The manifest-derived full `DocumentKey`
+index resolves entity and membership checkpoints without scanning unrelated
+page descriptors. Repeated requests for documents from that page clone only
+the requested checkpoint bytes; exact source bytes, blocks, SQLite receipts,
+and mutable CRDT documents are not retained. Starting another top-level
+materialization clears this memo and therefore rereads and revalidates the
+capsule. A different root or page replaces it. Accepted dependency heads and
+the current overlay remain authoritative, so an edited cold document never
+falls back to its initial baseline checkpoint, and a moved block's baseline
+location remains its immutable original-page storage location rather than
+current ownership.
 
 Reading one baseline page costs that page, not the pack. A sealed segment pack
 is written once and never rewritten, so its whole-pack digest is proved against
@@ -1488,6 +1551,18 @@ Patricia path or page-name index to duplicate SQLite ownership. A content or
 path-only edit of an existing physical same-name page does not reacquire its
 logical name; only a creation or exact-title change enters name-acquisition
 preflight.
+
+An incoming projection intent's portable-path root describes the author's whole
+index at authoring time. It is retained as part of the original intent and its
+derived work identity; it is not proof of the receiver's whole index. Receiver
+admission validates the exact path/key binding, agreement among the batch's
+intents, semantic projection transition, and occupied/released per-key causal
+records. It does not compare global roots or use whole-device causal clocks as
+a proxy for that comparison: unrelated accepted or journaled work may differ.
+The receiver derives its own path index through the existing per-key transition.
+Own journal replay still requires each record's root to match its local prefix
+transition, and reuse of an own projection candidate keeps its same-context check.
+No incoming root changes path ownership, release ancestry, or conflict ranking.
 
 One canonical page name has one owner, and a graph may legitimately hold more
 than one physical file for it. Activation already resolves that: it selects one
@@ -2096,19 +2171,18 @@ proof, and merely opening a directory is not generation adoption. Collision,
 missing/corrupt record, no-follow, publication-fault and retry tests preserve
 predecessor roots. Complete generation commits and live cutover remain absent.
 
-The staged **document capsule roster** uses `SealedDocumentMap`, composed from
-shared canonical UUID maps. `DocumentKey::Entity` has its own UUID root;
-`DocumentKey::Membership` retains the full `(block_document_id, page_document_id)`
-pair through an outer block map and an inner page map, without tuple hashing.
-The current capsule producer still supplies only entity keys. Membership root
-records are canonical postcard `{schema=1, count, root}` values authenticated by
-the outer map. Logical retirement uses the certified shared `remove_map`
-operation: it removes search-path entries and drops empty outer membership
-groups while preserving older immutable roots. It never physically deletes
-objects. Construction reads pending staged root records before on-disk records;
-a fresh complete-key census independently rebuilds both domains and verifies
-the combined count. The fixed membership-root read bound is 128 bytes and is
-independent of graph size or history. A map value addresses one canonical postcard record
+The staged **document capsule roster** uses `SealedDocumentMap` over the shared
+full-key authenticated map. `DocumentKey::Entity` encodes as the `0x01` tag plus
+its UUID (17 bytes), while `DocumentKey::Membership` encodes as the `0x02` tag
+plus the complete `(block_document_id, page_document_id)` pair (33 bytes). That
+lossless encoding is `AuthenticatedMapKey`; entity and membership entries share
+one root, preserve meaningful-byte lexicographic ordering, and never hash or
+truncate an address. The live capsule producer supplies both domains. Logical
+retirement uses the certified shared `remove_map` operation, which removes only
+the addressed search path while preserving older immutable roots; it never
+physically deletes objects. Construction reads pending staged nodes before
+on-disk nodes, and a fresh complete-key census independently rebuilds the shared
+root and verifies its count. A map value addresses one canonical postcard record
 `{schema=1, dependencies: DocumentDependencies, checkpoint: BlobDescription}`.
 Descriptor and actual CRDT checkpoint blobs share the `capsule-v1-<digest>`
 content-addressed staging namespace and the same bounded publication machinery.
@@ -2126,10 +2200,11 @@ document bound to the current cutoff. This is still staging, with no active mark
 or engine installation caller.
 
 The explicit full-roster builder enumerates the engine's complete accepted
-document set, including the catalog and retained home shards that need not appear
-as live pages. It checks the current accepted cutoff and exact document count. An empty
-accepted set keeps the existing implicit empty catalog; a nonempty set must
-contain the catalog.
+document set, including the fixed graph metadata document and retained entity or
+membership documents that need not appear in the live graph. It checks the
+current accepted cutoff and exact document count. A lazy-genesis baseline always
+contains the graph metadata document, even with no pages; an ordinary in-memory
+test engine with no installed baseline may still have the genuinely empty root.
 An inherited descriptor with identical canonical dependencies avoids CRDT loading
 and republishing; changed documents update the existing roster paths. This initial
 builder still enumerates O(documents) metadata and is not the R1c bounded actor COW
@@ -2175,9 +2250,11 @@ and no filesystem object exists per logical record: many small records share one
 pack and one point read.
 
 Two key domains compose the same shared canonical UUID map; there is no second
-tree, no tuple hashing and no SHA-256 truncated into a UUID. The **object domain**
-carries the full 256-bit key by composing two of those maps, the way
-`SealedDocumentMap` composes a membership pair. The outer map is keyed by
+tree, no tuple hashing and no SHA-256 truncated into a UUID. This cold object
+index remains its own two-level 256-bit content-digest composition; unlike it,
+`SealedDocumentMap` now stores each lossless tagged entity or full membership
+address directly in one shared authenticated map. The **object domain** carries
+the full 256-bit digest through an outer map keyed by
 `sha256[0..16]`; its value locates a canonical postcard **inner-root descriptor**
 `{schema=1, root: {count, root_key, root_digest}}` packed with the same physical
 pack machinery, and that descriptor names an inner authenticated map keyed by
@@ -3001,7 +3078,7 @@ writer incarnations, are carried in the clean checkpoint state section
 second index.
 
 **Schema.** This is one coherent current format with no reader for the previous
-one (D-1): `OPERATION_SCHEMA_VERSION` 8, writer-lane record schema 2, clean
+one (D-1): `OPERATION_SCHEMA_VERSION` 9, writer-lane record schema 2, clean
 checkpoint state schema 3. Every persisted point-index key encoding carries the
 full 16-byte incarnation UUID; none of them truncates or hashes it.
 

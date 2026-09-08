@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tine_storage::DurableBatchContract;
 
 use super::{
-    BatchId, DeviceId, DocumentId, FrontierV2, ImportId, SessionId, WorkspaceId,
+    BatchId, DeviceId, DocumentKey, FrontierV2, ImportId, SessionId, WorkspaceId,
     WriterIncarnationId, MANAGED_ENTITY_SET_VERSION,
 };
 
@@ -15,11 +15,12 @@ pub use tine_storage::formats::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-/// Bumped to 8 for persisted causal writer incarnations: a manifest's
-/// `BatchCausalDot` now names a `WriterIncarnationId`, not the enrolled
-/// `DeviceId`. One current format only — there is no reader for version 7
-/// (D-1).
-pub const OPERATION_SCHEMA_VERSION: u32 = 8;
+/// Bumped to 9 for the retirable document layout: every manifest descriptor,
+/// object envelope and per-document frontier now names a full `DocumentKey`
+/// (entity birth UUID, or the exact block/page membership pair) instead of a
+/// bare entity UUID. Version 8 added persisted causal writer incarnations.
+/// One current format only — there is no reader for version 8 (D-1).
+pub const OPERATION_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,13 +37,15 @@ pub struct CoreDurableBatchContract;
 
 #[doc(hidden)]
 pub struct CoreManifestValidationState {
-    crdt_documents: HashSet<DocumentId>,
+    crdt_documents: HashSet<DocumentKey>,
     semantic_count: usize,
 }
 
 impl DurableBatchContract for CoreDurableBatchContract {
     type WorkspaceId = WorkspaceId;
-    type DocumentId = DocumentId;
+    /// The FULL retirable-document address. Entity UUIDs and membership pairs
+    /// are distinct key domains; nothing hashes or truncates the pair.
+    type DocumentId = DocumentKey;
     type BatchId = BatchId;
     type DeviceId = DeviceId;
     /// One sequential authoring incarnation, independent of the enrolled
@@ -119,6 +122,7 @@ impl PreparedBatch {
         manifest: OperationBatch,
         objects: Vec<OperationObject>,
     ) -> Result<Self, BatchError> {
+        manifest.encode()?;
         let mut by_digest = BTreeMap::new();
         for object in objects {
             if object.workspace_id() != manifest.workspace_id() {
@@ -242,14 +246,15 @@ mod tests {
     use serde_json::Value;
     use uuid::Uuid;
 
+    use super::super::identity::DocumentId;
     use super::*;
 
     fn workspace(value: u128) -> WorkspaceId {
         WorkspaceId::from_uuid(Uuid::from_u128(value))
     }
 
-    fn document(value: u128) -> DocumentId {
-        DocumentId::from_uuid(Uuid::from_u128(value))
+    fn document(value: u128) -> DocumentKey {
+        DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(value)))
     }
 
     fn batch(value: u128) -> BatchId {
@@ -399,5 +404,56 @@ mod tests {
             matches!(error, BatchError::DuplicateCrdtDocument(found) if found == document(10)),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn prepared_batch_rejects_an_oversized_canonical_manifest() {
+        let semantic = OperationObject::new(
+            workspace(1),
+            document(1),
+            ObjectKind::SemanticEffect,
+            b"semantic".to_vec(),
+        )
+        .unwrap();
+        let semantic_descriptor = semantic.descriptor().unwrap();
+        let dependency_heads = (10_000_u128..40_000).map(batch).collect::<Vec<_>>();
+        assert!(dependency_heads.windows(2).all(|pair| pair[0] < pair[1]));
+        let device = DeviceId::from_uuid(Uuid::from_u128(4));
+        let manifest = OperationBatch::new_with_causality(
+            workspace(1),
+            LineageDigest::from_bytes([0x11; 32]),
+            batch(3),
+            device,
+            SessionId::from_uuid(Uuid::from_u128(5)),
+            BatchOrigin::LocalMutation,
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
+            dependency_heads,
+            FrontierV2::default(),
+            SemanticEffectDigest::of(b"semantic"),
+            vec![semantic_descriptor],
+        )
+        .unwrap();
+        let encoded_length = match manifest.encode().unwrap_err() {
+            BatchError::ManifestTooLarge(length) => length,
+            error => panic!("unexpected canonical encoder error: {error:?}"),
+        };
+        assert!(encoded_length > MAX_MANIFEST_BYTES);
+
+        let constructor_error = match PreparedBatch::new(manifest, vec![semantic]) {
+            Ok(_) => panic!("PreparedBatch admitted a manifest its canonical encoder refuses"),
+            Err(error) => error,
+        };
+        let constructor_length = match constructor_error {
+            BatchError::ManifestTooLarge(length) => length,
+            error => panic!("unexpected PreparedBatch constructor error: {error:?}"),
+        };
+        assert_eq!(constructor_length, encoded_length);
+        eprintln!("canonical oversized manifest bytes={encoded_length} limit={MAX_MANIFEST_BYTES}");
     }
 }

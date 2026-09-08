@@ -1,3 +1,4 @@
+use crate::oplog::DocumentKey;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -109,7 +110,7 @@ fn page(path: &str, blocks: Vec<MaterializedBlock>) -> ProjectionPageState {
                 .or_default()
                 .push(ProjectionClaimParticipant::new(
                     block.block_id,
-                    block.home_document_id,
+                    DocumentKey::Entity(block.home_document_id),
                 ));
         }
     }

@@ -9,7 +9,10 @@ use unicode_normalization::UnicodeNormalization;
 use caseless::Caseless;
 
 use super::identity::{parse_digest, write_hex};
-use super::{BatchId, BlockId, CrdtPeerId, DocumentId, ImportId, LogseqUuid, PageId, WorkspaceId};
+use super::{
+    BatchId, BlockId, CrdtPeerId, DocumentId, DocumentKey, ImportId, LogseqUuid, PageId,
+    WorkspaceId,
+};
 
 /// Candidate receipt schema. These bytes are explicitly not a stable wire format.
 pub const RECEIPT_SCHEMA_VERSION: u32 = 5;
@@ -45,18 +48,18 @@ pub enum ReceiptError {
     DuplicateLocator,
     DuplicateBlockIdentity(BlockId),
     DuplicateLogseqIdentity(LogseqUuid),
-    EmptyDocumentFrontier(DocumentId),
-    DuplicateDocument(DocumentId),
+    EmptyDocumentFrontier(DocumentKey),
+    DuplicateDocument(DocumentKey),
     DuplicateCrdtPeer(CrdtPeerId),
     DuplicateDependency(BatchId),
     NonCanonicalPeerCounters,
     NonCanonicalDependencies,
-    CausalStateDigestMismatch(DocumentId),
+    CausalStateDigestMismatch(DocumentKey),
     NonCanonicalAnnotations,
     EmptyProjectionClaimEvidence(LogseqUuid),
     NonCanonicalProjectionClaimEvidence,
     MissingProjectionClaimEvidence(LogseqUuid),
-    MissingProjectionClaimDocument(DocumentId),
+    MissingProjectionClaimDocument(DocumentKey),
     NonCanonicalInventory,
     NonCanonicalLogicalCompletionIds,
     InvalidImportIdDerivationPhase,
@@ -745,13 +748,15 @@ pub struct DocumentCausalDigest([u8; 32]);
 
 impl DocumentCausalDigest {
     pub(crate) fn of(
-        document_id: DocumentId,
+        document_id: DocumentKey,
         peer_counters: &[CrdtPeerCounter],
         direct_dependency_heads: &[BatchId],
     ) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(b"tine/frontier-v2/document-causal-state/v1\0");
-        hasher.update(document_id.as_uuid().as_bytes());
+        // Domain tag bumped with the full-address layout: an entity UUID and a
+        // membership pair are different key spaces and must not collide.
+        hasher.update(b"tine/frontier-v2/document-causal-state/v2\0");
+        hash_document_key(&mut hasher, document_id);
         hasher.update((peer_counters.len() as u64).to_be_bytes());
         for counter in peer_counters {
             hasher.update(counter.peer_id().as_u64().to_be_bytes());
@@ -805,7 +810,7 @@ impl<'de> Deserialize<'de> for DocumentCausalDigest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentDependencies {
-    document_id: DocumentId,
+    document_id: DocumentKey,
     peer_counters: Vec<CrdtPeerCounter>,
     direct_dependency_heads: Vec<BatchId>,
     causal_state_digest: DocumentCausalDigest,
@@ -814,7 +819,7 @@ pub struct DocumentDependencies {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DocumentDependenciesWire {
-    document_id: DocumentId,
+    document_id: DocumentKey,
     peer_counters: Vec<CrdtPeerCounter>,
     direct_dependency_heads: Vec<BatchId>,
     causal_state_digest: DocumentCausalDigest,
@@ -824,7 +829,7 @@ impl DocumentDependencies {
     /// Builds a canonical compact document frontier. Heads are only the
     /// maximal/direct batches whose complete atomic ancestry is accepted.
     pub fn new(
-        document_id: DocumentId,
+        document_id: DocumentKey,
         mut peer_counters: Vec<CrdtPeerCounter>,
         mut direct_dependency_heads: Vec<BatchId>,
     ) -> Result<Self, ReceiptError> {
@@ -842,7 +847,7 @@ impl DocumentDependencies {
         Ok(document)
     }
 
-    pub const fn document_id(&self) -> DocumentId {
+    pub const fn document_id(&self) -> DocumentKey {
         self.document_id
     }
 
@@ -910,8 +915,10 @@ impl<'de> Deserialize<'de> for DocumentDependencies {
     }
 }
 
-/// ADR 0049's compact sharding-neutral frontier: canonical `DocumentId`
+/// ADR 0049's compact sharding-neutral frontier: canonical `DocumentKey`
 /// entries with exact CRDT counters and maximal/direct atomic batch heads.
+/// Entries name full retirable-document addresses, so a membership fact has
+/// its own frontier entry rather than riding inside a page shard's.
 /// Cold validation reconstructs ancestry from immutable manifests.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -1026,11 +1033,11 @@ pub enum ProjectionPrecondition {
 #[serde(deny_unknown_fields)]
 pub struct ProjectionClaimParticipant {
     block_id: BlockId,
-    home_document_id: DocumentId,
+    home_document_id: DocumentKey,
 }
 
 impl ProjectionClaimParticipant {
-    pub const fn new(block_id: BlockId, home_document_id: DocumentId) -> Self {
+    pub const fn new(block_id: BlockId, home_document_id: DocumentKey) -> Self {
         Self {
             block_id,
             home_document_id,
@@ -1041,7 +1048,7 @@ impl ProjectionClaimParticipant {
         self.block_id
     }
 
-    pub const fn home_document_id(self) -> DocumentId {
+    pub const fn home_document_id(self) -> DocumentKey {
         self.home_document_id
     }
 }
@@ -1206,7 +1213,7 @@ impl ProjectionIntent {
 
         hasher.update((self.frontier.documents().len() as u64).to_be_bytes());
         for document in self.frontier.documents() {
-            hasher.update(document.document_id().as_uuid().as_bytes());
+            hash_document_key(&mut hasher, document.document_id());
             hasher.update((document.peer_counters().len() as u64).to_be_bytes());
             for counter in document.peer_counters() {
                 hasher.update(counter.peer_id().as_u64().to_be_bytes());
@@ -1225,7 +1232,7 @@ impl ProjectionIntent {
             hasher.update((evidence.participants.len() as u64).to_be_bytes());
             for participant in &evidence.participants {
                 hasher.update(participant.block_id.as_uuid().as_bytes());
-                hasher.update(participant.home_document_id.as_uuid().as_bytes());
+                hash_document_key(&mut hasher, participant.home_document_id);
             }
         }
 
@@ -2084,6 +2091,28 @@ fn validate_versions(
     Ok(())
 }
 
+/// Hash one FULL document address.
+///
+/// The class tag keeps entity and membership addresses in disjoint hash
+/// domains, and the membership pair is hashed in full: nothing truncates it
+/// into a synthetic UUID, so two different pairs can never share a digest.
+pub(crate) fn hash_document_key(hasher: &mut Sha256, key: DocumentKey) {
+    match key {
+        DocumentKey::Entity(document_id) => {
+            hasher.update([0_u8]);
+            hasher.update(document_id.as_uuid().as_bytes());
+        }
+        DocumentKey::Membership {
+            block_document_id,
+            page_document_id,
+        } => {
+            hasher.update([1_u8]);
+            hasher.update(block_document_id.as_uuid().as_bytes());
+            hasher.update(page_document_id.as_uuid().as_bytes());
+        }
+    }
+}
+
 fn hash_length_delimited(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
@@ -2246,7 +2275,7 @@ mod tests {
         .unwrap();
         let mut later_frontier = base.clone();
         later_frontier.frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentId::from_uuid(Uuid::from_u128(3)),
+            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(3))),
             Vec::new(),
             vec![BatchId::from_uuid(Uuid::from_u128(4))],
         )

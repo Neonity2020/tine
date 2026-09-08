@@ -2,11 +2,16 @@ use super::*;
 use crate::model::Format;
 use crate::oplog::absence_sweep::SweepActionState;
 use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
+use crate::oplog::hot_engine::test_block_home;
+use crate::oplog::DocumentKey;
 use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+#[path = "live_write_benchmark.rs"]
+mod live_write_benchmark;
 
 fn production_function_and_constructor_census() -> (
     Vec<(String, String)>,
@@ -3220,14 +3225,11 @@ fn clean_foreground_journal_compacts_and_reopens_after_threshold() {
     ));
 }
 
-/// The bounded hot-document cache may evict a page after unrelated pages
-/// are edited. Re-materializing that page from accepted history must leave
-/// its latest manifested projection usable as the predecessor of another
-/// ordinary save. This is deliberately wider than the 64-document hot
-/// cache; staying at or below the cache limit would never exercise the
-/// history-backed materialization path.
+/// Saving unrelated pages must preserve the accepted projection predecessor
+/// for another ordinary save of the first page. This fixture does not assert
+/// eviction; the configured-cap cold-document tests cover actual nonresidency.
 #[test]
-fn clean_foreground_page_can_be_saved_again_after_hot_document_eviction() {
+fn clean_foreground_page_can_be_saved_again_after_unrelated_page_edits() {
     const EDITED_PAGES: usize = 65;
     let fixture = ActivationFixture::scaled_with_blocks(
         "clean-foreground-save-after-hot-eviction",
@@ -3258,11 +3260,11 @@ fn clean_foreground_page_can_be_saved_again_after_hot_document_eviction() {
         &handle,
         first,
         revision,
-        "second accepted edit after hot-document eviction",
+        "second accepted edit after unrelated page edits",
     );
     assert_eq!(
         saved.blocks[0].raw,
-        "second accepted edit after hot-document eviction"
+        "second accepted edit after unrelated page edits"
     );
     drain_managed_local(&handle);
     assert!(matches!(
@@ -5001,7 +5003,9 @@ fn copy_provider_head_covering(
     relative
 }
 
-fn provider_head_covers(
+// A published clean head reports accepted tips. It does not advertise the
+// retired manifest-recovery record, nor certify independent archive retention.
+fn provider_head_names_tip(
     fixture: &ActivationFixture,
     author_device_id: DeviceId,
     batch_id: BatchId,
@@ -5019,9 +5023,10 @@ fn provider_head_covers(
         );
         SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap()).is_ok_and(
             |head| {
-                head.author_device_id() == author_device_id
+                head.workspace_id() == fixture.request.identities.workspace_id
+                    && head.lineage_digest() == fixture.request.identities.lineage_digest
+                    && head.author_device_id() == author_device_id
                     && head.frontier_tips().contains(&batch_id)
-                    && head.has_current_manifest_recovery_coverage()
             },
         )
     })
@@ -5572,7 +5577,7 @@ fn real_store_oracle_transaction(
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id,
                 parent: None,
@@ -5642,7 +5647,7 @@ fn real_store_oracle_transaction(
             vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: page.home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id: page.page_id,
                 parent: Some(BlockId::from_uuid(Uuid::from_u128(seed + 0x13))),
@@ -6030,7 +6035,7 @@ fn run_absence_sweep_recovery_oracle() {
 
 fn run_restore_recovery_oracle() {
     restore_revives_the_same_page_projects_it_and_survives_a_second_reopen();
-    over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor();
+    over_limit_restore_rediffs_case("sweep-restore-chunks-oracle", 0xc5102_1000);
     post_restore_external_deletion_defers_through_frontier_maximal_present_evidence();
 }
 
@@ -7299,7 +7304,109 @@ fn restore_revives_the_same_page_projects_it_and_survives_a_second_reopen() {
 
 #[test]
 fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor() {
-    let fixture = ActivationFixture::nested_unicode("sweep-restore-chunks", 0xc5102);
+    over_limit_restore_rediffs_case("sweep-restore-chunks", 0xc5102);
+}
+
+#[test]
+fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
+    for (case, blocks) in [("small", 8_usize), ("larger", 64_usize)] {
+        let fixture = ActivationFixture::empty(
+            &format!("baseline-page-read-{case}"),
+            0xc5102_2000 + blocks as u128,
+        );
+        let path = "notes/Baseline Page Read.md";
+        let source = (0..blocks)
+            .map(|index| format!("- baseline block {index:04}\n"))
+            .collect::<String>();
+        fs::write(fixture.graph_root.join(path), source).unwrap();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("baseline read fixture activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("baseline read fixture reopens");
+        let managed_path = ManagedPath::parse(path.to_owned()).unwrap();
+        let page_id = resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&managed_path, 2)
+            .unwrap()
+            .pop()
+            .expect("reopened projection contains the baseline page")
+            .page_id;
+        let engine = resources.runtime.engine();
+        let before = engine.lazy_genesis_page_capsule_decodes_for_test();
+        let first = engine.materialize_page(page_id).unwrap();
+        let after_first = engine.lazy_genesis_page_capsule_decodes_for_test();
+        assert_eq!(
+            after_first - before,
+            1,
+            "one top-level materialization must decode one baseline capsule for {blocks} blocks"
+        );
+        assert_eq!(first.blocks.len(), blocks);
+        assert!(first.blocks.iter().enumerate().all(|(index, block)| {
+            block.content == format!("baseline block {index:04}")
+                && block.block_id.as_uuid() != Uuid::nil()
+                && block.home_document_id.as_uuid() != Uuid::nil()
+        }));
+
+        let first_identity_and_content = first
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.block_id,
+                    block.home_document_id,
+                    block.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let second = engine.materialize_page(page_id).unwrap();
+        let after_second = engine.lazy_genesis_page_capsule_decodes_for_test();
+        eprintln!(
+            "baseline page read case={case} blocks={blocks} first_scope_decodes={} second_scope_decodes={}",
+            after_first - before,
+            after_second - after_first
+        );
+        assert_eq!(
+            after_second - after_first,
+            1,
+            "a subsequent top-level materialization must begin a fresh read scope"
+        );
+        assert_eq!(
+            second
+                .blocks
+                .iter()
+                .map(|block| (
+                    block.block_id,
+                    block.home_document_id,
+                    block.content.clone()
+                ))
+                .collect::<Vec<_>>(),
+            first_identity_and_content
+        );
+    }
+}
+
+fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
+    let phase = |name: &str| {
+        if std::env::var_os("TINE_PHASE_TRACE").is_some() {
+            eprintln!("RESTORE PHASE {label} {name}");
+        }
+    };
+    phase("first-activation-start");
+    let fixture = ActivationFixture::nested_unicode(label, seed);
     let mut source = String::new();
     for index in 0..1_100 {
         source.push_str(&format!("- original block {index:04}\n"));
@@ -7309,18 +7416,26 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
 
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     let handle = activated.handle.expect("chunk fixture activates");
+    phase("first-activation-complete");
+    phase("initial-feed-start");
     drive_initial_feed(&handle);
+    phase("initial-feed-complete");
+    phase("initial-shutdown-start");
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
     drop(handle);
+    phase("initial-shutdown-complete");
 
+    phase("first-reopen-start");
     let open_request = reopen_request(&fixture.request);
     let resources = open_clean_runtime_resources(&open_request)
         .unwrap()
         .expect("chunk fixture reopens");
+    phase("first-reopen-resources-complete");
     let identities = open_request.clean_identities.clone().unwrap();
+    phase("first-runtime-actor-start");
     let mut actor = RuntimeActor::from_clean_resources(
         open_request,
         identities,
@@ -7329,7 +7444,9 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
+    phase("first-runtime-actor-complete");
     let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
+    phase("first-page-lookup-start");
     let page_id = actor
         .clean
         .as_ref()
@@ -7343,6 +7460,8 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         .pop()
         .unwrap()
         .page_id;
+    phase("first-page-lookup-complete");
+    phase("first-page-materialize-start");
     let page = actor
         .clean
         .as_ref()
@@ -7352,15 +7471,22 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         .materialize_page(page_id)
         .unwrap();
     assert_eq!(page.blocks.len(), 1_100);
+    phase("first-page-materialize-complete");
 
+    phase("external-delete-start");
     fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+    phase("external-delete-complete");
+    phase("external-delete-observe-start");
     actor
         .observe(vec![
             SyncWatcherObservation::managed_path("Root.md").unwrap()
         ])
         .unwrap();
-    for _ in 0..64 {
+    phase("external-delete-observe-complete");
+    for tick_ordinal in 0..64 {
+        phase(&format!("external-delete-tick-{tick_ordinal}-start"));
         let tick = actor.tick();
+        phase(&format!("external-delete-tick-{tick_ordinal}-complete"));
         assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
         if !actor.clean.as_ref().unwrap().watcher_status().pending {
             break;
@@ -7373,6 +7499,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
     );
 
     for (chunk_ordinal, blocks) in page.blocks.chunks(400).enumerate() {
+        phase(&format!("edit-chunk-{chunk_ordinal}-start"));
         let operations = blocks
             .iter()
             .map(|block| SemanticOperation::EditBlockContent {
@@ -7391,6 +7518,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
                     ..
                 }
         ));
+        phase(&format!("edit-chunk-{chunk_ordinal}-complete"));
     }
 
     admit_after_restore_chunks_for_test(
@@ -7406,10 +7534,12 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         Some(1),
     );
     fail_once_after_restore_progress(fixture.request.identities.workspace_id);
+    phase("restore-entry");
     assert_eq!(
         actor.restore_absence_sweep(sweep_id),
         Err(SyncRuntimeRequestError::ActorUnavailable)
     );
+    phase("restore-interrupted-exit");
     assert!(
         actor.publication_barrier_active(),
         "a crash cut between chunks must not release the sweep hold"
@@ -7427,12 +7557,16 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         } if remaining_operation_watermark > RESTORE_CHUNK_OPERATION_LIMIT as u64
     )));
     drop(actor);
+    phase("interrupted-actor-dropped");
 
+    phase("second-reopen-start");
     let open_request = reopen_request(&fixture.request);
     let resources = open_clean_runtime_resources(&open_request)
         .unwrap()
         .expect("interrupted restore reopens");
+    phase("second-reopen-resources-complete");
     let identities = open_request.clean_identities.clone().unwrap();
+    phase("second-runtime-actor-start");
     let resumed = RuntimeActor::from_clean_resources(
         open_request,
         identities,
@@ -7441,6 +7575,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .expect("startup resumes the durable restore cursor");
+    phase("second-runtime-actor-complete");
     assert_eq!(
         fs::read(fixture.graph_root.join("Root.md")).unwrap(),
         expected
@@ -7465,6 +7600,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
             ..
         } if chunk_ordinal >= 2
     )));
+    phase("case-complete");
 }
 
 #[test]
@@ -9180,6 +9316,96 @@ fn managed_rename_uses_the_canonical_fold_for_final_sigma_names() {
 }
 
 #[test]
+fn pending_rename_and_delete_releases_mask_the_accepted_sqlite_name_owner() {
+    let fixture = ActivationFixture::nested_unicode("pending-name-release-mask", 0xa1774);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let opened = SyncRuntimeHandle::open_from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+    );
+    let handle = opened.handle.expect("clean actor handle opens");
+
+    let (rename_source, _) = accepted_new_application_page(
+        &handle,
+        "Pending Release Rename Source",
+        vec![BlockDto {
+            id: "pending-release-rename-block".into(),
+            raw: "rename body".into(),
+            ..BlockDto::default()
+        }],
+    );
+    drain_managed_local(&handle);
+    let (delete_source, _) = accepted_new_application_page(
+        &handle,
+        "Pending Release Delete Source",
+        vec![BlockDto {
+            id: "pending-release-delete-block".into(),
+            raw: "delete body".into(),
+            ..BlockDto::default()
+        }],
+    );
+    drain_managed_local(&handle);
+
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                old: "Pending Release Rename Source".into(),
+                new: "Pending Release Rename Target".into(),
+                expected_path: Some(rename_source.path),
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied
+    );
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Pending Release Rename Source".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: None,
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied,
+        "a pending rename release must mask the accepted SQLite owner"
+    );
+
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Pending Release Delete Source".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: Some(delete_source.path),
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied
+    );
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Pending Release Delete Source".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: None,
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied,
+        "a pending delete release must mask the accepted SQLite owner"
+    );
+
+    drain_managed_local(&handle);
+    let (renamed, _) =
+        load_application_logical(&handle, "Pending Release Rename Target", SyncPageKind::Page);
+    assert_eq!(renamed.blocks[0].raw, "rename body");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
 fn clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys() {
     let fixture = ActivationFixture::nested_unicode("clean-runtime-app-journeys", 0xa1772);
     fs::create_dir_all(fixture.graph_root.join("assets")).unwrap();
@@ -10064,7 +10290,9 @@ fn a_lost_writer_record_keeps_an_older_published_epoch_causally_apart() {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: BlockId::from_uuid(Uuid::from_u128(seed + 0x60)),
-                        home_document_id: base_document_id,
+                        home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(
+                            seed + 0x60,
+                        ))),
                     },
                     page_id: base_page_id,
                     parent: None,
@@ -10074,7 +10302,7 @@ fn a_lost_writer_record_keeps_an_older_published_epoch_causally_apart() {
                 SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: base_block_id,
-                        home_document_id: base_document_id,
+                        home_document_id: test_block_home(base_block_id),
                     },
                     content: "base text rewritten by the replacement epoch".into(),
                 },
@@ -13008,7 +13236,7 @@ fn shared_provider_clean_two_device_unicode_join_and_restart() {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: shared_block,
-                    home_document_id: shared_document,
+                    home_document_id: test_block_home(shared_block),
                 },
                 page_id: shared_page,
                 parent: None,
@@ -13764,13 +13992,16 @@ fn rebaselining_foundations_real_corpus_gate() {
             .map(|(_, state)| state.home_document_id()),
     ) {
         let compact = engine
-            .build_compact_accepted_document(&cutoff, document_id)
+            .build_compact_accepted_document(&cutoff, DocumentKey::Entity(document_id))
             .unwrap();
         assert_eq!(
             compact.cutoff_state_digest(),
             cutoff.frontier().state_digest()
         );
-        assert_eq!(compact.dependencies().document_id(), document_id);
+        assert_eq!(
+            compact.dependencies().document_id(),
+            DocumentKey::Entity(document_id)
+        );
         roster = roster
             .with_document(&mut capsule_store, &cutoff, &compact)
             .unwrap();
@@ -13787,13 +14018,17 @@ fn rebaselining_foundations_real_corpus_gate() {
             .map(|(_, state)| state.home_document_id()),
     ) {
         let (dependencies, _) = roster
-            .load_document(&disk_nodes, engine.catalog_document_id(), document_id)
+            .load_document(
+                &disk_nodes,
+                DocumentKey::Entity(engine.catalog_document_id()),
+                DocumentKey::Entity(document_id),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
             Some(dependencies),
             engine
-                .accepted_frontier_document(cutoff.frontier(), document_id)
+                .accepted_frontier_document(cutoff.frontier(), DocumentKey::Entity(document_id))
                 .unwrap()
         );
     }
@@ -13938,21 +14173,56 @@ fn shared_join_owns_ordinary_operation_until_atomic_enrollment_commit() {
 #[test]
 fn manager_empty_graph_activates_and_reopens_without_a_phantom_catalog_document() {
     let fixture = ActivationFixture::empty("manager-empty-genesis", 0xefa01);
-    let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-    let handle = active
-        .handle
-        .unwrap_or_else(|| panic!("empty activation: {:?}", active.status));
-    drive_initial_feed(&handle);
-    assert!(matches!(
-        handle.clean_shutdown(),
-        Ok(SyncShutdownOutcome::Safe(_))
-    ));
-    drop(handle);
-    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-    assert!(matches!(
-        reopened.clean_shutdown(),
-        Ok(SyncShutdownOutcome::Safe(_))
-    ));
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let expected_key = DocumentKey::Entity(fixture.request.identities.catalog_document_id);
+    let frontier = resources.runtime.engine().exact_frontier().unwrap();
+    assert_eq!(frontier.documents().len(), 1);
+    assert_eq!(frontier.documents()[0].document_id(), expected_key);
+    assert_eq!(
+        resources
+            .runtime
+            .engine()
+            .graph_document_identity_for_test()
+            .unwrap(),
+        (
+            expected_key,
+            fixture.request.identities.workspace_id,
+            fixture.request.identities.lineage_digest,
+        )
+    );
+    let snapshot = resources.runtime.engine().canonical_snapshot().unwrap();
+    assert!(snapshot.pages.is_empty());
+    assert!(snapshot.blocks.is_empty());
+    assert!(snapshot.memberships.is_empty());
+    let read = resources.runtime.database().materialized_read().unwrap();
+    assert!(read.pages(None, 1).unwrap().is_empty());
+    drop(read);
+    assert_eq!(
+        resources.runtime.database().frontier_root().unwrap(),
+        resources.runtime.engine().accepted_frontier_root().unwrap()
+    );
+    drop(resources);
+
+    let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+        .unwrap()
+        .expect("empty activation marker cold-opens");
+    assert_eq!(
+        reopened
+            .runtime
+            .engine()
+            .graph_document_identity_for_test()
+            .unwrap(),
+        (
+            expected_key,
+            fixture.request.identities.workspace_id,
+            fixture.request.identities.lineage_digest,
+        )
+    );
+    assert_eq!(
+        reopened.runtime.database().frontier_root().unwrap(),
+        reopened.runtime.engine().accepted_frontier_root().unwrap()
+    );
 }
 
 fn activate_and_prepare_shared(fixture: &ActivationFixture) -> SyncSharedEnrollmentDescriptor {
@@ -15514,7 +15784,7 @@ fn submit_shared_page(
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id,
                 parent: None,
@@ -16062,7 +16332,7 @@ fn receiver_completion_defers_closed_window_external_deletion_case(
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: document_id,
+                home_document_id: test_block_home(block_id),
             },
             content: "receiver updated bytes must not resurrect".into(),
         }],
@@ -16157,7 +16427,7 @@ fn receiver_incomplete_update_maps_absent_terminal_to_deferral_case() {
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: document_id,
+                home_document_id: test_block_home(block_id),
             },
             content: "receiver recovery target".into(),
         }],
@@ -16394,7 +16664,7 @@ fn provider_edit_projects_markdown_beside_a_concurrent_external_admission() {
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: document_id,
+                home_document_id: test_block_home(block_id),
             },
             content: "second".into(),
         }],
@@ -16461,7 +16731,7 @@ fn provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_adm
         vec![SemanticOperation::MoveSubtree {
             root: BlockLocation {
                 block_id: moved_block,
-                home_document_id: source_document,
+                home_document_id: test_block_home(moved_block),
             },
             from_page_id: source_page_id,
             to_page_id: target_page_id,
@@ -16673,7 +16943,7 @@ fn provider_cross_page_move_then_delete_converges_on_the_receiver() {
             SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 from_page_id: source_page_id,
                 to_page_id: target_page_id,
@@ -17671,6 +17941,109 @@ fn two_offline_devices_union_reordered_frontier_heads_without_history_scan() {
 }
 
 #[test]
+fn foreign_path_changes_converge_while_a_foreground_page_creation_is_journal_pending() {
+    let (first, second, first_handle, second_handle) =
+        joined_shared_pair("portable-path-pending-local-create", 0xe950);
+    let (remote_batch, ..) = submit_shared_page(
+        &second_handle,
+        0xe970,
+        "Remote path",
+        "notes/Remote path.md",
+        "remote original",
+    );
+    publish_shared_batch(&second_handle, &second, remote_batch);
+    settle_shared_provider(&second_handle);
+
+    let local_name = "Pending local path";
+    let saved = first_handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: local_name.into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(
+                local_name,
+                SyncPageKind::Page,
+                None,
+                vec![BlockDto {
+                    id: "pending-local-block".into(),
+                    raw: "local original".into(),
+                    ..BlockDto::default()
+                }],
+            ),
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+        panic!("foreground creation did not save: {saved:?}");
+    };
+    let local_path = page.path;
+    assert_eq!(
+        first_handle.status().unwrap().managed_local_pending,
+        1,
+        "this is an actual undrained foreground journal, not accepted history"
+    );
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    first_handle.observe_provider().unwrap();
+    assert_eq!(
+        first_handle.status().unwrap().managed_local_pending,
+        1,
+        "provider observation must arrive while the original local frame is pending"
+    );
+    settle_shared_provider(&first_handle);
+    assert_eq!(first_handle.status().unwrap().managed_local_pending, 0);
+    assert_eq!(
+        load_application_exact(&first_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+    assert_eq!(
+        load_application_exact(&first_handle, "notes/Remote path.md")
+            .0
+            .blocks[0]
+            .raw,
+        "remote original"
+    );
+    copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+    second_handle.observe_provider().unwrap();
+    settle_shared_provider(&second_handle);
+    assert_eq!(
+        load_application_exact(&second_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+
+    let (later_batch, ..) = submit_shared_page(
+        &second_handle,
+        0xe980,
+        "After drain",
+        "notes/After drain.md",
+        "later remote original",
+    );
+    publish_shared_batch(&second_handle, &second, later_batch);
+    settle_shared_provider(&second_handle);
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    first_handle.observe_provider().unwrap();
+    settle_shared_provider(&first_handle);
+    assert_eq!(
+        load_application_exact(&first_handle, "notes/After drain.md")
+            .0
+            .blocks[0]
+            .raw,
+        "later remote original"
+    );
+    assert_eq!(
+        load_application_exact(&first_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+    assert!(matches!(
+        first_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    assert!(matches!(
+        second_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+}
+
+#[test]
 fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
     let (first, second, first_handle, second_handle) =
         joined_shared_pair("provider-two-offline-authors", 0xe400);
@@ -17741,8 +18114,32 @@ fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
 
     copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
     copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
-    let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
-    let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+    let mut first_open_counters = None;
+    let first_merged = active_handle(SyncRuntimeHandle::open_with_progress(
+        reopen_request(&first.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_open_counters = Some(counters);
+            }
+        },
+    ));
+    let mut second_open_counters = None;
+    let second_merged = active_handle(SyncRuntimeHandle::open_with_progress(
+        reopen_request(&second.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_open_counters = Some(counters);
+            }
+        },
+    ));
+    for counters in [first_open_counters, second_open_counters] {
+        let counters = counters.expect("each returning author reports its actual open path");
+        assert_eq!(
+            counters.checkpoint_opens, 1,
+            "foreign path changes must also work after checkpoint restoration"
+        );
+        assert_eq!(counters.full_replay_opens, 0);
+    }
     for _ in 0..1_024 {
         let first_tick = first_merged.tick().unwrap();
         let second_tick = second_merged.tick().unwrap();
@@ -18079,7 +18476,7 @@ fn concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantic
 
 #[test]
 fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions() {
-    fn run_case(label: &str, seed: u128, first_is_explicit: bool) -> bool {
+    fn run_case(label: &str, seed: u128, explicit_should_win: bool) -> bool {
         let (first, second, first_handle, second_handle) = joined_empty_shared_pair(label, seed);
         let target_path = "notes/Café Plan.md";
         let target_page_id = admit_shared_page(
@@ -18091,6 +18488,26 @@ fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_dire
         copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
         second_handle.observe_provider().unwrap();
         settle_shared_provider(&second_handle);
+
+        // Both updates start from the same semantic version. Concurrent exact
+        // titles are selected by the greatest immutable (causal dot, batch
+        // id), so qualify the assignment from the two durable writer records
+        // and their next dots. Endpoint role and the unrelated Loro lane value
+        // are not winner guarantees.
+        let first_lane = lane_record(&first).2;
+        let second_lane = lane_record(&second).2;
+        let first_dot = crate::oplog::BatchCausalDot::new(
+            crate::oplog::CausalPeerId::from_key(first_lane.incarnation_id),
+            lane_own_high_water(&first_lane) + 1,
+        )
+        .unwrap();
+        let second_dot = crate::oplog::BatchCausalDot::new(
+            crate::oplog::CausalPeerId::from_key(second_lane.incarnation_id),
+            lane_own_high_water(&second_lane) + 1,
+        )
+        .unwrap();
+        assert_ne!(first_dot, second_dot);
+        let first_is_explicit = (first_dot > second_dot) == explicit_should_win;
 
         for (handle, explicit) in [
             (&first_handle, first_is_explicit),
@@ -18172,15 +18589,15 @@ fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_dire
             second_merged.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+        assert_eq!(
+            explicit_won, explicit_should_win,
+            "the peer-qualified concurrent title fixture selected the wrong native register winner"
+        );
         explicit_won
     }
 
-    let first_assignment = run_case("explicit-fallback-first-explicit", 0xe800, true);
-    let reversed_assignment = run_case("explicit-fallback-first-fallback", 0xe900, false);
-    assert_ne!(
-        first_assignment, reversed_assignment,
-        "swapping explicit/fallback over fixed endpoint provenance must exercise both winners"
-    );
+    assert!(run_case("explicit-fallback-explicit-wins", 0xe800, true));
+    assert!(!run_case("explicit-fallback-filename-wins", 0xe900, false));
 }
 
 #[test]
@@ -18203,7 +18620,7 @@ fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         vec![SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: BlockId::from_uuid(Uuid::from_u128(0xb304)),
-                home_document_id: document_id,
+                home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(0xb304))),
             },
             page_id,
             parent: None,
@@ -18216,7 +18633,7 @@ fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         vec![SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: BlockId::from_uuid(Uuid::from_u128(0xb305)),
-                home_document_id: document_id,
+                home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(0xb305))),
             },
             page_id,
             parent: None,
@@ -18910,7 +19327,7 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
         publish_shared_batch(&author_handle, &author, batch_id);
         for _ in 0..256 {
             let _ = author_handle.tick().unwrap();
-            if provider_head_covers(&author, author.request.identities.device_id, batch_id)
+            if provider_head_names_tip(&author, author.request.identities.device_id, batch_id)
                 && provider_intent_count_for(&author, author.request.identities.device_id) == 0
             {
                 break;
@@ -18924,7 +19341,7 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     }
     let latest_local = *local_batches.last().unwrap();
     assert!(
-        provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+        provider_head_names_tip(&author, author.request.identities.device_id, latest_local,),
         "own durable frontier did not advance while foreign objects were withheld; \
              covered own intent counts after each publication were {intent_counts:?}"
     );
@@ -18944,12 +19361,14 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     drop(author_handle);
     let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
     assert!(
-        provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+        provider_head_names_tip(&author, author.request.identities.device_id, latest_local,),
         "restart lost the durable own frontier published during foreign delay"
     );
     let mut restarted_incomplete = false;
+    let mut restart_tick_counts = BTreeMap::<String, usize>::new();
     for _ in 0..1_024 {
         let tick = restarted.tick().unwrap();
+        *restart_tick_counts.entry(format!("{tick:?}")).or_default() += 1;
         assert!(
             !matches!(
                 tick,
@@ -18968,7 +19387,8 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     }
     assert!(
         restarted_incomplete,
-        "restart forgot the visibly incomplete foreign manifest"
+        "restart forgot the visibly incomplete foreign manifest: ticks={restart_tick_counts:?}, status={:?}",
+        restarted.status().unwrap()
     );
     let late_delivery = copy_provider_batch(
         &delayed_peer,
@@ -20263,7 +20683,7 @@ fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "first offline text".into(),
             }],
@@ -20273,7 +20693,7 @@ fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "second offline text".into(),
             }],
@@ -20404,7 +20824,7 @@ fn two_offline_edit_delete_histories_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "offline edit racing deletion".into(),
             }],
@@ -20481,7 +20901,7 @@ fn two_offline_move_delete_histories_converge_in_both_delivery_orders() {
             vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 from_page_id: source_page_id,
                 to_page_id: target_page_id,
@@ -20578,7 +20998,7 @@ fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() 
                 block_rewrites: vec![crate::oplog::BlockContentRewrite {
                     block: BlockLocation {
                         block_id: referrer_block,
-                        home_document_id: referrer_document,
+                        home_document_id: test_block_home(referrer_block),
                     },
                     new_content: "referrer [[Rename Referrer Target Renamed]]".into(),
                 }],
@@ -20590,7 +21010,7 @@ fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() 
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: referrer_block,
-                    home_document_id: referrer_document,
+                    home_document_id: test_block_home(referrer_block),
                 },
                 content: "ordinary referrer edit [[Rename Referrer Target]]".into(),
             }],
@@ -20659,7 +21079,7 @@ fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "ALPHA beta gamma".into(),
             }],
@@ -20669,7 +21089,7 @@ fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "alpha beta GAMMA".into(),
             }],
@@ -21096,6 +21516,239 @@ fn a_foreground_journal_frame_projects_into_the_same_projection_turn_view() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[test]
+fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots() {
+    let fixture = ActivationFixture::nested_unicode("foreground-birth-replay", 0xa1c0_1000);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        open_request.clone(),
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+
+    // Existing page, newly born block: the page document is authority read by
+    // the operation but is not updated. The two new roles have no pre-state.
+    let (mut existing, existing_revision) = match actor
+        .load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "Root.md".into(),
+            },
+        })
+        .unwrap()
+    {
+        SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+        other => panic!("existing birth-authority page did not load: {other:?}"),
+    };
+    existing.blocks.push(BlockDto {
+        id: "temporary-read-authority-birth".into(),
+        raw: "born under a read-only page dependency".into(),
+        ..BlockDto::default()
+    });
+    assert!(matches!(
+        actor
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: existing.path.clone(),
+                    revision: existing_revision,
+                },
+                page: existing,
+            })
+            .unwrap(),
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+
+    // Newly born page and block: all three document roles are absent from the
+    // pre-frontier and must replay from their canonical empty Loro bases.
+    let born_name = "Journal Birth Page";
+    let born_page = new_application_page(
+        born_name,
+        SyncPageKind::Page,
+        None,
+        vec![BlockDto {
+            id: "temporary-page-birth-block".into(),
+            raw: "born with its page".into(),
+            ..BlockDto::default()
+        }],
+    );
+    assert!(matches!(
+        actor
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: born_name.into(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: born_page,
+            })
+            .unwrap(),
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+
+    let frames = actor
+        .managed_local
+        .as_ref()
+        .expect("foreground birth actor retains its journal")
+        .frames
+        .iter()
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 2);
+    let existing_record = crate::oplog::decode_managed_local_record(frames[0]).unwrap();
+    let page_record = crate::oplog::decode_managed_local_record(frames[1]).unwrap();
+
+    let existing_page_id = existing_record.projection().intent().page_id();
+    let existing_page_home = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .materialize_page(existing_page_id)
+        .unwrap()
+        .home_document_id;
+    let existing_birth = existing_record
+        .semantic_effect_for_test()
+        .blocks()
+        .iter()
+        .find(|delta| delta.before.is_none() && delta.after.is_some())
+        .expect("existing-page record creates one block");
+    let existing_block_id = existing_birth.block_id;
+    let existing_block_home = existing_birth.home_document_id;
+    let existing_membership = DocumentKey::Membership {
+        block_document_id: existing_block_home,
+        page_document_id: existing_page_home,
+    };
+    let existing_pre = existing_record
+        .prepared_batch()
+        .manifest()
+        .dependency_frontier();
+    assert!(existing_pre
+        .documents()
+        .iter()
+        .any(|dependency| dependency.document_id() == DocumentKey::Entity(existing_page_home)));
+    assert!(!existing_pre.documents().iter().any(|dependency| {
+        matches!(
+            dependency.document_id(),
+            document_id if document_id == DocumentKey::Entity(existing_block_home)
+                || document_id == existing_membership
+        )
+    }));
+    let existing_witnesses = existing_record.crdt_update_witnesses_for_test();
+    assert!(!existing_witnesses
+        .iter()
+        .any(|(document_id, _)| *document_id == DocumentKey::Entity(existing_page_home)));
+    for document_id in [
+        DocumentKey::Entity(existing_block_home),
+        existing_membership,
+    ] {
+        assert_eq!(
+            existing_witnesses
+                .iter()
+                .find(|(candidate, _)| *candidate == document_id)
+                .map(|(_, witness)| *witness),
+            Some(false),
+            "a born document has an absent causal-state witness"
+        );
+    }
+
+    let born_page_id = page_record.projection().intent().page_id();
+    let born_page_state = page_record
+        .semantic_effect_for_test()
+        .pages()
+        .iter()
+        .find(|delta| delta.page_id == born_page_id)
+        .and_then(|delta| delta.after.as_ref())
+        .expect("page-birth record creates its page");
+    let born_page_home = born_page_state.home_document_id();
+    let born_block = page_record
+        .semantic_effect_for_test()
+        .blocks()
+        .iter()
+        .find(|delta| delta.before.is_none() && delta.after.is_some())
+        .expect("page-birth record creates its block");
+    let born_block_id = born_block.block_id;
+    let born_block_home = born_block.home_document_id;
+    let born_membership = DocumentKey::Membership {
+        block_document_id: born_block_home,
+        page_document_id: born_page_home,
+    };
+    let born_keys = [
+        DocumentKey::Entity(born_page_home),
+        DocumentKey::Entity(born_block_home),
+        born_membership,
+    ];
+    let page_pre = page_record
+        .prepared_batch()
+        .manifest()
+        .dependency_frontier();
+    assert!(born_keys.iter().all(|document_id| !page_pre
+        .documents()
+        .iter()
+        .any(|dependency| dependency.document_id() == *document_id)));
+    let page_witnesses = page_record.crdt_update_witnesses_for_test();
+    for document_id in born_keys {
+        assert_eq!(
+            page_witnesses
+                .iter()
+                .find(|(candidate, _)| *candidate == document_id)
+                .map(|(_, witness)| *witness),
+            Some(false),
+            "each page-forest birth role has an absent causal-state witness"
+        );
+    }
+
+    let existing_root_before = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .block_document_root_value_for_test(existing_block_id)
+        .unwrap();
+    let born_root_before = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .block_document_root_value_for_test(born_block_id)
+        .unwrap();
+    drop(actor);
+
+    let reopened = open_clean_runtime_resources(&open_request)
+        .unwrap()
+        .expect("both journal-durable births crash-replay");
+    let engine = reopened.runtime.engine();
+    assert_eq!(
+        engine
+            .block_document_root_value_for_test(existing_block_id)
+            .unwrap(),
+        existing_root_before
+    );
+    assert_eq!(
+        engine
+            .block_document_root_value_for_test(born_block_id)
+            .unwrap(),
+        born_root_before
+    );
+    let existing_page = engine.materialize_page(existing_page_id).unwrap();
+    assert!(existing_page.blocks.iter().any(|block| {
+        block.block_id == existing_block_id
+            && block.home_document_id == existing_block_home
+            && block.content == "born under a read-only page dependency"
+    }));
+    let born_page = engine.materialize_page(born_page_id).unwrap();
+    assert!(born_page.blocks.iter().any(|block| {
+        block.block_id == born_block_id
+            && block.home_document_id == born_block_home
+            && block.content == "born with its page"
+    }));
 }
 
 #[test]
@@ -30856,6 +31509,7 @@ fn c7b_navigation_overlay_pending_paths_load_at_most_once_per_request() {
 
 pub(crate) mod c7b_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(crate) static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -30863,10 +31517,26 @@ pub(crate) mod c7b_alloc {
 
     pub(crate) struct Counting;
 
+    thread_local! {
+        static THREAD_ENABLED: Cell<bool> = const { Cell::new(false) };
+        static THREAD_CALLS: Cell<usize> = const { Cell::new(0) };
+        static THREAD_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn note_thread_allocation(bytes: usize) {
+        let _ = THREAD_ENABLED.try_with(|enabled| {
+            if enabled.get() {
+                THREAD_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+                THREAD_BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
+            }
+        });
+    }
+
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             CALLS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            note_thread_allocation(layout.size());
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -30875,12 +31545,43 @@ pub(crate) mod c7b_alloc {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             CALLS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
+            note_thread_allocation(new_size.saturating_sub(layout.size()));
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
 
     pub(crate) fn snapshot() -> (usize, usize) {
         (CALLS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+    }
+
+    struct ThreadMeasurementGuard;
+
+    impl ThreadMeasurementGuard {
+        fn begin() -> Self {
+            THREAD_ENABLED.with(|enabled| {
+                assert!(!enabled.replace(true), "nested allocation measurement");
+            });
+            THREAD_CALLS.with(|calls| calls.set(0));
+            THREAD_BYTES.with(|bytes| bytes.set(0));
+            Self
+        }
+    }
+
+    impl Drop for ThreadMeasurementGuard {
+        fn drop(&mut self) {
+            THREAD_ENABLED.with(|enabled| enabled.set(false));
+        }
+    }
+
+    /// Attribute allocations made synchronously by `operation` to its calling
+    /// test thread. Other parallel tests continue contributing only to the
+    /// legacy process-wide C7b totals.
+    pub(crate) fn measure_thread<T>(operation: impl FnOnce() -> T) -> (T, (usize, usize)) {
+        let guard = ThreadMeasurementGuard::begin();
+        let result = operation();
+        let sample = (THREAD_CALLS.with(Cell::get), THREAD_BYTES.with(Cell::get));
+        drop(guard);
+        (result, sample)
     }
 }
 
@@ -35276,7 +35977,7 @@ fn cold_archive_republication_uses_accepted_names_and_preserves_original_bytes()
         .unwrap();
     let object = OperationObject::new(
         fixture.request.identities.workspace_id,
-        fixture.request.identities.catalog_document_id,
+        DocumentKey::Entity(fixture.request.identities.catalog_document_id),
         crate::oplog::ObjectKind::SemanticEffect,
         effect.clone(),
     )

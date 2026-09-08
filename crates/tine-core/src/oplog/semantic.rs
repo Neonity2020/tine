@@ -6,7 +6,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{BlockId, DocumentId, LogseqUuid, ManagedPath, ManagedTextKind, PageId};
 
-pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 6;
+pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 7;
 pub const CATALOG_PAGE_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SEMANTIC_EFFECT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SEMANTIC_DELTA_ENTRIES: usize = 100_000;
@@ -513,6 +513,7 @@ impl PageDelta {
 
         match (&self.lifecycle, &self.before, &self.after) {
             (PageDeltaLifecycle::Ordinary, None, Some(PageState::Live { .. }))
+            | (PageDeltaLifecycle::Ordinary, None, Some(PageState::Tombstone { .. }))
             | (
                 PageDeltaLifecycle::Ordinary,
                 Some(PageState::Live { .. }),
@@ -740,9 +741,17 @@ fn splice_explicit_title(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct BlockBirth {
+    pub page_id: PageId,
+    pub page_document_id: DocumentId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockDelta {
     pub block_id: BlockId,
     pub home_document_id: DocumentId,
+    pub birth: Option<BlockBirth>,
     pub before: Option<BlockState>,
     pub after: Option<BlockState>,
 }
@@ -1036,6 +1045,9 @@ impl SemanticEffect {
             if delta.before.is_some() && delta.after.is_none() {
                 return Err(SemanticError::BlockStateRemoved);
             }
+            if (delta.before.is_none() && delta.after.is_some()) != delta.birth.is_some() {
+                return Err(SemanticError::InvalidBlockBirth);
+            }
             for state in [&delta.before, &delta.after].into_iter().flatten() {
                 if state.block_id != delta.block_id
                     || state.home_document_id != delta.home_document_id
@@ -1105,6 +1117,7 @@ pub enum SemanticError {
     NonCanonical,
     UnchangedDelta,
     InvalidPageLifecycle,
+    InvalidBlockBirth,
     BlockStateRemoved,
     PagePreambleStateRemoved,
     HomeShardChanged,
@@ -1138,6 +1151,9 @@ impl fmt::Display for SemanticError {
             Self::UnchangedDelta => f.write_str("semantic effect contains an unchanged delta"),
             Self::InvalidPageLifecycle => f.write_str(
                 "invalid page lifecycle transition: creation must be None -> Live; edits must be Live -> Live; deletion must be Live -> same-kind Tombstone; revival must be explicitly discriminated RevivePage Tombstone -> same-identity Live",
+            ),
+            Self::InvalidBlockBirth => f.write_str(
+                "block birth provenance must appear exactly on a None-to-Some block transition",
             ),
             Self::BlockStateRemoved => {
                 f.write_str("authoritative block state cannot be physically removed")
@@ -1299,6 +1315,7 @@ mod tests {
             vec![BlockDelta {
                 block_id,
                 home_document_id: home,
+                birth: None,
                 before: Some(block_before),
                 after: Some(block_after),
             }],
@@ -1630,6 +1647,10 @@ mod tests {
             vec![BlockDelta {
                 block_id: block,
                 home_document_id: document_id(2),
+                birth: Some(BlockBirth {
+                    page_id: page_id(1),
+                    page_document_id: document_id(1),
+                }),
                 before: None,
                 after: Some(BlockState {
                     block_id: block,
@@ -1691,13 +1712,11 @@ mod tests {
     #[test]
     fn page_delta_lifecycle_rejects_invalid_transitions() {
         let home = document_id(2);
+        assert!(
+            page_effect(None, Some(tombstone(home, ManagedTextKind::Page))).is_ok(),
+            "None -> Tombstone is the authenticated final state of an atomic create/delete"
+        );
         let rejected = [
-            (
-                "tombstone creation",
-                None,
-                Some(tombstone(home, ManagedTextKind::Page)),
-                SemanticError::InvalidPageLifecycle,
-            ),
             (
                 "physical removal of a live page",
                 Some(live(ManagedTextKind::Page)),

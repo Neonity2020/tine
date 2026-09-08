@@ -23,9 +23,10 @@ use super::hot_engine::{
 };
 use super::object_store::ObjectStore;
 use super::{
-    BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, DeviceId,
-    DocumentDependencies, DocumentId, WriterIncarnationId,
+    BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, DocumentDependencies,
+    DocumentKey, WriterIncarnationId,
 };
+use tine_storage::sealed_accepted_index::AuthenticatedMapKey;
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_DIRECTORY: &str = "clean-open-checkpoint-v1";
@@ -87,7 +88,7 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedEvidenceDecoder
 }
 
 #[derive(Default)]
-struct CheckpointSealedStore {
+pub(crate) struct CheckpointSealedStore {
     objects: BTreeMap<(u8, ContentDigest), Vec<u8>>,
 }
 
@@ -169,7 +170,7 @@ impl CheckpointSealedStore {
     fn collect_map(
         &self,
         root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
-    ) -> Result<BTreeMap<[u8; 16], ContentDigest>, String> {
+    ) -> Result<BTreeMap<AuthenticatedMapKey, ContentDigest>, String> {
         use tine_storage::sealed_accepted_index::{
             SealedAcceptedObjectKind, SealedAuthenticatedMapNodeV2,
         };
@@ -566,7 +567,7 @@ impl SealedDocumentRoster {
         let record_blob = store.stage_capsule_blob(&record.encode()?)?;
         let map = self.map.upsert(
             store,
-            super::DocumentKey::Entity(record.dependencies.document_id()),
+            record.dependencies.document_id(),
             ContentDigest::from_bytes(*record_blob.sha256()),
         )?;
         Ok(Self { map })
@@ -575,8 +576,8 @@ impl SealedDocumentRoster {
     pub(crate) fn load_document(
         self,
         store: &SealedGenerationDirectory,
-        catalog: DocumentId,
-        document: DocumentId,
+        catalog: DocumentKey,
+        document: DocumentKey,
     ) -> Result<Option<(DocumentDependencies, loro::LoroDoc)>, String> {
         let Some(record) = self.document_record(store, document)? else {
             return Ok(None);
@@ -590,10 +591,9 @@ impl SealedDocumentRoster {
     pub(crate) fn qualify_complete_keys(
         self,
         store: &SealedGenerationDirectory,
-        documents: impl Iterator<Item = DocumentId>,
+        documents: impl Iterator<Item = DocumentKey>,
     ) -> Result<(), String> {
-        self.map
-            .qualify_complete_keys(store, documents.map(super::DocumentKey::Entity))
+        self.map.qualify_complete_keys(store, documents)
     }
 
     pub(crate) fn document_count(self) -> u64 {
@@ -603,7 +603,7 @@ impl SealedDocumentRoster {
     pub(crate) fn inherited_dependencies(
         self,
         store: &SealedGenerationStagingStore,
-        document: DocumentId,
+        document: DocumentKey,
     ) -> Result<Option<DocumentDependencies>, String> {
         if store.failed {
             return Err("sealed generation staging previously failed".into());
@@ -616,12 +616,9 @@ impl SealedDocumentRoster {
     fn document_record(
         self,
         store: &SealedGenerationDirectory,
-        document: DocumentId,
+        document: DocumentKey,
     ) -> Result<Option<DocumentCapsuleRecord>, String> {
-        let Some(address) = self
-            .map
-            .value(store, super::DocumentKey::Entity(document))?
-        else {
+        let Some(address) = self.map.value(store, document)? else {
             return Ok(None);
         };
         // The map value authenticates the descriptor bytes. Its encoded size is
@@ -696,11 +693,13 @@ impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MapRootWire {
     count: u64,
-    root_key: Option<[u8; 16]>,
+    /// The map's full root key bytes. Shared authenticated-map keys are
+    /// variable length, so this is never a fixed-width identity field.
+    root_key: Option<Vec<u8>>,
     root_digest: Option<ContentDigest>,
 }
 
@@ -712,7 +711,7 @@ struct SequenceRootWire {
     root_digest: Option<ContentDigest>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RosterRootsWire {
     batch_map: MapRootWire,
@@ -725,7 +724,7 @@ fn map_root_to_wire(
 ) -> MapRootWire {
     MapRootWire {
         count: root.count,
-        root_key: root.root.map(|link| link.key),
+        root_key: root.root.map(|link| link.key.as_slice().to_vec()),
         root_digest: root.root.map(|link| link.digest),
     }
 }
@@ -734,8 +733,12 @@ fn map_root_from_wire(
     wire: MapRootWire,
 ) -> Result<tine_storage::sealed_accepted_index::AuthenticatedMapRootV1, String> {
     use tine_storage::sealed_accepted_index::{AuthenticatedMapLinkV1, AuthenticatedMapRootV1};
-    let root = match (wire.root_key, wire.root_digest) {
-        (Some(key), Some(digest)) => Some(AuthenticatedMapLinkV1 { key, digest }),
+    let root = match (wire.root_key.as_deref(), wire.root_digest) {
+        (Some(key), Some(digest)) => Some(AuthenticatedMapLinkV1 {
+            key: AuthenticatedMapKey::new(key)
+                .map_err(|error| format!("clean checkpoint map root key is invalid: {error}"))?,
+            digest,
+        }),
         (None, None) => None,
         _ => return Err("clean checkpoint map root is partial".into()),
     };
@@ -933,7 +936,8 @@ impl<Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore>
         // unreachable construction objects; predecessor roots still resolve.
         let roots = append_accepted_row(self.store, self.cutoff.roots, row)?;
         let frontier = row.evidence.post_frontier_root();
-        if roots.batch_map.root.map(|link| link.key) != frontier.batch_map_root_key()
+        if roots.batch_map.root.map(|link| link.key)
+            != frontier.batch_map_root_key().map(AuthenticatedMapKey::from)
             || roots.batch_map.root_digest() != frontier.batch_map_root_digest()
             || roots.sequence.len != frontier.acceptance_sequence()
         {
@@ -1477,7 +1481,10 @@ pub(crate) fn open_checkpoint(
             Ok(Some(entry)) => entry,
             Ok(None) | Err(_) => return Ok(invalid("clean checkpoint sequence is incomplete")),
         };
-        let Some(status_address) = status_addresses.get(&entry.batch_id).copied() else {
+        let Some(status_address) = status_addresses
+            .get(&AuthenticatedMapKey::from(entry.batch_id))
+            .copied()
+        else {
             return Ok(invalid("clean checkpoint sequence names no status"));
         };
         let status = match tine_storage::sealed_accepted_index::AcceptedStatusRecordV2::decode(
@@ -1494,7 +1501,10 @@ pub(crate) fn open_checkpoint(
             Ok(status) if entry.accepted_status_value_digest == status.value_digest() => status,
             Ok(_) | Err(_) => return Ok(invalid("clean checkpoint status binding failed")),
         };
-        let Some(causal_address) = causal_addresses.get(&entry.batch_id).copied() else {
+        let Some(causal_address) = causal_addresses
+            .get(&AuthenticatedMapKey::from(entry.batch_id))
+            .copied()
+        else {
             return Ok(invalid("clean checkpoint sequence names no causal record"));
         };
         if causal_address != status.accepted_causal_record_digest {
@@ -1738,10 +1748,12 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oplog::hot_engine::test_block_home;
     use crate::oplog::hot_engine::{
         accepted_causal_record_digest, authenticated_causal_clock_root, AcceptedFrontierRoot,
     };
     use crate::oplog::{BatchCausalDot, BatchId, CausalPeerId, ContentDigest, DeviceId};
+    use loro::ContainerTrait;
     use tine_storage::sealed_accepted_index::{
         AcceptedSequenceEntryV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
         AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
@@ -1901,10 +1913,11 @@ mod tests {
         let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(101));
         let lineage = LineageDigest::of(b"sealed-cutoff-engine");
         let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(102));
-        let (checkpoint, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
-            .unwrap()
-            .finish()
-            .unwrap();
+        let (checkpoint, dependencies) =
+            LazyGenesisCheckpointBuilder::new(catalog, workspace, lineage)
+                .unwrap()
+                .finish()
+                .unwrap();
         let baseline = Arc::new(
             LazyGenesisPackBuilder::new(
                 workspace,
@@ -1964,7 +1977,9 @@ mod tests {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: BlockId::from_uuid(uuid::Uuid::from_u128(400_000 + n)),
-                        home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300_000 + n)),
+                        home_document_id: test_block_home(BlockId::from_uuid(
+                            uuid::Uuid::from_u128(400_000 + n),
+                        )),
                     },
                     page_id: PageId::from_uuid(uuid::Uuid::from_u128(200_000 + n)),
                     parent: None,
@@ -2001,7 +2016,7 @@ mod tests {
                     .build_sealed_accepted_cutoff(&mut nodes, cutoff.as_ref())
                     .unwrap();
                 let compact = engine
-                    .build_compact_accepted_document(&current, catalog)
+                    .build_compact_accepted_document(&current, DocumentKey::Entity(catalog))
                     .unwrap();
                 let pruned_bytes = crate::oplog::hot_engine::probe_pruned_checkpoint_bytes(
                     catalog,
@@ -2013,8 +2028,10 @@ mod tests {
                     .capture_live_graph_document_closure(&current)
                     .unwrap();
                 assert_eq!(closure.document_count(), 2);
-                assert!(closure.contains(catalog));
-                assert!(closure.contains(DocumentId::from_uuid(uuid::Uuid::from_u128(300_000))));
+                assert!(closure.contains(DocumentKey::Entity(catalog)));
+                assert!(closure.contains(DocumentKey::Entity(DocumentId::from_uuid(
+                    uuid::Uuid::from_u128(300_000)
+                ))));
                 let mut staging = SealedGenerationStagingStore::open(&directory).unwrap();
                 if let Some(previous) = &previous_closure {
                     assert!(engine
@@ -2051,7 +2068,7 @@ mod tests {
                 vec![SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id,
-                        home_document_id: home,
+                        home_document_id: test_block_home(block_id),
                     },
                     page_id: page,
                     parent: None,
@@ -2073,7 +2090,7 @@ mod tests {
                     .build_sealed_accepted_cutoff(&mut nodes, cutoff.as_ref())
                     .unwrap();
                 let compact = engine
-                    .build_compact_accepted_document(&current, home)
+                    .build_compact_accepted_document(&current, DocumentKey::Entity(home))
                     .unwrap();
                 let pruned_bytes = crate::oplog::hot_engine::probe_pruned_checkpoint_bytes(
                     catalog,
@@ -2113,10 +2130,11 @@ mod tests {
         let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(101));
         let lineage = LineageDigest::of(b"sealed-cutoff-engine");
         let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(102));
-        let (checkpoint, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
-            .unwrap()
-            .finish()
-            .unwrap();
+        let (checkpoint, dependencies) =
+            LazyGenesisCheckpointBuilder::new(catalog, workspace, lineage)
+                .unwrap()
+                .finish()
+                .unwrap();
         let baseline = Arc::new(
             LazyGenesisPackBuilder::new(
                 workspace,
@@ -2164,20 +2182,28 @@ mod tests {
         drop(empty_disk);
 
         for n in 1..=2 {
+            let page_id = PageId::from_uuid(uuid::Uuid::from_u128(200 + n));
+            let page_home = DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n));
+            let block_id = crate::oplog::BlockId::from_uuid(uuid::Uuid::from_u128(600 + n));
+            let block_home = test_block_home(block_id);
+            let membership = DocumentKey::Membership {
+                block_document_id: block_home,
+                page_document_id: page_home,
+            };
             let transaction = OperationTransaction::new(vec![
                 SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200 + n)),
-                    home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+                    page_id,
+                    home_document_id: page_home,
                     name: LogicalPageName::parse(format!("Page {n}")).unwrap(),
                     path: ManagedPath::parse(format!("pages/Page{n}.md")).unwrap(),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreateBlock {
                     block: crate::oplog::BlockLocation {
-                        block_id: crate::oplog::BlockId::from_uuid(uuid::Uuid::from_u128(600 + n)),
-                        home_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+                        block_id,
+                        home_document_id: block_home,
                     },
-                    page_id: PageId::from_uuid(uuid::Uuid::from_u128(200 + n)),
+                    page_id,
                     parent: None,
                     order: "a".into(),
                     content: format!("Nested CRDT text {n}"),
@@ -2205,7 +2231,7 @@ mod tests {
                 outcome.disposition()
             );
             assert!(engine
-                .build_compact_accepted_document(&cutoff, catalog)
+                .build_compact_accepted_document(&cutoff, DocumentKey::Entity(catalog))
                 .is_err());
             let before = engine.capture_clean_checkpoint(0).unwrap().state_bytes;
             let manifests = archive.committed_manifest_names().unwrap();
@@ -2215,16 +2241,20 @@ mod tests {
             assert_eq!(cutoff.roots().sequence.len, n as u64);
             let previous_roster = roster;
             let mut capsule_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
-            for id in [
-                catalog,
-                DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+            for document_id in [
+                DocumentKey::Entity(catalog),
+                DocumentKey::Entity(page_home),
+                DocumentKey::Entity(block_home),
+                membership,
             ] {
-                let compact = engine.build_compact_accepted_document(&cutoff, id).unwrap();
+                let compact = engine
+                    .build_compact_accepted_document(&cutoff, document_id)
+                    .unwrap();
                 assert_eq!(
                     compact.cutoff_state_digest(),
                     cutoff.frontier().state_digest()
                 );
-                assert_eq!(compact.dependencies().document_id(), id);
+                assert_eq!(compact.dependencies().document_id(), document_id);
                 let restored = loro::LoroDoc::new();
                 assert!(restored
                     .import(compact.checkpoint())
@@ -2251,16 +2281,34 @@ mod tests {
             }
             drop(capsule_store.finish().unwrap());
             let reopened_capsules = SealedGenerationDirectory::open(&capsule_dir).unwrap();
-            for id in std::iter::once(catalog)
-                .chain((1..=n).map(|i| DocumentId::from_uuid(uuid::Uuid::from_u128(300 + i))))
-            {
+            let mut expected_document_keys = vec![DocumentKey::Entity(catalog)];
+            for i in 1..=n {
+                let page_home = DocumentId::from_uuid(uuid::Uuid::from_u128(300 + i));
+                let block_id = crate::oplog::BlockId::from_uuid(uuid::Uuid::from_u128(600 + i));
+                let block_home = test_block_home(block_id);
+                expected_document_keys.extend([
+                    DocumentKey::Entity(page_home),
+                    DocumentKey::Entity(block_home),
+                    DocumentKey::Membership {
+                        block_document_id: block_home,
+                        page_document_id: page_home,
+                    },
+                ]);
+            }
+            for document_id in expected_document_keys {
                 let (dependencies, restored) = roster
-                    .load_document(&reopened_capsules, catalog, id)
+                    .load_document(
+                        &reopened_capsules,
+                        DocumentKey::Entity(catalog),
+                        document_id,
+                    )
                     .unwrap()
                     .unwrap();
-                let compact = engine.build_compact_accepted_document(&cutoff, id).unwrap();
+                let compact = engine
+                    .build_compact_accepted_document(&cutoff, document_id)
+                    .unwrap();
                 let expected = super::super::hot_engine::qualify_compact_document(
-                    catalog,
+                    DocumentKey::Entity(catalog),
                     compact.dependencies(),
                     &compact.checkpoint().to_vec(),
                 )
@@ -2269,15 +2317,23 @@ mod tests {
                 assert_eq!(restored.get_deep_value(), expected.get_deep_value());
                 assert_eq!(restored.oplog_frontiers(), expected.oplog_frontiers());
             }
-            assert_eq!(roster.document_count(), n as u64 + 1);
+            assert_eq!(roster.document_count(), n as u64 * 3 + 1);
             if n == 2 {
                 let id = DocumentId::from_uuid(uuid::Uuid::from_u128(301));
                 let old = previous_roster
-                    .load_document(&reopened_capsules, catalog, id)
+                    .load_document(
+                        &reopened_capsules,
+                        DocumentKey::Entity(catalog),
+                        DocumentKey::Entity(id),
+                    )
                     .unwrap()
                     .unwrap();
                 let new = roster
-                    .load_document(&reopened_capsules, catalog, id)
+                    .load_document(
+                        &reopened_capsules,
+                        DocumentKey::Entity(catalog),
+                        DocumentKey::Entity(id),
+                    )
                     .unwrap()
                     .unwrap();
                 assert_eq!(old.0, new.0);
@@ -2291,7 +2347,11 @@ mod tests {
                     if n == 1 { None } else { Some(previous_roster) },
                 )
                 .unwrap();
-            assert_eq!(written, 2, "only catalog plus new page need compaction");
+            assert_eq!(
+                written,
+                if n == 1 { 4 } else { 3 },
+                "the first roster writes graph/page/block/pair; incremental growth reuses unchanged graph metadata"
+            );
             assert_eq!(automatic.map, roster.map);
             drop(complete_store.finish().unwrap());
             engine
@@ -2319,7 +2379,10 @@ mod tests {
             assert!(unchanged.finish().is_err());
 
             let address = SealedAcceptedIndexReader::new(&reopened_capsules)
-                .map_value(roster.map.entity_root(), catalog.as_uuid().into_bytes())
+                .map_value(
+                    roster.map.entity_root(),
+                    DocumentKey::Entity(catalog).authenticated_map_key(),
+                )
                 .unwrap()
                 .unwrap();
             let path = capsule_root.join(capsule_blob_name(address));
@@ -2329,7 +2392,7 @@ mod tests {
             let mut extra_root = SealedAcceptedIndexWriter::new(&mut extra_store)
                 .upsert_map(
                     roster.map.entity_root(),
-                    extra_id.as_uuid().into_bytes(),
+                    DocumentKey::Entity(extra_id).authenticated_map_key(),
                     address,
                 )
                 .unwrap();
@@ -2352,20 +2415,36 @@ mod tests {
             let exact_checkpoint = std::fs::read(&checkpoint_path).unwrap();
             std::fs::write(&checkpoint_path, b"torn checkpoint").unwrap();
             assert!(roster
-                .load_document(&reopened_capsules, catalog, catalog)
+                .load_document(
+                    &reopened_capsules,
+                    DocumentKey::Entity(catalog),
+                    DocumentKey::Entity(catalog)
+                )
                 .is_err());
             std::fs::write(&checkpoint_path, &exact_checkpoint).unwrap();
             std::fs::write(&path, b"torn descriptor").unwrap();
             assert!(roster
-                .load_document(&reopened_capsules, catalog, catalog)
+                .load_document(
+                    &reopened_capsules,
+                    DocumentKey::Entity(catalog),
+                    DocumentKey::Entity(catalog)
+                )
                 .is_err());
             std::fs::remove_file(&path).unwrap();
             assert!(roster
-                .load_document(&reopened_capsules, catalog, catalog)
+                .load_document(
+                    &reopened_capsules,
+                    DocumentKey::Entity(catalog),
+                    DocumentKey::Entity(catalog)
+                )
                 .is_err());
             std::fs::write(&path, &exact).unwrap();
             assert!(roster
-                .load_document(&reopened_capsules, catalog, catalog)
+                .load_document(
+                    &reopened_capsules,
+                    DocumentKey::Entity(catalog),
+                    DocumentKey::Entity(catalog)
+                )
                 .unwrap()
                 .is_some());
             // Validly addressed but semantically wrong bytes must not qualify.
@@ -2383,7 +2462,7 @@ mod tests {
             let bad_root = SealedAcceptedIndexWriter::new(&mut malformed)
                 .upsert_map(
                     roster.map.entity_root(),
-                    catalog.as_uuid().into_bytes(),
+                    DocumentKey::Entity(catalog).authenticated_map_key(),
                     ContentDigest::from_bytes(*bad_blob.sha256()),
                 )
                 .unwrap();
@@ -2393,7 +2472,7 @@ mod tests {
                 0,
             ));
             let wrong_dependencies = DocumentDependencies::new(
-                catalog,
+                DocumentKey::Entity(catalog),
                 wrong_vector,
                 record.dependencies.direct_dependency_heads().to_vec(),
             )
@@ -2408,7 +2487,7 @@ mod tests {
             let wrong_root = SealedAcceptedIndexWriter::new(&mut malformed)
                 .upsert_map(
                     roster.map.entity_root(),
-                    catalog.as_uuid().into_bytes(),
+                    DocumentKey::Entity(catalog).authenticated_map_key(),
                     ContentDigest::from_bytes(*wrong_blob.sha256()),
                 )
                 .unwrap();
@@ -2416,15 +2495,27 @@ mod tests {
             assert!(SealedDocumentRoster {
                 map: roster.map.with_entity_root_for_test(bad_root)
             }
-            .load_document(&reopened_capsules, catalog, catalog)
+            .load_document(
+                &reopened_capsules,
+                DocumentKey::Entity(catalog),
+                DocumentKey::Entity(catalog)
+            )
             .is_err());
             assert!(SealedDocumentRoster {
                 map: roster.map.with_entity_root_for_test(wrong_root)
             }
-            .load_document(&reopened_capsules, catalog, catalog)
+            .load_document(
+                &reopened_capsules,
+                DocumentKey::Entity(catalog),
+                DocumentKey::Entity(catalog)
+            )
             .is_err());
             assert!(roster
-                .load_document(&reopened_capsules, catalog, catalog)
+                .load_document(
+                    &reopened_capsules,
+                    DocumentKey::Entity(catalog),
+                    DocumentKey::Entity(catalog)
+                )
                 .unwrap()
                 .is_some());
             drop(reopened_capsules);
@@ -2451,13 +2542,23 @@ mod tests {
         assert_eq!(cutoff.frontier(), independent.frontier());
         let mut disk = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
         let mut full_roster = SealedDocumentRoster::empty();
-        for id in [
-            catalog,
-            DocumentId::from_uuid(uuid::Uuid::from_u128(301)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(302)),
-        ] {
+        let mut all_document_keys = vec![DocumentKey::Entity(catalog)];
+        for i in 1..=2 {
+            let page_home = DocumentId::from_uuid(uuid::Uuid::from_u128(300 + i));
+            let block_id = crate::oplog::BlockId::from_uuid(uuid::Uuid::from_u128(600 + i));
+            let block_home = test_block_home(block_id);
+            all_document_keys.extend([
+                DocumentKey::Entity(page_home),
+                DocumentKey::Entity(block_home),
+                DocumentKey::Membership {
+                    block_document_id: block_home,
+                    page_document_id: page_home,
+                },
+            ]);
+        }
+        for document_id in all_document_keys {
             let compact = replay
-                .build_compact_accepted_document(&independent, id)
+                .build_compact_accepted_document(&independent, document_id)
                 .unwrap();
             full_roster = full_roster
                 .with_document(&mut disk, &independent, &compact)
@@ -2495,9 +2596,9 @@ mod tests {
         let destination_home = DocumentId::from_uuid(uuid::Uuid::from_u128(1107));
         let block = BlockLocation {
             block_id: BlockId::from_uuid(uuid::Uuid::from_u128(1105)),
-            home_document_id: home,
+            home_document_id: test_block_home(BlockId::from_uuid(uuid::Uuid::from_u128(1105))),
         };
-        let (bytes, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+        let (bytes, dependencies) = LazyGenesisCheckpointBuilder::new(catalog, workspace, lineage)
             .unwrap()
             .finish()
             .unwrap();
@@ -2627,9 +2728,25 @@ mod tests {
                 .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
                 .unwrap();
             let compact = engine
-                .build_compact_accepted_document(&cutoff, home)
+                .build_compact_accepted_document(&cutoff, DocumentKey::Entity(home))
                 .unwrap();
             let compact_bytes = compact.checkpoint().to_vec();
+            let block_compact = engine
+                .build_compact_accepted_document(
+                    &cutoff,
+                    DocumentKey::Entity(block.home_document_id),
+                )
+                .unwrap();
+            let block_compact_bytes = block_compact.checkpoint().to_vec();
+            let old_block = super::super::hot_engine::qualify_compact_document(
+                DocumentKey::Entity(catalog),
+                block_compact.dependencies(),
+                &block_compact_bytes,
+            )
+            .unwrap();
+            let old_block_text = crate::oplog::retirable_document::root_text(&old_block);
+            let old_block_root = old_block_text.id();
+            let old_block_content = old_block_text.to_string();
             let tail_id = 3 + round * 2;
             let incoming_id = tail_id + 1;
             let updated = format!("{} {tail_label}", content(&engine));
@@ -2687,6 +2804,45 @@ mod tests {
                 compact_bytes,
                 "old compact bytes changed"
             );
+            let recovered_cutoff = recovered
+                .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
+                .unwrap();
+            let current_page_compact = recovered
+                .build_compact_accepted_document(&recovered_cutoff, DocumentKey::Entity(home))
+                .unwrap();
+            assert_eq!(
+                current_page_compact.checkpoint(),
+                compact_bytes,
+                "an untouched page document changed while its block was edited"
+            );
+            let current_block_compact = recovered
+                .build_compact_accepted_document(
+                    &recovered_cutoff,
+                    DocumentKey::Entity(block.home_document_id),
+                )
+                .unwrap();
+            assert_ne!(
+                current_block_compact.checkpoint(),
+                block_compact_bytes,
+                "an edited block incorrectly reused its predecessor checkpoint"
+            );
+            let current_block_checkpoint = current_block_compact.checkpoint().to_vec();
+            let current_block = super::super::hot_engine::qualify_compact_document(
+                DocumentKey::Entity(catalog),
+                current_block_compact.dependencies(),
+                &current_block_checkpoint,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::oplog::retirable_document::root_text(&current_block).id(),
+                old_block_root,
+                "returning-peer replay changed the block's stable root text identity"
+            );
+            assert_eq!(
+                crate::oplog::retirable_document::root_text(&old_block).to_string(),
+                old_block_content,
+                "the retained predecessor block checkpoint was mutated"
+            );
             for preserved in ["MAIN", "TAIL", offline_label] {
                 assert!(
                     content(&recovered).contains(preserved),
@@ -2704,7 +2860,7 @@ mod tests {
                 .find(|entry| entry.block_id == block.block_id)
                 .unwrap();
             assert_eq!(membership.page_id, destination);
-            assert_eq!(membership.home_document_id, home);
+            assert_eq!(membership.home_document_id, block.home_document_id);
             assert_eq!(
                 snapshot
                     .blocks
@@ -2712,7 +2868,7 @@ mod tests {
                     .find(|entry| entry.block_id == block.block_id)
                     .unwrap()
                     .home_document_id,
-                home
+                block.home_document_id
             );
 
             // Negative control: rebuilding only through C and then accepting
@@ -2733,11 +2889,24 @@ mod tests {
             let next = recovered
                 .build_sealed_accepted_cutoff(&mut SealedMemoryStore::default(), None)
                 .unwrap();
-            for id in [catalog, home, destination_home] {
+            for document_id in [
+                DocumentKey::Entity(catalog),
+                DocumentKey::Entity(home),
+                DocumentKey::Entity(destination_home),
+                DocumentKey::Entity(block.home_document_id),
+                DocumentKey::Membership {
+                    block_document_id: block.home_document_id,
+                    page_document_id: home,
+                },
+                DocumentKey::Membership {
+                    block_document_id: block.home_document_id,
+                    page_document_id: destination_home,
+                },
+            ] {
                 let next_compact = recovered
-                    .build_compact_accepted_document(&next, id)
+                    .build_compact_accepted_document(&next, document_id)
                     .unwrap();
-                assert_eq!(next_compact.dependencies().document_id(), id);
+                assert_eq!(next_compact.dependencies().document_id(), document_id);
             }
             assert_eq!(next.roots().sequence.len as usize, accepted.len());
             // Only the test's engine handle moves here. Durable marker/actor
@@ -2781,20 +2950,51 @@ mod tests {
         let (complete, written) = engine
             .build_compact_document_roster(&final_cutoff, &mut staging, None)
             .unwrap();
-        assert_eq!(written, 3);
+        assert_eq!(written, 6);
         let disk = staging.finish().unwrap();
         engine
             .qualify_full_document_roster(&final_cutoff, complete, &disk)
             .unwrap();
         assert!(complete
-            .load_document(&disk, catalog, home)
+            .load_document(
+                &disk,
+                DocumentKey::Entity(catalog),
+                DocumentKey::Entity(home)
+            )
             .unwrap()
             .is_some());
+        for document_id in [
+            DocumentKey::Entity(block.home_document_id),
+            DocumentKey::Membership {
+                block_document_id: block.home_document_id,
+                page_document_id: home,
+            },
+            DocumentKey::Membership {
+                block_document_id: block.home_document_id,
+                page_document_id: destination_home,
+            },
+        ] {
+            assert!(complete
+                .load_document(&disk, DocumentKey::Entity(catalog), document_id)
+                .unwrap()
+                .is_some());
+        }
         let closure = engine
             .capture_live_graph_document_closure(&final_cutoff)
             .unwrap();
-        assert_eq!(closure.document_count(), 3);
-        assert!(closure.contains(home));
+        assert_eq!(closure.document_count(), 4);
+        assert!(!closure.contains(DocumentKey::Entity(home)));
+        for document_id in [
+            DocumentKey::Entity(catalog),
+            DocumentKey::Entity(destination_home),
+            DocumentKey::Entity(block.home_document_id),
+            DocumentKey::Membership {
+                block_document_id: block.home_document_id,
+                page_document_id: destination_home,
+            },
+        ] {
+            assert!(closure.contains(document_id));
+        }
         let mut live_store = SealedGenerationStagingStore::open(&directory).unwrap();
         let live_roster = engine
             .build_live_graph_document_roster(&final_cutoff, &mut live_store, &closure)
@@ -2805,9 +3005,9 @@ mod tests {
             .unwrap();
         let mut incomplete_store = SealedGenerationStagingStore::open(&directory).unwrap();
         let mut visible_only = SealedDocumentRoster::empty();
-        for id in [catalog, destination_home] {
+        for id in [catalog, destination_home, block.home_document_id] {
             let compact = engine
-                .build_compact_accepted_document(&final_cutoff, id)
+                .build_compact_accepted_document(&final_cutoff, DocumentKey::Entity(id))
                 .unwrap();
             visible_only = visible_only
                 .with_document(&mut incomplete_store, &final_cutoff, &compact)
@@ -2816,6 +3016,9 @@ mod tests {
         drop(incomplete_store.finish().unwrap());
         assert!(engine
             .qualify_full_document_roster(&final_cutoff, visible_only, &disk)
+            .is_err());
+        assert!(engine
+            .qualify_live_graph_document_roster(&final_cutoff, visible_only, &disk, &closure,)
             .is_err());
         drop(disk);
         drop(directory);
@@ -3920,7 +4123,7 @@ mod tests {
         publish_capture(&store, empty_capture(b"stable checkpoint")).unwrap();
         let object = OperationObject::new(
             store.workspace_id(),
-            DocumentId::from_uuid(uuid::Uuid::new_v4()),
+            DocumentKey::Entity(DocumentId::from_uuid(uuid::Uuid::new_v4())),
             ObjectKind::CrdtUpdate,
             b"valid orphaned operation object".to_vec(),
         )

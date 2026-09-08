@@ -23,10 +23,10 @@ use std::io;
 use super::object_store::BatchInspection;
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlobDescription, BlockId,
-    CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
-    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
-    MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore, PageId,
-    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
+    CleanTombstoneAuthorization, DocumentKey, EngineError, LogseqIdentityOrigin, LogseqUuid,
+    ManagedPath, ManifestProjectionPrecondition, ManifestProjectionTarget,
+    ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
+    PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
     ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
     ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionTurn,
     ProjectionWork, ProjectionWorkTarget, ReceiptError, SequenceDomain, ShardedHotEngine,
@@ -4441,7 +4441,7 @@ mod tests {
                         logseq_uuid,
                         vec![ProjectionClaimParticipant::new(
                             block.block_id,
-                            block.home_document_id,
+                            DocumentKey::Entity(block.home_document_id),
                         )],
                     )
                     .unwrap()
@@ -4452,7 +4452,7 @@ mod tests {
             FrontierV2::default()
         } else {
             FrontierV2::new(vec![DocumentDependencies::new(
-                home_document_id,
+                DocumentKey::Entity(home_document_id),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(80_003), 0)],
                 Vec::new(),
             )

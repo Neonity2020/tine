@@ -549,6 +549,7 @@ pub(crate) fn frontier_strictly_dominates(later: &FrontierV2, earlier: &Frontier
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
     use uuid::Uuid;
 
     use super::*;
@@ -558,7 +559,7 @@ mod tests {
 
     fn frontier(counter: u64) -> FrontierV2 {
         FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentId::from_uuid(Uuid::from_u128(0xc3_1000)),
+            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc3_1000))),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(7), counter)],
             Vec::new(),
         )
@@ -647,7 +648,7 @@ mod tests {
             page_id,
             path.clone(),
             FrontierV2::new(vec![DocumentDependencies::new(
-                DocumentId::from_uuid(Uuid::from_u128(0xc3_1031)),
+                DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc3_1031))),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(9), 1)],
                 Vec::new(),
             )

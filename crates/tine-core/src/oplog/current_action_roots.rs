@@ -77,7 +77,7 @@ use super::object_store::{
     read_optional_regular, require_regular_entry,
 };
 use super::{
-    BatchId, DocumentId, FrontierV2, ManagedPath, ObjectStore, PageId, ProjectionIntent,
+    BatchId, DocumentKey, FrontierV2, ManagedPath, ObjectStore, PageId, ProjectionIntent,
     ProjectionIntentId, StoreError, WorkspaceId,
 };
 
@@ -857,7 +857,7 @@ impl CurrentActionRoots {
 /// cold-pack responsibility; this names the closure, nothing else.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RetentionClosure {
-    pub(crate) documents: BTreeSet<DocumentId>,
+    pub(crate) documents: BTreeSet<DocumentKey>,
     pub(crate) batches: BTreeSet<BatchId>,
     pub(crate) pages: BTreeSet<PageId>,
     pub(crate) intents: BTreeSet<ProjectionIntentId>,

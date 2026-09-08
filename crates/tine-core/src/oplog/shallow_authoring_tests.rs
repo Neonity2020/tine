@@ -128,8 +128,8 @@ fn update_ranges_start_at_exact_retained_peer_counters() {
     let first = source
         .export(ExportMode::updates(&before.oplog_vv()))
         .unwrap();
-    validate_update_base(id, &before, &first).unwrap();
-    assert!(validate_update_base(id, &source, &first).is_err());
+    validate_update_base(DocumentKey::Entity(id), &before, &first).unwrap();
+    assert!(validate_update_base(DocumentKey::Entity(id), &source, &first).is_err());
     let compact = LoroDoc::new();
     compact
         .import(&source.export(ExportMode::shallow_snapshot(&floor)).unwrap())
@@ -140,7 +140,7 @@ fn update_ranges_start_at_exact_retained_peer_counters() {
     let update = tail
         .export(ExportMode::updates(&compact.oplog_vv()))
         .unwrap();
-    validate_update_base(id, &compact, &update).unwrap();
+    validate_update_base(DocumentKey::Entity(id), &compact, &update).unwrap();
     let other = clone_doc(&compact, 402).unwrap();
     other.get_text("text").insert(0, "other ").unwrap();
     other.commit();
@@ -153,7 +153,7 @@ fn update_ranges_start_at_exact_retained_peer_counters() {
     let combined = tail
         .export(ExportMode::updates(&compact.oplog_vv()))
         .unwrap();
-    validate_update_base(id, &compact, &combined).unwrap();
+    validate_update_base(DocumentKey::Entity(id), &compact, &combined).unwrap();
 }
 
 #[test]
@@ -184,10 +184,12 @@ fn exact_frontier_alone_does_not_reject_overlapping_peer_ranges() {
     let permissive = clone_doc(&before, 504).unwrap();
     assert!(permissive.import(&overlapping).unwrap().pending.is_none());
     assert_eq!(permissive.get_text("text").to_string(), "abc");
-    assert!(matches!(validate_update_base(id, &before, &overlapping),
-        Err(EngineError::CrdtUpdateBaseMismatch(found)) if found == id));
+    assert!(
+        matches!(validate_update_base(DocumentKey::Entity(id), &before, &overlapping),
+        Err(EngineError::CrdtUpdateBaseMismatch(found)) if found == DocumentKey::Entity(id))
+    );
     let exact = source
         .export(ExportMode::updates(&before.oplog_vv()))
         .unwrap();
-    validate_update_base(id, &before, &exact).unwrap();
+    validate_update_base(DocumentKey::Entity(id), &before, &exact).unwrap();
 }
