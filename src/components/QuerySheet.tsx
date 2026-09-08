@@ -24,8 +24,11 @@ import {
   filterLabel,
   filterValueLabel,
   filterPhrase,
+  groupSelected,
   groupWithPrevious,
+  isDisabledAt,
   journalFilter,
+  moveSibling,
   namespaceFilter,
   onPageFilter,
   pageRefFilter,
@@ -43,6 +46,7 @@ import {
   searchFilter,
   setOp,
   taskFilter,
+  toggleDisabledAt,
   unwrapAt,
   wrapAt,
   BETWEEN_FIELDS,
@@ -50,6 +54,7 @@ import {
   PRIORITIES,
   type BetweenField,
   type BuilderLeafKind,
+  type GroupChoice,
   type PhraseSegment,
   type PropertyLeafTest,
   type PropertyOperatorId,
@@ -67,6 +72,11 @@ import { PropertyType, effectiveTypeOf, registryRowFor } from "./PropertyType";
 import { Listbox, stop, type ListboxOption } from "./QueryListbox";
 import { QueryVocabularyPicker, type VocabularyChoice } from "./QueryVocabularyPicker";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
+import {
+  beginQuerySheetReorder,
+  cancelQuerySheetReorder,
+  type QuerySheetDropTarget,
+} from "./querySheetReorder";
 import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } from "../transientLayers";
 
 // **The query builder's two states (SPEC §7.2, design §2.1).**
@@ -375,7 +385,18 @@ type SheetNode =
       /** The condition inside the wrappers. */
       core: Filter;
       negated: boolean;
+      /** Where the `not` ITSELF is, when the row has one. A row wears its `not`
+       *  and its `off` in either order, so the negative operator's own node is
+       *  not always at `loc` — and an edit aimed at `loc` would then remove the
+       *  wrong wrapper. `null` when the row is positive. */
+      negLoc: number[] | null;
+      /** This node carries its OWN `off` — the state its enabled control owns. */
       disabled: boolean;
+      /** An ANCESTOR is disabled, so this condition does not run whatever its
+       *  own switch says. Rendered as its own words rather than folded into
+       *  `disabled`: a control that claimed flipping this row could bring it
+       *  back would be lying about §3.5's structural omission (P6). */
+      inherited: boolean;
     }
   | {
       kind: "group";
@@ -385,10 +406,13 @@ type SheetNode =
       opLoc: number[];
       header: "all of" | "any of" | "none of" | "not all of";
       negated: boolean;
+      /** Where the `not` itself is — see the row's own note. */
+      negLoc: number[] | null;
       disabled: boolean;
+      inherited: boolean;
       children: SheetNode[];
     }
-  | { kind: "advanced"; loc: number[]; filter: Filter };
+  | { kind: "advanced"; loc: number[]; filter: Filter; disabled: boolean; inherited: boolean };
 
 /**
  * **The tree, as rows and groups (§7.4, design §2.5).**
@@ -401,11 +425,14 @@ type SheetNode =
  * negative operator and the row's greyed state. Around a group it is the
  * group's header and the group's greyed state.
  */
-function buildNodes(filter: Filter, loc: number[], depth: number): SheetNode {
-  if (depth >= MAX_QUERY_BUILDER_DEPTH) return { kind: "advanced", loc, filter };
+function buildNodes(filter: Filter, loc: number[], depth: number, inherited = false): SheetNode {
+  if (depth >= MAX_QUERY_BUILDER_DEPTH) {
+    return { kind: "advanced", loc, filter, disabled: isDisabledAt(filter, []), inherited };
+  }
   let node = filter;
   let at = loc;
   let negated = false;
+  let negLoc: number[] | null = null;
   let disabled = false;
   // Peel the decorations. `off` is P6's to toggle, but §3.5 requires the state
   // to RENDER now: a disabled row is present, round-trips, and does not run.
@@ -418,12 +445,16 @@ function buildNodes(filter: Filter, loc: number[], depth: number): SheetNode {
     }
     if (node.kind === "not" && !negated && (isLeafLike(node.inner) || node.inner.kind === "off")) {
       negated = true;
+      negLoc = at;
       node = node.inner;
       at = [...at, 0];
       continue;
     }
     break;
   }
+  // Everything below a disabled node is disabled too, whatever its own wrapper
+  // says: `Off` is structural omission of the whole subtree (§3.5).
+  const under = inherited || disabled;
   if (node.kind === "and" || node.kind === "or") {
     return {
       kind: "group",
@@ -431,8 +462,10 @@ function buildNodes(filter: Filter, loc: number[], depth: number): SheetNode {
       opLoc: at,
       header: negated ? (node.kind === "or" ? "none of" : "not all of") : node.kind === "or" ? "any of" : "all of",
       negated,
+      negLoc,
       disabled,
-      children: node.items.map((item, index) => buildNodes(item, [...at, index], depth + 1)),
+      inherited,
+      children: node.items.map((item, index) => buildNodes(item, [...at, index], depth + 1, under)),
     };
   }
   if (node.kind === "not") {
@@ -445,13 +478,218 @@ function buildNodes(filter: Filter, loc: number[], depth: number): SheetNode {
         opLoc: [...at, 0],
         header: inner.kind === "or" ? "none of" : "not all of",
         negated: true,
+        negLoc: at,
         disabled,
-        children: inner.items.map((item, index) => buildNodes(item, [...at, 0, index], depth + 1)),
+        inherited,
+        children: inner.items.map((item, index) => buildNodes(item, [...at, 0, index], depth + 1, under)),
       };
     }
-    return { kind: "row", loc, filter, core: inner, negated: true, disabled };
+    return { kind: "row", loc, filter, core: inner, negated: true, negLoc: at, disabled, inherited };
   }
-  return { kind: "row", loc, filter, core: node, negated, disabled };
+  return { kind: "row", loc, filter, core: node, negated, negLoc, disabled, inherited };
+}
+
+// ---------------------------------------------------------------------------
+// Selecting, disabling and reordering (§7.4 remainder, P6)
+// ---------------------------------------------------------------------------
+
+/** A node's place among its siblings — everything selection, moving and
+ *  dropping need, derived from the node's own `loc` plus how many siblings the
+ *  list it lives in has. */
+interface SiblingPos {
+  /** The boolean node whose child list this item is in. */
+  parentLoc: number[];
+  index: number;
+  count: number;
+}
+
+const posOf = (loc: number[], count: number): SiblingPos => ({
+  parentLoc: loc.slice(0, -1),
+  index: loc[loc.length - 1],
+  count,
+});
+
+/** **What is selected, in ONE rendered boolean list (§7.4).**
+ *
+ *  Selection is sibling-local by construction, not by a check afterwards: it
+ *  names one parent and indices inside it, so "select a row in a different
+ *  group" cannot express a selection that spans two lists and a group operation
+ *  can never move a condition between them. Choosing a sibling elsewhere starts
+ *  a new selection rather than extending this one. */
+interface SheetSelection {
+  parentLoc: number[];
+  indices: number[];
+}
+
+/** The controls the rows share. They are the sheet's, not each row's: selection
+ *  and an in-flight drag are ONE state for the whole sheet, and both are
+ *  invalidated by the same event — a new root revision. */
+interface SheetControls {
+  selection: () => SheetSelection | null;
+  isSelected: (loc: number[]) => boolean;
+  toggleSelected: (loc: number[]) => void;
+  clearSelection: () => void;
+  /** Add or remove this node's own `Off`. */
+  toggleEnabled: (loc: number[]) => void;
+  /** Move within the list, by the index the item ends at. */
+  move: (pos: SiblingPos, to: number) => void;
+  startDrag: (event: PointerEvent, pos: SiblingPos) => void;
+  dropTarget: () => QuerySheetDropTarget | null;
+}
+
+/** The drop indicator classes for one item, or nothing when the drag is
+ *  elsewhere. Keyed by the LIST as well as the index: two lists can both have
+ *  an item 0, and only the dragged item's own list may draw a line. */
+function dropClasses(controls: SheetControls, pos: SiblingPos): Record<string, boolean> {
+  const target = controls.dropTarget();
+  const mine = !!target && target.parent === locKey(pos.parentLoc) && target.index === pos.index;
+  return {
+    "qs-drop-before": mine && target!.before,
+    "qs-drop-after": mine && !target!.before,
+  };
+}
+
+/** **The drag handle, and the keyboard operation that equals it (§7.4, §7.7).**
+ *
+ *  A drag starts HERE and nowhere else, so typing a value, pressing a menu,
+ *  scrolling and selecting text are untouched. It is a button rather than a
+ *  decorated `<span>` because the keyboard has to reach the same operation: Up
+ *  and Down on a focused handle move the item exactly as a drop would, through
+ *  the same `moveSibling`, and focus stays on the handle that moved so a second
+ *  press continues rather than starting over. */
+function DragHandle(props: { pos: SiblingPos; label: string; controls: SheetControls }): JSX.Element {
+  const loc = () => [...props.pos.parentLoc, props.pos.index];
+  return (
+    <button
+      type="button"
+      class="qs-drag-handle"
+      data-qs-handle={locKey(loc())}
+      aria-label={props.label}
+      aria-keyshortcuts="ArrowUp ArrowDown"
+      title="Drag to reorder, or use the up and down arrow keys"
+      onPointerDown={(event) => props.controls.startDrag(event, props.pos)}
+      onKeyDown={(event) => {
+        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+        event.preventDefault();
+        event.stopPropagation();
+        props.controls.move(props.pos, props.pos.index + (event.key === "ArrowUp" ? -1 : 1));
+      }}
+      onClick={stop}
+    >
+      ⋮⋮
+    </button>
+  );
+}
+
+/** **The selection box — NOT the enabled control (§7.4).**
+ *
+ *  They were one control in the chip bar's descendants and in most filter
+ *  builders: a checkbox that both picked the row and switched it off. Two
+ *  questions ("which rows am I about to group?" and "which conditions run?")
+ *  answered by one box means every grouping gesture silently changes what the
+ *  query returns. */
+function SelectBox(props: { pos: SiblingPos; label: string; controls: SheetControls }): JSX.Element {
+  const loc = () => [...props.pos.parentLoc, props.pos.index];
+  return (
+    <label class="qs-select-target" onClick={stop}>
+      <input
+        type="checkbox"
+        class="qs-select"
+        aria-label={props.label}
+        checked={props.controls.isSelected(loc())}
+        onChange={() => props.controls.toggleSelected(loc())}
+      />
+    </label>
+  );
+}
+
+/** **The enabled control: this node's own `Off`, told honestly (§3.5, §7.4).**
+ *
+ *  `aria-checked` is the node's OWN state, because that is the only state this
+ *  switch owns. When an ancestor is disabled the row does not run whatever this
+ *  switch says, and the row says so in words beside it rather than letting the
+ *  switch imply that one press here would bring the condition back. */
+function EnabledSwitch(props: {
+  loc: number[];
+  disabled: boolean;
+  inherited: boolean;
+  label: string;
+  controls: SheetControls;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="switch"
+      class="qs-enabled"
+      aria-label={props.label}
+      aria-checked={props.disabled ? "false" : "true"}
+      title={
+        props.inherited
+          ? "The group above is disabled, so this does not run"
+          : props.disabled
+            ? "Disabled — kept in the query, not run"
+            : "Running — press to disable without removing it"
+      }
+      onClick={(event) => {
+        stop(event);
+        props.controls.toggleEnabled(props.loc);
+      }}
+    >
+      {props.disabled ? "○" : "●"}
+    </button>
+  );
+}
+
+/** Why this item is greyed, in the sheet's own words. `null` when it runs. */
+function offLabel(node: { disabled: boolean; inherited: boolean }): string | null {
+  if (node.inherited) return "disabled by group";
+  return node.disabled ? "disabled" : null;
+}
+
+/** The move entries every item's ⋮ menu carries, offered only where they mean
+ *  something: the first item has nothing above it and the last has nothing
+ *  below. They move the SAME siblings the drag does, through the same helper. */
+function moveOptions(pos: SiblingPos): ListboxOption[] {
+  const options: ListboxOption[] = [];
+  if (pos.index > 0) options.push({ key: "move-up", label: "Move up" });
+  if (pos.index < pos.count - 1) options.push({ key: "move-down", label: "Move down" });
+  if (pos.index > 0) {
+    options.push(
+      { key: "group-above-all", label: "Group with row above — all of" },
+      { key: "group-above-any", label: "Group with row above — any of" },
+      { key: "group-above-none", label: "Group with row above — none of" },
+    );
+  }
+  return options;
+}
+
+const GROUP_ABOVE_CHOICE: Record<string, GroupChoice> = {
+  "group-above-all": "all",
+  "group-above-any": "any",
+  "group-above-none": "none",
+};
+
+/** Handle one of {@link moveOptions}' keys. `false` means "not mine" — the
+ *  caller's own menu entries (Remove, Ungroup, None of) follow. */
+function pickMoveOption(
+  key: string,
+  pos: SiblingPos,
+  node: { loc: number[] },
+  sheet: QuerySheetProps,
+  controls: SheetControls,
+): boolean {
+  if (key === "move-up") {
+    controls.move(pos, pos.index - 1);
+    return true;
+  }
+  if (key === "move-down") {
+    controls.move(pos, pos.index + 1);
+    return true;
+  }
+  const choice = GROUP_ABOVE_CHOICE[key];
+  if (!choice) return false;
+  sheet.apply(groupWithPrevious(sheet.root(), node.loc, choice));
+  return true;
 }
 
 /** A popover anchored to a trigger button, registered in the dismissal ladder. */
@@ -773,12 +1011,115 @@ export interface QuerySheetProps {
   stale?: boolean;
 }
 
+/** `openMenu`'s key for the "Group selected ▾" chooser. */
+const GROUP_SELECTED_MENU_KEY = "group-selected";
+
 export function QuerySheet(props: QuerySheetProps): JSX.Element {
   const nodes = createMemo(() => buildNodes(props.root(), [], 0));
   const isEmpty = createMemo(() => {
     const node = nodes();
     return node.kind === "group" && node.children.length === 0;
   });
+
+  // -- selection, disabling and reordering (§7.4 remainder, P6) --------------
+
+  const [selection, setSelection] = createSignal<SheetSelection | null>(null);
+  const [dropTarget, setDropTarget] = createSignal<QuerySheetDropTarget | null>(null);
+  let sheetEl: HTMLDivElement | undefined;
+
+  /** **A loc is a path into a ROOT REVISION, not a node's identity.**
+   *
+   *  The moment the tree on screen is replaced — by this sheet's own edit, by a
+   *  save in the text pane, by an anchor switch, by the block being re-read
+   *  after an external file change or a graph transition — every index a
+   *  selection or a drag is holding addresses a position that may now mean
+   *  something else. There is no remapping that could be right, so both are
+   *  dropped and an in-flight drag is cancelled without applying. This is also
+   *  what clears the selection after a successful group: the edit lands, the
+   *  root changes, the boxes empty. */
+  createEffect(() => {
+    props.root();
+    props.anchor();
+    setSelection(null);
+    cancelQuerySheetReorder();
+  });
+  onCleanup(() => cancelQuerySheetReorder());
+
+  /** Put the keyboard back on the control that just moved. The row list is
+   *  rebuilt from the new tree, so the button the user was on is a different
+   *  element at a different place; without this a second Down press would have
+   *  nothing to act on. */
+  const refocusHandle = (loc: number[]) => {
+    const find = () => sheetEl?.querySelector<HTMLElement>(`[data-qs-handle="${locKey(loc)}"]`) ?? null;
+    const now = find();
+    if (now) now.focus();
+    else queueMicrotask(() => find()?.focus());
+  };
+
+  const controls: SheetControls = {
+    selection,
+    isSelected: (loc) => {
+      const current = selection();
+      return (
+        !!current
+        && locKey(current.parentLoc) === locKey(loc.slice(0, -1))
+        && current.indices.includes(loc[loc.length - 1])
+      );
+    },
+    toggleSelected: (loc) => {
+      const parentLoc = loc.slice(0, -1);
+      const index = loc[loc.length - 1];
+      setSelection((current) => {
+        // A sibling of a DIFFERENT list starts a new selection: conditions are
+        // never implicitly carried out of the group they were written in.
+        if (!current || locKey(current.parentLoc) !== locKey(parentLoc)) {
+          return { parentLoc, indices: [index] };
+        }
+        const indices = current.indices.includes(index)
+          ? current.indices.filter((other) => other !== index)
+          : [...current.indices, index].sort((a, b) => a - b);
+        return indices.length ? { parentLoc, indices } : null;
+      });
+    },
+    clearSelection: () => setSelection(null),
+    toggleEnabled: (loc) => props.apply(toggleDisabledAt(props.root(), loc)),
+    move: (pos, to) => {
+      const root = props.root();
+      const next = moveSibling(root, [...pos.parentLoc, pos.index], to);
+      // `moveSibling` hands the tree back unchanged for a boundary or a stale
+      // path, and an unchanged tree is not an edit: a save at the end of a list
+      // would put an undo step on the stack that undoes nothing.
+      if (next === root) return;
+      props.apply(next);
+      refocusHandle([...pos.parentLoc, to]);
+    },
+    startDrag: (event, pos) => {
+      const root = props.root();
+      beginQuerySheetReorder(event, {
+        parent: locKey(pos.parentLoc),
+        from: pos.index,
+        isCurrent: () => props.root() === root,
+        setTarget: setDropTarget,
+        commit: (to) => controls.move(pos, to),
+      });
+    },
+    dropTarget,
+  };
+
+  const groupSelection = (choice: GroupChoice) => {
+    const current = selection();
+    props.setOpenMenu(null);
+    if (!current || current.indices.length < 2) return;
+    const root = props.root();
+    const next = groupSelected(
+      root,
+      current.indices.map((index) => [...current.parentLoc, index]),
+      choice,
+    );
+    if (next === root) return;
+    setSelection(null);
+    props.apply(next);
+  };
   // The add-condition chooser is one of the sheet's menus, not a signal of its
   // own: sharing `openMenu` is what makes opening it close a row's menu, and
   // what tells the HOST that a press belongs to the menu's rung of the ladder
@@ -796,7 +1137,10 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
 
   return (
     <div
-      ref={props.sheetRef}
+      ref={(element) => {
+        sheetEl = element;
+        props.sheetRef?.(element);
+      }}
       class="qs-sheet"
       classList={{ "qs-sheet-stale": props.stale }}
       role="group"
@@ -816,10 +1160,21 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
         node={nodes()}
         isRoot
         sheet={props}
+        controls={controls}
         adding={adding}
         setAdding={setAdding}
         onAdd={addAtRoot}
       />
+      <Show when={selection()}>
+        {(current) => (
+          <SelectionBar
+            selection={current()}
+            sheet={props}
+            controls={controls}
+            onGroup={groupSelection}
+          />
+        )}
+      </Show>
       <Show when={isEmpty() && props.suggestions().length > 0}>
         <div class="qs-try">
           <span class="qs-try-label">Try:</span>
@@ -959,18 +1314,98 @@ function AnchorPromptPanel(props: { prompt: AnchorPrompt }): JSX.Element {
 // Rows and groups
 // ---------------------------------------------------------------------------
 
+/** **"Group selected ▾", and what is selected right now (§7.4).**
+ *
+ *  One bar for the whole sheet rather than a control per list: the selection is
+ *  already one list's, and a phone-width row has no space for a sixth control.
+ *  It states the count, because a non-contiguous selection two groups down is
+ *  otherwise invisible, and it offers the same three headers a group can carry.
+ *  Grouping needs two; with one selected the action is offered but refused, so
+ *  the rule is visible rather than mysterious. */
+function SelectionBar(props: {
+  selection: SheetSelection;
+  sheet: QuerySheetProps;
+  controls: SheetControls;
+  onGroup: (choice: GroupChoice) => void;
+}): JSX.Element {
+  let trigger: HTMLButtonElement | undefined;
+  const menuId = `qs-group-selected-${createUniqueId()}`;
+  const open = () => props.sheet.openMenu() === GROUP_SELECTED_MENU_KEY;
+  const count = () => props.selection.indices.length;
+  return (
+    <div class="qs-selection" role="group" aria-label="Selected conditions">
+      <span class="qs-selection-count">{count()} selected</span>
+      <span class="qs-menu-wrap">
+        <button
+          ref={trigger}
+          type="button"
+          class="qs-group-selected"
+          disabled={count() < 2}
+          title={count() < 2 ? "Select two or more conditions to group them" : undefined}
+          aria-haspopup="listbox"
+          aria-expanded={open() ? "true" : "false"}
+          aria-controls={menuId}
+          onClick={(e) => {
+            stop(e);
+            props.sheet.setOpenMenu(open() ? null : GROUP_SELECTED_MENU_KEY);
+          }}
+        >
+          Group selected ▾
+        </button>
+        <Popover
+          open={open}
+          close={() => props.sheet.setOpenMenu(null)}
+          parentId={props.sheet.layerId}
+          trigger={() => trigger ?? null}
+        >
+          {(rootRef) => (
+            <Listbox
+              id={menuId}
+              label="Group the selected conditions"
+              rootRef={rootRef}
+              options={GROUP_CHOICES}
+              onPick={(key) => props.onGroup(key as GroupChoice)}
+            />
+          )}
+        </Popover>
+      </span>
+      <button type="button" class="qs-selection-clear" onClick={(e) => {
+        stop(e);
+        props.controls.clearSelection();
+      }}>
+        Clear
+      </button>
+    </div>
+  );
+}
+
+/** The three group headers, in the order the sheet's own menus use. */
+const GROUP_CHOICES: ListboxOption[] = [
+  { key: "all", label: "All of" },
+  { key: "any", label: "Any of" },
+  { key: "none", label: "None of" },
+];
+
 function NodeList(props: {
   node: SheetNode;
   isRoot?: boolean;
   sheet: QuerySheetProps;
+  controls: SheetControls;
+  /** Where this group sits among its own siblings; absent at the root, which
+   *  is the sheet's implicit list and has no controls of its own. */
+  pos?: SiblingPos;
   adding?: Accessor<boolean>;
   setAdding?: (open: boolean) => void;
   onAdd?: (filter: Filter) => void;
 }): JSX.Element {
   return (
-    <Show when={props.node.kind === "group"} fallback={<SheetItem node={props.node} sheet={props.sheet} />}>
+    <Show
+      when={props.node.kind === "group"}
+      fallback={<SheetItem node={props.node} sheet={props.sheet} controls={props.controls} pos={props.pos!} />}
+    >
       {(() => {
         const group = props.node as Extract<SheetNode, { kind: "group" }>;
+        const count = () => group.children.length;
         const body = (
           <>
             <div
@@ -979,16 +1414,31 @@ function NodeList(props: {
               aria-label={props.isRoot ? "Query conditions" : `Conditions, ${group.header}`}
             >
               <For each={group.children}>
-                {(child) => (
-                  <Show
-                    when={child.kind === "group"}
-                    fallback={<SheetItem node={child} sheet={props.sheet} />}
-                  >
-                    <div class="qs-listitem" role="listitem">
-                      <NodeList node={child} sheet={props.sheet} />
-                    </div>
-                  </Show>
-                )}
+                {(child, index) => {
+                  const pos = (): SiblingPos => posOf(child.loc, count());
+                  return (
+                    <Show
+                      when={child.kind === "group"}
+                      fallback={
+                        <SheetItem node={child} sheet={props.sheet} controls={props.controls} pos={pos()} />
+                      }
+                    >
+                      {/* The group's own item in THIS list: it is what a drop
+                          lands on when the pointer is anywhere inside it, which
+                          is how a nested row can never become a drop target of
+                          its grandparent's list. */}
+                      <div
+                        class="qs-listitem"
+                        role="listitem"
+                        data-qs-parent={locKey(group.opLoc)}
+                        data-row-index={index()}
+                        classList={dropClasses(props.controls, pos())}
+                      >
+                        <NodeList node={child} sheet={props.sheet} controls={props.controls} pos={pos()} />
+                      </div>
+                    </Show>
+                  );
+                }}
               </For>
             </div>
             <Show when={props.isRoot}>
@@ -1004,8 +1454,8 @@ function NodeList(props: {
         return props.isRoot ? (
           body
         ) : (
-          <div class="qs-group" classList={{ "qs-off": group.disabled }}>
-            <GroupHeader group={group} sheet={props.sheet} />
+          <div class="qs-group" classList={{ "qs-off": group.disabled || group.inherited }}>
+            <GroupHeader group={group} sheet={props.sheet} controls={props.controls} pos={props.pos!} />
             {body}
           </div>
         );
@@ -1017,6 +1467,8 @@ function NodeList(props: {
 function GroupHeader(props: {
   group: Extract<SheetNode, { kind: "group" }>;
   sheet: QuerySheetProps;
+  controls: SheetControls;
+  pos: SiblingPos;
 }): JSX.Element {
   let menuTrigger: HTMLButtonElement | undefined;
   const menuKey = () => `group-menu:${locKey(props.group.loc)}`;
@@ -1031,6 +1483,8 @@ function GroupHeader(props: {
   };
   return (
     <div class="qs-group-header">
+      <DragHandle pos={props.pos} label="Move group" controls={props.controls} />
+      <SelectBox pos={props.pos} label="Select group" controls={props.controls} />
       <button
         type="button"
         class="qs-group-op"
@@ -1070,16 +1524,24 @@ function GroupHeader(props: {
               label="Group actions"
               rootRef={rootRef}
               options={[
+                ...moveOptions(props.pos),
                 { key: "none", label: props.group.negated ? "Remove none of" : "None of" },
-                { key: "ungroup", label: "Ungroup" },
+                // A group inside a `not`/`off` has no list to splice its rows
+                // into, and inventing one is a De Morgan rewrite §3.5 forbids.
+                // The action is left OUT where it cannot be performed rather
+                // than offered as a press that saves an unchanged tree.
+                ...(unwrapAt(root(), props.group.opLoc) !== root()
+                  ? [{ key: "ungroup", label: "Ungroup" }]
+                  : []),
                 { key: "remove", label: "Remove" },
               ]}
               onPick={(key) => {
                 props.sheet.setOpenMenu(null);
+                if (pickMoveOption(key, props.pos, props.group, props.sheet, props.controls)) return;
                 if (key === "none") {
                   props.sheet.apply(
-                    props.group.negated
-                      ? unwrapAt(root(), props.group.loc)
+                    props.group.negated && props.group.negLoc
+                      ? unwrapAt(root(), props.group.negLoc)
                       : wrapAt(root(), props.group.opLoc, "not"),
                   );
                 } else if (key === "ungroup") {
@@ -1092,17 +1554,46 @@ function GroupHeader(props: {
           )}
         </Popover>
       </span>
+      {/* A group is disabled the same way a row is — one `Off` around the node
+          the header names — so it is the SAME control and the same helper. */}
+      <EnabledSwitch
+        loc={props.group.loc}
+        disabled={props.group.disabled}
+        inherited={props.group.inherited}
+        label="Group enabled"
+        controls={props.controls}
+      />
+      <Show when={offLabel(props.group)}>
+        {(label) => <span class="qs-off-label">{label()}</span>}
+      </Show>
     </div>
   );
 }
 
-function SheetItem(props: { node: SheetNode; sheet: QuerySheetProps }): JSX.Element {
+function SheetItem(props: {
+  node: SheetNode;
+  sheet: QuerySheetProps;
+  controls: SheetControls;
+  pos: SiblingPos;
+}): JSX.Element {
   return (
     <Show
       when={props.node.kind === "advanced"}
-      fallback={<QueryRow node={props.node as Extract<SheetNode, { kind: "row" }>} sheet={props.sheet} />}
+      fallback={
+        <QueryRow
+          node={props.node as Extract<SheetNode, { kind: "row" }>}
+          sheet={props.sheet}
+          controls={props.controls}
+          pos={props.pos}
+        />
+      }
     >
-      <AdvancedChip node={props.node as Extract<SheetNode, { kind: "advanced" }>} sheet={props.sheet} />
+      <AdvancedChip
+        node={props.node as Extract<SheetNode, { kind: "advanced" }>}
+        sheet={props.sheet}
+        controls={props.controls}
+        pos={props.pos}
+      />
     </Show>
   );
 }
@@ -1127,10 +1618,26 @@ function SheetItem(props: { node: SheetNode; sheet: QuerySheetProps }): JSX.Elem
 function AdvancedChip(props: {
   node: Extract<SheetNode, { kind: "advanced" }>;
   sheet: QuerySheetProps;
+  controls: SheetControls;
+  pos: SiblingPos;
 }): JSX.Element {
   const phrase = () => `${ADVANCED_PHRASE} ${filterLabel(props.node.filter)}`;
   return (
-    <div class="qs-row qs-row-advanced" role="listitem">
+    <div
+      class="qs-row qs-row-advanced"
+      role="listitem"
+      data-qs-parent={locKey(props.pos.parentLoc)}
+      data-row-index={props.pos.index}
+      classList={{
+        "qs-off": props.node.disabled || props.node.inherited,
+        ...dropClasses(props.controls, props.pos),
+      }}
+    >
+      {/* A folded subtree is a sibling like any other: it selects, it moves and
+          it disables. Its payload is opaque to the sheet, which is exactly why
+          none of those three may re-read or rewrite it (§7.4, §4.3.2). */}
+      <DragHandle pos={props.pos} label="Move condition" controls={props.controls} />
+      <SelectBox pos={props.pos} label="Select condition" controls={props.controls} />
       <Show
         when={props.sheet.onEditText}
         fallback={<span class="qs-advanced" title="edit in the query text below">{phrase()}</span>}
@@ -1148,6 +1655,17 @@ function AdvancedChip(props: {
           {phrase()}
         </button>
       </Show>
+      <EnabledSwitch
+        loc={props.node.loc}
+        disabled={props.node.disabled}
+        inherited={props.node.inherited}
+        label="Condition enabled"
+        controls={props.controls}
+      />
+      <Show when={offLabel(props.node)}>
+        {(label) => <span class="qs-off-label">{label()}</span>}
+      </Show>
+      <AdvancedMenu node={props.node} sheet={props.sheet} controls={props.controls} pos={props.pos} />
       <button
         type="button"
         class="qs-row-remove"
@@ -1161,6 +1679,60 @@ function AdvancedChip(props: {
         ×
       </button>
     </div>
+  );
+}
+
+/** The folded subtree's ⋮: the move and group entries every sibling has, and
+ *  nothing that would edit a payload this row cannot read. */
+function AdvancedMenu(props: {
+  node: Extract<SheetNode, { kind: "advanced" }>;
+  sheet: QuerySheetProps;
+  controls: SheetControls;
+  pos: SiblingPos;
+}): JSX.Element {
+  let trigger: HTMLButtonElement | undefined;
+  const menuKey = () => `advanced-menu:${locKey(props.node.loc)}`;
+  const open = () => props.sheet.openMenu() === menuKey();
+  const menuId = `qs-advanced-menu-${createUniqueId()}`;
+  return (
+    <Show when={moveOptions(props.pos).length > 0}>
+      <span class="qs-menu-wrap">
+        <button
+          ref={trigger}
+          type="button"
+          class="qs-row-menu"
+          aria-label="Row actions"
+          aria-haspopup="listbox"
+          aria-expanded={open() ? "true" : "false"}
+          aria-controls={menuId}
+          onClick={(e) => {
+            stop(e);
+            props.sheet.setOpenMenu(open() ? null : menuKey());
+          }}
+        >
+          ⋮
+        </button>
+        <Popover
+          open={open}
+          close={() => props.sheet.setOpenMenu(null)}
+          parentId={props.sheet.layerId}
+          trigger={() => trigger ?? null}
+        >
+          {(rootRef) => (
+            <Listbox
+              id={menuId}
+              label="Row actions"
+              rootRef={rootRef}
+              options={moveOptions(props.pos)}
+              onPick={(key) => {
+                props.sheet.setOpenMenu(null);
+                pickMoveOption(key, props.pos, props.node, props.sheet, props.controls);
+              }}
+            />
+          )}
+        </Popover>
+      </span>
+    </Show>
   );
 }
 
@@ -1178,6 +1750,8 @@ function effectiveFor(
 function QueryRow(props: {
   node: Extract<SheetNode, { kind: "row" }>;
   sheet: QuerySheetProps;
+  controls: SheetControls;
+  pos: SiblingPos;
 }): JSX.Element {
   const core = () => props.node.core;
   const root = () => props.sheet.root();
@@ -1312,8 +1886,8 @@ function QueryRow(props: {
     // The positive leaf is what a negative operator wraps, so flipping is
     // wrapping or unwrapping exactly one `not`.
     props.sheet.apply(
-      props.node.negated
-        ? unwrapAt(root(), props.node.loc)
+      props.node.negated && props.node.negLoc
+        ? unwrapAt(root(), props.node.negLoc)
         : wrapAt(root(), props.node.loc, "not"),
     );
     props.sheet.setOpenMenu(null);
@@ -1323,8 +1897,18 @@ function QueryRow(props: {
     <div
       class="qs-row"
       role="listitem"
-      classList={{ "qs-row-raw": !!raw(), "qs-off": props.node.disabled }}
+      data-qs-parent={locKey(props.pos.parentLoc)}
+      data-row-index={props.pos.index}
+      classList={{
+        "qs-row-raw": !!raw(),
+        "qs-off": props.node.disabled || props.node.inherited,
+        ...dropClasses(props.controls, props.pos),
+      }}
     >
+      {/* A disabled row is still a row: it can be selected, moved and dragged.
+          Only the controls that would EDIT the condition wait (§7.4). */}
+      <DragHandle pos={props.pos} label="Move condition" controls={props.controls} />
+      <SelectBox pos={props.pos} label="Select condition" controls={props.controls} />
       <Show
         when={!raw()}
         fallback={
@@ -1561,6 +2145,13 @@ function QueryRow(props: {
           </Show>
         </span>
       </Show>
+      <EnabledSwitch
+        loc={props.node.loc}
+        disabled={props.node.disabled}
+        inherited={props.node.inherited}
+        label="Condition enabled"
+        controls={props.controls}
+      />
       <span class="qs-menu-wrap">
         <button
           ref={rowMenuTrigger}
@@ -1588,17 +2179,11 @@ function QueryRow(props: {
               id={rowMenuId}
               label="Row actions"
               rootRef={rootRef}
-              options={[
-                { key: "group", label: "Group with row above" },
-                { key: "remove", label: "Remove" },
-              ]}
+              options={[...moveOptions(props.pos), { key: "remove", label: "Remove" }]}
               onPick={(picked) => {
                 props.sheet.setOpenMenu(null);
-                props.sheet.apply(
-                  picked === "group"
-                    ? groupWithPrevious(root(), props.node.loc)
-                    : removeAt(root(), props.node.loc),
-                );
+                if (pickMoveOption(picked, props.pos, props.node, props.sheet, props.controls)) return;
+                props.sheet.apply(removeAt(root(), props.node.loc));
               }}
             />
           )}
@@ -1616,8 +2201,8 @@ function QueryRow(props: {
       >
         ×
       </button>
-      <Show when={props.node.disabled}>
-        <span class="qs-off-label">disabled</span>
+      <Show when={offLabel(props.node)}>
+        {(label) => <span class="qs-off-label">{label()}</span>}
       </Show>
     </div>
   );

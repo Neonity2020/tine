@@ -1,9 +1,9 @@
-// Linux real-WebKit journey for the two states of the visual query builder
-// (SPEC §7.2–§7.4): a `{{query}}` block RESTS as one plain-English sentence and
-// EXPANDS into a sheet of rows, and what the sheet writes is still an ordinary
-// Logseq-readable query block.
+// Linux real-WebKit journey for the visual query builder (SPEC §7.2–§7.4): a
+// `{{query}}` block RESTS as one plain-English sentence, EXPANDS into a sheet of
+// rows, and every P6 grouping/enable/reorder edit remains an ordinary,
+// Logseq-readable query block after save, undo and restart.
 //
-// Two things need a real browser rather than jsdom.
+// Three things need a real browser rather than jsdom.
 //
 //  1. The sheet is PORTALLED to <body> and positioned from the sentence's rect,
 //     because `.query-block` carries `transform: translateZ(0)` (the GH #64
@@ -17,6 +17,11 @@
 //     re-read by Rust; a jsdom test can only mock that. Restarting the app and
 //     finding the same sentence is the only proof that what landed on disk says
 //     what the sheet said (I-4).
+//
+//  3. P6's pointer cancellation, keyboard focus continuity, and 390px target
+//     geometry are properties of the native WebKit event/layout path. The last
+//     launch uses the Rust-owned narrow-window E2E policy rather than mutating a
+//     frontend viewport signal.
 import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -24,6 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { openPageByName } from "./lib/e2e-navigation.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
@@ -33,16 +39,17 @@ const APP = process.env.TINE_APP || path.join(ROOT, "target/release/tine");
 const TD = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver") : "tauri-driver");
 const DRIVER_BASE = Number(process.env.E2E_DRIVER_PORT || 4496);
 const NATIVE_BASE = Number(process.env.E2E_NATIVE_PORT || 4497);
-const TMP = "/tmp/tine-query-sheet-e2e";
+const TMP_ROOT = path.resolve(process.env.E2E_TMP_ROOT || process.env.TMPDIR || "/tmp");
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+const TMP = fs.mkdtempSync(path.join(TMP_ROOT, "tine-query-sheet-e2e-"));
 const GRAPH = `${TMP}/graph`;
 
-fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq"]) fs.mkdirSync(`${GRAPH}/${dir}`, { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(`${TMP}/xdg/${dir}`, { recursive: true });
 fs.writeFileSync(`${GRAPH}/logseq/config.edn`, "{}\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
-fs.writeFileSync(`${GRAPH}/journals/${journal}.md`, "- Open [[Sheet]] and [[Deep]]\n");
+fs.writeFileSync(`${GRAPH}/journals/${journal}.md`, "- Open [[Sheet]], [[Deep]], and [[P6 controls]]\n");
 
 // The second query block is the CONTROL: nothing in this journey touches it, so
 // after the first block is edited its bytes must be exactly what they were
@@ -71,6 +78,19 @@ fs.writeFileSync(
   `- {{query ${"(and ".repeat(20)}(task TODO)${")".repeat(20)}}}\n`,
 );
 
+// Four distinct siblings make order and grouping visible in both the sheet and
+// the engine-printed source. The second block is a byte sentinel: no P6 gesture
+// targets it, so any rewrite of it exposes an over-broad save boundary.
+const P6_QUERY = '- {{query (and "alpha" "beta" "gamma" "delta")}}';
+const P6_UNTOUCHED = '- {{query (and  (property "guard"   "keep-these-bytes"))}}';
+const P6_FILE = `${GRAPH}/pages/P6 controls.md`;
+fs.writeFileSync(P6_FILE, [
+  P6_QUERY,
+  P6_UNTOUCHED,
+  "- alpha beta gamma delta fixture",
+  "",
+].join("\n"));
+
 const env = {
   ...process.env,
   TINE_GRAPH: GRAPH,
@@ -83,12 +103,15 @@ const env = {
   GDK_BACKEND: "x11",
 };
 
-async function withApp(index, fn) {
+async function withApp(index, fn, { forceMobile = false } = {}) {
   const driverPort = DRIVER_BASE + index * 2;
   const nativePort = NATIVE_BASE + index * 2;
   const log = fs.openSync(`${TMP}/tauri-driver-${index}.log`, "w");
+  const launchEnv = { ...env };
+  if (forceMobile) launchEnv.TINE_E2E_FORCE_MOBILE_DRAWERS = "1";
+  else delete launchEnv.TINE_E2E_FORCE_MOBILE_DRAWERS;
   const td = spawn(TD, webdriverServerArgs(driverPort, nativePort, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"), {
-    env, stdio: ["ignore", log, log], detached: true,
+    env: launchEnv, stdio: ["ignore", log, log], detached: true,
   });
   await sleep(2500);
   let browser;
@@ -108,23 +131,78 @@ async function withApp(index, fn) {
   }
 }
 
-/** Navigate the way a user does — click the page reference on today's journal.
- *  No test-only navigation hook, so this journey cannot pass through a door the
- *  product does not have. */
+/** Navigate through the product's Quick Switcher. The shared helper re-finds a
+ *  result on each retry, so no WebDriver handle outlives the live result list. */
 async function openPage(browser, title) {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
-  await browser.waitUntil(async () => {
-    for (const selector of [`a.page-ref=${title}`, `span.page-ref=${title}`, `*=${title}`]) {
-      const link = await browser.$(selector);
-      if (await link.isExisting()) { await link.click(); return true; }
-    }
-    return false;
-  }, { timeout: 15_000, timeoutMsg: `never found a link to ${title}` });
+  await openPageByName(browser, title);
   await browser.waitUntil(
     async () => (await browser.$("h1.page-title").getText()).trim() === title,
     { timeout: 10_000, timeoutMsg: `${title} did not open` },
   );
   await sleep(400);
+}
+
+const p6Lines = () => fs.readFileSync(P6_FILE, "utf8").split(/\r?\n/);
+
+async function waitForP6Source(browser, predicate, message) {
+  await browser.waitUntil(() => predicate(p6Lines()[0]), { timeout: 15_000, timeoutMsg: message });
+  const lines = p6Lines();
+  if (lines[1] !== P6_UNTOUCHED) {
+    fail(`a P6 edit rewrote the unrelated control block:\n  before: ${JSON.stringify(P6_UNTOUCHED)}\n  after:  ${JSON.stringify(lines[1])}`);
+  }
+  return lines[0];
+}
+
+async function p6Root(browser) {
+  return browser.execute(() => {
+    const list = document.querySelector(".qs-sheet > .qs-rows");
+    const items = list
+      ? [...list.children].filter((element) => element.getAttribute("data-qs-parent") === "")
+      : [];
+    const identify = (element) => {
+      const text = (element.textContent ?? "").toLowerCase();
+      return ["alpha", "beta", "gamma", "delta"].filter((term) => text.includes(term)).join("+") || "unknown";
+    };
+    return items.map((element) => ({
+      identity: identify(element),
+      group: element.querySelector(":scope > .qs-group > .qs-group-header .qs-group-op")?.textContent?.trim() ?? null,
+      children: [...element.querySelectorAll(":scope > .qs-group > .qs-rows > [data-qs-parent]")].map(identify),
+    }));
+  });
+}
+
+async function waitForP6Root(browser, predicate, message) {
+  let latest;
+  await browser.waitUntil(async () => {
+    latest = await p6Root(browser);
+    return predicate(latest);
+  }, { timeout: 10_000, timeoutMsg: message });
+  return latest;
+}
+
+async function selectP6Rows(browser, indices) {
+  for (const index of indices) {
+    const selector = `.qs-sheet > .qs-rows > .qs-row[data-qs-parent=""][data-row-index="${index}"] .qs-select`;
+    const checkbox = await browser.$(selector);
+    await checkbox.waitForExist({ timeout: 5_000 });
+    await checkbox.click();
+  }
+  await browser.waitUntil(async () => {
+    const selected = await browser.$$(".qs-sheet > .qs-rows > .qs-row[data-qs-parent=\"\"] .qs-select:checked");
+    return selected.length === indices.length;
+  }, { timeout: 5_000, timeoutMsg: `selection did not settle on ${indices.join(",")}` });
+}
+
+async function pickVisibleOption(browser, label) {
+  const options = await browser.$$(".qs-menu .qs-option");
+  for (const option of options) {
+    if ((await option.getText()).trim() === label) {
+      await option.click();
+      return;
+    }
+  }
+  fail(`no open query-sheet option read ${JSON.stringify(label)}`);
 }
 
 async function sentenceText(browser) {
@@ -359,7 +437,182 @@ await withApp(0, async (browser) => {
   await browser.setWindowSize(1280, 900);
   await sleep(400);
 
-  // --- 6. a hostile depth stays a short line and a small sheet (I-22) -------
+  // --- 6. P6 controls: state, reorder, cancellation and grouping -------------
+  await openPage(browser, "P6 controls");
+  await openSheet(browser);
+  const initialP6 = p6Lines()[0];
+  const flat = await waitForP6Root(
+    browser,
+    (items) => items.map((item) => item.identity).join(",") === "alpha,beta,gamma,delta",
+    "the P6 fixture did not reopen as four distinct siblings",
+  );
+
+  // Selection answers "which rows?" and must neither toggle Off nor save.
+  const firstRow = ".qs-sheet > .qs-rows > .qs-row[data-qs-parent=\"\"][data-row-index=\"0\"]";
+  const firstSelect = await browser.$(`${firstRow} .qs-select`);
+  const firstEnabled = await browser.$(`${firstRow} .qs-enabled`);
+  if ((await firstEnabled.getAttribute("aria-checked")) !== "true") fail("the initially enabled alpha row did not expose its own enabled state");
+  await firstSelect.click();
+  if (!(await firstSelect.isSelected())) fail("the alpha selection checkbox did not select alpha");
+  if ((await firstEnabled.getAttribute("aria-checked")) !== "true") fail("selecting alpha also disabled it");
+  if (p6Lines()[0] !== initialP6) fail("selection alone wrote the query file");
+
+  // The separate enabled switch is a real engine save, and one ordinary undo
+  // restores it. Root replacement must clear the selection that named the old
+  // revision rather than silently moving that selection to a different row.
+  await firstEnabled.click();
+  await waitForP6Source(browser, (line) => /\(off\s+"alpha"\)/i.test(line), "disabling alpha never reached the query file");
+  const disabled = await browser.$(`${firstRow} .qs-enabled`);
+  if ((await disabled.getAttribute("aria-checked")) !== "false") fail("alpha's own enabled switch did not read disabled after save");
+  if ((await browser.$$(".qs-sheet .qs-select:checked")).length !== 0) fail("a saved root replacement retained a stale selection");
+  await browser.keys(["Control", "z"]);
+  await waitForP6Source(browser, (line) => line === initialP6, "one Ctrl+Z did not restore the enabled query bytes");
+  await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "alpha,beta,gamma,delta", "undo did not restore the flat P6 rows");
+
+  // The handle's arrow operation is the accessible equivalent of drag. Focus
+  // follows the MOVED alpha row, so the second Down continues from its new
+  // position and yields beta,gamma,alpha,delta rather than moving beta.
+  const firstHandle = await browser.$(`${firstRow} .qs-drag-handle`);
+  await firstHandle.click();
+  await browser.keys(["ArrowDown"]);
+  await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "beta,alpha,gamma,delta", "the first keyboard reorder did not move alpha down once");
+  const afterFirstMoveFocus = await browser.execute(() => ({
+    handle: document.activeElement?.getAttribute("data-qs-handle") ?? null,
+    row: document.activeElement?.closest(".qs-row")?.textContent?.toLowerCase() ?? "",
+  }));
+  if (afterFirstMoveFocus.handle !== "1" || !afterFirstMoveFocus.row.includes("alpha")) {
+    fail(`focus did not follow alpha after the first keyboard move: ${JSON.stringify(afterFirstMoveFocus)}`);
+  }
+  await browser.keys(["ArrowDown"]);
+  await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "beta,gamma,alpha,delta", "the second keyboard reorder did not continue from alpha's new position");
+  const afterSecondMoveFocus = await browser.execute(() => ({
+    handle: document.activeElement?.getAttribute("data-qs-handle") ?? null,
+    row: document.activeElement?.closest(".qs-row")?.textContent?.toLowerCase() ?? "",
+  }));
+  if (afterSecondMoveFocus.handle !== "2" || !afterSecondMoveFocus.row.includes("alpha")) {
+    fail(`focus did not follow alpha after the second keyboard move: ${JSON.stringify(afterSecondMoveFocus)}`);
+  }
+  const reorderedP6 = await waitForP6Source(
+    browser,
+    (line) => /\(and\s+"beta"\s+"gamma"\s+"alpha"\s+"delta"\)/i.test(line),
+    "the two keyboard reorders never reached the file in visible order",
+  );
+
+  // Start a real pointer drag far enough to show an insertion indicator, then
+  // press Escape while the pointer remains down. Releasing afterwards must not
+  // apply the previewed move, and Escape must peel the drag without closing its
+  // parent sheet.
+  const dragPoints = await browser.execute(() => {
+    const rows = [...document.querySelectorAll('.qs-sheet > .qs-rows > .qs-row[data-qs-parent=""]')];
+    const handle = rows[0]?.querySelector(".qs-drag-handle");
+    const target = rows[rows.length - 1];
+    if (!(handle instanceof HTMLElement) || !(target instanceof HTMLElement)) return null;
+    const start = handle.getBoundingClientRect();
+    const end = target.getBoundingClientRect();
+    handle.focus();
+    return {
+      start: { x: start.left + start.width / 2, y: start.top + start.height / 2 },
+      end: { x: end.left + Math.min(30, end.width / 2), y: end.top + end.height * 0.75 },
+    };
+  });
+  if (!dragPoints) fail("the native sheet did not expose drag coordinates");
+  await browser.performActions([{
+    type: "pointer",
+    id: "p6-cancel-mouse",
+    parameters: { pointerType: "mouse" },
+    actions: [
+      { type: "pointerMove", duration: 0, origin: "viewport", x: Math.round(dragPoints.start.x), y: Math.round(dragPoints.start.y) },
+      { type: "pointerDown", button: 0 },
+      { type: "pointerMove", duration: 80, origin: "viewport", x: Math.round(dragPoints.end.x), y: Math.round(dragPoints.end.y) },
+    ],
+  }]);
+  try {
+    await browser.waitUntil(
+      () => browser.execute(() => !!document.querySelector(".qs-drop-before, .qs-drop-after")),
+      { timeout: 5_000, timeoutMsg: "a threshold-crossing pointer drag never exposed an insertion position" },
+    );
+    await browser.keys(["Escape"]);
+  } finally {
+    await browser.releaseActions();
+  }
+  await browser.waitUntil(
+    () => browser.execute(() => !document.querySelector(".qs-drop-before, .qs-drop-after")),
+    { timeout: 5_000, timeoutMsg: "Escape left the drag insertion position active" },
+  );
+  if (!(await browser.$(".qs-sheet").isExisting())) fail("Escape cancelled the drag and its parent sheet together");
+  if (p6Lines()[0] !== reorderedP6) fail("Escape-cancelled drag wrote the query file");
+  await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "beta,gamma,alpha,delta", "Escape-cancelled drag changed row order");
+
+  // The compact per-row route shares the grouping owner. Group alpha with the
+  // row above, observe one nested `any of`, then undo back to the same flat
+  // revision before exercising multi-selection.
+  await (await browser.$('.qs-sheet > .qs-rows > .qs-row[data-qs-parent=""][data-row-index="2"] .qs-row-menu')).click();
+  await pickVisibleOption(browser, "Group with row above — any of");
+  await waitForP6Root(browser, (items) =>
+    items.length === 3 && items[1]?.group === "any of" && items[1]?.children.join(",") === "gamma,alpha",
+  "group-with-row-above did not retain gamma,alpha as one any-of subtree");
+  await waitForP6Source(browser, (line) => /\(or\s+"gamma"\s+"alpha"\)/i.test(line), "group-with-row-above never reached the file");
+  await browser.keys(["Control", "z"]);
+  await waitForP6Source(browser, (line) => line === reorderedP6, "undo did not restore the pre-group row order");
+  await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "beta,gamma,alpha,delta", "undo did not flatten group-with-row-above");
+
+  const groupSelected = async ({ label, header, indices, children, source, keep = false }) => {
+    await selectP6Rows(browser, indices);
+    await (await browser.$(".qs-group-selected")).click();
+    await pickVisibleOption(browser, label);
+    const grouped = await waitForP6Root(browser, (items) =>
+      items.some((item) => item.group === header && item.children.join(",") === children.join(",")),
+    `${label} did not group the selected siblings in their original order`);
+    await waitForP6Source(browser, (line) => source.test(line), `${label} did not persist through the engine printer`);
+    if (!keep) {
+      await browser.keys(["Control", "z"]);
+      await waitForP6Source(browser, (line) => line === reorderedP6, `undo did not restore the flat query after ${label}`);
+      await waitForP6Root(browser, (items) => items.map((item) => item.identity).join(",") === "beta,gamma,alpha,delta", `undo did not flatten ${label}`);
+    }
+    return grouped;
+  };
+
+  const allGrouped = await groupSelected({
+    label: "All of", header: "all of", indices: [0, 2], children: ["beta", "alpha"],
+    source: /\(and\s+\(and\s+"beta"\s+"alpha"\)\s+"gamma"\s+"delta"\)/i,
+  });
+  const anyGrouped = await groupSelected({
+    label: "Any of", header: "any of", indices: [1, 3], children: ["gamma", "delta"],
+    source: /\(and\s+"beta"\s+\(or\s+"gamma"\s+"delta"\)\s+"alpha"\)/i,
+  });
+  const noneGrouped = await groupSelected({
+    label: "None of", header: "none of", indices: [1, 3], children: ["gamma", "delta"],
+    source: /\(and\s+"beta"\s+\(not\s+\(or\s+"gamma"\s+"delta"\)\)\s+"alpha"\)/i,
+    keep: true,
+  });
+  // Disable the group itself. Its switch owns that Off; its children remain
+  // individually on while truthfully saying that the disabled ancestor keeps
+  // them from running. Keep this nested state for restart and 390px geometry.
+  const finalGroup = '.qs-sheet > .qs-rows > .qs-listitem[data-qs-parent=""][data-row-index="1"] > .qs-group';
+  await (await browser.$(`${finalGroup} > .qs-group-header .qs-enabled`)).click();
+  await waitForP6Source(
+    browser,
+    (line) => /\(and\s+"beta"\s+\(off\s+\(not\s+\(or\s+"gamma"\s+"delta"\)\)\)\s+"alpha"\)/i.test(line),
+    "disabling the final none-of group never reached the file",
+  );
+  const disabledGroupState = await browser.execute((selector) => {
+    const group = document.querySelector(selector);
+    return {
+      own: group?.querySelector(":scope > .qs-group-header .qs-enabled")?.getAttribute("aria-checked") ?? null,
+      children: [...(group?.querySelectorAll(":scope > .qs-rows > .qs-row .qs-enabled") ?? [])].map((node) => node.getAttribute("aria-checked")),
+      inherited: [...(group?.querySelectorAll(":scope > .qs-rows > .qs-row .qs-off-label") ?? [])].map((node) => node.textContent?.trim()),
+    };
+  }, finalGroup);
+  if (disabledGroupState.own !== "false"
+      || disabledGroupState.children.join(",") !== "true,true"
+      || disabledGroupState.inherited.join(",") !== "disabled by group,disabled by group") {
+    fail(`own and inherited Off states were not distinguished: ${JSON.stringify(disabledGroupState)}`);
+  }
+  const savedP6 = p6Lines()[0];
+  await browser.keys(["Escape"]);
+  await browser.$(".qs-sheet").waitForExist({ reverse: true, timeout: 5_000 });
+
+  // --- 7. a hostile depth stays a short line and a small sheet (I-22) -------
   await openPage(browser, "Deep");
   const deep = await sentenceText(browser);
   if (deep.length > 200) fail(`a 20-deep query drew a ${deep.length}-character sentence`);
@@ -373,10 +626,10 @@ await withApp(0, async (browser) => {
   if (bounded.rows > 8 || bounded.groups > 3) fail(`the sheet grew with the nesting: ${JSON.stringify(bounded)}`);
   if (bounded.chips < 1) fail("the folded subtree has no ⟨advanced⟩ row to edit or remove");
   await browser.keys(["Escape"]);
-  console.log(`sheet: resting=${JSON.stringify(resting)} after=${JSON.stringify(after)} narrow=${JSON.stringify(narrow)} deep=${JSON.stringify(bounded)}`);
+  console.log(`sheet: resting=${JSON.stringify(resting)} after=${JSON.stringify(after)} narrow=${JSON.stringify(narrow)} p6=${JSON.stringify({ flat, allGrouped, anyGrouped, noneGrouped, savedP6 })} deep=${JSON.stringify(bounded)}`);
 });
 
-// --- 7. restart: what landed on disk still says what the sheet said ---------
+// --- 8. restart: what landed on disk still says what the sheet said ---------
 await withApp(1, async (browser) => {
   await openPage(browser, "Sheet");
   const reopened = await sentenceText(browser);
@@ -386,7 +639,201 @@ await withApp(1, async (browser) => {
   await openSheet(browser);
   const rows = (await browser.$$(".qs-sheet .qs-row")).length;
   if (rows !== 2) fail(`the saved query reopened with ${rows} rows, not 2`);
-  console.log(`reopened: ${JSON.stringify(reopened)} rows=${rows}`);
+  await browser.keys(["Escape"]);
+
+  await openPage(browser, "P6 controls");
+  await openSheet(browser);
+  const reopenedP6 = await waitForP6Root(browser, (items) =>
+    items.length === 3
+      && items[0]?.identity === "beta"
+      && items[1]?.group === "none of"
+      && items[1]?.children.join(",") === "gamma,delta"
+      && items[2]?.identity === "alpha",
+  "the saved P6 query did not reopen as beta / none-of(gamma,delta) / alpha");
+  await waitForP6Source(
+    browser,
+    (line) => /\(and\s+"beta"\s+\(off\s+\(not\s+\(or\s+"gamma"\s+"delta"\)\)\)\s+"alpha"\)/i.test(line),
+    "the reopened P6 structure was absent from the file",
+  );
+  const reopenedDisabled = await browser.execute(() => ({
+    groupOwn: document.querySelector('.qs-sheet > .qs-rows > .qs-listitem[data-qs-parent=""][data-row-index="1"] > .qs-group > .qs-group-header .qs-enabled')?.getAttribute("aria-checked") ?? null,
+    inherited: [...document.querySelectorAll('.qs-sheet > .qs-rows > .qs-listitem[data-qs-parent=""][data-row-index="1"] > .qs-group > .qs-rows .qs-off-label')].map((node) => node.textContent?.trim()),
+  }));
+  if (reopenedDisabled.groupOwn !== "false" || reopenedDisabled.inherited.join(",") !== "disabled by group,disabled by group") {
+    fail(`the reopened query lost own/inherited Off state: ${JSON.stringify(reopenedDisabled)}`);
+  }
+  console.log(`reopened: ${JSON.stringify(reopened)} rows=${rows} p6=${JSON.stringify(reopenedP6)}`);
 });
+
+// --- 9. true native 390px: reachable P6 targets and no horizontal escape ---
+// This uses the app's Rust-owned E2E window policy, the same one as the native
+// mobile-drawer journey. `setWindowSize(390, …)` cannot prove this because the
+// ordinary desktop config clamps its minimum width to 640px.
+await withApp(2, async (browser) => {
+  // A restored phone-width session can start with a drawer over the workspace.
+  // Close it through its actual visible control before touching the query.
+  const drawerClose = await browser.$(".mobile-drawer-close, .rs-close");
+  if (await drawerClose.isExisting()) {
+    await drawerClose.click();
+    await browser.waitUntil(
+      () => browser.execute(() => !document.querySelector(".mobile-drawer-scrim")),
+      { timeout: 5_000, timeoutMsg: "the restored mobile drawer did not close" },
+    );
+  }
+  await openPage(browser, "P6 controls");
+  await openSheet(browser);
+  await selectP6Rows(browser, [0]);
+
+  const rowGeometry = await browser.execute(() => {
+    const row = document.querySelector('.qs-sheet > .qs-rows > [data-qs-parent=""][data-row-index="0"]');
+    const sheet = document.querySelector(".qs-sheet");
+    if (!(row instanceof HTMLElement) || !(sheet instanceof HTMLElement)) return null;
+    row.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const controls = [
+      ["drag", row.querySelector(".qs-drag-handle")],
+      ["select", row.querySelector(".qs-select")?.closest("label") ?? row.querySelector(".qs-select")],
+      ["enabled", row.querySelector(".qs-enabled")],
+    ];
+    const box = (name, element) => {
+      if (!(element instanceof HTMLElement)) return { name, missing: true };
+      const rect = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return {
+        name,
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        width: rect.width,
+        height: rect.height,
+        hit: !!hit && (hit === element || element.contains(hit)),
+      };
+    };
+    const targets = controls.map(([name, element]) => box(name, element));
+    const overlaps = [];
+    for (let a = 0; a < targets.length; a += 1) {
+      for (let b = a + 1; b < targets.length; b += 1) {
+        const left = Math.max(targets[a].left ?? 0, targets[b].left ?? 0);
+        const right = Math.min(targets[a].right ?? 0, targets[b].right ?? 0);
+        const top = Math.max(targets[a].top ?? 0, targets[b].top ?? 0);
+        const bottom = Math.min(targets[a].bottom ?? 0, targets[b].bottom ?? 0);
+        if (right - left > 1 && bottom - top > 1) overlaps.push(`${targets[a].name}/${targets[b].name}`);
+      }
+    }
+    const sheetRect = sheet.getBoundingClientRect();
+    return {
+      viewport: { width: innerWidth, height: innerHeight },
+      sheet: {
+        left: sheetRect.left,
+        right: sheetRect.right,
+        width: sheetRect.width,
+        clientWidth: sheet.clientWidth,
+        scrollWidth: sheet.scrollWidth,
+      },
+      row: { clientWidth: row.clientWidth, scrollWidth: row.scrollWidth },
+      targets,
+      overlaps,
+    };
+  });
+  if (!rowGeometry) fail("the 390px native sheet had no first P6 row to measure");
+  if (rowGeometry.viewport.width < 370 || rowGeometry.viewport.width > 410) {
+    fail(`the native narrow journey missed the bounded 390px viewport: ${JSON.stringify(rowGeometry.viewport)}`);
+  }
+  if (rowGeometry.sheet.left < -1 || rowGeometry.sheet.right > rowGeometry.viewport.width + 1
+      || rowGeometry.sheet.scrollWidth > rowGeometry.sheet.clientWidth + 1
+      || rowGeometry.row.scrollWidth > rowGeometry.row.clientWidth + 1) {
+    fail(`the P6 sheet or row overflowed horizontally at 390px: ${JSON.stringify(rowGeometry)}`);
+  }
+  for (const target of rowGeometry.targets) {
+    if (target.missing || target.width < 43.5 || target.height < 43.5 || !target.hit
+        || target.left < -1 || target.right > rowGeometry.viewport.width + 1) {
+      fail(`the ${target.name} control was not a reachable 44px target at 390px: ${JSON.stringify(rowGeometry)}`);
+    }
+  }
+  if (rowGeometry.overlaps.length) fail(`P6 row hit targets overlap at 390px: ${JSON.stringify(rowGeometry)}`);
+
+  const groupGeometry = await browser.execute(() => {
+    const group = document.querySelector('.qs-sheet > .qs-rows > .qs-listitem[data-qs-parent=""][data-row-index="1"] > .qs-group');
+    const header = group?.querySelector(":scope > .qs-group-header");
+    if (!(group instanceof HTMLElement) || !(header instanceof HTMLElement)) return null;
+    header.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const elements = [
+      ["group drag", header.querySelector(".qs-drag-handle")],
+      ["group select", header.querySelector(".qs-select")?.closest("label") ?? header.querySelector(".qs-select")],
+      ["group enabled", header.querySelector(".qs-enabled")],
+    ];
+    const targets = elements.map(([name, element]) => {
+      if (!(element instanceof HTMLElement)) return { name, missing: true };
+      const rect = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return {
+        name, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+        width: rect.width, height: rect.height,
+        hit: !!hit && (hit === element || element.contains(hit)),
+      };
+    });
+    const overlaps = [];
+    for (let a = 0; a < targets.length; a += 1) {
+      for (let b = a + 1; b < targets.length; b += 1) {
+        const left = Math.max(targets[a].left ?? 0, targets[b].left ?? 0);
+        const right = Math.min(targets[a].right ?? 0, targets[b].right ?? 0);
+        const top = Math.max(targets[a].top ?? 0, targets[b].top ?? 0);
+        const bottom = Math.min(targets[a].bottom ?? 0, targets[b].bottom ?? 0);
+        if (right - left > 1 && bottom - top > 1) overlaps.push(`${targets[a].name}/${targets[b].name}`);
+      }
+    }
+    const rect = header.getBoundingClientRect();
+    return {
+      header: { left: rect.left, right: rect.right, clientWidth: header.clientWidth, scrollWidth: header.scrollWidth },
+      group: { clientWidth: group.clientWidth, scrollWidth: group.scrollWidth },
+      targets,
+      overlaps,
+      inheritedLabels: [...group.querySelectorAll(".qs-off-label")].map((node) => node.textContent?.trim()),
+    };
+  });
+  if (!groupGeometry
+      || groupGeometry.header.left < -1 || groupGeometry.header.right > rowGeometry.viewport.width + 1
+      || groupGeometry.header.scrollWidth > groupGeometry.header.clientWidth + 1
+      || groupGeometry.group.scrollWidth > groupGeometry.group.clientWidth + 1) {
+    fail(`the disabled nested group/header overflowed at 390px: ${JSON.stringify(groupGeometry)}`);
+  }
+  for (const target of groupGeometry.targets) {
+    if (target.missing || target.width < 43.5 || target.height < 43.5 || !target.hit
+        || target.left < -1 || target.right > rowGeometry.viewport.width + 1) {
+      fail(`the ${target.name} target was not reachable at 390px: ${JSON.stringify(groupGeometry)}`);
+    }
+  }
+  if (groupGeometry.overlaps.length) fail(`nested-group hit targets overlap at 390px: ${JSON.stringify(groupGeometry)}`);
+  if (groupGeometry.inheritedLabels.filter((label) => label === "disabled by group").length !== 2) {
+    fail(`the narrow nested group hid its inherited disabled state: ${JSON.stringify(groupGeometry)}`);
+  }
+
+  const selectionGeometry = await browser.execute(() => {
+    const bar = document.querySelector(".qs-selection");
+    if (!(bar instanceof HTMLElement)) return null;
+    bar.scrollIntoView({ block: "nearest", inline: "nearest" });
+    return [...bar.querySelectorAll("button")].map((button) => {
+      const rect = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return {
+        label: button.textContent?.trim(),
+        width: rect.width,
+        height: rect.height,
+        left: rect.left,
+        right: rect.right,
+        hit: !!hit && (hit === button || button.contains(hit)),
+      };
+    });
+  });
+  if (!selectionGeometry || selectionGeometry.length !== 2) fail(`the 390px selection bar did not expose Group selected and Clear: ${JSON.stringify(selectionGeometry)}`);
+  for (const target of selectionGeometry) {
+    if (target.width < 43.5 || target.height < 43.5 || !target.hit
+        || target.left < -1 || target.right > rowGeometry.viewport.width + 1) {
+      fail(`the selection-bar control was not reachable at 390px: ${JSON.stringify(selectionGeometry)}`);
+    }
+  }
+  if (p6Lines()[1] !== P6_UNTOUCHED) fail("the narrow P6 inspection changed the unrelated query block");
+  console.log(`p6 narrow390=${JSON.stringify({ rowGeometry, groupGeometry, selectionGeometry })}`);
+}, { forceMobile: true });
 
 console.log("query-sheet OK");

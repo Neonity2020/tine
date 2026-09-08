@@ -27,8 +27,11 @@ import {
   filterLabel,
   filterValueLabel,
   filterPhrase,
+  groupSelected,
   groupWithPrevious,
+  isDisabledAt,
   journalFilter,
+  moveSibling,
   namespaceFilter,
   onPageFilter,
   pagePropertyFilter,
@@ -50,6 +53,7 @@ import {
   setOp,
   sortLabel,
   taskFilter,
+  toggleDisabledAt,
   unwrapAt,
   withAgg,
   withGroup,
@@ -876,5 +880,301 @@ describe("groupWithPrevious", () => {
       kind: "and",
       items: [A, { kind: "or", items: [B, { kind: "and", items: [C, A] }] }],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6: grouping a selection, reordering siblings, and the enabled control
+// (SPEC §7.4 remainder). The IR these produce is what a drag, a keyboard move
+// and a menu all have to agree on, so it is pinned HERE and the mounted tests
+// only have to show that each gesture arrives at it.
+// ---------------------------------------------------------------------------
+
+/** A `raw` leaf: the payload a re-enable must hand back byte for byte. */
+const RAW: Filter = { kind: "raw", text: "task = 'TODO'", diagnostic_kind: "not_applicable" };
+/** A subtree past the rendering cap — the `⟨advanced⟩` chip's node. */
+const DEEP: Filter = {
+  kind: "or",
+  items: [{ kind: "and", items: [A, { kind: "or", items: [B, C] }] }, RAW],
+};
+
+describe("groupSelected", () => {
+  it("groups a contiguous selection at the first selected position", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    expect(groupSelected(root, [[0], [1]], "all")).toEqual({
+      kind: "and",
+      items: [{ kind: "and", items: [A, B] }, C],
+    });
+  });
+
+  it("keeps the selected items in their original order however they were picked", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    // Picked bottom-up: the group still reads A then B, not B then A.
+    expect(groupSelected(root, [[1], [0]], "all")).toEqual({
+      kind: "and",
+      items: [{ kind: "and", items: [A, B] }, C],
+    });
+  });
+
+  it("lands a non-contiguous selection where the topmost selected row was, leaving the rest in order", () => {
+    const D = pageRefFilter("D");
+    const root: Filter = { kind: "and", items: [A, B, C, D] };
+    expect(groupSelected(root, [[1], [3]], "any")).toEqual({
+      kind: "and",
+      items: [A, { kind: "or", items: [B, D] }, C],
+    });
+  });
+
+  it("spells `none of` as the not-over-or the group header already reads back", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    expect(groupSelected(root, [[0], [2]], "none")).toEqual({
+      kind: "and",
+      items: [{ kind: "not", inner: { kind: "or", items: [A, C] } }, B],
+    });
+  });
+
+  it("groups inside a nested list without touching anything outside it", () => {
+    const root: Filter = { kind: "and", items: [A, { kind: "or", items: [B, C, A] }] };
+    expect(groupSelected(root, [[1, 0], [1, 2]], "all")).toEqual({
+      kind: "and",
+      items: [A, { kind: "or", items: [{ kind: "and", items: [B, A] }, C] }],
+    });
+  });
+
+  it("moves a whole group and its wrappers into the new group, not a copy of its rows", () => {
+    const inner: Filter = { kind: "not", inner: { kind: "or", items: [B, C] } };
+    const root: Filter = { kind: "and", items: [A, inner] };
+    expect(groupSelected(root, [[0], [1]], "any")).toEqual({
+      kind: "and",
+      items: [{ kind: "or", items: [A, inner] }],
+    });
+  });
+
+  it("carries a disabled row, its `off`, and an opaque `raw` payload through untouched", () => {
+    const disabled: Filter = { kind: "off", inner: RAW };
+    const root: Filter = { kind: "and", items: [disabled, DEEP, A] };
+    const grouped = groupSelected(root, [[0], [1]], "all");
+    expect(grouped).toEqual({
+      kind: "and",
+      items: [{ kind: "and", items: [disabled, DEEP] }, A],
+    });
+  });
+
+  it("refuses a selection of fewer than two, so nothing is wrapped that was not asked for", () => {
+    const root: Filter = { kind: "and", items: [A, B] };
+    expect(groupSelected(root, [[0]], "all")).toEqual(root);
+    expect(groupSelected(root, [], "all")).toEqual(root);
+  });
+
+  it("refuses locs from two different lists rather than moving conditions between them", () => {
+    const root: Filter = { kind: "and", items: [A, { kind: "or", items: [B, C] }] };
+    expect(groupSelected(root, [[0], [1, 0]], "all")).toEqual(root);
+    expect(groupSelected(root, [[1, 0], [1, 1], [0]], "all")).toEqual(root);
+  });
+
+  it("refuses an ancestor selected together with its own descendant", () => {
+    const root: Filter = { kind: "and", items: [A, { kind: "or", items: [B, C] }] };
+    // `[1]` is the group; `[1, 1]` is inside it. They are not siblings.
+    expect(groupSelected(root, [[1], [1, 1]], "all")).toEqual(root);
+  });
+
+  it("refuses a duplicate, a stale index and a leaf parent", () => {
+    const root: Filter = { kind: "and", items: [A, B] };
+    expect(groupSelected(root, [[1], [1]], "all")).toEqual(root);
+    expect(groupSelected(root, [[0], [7]], "all")).toEqual(root);
+    expect(groupSelected(root, [[0], [-1]], "all")).toEqual(root);
+    // A `not` has one child and no list to group inside.
+    const unary: Filter = { kind: "and", items: [{ kind: "not", inner: A }] };
+    expect(groupSelected(unary, [[0, 0], [0, 1]], "all")).toEqual(unary);
+  });
+});
+
+describe("groupWithPrevious", () => {
+  it("is groupSelected over the two rows the menu names, with the same choices", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    expect(groupWithPrevious(root, [2], "any")).toEqual(groupSelected(root, [[1], [2]], "any"));
+    expect(groupWithPrevious(root, [2], "none")).toEqual(groupSelected(root, [[1], [2]], "none"));
+    expect(groupWithPrevious(root, [2])).toEqual(groupSelected(root, [[1], [2]], "all"));
+  });
+});
+
+describe("moveSibling", () => {
+  it("moves a row up and down among its own siblings", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    expect(moveSibling(root, [2], 1)).toEqual({ kind: "and", items: [A, C, B] });
+    expect(moveSibling(root, [0], 2)).toEqual({ kind: "and", items: [B, C, A] });
+  });
+
+  it("refuses the boundary moves rather than saving an unchanged tree", () => {
+    const root: Filter = { kind: "and", items: [A, B, C] };
+    expect(moveSibling(root, [0], -1)).toBe(root);
+    expect(moveSibling(root, [2], 3)).toBe(root);
+    expect(moveSibling(root, [1], 1)).toBe(root);
+  });
+
+  it("refuses a stale or foreign path", () => {
+    const root: Filter = { kind: "and", items: [A, B] };
+    expect(moveSibling(root, [7], 0)).toBe(root);
+    expect(moveSibling(root, [0, 1], 0)).toBe(root);
+    expect(moveSibling(root, [], 0)).toBe(root);
+  });
+
+  it("moves a group's COMPLETE subtree and its wrappers, byte for byte", () => {
+    const group: Filter = { kind: "off", inner: { kind: "not", inner: { kind: "or", items: [B, DEEP] } } };
+    const root: Filter = { kind: "and", items: [A, group, C] };
+    const moved = moveSibling(root, [1], 0);
+    expect(moved).toEqual({ kind: "and", items: [group, A, C] });
+    // Nothing inside the moved node was rebuilt into a different shape.
+    expect((moved as { items: Filter[] }).items[0]).toEqual(group);
+  });
+
+  it("is atomic against the original tree: the destination is not recomputed after a prune", () => {
+    // The mover is the ONLY child of its group. A remove-then-insert would
+    // prune the emptied `or` first, which shifts every later index — the
+    // destination `1` would then address a list that no longer exists.
+    const root: Filter = {
+      kind: "and",
+      items: [{ kind: "or", items: [A] }, B],
+    };
+    expect(moveSibling(root, [0], 1)).toEqual({
+      kind: "and",
+      items: [B, { kind: "or", items: [A] }],
+    });
+    // And moving the inner row inside its one-child list is refused, not turned
+    // into a cross-parent move.
+    expect(moveSibling(root, [0, 0], 1)).toBe(root);
+  });
+
+  it("moves back: a pair of opposite moves returns the tree it started from", () => {
+    const root: Filter = { kind: "and", items: [A, { kind: "or", items: [B, C] }, RAW, DEEP] };
+    for (const [from, to] of [[0, 3], [3, 0], [1, 2], [2, 1]]) {
+      const there = moveSibling(root, [from], to);
+      expect(there).not.toEqual(root);
+      expect(moveSibling(there, [to], from)).toEqual(root);
+    }
+  });
+});
+
+describe("toggleDisabledAt", () => {
+  it("wraps and unwraps the node's own Off", () => {
+    const root: Filter = { kind: "and", items: [A, B] };
+    const off = toggleDisabledAt(root, [0]);
+    expect(off).toEqual({ kind: "and", items: [{ kind: "off", inner: A }, B] });
+    expect(isDisabledAt(off, [0])).toBe(true);
+    expect(toggleDisabledAt(off, [0])).toEqual(root);
+    expect(isDisabledAt(root, [0])).toBe(false);
+  });
+
+  it("keeps the row's Not, in either order it was stored", () => {
+    // Disabling a negated row wraps the whole row, `not` included.
+    const negated: Filter = { kind: "and", items: [{ kind: "not", inner: A }] };
+    expect(toggleDisabledAt(negated, [0])).toEqual({
+      kind: "and",
+      items: [{ kind: "off", inner: { kind: "not", inner: A } }],
+    });
+    // And enabling gives the `not` back from either stored order — both spell
+    // one negated, disabled row (§3.5 removes `Not(<removed>)` the same way).
+    const offOverNot: Filter = { kind: "and", items: [{ kind: "off", inner: { kind: "not", inner: A } }] };
+    const notOverOff: Filter = { kind: "and", items: [{ kind: "not", inner: { kind: "off", inner: A } }] };
+    expect(toggleDisabledAt(offOverNot, [0])).toEqual(negated);
+    expect(toggleDisabledAt(notOverOff, [0])).toEqual(negated);
+    expect(isDisabledAt(notOverOff, [0])).toBe(true);
+  });
+
+  it("leaves a disabled DESCENDANT disabled when its group is enabled again", () => {
+    const child: Filter = { kind: "off", inner: B };
+    const group: Filter = { kind: "off", inner: { kind: "and", items: [A, child] } };
+    const root: Filter = { kind: "and", items: [group, C] };
+    const enabled = toggleDisabledAt(root, [0]);
+    expect(enabled).toEqual({
+      kind: "and",
+      items: [{ kind: "and", items: [A, child] }, C],
+    });
+    // The child's own Off is still there, and still its own to toggle.
+    expect(isDisabledAt(enabled, [0, 1])).toBe(true);
+    expect(toggleDisabledAt(enabled, [0, 1])).toEqual({
+      kind: "and",
+      items: [{ kind: "and", items: [A, B] }, C],
+    });
+  });
+
+  it("preserves a Raw payload and an opaque advanced subtree across a disable/enable pair", () => {
+    const root: Filter = { kind: "and", items: [RAW, DEEP] };
+    const off = toggleDisabledAt(toggleDisabledAt(root, [0]), [1]);
+    expect(off).toEqual({
+      kind: "and",
+      items: [{ kind: "off", inner: RAW }, { kind: "off", inner: DEEP }],
+    });
+    const back = toggleDisabledAt(toggleDisabledAt(off, [1]), [0]);
+    expect(back).toEqual(root);
+    // The payload itself, not merely a tree that prints the same.
+    expect(JSON.stringify(back)).toBe(JSON.stringify(root));
+  });
+
+  it("is a no-op on the root and on a stale loc", () => {
+    const root: Filter = { kind: "and", items: [A] };
+    expect(toggleDisabledAt(root, [])).toBe(root);
+    expect(toggleDisabledAt(root, [4])).toEqual(root);
+    expect(isDisabledAt(root, [4])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A group inside a `not`/`off` wrapper (P6). Its three actions address the
+// `and`/`or` INSIDE the wrapper, and every one of them used to write a new but
+// identical tree — a dead click that saved the block and pushed an empty step
+// onto the undo stack. The `none of` half of this predates P6; the disabled half
+// became reachable the moment a group could be switched off.
+// ---------------------------------------------------------------------------
+
+describe("editing a group that sits inside a unary wrapper", () => {
+  const disabled = (): Filter => ({
+    kind: "and",
+    items: [{ kind: "off", inner: { kind: "and", items: [A, B] } }, C],
+  });
+  const negated = (): Filter => ({
+    kind: "and",
+    items: [{ kind: "not", inner: { kind: "or", items: [A, B] } }, C],
+  });
+
+  it("switches all of ↔ any of inside the wrapper, keeping the wrapper", () => {
+    expect(setOp(disabled(), [0, 0], "or")).toEqual({
+      kind: "and",
+      items: [{ kind: "off", inner: { kind: "or", items: [A, B] } }, C],
+    });
+    expect(setOp(negated(), [0, 0], "and")).toEqual({
+      kind: "and",
+      items: [{ kind: "not", inner: { kind: "and", items: [A, B] } }, C],
+    });
+  });
+
+  it("wraps the inner group in a Not without disturbing the Off around it", () => {
+    expect(wrapAt(disabled(), [0, 0], "not")).toEqual({
+      kind: "and",
+      items: [
+        { kind: "off", inner: { kind: "not", inner: { kind: "and", items: [A, B] } } },
+        C,
+      ],
+    });
+  });
+
+  it("lifts a single child out, and refuses what would need a De Morgan rewrite", () => {
+    const single: Filter = { kind: "and", items: [{ kind: "not", inner: { kind: "or", items: [A] } }] };
+    expect(unwrapAt(single, [0, 0])).toEqual({ kind: "and", items: [{ kind: "not", inner: A }] });
+    // Two children cannot be placed inside a unary wrapper, and neither
+    // distributing the wrapper nor rewriting the group is the builder's to
+    // decide (§3.5). The tree comes back UNCHANGED — identity, so the sheet can
+    // tell a refusal from an edit and not save.
+    const two = negated();
+    expect(unwrapAt(two, [0, 0])).toBe(two);
+    const off = disabled();
+    expect(unwrapAt(off, [0, 0])).toBe(off);
+  });
+
+  it("keeps ungroup lossless: every wrapper the group HELD comes back out", () => {
+    const child: Filter = { kind: "off", inner: { kind: "not", inner: B } };
+    const kept: Filter = { kind: "raw", text: "task = 'TODO'", diagnostic_kind: "not_applicable" };
+    const root: Filter = { kind: "and", items: [A, { kind: "or", items: [child, kept, DEEP] }, C] };
+    expect(unwrapAt(root, [1])).toEqual({ kind: "and", items: [A, child, kept, DEEP, C] });
   });
 });

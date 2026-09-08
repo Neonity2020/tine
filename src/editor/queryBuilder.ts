@@ -1403,6 +1403,42 @@ function normalize(root: Filter): Filter {
   return withChildren(root, kids);
 }
 
+/** **Put `next` where `loc` points, whatever kind of node holds that place.**
+ *
+ *  `locate` above answers a LIST question — it hands back the child array a
+ *  splice needs — and `filterChildren` synthesizes a fresh one-element array for
+ *  the unary `not`/`off`. That is right for a splice (you cannot splice two
+ *  children into a `not`) and silently wrong for an assignment: writing into the
+ *  synthesized array wrote into a copy, so every edit addressed at a child of a
+ *  unary wrapper did nothing and STILL returned a new tree, which the sheet
+ *  saved. The three group actions that address the `and`/`or` inside its
+ *  wrapper — the all/any header, "None of" and "Ungroup" — were therefore dead
+ *  clicks that wrote the block and pushed an empty step onto the undo stack, on
+ *  every `none of` group and (since P6 let a group be switched off) on every
+ *  disabled one. Assignment goes through here instead. */
+function assignAt(draft: Filter, loc: number[], next: Filter): boolean {
+  if (loc.length === 0) return false;
+  let node = draft;
+  for (let i = 0; i < loc.length - 1; i++) {
+    const kids = filterChildren(node);
+    const child = kids?.[loc[i]];
+    if (!child) return false;
+    node = child;
+  }
+  const index = loc[loc.length - 1];
+  if (node.kind === "and" || node.kind === "or") {
+    if (!node.items[index]) return false;
+    node.items[index] = next;
+    return true;
+  }
+  if (node.kind === "not" || node.kind === "off") {
+    if (index !== 0) return false;
+    node.inner = next;
+    return true;
+  }
+  return false;
+}
+
 /** Mutating a node the path does not address is a no-op that returns the input
  *  unchanged, so a stale `loc` from a popover that outlived its tree cannot
  *  corrupt the query. */
@@ -1432,52 +1468,217 @@ export function removeAt(root: Filter, loc: number[]): Filter {
 }
 
 export function replaceAt(root: Filter, loc: number[], filter: Filter): Filter {
+  return edit(root, (draft) => assignAt(draft, loc, filter));
+}
+
+/** Wrap the node at `loc` in a new boolean node.
+ *
+ *  `off` is here for the same reason `not` is: the row's enabled control and the
+ *  row's negative operator are both ONE wrapper around the node the user is
+ *  looking at, and giving disabling its own wrap helper is how the two would
+ *  come to disagree about what "the node at `loc`" means. */
+export function wrapAt(root: Filter, loc: number[], op: "and" | "or" | "not" | "off"): Filter {
   return edit(root, (draft) => {
-    const at = locate(draft, loc);
-    if (!at || !at.children[at.idx]) return false;
-    at.children[at.idx] = filter;
-    return true;
+    const current = nodeAt(draft, loc);
+    if (!current) return false;
+    return assignAt(
+      draft,
+      loc,
+      op === "not"
+        ? { kind: "not", inner: current }
+        : op === "off"
+          ? { kind: "off", inner: current }
+          : { kind: op, items: [current] },
+    );
   });
 }
 
-/** Wrap the node at `loc` in a new boolean node. */
-export function wrapAt(root: Filter, loc: number[], op: "and" | "or" | "not"): Filter {
+// ---------------------------------------------------------------------------
+// Grouping, reordering and disabling (SPEC §7.4 remainder, P6)
+// ---------------------------------------------------------------------------
+
+/** The three group headers the sheet offers, in the sheet's own words.
+ *
+ *  They are NOT three boolean node kinds: `none of` is `not(or(…))`, the shape
+ *  the group header already reads back as "none of". §3.5 forbids De Morgan
+ *  rewriting in the stored form, so the header the user picked is the shape that
+ *  gets stored — the builder never restates a query as its dual. */
+export type GroupChoice = "all" | "any" | "none";
+
+const groupNode = (choice: GroupChoice, items: Filter[]): Filter =>
+  choice === "any"
+    ? { kind: "or", items }
+    : choice === "none"
+      ? { kind: "not", inner: { kind: "or", items } }
+      : { kind: "and", items };
+
+/** **Group the selected siblings into one group (§7.4, design §2.5).**
+ *
+ *  The ONE grouping operation: multi-select grouping, "group with the row
+ *  above" and any future gesture all come through here, so the answer to "which
+ *  rows end up where" is written once.
+ *
+ *  Three rules, and each of them is a way a selection can be quietly betrayed:
+ *
+ *   - **Selected items keep their original relative order.** Grouping is not a
+ *     sort, and the order of an `and`/`or` list is the order the author typed
+ *     (§3.5 keeps child order in the editable form).
+ *   - **The group is inserted at the FIRST selected position**, and the
+ *     unselected siblings keep their own order around it. A non-contiguous
+ *     selection follows the same rule rather than a second one: the group lands
+ *     where the topmost selected row was.
+ *   - **Anything that is not a set of siblings is REFUSED**, not repaired. Locs
+ *     from two different lists, a loc and its own descendant, a duplicate, an
+ *     index past the end, a stale path from a menu that outlived its tree —
+ *     each returns the tree unchanged, exactly as every other edit here does.
+ *     Sibling-ness is what makes ancestor/descendant selection impossible: two
+ *     locs with the same parent path can never nest.
+ *
+ *  Fewer than two locs is a refusal too: "group" of one row is a wrapper the
+ *  user did not ask for. */
+export function groupSelected(root: Filter, locs: number[][], choice: GroupChoice): Filter {
+  if (locs.length < 2) return root;
+  const parent = locs[0].slice(0, -1);
+  const sibling = (loc: number[]) =>
+    loc.length === parent.length + 1 && parent.every((step, i) => loc[i] === step);
+  if (!locs.every(sibling)) return root;
+  const indices = [...new Set(locs.map((loc) => loc[loc.length - 1]))].sort((a, b) => a - b);
+  if (indices.length !== locs.length) return root;
   return edit(root, (draft) => {
-    const at = locate(draft, loc);
-    const current = at?.children[at.idx];
-    if (!at || !current) return false;
-    at.children[at.idx] =
-      op === "not" ? { kind: "not", inner: current } : { kind: op, items: [current] };
+    const node = nodeAt(draft, parent);
+    if (!node || (node.kind !== "and" && node.kind !== "or")) return false;
+    const children = node.items;
+    if (indices.some((index) => !Number.isInteger(index) || index < 0 || index >= children.length)) {
+      return false;
+    }
+    const picked = indices.map((index) => children[index]);
+    const chosen = new Set(indices);
+    const kept = children.filter((_, index) => !chosen.has(index));
+    // Where the group goes among what is LEFT: as many unselected siblings
+    // precede it as preceded the first selected row.
+    const before = children.slice(0, indices[0]).filter((_, index) => !chosen.has(index)).length;
+    kept.splice(before, 0, groupNode(choice, picked));
+    node.items = kept;
     return true;
   });
 }
 
 /** **"Group with the row above" (§7.4, design §2.5).**
  *
- *  Wraps the addressed row and the sibling immediately before it into one `and`
- *  group, in place. The first row of a group has nothing above it, so it is a
- *  no-op — as is a stale `loc` from a menu that outlived its tree, exactly like
- *  every other edit here. */
-export function groupWithPrevious(root: Filter, loc: number[]): Filter {
+ *  The addressed row and the sibling immediately before it, in place. It is
+ *  {@link groupSelected} with the selection the menu implies rather than a
+ *  second implementation of the same question — which is why it offers the same
+ *  all/any/none choices and lands in the same place. The first row of a list has
+ *  nothing above it, so it is a no-op, as is a stale `loc`. */
+export function groupWithPrevious(root: Filter, loc: number[], choice: GroupChoice = "all"): Filter {
+  if (loc.length === 0) return root;
+  const previous = [...loc.slice(0, -1), loc[loc.length - 1] - 1];
+  return groupSelected(root, [previous, loc], choice);
+}
+
+/** **Move a row or group among its own siblings (§7.4, P6).**
+ *
+ *  `to` is the index the node ends up at in the SAME list — the drop position a
+ *  drag reports and the one step "move up"/"move down" ask for, which is why
+ *  keyboard and pointer produce the same tree.
+ *
+ *  **Atomic against the original tree.** Removing the node and inserting it
+ *  again are one edit over one draft, so the destination is computed against the
+ *  list the user was looking at. A remove-then-insert built out of `removeAt`
+ *  and `addChild` would normalize in between: `removeAt` PRUNES an `and`/`or`
+ *  its last child just left, so moving the only row out of a group would delete
+ *  the group and shift every path after it — including the one holding the
+ *  destination. Boundary destinations are refused rather than clamped: a clamp
+ *  turns "I pressed up on the first row" into a silent save of an unchanged
+ *  tree. */
+export function moveSibling(root: Filter, loc: number[], to: number): Filter {
   return edit(root, (draft) => {
     const at = locate(draft, loc);
-    if (!at || at.idx === 0) return false;
-    const current = at.children[at.idx];
-    const previous = at.children[at.idx - 1];
-    if (!current || !previous) return false;
-    at.children.splice(at.idx - 1, 2, { kind: "and", items: [previous, current] });
+    if (!at) return false;
+    const node = at.children[at.idx];
+    if (!node) return false;
+    if (!Number.isInteger(to) || to < 0 || to >= at.children.length || to === at.idx) return false;
+    at.children.splice(at.idx, 1);
+    at.children.splice(to, 0, node);
     return true;
   });
 }
 
-/** Replace the boolean node at `loc` with its children spliced into the parent. */
+/** The path of the node's OWN `off` wrapper, relative to the node, or `null`
+ *  when it has none.
+ *
+ *  It mirrors the sheet's peel exactly: a row wears at most one `not` and one
+ *  `off`, in either order (`off(not(x))` and `not(off(x))` both draw as one
+ *  negated, disabled row, and §3.5 removes both the same way). The wrapper this
+ *  finds is the row's own; an `off` deeper inside — on a relation's predicate,
+ *  or on a child of a group — belongs to that node and is never touched here. */
+function ownOffPath(node: Filter): number[] | null {
+  if (node.kind === "off") return [];
+  if (node.kind === "not" && node.inner.kind === "off") return [0];
+  return null;
+}
+
+/** Whether the node at `loc` carries its OWN `off` wrapper. An ancestor's `off`
+ *  is a different fact, and the sheet renders it as one (P6). */
+export function isDisabledAt(root: Filter, loc: number[]): boolean {
+  const node = nodeAt(root, loc);
+  return !!node && ownOffPath(node) !== null;
+}
+
+/** **The enabled control: add or remove this node's own `Off` (§3.5, §7.4).**
+ *
+ *  Disabling WRAPS the addressed node whole, so the `not` that spells the row's
+ *  negative operator, the `raw` payload of a condition the parser could not
+ *  read, an opaque advanced subtree past the rendering cap, and any `off` a
+ *  DESCENDANT carries all travel inside it untouched. Enabling removes exactly
+ *  the one wrapper the row draws as its greyed state and nothing else, so a
+ *  disabled group full of individually disabled rows comes back as it went in.
+ *
+ *  Nothing is deleted, coerced or re-read: `Off` is structural omission, and a
+ *  re-enabled `Raw` is the same bytes with the same diagnostic it always had
+ *  (§4.3.2). */
+export function toggleDisabledAt(root: Filter, loc: number[]): Filter {
+  if (loc.length === 0) return root;
+  const node = nodeAt(root, loc);
+  if (!node) return root;
+  const off = ownOffPath(node);
+  if (off === null) return wrapAt(root, loc, "off");
+  // Enabling REBUILDS the row's whole node rather than addressing the `off`
+  // inside it. Both spellings — `off(not(x))` and `not(off(x))` — have to come
+  // back as `not(x)`, and stating that here keeps the answer next to
+  // `ownOffPath`, which is the only place that knows where the row's own `off`
+  // can be. The `not` and the payload under it are carried across untouched.
+  const inner = off.length === 0
+    ? (node as Filter & { kind: "off" }).inner
+    : { kind: "not" as const, inner: ((node as Filter & { kind: "not" }).inner as Filter & { kind: "off" }).inner };
+  return replaceAt(root, loc, clone(inner));
+}
+
+/** Replace the boolean node at `loc` with its children spliced into the parent.
+ *
+ *  Lossless: whatever the group held comes out exactly as it went in, `not` and
+ *  `off` wrappers on the CHILDREN included — the sheet never normalizes a
+ *  wrapper away to make its own rendering simpler (§3.5).
+ *
+ *  A group inside a unary wrapper (`not(or(a, b))`, `off(and(a, b))`) has no
+ *  list to splice into. One child can still be lifted, which is exactly what
+ *  unwrapping means there; several cannot, because the only ways to place them
+ *  are a De Morgan rewrite or a distribution of the wrapper, and §3.5 forbids
+ *  the stored form from being restated either way. So that case is REFUSED — the
+ *  caller offers the action only where it can be performed — rather than
+ *  half-done or silently saved as an unchanged tree. */
 export function unwrapAt(root: Filter, loc: number[]): Filter {
+  const current = nodeAt(root, loc);
+  const kids = current ? filterChildren(current) : null;
+  if (!current || !kids || kids.length === 0) return root;
+  const parent = loc.length > 1 ? nodeAt(root, loc.slice(0, -1)) : root;
+  if (parent && (parent.kind === "not" || parent.kind === "off")) {
+    return kids.length === 1 ? replaceAt(root, loc, clone(kids[0])) : root;
+  }
   return edit(root, (draft) => {
     const at = locate(draft, loc);
-    const current = at?.children[at.idx];
-    const kids = current ? filterChildren(current) : null;
-    if (!at || !current || !kids) return false;
-    at.children.splice(at.idx, 1, ...kids);
+    if (!at || !at.children[at.idx]) return false;
+    at.children.splice(at.idx, 1, ...(filterChildren(at.children[at.idx]) ?? []));
     return true;
   });
 }
@@ -1489,10 +1690,8 @@ export function setOp(root: Filter, loc: number[], op: "and" | "or"): Filter {
     return normalize({ kind: op, items: structuredClone(filterChildren(root) ?? []) });
   }
   return edit(root, (draft) => {
-    const at = locate(draft, loc);
-    const current = at?.children[at.idx];
-    if (!at || !current || (current.kind !== "and" && current.kind !== "or")) return false;
-    at.children[at.idx] = { kind: op, items: filterChildren(current) ?? [] };
-    return true;
+    const current = nodeAt(draft, loc);
+    if (!current || (current.kind !== "and" && current.kind !== "or")) return false;
+    return assignAt(draft, loc, { kind: op, items: current.items });
   });
 }
