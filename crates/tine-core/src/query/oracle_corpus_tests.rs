@@ -1,14 +1,27 @@
-//! The corpus-walking helpers both query-engine example binaries share
+//! The corpus-walking helpers both ignored query oracle tests share
 //! (`query-walk-dump`, the O8 parity exporter, and `query-gate1-dump`, gate 1's
 //! walk side).
 //!
 //! Two copies of a macro scanner would drift, and a drift here is silent: the
 //! gate would compare a different set of queries than the parity export. This
-//! module is the one producer (D-4). It lives under `examples/support/` so
-//! Cargo does not try to build it as an example of its own.
+//! module is the one producer (D-4), compiled only for tests.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+
+pub fn dump_inputs() -> (Vec<String>, std::fs::File) {
+    let args = serde_json::from_str(
+        &std::env::var("TINE_QUERY_ORACLE_ARGS")
+            .expect("use scripts/query-oracle-dump.py to supply corpus arguments"),
+    )
+    .expect("oracle arguments must be a JSON string array");
+    let output = std::env::var_os("TINE_QUERY_ORACLE_OUTPUT")
+        .expect("use scripts/query-oracle-dump.py to supply the TSV output path");
+    (
+        args,
+        std::fs::File::create(output).expect("create oracle TSV output"),
+    )
+}
 
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

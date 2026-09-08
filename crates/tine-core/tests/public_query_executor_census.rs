@@ -140,14 +140,8 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
         1,
         "RET3: the export reader over Managed storage",
     ),
-    // ---- oracle / counterfactual: these stay ----
-    (
-        "crates/tine-core/src/query.rs",
-        "run_query_bounded_in_mode",
-        1,
-        "oracle: §8.1's counterfactual mode wrapper, constructed by no product \
-         caller",
-    ),
+    // Counterfactual corpus modes now compile only in ignored unit tests.
+    // scripts/query-oracle-dump.py preserves their reproducible TSV command.
 ];
 
 /// A file a SIBLING (or its parent module file) declares under `#[cfg(test)]`.

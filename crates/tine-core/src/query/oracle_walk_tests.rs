@@ -12,24 +12,28 @@
 //! is reduced to a stable 16-hex-digit FNV-1a hash.
 //!
 //! Usage:
-//! `cargo run -q -p tine-core --example query-walk-dump -- <graph-dir>…`
+//! `python3 scripts/query-oracle-dump.py walk --output /tmp/walk.tsv -- <graph-dir>…`
 //!
 //! A graph directory that does not exist is reported as `# skipped <label>` on
-//! stdout rather than failing, so the same command line works with and without
+//! TSV output rather than failing, so the same command works with and without
 //! the anonymized graph.
 
+use crate as tine_core;
+use std::io::Write;
 use std::path::PathBuf;
 
 use tine_core::query::run_query_bounded;
 use tine_core::Graph;
 
-#[path = "support/query_corpus.rs"]
+#[path = "oracle_corpus_tests.rs"]
 mod query_corpus;
 
 use query_corpus::{fnv1a, graph_files, macro_args, materialize_single_file};
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+#[test]
+#[ignore = "explicit corpus oracle; use scripts/query-oracle-dump.py"]
+fn dump() {
+    let (args, mut output) = query_corpus::dump_inputs();
     if args.is_empty() {
         eprintln!("usage: query-walk-dump <graph-dir>…");
         std::process::exit(2);
@@ -43,7 +47,7 @@ fn main() {
             .to_string();
         let (root, scratch) = materialize_single_file(&root);
         if !root.is_dir() {
-            println!("# skipped {label} (absent)");
+            writeln!(output, "# skipped {label} (absent)").unwrap();
             continue;
         }
         let graph = Graph::open(&root);
@@ -78,10 +82,10 @@ fn main() {
         }
         rows.sort();
         if rows.is_empty() {
-            println!("# no queries in {label}");
+            writeln!(output, "# no queries in {label}").unwrap();
         }
         for row in rows {
-            println!("{row}");
+            writeln!(output, "{row}").unwrap();
         }
         if let Some(dir) = scratch {
             let _ = std::fs::remove_dir_all(dir);

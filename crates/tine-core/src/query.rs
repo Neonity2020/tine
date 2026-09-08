@@ -9,6 +9,12 @@ mod conformance;
 pub mod derived;
 pub(crate) mod eval;
 mod execution_error;
+#[cfg(test)]
+#[path = "query/oracle_gate1_tests.rs"]
+mod oracle_gate1;
+#[cfg(test)]
+#[path = "query/oracle_walk_tests.rs"]
+mod oracle_walk;
 pub use execution_error::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
 pub mod ir;
 pub mod macro_text;
@@ -2186,11 +2192,13 @@ pub(crate) trait QueryPageSource {
 /// Gate 1 needs the SAME walk over the SAME pages with one decision switched
 /// off, so this delegates everything except the mode. Nothing in the product
 /// constructs it; [`run_query_bounded_in_mode`] is its only caller.
+#[cfg(test)]
 pub(crate) struct GraphQueryPagesInMode<'a>(
     pub(crate) GraphQueryPages<'a>,
     pub(crate) atom::CompareMode,
 );
 
+#[cfg(test)]
 impl QueryPageSource for GraphQueryPagesInMode<'_> {
     fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
         self.0.for_each_page(visit);
@@ -2212,7 +2220,8 @@ impl QueryPageSource for GraphQueryPagesInMode<'_> {
 /// [`run_query_bounded`] under one §8.1 mode. Gate 1's entry point: the walk is
 /// identical, only the atomizer's split, the atom identity and the coercion
 /// change, so a difference between two modes attributes itself.
-pub fn run_query_bounded_in_mode(
+#[cfg(test)]
+pub(crate) fn run_query_bounded_in_mode(
     graph: &Graph,
     query_src: &str,
     mode: atom::CompareMode,
