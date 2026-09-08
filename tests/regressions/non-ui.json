@@ -15,7 +15,7 @@
    "crates/tine-core/src/query/sql.rs::tests::page_blocks_bounds_only_from_a_selective_positive_block_predicate"
   ],
   "scenario": "query-engine.page-blocks-physical-page-semantics",
-  "failBefore": "Source-confirmed on base 464f9808: accepted @page and any(blocks, task = 'TODO') returns no pages from both the walk oracle and SQL because eval_page and leaf_page implement only Props. The manager will run the new expected-membership test against the base before accepting this row as covered."
+  "failBefore": "Manager gate 32038 failed expected TODO page membership on base 464f9808. With the semantic changes and TQL dependency 4c0fd750, gate 43010 passed all four page-block tests; gate 11427 passed 46 SQL tests with eight ignored; gate 99375 passed 402 query tests with twelve ignored."
  },
  "notes": "The relation ranges over all ordinary roots and descendants on one page_id, excludes the page preamble, preserves vacuous Every/None, block predicates and nested Page/Blocks re-entry, and admits each outer page once. Equal display names do not merge physical pages. Manager verified fail-before and pass-after at the core layer. This does not claim completed page Display or native delivery."
 },
