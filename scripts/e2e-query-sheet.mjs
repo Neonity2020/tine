@@ -870,25 +870,53 @@ await withApp(2, async (browser) => {
     fail(`the narrow nested group hid its inherited disabled state: ${JSON.stringify(groupGeometry)}`);
   }
 
-  const selectionGeometry = await browser.execute(() => {
-    const bar = document.querySelector(".qs-selection");
-    if (!(bar instanceof HTMLElement)) return null;
-    bar.scrollIntoView({ block: "nearest", inline: "nearest" });
-    return [...bar.querySelectorAll("button")].map((button) => {
-      const rect = button.getBoundingClientRect();
-      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-      return {
-        label: button.textContent?.trim(),
-        width: rect.width,
-        height: rect.height,
-        left: rect.left,
-        right: rect.right,
-        hit: !!hit && (hit === button || button.contains(hit)),
-      };
+  // Let the native scroll settle before judging pointer reachability. The
+  // original same-turn scroll/hit probe failed for both controls. Poll their
+  // actual hit targets; a persistently clipped or covered bar still fails,
+  // with the scrollport and covering element recorded below.
+  const selectionBar = await browser.$(".qs-selection");
+  await selectionBar.scrollIntoView({ block: "nearest", inline: "nearest" });
+  let selectionGeometry = null;
+  try {
+    await browser.waitUntil(async () => {
+      selectionGeometry = await browser.execute(() => {
+        const bar = document.querySelector(".qs-selection");
+        const sheet = bar?.closest(".qs-sheet");
+        if (!(bar instanceof HTMLElement) || !(sheet instanceof HTMLElement)) return null;
+        const barRect = bar.getBoundingClientRect();
+        const sheetRect = sheet.getBoundingClientRect();
+        const targets = [...bar.querySelectorAll("button")].map((button) => {
+          const rect = button.getBoundingClientRect();
+          const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          return {
+            label: button.textContent?.trim(),
+            width: rect.width,
+            height: rect.height,
+            left: rect.left,
+            right: rect.right,
+            top: rect.top,
+            bottom: rect.bottom,
+            hit: !!hit && (hit === button || button.contains(hit)),
+            topmost: hit instanceof HTMLElement ? hit.className || hit.tagName : null,
+          };
+        });
+        return {
+          bar: { top: barRect.top, bottom: barRect.bottom },
+          sheet: { top: sheetRect.top, bottom: sheetRect.bottom, scrollTop: sheet.scrollTop },
+          targets,
+        };
+      });
+      return selectionGeometry?.targets.length === 2
+        && selectionGeometry.targets.every((target) => target.hit);
+    }, {
+      timeout: 5_000,
+      timeoutMsg: "the 390px selection bar did not settle at a pointer-reachable scroll position",
     });
-  });
-  if (!selectionGeometry || selectionGeometry.length !== 2) fail(`the 390px selection bar did not expose Group selected and Clear: ${JSON.stringify(selectionGeometry)}`);
-  for (const target of selectionGeometry) {
+  } catch (error) {
+    throw new Error(`${String(error)}; geometry=${JSON.stringify(selectionGeometry)}`);
+  }
+  if (!selectionGeometry || selectionGeometry.targets.length !== 2) fail(`the 390px selection bar did not expose Group selected and Clear: ${JSON.stringify(selectionGeometry)}`);
+  for (const target of selectionGeometry.targets) {
     if (target.width < 43.5 || target.height < 43.5 || !target.hit
         || target.left < -1 || target.right > rowGeometry.viewport.width + 1) {
       fail(`the selection-bar control was not reachable at 390px: ${JSON.stringify(selectionGeometry)}`);
