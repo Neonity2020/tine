@@ -7171,5 +7171,28 @@
  },
  "notes": "Measured on 37b15bc1, 2026-09-08. The walk-backed hydrate_selected_export_queries resolves each export root by scanning the named page for the FIRST block whose uuid OR id:: property equals the root\u2019s public id, so a decoy block carrying another block\u2019s structural id in its id:: property wins and the export emits the decoy\u2019s subtree instead of the selected one; equal page display names are ambiguous the same way. The named tests pin the correct physical answer for the new database-read core (which carries a ResultLocator of source index plus physical page and block id from selection through hydration) AND assert that the oracle really does answer wrongly, so the divergence is recorded rather than copied. Not fixed here: the remaining wrong answer is in the public walk adapters, outside this packet\u2019s write set."
 }
+,
+{
+   "id": "REG-QE-TQL-STRUCTURE-AND-CURRENT-SCOPE-001",
+   "title": "Persisted TQL retains editable groups and resolves page hops from the current nested row",
+   "family": "query-engine",
+   "sources": {"issues": [], "commits": [], "internal": "P6 native root diagnostic and PageBlocks89744"},
+   "platforms": ["all"],
+   "layer": "rust-core",
+   "status": "fixing",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/query/tql.rs::tests::unparenthesized_boolean_chains_are_nary_but_parenthesized_groups_survive",
+     "crates/tine-core/src/query/tql.rs::tests::page_hops_follow_the_current_nested_scope",
+     "crates/tine-core/src/query/tql.rs::tests::quantified_page_properties_and_page_tags_use_the_same_current_scope_rule",
+     "crates/tine-core/src/query/print.rs::tests::tql_preserves_flat_chains_and_explicit_group_boundaries_exactly",
+     "crates/tine-core/src/query/print.rs::tests::layered_tql_keeps_a_same_kind_group_beside_an_off_sibling",
+     "crates/tine-core/src/query/print.rs::tests::reopened_structural_tql_accepts_an_edit_and_round_trips_again"
+    ],
+    "scenario": "query-engine.tql-structure-and-current-scope",
+    "failBefore": "manager-native-root-diagnostic exits 1 with a flat four-row query reopened as nested binary groups; PageBlocks89744 returns no page for a matching nested page_prop"
+   },
+   "notes": "The P6 native journey persisted the right one-line tine-query and kept its sheet open, but sqlparser's binary associativity leaked into the editable IR. TQL lowering also decided Page hops from the outer anchor, so page_prop inside an @page blocks relation stayed on the block. The correction preserves explicit same-operator parentheses, flattens only unparenthesized parser chains, and resolves page targets from the current Scope. Exact manager-owned Rust and native pass-after evidence remains pending."
+  }
 ]
 }
