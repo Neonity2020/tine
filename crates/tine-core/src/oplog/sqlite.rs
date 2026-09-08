@@ -12354,6 +12354,7 @@ mod tests {
 
         let engine = fixture.runtime.engine();
         let store = engine.archive_store().unwrap();
+        let expected_work = engine.clean_projection_work_for_batch(batch_id).unwrap();
 
         // Additively relocate this batch's exact originals into cold packs.
         let outcome = store
@@ -12415,6 +12416,11 @@ mod tests {
         assert_eq!(
             replayed.dependency_frontier(),
             expected.dependency_frontier()
+        );
+        let reconstructed_work = engine.clean_projection_work_for_batch(batch_id).unwrap();
+        assert_eq!(
+            reconstructed_work, expected_work,
+            "accepted projection catch-up must reconstruct the same work from cold originals"
         );
         let after = store.instrumentation();
         assert!(

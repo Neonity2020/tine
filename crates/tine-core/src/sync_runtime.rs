@@ -9014,10 +9014,23 @@ fn publish_complete_clean_archive(
     provider: &mut SharedProviderTransport,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
+    accepted_batch_ids: &[BatchId],
 ) -> Result<(), SyncRuntimeRequestError> {
-    let manifests = store
-        .committed_manifests()
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    // This is explicit whole-archive publication. The accepted roster supplies
+    // logical names; physical hot/cold placement cannot change its membership.
+    let manifests = accepted_batch_ids
+        .iter()
+        .map(|batch_id| {
+            store
+                .resolve_logical_manifest(*batch_id)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                .ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(format!(
+                        "clean accepted manifest {batch_id} is absent during archive publication"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for manifest in &manifests {
         if manifest.workspace_id() != workspace_id || manifest.lineage_digest() != lineage_digest {
             return Err(SyncRuntimeRequestError::ActorRefused(format!(
@@ -9027,14 +9040,14 @@ fn publish_complete_clean_archive(
         }
         for object in manifest.required_objects() {
             let bytes = store
-                .read_object_bytes(object.content_digest())
+                .resolve_logical_object_bytes(object.content_digest())
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
         }
     }
     for manifest in manifests {
         let bytes = store
-            .read_manifest_bytes(manifest.batch_id())
+            .resolve_logical_manifest_bytes(manifest.batch_id())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         if OperationBatch::decode(&bytes)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
@@ -10052,7 +10065,7 @@ fn publish_clean_archive_batch(
     batch_id: BatchId,
 ) -> Result<(), SyncRuntimeRequestError> {
     let validated = match store
-        .inspect_batch(batch_id)
+        .inspect_batch_with_cold_history(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     {
         crate::oplog::BatchInspection::Ready(validated) => validated,
@@ -10077,12 +10090,12 @@ fn publish_clean_archive_batch(
     }
     for object in validated.manifest().required_objects() {
         let bytes = store
-            .read_object_bytes(object.content_digest())
+            .resolve_logical_object_bytes(object.content_digest())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
     }
     let bytes = store
-        .read_manifest_bytes(batch_id)
+        .resolve_logical_manifest_bytes(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     publish_clean_manifest_exact(provider, batch_id, &bytes)
 }
@@ -22822,11 +22835,16 @@ impl RuntimeActor {
                 Ok(head) => head,
                 Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
             };
+            let accepted_batch_ids = match engine.status().accepted_batch_ids() {
+                Ok(ids) => ids,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
             let repaired = publish_complete_clean_archive(
                 &store,
                 self.provider.as_mut().expect("provider checked"),
                 descriptor.workspace_id(),
                 descriptor.lineage_digest(),
+                &accepted_batch_ids,
             )
             .and_then(|()| {
                 publish_clean_descriptor_exact(
@@ -22965,7 +22983,7 @@ impl RuntimeActor {
             };
             let mut missing_dependency = false;
             for dependency in manifest.causal_dependency_heads().iter().rev() {
-                let retained = match store.inspect_batch(*dependency) {
+                let retained = match store.inspect_batch_with_cold_history(*dependency) {
                     Ok(crate::oplog::BatchInspection::Ready(_)) => true,
                     Ok(
                         crate::oplog::BatchInspection::Absent
@@ -23660,11 +23678,17 @@ impl RuntimeActor {
             shared_namespace_digest(self.binding.workspace_id()),
         )
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let accepted_batch_ids = self
+            .active_engine()?
+            .status()
+            .accepted_batch_ids()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_complete_clean_archive(
             &store,
             &mut provider,
             self.binding.workspace_id(),
             self.binding.lineage_digest(),
+            &accepted_batch_ids,
         )?;
         publish_clean_descriptor_exact(&mut provider, &descriptor)?;
         let head =

@@ -7200,7 +7200,7 @@ impl ShardedHotEngine {
         let mut pending = BTreeMap::new();
         for batch_id in batch_ids {
             let validated = match store
-                .inspect_batch(*batch_id)
+                .inspect_batch_with_cold_history(*batch_id)
                 .map_err(|error| EngineError::Archive(error.to_string()))?
             {
                 BatchInspection::Ready(batch) => batch,
@@ -16477,7 +16477,7 @@ impl ShardedHotEngine {
     ) -> Result<Vec<ProjectionWork>, EngineError> {
         let (store, endpoint) = self.clean_projection_runtime_binding()?;
         let manifest = store
-            .read_manifest(batch_id)
+            .resolve_logical_manifest(batch_id)
             .map_err(|error| EngineError::Archive(error.to_string()))?
             .ok_or_else(|| {
                 EngineError::Archive(format!(
@@ -16505,7 +16505,7 @@ impl ShardedHotEngine {
     ) -> Result<Vec<ProjectionWork>, EngineError> {
         let (store, endpoint) = self.clean_projection_runtime_binding()?;
         let manifest = store
-            .read_manifest(batch_id)
+            .resolve_logical_manifest(batch_id)
             .map_err(|error| EngineError::Archive(error.to_string()))?
             .ok_or_else(|| {
                 EngineError::Archive(format!(
@@ -20697,7 +20697,7 @@ impl ShardedHotEngine {
             .as_ref()
             .ok_or(EngineError::MissingDependency(batch_id))?;
         match store
-            .inspect_batch(batch_id)
+            .inspect_batch_with_cold_history(batch_id)
             .map_err(|error| EngineError::Archive(error.to_string()))?
         {
             BatchInspection::Ready(batch) => Ok(batch),
@@ -21738,7 +21738,7 @@ impl ShardedHotEngine {
             .filter(|descriptor| descriptor.kind() == ObjectKind::ProjectionIntent)
             .map(|descriptor| {
                 let bytes = store
-                    .read_object_bytes(descriptor.content_digest())
+                    .resolve_logical_object_bytes(descriptor.content_digest())
                     .map_err(|error| EngineError::Archive(error.to_string()))?;
                 let object = OperationObject::decode(&bytes)?;
                 if object.descriptor()? != *descriptor {

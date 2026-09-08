@@ -34435,3 +34435,179 @@ fn r5c_the_worst_case_patch_is_measured() {
 
 #[path = "rebaselining_layout_tests.rs"]
 mod rebaselining_layout;
+
+#[test]
+fn cold_archive_republication_uses_accepted_names_and_preserves_original_bytes() {
+    let fixture = ActivationFixture::nested_unicode("cold-archive-republication", 0xa1d8);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+    let (mut page, revision) = match actor
+        .load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "Root.md".into(),
+            },
+        })
+        .unwrap()
+    {
+        SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+        other => panic!("fixture page did not load: {other:?}"),
+    };
+    page.blocks[0].raw = "original accepted cold publication".into();
+    actor
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    actor.clean_shutdown().unwrap();
+    let accepted = actor
+        .active_engine()
+        .unwrap()
+        .status()
+        .accepted_batch_ids()
+        .unwrap();
+    assert!(!accepted.is_empty());
+    let store = actor.retained_archive_store().unwrap();
+    let mut expected = BTreeMap::new();
+    let mut object_digests = BTreeSet::new();
+    for batch_id in &accepted {
+        let manifest = store.read_manifest(*batch_id).unwrap().unwrap();
+        expected.insert(
+            format!("manifests/{batch_id}.manifest"),
+            store.read_manifest_bytes(*batch_id).unwrap(),
+        );
+        for object in manifest.required_objects() {
+            let digest = object.content_digest();
+            expected.insert(
+                format!("objects/{digest}.object"),
+                store.read_object_bytes(digest).unwrap(),
+            );
+            object_digests.insert(digest);
+        }
+    }
+    // A physically committed but unaccepted original must not be advertised by
+    // whole accepted-history publication merely because its file is present.
+    let extra_id = BatchId::from_uuid(Uuid::from_u128(0xa1d8_ff));
+    let effect = crate::oplog::SemanticEffect::new(vec![], vec![], vec![])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let object = OperationObject::new(
+        fixture.request.identities.workspace_id,
+        fixture.request.identities.catalog_document_id,
+        crate::oplog::ObjectKind::SemanticEffect,
+        effect.clone(),
+    )
+    .unwrap();
+    let extra_manifest = OperationBatch::new_with_causality(
+        fixture.request.identities.workspace_id,
+        fixture.request.identities.lineage_digest,
+        extra_id,
+        fixture.request.identities.device_id,
+        fixture.request.identities.session_id,
+        crate::oplog::BatchOrigin::LocalMutation,
+        crate::oplog::BatchCausalDot::new(
+            crate::oplog::CausalPeerId::from_device_id(fixture.request.identities.device_id),
+            1,
+        )
+        .unwrap(),
+        vec![],
+        crate::oplog::FrontierV2::new(vec![]).unwrap(),
+        crate::oplog::SemanticEffectDigest::of(&effect),
+        vec![object.descriptor().unwrap()],
+    )
+    .unwrap();
+    store
+        .publish_prepared_fixture(
+            &crate::oplog::PreparedBatch::new(extra_manifest, vec![object]).unwrap(),
+        )
+        .unwrap();
+    store
+        .publish_cold_history_for_batches(&accepted.iter().copied().collect())
+        .unwrap();
+    for batch_id in &accepted {
+        fs::remove_file(
+            store
+                .root_path()
+                .join("batches")
+                .join(format!("{batch_id}.manifest")),
+        )
+        .unwrap();
+    }
+    for digest in object_digests {
+        fs::remove_file(
+            store
+                .root_path()
+                .join("objects")
+                .join(format!("{digest}.object")),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        store.committed_manifests().unwrap().len(),
+        1,
+        "only the unaccepted original remains in the hot manifest directory"
+    );
+    for complete in [false, true] {
+        let root = fixture.root.join(if complete {
+            "cold-complete-provider"
+        } else {
+            "cold-single-provider"
+        });
+        let journal = fixture
+            .root
+            .join(if complete {
+                "cold-complete-device"
+            } else {
+                "cold-single-device"
+            })
+            .join("journal");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let mut provider = SharedProviderTransport::open(&root, &journal).unwrap();
+        if complete {
+            publish_complete_clean_archive(
+                &store,
+                &mut provider,
+                fixture.request.identities.workspace_id,
+                fixture.request.identities.lineage_digest,
+                &accepted,
+            )
+            .unwrap();
+        } else {
+            for batch_id in &accepted {
+                publish_clean_archive_batch(
+                    &store,
+                    &mut provider,
+                    fixture.request.identities.workspace_id,
+                    fixture.request.identities.lineage_digest,
+                    *batch_id,
+                )
+                .unwrap();
+            }
+        }
+        for (path, bytes) in &expected {
+            assert_eq!(
+                fs::read(root.join("outbox").join(path)).unwrap(),
+                *bytes,
+                "republication must preserve exact original bytes: {path}"
+            );
+        }
+        assert!(!root
+            .join("outbox/manifests")
+            .join(format!("{extra_id}.manifest"))
+            .exists());
+    }
+}

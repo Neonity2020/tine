@@ -3884,3 +3884,18 @@ an uncertain outcome. Missing, malformed or unrelated markers fail closed. The
 old authority generation remains available before the commit point, and installed
 replacement authority is reopened after it. This fixes the existing join path; it
 does not enable archive rebaselining or prove its future retention closure.
+
+
+### Indexed historical callers after cold relocation
+
+Accepted engine replay, accepted projection-work reconstruction and retained
+projection-intent loading use the single ObjectStore logical resolver. Current
+projection payload pins and admission readbacks remain hot. Relocation therefore
+preserves historical logical presence without treating a cold directory listing as
+an accepted roster. Explicit full-archive provider repair/sharing publication takes
+accepted batch IDs from the engine and resolves those exact originals; it does not
+publish every physically committed hot manifest. Single-batch history republication
+and retained dependency recovery use the same resolver. Original manifest/object
+bytes remain unchanged and manifests are published after their required objects.
+These are historical read-path changes, not authorization for hot deletion or a
+claim that portable baseline join and bounded active generations are installed.
