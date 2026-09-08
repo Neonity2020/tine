@@ -18,6 +18,8 @@ import {
   reopenClosedTab,
   activateNextTab,
   activatePrevTab,
+  goBack,
+  goForward,
   openQueryInNewTab,
   updateActiveQuery,
   replaceActiveRoute,
@@ -220,6 +222,111 @@ describe("query workspace display draft (P5C)", () => {
     expect(activeTab().history[0]).toMatchObject({
       kind: "query", display: { columns: ["prop:owner"], sample: 4 },
     });
+  });
+
+  it("applies the complete mixed-result state in one stable history entry", () => {
+    const opened = openQueryInNewTab("alpha", "search", true);
+    updateActiveQuery({
+      source: "alpha -draft",
+      sourceKind: "dsl",
+      presentation: "table",
+      display: { columns: ["prop:legacy"] },
+      pagePresentation: "board",
+      pageDisplay: {},
+      blockPresentation: "list",
+      blockDisplay: { sort: [["priority", "desc"]], sample: 9 },
+      pageMatchScope: "both",
+    });
+
+    expect(queryRoute()).toEqual({
+      kind: "query",
+      id: opened.id,
+      sourceKind: "dsl",
+      source: "alpha -draft",
+      presentation: "table",
+      display: { columns: ["prop:legacy"] },
+      pagePresentation: "board",
+      pageDisplay: {},
+      blockPresentation: "list",
+      blockDisplay: { sort: [["priority", "desc"]], sample: 9 },
+      pageMatchScope: "both",
+    });
+    expect(activeTab().history).toHaveLength(1);
+  });
+
+  it("rejects every simultaneous edit when one optional scoped value is bad", () => {
+    openQueryInNewTab("alpha", "search", true);
+    updateActiveQuery({ pageDisplay: {}, pageMatchScope: "names" });
+    const before = queryRoute();
+
+    for (const badPatch of [
+      { pageDisplay: { columns: ["bad;field"] } },
+      { blockDisplay: { sample: -1 } },
+      { pagePresentation: "gallery" },
+      { blockPresentation: "cards" },
+      { pageMatchScope: "all" },
+    ]) {
+      updateActiveQuery({
+        source: "must-not-apply",
+        blockDisplay: { columns: ["prop:valid"] },
+        ...badPatch,
+      } as never);
+      expect(queryRoute()).toEqual(before);
+    }
+    expect(activeTab().history).toHaveLength(1);
+  });
+
+  it("keeps omitted overrides, removes explicit undefined, and preserves empty drafts", () => {
+    openQueryInNewTab("alpha", "table", true);
+    updateActiveQuery({
+      display: { columns: ["prop:legacy"] },
+      pagePresentation: "board",
+      pageDisplay: {},
+      blockPresentation: "list",
+      blockDisplay: { sample: 3 },
+      pageMatchScope: "names",
+    });
+    updateActiveQuery({ source: "beta" });
+    expect(queryRoute()).toMatchObject({
+      pagePresentation: "board",
+      pageDisplay: {},
+      blockPresentation: "list",
+      blockDisplay: { sample: 3 },
+      pageMatchScope: "names",
+    });
+
+    updateActiveQuery({
+      pagePresentation: undefined,
+      pageDisplay: undefined,
+      pageMatchScope: undefined,
+    });
+    const cleared = queryRoute();
+    expect(Object.hasOwn(cleared, "pagePresentation")).toBe(false);
+    expect(Object.hasOwn(cleared, "pageDisplay")).toBe(false);
+    expect(Object.hasOwn(cleared, "pageMatchScope")).toBe(false);
+    expect(cleared.display).toEqual({ columns: ["prop:legacy"] });
+    expect(cleared.blockDisplay).toEqual({ sample: 3 });
+  });
+
+  it("revisits the captured scoped route through Back and Forward", () => {
+    openQueryInNewTab("alpha", "search", true);
+    updateActiveQuery({
+      pagePresentation: "table",
+      pageDisplay: { columns: ["name"] },
+      blockPresentation: "list",
+      blockDisplay: {},
+      pageMatchScope: "content",
+    });
+    const captured = queryRoute();
+    openPage("Elsewhere");
+    expect(activeTab().history).toHaveLength(2);
+
+    goBack();
+    expect(route()).toEqual(captured);
+    goForward();
+    expect(route()).toMatchObject({ kind: "page", name: "Elsewhere" });
+    goBack();
+    expect(route()).toEqual(captured);
   });
 });
 

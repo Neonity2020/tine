@@ -20,7 +20,8 @@
 // Nothing here is a query parser or printer. The backend remains the only
 // producer of query language.
 import { propertyKeyNorm } from "../render/block";
-import type { AggFn, Field, ViewSettings } from "./queryIr";
+import type { AggFn, Field, ViewKind, ViewSettings } from "./queryIr";
+import type { FriendlyPageMatchScope, QueryDisplayDraft } from "./queryDisplayDraft";
 
 /** The six display facts a query block persists (§7.6). A typed sheet SCHEMA is
  *  deliberately not one of them: `tine.fields::` is schema, `tine.columns::` is
@@ -45,6 +46,42 @@ export const QUERY_GROUP_FIELD_PROPERTY = "tine.group-field";
 /** The ambiguous predecessor. Read for compatibility, retired on the first save
  *  that states the grouping, never written. */
 export const QUERY_LEGACY_GROUP_PROPERTY = "tine.group-by";
+
+/** One key map for the singular compatibility writer and both mixed-result
+ *  namespaces. The scoped forms reuse the same scalar/list encoders below. */
+export const QUERY_DISPLAY_PROPERTY_NAMESPACES = {
+  legacy: {
+    view: "tine.view",
+    marker: null,
+    sort: "tine.sort",
+    grouping: "tine.group-field",
+    columns: "tine.columns",
+    aggregates: "tine.col-aggregates",
+    sample: "tine.sample",
+  },
+  page: {
+    view: "tine.page-view",
+    marker: "tine.page-display",
+    sort: "tine.page-sort",
+    grouping: "tine.page-group-field",
+    columns: "tine.page-columns",
+    aggregates: "tine.page-col-aggregates",
+    sample: "tine.page-sample",
+  },
+  block: {
+    view: "tine.block-view",
+    marker: "tine.block-display",
+    sort: "tine.block-sort",
+    grouping: "tine.block-group-field",
+    columns: "tine.block-columns",
+    aggregates: "tine.block-col-aggregates",
+    sample: "tine.block-sample",
+  },
+} as const;
+
+export const QUERY_PAGE_MATCH_SCOPE_PROPERTY = "tine.page-match-scope";
+export type QueryDisplayPropertyNamespace = keyof typeof QUERY_DISPLAY_PROPERTY_NAMESPACES;
+export type QueryScopedDisplayPropertyNamespace = Exclude<QueryDisplayPropertyNamespace, "legacy">;
 
 /** The six sheet builtins a column name can spell. Every other string is an
  *  ordinary property name. Mirrors `BUILTIN_FIELDS` in `sheet/config.ts` and
@@ -444,21 +481,22 @@ export interface QueryViewPatchInput {
  */
 export function queryViewPropertyPatch(input: QueryViewPatchInput): QueryPropertyWrite[] {
   const { view, properties } = input;
+  const keys = QUERY_DISPLAY_PROPERTY_NAMESPACES.legacy;
   const writes: QueryPropertyWrite[] = [];
   const current = (key: string) => firstProperty(properties, key);
   const push = (key: string, value: string) => writes.push([key, value || null]);
 
   // `tine.view` — a bare enum word.
   const viewValue = view.view ?? "";
-  if ((current("tine.view") ?? "").trim().toLowerCase() !== viewValue) {
-    push("tine.view", viewValue);
+  if ((current(keys.view) ?? "").trim().toLowerCase() !== viewValue) {
+    push(keys.view, viewValue);
   }
 
   // `tine.sort` — compared as PARSED pairs, so re-spacing an identical sort is
   // not a write.
   const sort = view.sort ?? [];
-  const persistedSort = parsePersistedSort(current("tine.sort") ?? "");
-  if (!sameSort(persistedSort, sort)) push("tine.sort", serializeQuerySort(sort));
+  const persistedSort = parsePersistedSort(current(keys.sort) ?? "");
+  if (!sameSort(persistedSort, sort)) push(keys.sort, serializeQuerySort(sort));
 
   // **`tine.group-field` — the canonical grouping identity** (P5B).
   //
@@ -489,8 +527,8 @@ export function queryViewPropertyPatch(input: QueryViewPatchInput): QueryPropert
   const propertiesAfterSave: PropertyPairs = [
     // The destination view, spelled out: `view.view` absent means the default
     // LIST, and leaving the slot empty would let a stale reading decide instead.
-    ["tine.view", viewValue || "list"] as const,
-    ...properties.filter(([key]) => propertyKeyNorm(key) !== "tine.view"),
+    [keys.view, viewValue || "list"] as const,
+    ...properties.filter(([key]) => propertyKeyNorm(key) !== keys.view),
   ];
   const persistedGrouping = resolveQueryGrouping(propertiesAfterSave);
   const nextGrouping = groupingFromViewValue(view.group_by);
@@ -506,8 +544,8 @@ export function queryViewPropertyPatch(input: QueryViewPatchInput): QueryPropert
 
   // `tine.sample`.
   const sample = view.sample == null ? "" : String(view.sample);
-  const persistedSample = (current("tine.sample") ?? "").trim();
-  if (persistedSample !== sample) push("tine.sample", sample);
+  const persistedSample = (current(keys.sample) ?? "").trim();
+  if (persistedSample !== sample) push(keys.sample, sample);
 
   // `tine.columns` — the baseline is the full RESOLUTION, legacy branch
   // included, because a legacy bare list is what the block's properties
@@ -527,11 +565,120 @@ export function queryViewPropertyPatch(input: QueryViewPatchInput): QueryPropert
 
   // `tine.col-aggregates` — segment-preserving, see `mergeQueryAggregateValue`.
   const aggregates = view.aggregates ?? [];
-  const rawAggregates = current("tine.col-aggregates") ?? null;
+  const rawAggregates = current(keys.aggregates) ?? null;
   const merged = mergeQueryAggregateValue(rawAggregates, aggregates);
-  if (merged !== undefined) writes.push(["tine.col-aggregates", merged]);
+  if (merged !== undefined) writes.push([keys.aggregates, merged]);
 
   return writes;
+}
+
+export interface QueryScopedDisplayPropertyPatchInput {
+  namespace: QueryScopedDisplayPropertyNamespace;
+  presentation?: ViewKind;
+  /** Absence removes this scope's marker and recognized member keys. A present
+   *  empty object writes the marker alone. */
+  display?: QueryDisplayDraft;
+  properties: PropertyPairs;
+}
+
+/** Materialize one page/block display override without touching the other
+ *  namespace or any unrecognized authored key. This is a writer only; Rust
+ *  remains the property reader for reopened macros. */
+export function queryScopedDisplayPropertyPatch(
+  input: QueryScopedDisplayPropertyPatchInput,
+): QueryPropertyWrite[] {
+  const { namespace, presentation, display, properties } = input;
+  const keys = QUERY_DISPLAY_PROPERTY_NAMESPACES[namespace];
+  const writes: QueryPropertyWrite[] = [];
+  const current = (key: string) => firstProperty(properties, key);
+  const removeIfPresent = (key: string) => {
+    if (current(key) !== undefined) writes.push([key, null]);
+  };
+
+  if (presentation === undefined) {
+    removeIfPresent(keys.view);
+  } else if ((current(keys.view) ?? "").trim().toLowerCase() !== presentation) {
+    writes.push([keys.view, presentation]);
+  }
+
+  if (display === undefined) {
+    removeIfPresent(keys.marker);
+  } else if (current(keys.marker) !== "1") {
+    writes.push([keys.marker, "1"]);
+  }
+
+  const sortPresent = display !== undefined && Object.hasOwn(display, "sort");
+  const sort = display?.sort ?? [];
+  if (!sortPresent) {
+    removeIfPresent(keys.sort);
+  } else if (!sameSort(parsePersistedSort(current(keys.sort) ?? ""), sort)) {
+    writes.push([keys.sort, serializeQuerySort(sort)]);
+  } else if (current(keys.sort) === undefined) {
+    writes.push([keys.sort, ""]);
+  }
+
+  const grouping = display?.group_by;
+  if (grouping === undefined) {
+    removeIfPresent(keys.grouping);
+  } else if (grouping === "") {
+    if (current(keys.grouping)?.trim() !== "") writes.push([keys.grouping, ""]);
+  } else if (canonicalGroupField(current(keys.grouping) ?? "") !== grouping) {
+    writes.push([keys.grouping, grouping]);
+  }
+
+  const columnsPresent = display !== undefined && Object.hasOwn(display, "columns");
+  const columns = display?.columns ?? [];
+  if (!columnsPresent) {
+    removeIfPresent(keys.columns);
+  } else {
+    const persisted = current(keys.columns);
+    const parsed = persisted === undefined ? null : queryColumnTokens(persisted);
+    if (!parsed || !sameStrings(parsed, columns)) {
+      writes.push([keys.columns, serializeQueryColumns(columns)]);
+    }
+  }
+
+  const aggregatesPresent = display !== undefined && Object.hasOwn(display, "aggregates");
+  const aggregates = display?.aggregates ?? [];
+  const rawAggregates = current(keys.aggregates);
+  const mergedAggregates = mergeQueryAggregateValue(rawAggregates ?? null, aggregates);
+  if (aggregatesPresent) {
+    if (mergedAggregates !== undefined) {
+      writes.push([keys.aggregates, mergedAggregates ?? ""]);
+    } else if (rawAggregates === undefined) {
+      writes.push([keys.aggregates, ""]);
+    }
+  } else if (mergedAggregates !== undefined) {
+    writes.push([keys.aggregates, mergedAggregates]);
+  } else if (rawAggregates !== undefined && !rawAggregates.split(";").some(
+    (segment) => segment.trim() !== "" && parseQueryAggregateSegment(segment) === null,
+  )) {
+    writes.push([keys.aggregates, null]);
+  }
+
+  const sample = display?.sample;
+  if (sample === undefined) {
+    removeIfPresent(keys.sample);
+  } else if ((current(keys.sample) ?? "").trim() !== String(sample)) {
+    writes.push([keys.sample, String(sample)]);
+  }
+
+  return writes;
+}
+
+/** Persist Friendly page membership independently of either display namespace.
+ *  Absence removes the override and restores historical name/alias matching. */
+export function queryPageMatchScopePropertyPatch(input: {
+  scope?: FriendlyPageMatchScope;
+  properties: PropertyPairs;
+}): QueryPropertyWrite[] {
+  const current = firstProperty(input.properties, QUERY_PAGE_MATCH_SCOPE_PROPERTY);
+  if (input.scope === undefined) {
+    return current === undefined ? [] : [[QUERY_PAGE_MATCH_SCOPE_PROPERTY, null]];
+  }
+  return (current ?? "").trim() === input.scope
+    ? []
+    : [[QUERY_PAGE_MATCH_SCOPE_PROPERTY, input.scope]];
 }
 
 /** The six display facts, and the property keys a change to each may touch. */

@@ -23,6 +23,27 @@
 // state: nothing here refuses to open anything.
 import type { AggFn, Field, SortDir, ViewKind, ViewSettings } from "./queryIr";
 import { canonicalGroupField } from "./queryViewProperties";
+import type { QueryRoute } from "../router";
+
+/** Which source of page membership a Friendly mixed search requests: page
+ *  names/aliases, contained block text, or their union. This is unrelated to
+ *  the routed physical-page scope used by query execution. */
+export type FriendlyPageMatchScope = "names" | "content" | "both";
+
+const FRIENDLY_PAGE_MATCH_SCOPES: ReadonlySet<string> = new Set([
+  "names",
+  "content",
+  "both",
+]);
+
+/** The one normalizer for route patches and persisted sessions. `null` means
+ *  unreadable; callers choose whether that rejects a patch or drops one
+ *  optional persisted field. */
+export function normalizeFriendlyPageMatchScope(value: unknown): FriendlyPageMatchScope | null {
+  return typeof value === "string" && FRIENDLY_PAGE_MATCH_SCOPES.has(value)
+    ? value as FriendlyPageMatchScope
+    : null;
+}
 
 /** The non-presentation half of `ViewSettings`, as a query workspace's route
  *  carries it.
@@ -216,4 +237,22 @@ export function queryDisplaySettings(
       : {}),
     ...(source.sample !== undefined ? { sample: source.sample } : {}),
   };
+}
+
+/** Resolve one half of a mixed-result route. Scoped presentation and draft
+ *  override the singular compatibility fields independently. A present `{}`
+ *  is therefore a clear, while an absent scoped draft inherits `display`. */
+export function queryResultDisplaySettings(
+  route: QueryRoute,
+  parsed: ViewSettings | undefined,
+  target: "page" | "block",
+): ViewSettings {
+  const page = target === "page";
+  const scopedDraftKey = page ? "pageDisplay" : "blockDisplay";
+  const draft = Object.hasOwn(route, scopedDraftKey)
+    ? route[scopedDraftKey]
+    : route.display;
+  const presentation = (page ? route.pagePresentation : route.blockPresentation)
+    ?? route.presentation;
+  return queryDisplaySettings(draft, parsed, presentation);
 }
