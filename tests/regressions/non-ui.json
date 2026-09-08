@@ -7184,6 +7184,8 @@
     "tests": [
      "crates/tine-core/src/query/tql.rs::tests::unparenthesized_boolean_chains_are_nary_but_parenthesized_groups_survive",
      "crates/tine-core/src/query/tql.rs::tests::page_hops_follow_the_current_nested_scope",
+     "crates/tine-core/src/query/tql.rs::tests::quantifier_calls_after_boolean_operators_keep_their_exact_ir",
+     "crates/tine-core/src/query/tql.rs::tests::quantifier_disambiguation_ignores_quoted_text_and_comments",
      "crates/tine-core/src/query/tql.rs::tests::quantified_page_properties_and_page_tags_use_the_same_current_scope_rule",
      "crates/tine-core/src/query/print.rs::tests::tql_preserves_flat_chains_and_explicit_group_boundaries_exactly",
      "crates/tine-core/src/query/print.rs::tests::layered_tql_keeps_a_same_kind_group_beside_an_off_sibling",
