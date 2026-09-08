@@ -12,7 +12,7 @@ fn query_execution_errors_are_not_memoized_as_empty_results() {
         gen: graph.cache_generation(),
         today: crate::date::JournalDate::today().ordinal_key(),
         config_digest: graph.config.parse_config().digest(),
-        registry_gen: 0,
+        registry_gen: None,
     };
     for (index, error) in [
         Error::NotReady(QueryReadinessReason::Indexing),

@@ -759,7 +759,10 @@ cache generation before and after its read transaction starts, then its
 interrupt handle and the snapshot-scoped `session_pages` identity set are
 registered with the job owner. A property-bearing Direct query captures its
 committed registry cache alongside the SQL snapshot, using the actual storage
-query revision and parse config. This owner is separate from the editor registry.
+query revision and parse config. A query without a property leaf carries no
+registry capture and does not clone dirty keys or scan the published registry
+base; asking that registry-free job for registry state is an invalid-snapshot
+error. This owner is separate from the editor registry.
 The first read builds the registry from SQL; successful page deltas invalidate
 only changed property keys and declaration-page dependencies. The producer
 compares touched-page metadata before writing with its physical materialization
@@ -828,7 +831,9 @@ query result is memoized PRE-VIEW — the matched rows in base order, before
 display sorting and sampling — under the resolved normalized query IR, the
 graph cache generation, the execution day, the construction bounds and profile,
 the parse-config digest, and, when the query names a property, the observed
-registry generation. The key is the IR and not the query text, so `(task TODO)`,
+registry generation. Property-free memo lookups carry no registry-generation
+term and do not consult the editor registry or evict property entries. The key
+is the IR and not the query text, so `(task TODO)`,
 `(and (task TODO))` and the datalog spelling of the same question are ONE entry.
 View directives that do not change the construction profile reuse those rows.
 The parse-config digest is unconditional, because

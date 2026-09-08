@@ -3987,7 +3987,8 @@ struct DerivedMemoStamp {
     gen: u64,
     today: i64,
     config_digest: tine_storage::ContentDigest,
-    registry_gen: u64,
+    /// None means this lookup does not depend on a registry.
+    registry_gen: Option<u64>,
 }
 
 struct DerivedCache {
@@ -6721,7 +6722,12 @@ impl Graph {
         }
         // Acquire before reading registry inputs: lowering and output must see
         // the same SQLite transaction even when a save lands between them.
-        let mut job = match projection.open_query_job(generation) {
+        let registry_sensitivity = if query.filter.has_props_leaf() {
+            crate::direct_projection::RegistrySensitivity::Required
+        } else {
+            crate::direct_projection::RegistrySensitivity::Insensitive
+        };
+        let mut job = match projection.open_query_job_for(generation, registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -6946,6 +6952,7 @@ impl Graph {
     /// classification and the recovery stay in `dispatch_direct_query`.
     fn direct_projection_query_job<T>(
         &self,
+        registry_sensitivity: crate::direct_projection::RegistrySensitivity,
         read: impl FnOnce(
             &mut crate::direct_projection::DirectQueryJob,
             u64,
@@ -6967,7 +6974,7 @@ impl Graph {
         if !projection.ready_at(generation) {
             return DirectAttempt::NotReady;
         }
-        let mut job = match projection.open_query_job(generation) {
+        let mut job = match projection.open_query_job_for(generation, registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -7011,7 +7018,12 @@ impl Graph {
         if query.is_invalid() {
             return DirectAttempt::Answered(crate::query::results::PageAnswer::default());
         }
-        self.direct_projection_query_job(|job, generation, fts_ready| {
+        let registry_sensitivity = if query.filter.has_props_leaf() {
+            crate::direct_projection::RegistrySensitivity::Required
+        } else {
+            crate::direct_projection::RegistrySensitivity::Insensitive
+        };
+        self.direct_projection_query_job(registry_sensitivity, |job, generation, fts_ready| {
             let registry =
                 self.direct_lowering_registry(query.filter.has_props_leaf(), generation, job)?;
             let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
@@ -7058,7 +7070,12 @@ impl Graph {
         bounds: crate::query::ir::Bounds,
     ) -> DirectAttempt<Vec<usize>> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
-        self.direct_projection_query_job(|job, generation, fts_ready| {
+        let registry_sensitivity = if probes.iter().any(|probe| probe.filter.has_props_leaf()) {
+            crate::direct_projection::RegistrySensitivity::Required
+        } else {
+            crate::direct_projection::RegistrySensitivity::Insensitive
+        };
+        self.direct_projection_query_job(registry_sensitivity, |job, generation, fts_ready| {
             let profile = crate::query::ConstructionProfile::from_view(view);
             // One lowering per probe, all under ONE registry snapshot: a probe that
             // read a different effective type than its siblings would explain a
@@ -7445,6 +7462,24 @@ impl Graph {
     pub(crate) fn clear_query_memos_test(&self) {
         *self.derived_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn derived_props_entry_count_test(&self) -> usize {
+        self.derived_cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |cache| cache.props_keys.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_editor_registry_generation_test(&self, generation: u64) {
+        let mut editor = self.property_registry.write().unwrap();
+        let state = editor
+            .as_mut()
+            .expect("the fixture must publish the editor registry first");
+        state.registry = Arc::new((*state.registry).clone().with_generation(generation));
     }
 
     /// Every page document the projection-side readers loaded from the parsed
@@ -16840,27 +16875,7 @@ impl Graph {
         registry
     }
 
-    /// The C6 registry term of a memo identity, from the PUBLISHED snapshot
-    /// alone.
-    ///
-    /// A text/task/reference query cannot observe property types, so it must
-    /// not trigger a registry refresh merely to check a memo (I-13,
-    /// `task_query_does_not_refresh_property_registry`). RET2 removed the other
-    /// branch: a `props`-sensitive query's term is
-    /// [`Graph::query_memo_registry_generation`], which is SQL-only — the
-    /// legacy `property_registry()` refresh is a document walk when the
-    /// projection is not ready and a ~250 ms debounced snapshot when it is, and
-    /// neither is an eligible source for the identity an answer is published
-    /// under.
-    fn published_registry_generation(&self) -> u64 {
-        self.property_registry
-            .read()
-            .unwrap()
-            .as_ref()
-            .map_or(0, |state| state.registry.generation())
-    }
-
-    /// The C6 registry term for a query memo, SQL-only (RET2).
+    /// The optional C6 registry term for a query memo, SQL-only (RET2).
     ///
     /// `props`-sensitive queries need the CURRENT effective types: an answer
     /// published under a registry generation it did not use is served again
@@ -16870,18 +16885,20 @@ impl Graph {
     /// takes the same fast path), so nothing is read. Otherwise ONE owned job
     /// reads it through the same `DirectQueryJob::read_registry` the execution
     /// uses, and the execution then hits the published fast path — one table,
-    /// two readers, no second producer (D-14).
+    /// two readers, no second producer (D-14). A property-free lookup returns
+    /// None and never reads the editor registry.
     fn query_memo_registry_generation(
         &self,
         props_sensitive: bool,
         source_generation: u64,
-    ) -> Result<u64, crate::query::QueryExecutionError> {
+    ) -> Result<Option<u64>, crate::query::QueryExecutionError> {
         if !props_sensitive {
-            return Ok(self.published_registry_generation());
+            return Ok(None);
         }
-        Ok(self
-            .query_property_registry_current(source_generation)?
-            .generation())
+        Ok(Some(
+            self.query_property_registry_current(source_generation)?
+                .generation(),
+        ))
     }
 
     /// §6.2's registry for the CURRENT source generation, SQL-only and
@@ -16901,9 +16918,10 @@ impl Graph {
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         let config = self.config.parse_config();
         self.dispatch_direct_query(|| {
-            self.direct_projection_query_job(|job, generation, _| {
-                self.query_property_registry_at(generation, &config, job)
-            })
+            self.direct_projection_query_job(
+                crate::direct_projection::RegistrySensitivity::Required,
+                |job, generation, _| self.query_property_registry_at(generation, &config, job),
+            )
         })
     }
 
@@ -16972,9 +16990,10 @@ impl Graph {
         let props = query.filter.has_props_leaf();
         let sensitivity = CacheSensitivity::Known(props);
         let gen = self.cache_gen.load(Ordering::Acquire);
-        // The metadata half of the identity is acquired BEFORE the cache is
+        // A property-bearing identity acquires metadata BEFORE the cache is
         // consulted and is SQL-only: a readiness or read failure here is the
         // query's answer, not a reason to key the entry off a stale table.
+        // Property-free identities carry no registry term.
         let stamp = DerivedMemoStamp {
             gen,
             today: crate::date::JournalDate::today().ordinal_key(),
@@ -17015,8 +17034,7 @@ impl Graph {
         let today = crate::date::JournalDate::today().ordinal_key();
         let config_digest = self.config.parse_config().digest();
         // Backlinks, unlinked references and block referrers carry no `props`
-        // leaf, so the published generation is their whole registry term.
-        let registry_gen = self.published_registry_generation();
+        // leaf, so they have no registry term and cannot evict property memos.
         self.try_derived_memo_entry(
             key,
             sensitivity,
@@ -17024,7 +17042,7 @@ impl Graph {
                 gen,
                 today,
                 config_digest,
-                registry_gen,
+                registry_gen: None,
             },
             || Ok::<_, std::convert::Infallible>(compute()),
         )
@@ -17050,14 +17068,16 @@ impl Graph {
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
-                evict_props_entries_on_registry_advance(
-                    &mut dc.results,
-                    &mut dc.lru,
-                    &mut dc.bytes,
-                    &mut dc.props_keys,
-                    &mut dc.registry_gen,
-                    registry_gen,
-                );
+                if let Some(registry_gen) = registry_gen {
+                    evict_props_entries_on_registry_advance(
+                        &mut dc.results,
+                        &mut dc.lru,
+                        &mut dc.bytes,
+                        &mut dc.props_keys,
+                        &mut dc.registry_gen,
+                        registry_gen,
+                    );
+                }
                 if dc.gen == gen && dc.today == today && dc.config_digest == config_digest {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
@@ -17102,7 +17122,7 @@ impl Graph {
                     gen,
                     today,
                     config_digest,
-                    registry_gen,
+                    registry_gen: registry_gen.unwrap_or(0),
                     props_keys,
                     results,
                     lru: std::collections::VecDeque::from([key]),
@@ -17151,14 +17171,16 @@ impl Graph {
         {
             let mut g = self.advanced_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
-                evict_props_entries_on_registry_advance(
-                    &mut dc.results,
-                    &mut dc.lru,
-                    &mut dc.bytes,
-                    &mut dc.props_keys,
-                    &mut dc.registry_gen,
-                    registry_gen,
-                );
+                if let Some(registry_gen) = registry_gen {
+                    evict_props_entries_on_registry_advance(
+                        &mut dc.results,
+                        &mut dc.lru,
+                        &mut dc.bytes,
+                        &mut dc.props_keys,
+                        &mut dc.registry_gen,
+                        registry_gen,
+                    );
+                }
                 if dc.gen == gen && dc.today == today && dc.config_digest == config_digest {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
@@ -17208,7 +17230,7 @@ impl Graph {
                     gen,
                     today,
                     config_digest,
-                    registry_gen,
+                    registry_gen: registry_gen.unwrap_or(0),
                     props_keys,
                     results,
                     lru: std::collections::VecDeque::from([key]),

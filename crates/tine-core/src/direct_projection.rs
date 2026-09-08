@@ -182,8 +182,18 @@ pub(crate) enum WarmStreamItem {
 
 struct PendingQueryCapture {
     generation: u64,
+    registry_sensitivity: RegistrySensitivity,
     slot: crate::query_jobs::OwnedJobSlot,
     reply: std::sync::mpsc::SyncSender<QueryJobOpen>,
+}
+
+/// Whether a query can observe property type inference. Registry-sensitive
+/// jobs freeze the cache input beside their SQL snapshot; all other jobs carry
+/// no registry state at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegistrySensitivity {
+    Insensitive,
+    Required,
 }
 
 fn reject_query_captures(captures: Vec<PendingQueryCapture>) {
@@ -372,6 +382,8 @@ struct ProjectionShared {
     /// say "exactly one statement per query" and mean it.
     #[cfg(test)]
     statement_reads: AtomicU64,
+    #[cfg(test)]
+    registry_capture_attempts: AtomicU64,
     /// §5.9's failed-read injection: one read through the seam fails, exactly as
     /// a torn or truncated projection file, a disk error or a resource limit
     /// makes it fail. It exists because the obligation a failed read carries —
@@ -437,6 +449,7 @@ impl ProjectionShared {
 fn capture_query_job(
     shared: &ProjectionShared,
     cache_generation: u64,
+    registry_sensitivity: RegistrySensitivity,
     slot: crate::query_jobs::OwnedJobSlot,
 ) -> QueryJobOpen {
     #[cfg(test)]
@@ -467,19 +480,33 @@ fn capture_query_job(
         return QueryJobOpen::Cancelled;
     }
     let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
-    let registry = {
-        let owner = shared.committed_registry.lock().unwrap();
-        let Some(owner) = owner.as_ref() else {
-            return QueryJobOpen::NotReady;
-        };
-        let capture = snapshot
-            .query_revision()
-            .ok()
-            .and_then(|revision| owner.cache.capture(revision, &owner.config).ok());
-        let Some(capture) = capture else {
-            return QueryJobOpen::Failed;
-        };
-        capture
+    let registry = match registry_sensitivity {
+        RegistrySensitivity::Insensitive => {
+            // Preserve the committed-owner readiness gate without copying any
+            // registry state a property-free query cannot observe.
+            if shared.committed_registry.lock().unwrap().is_none() {
+                return QueryJobOpen::NotReady;
+            }
+            None
+        }
+        RegistrySensitivity::Required => {
+            let owner = shared.committed_registry.lock().unwrap();
+            let Some(owner) = owner.as_ref() else {
+                return QueryJobOpen::NotReady;
+            };
+            #[cfg(test)]
+            shared
+                .registry_capture_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            let capture = snapshot
+                .query_revision()
+                .ok()
+                .and_then(|revision| owner.cache.capture(revision, &owner.config).ok());
+            let Some(capture) = capture else {
+                return QueryJobOpen::Failed;
+            };
+            Some(capture)
+        }
     };
     if !shared.ready_at(cache_generation) {
         return QueryJobOpen::NotReady;
@@ -490,7 +517,7 @@ fn capture_query_job(
         _slot: slot,
         snapshot,
         session_pages,
-        registry: Some(registry),
+        registry,
         registry_owner: Arc::clone(&shared.committed_registry),
     })
 }
@@ -640,6 +667,8 @@ impl DirectProjection {
             indexed_reads: AtomicU64::new(0),
             #[cfg(test)]
             statement_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            registry_capture_attempts: AtomicU64::new(0),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
@@ -1166,13 +1195,19 @@ impl DirectProjection {
     ///
     /// Capacity is acquired on the caller before enqueueing a capture. The
     /// producer opens the snapshot and captures session identity between write
-    /// turns, validating `ready_at(generation)` around the transaction. It
-    /// registers cancellation before handing the owned job back. Selection
-    /// and payload construction then execute on the caller, off the producer.
+    /// turns, validating `ready_at(generation)` around the transaction. A
+    /// registry-sensitive request also freezes its registry input there; an
+    /// insensitive request carries none. The producer registers cancellation
+    /// before handing the owned job back. Selection and payload construction
+    /// then execute on the caller, off the producer.
     /// The statement's compiled-regex program is installed by
     /// `query::results::read_results` on the job's own connection — the ONE
     /// install site — so a job carries no regex state of its own.
-    pub(crate) fn open_query_job(&self, cache_generation: u64) -> QueryJobOpen {
+    pub(crate) fn open_query_job_for(
+        &self,
+        cache_generation: u64,
+        registry_sensitivity: RegistrySensitivity,
+    ) -> QueryJobOpen {
         if !self.ready_at(cache_generation) {
             return QueryJobOpen::NotReady;
         }
@@ -1210,12 +1245,19 @@ impl DirectProjection {
             }
             pending.captures.push(PendingQueryCapture {
                 generation: cache_generation,
+                registry_sensitivity,
                 slot,
                 reply,
             });
         }
         self.shared.changed.notify_all();
         result.recv().unwrap_or(QueryJobOpen::Failed)
+    }
+
+    /// Existing low-level fixtures exercise the stronger registry-bearing job.
+    #[cfg(test)]
+    pub(crate) fn open_query_job(&self, cache_generation: u64) -> QueryJobOpen {
+        self.open_query_job_for(cache_generation, RegistrySensitivity::Required)
     }
 
     #[cfg(test)]
@@ -1745,6 +1787,13 @@ impl DirectProjection {
     }
 
     #[cfg(test)]
+    pub(crate) fn take_registry_capture_attempts(&self) -> u64 {
+        self.shared
+            .registry_capture_attempts
+            .swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
     pub(crate) fn fallback_reads(&self) -> u64 {
         self.shared.fallback_reads.load(Ordering::Relaxed)
     }
@@ -1913,7 +1962,12 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             let captures = std::mem::take(&mut pending.captures);
             drop(pending);
             for capture in captures {
-                let job = capture_query_job(&shared, capture.generation, capture.slot);
+                let job = capture_query_job(
+                    &shared,
+                    capture.generation,
+                    capture.registry_sensitivity,
+                    capture.slot,
+                );
                 let _ = capture.reply.send(job);
             }
             let mut pending = shared.pending.lock().unwrap();
@@ -5575,6 +5629,117 @@ mod tests {
         assert!(!graph.has_parsed_cache_test());
     }
 
+    #[test]
+    fn task_query_skips_registry_capture_after_many_dirty_property_keys() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("task-no-registry-capture");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Source.md"), "seed:: 1\n- TODO task\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+
+        let initial = graph
+            .query_registry_snapshot_ready()
+            .expect("the first public registry read publishes a base");
+        assert!(initial.rows.iter().any(|row| row.normalized_name == "seed"));
+        projection.take_registry_capture_attempts();
+
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "Source")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.pre_block = Some(
+            (0..64)
+                .map(|index| format!("key-{index:03}:: {index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        );
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        projection.take_registry_capture_attempts();
+
+        let result = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the non-property public query remains available");
+        assert_eq!(result.total, 1);
+        assert_eq!(
+            projection.take_registry_capture_attempts(),
+            0,
+            "a non-property query must not clone accumulated registry dirtiness"
+        );
+
+        let QueryJobOpen::Job(mut registry_free) = projection
+            .open_query_job_for(graph.cache_generation(), RegistrySensitivity::Insensitive)
+        else {
+            panic!("the ready projection admits a registry-free job");
+        };
+        assert!(matches!(
+            registry_free.read_registry(&graph.config.parse_config()),
+            Err(crate::query::QueryExecutionError::Unavailable(
+                crate::query::QueryUnavailableReason::InvalidSnapshot
+            ))
+        ));
+        drop(registry_free);
+
+        let current = graph
+            .query_registry_snapshot_ready()
+            .expect("the public registry still captures and patches the same snapshot");
+        assert_eq!(projection.take_registry_capture_attempts(), 1);
+        let changed = current
+            .rows
+            .iter()
+            .find(|row| row.normalized_name == "key-031")
+            .expect("the patched registry contains the new property key");
+        assert_eq!(
+            changed.observed_type,
+            crate::query::ir::ObservedType::Number
+        );
+        assert!(!current.rows.iter().any(|row| row.normalized_name == "seed"));
+        assert!(!graph.has_parsed_cache_test());
+    }
+
+    #[test]
+    fn non_property_query_does_not_borrow_editor_registry_generation() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("task-no-editor-registry-generation");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 1\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let property = graph
+            .run_query_bounded("(property score 1)", 100, 1_000_000)
+            .expect("the property query publishes a property-sensitive memo");
+        assert_eq!(property.total, 1);
+        assert_eq!(graph.derived_props_entry_count_test(), 1);
+
+        graph.property_registry();
+        graph.set_editor_registry_generation_test(777);
+        let task = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("the property-free query remains available");
+        assert_eq!(task.total, 1);
+        assert_eq!(
+            graph.derived_props_entry_count_test(),
+            1,
+            "a property-free memo lookup must not evict from an editor-only generation"
+        );
+        assert!(!graph.has_parsed_cache_test());
+    }
+
     /// **R6 §1, cold.** A fresh projection streams its build: every page is
     /// lowered, no parsed cache is retained, and never more than
     /// `WARM_STREAM_HIGH_WATER` documents wait in the queue.
@@ -6001,6 +6166,7 @@ mod tests {
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
             statement_reads: AtomicU64::new(0),
+            registry_capture_attempts: AtomicU64::new(0),
             inject_read_failure: AtomicBool::new(false),
             fallback_reads: AtomicU64::new(0),
             referenced_name_reads: AtomicU64::new(0),
@@ -6029,6 +6195,7 @@ mod tests {
                     .captures
                     .push(PendingQueryCapture {
                         generation: 0,
+                        registry_sensitivity: RegistrySensitivity::Required,
                         slot,
                         reply,
                     });
@@ -6117,6 +6284,7 @@ mod tests {
             .captures
             .push(PendingQueryCapture {
                 generation: graph.cache_generation(),
+                registry_sensitivity: RegistrySensitivity::Required,
                 slot,
                 reply,
             });
