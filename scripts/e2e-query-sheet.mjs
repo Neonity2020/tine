@@ -746,6 +746,18 @@ await withApp(2, async (browser) => {
   await openSheet(browser);
   await selectP6Rows(browser, [0]);
 
+  // This native harness deliberately forces software rendering. Acknowledge
+  // only its known sticky hardware reminder through the visible Dismiss
+  // control before probing the bottom sheet beneath it. Other notifications,
+  // including query/save errors, remain present and can fail reachability.
+  for (const toast of await browser.$$(".toast")) {
+    const message = await toast.$(".toast-msg").getText();
+    if (!message.startsWith("Software rendering is on (")) continue;
+    console.log(`narrow setup: dismissing forced-rendering reminder: ${message}`);
+    await toast.$(".toast-close").click();
+    await toast.waitForExist({ reverse: true, timeout: 5_000 });
+  }
+
   const rowGeometry = await browser.execute(() => {
     const row = document.querySelector('.qs-sheet > .qs-rows > [data-qs-parent=""][data-row-index="0"]');
     const sheet = document.querySelector(".qs-sheet");
@@ -898,6 +910,7 @@ await withApp(2, async (browser) => {
             bottom: rect.bottom,
             hit: !!hit && (hit === button || button.contains(hit)),
             topmost: hit instanceof HTMLElement ? hit.className || hit.tagName : null,
+            coveringText: hit?.closest(".toast")?.querySelector(".toast-msg")?.textContent ?? null,
           };
         });
         return {
