@@ -913,6 +913,8 @@ execution supports it. All currently supported relations are page-local. A
 property leaf uses the registry patched off the actor.
 
 **The property registry is patched, never rebuilt, for a pending query.**
+Query capture propagates an accepted-registry read failure before execution;
+it never substitutes a cached or empty registry for failed metadata acquisition.
 The actor caches ONE registry: the accepted table, keyed by acceptance
 sequence, frontier digest and parse config; a pending suffix does not evict it
 and does not advance its generation. A captured query with a property leaf

@@ -2,6 +2,21 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-ACCEPTED-REGISTRY-FAILURE-STOPS-CAPTURE",
+ "title": "Failed accepted property metadata stops Managed query capture before execution",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager registry review" },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_failed_accepted_registry_aborts_capture_before_execution"],
+  "scenario": "query-engine.accepted-registry-failure",
+  "failBefore": "accepted-registry-stage-before.log: real orphaned property metadata reaches injected Busy executor instead of failing capture"
+ },
+ "notes": "SimpleQuery and public IR capture must propagate failed metadata reads, not substitute cached or empty type information. The executor stage witness distinguishes this from downstream SQL validation of the same damage."
+},
+{
  "id": "REG-QE-FAILED-PENDING-OVERLAY-NOT-BUSY",
  "title": "A vanished or failed pending query projection reports a bounded error instead of endless readiness",
  "family": "query-engine",

@@ -33991,6 +33991,53 @@ fn r5c_a_property_row_naming_an_absent_page_fails_the_pending_read() {
     assert_eq!(r5a_census(&handle), (0, 0, 0, 2, 0));
 }
 
+#[test]
+fn ret2_failed_accepted_registry_aborts_capture_before_execution() {
+    use crate::query::{QueryExecutionError, QueryUnavailableReason};
+    for ir in [false, true] {
+        let fixture = r5c_fixture("ret2-accepted-registry-damage", 0x5c39 + u128::from(ir));
+        let handle = r4a_reopen(&fixture);
+        let writer = rusqlite::Connection::open(&fixture.request.database_path).unwrap();
+        writer.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        assert_eq!(
+            writer
+                .execute("DELETE FROM pages WHERE path = ?1", ["notes/Solo.md"])
+                .unwrap(),
+            1
+        );
+        drop(writer);
+        // The property owner remains, but the metadata read cannot resolve
+        // its page. A busy executor is a stage witness: it must never be
+        // consulted after registry acquisition has already failed. Without
+        // this witness later SQL validation can mask the preparation defect
+        // by failing for the same damaged page through a different read.
+        r4b_inject(
+            &handle,
+            vec![crate::managed_query::ManagedQueryOutcome::Busy],
+        );
+        let result = if ir {
+            let (query, view) = ret1_parse("(property lonely yes)", crate::query::QueryInput::Og);
+            ret2_ir_navigate(
+                &handle,
+                &query,
+                &view,
+                &crate::query::ir::ExecutionContext::none(),
+                false,
+            )
+            .map(|answer| format!("{answer:?}"))
+        } else {
+            r4a_navigate(&handle, "(property lonely yes)", R5A_ROWS, R5A_BYTES)
+                .map(|answer| format!("{answer:?}"))
+        };
+        assert_query_execution_error(
+            "failed accepted registry metadata",
+            &result.unwrap_err(),
+            QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed),
+        );
+        assert_eq!(r5a_census(&handle), (0, 0, 0, 1, 0));
+    }
+}
+
 /// I-20 exactness: a memoized pending answer is exact for the pending state it
 /// was taken under. A second pending save on the same page moves the stamp, so
 /// the memo misses, the patch cache misses and the answer follows the new

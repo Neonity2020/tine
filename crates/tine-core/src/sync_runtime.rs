@@ -11321,7 +11321,9 @@ fn run_actor_loop(
             #[cfg(test)]
             ActorRequest::ApplicationPropertyRegistryProbe { reply } => {
                 let _ = reply.send(ApplicationPropertyRegistryProbe {
-                    accepted: actor.accepted_property_registry(),
+                    accepted: actor
+                        .accepted_property_registry()
+                        .expect("registry probe requires readable accepted metadata"),
                     merged: actor.application_property_registry(),
                     config: actor.graph.config.parse_config(),
                 });
@@ -15883,8 +15885,16 @@ impl RuntimeActor {
     /// property query under, so the capture carries the base the executor
     /// patches (R5c). With nothing pending it is the same table
     /// `application_property_registry` returns.
-    fn accepted_property_registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {
-        self.serve_application_property_registry(self.accepted_property_registry_ready())
+    fn accepted_property_registry(
+        &self,
+    ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
+    {
+        // A query cannot substitute old or empty type information after a
+        // failed metadata read: that would change the meaning of its filter.
+        self.accepted_property_registry_ready().map_err(|_| {
+            self.managed_query.census.note_failed_read();
+            query_unavailable(crate::query::QueryUnavailableReason::ReadFailed)
+        })
     }
 
     fn serve_application_property_registry(
@@ -16084,7 +16094,7 @@ impl RuntimeActor {
         // effective type, so building the registry to key it would be cost with
         // no meaning.
         let registry = if props {
-            self.accepted_property_registry()
+            self.accepted_property_registry()?
         } else {
             std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
         };
@@ -16479,7 +16489,7 @@ impl RuntimeActor {
         // reads property atoms. The CAPTURE path prepares under the ACCEPTED
         // table, because that is the base the off-actor executor patches.
         let registry = if props {
-            self.accepted_property_registry()
+            self.accepted_property_registry()?
         } else {
             std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
         };
