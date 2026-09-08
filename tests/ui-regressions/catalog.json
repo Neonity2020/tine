@@ -2,6 +2,46 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-QUERY-SHEET-P6-CONTROLS-20260908",
+      "title": "The query sheet can select, disable, group and reorder conditions without a second tree editor",
+      "family": "query-builder",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QuerySheet.test.tsx::a folded subtree is a sibling like any other::shows a folded not-off subtree as disabled and enables only its own Off",
+          "src/editor/queryBuilder.test.ts::groupSelected::lands a non-contiguous selection where the topmost selected row was, leaving the rest in order",
+          "src/editor/queryBuilder.test.ts::groupSelected::refuses locs from two different lists rather than moving conditions between them",
+          "src/editor/queryBuilder.test.ts::moveSibling::is atomic against the original tree: the destination is not recomputed after a prune",
+          "src/editor/queryBuilder.test.ts::toggleDisabledAt::preserves a Raw payload and an opaque advanced subtree across a disable/enable pair",
+          "src/components/QuerySheet.test.tsx::the selection box and the enabled switch are two controls::selects without saving, and disables without selecting",
+          "src/components/QuerySheet.test.tsx::the selection box and the enabled switch are two controls::tells a row inside a disabled group that its own switch cannot bring it back",
+          "src/components/QuerySheet.test.tsx::grouping a selection::groups two selected rows under the header the user picked, in one save",
+          "src/components/QuerySheet.test.tsx::reordering: the drag and the keyboard reach the same tree::a drop and the arrow key produce the same IR, and a drop is exactly one edit",
+          "src/components/QuerySheet.test.tsx::a drag that does not finish changes nothing::cancels on Escape, through the sheet's own dismissal ladder",
+          "src/components/QuerySheet.test.tsx::a drag that does not finish changes nothing::refuses a drop whose tree was replaced under it",
+          "src/editor/queryBuilder.test.ts::editing a group that sits inside a unary wrapper::lifts a single child out, and refuses what would need a De Morgan rewrite",
+          "src/editor/queryBuilder.test.ts::editing a group that sits inside a unary wrapper::keeps ungroup lossless: every wrapper the group HELD comes back out",
+          "src/components/QuerySheet.test.tsx::a group that has been switched off is still a group::keeps its header actions working on the right wrapper, and offers only what it can do"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "SPEC \u00a77.4 remainder (packet P6) over the existing Off/boolean IR: no new predicate syntax, no grammar, printer, IPC, persistence or registry change. Selection and the enabled switch are two controls, so a grouping gesture cannot change what the query returns. Grouping, moving and disabling are pure operations in src/editor/queryBuilder.ts (groupSelected, moveSibling, toggleDisabledAt) called through the one QuerySheet apply boundary; the drag reuses rowReorder.ts and dragSelectionGuard rather than a second pointer loop or a drag library. Locators are paths into a captured root revision: a replaced root, an anchor switch or an unmount drops the selection and cancels the drag without applying. Switching a group off also exposed a defect that predates this packet on every `none of` group: an edit addressed at the and/or INSIDE a not/off wrote into the one-element array filterChildren synthesizes, so the header cycle, None of and Ungroup did nothing and still returned a new tree the sheet saved. Assignment now goes through assignAt; unwrapAt lifts a single child out of a unary wrapper and refuses two or more rather than inventing a De Morgan rewrite (\u00a73.5), and the group menu omits Ungroup exactly where it would be refused. SheetNode records the not's own location, so Remove none of no longer strips an Off that happened to be outermost. Fail-before evidence: tine-agents/evidence/qe/p6-controls/fail-before.log (26 pure and 20 mounted tests fail against base ad41c224 while the 7 pre-existing sheet tests and the ungroup-losslessness pin still pass)."
+    },
+    {
+      "id": "UI-QUERY-SHEET-P6-NATIVE-390-20260908",
+      "title": "Query-sheet select/disable/group/reorder controls fit 390px and survive save, reopen and undo on a device",
+      "family": "query-builder",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "reported",
+      "coverage": { "tests": [], "failBefore": "unavailable" },
+      "notes": "The component layer proves the IR each gesture saves; it cannot prove geometry, touch, or that the saved tree round-trips through the block on disk. Outstanding manager work for the P6 controls packet: a 390px browser/native pass showing the handle, selection box, enabled switch, row menu and Group selected bar all reachable without horizontal overflow and without hover; a touch drag started from the handle only; and a save/reopen/undo journey showing a grouped or reordered query re-reading as the same tree with one undo step per gesture. Rust Off round-trip and oracle gates are also the manager's."
+    },
+    {
       "id": "UI-QUERY-CANDIDATE-ORACLE-ONLY-20260908",
       "title": "Production query requests do not run the retired candidate planner",
       "family": "query-results",

@@ -9307,6 +9307,131 @@ img.emoji {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+
+/* --- selecting, disabling and reordering a condition (SPEC §7.4, P6) ---
+   Every one of these is ALWAYS drawn, never revealed on hover: a phone has no
+   hover, and the sheet has to be operable at 390px. They are small and they sit
+   at the two ends of the row, so the field/operator/value cells keep the width.
+   The row itself is `flex-wrap: wrap`, so a narrow viewport wraps the cells
+   rather than overflowing sideways. */
+.qs-drag-handle {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: -1px;
+  padding: 4px 3px;
+  border-radius: 4px;
+  cursor: grab;
+  /* The handle owns the gesture: without this the browser claims a touch drag
+     as a scroll and the pointer stream stops mid-reorder. Confined to the
+     handle, so the sheet still scrolls under a finger anywhere else. */
+  touch-action: none;
+}
+.qs-drag-handle:hover {
+  color: var(--link-color);
+  background: var(--bg-tertiary);
+}
+.qs-drag-handle:active {
+  cursor: grabbing;
+}
+.qs-select-target {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+.qs-select {
+  flex: 0 0 auto;
+  margin: 0;
+  /* The surrounding label supplies the larger mobile hit area. */
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+.qs-enabled {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.qs-enabled[aria-checked="true"] {
+  color: var(--link-color);
+}
+.qs-enabled:hover {
+  background: var(--bg-tertiary);
+}
+@media (max-width: 600px) {
+  .qs-select-target,
+  .qs-enabled,
+  .qs-drag-handle,
+  .qs-group-selected,
+  .qs-selection-clear {
+    min-width: 44px;
+    min-height: 44px;
+    box-sizing: border-box;
+  }
+}
+/* Where the drop would land. A shadow rather than a border, so the indicator
+   never changes the height of the row it is drawn on and the list does not
+   shuffle under the pointer. */
+.qs-drop-before {
+  box-shadow: inset 0 2px 0 0 var(--link-color);
+}
+.qs-drop-after {
+  box-shadow: inset 0 -2px 0 0 var(--link-color);
+}
+/* The selection's own bar: what is selected, and the one grouping control. */
+.qs-selection {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+.qs-selection-count {
+  color: var(--text-muted);
+}
+.qs-group-selected {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.qs-group-selected:hover:enabled {
+  color: var(--link-color);
+  border-color: var(--link-color);
+}
+.qs-group-selected:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.qs-selection-clear {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.qs-selection-clear:hover {
+  color: var(--link-color);
+  background: var(--bg-tertiary);
+}
 .qs-row-advanced .qs-advanced {
   font-family: var(--ls-font-mono);
   font-size: 12px;

@@ -1068,6 +1068,14 @@ mod tests {
         assert!(page.markdown.contains("**Find blocks ▾ where …**"));
         assert!(page.markdown.contains("**+ Add condition**"));
         assert!(page.markdown.contains("**Try again**"));
+        // P6 keeps selection, disabling and movement distinct in the Guide.
+        assert!(page.markdown.contains("**Group selected ▾**"));
+        assert!(page.markdown.contains("**disabled by group**"));
+        assert!(page.markdown.contains("**Move up**"));
+        assert!(page.markdown.contains("**Move down**"));
+        assert!(page
+            .markdown
+            .contains("**Escape** in the middle of one cancels it"));
         assert!(page.markdown.contains("**Remove them**"));
         assert!(page
             .markdown
