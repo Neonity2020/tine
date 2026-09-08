@@ -3538,22 +3538,18 @@ mod tests {
 
     /// **SPEC §5.3's base order and hydration, together.**
     ///
-    /// The statement carries no `ORDER BY` — the walk's base order is its page
-    /// SOURCE's enumeration order and no projection column reproduces it — so
-    /// order is the CALLER's, reproduced in the result construction. An identity
-    /// gate that compares SETS cannot see an ordering regression, and today's
-    /// gates compare sets; `signature` here compares the ordered page list AND
-    /// each page's ordered block list.
+    /// The selection relation is unordered; its descriptor wrapper orders by
+    /// persisted page position and block preorder. `signature` compares the
+    /// ordered page list and each page's ordered block list, so a set-equivalent
+    /// result with changed traversal order fails this gate.
     ///
     /// Two visible-order paths are covered because they are different paths and
     /// a feed-only repro misses real bugs: a routed NAMED page (nested blocks,
     /// document order within the page) and the JOURNAL feed (kind rank, journal
     /// before page at the same display name).
     ///
-    /// The hydration claim rides along: the pages a dispatched query loads a
-    /// `Document` for are exactly the pages its RESULT names (I-13, I-15). A
-    /// hydration that loaded a candidate superset and filtered in Rust would be
-    /// the whole-graph walk this campaign exists to delete, wearing a hat.
+    /// Result payload comes from SQLite for admitted rows. No query result page
+    /// is loaded as a `Document` (I-13, I-15).
     #[test]
     fn the_dispatched_result_reproduces_the_walks_order_and_loads_only_result_pages() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
@@ -4803,37 +4799,93 @@ mod tests {
 
     #[test]
     fn storage_contract_names_the_generation_bound_cutover() {
+        fn contains_words(haystack: &str, needle: &str) -> bool {
+            let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let needle = normalize(needle);
+            normalize(haystack).contains(needle.as_str())
+        }
+
         let contract = include_str!("../../../docs/storage-sync-contract.md");
-        assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
+        assert!(contains_words(
+            contract,
+            "direct-files-projections/<canonical-graph-path-digest>.sqlite"
+        ));
         // RET2 correction: the sparse task-query family is DELETED, so the
         // contract must say so rather than describe it as a live read family.
         // Pinned as a retirement, because "the document still mentions it" is
         // how dead code survives a sweep.
-        assert!(contract.contains("There is no separate sparse task-query read family."));
-        assert!(contract.contains("the RET2 correction deleted the\ngate"));
-        assert!(contract.contains("shared\nproperty-facet rows"));
-        assert!(contract.contains("PageRef simple-query candidate plan"));
-        assert!(contract.contains("same SQL read family in\nboth storage regimes"));
-        assert!(contract.contains("literal fuzzy-search candidate"));
-        assert!(contract.contains("referenced-page\ninventory"));
-        assert!(contract.contains("retains no separate semantic memo"));
-        assert!(contract.contains("exact current parser-cache\ngeneration"));
-        assert!(contract.contains("Direct fact-extractor version"));
-        assert!(contract.contains("app-private graph-fact projection contains no managed state"));
-        assert!(contract.contains("clean\nreopen lowers none"));
-        assert!(
-            contract.contains("memo of already-shaped frontend result DTOs remains Tine-native")
-        );
-        assert!(contract.contains("grants no\n   authority"));
+        assert!(contains_words(
+            contract,
+            "There is no separate sparse task-query read family."
+        ));
+        assert!(contains_words(
+            contract,
+            "the RET2 correction deleted the\ngate"
+        ));
+        assert!(contains_words(contract, "shared\nproperty-facet rows"));
+        assert!(contains_words(
+            contract,
+            "PageRef simple-query candidate plan"
+        ));
+        assert!(contains_words(
+            contract,
+            "PageRef simple-query candidate plan in the independent test oracle."
+        ));
+        assert!(contains_words(
+            contract,
+            "Both production\nquery backends now select results through SQL."
+        ));
+        assert!(contains_words(contract, "literal fuzzy-search candidate"));
+        assert!(contains_words(contract, "referenced-page\ninventory"));
+        assert!(contains_words(
+            contract,
+            "retains no separate semantic memo"
+        ));
+        assert!(contains_words(
+            contract,
+            "exact current graph cache generation"
+        ));
+        assert!(contains_words(contract, "Direct fact-extractor version"));
+        assert!(contains_words(
+            contract,
+            "app-private graph-fact projection contains no managed state"
+        ));
+        assert!(contains_words(contract, "clean\nreopen lowers none"));
+        assert!(contains_words(
+            contract,
+            "memo of already-shaped frontend result DTOs remains Tine-native"
+        ));
+        assert!(contains_words(contract, "grants no\n   authority"));
         // R3: the owned-snapshot job contract this file implements.
-        assert!(contract.contains("capacity is acquired before\nthe snapshot"));
-        assert!(contract.contains("the worker drains every job before a rebuild touches the file"));
-        assert!(contract.contains("Cancellation is\nan answer by the walk, not a failed read"));
-        assert!(contract.contains("Result identity follows who lowered the row"));
+        assert!(contains_words(
+            contract,
+            "capacity is acquired before\nthe snapshot"
+        ));
+        assert!(contains_words(
+            contract,
+            "the worker drains every job before a rebuild touches the file"
+        ));
+        assert!(contains_words(
+            contract,
+            "Cancellation is\na typed dispatch answer, not a failed read"
+        ));
+        assert!(contains_words(
+            contract,
+            "Result identity follows who lowered the row"
+        ));
         // R6: warm validation and the session-identity ownership rule.
-        assert!(contract.contains("Warm validation from bytes, never from a parsed graph"));
-        assert!(contract.contains("a delta alone never publishes an\ninventory"));
-        assert!(contract.contains("dropping the parsed cache clears the set"));
+        assert!(contains_words(
+            contract,
+            "Warm validation from bytes, never from a parsed graph"
+        ));
+        assert!(contains_words(
+            contract,
+            "a delta alone never publishes an\ninventory"
+        ));
+        assert!(contains_words(
+            contract,
+            "dropping the parsed cache clears the set"
+        ));
 
         // The routing rule is asserted inside its own section, not anywhere in
         // the document: a whole-document `contains` passes with the sentence
@@ -4846,41 +4898,53 @@ mod tests {
             .find("\n## ")
             .map_or(body, |end| &body[..end])
             .to_owned();
-        // SPEC §5.9's Direct Files route, and the three things a reader has to
-        // be able to check without reading the code: which reads a query
-        // performs, what a failed read owes and for which named failure, and
-        // what a cached result is keyed by.
+        // RET2's Direct Files route, and the lifecycle facts a reader has to be
+        // able to check without reading the code: which reads a query performs,
+        // how every non-answer is classified, what one repair owes, and what a
+        // cached result is keyed by.
         for sentence in [
-            // Three shapes, and no fourth. The negative clause is pinned too,
-            // because a route policy is exactly the kind of sentence that gets
-            // softened into "usually".
-            "ONE lowered SQL\nstatement answers a simple `{{query ...}}` or advanced datalog query, whatever\nthat query's shape",
-            "There is no cost test and no selectivity hatch in front of\nthat decision.",
-            "answered by the tree walk over the same query IR, with nothing scheduled",
-            // The reads (I-13, I-15).
-            "a dispatched query loads NO `Document` and reads NO source text",
-            "pages loaded by a dispatched query equals zero",
-            "the statement therefore carries no `ORDER BY`, and the\ndispatched result equals the walk's result including order",
-            "remembered once per generation, never once per query",
-            // The failed-read obligation, with its in-scope scenario named.
-            "a torn or truncated projection file after a crash or power loss, a disk error, a\nresource limit, or a projection whose page set has drifted from the parsed\ncache",
-            "the same\nfull-snapshot enqueue the open path uses is scheduled from the already-parsed\npage cache",
-            "Clearing readiness alone would not do",
-            "An unavailable, stale, failed, or raced\nprojection uses the parser fallback.",
+            // One SQL route. The no-walk clause is pinned because weakening it
+            // into an availability fallback would restore the retired engine.
+            "The Direct public-query route has no production tree-walk fallback.",
+            "semantically refused source returns its existing empty or unsupported-report\nanswer before any job or snapshot",
+            "`@block`, `@page` and Explain reads enter `dispatch_direct_query`",
+            "a refresh enters the same dispatcher\nand query-job owner",
+            "There is no cost test and no selectivity hatch in\nfront of this route.",
+            "None of these\nbranches evaluates the parsed graph or fabricates an empty success.",
+            // Snapshot, metadata and ordered result reads (I-13, I-15).
+            "Capacity is acquired before SQLite opens\nthe owned snapshot.",
+            "when the table is not\nalready current, the job reads it from its own snapshot before lowering",
+            "Ready query selection\nand result construction load NO `Document`, read NO source text and consult no\nparsed graph.",
+            "Recovery source-inventory work is counted separately.",
+            "Its descriptor wrapper does: Direct\nblock answers carry `query_page_order.position` and\n`query_block_results.preorder` and end with `ORDER BY` on those columns",
+            "Missing Direct order metadata\nfails the read",
+            "remembered once per generation,\nnever once per query",
+            // Typed non-answers and the one-repair obligation.
+            "Capacity pressure is\n`NotReady(Busy)`.",
+            "cancellation is `Cancelled` and schedules no\nrepair",
+            "gets at most one\nbounded repair and one SQL retry",
+            "a torn or truncated projection file after a crash or power\nloss, a disk error, a resource limit, or a projection whose page set has drifted\nfrom the current graph generation",
+            "otherwise recovery validates a\ncomplete source inventory from bytes and streams bounded per-page replacements",
+            "Clearing readiness\nalone would strand the projection until another edit.",
+            "Cancellation is excluded\nfrom repair",
             // The cache key.
             "memoized PRE-VIEW",
-            "under the resolved normalized query IR, the\nparser-cache generation, the execution day, the construction bounds, the\nparse-config digest, and, when the query names a property, the observed-registry\ngeneration",
+            "under the resolved normalized query IR, the\ngraph cache generation, the execution day, the construction bounds and profile",
             "The parse-config digest is unconditional",
-            // Managed storage still owns the candidate plan and its cutoff, and
-            // the contract says which backend each rule is about.
-            "Managed storage still routes a `SimpleQueryCandidatePlan::Indexed` query through\nthe candidate page set the shared lowering returns",
-            "larger than one thirty-second of the graph's page\ncount or 32 pages, whichever is greater, in which case the projection read is\nabandoned and the parser fallback runs instead",
-            "`Empty` returns without\nprojection or graph access.",
-            "`All` uses the parser whole-graph evaluator.",
+            "A warm parsed cache\nallows a safe ordinary content edit to retain unaffected entries",
+            "A cold session with no parsed\ncache, a page-set or alias/identity change, an unreadable key, or another\ngraph-wide uncertainty drops the applicable memo",
+            "Query execution and memo hits themselves\ndo not require a resident parsed graph.",
+            // Navigation and Friendly remain separately scoped migration work.
+            "Friendly graph\nsearch likewise still ranks and produces evidence from parser-projected blocks",
+            "they do not authorize a fallback from the\nsimple, advanced, page, registry, or Explain public-query dispatch",
+            // The candidate planner and its selectivity cutoff are oracle-only.
+            "Managed production queries no longer construct a candidate-page plan or apply\nits selectivity cutoff.",
+            "semantic empty refusal before any snapshot or registry acquisition",
+            "Candidate types and lowering remain test-only\nfor the independent oracle.",
         ] {
             assert!(
-                section.contains(sentence),
-                "§1.3 must state the Direct Files query route verbatim: {sentence}"
+                contains_words(&section, sentence),
+                "§1.3 must state the required Direct Files query semantics: {sentence}"
             );
         }
     }

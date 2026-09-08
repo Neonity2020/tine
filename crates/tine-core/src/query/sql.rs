@@ -520,16 +520,10 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
             .join(", ");
         where_ = fold_and(vec![where_, format!("{mask_column} NOT IN ({list})")]);
     }
-    // **No `ORDER BY` (§5.3, measured).** The walk's base order is its page
-    // SOURCE's enumeration order, which no column of the projection reproduces —
-    // ordering by `pages.path` would be a guess, and it is a costly one: with
-    // `ORDER BY p.path` in the statement SQLite prefers `SCAN p USING INDEX
-    // pages_path_idx` over the `pages_journal_day_idx` range the filter asks
-    // for, because scanning the path index avoids the sort. That is exactly
-    // §5.7's failure mode, bought for an ordering the caller has to impose
-    // anyway when it groups the rows by page. Base order and grouping therefore
-    // belong to the result construction, and this statement answers only which
-    // rows match.
+    // The selection relation answers membership only. Descriptor/page wrappers
+    // apply backend order using persisted Direct page positions and preorder,
+    // or Managed paths. Keeping presentation order out of this relation also
+    // leaves the predicate's index choices independent of a pages.path sort.
     let mut sql = match &cte {
         Some(cte) => format!("{cte} {select} {from} WHERE {where_}"),
         None => format!("{select} {from} WHERE {where_}"),

@@ -77,7 +77,7 @@ adapter call edges.
 | application_request | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed application request boundary. |
 | application_resolve_blocks_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Materializes resolved Managed UUID groups. |
 | application_simple_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed simple-query driver: captured accepted/pending SQL execution with `operation` released; bounded stale recapture, typed readiness, cancellation and failure, no traversal. |
-| application_simple_query_prepared | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Parses a Managed simple query once and stamps it with the actor's accepted-frontier evidence (memo key, registry snapshot). |
+| application_simple_query_prepared_ir | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Stamps already-parsed Managed simple-query IR with the actor's accepted-frontier evidence (memo key, registry snapshot); parsing happens once before database admission. |
 | application_simple_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Actor half of a Managed simple query: readiness, memo hit or a capture for off-actor accepted/pending SQL execution. |
 | application_subtree_nodes | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Counts nodes in a Managed DTO subtree for admission. |
 | application_templates_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | application_page_templates | Supplies hydrated Managed pages to the canonical template walk. |

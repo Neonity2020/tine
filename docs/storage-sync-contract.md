@@ -512,9 +512,11 @@ interpolated statement is not expressible, and `explain_query_plan` binds the
 same parameters as the query it explains, because with `sqlite_stat4` present an
 unbound explain can report a plan for a statement the caller never runs.
 
-**This seam adds no refusal.** The in-scope failures it can meet — a missing,
-stale or corrupt projection — are answered by rebuild, and contention by
-`busy_timeout`.
+**This seam adds no SQL-text refusal.** A missing or stale projection is caught
+by lifecycle admission before a statement; a corrupt or otherwise failed read
+is reported to the public dispatcher, which owns the one-repair rule below.
+SQLite lock contention uses `busy_timeout`, while exhausted query-job capacity
+is the separate typed `NotReady(Busy)` outcome.
 
 **A query job owns its snapshot; the projection owns the jobs (R3).** A
 database-answered query runs on `PhysicalProjectionQuerySnapshot::open_direct`,
@@ -522,7 +524,7 @@ one read transaction pinned for the job's whole descriptor-and-payload read so
 every row it returns describes one projection state. The projection admits at
 most `DEFAULT_QUERY_JOB_CAPACITY` jobs at once and **capacity is acquired before
 the snapshot**, so a waiting job pins no WAL pages; the snapshot is validated
-against the exact parser-cache generation before and after SQLite establishes
+against the exact graph cache generation before and after SQLite establishes
 the transaction, and a job whose generation moved is `NotReady`, never a stale
 answer. Every admitted job registers its interrupt handle with the owner, and
 **the worker drains every job before a rebuild touches the file**: it cancels
@@ -530,7 +532,7 @@ each registered statement, cancels waiters and late registrations, and blocks
 until no slot is held, so no owned snapshot can retain a handle to a file about
 to be reset or replaced (in-scope: a torn projection rebuilt under a live
 reader). Closing the projection refuses every later admission. Cancellation is
-an answer by the walk, not a failed read: it schedules no recovery.
+a typed dispatch answer, not a failed read: it schedules no recovery or retry.
 
 **Result identity follows who lowered the row.** `query_block_results.result_id`
 is the runtime id the lowering process assigned. The projection tracks
@@ -623,23 +625,24 @@ and mints a conflict from the retained snapshot. There is no separate
 pre-retirement full-file reread; creates, unpinned auxiliary writes, and managed
 projections keep their independent recheck rules.
 
-The existing parsed `PageEntry + Arc<Document>` cache feeds one background
-SQLite owner. The database retains each page's exact caller-owned content
-revision together with the Direct fact-extractor version as disposable adapter
-metadata. Bumping that extractor version forces one background re-lowering when
-unchanged source bytes acquire new physical facts. A full warm-cache installation
-compares those revisions and lowers only changed or missing pages; a clean
-reopen lowers none. One-page cache upserts and deletes enqueue coalesced page
-deltas. The editor, watcher, and save paths never wait for SQL. Indexed reads
-are admitted only when the worker has published the exact current parser-cache
-generation. One app-private sidecar lease permits only one graph instance to
-publish into a projection database at a time; a concurrent window or process
-that cannot acquire it stays on the parser evaluator. This prevents an older
-instance from replacing facts behind another instance's locally-ready
-generation watermark. A missing, stale, corrupt, incompatible, leased, or
-unwritable database
-therefore uses the established parser evaluator and cannot block graph open,
-save, or external file observation.
+One background SQLite owner accepts either an already-resident
+`PageEntry + Arc<Document>` snapshot or the bounded warm stream. The database
+retains each page's exact caller-owned content revision together with the Direct
+fact-extractor version as disposable adapter metadata. Bumping that extractor
+version forces one background re-lowering when unchanged source bytes acquire
+new physical facts. Warm validation compares the complete byte-derived source
+inventory, parses only changed or missing pages in bounded batches and retains
+no parsed graph; a clean reopen lowers none. One-page cache upserts and deletes
+enqueue coalesced page deltas. The editor, watcher, and save paths never wait
+for SQL. Indexed reads are admitted only when the worker has published the
+exact current graph cache generation. One app-private sidecar lease permits
+only one graph instance to publish into a projection database at a time, which
+prevents an older instance from replacing facts behind another instance's
+locally-ready generation watermark. A public query against a missing, stale,
+corrupt, incompatible, leased or unwritable projection follows the typed
+dispatch and bounded repair rules below; the remaining parser-owned navigation
+and search consumers may use their existing fallback. Neither case blocks
+graph open, save or external file observation.
 
 The switched read families are literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
@@ -685,33 +688,43 @@ candidate set, groups it in the same relative-path/document order as Direct
 Files, and only then applies the shared row and byte construction budget.
 `groups`, `total`, and `exceeded` therefore describe the exact same prefix in
 both modes; an internal-ID-ordered early subset is not an allowed optimization.
-The bounded generation-keyed
-memo of already-shaped frontend result DTOs remains Tine-native: SQLite cannot
-own parser AST semantics or presentation reuse, and dropping that memo would
-turn reactive re-renders into repeated SQL plus parser evaluation. If SQLite is
-unavailable, the same parser evaluator remains the correctness fallback; it is
-not a second candidate index. Referenced-name fallback walks only the already-
-parsed page cache and deliberately retains no separate semantic memo. Non-UUID
-`id::` values and names that cannot be safely narrowed by SQLite tokenization
-also use that parser fallback. All other query, navigation, and search families retain their existing
-implementation until an equivalent generation-bound differential packet
-replaces and deletes each old route.
+The bounded generation-keyed memo of already-shaped frontend result DTOs
+remains Tine-native for the reference-result families that still hydrate parser
+DTOs; it is separate from the Direct public-query route below. For those
+not-yet-migrated navigation and search families, an unavailable candidate or
+name read may still use the established parser-owned fallback. Referenced-name
+fallback walks only an already-parsed page cache and deliberately retains no
+separate semantic memo. Non-UUID `id::` values and names that cannot be safely
+narrowed by SQLite tokenization also use that parser fallback. Friendly graph
+search likewise still ranks and produces evidence from parser-projected blocks:
+the Direct projection narrows the single literal-fuzzy block shape when ready,
+while the other Friendly shapes still use the parsed page source. These routes
+remain explicit migration work; they do not authorize a fallback from the
+simple, advanced, page, registry, or Explain public-query dispatch below.
 
-**The Direct Files query route: three shapes, and no fourth.** When the
-worker has published the exact current parser-cache generation, ONE lowered SQL
-statement answers a simple `{{query ...}}` or advanced datalog query, whatever
-that query's shape. There is no cost test and no selectivity hatch in front of
-that decision. The statement selects the ANSWER, not a candidate page superset,
-so an unselective query costs what its answer costs; and a second engine kept
-alive for some class of queries would make the tree walk's retirement
-unreachable, which is the point of having a projection at all. The other two
-shapes already existed. A projection that is NOT ready — open reconciliation, a
-full rebuild, or the milliseconds after a save while the delta applies — is
-answered by the tree walk over the same query IR, with nothing scheduled,
-because the worker is already on its way and asking for a whole-graph snapshot
-on every keystroke after a save is the unrequested whole-graph work this route
-exists to remove. A read that was ATTEMPTED and did not answer is the
-failed-read shape below.
+**The Direct public-query route has no production tree-walk fallback.** A
+semantically refused source returns its existing empty or unsupported-report
+answer before any job or snapshot, and a successful pre-view memo hit can reuse
+an earlier SQL answer. Otherwise simple `{{query ...}}`, advanced datalog,
+`@block`, `@page` and Explain reads enter `dispatch_direct_query`. The public
+registry returns its published snapshot only when the graph generation, parse
+config and declaration state still match; a refresh enters the same dispatcher
+and query-job owner. A ready block query lowers once, wraps the selected ids in
+the descriptor read and loads only admitted payload; a ready page query uses
+the corresponding ordered page statement. Explain runs all of its probes
+through one owned query job. There is no cost test and no selectivity hatch in
+front of this route. The lowered selection chooses the ANSWER rather than a
+candidate superset. Selection may inspect substantial predicate data; output
+payload construction is restricted to admitted results.
+
+Every other dispatch outcome is typed. Capacity pressure is
+`NotReady(Busy)`. A worker that is already reconciling, rebuilding or applying
+a delta reports its current `NotReady` reason. A stopped or unattached
+projection is `Unavailable`; cancellation is `Cancelled` and schedules no
+repair. An idle stale projection or an attempted failed read gets at most one
+bounded repair and one SQL retry. If that retry still cannot answer, the caller
+receives the resulting typed readiness or unavailability error. None of these
+branches evaluates the parsed graph or fabricates an empty success.
 
 **There is no fourth shape for "the compiler would not lower this."** The
 lowering is TOTAL by type: it returns a statement for every query the IR can
@@ -737,14 +750,22 @@ it does not duplicate text or construct output payload. The durable schema is
 unchanged. Regex program IDs distinguish the effective patterns of both
 syntaxes, and missing required visible text fails the read.
 
-**What one dispatched query reads.** One descriptor statement over the
-projection, plus the payload batches for the ids the answer ADMITS — never a
-candidate superset, never a page the answer does not contain, and never a page
-document: a dispatched query loads NO `Document` and reads NO source text, so
-pages loaded by a dispatched query equals zero. The page's name, kind and
-journal day come from the projection's own page row, and a projection that
-cannot account for a selected descriptor fails that read rather than serving
-a result it cannot account for.
+**What one dispatched query reads.** Capacity is acquired before SQLite opens
+the owned snapshot. The snapshot is validated against the exact current graph
+cache generation before and after its read transaction starts, then its
+interrupt handle and the snapshot-scoped `session_pages` identity set are
+registered with the job owner. A property-bearing query uses the registry
+published for that graph generation and parse config; when the table is not
+already current, the job reads it from its own snapshot before lowering. A
+query without a property leaf uses the empty registry because no predicate can
+observe its types. The answer then uses one descriptor statement plus payload
+batches for the ids the budget ADMITS — never a candidate superset, never a
+page the answer does not contain, and never a page document. Ready query selection
+and result construction load NO `Document`, read NO source text and consult no
+parsed graph. Recovery source-inventory work is counted separately. The page's name, kind and journal day
+come from the projection's own page row, and a projection that cannot account
+for a selected descriptor fails the whole read rather than serving a shorter
+answer.
 
 **A block statement answers `(block_id, page_id, path)` and nothing else, and
 its match set reads `blocks` alone.** The block identity is the answer, the page
@@ -761,49 +782,53 @@ carrying two unread columns and probing the pages primary key once per candidate
 is the unrequested work the projection exists to remove, and it measured 0.81 –
 0.98× of the previous statement across broad and selective nonempty shapes on
 the anonymized corpus, with controls recorded in `RECEIPT-db1.md` (under 1% for shapes above
-25 microseconds). Page-anchored
-statements are unaffected and still answer `(page_id, name, text_kind,
-journal_day)`. A row that does not have the block shape is a failed read, never
-an empty answer. Base order and within-page order
-are the caller's and are reproduced in the result construction, because the tree
-walk's base order is its page source's enumeration order and no projection
-column reproduces it; the statement therefore carries no `ORDER BY`, and the
-dispatched result equals the walk's result including order. The FTS-readiness
-signal the content predicates' candidate bounds depend on is probed through the
-same seam and remembered once per generation, never once per query — and only a
-READY observation is remembered, because readiness is monotonic within one
-projection file while a rebuild publishes a new generation.
+25 microseconds). Page-anchored statements are unaffected and still answer
+`(page_id, name, text_kind, journal_day, path)`. A row that does not have its
+required shape is a failed read, never an empty answer. The lowered selection
+statement itself has no ordering metadata. Its descriptor wrapper does: Direct
+block answers carry `query_page_order.position` and
+`query_block_results.preorder` and end with `ORDER BY` on those columns; the
+page wrapper carries the same page position. Missing Direct order metadata
+fails the read, because silently moving a page would change which rows survive
+a bounded budget. The FTS-readiness signal the content predicates' bounds
+depend on is probed through the same seam and remembered once per generation,
+never once per query — and only a READY observation is remembered, because
+readiness is monotonic within one projection file while a rebuild publishes a
+new generation.
 
-**A failed read recovers; it never refuses.** The in-scope scenarios are §3.1's:
-a torn or truncated projection file after a crash or power loss, a disk error, a
-resource limit, or a projection whose page set has drifted from the parsed
-cache. The projection is a disposable cache, so the answer is recovery. The
-fallback is counted, the tree walk answers the user's query, and the same
-full-snapshot enqueue the open path uses is scheduled from the already-parsed
-page cache, with a sticky request to reopen and reset the disposable projection.
-The worker drops cached readers before reopening and clears source revision
-stamps so unchanged pages are lowered again. The foreground needs no reparse,
-source-file read, or user action, and no refusal reaches
-the user. Clearing readiness alone would not do: it leaves the projection
-unusable until the user happens to save a page. Every route out of a query
-passes through the one place that owns both obligations, so a later route cannot
-carry one and forget the other. An unavailable, stale, failed, or raced
-projection uses the parser fallback.
+**A failed read repairs once, then reports the SQL outcome.** The in-scope
+scenarios are §3.1's: a torn or truncated projection file after a crash or power
+loss, a disk error, a resource limit, or a projection whose page set has drifted
+from the current graph generation. Because the projection is disposable,
+`dispatch_direct_query` requests a rebuild only after the failed job and its
+owned snapshot have dropped, then retries the SQL route once. The worker drains
+all old query jobs before it resets the file. If a complete parsed snapshot is
+already resident, recovery may enqueue it; otherwise recovery validates a
+complete source inventory from bytes and streams bounded per-page replacements,
+without constructing or retaining a whole parsed graph. Clearing readiness
+alone would strand the projection until another edit. Cancellation is excluded
+from repair because the drain or close deliberately removed the snapshot's
+subject.
 
 **What a cached query result is keyed by.** A Direct Files simple or advanced
 query result is memoized PRE-VIEW — the matched rows in base order, before
-`sort-by` and `sample` — under the resolved normalized query IR, the
-parser-cache generation, the execution day, the construction bounds, the
-parse-config digest, and, when the query names a property, the observed-registry
-generation. The key is the IR and not the query text, so `(task TODO)`, `(and
-(task TODO))` and the datalog spelling of the same question are ONE entry, and a
-view-only edit re-sorts rows the cache already holds instead of recomputing
-them. The parse-config digest is unconditional, because
+display sorting and sampling — under the resolved normalized query IR, the
+graph cache generation, the execution day, the construction bounds and profile,
+the parse-config digest, and, when the query names a property, the observed
+registry generation. The key is the IR and not the query text, so `(task TODO)`,
+`(and (task TODO))` and the datalog spelling of the same question are ONE entry.
+View directives that do not change the construction profile reuse those rows.
+The parse-config digest is unconditional, because
 `:journal/page-title-format` decides whether a page is a journal day at all and
-a query with no property leaf is still config-sensitive. A page edit evicts an
-entry when that page could contribute to the entry's own IR, judged by the same
-evaluator the query itself uses; a `tine.type::` change on a property-key page
-advances the registry generation and so evicts every typed query over that key.
+a query with no property leaf is still config-sensitive. A warm parsed cache
+allows a safe ordinary content edit to retain unaffected entries: the old and
+new page are tested against the entry's serialized IR with the shared evaluator,
+and survivors advance to the new generation. A cold session with no parsed
+cache, a page-set or alias/identity change, an unreadable key, or another
+graph-wide uncertainty drops the applicable memo instead of claiming scoped
+retention. A property-key declaration change advances the registry generation
+and evicts property-sensitive entries. Query execution and memo hits themselves
+do not require a resident parsed graph.
 
 Managed production queries no longer construct a candidate-page plan or apply
 its selectivity cutoff. A simple query is parsed once; invalid input returns its
