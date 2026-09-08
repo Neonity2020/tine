@@ -188,8 +188,25 @@ pub(crate) enum WarmStreamItem {
     },
 }
 
+struct PendingQueryCapture {
+    generation: u64,
+    slot: crate::query_jobs::OwnedJobSlot,
+    reply: std::sync::mpsc::SyncSender<QueryJobOpen>,
+}
+
+fn reject_query_captures(captures: Vec<PendingQueryCapture>) {
+    for capture in captures {
+        // Release admission before replying, so the receiver can immediately
+        // retry without being held behind its own rejected capture.
+        drop(capture.slot);
+        let _ = capture.reply.send(QueryJobOpen::Cancelled);
+    }
+}
+
 #[derive(Default)]
 struct PendingProjection {
+    // Each capture owns one slot from the shared two-job cap.
+    captures: Vec<PendingQueryCapture>,
     full: Option<PendingFull>,
     rebuild: bool,
     deltas: BTreeMap<String, (u64, PageDelta)>,
@@ -351,6 +368,10 @@ struct ProjectionShared {
     /// a save of some other page before the warm runs.
     validated: AtomicBool,
     #[cfg(test)]
+    after_sql_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    capture_thread: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
+    #[cfg(test)]
     indexed_reads: AtomicU64,
     /// §5.9's dispatched statements: how many times the lowering ANSWERED a
     /// user query through the seam. Separate from `indexed_reads`, which counts
@@ -375,6 +396,27 @@ struct ProjectionShared {
 }
 
 impl ProjectionShared {
+    fn ready_at(&self, generation: u64) -> bool {
+        self.ready.load(Ordering::Acquire)
+            && self.ready_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn cancel_queued_captures(&self, close: bool) -> crate::query_jobs::QueryDrainFence {
+        let (fence, captures) = {
+            let mut pending = self.pending.lock().unwrap();
+            let fence = if close {
+                pending.stop = true;
+                self.query_jobs.begin_close()
+            } else {
+                self.query_jobs.begin_drain()
+            };
+            (fence, std::mem::take(&mut pending.captures))
+        };
+        reject_query_captures(captures);
+        self.changed.notify_all();
+        fence
+    }
+
     /// R3 identity policy bookkeeping, run by the worker after every
     /// successful apply: the pages just lowered carry this process's live ids;
     /// the pages just deleted carry nothing.
@@ -397,6 +439,51 @@ impl ProjectionShared {
         }
         *current = Arc::new(next);
     }
+}
+
+fn capture_query_job(
+    shared: &ProjectionShared,
+    cache_generation: u64,
+    slot: crate::query_jobs::OwnedJobSlot,
+) -> QueryJobOpen {
+    #[cfg(test)]
+    if let Some(observed) = shared.capture_thread.lock().unwrap().take() {
+        observed.send(std::thread::current().id()).unwrap();
+    }
+    if slot.is_cancelled() {
+        return QueryJobOpen::Cancelled;
+    }
+    let validate = || {
+        if shared.ready_at(cache_generation) {
+            Ok(())
+        } else {
+            Err(tine_storage::sqlite::MaterializationError::Incomplete(
+                "projection generation moved during snapshot acquisition".into(),
+            ))
+        }
+    };
+    let snapshot = match PhysicalProjectionQuerySnapshot::open_direct(&shared.path, validate) {
+        Ok(snapshot) => snapshot,
+        // The validator is the only `Incomplete` this call can produce and
+        // it means the generation moved: not a defect. Anything else is
+        // an unopenable or unreadable file.
+        Err(_) if !shared.ready_at(cache_generation) => return QueryJobOpen::NotReady,
+        Err(_) => return QueryJobOpen::Failed,
+    };
+    if !slot.register(snapshot.cancellation()) {
+        return QueryJobOpen::Cancelled;
+    }
+    let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
+    if !shared.ready_at(cache_generation) {
+        return QueryJobOpen::NotReady;
+    }
+    #[cfg(test)]
+    shared.statement_reads.fetch_add(1, Ordering::Relaxed);
+    QueryJobOpen::Job(DirectQueryJob {
+        _slot: slot,
+        snapshot,
+        session_pages,
+    })
 }
 
 /// One admitted, snapshot-owning Direct query job (R3). Everything the result
@@ -613,6 +700,10 @@ impl DirectProjection {
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
+            #[cfg(test)]
+            after_sql_commit: Mutex::new(None),
+            #[cfg(test)]
+            capture_thread: Mutex::new(None),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
             #[cfg(test)]
@@ -1135,13 +1226,11 @@ impl DirectProjection {
 
     /// R3: open a database-owned query job at the current cache generation.
     ///
-    /// Order matters and is the plan's (§2B): capacity FIRST, so a waiting job
-    /// pins no WAL pages; then the owned snapshot, validated by
-    /// `ready_at(generation)` before and after SQLite establishes the read
-    /// transaction (`open_direct`); then the job registers its interrupt
-    /// handle with the owner, which is what lets a rebuild reach a statement
-    /// mid-flight; finally the identity input is captured and the generation
-    /// re-checked, so the captured set describes the rows the snapshot sees.
+    /// Capacity is acquired on the caller before enqueueing a capture. The
+    /// producer opens the snapshot and captures session identity between write
+    /// turns, validating `ready_at(generation)` around the transaction. It
+    /// registers cancellation before handing the owned job back. Selection
+    /// and payload construction then execute on the caller, off the producer.
     /// The statement's compiled-regex program is installed by
     /// `query::results::read_results` on the job's own connection — the ONE
     /// install site — so a job carries no regex state of its own.
@@ -1169,38 +1258,26 @@ impl DirectProjection {
             // boundary may retry without ever considering a repair.
             OwnedAdmission::Busy => return QueryJobOpen::Busy,
         };
-        let validate = || {
-            if self.ready_at(cache_generation) {
-                Ok(())
-            } else {
-                Err(tine_storage::sqlite::MaterializationError::Incomplete(
-                    "projection generation moved during snapshot acquisition".into(),
-                ))
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            if pending.stop || slot.is_cancelled() {
+                return QueryJobOpen::Cancelled;
             }
-        };
-        let snapshot =
-            match PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, validate) {
-                Ok(snapshot) => snapshot,
-                // The validator is the only `Incomplete` this call can produce and
-                // it means the generation moved: not a defect. Anything else is
-                // an unopenable or unreadable file.
-                Err(_) if !self.ready_at(cache_generation) => return QueryJobOpen::NotReady,
-                Err(_) => return QueryJobOpen::Failed,
-            };
-        if !slot.register(snapshot.cancellation()) {
-            return QueryJobOpen::Cancelled;
+            if !self.shared.worker_available.load(Ordering::Acquire) {
+                return QueryJobOpen::Failed;
+            }
+            if !self.ready_at(cache_generation) {
+                return QueryJobOpen::NotReady;
+            }
+            pending.captures.push(PendingQueryCapture {
+                generation: cache_generation,
+                slot,
+                reply,
+            });
         }
-        let session_pages = Arc::clone(&self.shared.session_pages.lock().unwrap());
-        if !self.ready_at(cache_generation) {
-            return QueryJobOpen::NotReady;
-        }
-        #[cfg(test)]
-        self.shared.statement_reads.fetch_add(1, Ordering::Relaxed);
-        QueryJobOpen::Job(DirectQueryJob {
-            _slot: slot,
-            snapshot,
-            session_pages,
-        })
+        self.shared.changed.notify_all();
+        result.recv().unwrap_or(QueryJobOpen::Failed)
     }
 
     #[cfg(test)]
@@ -1623,8 +1700,7 @@ impl DirectProjection {
     }
 
     pub(crate) fn ready_at(&self, generation: u64) -> bool {
-        self.shared.ready.load(Ordering::Acquire)
-            && self.shared.ready_generation.load(Ordering::Acquire) == generation
+        self.shared.ready_at(generation)
     }
 
     /// RET2's readiness lifecycle: why this generation is not ready, and what
@@ -1751,12 +1827,8 @@ impl DirectProjection {
     /// owner are both terminal, so a caller that closes explicitly and then
     /// drops pays a second no-op drain and nothing else.
     fn close(&self) {
-        self.shared.query_jobs.close();
-        {
-            let mut pending = self.shared.pending.lock().unwrap();
-            pending.stop = true;
-        }
-        self.shared.changed.notify_all();
+        let fence = self.shared.cancel_queued_captures(true);
+        self.shared.query_jobs.wait_for_drain(fence);
     }
 
     /// Retain a resource until the writer has released its connection and lease.
@@ -1810,6 +1882,8 @@ struct ProjectionWorkerExit(Arc<ProjectionShared>);
 impl Drop for ProjectionWorkerExit {
     fn drop(&mut self) {
         self.0.worker_available.store(false, Ordering::Release);
+        let captures = std::mem::take(&mut self.0.pending.lock().unwrap().captures);
+        reject_query_captures(captures);
         let resources = self.0.worker_resources.lock().unwrap().take();
         drop(resources);
         self.0.worker_finished.store(true, Ordering::Release);
@@ -1890,13 +1964,26 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     loop {
         let turn = {
             let mut pending = shared.pending.lock().unwrap();
-            while !pending.has_work() && !pending.stop {
+            while !pending.has_work() && pending.captures.is_empty() && !pending.stop {
                 pending = shared.changed.wait(pending).unwrap();
             }
             if pending.stop {
                 shared.worker_available.store(false, Ordering::Release);
                 shared.changed.notify_all();
                 return;
+            }
+            let captures = std::mem::take(&mut pending.captures);
+            drop(pending);
+            for capture in captures {
+                let job = capture_query_job(&shared, capture.generation, capture.slot);
+                let _ = capture.reply.send(job);
+            }
+            let mut pending = shared.pending.lock().unwrap();
+            if pending.stop {
+                return;
+            }
+            if !pending.has_work() {
+                continue;
             }
             shared.worker_busy.store(true, Ordering::Release);
             if std::mem::take(&mut pending.needs_full) {
@@ -1966,7 +2053,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         // reset or removed, and the rebuild never waits on a read
                         // nobody will finish. In-scope scenario: a torn projection
                         // rebuilt under a live reader (D-3).
-                        shared.query_jobs.cancel_all_and_drain();
+                        let fence = shared.cancel_queued_captures(false);
+                        shared.query_jobs.wait_for_drain(fence);
                         // Drop every connection before the disposable file can be
                         // replaced; a reader must not retain an old file handle.
                         let mut reader = shared.reader.lock().unwrap();
@@ -2041,6 +2129,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 continue;
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
+            hook();
+        }
         shared.record_session_pages(&applied.pages);
         if had_full || had_warm {
             requires_full_rebuild = false;
@@ -5774,11 +5866,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 
-    /// **R6 §3, unit.** A structural relowering removes the page from the
-    /// session set exactly as a deletion does.
-    #[test]
-    fn a_structural_relower_drops_the_session_identity() {
-        let shared = ProjectionShared {
+    fn empty_projection_shared() -> ProjectionShared {
+        ProjectionShared {
             path: PathBuf::from("unused"),
             pending: Mutex::new(PendingProjection::default()),
             changed: Condvar::new(),
@@ -5796,13 +5885,203 @@ mod tests {
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
+            after_sql_commit: Mutex::new(None),
+            #[cfg(test)]
+            capture_thread: Mutex::new(None),
+            #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
             statement_reads: AtomicU64::new(0),
             inject_read_failure: AtomicBool::new(false),
             fallback_reads: AtomicU64::new(0),
             referenced_name_reads: AtomicU64::new(0),
             fuzzy_candidate_reads: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn query_job_queued_captures_release_before_reset_or_close_waits() {
+        for close in [false, true] {
+            let shared = empty_projection_shared();
+            let epoch = shared.query_jobs.capture_epoch();
+            let mut results = Vec::new();
+            for _ in 0..DEFAULT_QUERY_JOB_CAPACITY {
+                let OwnedAdmission::Slot(slot) = shared
+                    .query_jobs
+                    .acquire_owned_at_within(epoch, Duration::ZERO)
+                else {
+                    panic!("fixture admission");
+                };
+                let (reply, result) = std::sync::mpsc::sync_channel(1);
+                shared
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .captures
+                    .push(PendingQueryCapture {
+                        generation: 0,
+                        slot,
+                        reply,
+                    });
+                results.push(result);
+            }
+            assert!(matches!(
+                shared
+                    .query_jobs
+                    .acquire_owned_at_within(epoch, Duration::ZERO),
+                OwnedAdmission::Busy
+            ));
+            let fence = shared.cancel_queued_captures(close);
+            // Assert before waiting: a regression fails instead of deadlocking.
+            assert_eq!(shared.query_jobs.active(), 0);
+            assert!(shared.pending.lock().unwrap().captures.is_empty());
+            for result in results {
+                assert!(matches!(
+                    result.try_recv().unwrap(),
+                    QueryJobOpen::Cancelled
+                ));
+            }
+            shared.query_jobs.wait_for_drain(fence);
+            assert!(matches!(
+                shared
+                    .query_jobs
+                    .acquire_owned_at_within(epoch, Duration::ZERO),
+                OwnedAdmission::Cancelled
+            ));
+            let next = shared
+                .query_jobs
+                .acquire_owned_at_within(shared.query_jobs.capture_epoch(), Duration::ZERO);
+            if close {
+                assert!(matches!(next, OwnedAdmission::Cancelled));
+            } else {
+                assert!(matches!(next, OwnedAdmission::Slot(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn query_job_capture_waits_for_post_commit_identity_publication() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("producer-identity-boundary");
+        let database = root.join("private/projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let entry = graph.list_pages().into_iter().next().unwrap();
+        let id = page_id(&entry.rel_path);
+        assert!(!projection.session_pages_test().contains(&id));
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO producer identity sentinel".into();
+        let (paused, observed) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        *projection.shared.after_sql_commit.lock().unwrap() = Some(Box::new(move || {
+            paused.send(()).unwrap();
+            resumed.recv().unwrap();
+        }));
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        // The new SQL is committed but its identity policy has not published.
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let committed: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM block_text WHERE content = 'TODO producer identity sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let identity_pending = !projection.session_pages_test().contains(&id);
+        let owner = &projection.shared.query_jobs;
+        let OwnedAdmission::Slot(slot) =
+            owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO)
+        else {
+            panic!("capture admission");
         };
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        projection
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .captures
+            .push(PendingQueryCapture {
+                generation: graph.cache_generation(),
+                slot,
+                reply,
+            });
+        projection.shared.changed.notify_all();
+        let remained_queued =
+            matches!(result.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        // Always release the barrier before assertions or graph destruction.
+        resume.send(()).unwrap();
+        let captured = result.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(committed, 1);
+        assert!(identity_pending);
+        assert!(remained_queued);
+        let QueryJobOpen::Job(mut job) = captured else {
+            panic!("published capture");
+        };
+        assert!(job.session_pages.contains(&id));
+        let mut matching = 0;
+        job.snapshot
+            .visit_projection_query(
+                "SELECT block_id FROM block_text WHERE content = 'TODO producer identity sentinel'",
+                &[],
+                |_| {
+                    matching += 1;
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
+        assert_eq!(matching, 1);
+        drop(job);
+        drop(connection);
+        drop(projection);
+        drop(graph);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_job_snapshot_is_captured_on_the_projection_worker() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("producer-capture");
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let (observed, result) = std::sync::mpsc::channel();
+        *projection.shared.capture_thread.lock().unwrap() = Some(observed);
+        let QueryJobOpen::Job(mut job) = projection.open_query_job(graph.cache_generation()) else {
+            panic!("ready capture");
+        };
+        assert_ne!(
+            result.try_recv().unwrap(),
+            std::thread::current().id(),
+            "foreground snapshot acquisition bypassed producer serialization"
+        );
+        let mut rows = 0;
+        job.snapshot
+            .visit_projection_query("SELECT block_id FROM blocks", &[], |_| {
+                rows += 1;
+                Ok(std::ops::ControlFlow::Continue(()))
+            })
+            .unwrap();
+        assert!(rows > 0);
+        drop(job);
+        drop(projection);
+        drop(graph);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **R6 §3, unit.** A structural relowering removes the page from the
+    /// session set exactly as a deletion does.
+    #[test]
+    fn a_structural_relower_drops_the_session_identity() {
+        let shared = empty_projection_shared();
         let a = page_id("pages/a.md");
         let b = page_id("pages/b.md");
         shared.record_session_pages(&AppliedPages {
