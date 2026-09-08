@@ -2,6 +2,23 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-QUERY-PAGE-SNAPSHOT-UNDO-LIFETIME-20260908",
+      "title": "Scoped page undo keeps the open query sheet mounted",
+      "family": "query-builder",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.queryUndoLifecycle.test.tsx",
+          "src/historyParity.test.ts"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Native journey61772 reproduced undo restoring source bytes while dismissing the sheet. The scoped snapshot restore replaced FeedPage and disposed PageView descendants. Manager preserves the existing page object while restoring all fields and removing absent optional metadata. Store before50473 fails identity, after83937 passes6. Actual PageView component after13192 passes save/undo/redo with the same connected gear and sheet; neighboring render55226 passes134. Exact native pass-after is still required; this row claims component/state behavior only, not touch, focus, TODO-scroll stability or delivery."
+    },
+    {
       "id": "UI-QUERY-SHEET-P6-CONTROLS-20260908",
       "title": "The query sheet can select, disable, group and reorder conditions without a second tree editor",
       "family": "query-builder",
