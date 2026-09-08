@@ -1698,10 +1698,10 @@ mod tests {
     use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         recover_incomplete_projections, AnnotatedProjectionBase, ApplicationRuntimeRoot, BlockId,
-        BlockLocation, DeviceId, DocumentId, LineageDigest, LogicalPageName, ManagedPath,
-        ManagedTextKind, ManifestProjectionPrecondition, ManifestedProjectionIntent, ObjectKind,
-        OperationTransaction, PageId, ProjectionClaim, ProjectionEndpointId, SemanticOperation,
-        TAIL_MAX_BYTES,
+        BlockLocation, DeviceId, DocumentId, EngineError, LineageDigest, LogicalPageName,
+        ManagedPath, ManagedTextKind, ManifestProjectionPrecondition, ManifestedProjectionIntent,
+        ObjectKind, OperationBatch, OperationObject, OperationTransaction, PageId, PreparedBatch,
+        ProjectionClaim, ProjectionEndpointId, SemanticOperation, ValidatedBatch, TAIL_MAX_BYTES,
     };
 
     struct TestRoot(PathBuf);
@@ -1946,6 +1946,29 @@ mod tests {
             .unwrap()
         }
 
+        fn prepare_admitted_local(&mut self, batch_id: BatchId, content: &str) -> PreparedBatch {
+            let transaction = self.local_edit_transaction(content);
+            let page_home_hints = BTreeMap::from([(self.page_id, self.home_document_id)]);
+            let prepared = {
+                let mut session = self.runtime.admit_clean_mutation(&self.graph).unwrap();
+                OperationalCoordinator::prepare_clean_trusted_local_compound(
+                    &mut session,
+                    &self.graph,
+                    &self.receipts,
+                    &transaction,
+                    batch_id,
+                    &page_home_hints,
+                )
+                .unwrap()
+            };
+            match prepared {
+                PreparedLocalMutationState::Prepared(prepared) => prepared.into_trusted_batch(),
+                PreparedLocalMutationState::ReconciliationRequired(_) => {
+                    panic!("admitted local edit unexpectedly requires reconciliation")
+                }
+            }
+        }
+
         fn local_author(&self, seed: u128) -> AuthorBatch {
             AuthorBatch {
                 batch_id: BatchId::from_uuid(Uuid::from_u128(seed)),
@@ -2167,6 +2190,54 @@ mod tests {
         }
     }
 
+    fn without_projection_objects(prepared: &PreparedBatch) -> PreparedBatch {
+        let objects = prepared
+            .objects()
+            .iter()
+            .filter(|object| {
+                !matches!(
+                    object.kind(),
+                    ObjectKind::ProjectionIntent | ObjectKind::AnnotatedBaseBlob
+                )
+            })
+            .cloned()
+            .collect::<Vec<OperationObject>>();
+        let manifest = prepared.manifest();
+        let manifest = OperationBatch::new_with_causality(
+            manifest.workspace_id(),
+            manifest.lineage_digest(),
+            manifest.batch_id(),
+            manifest.author_device_id(),
+            manifest.author_session_id(),
+            manifest.origin(),
+            manifest.causal_dot(),
+            manifest.causal_dependency_heads().to_vec(),
+            manifest.dependency_frontier().clone(),
+            manifest.semantic_effect_digest(),
+            objects
+                .iter()
+                .map(OperationObject::descriptor)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .unwrap();
+        PreparedBatch::new(manifest, objects).unwrap()
+    }
+
+    fn stage_admitted_candidate(
+        fixture: &mut CleanCoordinatorFixture,
+        prepared: PreparedBatch,
+    ) -> BatchDisposition {
+        let mut session = fixture
+            .runtime
+            .admit_clean_mutation(&fixture.graph)
+            .unwrap();
+        let (_, engine, _) = session.parts().unwrap();
+        engine
+            .stage_ready(ValidatedBatch::new(prepared))
+            .disposition()
+    }
+
     fn clean_coordinator_source(path: &str, root: &str, child: &str) -> Vec<u8> {
         if path.ends_with(".org") {
             format!("* {root}\n** {child}\n").into_bytes()
@@ -2185,6 +2256,94 @@ mod tests {
                 )
             }
         }
+    }
+
+    #[test]
+    fn admitted_missing_projection_intent_refuses_live_causal_base_even_after_receiver_deletion() {
+        assert!(
+            std::env::var_os("TINE_SQLITE_HELPER_MODE").is_none(),
+            "SQLite helper mode must not authorize this production-path negative"
+        );
+
+        let mut live = CleanCoordinatorFixture::new("missing-live-projection-intent");
+        let live_batch_id = BatchId::from_uuid(Uuid::from_u128(0xc5102_3200));
+        let live_prepared = live.prepare_admitted_local(live_batch_id, "missing live intent");
+        assert!(live_prepared
+            .objects()
+            .iter()
+            .any(|object| object.kind() == ObjectKind::ProjectionIntent));
+        assert!(!crate::oplog::hot_engine::is_test_fixture_batch(
+            live_batch_id
+        ));
+        let live_missing = without_projection_objects(&live_prepared);
+        assert!(matches!(
+            stage_admitted_candidate(&mut live, live_missing),
+            BatchDisposition::Rejected {
+                error: EngineError::ProjectionManifest(ref detail)
+            } if detail == "origin requires complete affected-path projection intents"
+        ));
+
+        let mut deleted_receiver =
+            CleanCoordinatorFixture::new("missing-causal-live-projection-intent");
+        let stale_batch_id = BatchId::from_uuid(Uuid::from_u128(0xc5102_3300));
+        let stale_prepared =
+            deleted_receiver.prepare_admitted_local(stale_batch_id, "authored while live");
+        assert!(stale_prepared
+            .objects()
+            .iter()
+            .any(|object| object.kind() == ObjectKind::ProjectionIntent));
+        assert!(!crate::oplog::hot_engine::is_test_fixture_batch(
+            stale_batch_id
+        ));
+        let stale_missing = without_projection_objects(&stale_prepared);
+
+        let remote_device = DeviceId::from_uuid(Uuid::from_u128(0xc5102_3310));
+        let remote_delete = deleted_receiver
+            .engine()
+            .prepare_fixture_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(0xc5102_3311)),
+                    author_device_id: remote_device,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0xc5102_3312)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0xc5102_3313),
+                    causal_peer_id: CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_for_device(remote_device),
+                    ),
+                },
+                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
+                    page_id: deleted_receiver.page_id,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let (delete_outcome, stale_outcome) = {
+            let mut session = deleted_receiver
+                .runtime
+                .admit_clean_mutation(&deleted_receiver.graph)
+                .unwrap();
+            let (_, engine, _) = session.parts().unwrap();
+            let delete_outcome = engine
+                .stage_ready(ValidatedBatch::new(remote_delete))
+                .disposition();
+            let stale_outcome = engine
+                .stage_ready(ValidatedBatch::new(stale_missing))
+                .disposition();
+            (delete_outcome, stale_outcome)
+        };
+        assert!(matches!(delete_outcome, BatchDisposition::Accepted { .. }));
+        assert!(matches!(
+            deleted_receiver
+                .engine()
+                .materialize_page(deleted_receiver.page_id),
+            Err(EngineError::PageDeleted(page_id)) if page_id == deleted_receiver.page_id
+        ));
+
+        assert!(matches!(
+            stale_outcome,
+            BatchDisposition::Rejected {
+                error: EngineError::ProjectionManifest(ref detail)
+            } if detail == "origin requires complete affected-path projection intents"
+        ), "receiver-current tombstone accepted or misclassified the causal-live omission: {stale_outcome:?}");
     }
 
     fn expect_clean_local_pending(state: CleanLocalMutationState) -> CleanPublishedContinuation {

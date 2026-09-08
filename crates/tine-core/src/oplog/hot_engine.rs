@@ -2634,6 +2634,11 @@ pub(crate) fn take_last_admitted_local_author() -> Option<AuthorBatch> {
     LAST_ADMITTED_LOCAL_AUTHOR.with(Cell::take)
 }
 
+#[cfg(test)]
+pub(crate) fn is_test_fixture_batch(batch_id: BatchId) -> bool {
+    TEST_FIXTURE_BATCHES.with(|batches| batches.borrow().contains(&batch_id))
+}
+
 /// Exact author-generation observation carried only by a promoted local-author
 /// authority. Its fields stay private to the engine so no caller can assert a
 /// current generation/root pair.
@@ -4071,14 +4076,7 @@ impl AcceptedRootMaterializer<'_> {
             .ok_or(EngineError::MissingDocument(key.document_id))
     }
 
-    pub(crate) fn materialize_page(
-        &mut self,
-        page_id: PageId,
-    ) -> Result<Option<MaterializedPage>, EngineError> {
-        let reads_before = self.engine.archive_read_stats();
-        // No catalog document is loaded: the page's own document answers its
-        // own state, and the accepted current-owner range answers which pairs
-        // to resolve.
+    pub(crate) fn page_state(&mut self, page_id: PageId) -> Result<Option<PageState>, EngineError> {
         let Some(page_document_id) = self.engine.accepted_page_home(page_id) else {
             return Ok(None);
         };
@@ -4086,10 +4084,18 @@ impl AcceptedRootMaterializer<'_> {
         let Some(page_cache_key) = self.load_document(page_key)? else {
             return Ok(None);
         };
-        let page_state = read_page_state(page_key, self.document(page_cache_key)?)?;
-        let Some(page_state @ PageState::Live { .. }) = page_state else {
+        read_page_state(page_key, self.document(page_cache_key)?)
+    }
+
+    pub(crate) fn materialize_page(
+        &mut self,
+        page_id: PageId,
+    ) -> Result<Option<MaterializedPage>, EngineError> {
+        let reads_before = self.engine.archive_read_stats();
+        let Some(page_state @ PageState::Live { .. }) = self.page_state(page_id)? else {
             return Ok(None);
         };
+        let page_document_id = page_state.home_document_id();
         let members = self.engine.accepted_page_members(page_id);
         for document_id in self
             .engine
@@ -11089,12 +11095,13 @@ impl ShardedHotEngine {
     /// preceding local author commit. This is a bounded current-head cache,
     /// never authority: restart, a different batch/root, or a missing page
     /// falls back to immutable accepted-history materialization.
-    pub(crate) fn accepted_author_projection_outcome(
+    pub(crate) fn accepted_author_projection_outcome<T>(
         &self,
         batch_id: BatchId,
         post_frontier_state_digest: ContentDigest,
         page_id: PageId,
-    ) -> Option<Option<MaterializedPage>> {
+        inspect: impl FnOnce(Option<&MaterializedPage>) -> T,
+    ) -> Option<T> {
         let retained = self.accepted_author_projection_pages.borrow();
         let retained = retained.as_ref()?;
         if retained.batch_id != batch_id
@@ -11105,7 +11112,7 @@ impl ShardedHotEngine {
         retained
             .outcomes
             .get(&page_id)
-            .map(|outcome| outcome.as_ref().map(|state| state.page.clone()))
+            .map(|outcome| inspect(outcome.as_ref().map(|state| &state.page)))
     }
 
     pub(crate) fn accepted_root_materializer(
@@ -16259,6 +16266,50 @@ impl ShardedHotEngine {
                 }
             }
         }
+        // An unchanged affected page that is already tombstoned contributes no
+        // file transition. Carry its exact page document through the existing
+        // read-only dependency seam used by block-birth authority, so closed-set
+        // acceptance can prove absence at the authored causal base. Page deltas
+        // already carry their own before/after page documents.
+        let page_delta_ids = effect
+            .pages()
+            .iter()
+            .map(|delta| delta.page_id)
+            .collect::<BTreeSet<_>>();
+        let mut unchanged_tombstone_vectors = BTreeMap::new();
+        for page_id in affected_projection_pages(&effect) {
+            if page_delta_ids.contains(&page_id) {
+                continue;
+            }
+            let state = self.current_hot_catalog_page_state(page_id)?;
+            let PageState::Tombstone {
+                home_document_id, ..
+            } = state
+            else {
+                continue;
+            };
+            let page_key = DocumentKey::Entity(home_document_id);
+            if before_vectors.contains_key(&page_key)
+                || birth_page_vectors.contains_key(&page_key)
+                || unchanged_tombstone_vectors.contains_key(&page_key)
+            {
+                continue;
+            }
+            let page_document =
+                self.clone_current_hot_document(page_key, author.crdt_peer_id.as_u64())?;
+            if document_page_id(page_key, &page_document)? != Some(page_id)
+                || !matches!(
+                    read_page_state(page_key, &page_document)?,
+                    Some(PageState::Tombstone { .. })
+                )
+            {
+                return Err(malformed(
+                    page_key,
+                    "projection absence dependency is not its tombstoned page document",
+                ));
+            }
+            unchanged_tombstone_vectors.insert(page_key, page_document.oplog_vv());
+        }
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
             detail.effect_derive_encode = detail
@@ -16275,6 +16326,7 @@ impl ShardedHotEngine {
             .iter()
             .copied()
             .chain(birth_page_vectors.keys().copied())
+            .chain(unchanged_tombstone_vectors.keys().copied())
             .collect::<BTreeSet<_>>();
         let mut frontier_documents = Vec::with_capacity(dependency_document_ids.len());
         let mut affected_heads = BTreeMap::new();
@@ -16284,6 +16336,7 @@ impl ShardedHotEngine {
                 before_vectors
                     .get(document_id)
                     .or_else(|| birth_page_vectors.get(document_id))
+                    .or_else(|| unchanged_tombstone_vectors.get(document_id))
                     .expect("dependency before vector exists"),
             )?;
             let direct_heads: Vec<_> = match authenticated_direct_heads.remove(document_id) {
@@ -17109,7 +17162,8 @@ impl ShardedHotEngine {
             batch.objects(),
         )
         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        let affected = affected_projection_pages(effect);
+        let required_projection_pages =
+            required_projection_pages_from_exact_states(effect, before, after)?;
         if projection.intents().is_empty() {
             #[cfg(test)]
             if TEST_FIXTURE_BATCHES.with(|batches| batches.borrow().contains(&batch_id))
@@ -17119,7 +17173,7 @@ impl ShardedHotEngine {
             }
             return match batch.manifest().origin() {
                 BatchOrigin::BootstrapImport => Ok(()),
-                BatchOrigin::LocalMutation if affected.is_empty() => Ok(()),
+                BatchOrigin::LocalMutation if required_projection_pages.is_empty() => Ok(()),
                 BatchOrigin::LocalMutation | BatchOrigin::ExternalReconciliation { .. } => {
                     Err(EngineError::ProjectionManifest(
                         "origin requires complete affected-path projection intents".into(),
@@ -17146,12 +17200,12 @@ impl ShardedHotEngine {
             .iter()
             .map(ManifestedProjectionIntent::page_id)
             .collect::<BTreeSet<_>>();
-        if intent_pages != affected {
+        if intent_pages != required_projection_pages {
             return Err(EngineError::ProjectionManifest(
-                "projection intents do not exactly cover affected pages".into(),
+                "projection intents do not exactly cover required pages".into(),
             ));
         }
-        for page_id in &affected {
+        for page_id in &required_projection_pages {
             let intents = projection
                 .intents()
                 .iter()
@@ -25400,6 +25454,57 @@ impl ShardedHotEngine {
             .as_ref()
             .expect("read-only catalog was populated"))
     }
+}
+
+/// Derive the exact page closure that must carry file-projection intents.
+/// Affected pages are exempt only when their declared native before AND after
+/// states prove absence. Missing proof stays in the required set; receiver-local
+/// SQLite or current page state is never authority for an omission.
+fn required_projection_pages_from_exact_states(
+    effect: &SemanticEffect,
+    before: &BTreeMap<DocumentKey, &LoroDoc>,
+    after: &BTreeMap<DocumentKey, &LoroDoc>,
+) -> Result<BTreeSet<PageId>, EngineError> {
+    let affected = affected_projection_pages(effect);
+    let exact_states = |documents: &BTreeMap<DocumentKey, &LoroDoc>| {
+        let mut states = BTreeMap::<PageId, Option<PageState>>::new();
+        for (document_id, document) in documents {
+            let Some(page_id) = document_page_id(*document_id, document)? else {
+                continue;
+            };
+            if !affected.contains(&page_id) {
+                continue;
+            }
+            let state = read_page_state(*document_id, document)?;
+            if states.insert(page_id, state).is_some() {
+                return Err(EngineError::ProjectionManifest(format!(
+                    "exact projection closure has duplicate page documents for {page_id}"
+                )));
+            }
+        }
+        Ok(states)
+    };
+    let mut before_states = exact_states(before)?;
+    let mut after_states = exact_states(after)?;
+    // Page-changing operations already declare their exact page states and
+    // update the page document. In particular, `None` is exact absence rather
+    // than missing proof at this boundary.
+    for delta in effect.pages() {
+        before_states.insert(delta.page_id, delta.before.clone());
+        after_states.insert(delta.page_id, delta.after.clone());
+    }
+    let exactly_absent = |states: &BTreeMap<PageId, Option<PageState>>, page_id: PageId| {
+        matches!(
+            states.get(&page_id),
+            Some(None) | Some(Some(PageState::Tombstone { .. }))
+        )
+    };
+    Ok(affected
+        .into_iter()
+        .filter(|page_id| {
+            !exactly_absent(&before_states, *page_id) || !exactly_absent(&after_states, *page_id)
+        })
+        .collect())
 }
 
 fn affected_projection_pages(effect: &SemanticEffect) -> BTreeSet<PageId> {

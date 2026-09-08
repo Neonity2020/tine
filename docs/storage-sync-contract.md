@@ -1277,6 +1277,29 @@ does change the selected block owners and membership pairs. Deferred pages keep
 their existing behavior. A path rename preserves its matched `PageId` and is
 therefore not a whole-file page deletion.
 
+Projection-manifest completeness is computed per affected page from the exact
+native before/after states. A page absent at both states needs no file intent;
+every page live before or after still requires its complete manifested
+projection directions. This is page-local even in a mixed batch: an unchanged
+tombstoned page may be projectionless while another affected live page carries
+its ordinary replacement. The author carries an unchanged tombstoned page
+document through the existing read-only dependency frontier; missing exact
+proof never excuses a missing intent, and receiver-current SQLite/page state is
+not authority for the decision.
+
+`AcceptedBatchEvent` resolves affected pages against its authenticated accepted
+post-root. `EffectValidationContext.merged_deletions` carries that existing
+accepted-rendering absence proof for both contested and uncontested pages;
+contested live pages retain their complete recomputed rendering in
+`merged_replacements`. SQLite therefore permits an absent page's replacement to
+be omitted only with accepted-root deletion proof, while every visible page is
+still checked byte-exactly against the authored effect (or recomputed-and-
+compared when merge superseded it). The supplied materialization must still
+cover every affected page exactly once as replacement or derived deletion.
+Cold replay preserves retained blocks' original entity homes and native
+root-text identities and leaves an absent page hidden until an explicit
+`RevivePage` restores its predecessor state.
+
 Every `PreparedBatch` constructor proves that the existing canonical manifest
 encoder accepts the manifest before returning the publishable value. Oversize
 uses the existing typed `ManifestTooLarge` error and unchanged 1 MiB limit; it
