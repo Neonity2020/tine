@@ -54,14 +54,6 @@ fn run_before_apply_pending_hook() {
     }
 }
 
-/// The registry's snapshot-scoped page identity on the Direct Files projection
-/// side. The Managed side uses `page:<uuid>` and the cold walk the page's
-/// relative path; all three are opaque to `build_registry`, which only ever
-/// looks a row's page up in the map that came with it.
-fn direct_registry_page_key(page_id: [u8; 16]) -> String {
-    format!("page:{}", hex16(page_id))
-}
-
 #[cfg(test)]
 thread_local! {
     static REGISTRY_READ_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -70,15 +62,6 @@ thread_local! {
 #[cfg(test)]
 fn take_registry_read_attempts() -> u64 {
     REGISTRY_READ_ATTEMPTS.with(|count| count.replace(0))
-}
-
-fn hex16(id: [u8; 16]) -> String {
-    let mut out = String::with_capacity(32);
-    for byte in id {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// One queued page change. **The graph config travels INSIDE the work item**
@@ -511,100 +494,7 @@ impl DirectQueryJob {
     ) -> Result<crate::query::registry::Registry, crate::query::QueryExecutionError> {
         #[cfg(test)]
         REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
-        use crate::query::registry::{OwnerRow, OwnerType, PageMeta};
-        use crate::query::results::{blob16, integer, text};
-        use crate::query::{QueryExecutionError as Error, QueryUnavailableReason as Reason};
-        use std::ops::ControlFlow;
-        use tine_storage::sqlite::MaterializationError;
-
-        let mut pages = HashMap::new();
-        let mut rows = Vec::new();
-        let read = (|| -> Result<(), MaterializationError> {
-            self.snapshot.visit_projection_query(
-                "SELECT page_id, path, name, text_kind FROM pages",
-                &[],
-                |row| {
-                    let decode = || -> Result<_, String> {
-                        let id = blob16(row, 0, "pages.page_id")?;
-                        let path = text(row, 1, "pages.path")?;
-                        let name = text(row, 2, "pages.name")?;
-                        if !matches!(integer(row, 3, "pages.text_kind")?, 0 | 1) {
-                            return Err("invalid registry page kind".into());
-                        }
-                        Ok((
-                            direct_registry_page_key(id),
-                            PageMeta {
-                                format: Format::from_path(Path::new(&path)).into(),
-                                name,
-                            },
-                        ))
-                    };
-                    let (id, meta) = decode().map_err(MaterializationError::Corrupt)?;
-                    if pages.insert(id, meta).is_some() {
-                        return Err(MaterializationError::Corrupt(
-                            "duplicate registry page".into(),
-                        ));
-                    }
-                    Ok(ControlFlow::Continue(()))
-                },
-            )?;
-            self.snapshot.visit_projection_query(
-                "SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
-                 o.value, o.ordinal, b.page_id FROM properties o \
-                 LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id \
-                 ORDER BY o.owner_type, o.owner_id, o.name, o.ordinal",
-                &[],
-                |row| {
-                    let decode = || -> Result<OwnerRow, String> {
-                        let owner_id = blob16(row, 1, "properties.owner_id")?;
-                        let page_id = blob16(row, 2, "properties.page_id")?;
-                        let (owner_type, prefix) = match integer(row, 0, "properties.owner_type")? {
-                            0 if owner_id == page_id => (OwnerType::Page, "p"),
-                            1 if blob16(row, 7, "blocks.page_id")? == page_id => {
-                                (OwnerType::Block, "b")
-                            }
-                            _ => return Err("invalid registry property ownership".into()),
-                        };
-                        let page_id = direct_registry_page_key(page_id);
-                        if !pages.contains_key(&page_id) {
-                            return Err("registry property names an absent page".into());
-                        }
-                        Ok(OwnerRow {
-                            owner_type,
-                            owner_id: format!("{prefix}:{}", hex16(owner_id)),
-                            page_id,
-                            source_name: text(row, 3, "properties.name")?,
-                            normalized_name: text(row, 4, "properties.normalized_name")?,
-                            value: text(row, 5, "properties.value")?,
-                            ordinal: u32::try_from(integer(row, 6, "properties.ordinal")?)
-                                .map_err(|_| "invalid registry property ordinal".to_owned())?,
-                        })
-                    };
-                    rows.push(decode().map_err(MaterializationError::Corrupt)?);
-                    Ok(ControlFlow::Continue(()))
-                },
-            )?;
-            Ok(())
-        })();
-        if let Err(error) = read {
-            return Err(if self.snapshot.cancellation().is_cancelled() {
-                Error::Cancelled
-            } else if matches!(error, MaterializationError::Corrupt(_)) {
-                Error::Unavailable(Reason::InvalidSnapshot)
-            } else {
-                Error::Unavailable(Reason::ReadFailed)
-            });
-        }
-        let registry = crate::query::registry::build_registry(
-            rows.into_iter(),
-            &|page| pages.get(page).cloned(),
-            config,
-        )
-        .map_err(|_| Error::Unavailable(Reason::InvalidSnapshot))?;
-        if self.snapshot.cancellation().is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        Ok(registry)
+        crate::query::registry_sql::read_registry(&mut self.snapshot, config)
     }
 }
 
@@ -1164,7 +1054,7 @@ impl DirectProjection {
             |row| (row.page_id, row.path.clone()),
             |row| {
                 pages.insert(
-                    direct_registry_page_key(row.page_id),
+                    crate::query::registry_sql::page_key(row.page_id),
                     PageMeta {
                         // §6.2 E4: `Format::from_path`, case-insensitive —
                         // never `reference_source_is_org`.
@@ -1190,13 +1080,19 @@ impl DirectProjection {
             |row| (row.owner, row.source_name.clone(), row.ordinal),
             |row| {
                 let (owner_type, owner_id) = match row.owner {
-                    PhysicalEntityId::Page(id) => (OwnerType::Page, format!("p:{}", hex16(id))),
-                    PhysicalEntityId::Block(id) => (OwnerType::Block, format!("b:{}", hex16(id))),
+                    PhysicalEntityId::Page(id) => (
+                        OwnerType::Page,
+                        format!("p:{}", crate::query::registry_sql::hex16(id)),
+                    ),
+                    PhysicalEntityId::Block(id) => (
+                        OwnerType::Block,
+                        format!("b:{}", crate::query::registry_sql::hex16(id)),
+                    ),
                 };
                 rows.push(OwnerRow {
                     owner_type,
                     owner_id,
-                    page_id: direct_registry_page_key(row.page_id),
+                    page_id: crate::query::registry_sql::page_key(row.page_id),
                     source_name: row.source_name,
                     normalized_name: row.normalized_name,
                     ordinal: row.ordinal,
