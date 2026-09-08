@@ -6947,7 +6947,7 @@ impl Graph {
     fn direct_projection_query_job<T>(
         &self,
         read: impl FnOnce(
-            &mut crate::direct_projection::DirectQueryJob<'_>,
+            &mut crate::direct_projection::DirectQueryJob,
             u64,
             bool,
         ) -> Result<T, crate::query::QueryExecutionError>,
@@ -6992,7 +6992,7 @@ impl Graph {
         &self,
         has_properties: bool,
         generation: u64,
-        job: &mut crate::direct_projection::DirectQueryJob<'_>,
+        job: &mut crate::direct_projection::DirectQueryJob,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         let config = self.config.parse_config();
         if !has_properties {
@@ -16731,7 +16731,7 @@ impl Graph {
         &self,
         source_generation: u64,
         config: &crate::config::ParseConfig,
-        job: &mut crate::direct_projection::DirectQueryJob<'_>,
+        job: &mut crate::direct_projection::DirectQueryJob,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         if job.snapshot.cancellation().is_cancelled() {
             return Err(crate::query::QueryExecutionError::Cancelled);

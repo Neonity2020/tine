@@ -3,7 +3,9 @@ use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::oplog::query_cursor::drain_after;
 use crate::query::PropertyFacetAccumulator;
-use crate::query_jobs::{Admission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY};
+use crate::query_jobs::{
+    OwnedAdmission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY, QUERY_JOB_WAIT,
+};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -305,7 +307,7 @@ struct ProjectionShared {
     /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
     /// drains every job before it replaces or resets the file, and `Drop`
     /// drains before the worker is stopped.
-    query_jobs: QueryJobOwner,
+    query_jobs: Arc<QueryJobOwner>,
     /// R3 identity policy (WARM-IDENTITY-ORDER-CONTRACT.md §"Chosen strategy"
     /// 2–3): the pages whose rows THIS process lowered. Their stored
     /// `query_block_results.result_id` is the live runtime id the parsed
@@ -402,18 +404,18 @@ impl ProjectionShared {
 /// validation: the pinned read transaction, the compiled-regex program already
 /// installed on its connection, and the identity policy input. Dropping the
 /// job releases the transaction and the capacity slot.
-pub(crate) struct DirectQueryJob<'a> {
+pub(crate) struct DirectQueryJob {
     // Field drop order is a lifecycle boundary: release the SQLite transaction
     // before the admission slot can wake a projection replacement drain.
     pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
     /// Held for its `Drop`: releasing the slot is the job's only exit.
-    _slot: crate::query_jobs::JobSlot<'a>,
+    _slot: crate::query_jobs::OwnedJobSlot,
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
 }
 
-impl DirectQueryJob<'_> {
+impl DirectQueryJob {
     /// Registry input and selection share this owned transaction. This scans
     /// metadata, not result payload; inference remains build_registry's job.
     pub(crate) fn read_registry(
@@ -520,7 +522,7 @@ impl DirectQueryJob<'_> {
 }
 
 #[cfg(test)]
-impl DirectQueryJob<'_> {
+impl DirectQueryJob {
     /// True once a drain (rebuild, reset, close) has cancelled this job. The
     /// production read checks the snapshot's own sticky flag between batches;
     /// this is the slot's view, for the drain tests.
@@ -531,8 +533,8 @@ impl DirectQueryJob<'_> {
 
 /// What one attempt to open a query job produced (R3; the §5.9 states plus
 /// the two the job owner adds).
-pub(crate) enum QueryJobOpen<'a> {
-    Job(DirectQueryJob<'a>),
+pub(crate) enum QueryJobOpen {
+    Job(DirectQueryJob),
     /// Not ready at this generation, or the generation moved while the
     /// snapshot was being pinned. Nothing is wrong with the projection;
     /// `ProjectionProgress` decides whether readiness is on its way.
@@ -601,7 +603,7 @@ impl DirectProjection {
             ready_generation: AtomicU64::new(0),
             reader: Mutex::new(None),
             statement_seam: Mutex::new(None),
-            query_jobs: QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY),
+            query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             fts_ready_at: AtomicU64::new(0),
             fts_ever_ready: AtomicBool::new(false),
@@ -1143,7 +1145,7 @@ impl DirectProjection {
     /// The statement's compiled-regex program is installed by
     /// `query::results::read_results` on the job's own connection — the ONE
     /// install site — so a job carries no regex state of its own.
-    pub(crate) fn open_query_job(&self, cache_generation: u64) -> QueryJobOpen<'_> {
+    pub(crate) fn open_query_job(&self, cache_generation: u64) -> QueryJobOpen {
         if !self.ready_at(cache_generation) {
             return QueryJobOpen::NotReady;
         }
@@ -1155,13 +1157,17 @@ impl DirectProjection {
         {
             return QueryJobOpen::Failed;
         }
-        let slot = match self.shared.query_jobs.acquire() {
-            Admission::Slot(slot) => slot,
-            Admission::Cancelled => return QueryJobOpen::Cancelled,
+        let slot = match self
+            .shared
+            .query_jobs
+            .acquire_owned_at_within(self.shared.query_jobs.capture_epoch(), QUERY_JOB_WAIT)
+        {
+            OwnedAdmission::Slot(slot) => slot,
+            OwnedAdmission::Cancelled => return QueryJobOpen::Cancelled,
             // RET2: capacity, not readiness. The projection is ready and other
             // jobs are draining, so this is the one `NotReady` the public
             // boundary may retry without ever considering a repair.
-            Admission::Busy => return QueryJobOpen::Busy,
+            OwnedAdmission::Busy => return QueryJobOpen::Busy,
         };
         let validate = || {
             if self.ready_at(cache_generation) {
@@ -2802,9 +2808,9 @@ mod tests {
         writer.busy_timeout(Duration::ZERO).unwrap();
         writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE payload(value TEXT); INSERT INTO payload VALUES ('before');").unwrap();
         let snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-        let owner = crate::query_jobs::QueryJobOwner::new(1);
-        let slot = match owner.acquire() {
-            crate::query_jobs::Admission::Slot(slot) => slot,
+        let owner = Arc::new(crate::query_jobs::QueryJobOwner::new(1));
+        let slot = match owner.acquire_owned_at_within(owner.capture_epoch(), QUERY_JOB_WAIT) {
+            crate::query_jobs::OwnedAdmission::Slot(slot) => slot,
             _ => panic!("query admission"),
         };
         assert!(slot.register(snapshot.cancellation()));
@@ -2825,8 +2831,8 @@ mod tests {
         };
         assert_eq!(checkpoint(), 1, "fixture must retain a real WAL snapshot");
         let (releasing, resume) = owner.pause_next_release_for_test();
-        let busy_at_release = std::thread::scope(|scope| {
-            let dropper = scope.spawn(move || drop(job));
+        let busy_at_release = {
+            let dropper = std::thread::spawn(move || drop(job));
             releasing.recv_timeout(Duration::from_secs(3)).unwrap();
             let busy = checkpoint();
             // Resume before asserting: the old declaration order must fail,
@@ -2834,7 +2840,7 @@ mod tests {
             resume.send(()).unwrap();
             dropper.join().unwrap();
             busy
-        });
+        };
         assert_eq!(owner.active(), 0);
         drop(writer);
         let _ = std::fs::remove_file(path);
@@ -5780,7 +5786,7 @@ mod tests {
             ready_generation: AtomicU64::new(0),
             reader: Mutex::new(None),
             statement_seam: Mutex::new(None),
-            query_jobs: QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY),
+            query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             fts_ready_at: AtomicU64::new(0),
             fts_ever_ready: AtomicBool::new(false),
