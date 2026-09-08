@@ -76,6 +76,10 @@ import { dismissOnOutsidePointer, registerTransientLayer } from "../transientLay
 
 export type { RegistryAccess };
 
+export type QueryBuilderChange =
+  | ((next: BuilderSession) => void)
+  | ((next: BuilderSession) => Promise<boolean>);
+
 /** One landed registry read, tagged with the graph scope and declaration
  *  revision it answers — and carrying either the snapshot or the terminal
  *  failure that replaced it. Both are scoped, so neither can be published for a
@@ -818,7 +822,7 @@ export function QueryBuilder(props: {
   session: () => BuilderSession | undefined;
   /** Persist an edit. Row edits call this immediately (each one is a complete,
    *  valid IR); the pane calls it only when the user saves a parse. */
-  onChange: (next: BuilderSession) => void;
+  onChange: QueryBuilderChange;
   /** The text pane's language: `tql` for a query block, `og` for the workspace,
    *  which materializes OG text. */
   paneDialect?: Extract<QueryPrintDialect, "og" | "tql">;
@@ -1037,8 +1041,9 @@ export function QueryBuilder(props: {
     const current = session();
     if (!current) return;
     invalidateAnchorPreview();
-    props.onChange({ query: { ...current.query, filter: next }, view: current.view });
+    const outcome = props.onChange({ query: { ...current.query, filter: next }, view: current.view });
     setOpenMenu(null);
+    return outcome;
   };
   const applyView = (next: ViewSettings) => {
     const current = session();

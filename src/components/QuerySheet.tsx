@@ -989,7 +989,7 @@ export interface QuerySheetProps {
   root: () => Filter;
   /** The whole query, for the diagnostics a red row shows. */
   query: () => Query | undefined;
-  apply: (next: Filter) => void;
+  apply: (next: Filter) => void | Promise<boolean>;
   registry: RegistryAccess;
   /** Open and focus the query text pane — the route the `⟨advanced⟩` control
    *  takes, and the route a row that cannot be edited here always has (§7.4). */
@@ -1026,6 +1026,78 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
   const [selection, setSelection] = createSignal<SheetSelection | null>(null);
   const [dropTarget, setDropTarget] = createSignal<QuerySheetDropTarget | null>(null);
   let sheetEl: HTMLDivElement | undefined;
+  let reorderFocusGeneration = 0;
+  let reorderFocusIntent: {
+    generation: number;
+    anchor: Anchor;
+    sourceRoot: Filter;
+    expectedRoot: string;
+    target: number[];
+    origin: HTMLElement | null;
+    saved: boolean;
+    scheduled: boolean;
+  } | null = null;
+
+  // A successful save is re-parsed into fresh objects. Raw spans name source
+  // positions rather than filter meaning, so they do not identify the revision
+  // whose rendered rows should receive this one move's focus.
+  const reorderRootRevision = (filter: Filter): string =>
+    JSON.stringify(filter, (key, value) => key === "span" ? undefined : value);
+  const cancelReorderFocus = () => {
+    reorderFocusGeneration += 1;
+    reorderFocusIntent = null;
+  };
+  const handleFocusChange = (event: FocusEvent) => {
+    const intent = reorderFocusIntent;
+    if (!intent || event.target === intent.origin) return;
+    cancelReorderFocus();
+  };
+  const restoreReorderFocus = (
+    intent: NonNullable<typeof reorderFocusIntent>,
+    immediate = false,
+  ) => {
+    if (reorderFocusIntent !== intent || reorderFocusGeneration !== intent.generation) return;
+    const root = props.root();
+    if (props.anchor() !== intent.anchor) {
+      cancelReorderFocus();
+      return;
+    }
+    if (root === intent.sourceRoot) return;
+    if (reorderRootRevision(root) !== intent.expectedRoot) {
+      cancelReorderFocus();
+      return;
+    }
+    // A matching tree can arrive from outside while this save is pending. Its
+    // later stale-write refusal must cancel the intent, not let that tree steal
+    // focus. Both the accepted write and its freshly rendered root are needed.
+    if (!intent.saved || intent.scheduled) return;
+    const focus = () => {
+      if (reorderFocusIntent !== intent || reorderFocusGeneration !== intent.generation) return;
+      const renderedRoot = props.root();
+      if (
+        props.anchor() !== intent.anchor
+        || renderedRoot === intent.sourceRoot
+        || reorderRootRevision(renderedRoot) !== intent.expectedRoot
+      ) {
+        cancelReorderFocus();
+        return;
+      }
+      const active = document.activeElement;
+      if (active !== intent.origin && active !== document.body) {
+        cancelReorderFocus();
+        return;
+      }
+      const target = sheetEl?.querySelector<HTMLElement>(
+        `[data-qs-handle="${locKey(intent.target)}"]`,
+      ) ?? null;
+      reorderFocusIntent = null;
+      target?.focus();
+    };
+    intent.scheduled = true;
+    if (immediate) focus();
+    else queueMicrotask(focus);
+  };
+  onMount(() => document.addEventListener("focusin", handleFocusChange, true));
 
   /** **A loc is a path into a ROOT REVISION, not a node's identity.**
    *
@@ -1042,19 +1114,17 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
     props.anchor();
     setSelection(null);
     cancelQuerySheetReorder();
+    const intent = reorderFocusIntent;
+    if (!intent) return;
+    // Effects observe the new root before Solid has necessarily reconciled its
+    // keyed rows. One microtask targets the committed DOM, without polling.
+    restoreReorderFocus(intent);
   });
-  onCleanup(() => cancelQuerySheetReorder());
-
-  /** Put the keyboard back on the control that just moved. The row list is
-   *  rebuilt from the new tree, so the button the user was on is a different
-   *  element at a different place; without this a second Down press would have
-   *  nothing to act on. */
-  const refocusHandle = (loc: number[]) => {
-    const find = () => sheetEl?.querySelector<HTMLElement>(`[data-qs-handle="${locKey(loc)}"]`) ?? null;
-    const now = find();
-    if (now) now.focus();
-    else queueMicrotask(() => find()?.focus());
-  };
+  onCleanup(() => {
+    document.removeEventListener("focusin", handleFocusChange, true);
+    cancelReorderFocus();
+    cancelQuerySheetReorder();
+  });
 
   const controls: SheetControls = {
     selection,
@@ -1090,8 +1160,45 @@ export function QuerySheet(props: QuerySheetProps): JSX.Element {
       // path, and an unchanged tree is not an edit: a save at the end of a list
       // would put an undo step on the stack that undoes nothing.
       if (next === root) return;
-      props.apply(next);
-      refocusHandle([...pos.parentLoc, to]);
+      const source = [...pos.parentLoc, pos.index];
+      const origin = sheetEl?.querySelector<HTMLElement>(
+        `[data-qs-handle="${locKey(source)}"]`,
+      ) ?? null;
+      const intent = {
+        generation: ++reorderFocusGeneration,
+        anchor: props.anchor(),
+        sourceRoot: root,
+        expectedRoot: reorderRootRevision(next),
+        target: [...pos.parentLoc, to],
+        origin: document.activeElement === origin ? origin : null,
+        saved: false,
+        scheduled: false,
+      };
+      reorderFocusIntent = intent;
+      let outcome: void | Promise<boolean>;
+      try {
+        outcome = props.apply(next);
+      } catch (error) {
+        cancelReorderFocus();
+        throw error;
+      }
+      if (outcome instanceof Promise) {
+        void outcome.then((saved) => {
+          if (reorderFocusIntent !== intent) return;
+          if (!saved) cancelReorderFocus();
+          else {
+            intent.saved = true;
+            restoreReorderFocus(intent);
+          }
+        }, () => {
+          if (reorderFocusIntent === intent) cancelReorderFocus();
+        });
+      } else {
+        // Controlled builders publish synchronously. Preserve their immediate
+        // keyboard contract while the native path waits for both save and parse.
+        intent.saved = true;
+        restoreReorderFocus(intent, true);
+      }
     },
     startDrag: (event, pos) => {
       const root = props.root();

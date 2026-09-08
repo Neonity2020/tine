@@ -473,15 +473,15 @@ export function QueryMacro(props: {
   // text carried have no home in TQL, so they are written to the block's `tine.*`
   // properties in the SAME undo unit (§4.3 Y2) — otherwise the crossed block
   // would re-parse without its sort, sample, grouping or aggregate.
-  const applyEdit = async (next: BuilderSession) => {
-    if (!props.blockId) return;
-    const rawAtStart = doc.byId[props.blockId]?.raw;
+  const applyEdit = async (next: BuilderSession): Promise<boolean> => {
+    if (!props.blockId || !doc.byId[props.blockId]) return false;
+    const rawAtStart = doc.byId[props.blockId].raw;
     const epochAtStart = graphEpoch();
     const request = parseRequest();
     const baseline = parsedSnapshot.latest;
     if (baseline && (baseline.request.argument !== request.argument || baseline.request.name !== request.name)) {
       setPrintError("The query text changed. Wait for it to refresh, then try this edit again.");
-      return;
+      return false;
     }
     if (baseline && JSON.stringify(baseline.request.properties) !== JSON.stringify(request.properties)) {
       // Rebase only because the reading predates a property edit. The ordinary
@@ -502,7 +502,7 @@ export function QueryMacro(props: {
         next = { ...next, view: rebased };
       } catch (error) {
         setPrintError(errorText(error));
-        return;
+        return false;
       }
     }
     const current = macroName();
@@ -511,7 +511,7 @@ export function QueryMacro(props: {
       expressible = await backend().queryOgExpressible(next.query, next.view);
     } catch (error) {
       setPrintError(errorText(error));
-      return;
+      return false;
     }
     const crossing = !expressible && current.toLowerCase() !== "tine-query";
     let name = expressible ? current : QUERY_MACRO_NAMES[1];
@@ -529,16 +529,16 @@ export function QueryMacro(props: {
           argument = await backend().printQuery(next.query, next.view, dialect);
         } catch (second) {
           setPrintError(errorText(second));
-          return;
+          return false;
         }
       } else {
         setPrintError(errorText(error));
-        return;
+        return false;
       }
     }
     if (graphEpoch() !== epochAtStart || doc.byId[props.blockId]?.raw !== rawAtStart) {
       setPrintError("The block changed while saving. Try this edit again.");
-      return;
+      return false;
     }
     setPrintError(null);
     // **What the notice can show comes from the ENGINE, or from nothing.**
@@ -557,24 +557,27 @@ export function QueryMacro(props: {
     // manufacture evidence the save path did not need.
     const changed = crossing ? boundedFeature(argument) : null;
     const node = doc.byId[props.blockId];
+    let wrote = false;
     const write = () => {
       rewriteMacro(`{{${name} ${argument}}}`);
       writeViewProperties(next.view);
+      wrote = true;
     };
     // ONE undo unit for the whole save, under both macro names (§4.3 directive
     // migration). The tag is what the §7.5 notice's [Undo that change] button
     // recognises, so only a CROSSING save carries the crossing tag.
-    if (node) {
-      withUndoUnit(
-        crossing ? `query:cross:${props.blockId}` : `query:save:${props.blockId}`,
-        [node.page],
-        write,
-      );
-    } else write();
+    if (!node) return false;
+    withUndoUnit(
+      crossing ? `query:cross:${props.blockId}` : `query:save:${props.blockId}`,
+      [node.page],
+      write,
+    );
+    if (!wrote) return false;
     // The notice is the user half of the crossing (§7.5): the bytes changed
     // under the user without asking, so say so and offer the way back.
     if (crossing && node) setCrossed(props.blockId, changed);
     rememberDisplay(next.view);
+    return true;
   };
   /** **The view lives in the block's `tine.*` properties (§7.6), for BOTH macro
    *  names (§4.3 "Directive migration", Q15).**
@@ -1361,7 +1364,7 @@ export function QueryMacro(props: {
             <Show when={showBuilder()}>
               <QueryBuilder
                 session={builderSession}
-                onChange={(next) => void applyEdit(next)}
+                onChange={applyEdit}
                 paneDialect="tql"
                 blockId={props.blockId}
                 total={<span class="query-count">{total()}</span>}

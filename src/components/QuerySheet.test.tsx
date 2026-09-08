@@ -524,6 +524,54 @@ describe("reordering: the drag and the keyboard reach the same tree", () => {
     }
   });
 
+  it("drops pending focus when the anchor changes but the root object does not", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const initial = session(start());
+    const [current, setCurrent] = createSignal<BuilderSession>(initial);
+    let submitted: BuilderSession | undefined;
+    let finish!: (saved: boolean) => void;
+    const save = new Promise<boolean>((resolve) => { finish = resolve; });
+    const dispose = render(
+      () => (
+        <QueryBuilder
+          session={current}
+          onChange={(next) => {
+            submitted = next;
+            return save;
+          }}
+        />
+      ),
+      host,
+    );
+
+    try {
+      host.querySelector<HTMLButtonElement>(".qs-gear")!.click();
+      const sheet = document.querySelector<HTMLElement>(".qs-sheet")!;
+      const sourceRoot = current().query.filter;
+      const handle = rootItems(sheet)[0]!.querySelector<HTMLElement>(".qs-drag-handle")!;
+      handle.focus();
+      arrow(handle, "ArrowDown");
+      if (!submitted) throw new Error("the deferred reorder was not submitted");
+
+      // The anchor effect must invalidate the path even though the filter still
+      // has the exact source object identity. Returning to the old anchor before
+      // the save resolves must not resurrect that discarded intent.
+      setCurrent({ ...initial, query: { ...initial.query, anchor: "page" } });
+      expect(current().query.filter).toBe(sourceRoot);
+      await Promise.resolve();
+      setCurrent({ ...submitted, query: { ...submitted.query, anchor: "block" } });
+      finish(true);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect((document.activeElement as HTMLElement).dataset.qsHandle).not.toBe("1");
+    } finally {
+      dispose();
+    }
+  });
+
   it("saves nothing at the boundary of the list", () => {
     const builder = mountBuilder(start());
     try {
