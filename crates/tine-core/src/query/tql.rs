@@ -256,6 +256,7 @@ fn report_stray_anchor(
 enum Prev {
     Start,
     Cmp,
+    Boolean,
     Open,
     Comma,
     Other,
@@ -267,13 +268,16 @@ fn desugar(text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut prev = Prev::Start;
-    // One entry per open paren: whether it is the list of an `in`.
-    let mut parens: Vec<bool> = Vec::new();
+    // One entry per open paren: whether it is the list of an `in`, and
+    // whether the pre-pass inserted an outer paren around a quantifier call.
+    let mut parens: Vec<(bool, bool)> = Vec::new();
     let mut pending_in = false;
+    let mut pending_quantifier = false;
     let mut i = 0usize;
     while i < bytes.len() {
         let value_position = prev == Prev::Cmp
-            || (matches!(prev, Prev::Open | Prev::Comma) && parens.last() == Some(&true));
+            || (matches!(prev, Prev::Open | Prev::Comma)
+                && parens.last().is_some_and(|(in_list, _)| *in_list));
         match bytes[i] {
             b' ' | b'\t' | b'\r' | b'\n' => {
                 out.push(bytes[i] as char);
@@ -283,6 +287,24 @@ fn desugar(text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
                 let end = literal_end(text, i);
                 out.push_str(&text[i..end]);
                 prev = Prev::Other;
+                i = end;
+            }
+            b'"' => {
+                let end = double_quoted_end(text, i);
+                out.push_str(&text[i..end]);
+                prev = Prev::Other;
+                i = end;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                let end = text[i..].find('\n').map_or(bytes.len(), |at| i + at);
+                out.push_str(&text[i..end]);
+                i = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let end = text[i + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |at| i + 2 + at + 2);
+                out.push_str(&text[i..end]);
                 i = end;
             }
             b'[' if text[i..].starts_with("[[") => {
@@ -321,15 +343,19 @@ fn desugar(text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
                 i = end;
             }
             b'(' => {
-                parens.push(pending_in);
+                parens.push((pending_in, pending_quantifier));
                 pending_in = false;
+                pending_quantifier = false;
                 out.push('(');
                 prev = Prev::Open;
                 i += 1;
             }
             b')' => {
-                parens.pop();
+                let wrapped_quantifier = parens.pop().is_some_and(|(_, wrapped)| wrapped);
                 out.push(')');
+                if wrapped_quantifier {
+                    out.push(')');
+                }
                 prev = Prev::Other;
                 i += 1;
             }
@@ -354,6 +380,17 @@ fn desugar(text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
                     i += 1;
                 }
                 let word = &text[start..i];
+                let next = next_code_byte(text, i);
+                pending_quantifier = prev == Prev::Boolean
+                    && word.eq_ignore_ascii_case("any")
+                    && next.is_some_and(|at| bytes.get(at) == Some(&b'('));
+                // sqlparser treats `ANY` after a boolean operator as SQL's
+                // reserved quantified-comparison operator. An extra expression
+                // boundary makes the same token unambiguously the TQL function;
+                // the matching close is emitted by the paren frame above.
+                if pending_quantifier {
+                    out.push('(');
+                }
                 out.push_str(word);
                 pending_in = word.eq_ignore_ascii_case("in");
                 // The word-spelled comparison operators put the next token in
@@ -363,6 +400,8 @@ fn desugar(text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
                     .any(|op| word.eq_ignore_ascii_case(op))
                 {
                     Prev::Cmp
+                } else if word.eq_ignore_ascii_case("and") || word.eq_ignore_ascii_case("or") {
+                    Prev::Boolean
                 } else {
                     Prev::Other
                 };
@@ -376,6 +415,48 @@ fn desugar(text: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
         }
     }
     out
+}
+
+/// Next non-comment token byte. Quantifier calls remain calls when SQL comments
+/// separate their name and argument list, and comment payload is never scanned.
+fn next_code_byte(text: &str, mut at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    loop {
+        while bytes.get(at).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            at += 1;
+        }
+        if bytes.get(at) == Some(&b'-') && bytes.get(at + 1) == Some(&b'-') {
+            at = text[at..]
+                .find('\n')
+                .map_or(bytes.len(), |end| at + end + 1);
+            continue;
+        }
+        if bytes.get(at) == Some(&b'/') && bytes.get(at + 1) == Some(&b'*') {
+            at = text[at + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |end| at + 2 + end + 2);
+            continue;
+        }
+        return (at < bytes.len()).then_some(at);
+    }
+}
+
+/// End offset for a double-quoted SQL token, including doubled quotes. The
+/// pre-pass must not recognize a quantifier name inside quoted text.
+fn double_quoted_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if bytes.get(i + 1) == Some(&b'"') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 fn emit_page_name(out: &mut String, inner: &str, value_position: bool) {
@@ -1761,6 +1842,33 @@ mod tests {
     // -- §4.2.2 probe set ---------------------------------------------------
 
     #[test]
+    fn quantifier_disambiguation_ignores_quoted_text_and_comments() {
+        let source = "content = 'any(children, true)' and content = \"every(children, true)\" -- none(children, true)\nor any(children, true)";
+        let rewritten = desugar(source, &mut Vec::new());
+        assert_eq!(
+            rewritten,
+            "content = 'any(children, true)' and content = \"every(children, true)\" -- none(children, true)\nor (any(children, true))"
+        );
+        assert_eq!(
+            desugar(
+                "content like '%x%' and any /* any in a comment */ (children, true)",
+                &mut Vec::new(),
+            ),
+            "content like '%x%' and (any /* any in a comment */ (children, true))"
+        );
+
+        let mut diagnostics = Vec::new();
+        let unchanged = pre_pass("content = 'any(children, true)'", &mut diagnostics);
+        assert_eq!(unchanged.offset, Some(0));
+        let rewritten = pre_pass(
+            "content like '%x%' and any(children, true)",
+            &mut diagnostics,
+        );
+        assert_eq!(rewritten.offset, None);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn probe_anchor_alone_is_every_row_of_the_anchor() {
         let query = parse("@block");
         assert_eq!(query.anchor, Anchor::Block);
@@ -1815,6 +1923,52 @@ mod tests {
                 gamma(),
                 delta(),
             ]),
+        );
+    }
+
+    #[test]
+    fn quantifier_calls_after_boolean_operators_keep_their_exact_ir() {
+        for (name, quant) in [
+            ("any", Quant::Any),
+            ("every", Quant::Every),
+            ("none", Quant::None),
+        ] {
+            let relation = || Filter::rel(Rel::Children, quant, Filter::page_ref("x"));
+            assert_eq!(
+                ok(&format!(
+                    "content like '%before%' and {name}(children, ref('x'))"
+                )),
+                Filter::and(vec![content("%before%"), relation()]),
+                "{name} after and",
+            );
+            assert_eq!(
+                ok(&format!(
+                    "content like '%before%' or {name}(children, ref('x'))"
+                )),
+                Filter::or(vec![content("%before%"), relation()]),
+                "{name} after or",
+            );
+        }
+
+        let query = parse(
+            "@page and any(blocks, content like '%parent owns%' and any(children, ref('ParentOwn')))",
+        );
+        assert!(
+            !query.is_invalid(),
+            "valid nested PageBlocks query: {:?}",
+            query.diagnostics
+        );
+        assert_eq!(query.anchor, Anchor::Page);
+        assert_eq!(
+            query.filter,
+            Filter::rel(
+                Rel::Blocks,
+                Quant::Any,
+                Filter::and(vec![
+                    content("%parent owns%"),
+                    Filter::rel(Rel::Children, Quant::Any, Filter::page_ref("ParentOwn")),
+                ]),
+            )
         );
     }
 
