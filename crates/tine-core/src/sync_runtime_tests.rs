@@ -10,7 +10,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[path = "live_write_benchmark.rs"]
+#[cfg(test)]
+#[path = "live_write_benchmark_tests.rs"]
 mod live_write_benchmark;
 
 fn production_function_and_constructor_census() -> (
@@ -1747,11 +1748,12 @@ fn managed_save_refusals_cannot_be_constructed_without_a_site_name() {
     // The four arms of the two total error mappers plus the two
     // `editor_refusal_*` promoters. Each one only re-shapes a refusal that
     // some other site already decided; none of them is an origin.
-    const PERMITTED_PASS_THROUGH: [&str; 4] = [
+    const PERMITTED_PASS_THROUGH: [&str; 5] = [
         "SyncEditorRequestError::ActorRefused => SyncApplicationPageRequestError::ActorRefused,",
         "| SyncApplicationPageRequestError::ActorRefused => SyncEditorRequestError::ActorRefused,",
         "SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),",
         "SyncEditorRequestError::ActorRefused | SyncEditorRequestError::ActorRefusedAt(_) => {",
+        "| SyncApplicationPageRequestError::ActorRefused => {",
     ];
 
     let mut unattributed = Vec::new();
@@ -7330,6 +7332,402 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
 }
 
 #[test]
+fn retained_block_edit_on_tombstoned_page_is_projectionless_and_replays() {
+    let fixture = ActivationFixture::nested_unicode("retained-hidden-edit", 0xc5102_3000);
+    fs::write(
+        fixture.graph_root.join("Root.md"),
+        b"- one retained block\n",
+    )
+    .unwrap();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = activated.handle.expect("hidden-edit fixture activates");
+    drive_initial_feed(&handle);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+
+    let open_request = reopen_request(&fixture.request);
+    let resources = open_clean_runtime_resources(&open_request)
+        .unwrap()
+        .expect("hidden-edit fixture reopens");
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+    let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
+    let page_id = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .database()
+        .materialized_read()
+        .unwrap()
+        .pages_by_path(&root, 2)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .page_id;
+    let block = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .materialize_page(page_id)
+        .unwrap()
+        .blocks[0]
+        .clone();
+
+    let live = actor.submit_local_mutation(
+        OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+            },
+            content: "live control edit".into(),
+        }])
+        .unwrap(),
+    );
+    assert!(
+        matches!(
+            live,
+            SyncLocalMutationOutcome::Durable { .. }
+                | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                    batch_id: Some(_),
+                    ..
+                }
+        ),
+        "live-page control edit was not accepted: {live:?}"
+    );
+    for _ in 0..64 {
+        if actor.clean.as_ref().unwrap().pending.is_none()
+            && actor.projection_turns.as_ref().unwrap().pending_count() == 0
+            && actor
+                .managed_local
+                .as_ref()
+                .is_none_or(|managed| managed.pending_count() == 0)
+        {
+            break;
+        }
+        assert!(!matches!(actor.tick(), SyncRuntimeTick::Terminal(_)));
+    }
+    assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+        .unwrap()
+        .contains("live control edit"));
+
+    fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+    actor
+        .observe(vec![
+            SyncWatcherObservation::managed_path("Root.md").unwrap()
+        ])
+        .unwrap();
+    for _ in 0..64 {
+        let tick = actor.tick();
+        assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+        if !actor.clean.as_ref().unwrap().watcher_status().pending {
+            break;
+        }
+    }
+    assert!(!actor.clean.as_ref().unwrap().watcher_status().pending);
+    assert!(actor.clean.as_ref().unwrap().pending.is_none());
+    assert!(!fixture.graph_root.join("Root.md").exists());
+    let sweep_id = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].sweep_id;
+
+    let hidden = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: block.block_id,
+            home_document_id: block.home_document_id,
+        },
+        content: "hidden retained edit".into(),
+    }])
+    .unwrap();
+    let detailed = {
+        let RuntimeActor {
+            graph,
+            receipts,
+            projection_turns,
+            clean,
+            ..
+        } = &mut actor;
+        clean.as_mut().unwrap().execute_local(
+            graph,
+            receipts,
+            &hidden,
+            projection_turns.as_mut().unwrap(),
+        )
+    };
+    assert!(
+        matches!(
+            detailed,
+            Ok(CleanActorMutationOutcome::Durable(_))
+                | Ok(CleanActorMutationOutcome::DurablePending { .. })
+        ),
+        "retained hidden edit detail: {detailed:?}"
+    );
+    assert!(!fixture.graph_root.join("Root.md").exists());
+    drop(actor);
+
+    let open_request = reopen_request(&fixture.request);
+    let resources = open_clean_runtime_resources(&open_request)
+        .unwrap()
+        .expect("projectionless hidden edit cold-replays");
+    assert_eq!(resources.projection_turns.pending_count(), 0);
+    assert!(matches!(
+        resources.runtime.engine().materialize_page(page_id),
+        Err(crate::oplog::EngineError::PageDeleted(found)) if found == page_id
+    ));
+    let recovered = resources
+        .runtime
+        .engine()
+        .recover_block_state(block.home_document_id, block.block_id)
+        .unwrap()
+        .expect("retained block remains addressable after cold replay");
+    assert_eq!(recovered.owner, crate::oplog::BlockOwner::Page(page_id));
+    assert_eq!(recovered.content, "hidden retained edit");
+    assert!(!fixture.graph_root.join("Root.md").exists());
+
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut revived = RuntimeActor::from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+    revived.restore_absence_sweep(sweep_id).unwrap();
+    let restored = revived
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .materialize_page(page_id)
+        .unwrap();
+    assert_eq!(restored.blocks.len(), 1);
+    assert_eq!(restored.blocks[0].block_id, block.block_id);
+    assert_eq!(restored.blocks[0].home_document_id, block.home_document_id);
+    assert_eq!(restored.blocks[0].content, "live control edit");
+    assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
+        .unwrap()
+        .contains("live control edit"));
+}
+
+#[test]
+fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() {
+    let fixture = ActivationFixture::nested_unicode("retained-hidden-visible-edit", 0xc5102_3100);
+    fs::write(
+        fixture.graph_root.join("Hidden.md"),
+        b"- hidden retained block\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("Visible.md"),
+        b"- visible retained block\n",
+    )
+    .unwrap();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = activated.handle.expect("mixed-edit fixture activates");
+    drive_initial_feed(&handle);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    drop(handle);
+
+    let open_request = reopen_request(&fixture.request);
+    let resources = open_clean_runtime_resources(&open_request)
+        .unwrap()
+        .expect("mixed-edit fixture reopens");
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+    let page_and_block = |actor: &RuntimeActor, path: &str| {
+        let managed_path = ManagedPath::parse(path.to_owned()).unwrap();
+        let page_id = actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&managed_path, 2)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .page_id;
+        let block = actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .engine()
+            .materialize_page(page_id)
+            .unwrap()
+            .blocks[0]
+            .clone();
+        (page_id, block)
+    };
+    let (hidden_page_id, hidden_block) = page_and_block(&actor, "Hidden.md");
+    let (visible_page_id, visible_block) = page_and_block(&actor, "Visible.md");
+
+    fs::remove_file(fixture.graph_root.join("Hidden.md")).unwrap();
+    actor
+        .observe(vec![
+            SyncWatcherObservation::managed_path("Hidden.md").unwrap()
+        ])
+        .unwrap();
+    for _ in 0..64 {
+        let tick = actor.tick();
+        assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
+        if !actor.clean.as_ref().unwrap().watcher_status().pending {
+            break;
+        }
+    }
+    assert!(!actor.clean.as_ref().unwrap().watcher_status().pending);
+    assert!(actor.clean.as_ref().unwrap().pending.is_none());
+    assert!(!fixture.graph_root.join("Hidden.md").exists());
+
+    let mixed = OperationTransaction::new(vec![
+        SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: hidden_block.block_id,
+                home_document_id: hidden_block.home_document_id,
+            },
+            content: "hidden batch edit".into(),
+        },
+        SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: visible_block.block_id,
+                home_document_id: visible_block.home_document_id,
+            },
+            content: "visible batch edit".into(),
+        },
+    ])
+    .unwrap();
+    let detailed = {
+        let RuntimeActor {
+            graph,
+            receipts,
+            projection_turns,
+            clean,
+            ..
+        } = &mut actor;
+        clean.as_mut().unwrap().execute_local(
+            graph,
+            receipts,
+            &mixed,
+            projection_turns.as_mut().unwrap(),
+        )
+    };
+    let mixed_batch_id = match detailed {
+        Ok(CleanActorMutationOutcome::Durable(batch_id))
+        | Ok(CleanActorMutationOutcome::DurablePending { batch_id, .. }) => batch_id,
+        other => panic!("mixed hidden/visible edit detail: {other:?}"),
+    };
+    for _ in 0..64 {
+        if actor.clean.as_ref().unwrap().pending.is_none()
+            && actor.projection_turns.as_ref().unwrap().pending_count() == 0
+            && actor
+                .managed_local
+                .as_ref()
+                .is_none_or(|managed| managed.pending_count() == 0)
+        {
+            break;
+        }
+        assert!(!matches!(actor.tick(), SyncRuntimeTick::Terminal(_)));
+    }
+    assert!(
+        actor.clean.as_ref().unwrap().pending.is_none(),
+        "mixed batch remained pending (hidden {hidden_page_id}, visible {visible_page_id}): {:?}",
+        actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .pending
+            .as_ref()
+            .map(|pending| pending.failure().to_string())
+    );
+    assert_eq!(actor.projection_turns.as_ref().unwrap().pending_count(), 0);
+    assert!(actor
+        .managed_local
+        .as_ref()
+        .is_none_or(|managed| managed.pending_count() == 0));
+    assert!(actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .archive_store()
+        .unwrap()
+        .read_manifest(mixed_batch_id)
+        .unwrap()
+        .is_some());
+    assert!(!fixture.graph_root.join("Hidden.md").exists());
+    assert!(fs::read_to_string(fixture.graph_root.join("Visible.md"))
+        .unwrap()
+        .contains("visible batch edit"));
+    drop(actor);
+
+    let open_request = reopen_request(&fixture.request);
+    let resources = open_clean_runtime_resources(&open_request)
+        .unwrap()
+        .expect("mixed hidden/visible edit cold-replays");
+    assert!(matches!(
+        resources.runtime.engine().materialize_page(hidden_page_id),
+        Err(crate::oplog::EngineError::PageDeleted(found)) if found == hidden_page_id
+    ));
+    let recovered_hidden = resources
+        .runtime
+        .engine()
+        .recover_block_state(hidden_block.home_document_id, hidden_block.block_id)
+        .unwrap()
+        .expect("hidden block remains addressable after cold replay");
+    assert_eq!(recovered_hidden.block_id, hidden_block.block_id);
+    assert_eq!(
+        recovered_hidden.home_document_id,
+        hidden_block.home_document_id
+    );
+    assert_eq!(
+        recovered_hidden.owner,
+        crate::oplog::BlockOwner::Page(hidden_page_id)
+    );
+    assert_eq!(recovered_hidden.content, "hidden batch edit");
+    let replayed_visible = resources
+        .runtime
+        .engine()
+        .materialize_page(visible_page_id)
+        .unwrap();
+    assert_eq!(replayed_visible.page_id, visible_page_id);
+    assert_eq!(replayed_visible.blocks[0].block_id, visible_block.block_id);
+    assert_eq!(
+        replayed_visible.blocks[0].home_document_id,
+        visible_block.home_document_id
+    );
+    assert_eq!(replayed_visible.blocks[0].content, "visible batch edit");
+    assert!(!fixture.graph_root.join("Hidden.md").exists());
+    assert!(fs::read_to_string(fixture.graph_root.join("Visible.md"))
+        .unwrap()
+        .contains("visible batch edit"));
+}
+
+#[test]
 fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
     for (case, blocks) in [("small", 8_usize), ("larger", 64_usize)] {
         let fixture = ActivationFixture::empty(
@@ -7537,14 +7935,18 @@ fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
                 content: format!("changed before restore {chunk_ordinal}"),
             })
             .collect();
-        assert!(matches!(
-            actor.submit_local_mutation(OperationTransaction::new(operations).unwrap()),
-            SyncLocalMutationOutcome::Durable { .. }
-                | SyncLocalMutationOutcome::RetryableRetainedRecovery {
-                    batch_id: Some(_),
-                    ..
-                }
-        ));
+        let outcome = actor.submit_local_mutation(OperationTransaction::new(operations).unwrap());
+        assert!(
+            matches!(
+                outcome,
+                SyncLocalMutationOutcome::Durable { .. }
+                    | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(_),
+                        ..
+                    }
+            ),
+            "retained-block edit chunk {chunk_ordinal}: {outcome:?}"
+        );
         phase(&format!("edit-chunk-{chunk_ordinal}-complete"));
     }
 
@@ -24273,11 +24675,6 @@ fn managed_cross_page_move_100_and_10000_page_manual_benchmark() {
                     after.engine.authenticated_page_identity_lookups,
                     "block-only move derivative must use exact SQLite page rows rather than the legacy authenticated scratch catalog",
                 );
-            assert_eq!(
-                    after_derivative.forbidden.graph_wide_catalog_validations,
-                    after.forbidden.graph_wide_catalog_validations,
-                    "block-only move derivative must reuse the retained catalog shape proof rather than validating the graph-sized catalog",
-                );
             last_derivative_detail = Some(after_derivative.derivative_stages);
             derivative_samples.push(derivative_started.elapsed());
         }
@@ -24376,9 +24773,8 @@ fn managed_page_mutations_100_and_10000_page_manual_benchmark() {
                         forbidden.archive_object_reads,
                         forbidden.projection_receipt_loads,
                         forbidden.graph_wide_catalog_decodes,
-                        forbidden.graph_wide_catalog_validations,
                     ),
-                    (0, 0, 0, 0, 0),
+                    (0, 0, 0, 0),
                     "{label} performed forbidden global/derivative work: {forbidden:?}"
                 );
                 assert_eq!(

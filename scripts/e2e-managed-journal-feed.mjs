@@ -453,15 +453,20 @@ try {
   // reproduces the physical key-repeat failure where several page-boundary
   // moves were captured against one stale source page and then flooded errors.
   const dispatched = await browser.execute(async (count, marker) => {
+    const dispatchDeadline = performance.now() + 30_000;
+    let attempted = 0;
     let accepted = 0;
-    for (let index = 0; index < count; index++) {
+    let busyUnhandled = 0;
+    let unexpectedUnhandled = 0;
+    let incoherent = 0;
+    while (accepted < count && performance.now() < dispatchDeadline) {
       // A cross-page render replaces the textarea. Physical key repeat follows
       // the newly focused editor; a synthetic loop that retains the first DOM
       // node silently stops bubbling after that node is detached. Reacquire the
       // live editor, but never wait for the managed actor or durable projection
       // between commands.
       let editor;
-      const deadline = performance.now() + 1_000;
+      const deadline = Math.min(performance.now() + 1_000, dispatchDeadline);
       do {
         editor = [...document.querySelectorAll("textarea.block-editor")]
           .find((candidate) => candidate instanceof HTMLTextAreaElement
@@ -471,14 +476,20 @@ try {
         }
       } while (!(editor instanceof HTMLTextAreaElement) && performance.now() < deadline);
       if (!(editor instanceof HTMLTextAreaElement)) break;
-      editor.dispatchEvent(new KeyboardEvent("keydown", {
+      const page = editor.closest(".page-section");
+      const busy = editor.disabled
+        || editor.matches(":disabled")
+        || editor.closest("[inert]") !== null
+        || page?.getAttribute("aria-busy") === "true";
+      const keydown = new KeyboardEvent("keydown", {
         key: "ArrowDown",
         code: "ArrowDown",
         altKey: true,
         shiftKey: true,
         bubbles: true,
         cancelable: true,
-      }));
+      });
+      const keydownDispatchReturn = editor.dispatchEvent(keydown);
       editor.dispatchEvent(new KeyboardEvent("keyup", {
         key: "ArrowDown",
         code: "ArrowDown",
@@ -487,13 +498,32 @@ try {
         bubbles: true,
         cancelable: true,
       }));
-      accepted++;
+      attempted++;
+      if (keydown.defaultPrevented === !keydownDispatchReturn) {
+        if (keydown.defaultPrevented) accepted++;
+        else if (busy) busyUnhandled++;
+        else unexpectedUnhandled++;
+      } else {
+        incoherent++;
+      }
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    return accepted;
+    return { attempted, accepted, busyUnhandled, unexpectedUnhandled, incoherent };
   }, RAPID_MOVE_COMMANDS, RAPID_MOVE_MARKER);
-  if (dispatched !== RAPID_MOVE_COMMANDS) {
-    throw new Error(`rapid managed move dispatched only ${dispatched}/${RAPID_MOVE_COMMANDS} commands`);
+  receipt.milestones.rapidMultiDayMove = {
+    marker: RAPID_MOVE_MARKER,
+    attemptedCommands: dispatched.attempted,
+    acceptedCommands: dispatched.accepted,
+    busyUnhandledCommands: dispatched.busyUnhandled,
+  };
+  if (dispatched.incoherent) {
+    throw new Error(`rapid managed move observed ${dispatched.incoherent} incoherent keydown dispatch results`);
+  }
+  if (dispatched.unexpectedUnhandled) {
+    throw new Error(`rapid managed move left ${dispatched.unexpectedUnhandled} keydowns unhandled on an enabled, non-inert editor`);
+  }
+  if (dispatched.accepted !== RAPID_MOVE_COMMANDS) {
+    throw new Error(`rapid managed move handler accepted only ${dispatched.accepted}/${RAPID_MOVE_COMMANDS} commands after ${dispatched.attempted} attempts`);
   }
   const rapidDestination = path.join(GRAPH, "journals", `${stem(days[4])}.md`);
   await waitFor(
@@ -517,15 +547,14 @@ try {
   if (rapidErrors.length) {
     throw new Error(`rapid managed move emitted error notifications: ${JSON.stringify(rapidErrors)}`);
   }
-  receipt.milestones.rapidMultiDayMove = {
-    marker: RAPID_MOVE_MARKER,
+  Object.assign(receipt.milestones.rapidMultiDayMove, {
     commands: RAPID_MOVE_COMMANDS,
     interCommandDelayMs: 5,
     crossedDayBoundaries: 4,
     destinationDayIndex: rapidLocations[0].index,
     elapsedMs: Date.now() - rapidStartedAt,
     errorNotifications: rapidErrors,
-  };
+  });
 
   phase = "bulk-cross-page-cut-paste";
   const bulkStartedAt = Date.now();

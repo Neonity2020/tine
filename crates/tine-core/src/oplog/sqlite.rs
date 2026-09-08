@@ -710,17 +710,17 @@ impl AcceptedBatchEvent {
                 contested_documents.insert(accepted.document_id());
             }
         }
+        let effective =
+            SemanticEffect::decode(&self.effective_semantic_effect).map_err(|error| {
+                ProjectionError::InvalidAcceptedEvent(format!(
+                    "accepted batch {} effective effect cannot be decoded: {error}",
+                    self.batch_id
+                ))
+            })?;
         let mut context = super::sqlite_materialization::EffectValidationContext::linear();
         if !contested_documents.is_empty() {
             let contested_document =
                 |document: DocumentId| contested_documents.contains(&DocumentKey::Entity(document));
-            let effective =
-                SemanticEffect::decode(&self.effective_semantic_effect).map_err(|error| {
-                    ProjectionError::InvalidAcceptedEvent(format!(
-                        "accepted batch {} effective effect cannot be decoded: {error}",
-                        self.batch_id
-                    ))
-                })?;
             for delta in effective.pages() {
                 let document = delta
                     .after
@@ -764,51 +764,94 @@ impl AcceptedBatchEvent {
                     context.contested_pages.insert(page_id);
                 }
             }
-            // Contested pages are validated against the engine's own merged
-            // rendering at this event's accepted root — the same deterministic
-            // authority `materialize_accepted_event` reads — never skipped.
-            if !context.contested_pages.is_empty() {
-                let transitions = effective_transition_index(&self);
-                // An engine that cannot materialize (no archive store or
-                // run-local scratch) constructs the event WITHOUT merged
-                // expectations rather than refusing construction: validation
-                // then refuses any supplied materialization for a contested
-                // page (the defensive arm), which is the correct fail-closed
-                // layer, while paths that never validate a materialization
-                // proceed.
-                let mut materializer =
-                    match engine.accepted_root_materializer(&self.post_frontier_root) {
-                        Ok(materializer) => materializer,
-                        Err(_) => {
-                            self.effect_validation_context = context;
-                            return Ok(self);
-                        }
-                    };
-                for page_id in context.contested_pages.clone() {
-                    match materializer.materialize_page(page_id) {
-                        Ok(Some(mut page)) => {
-                            if let Some(transition) = transitions.get(&page_id) {
-                                transition
-                                    .apply_to_materialized(&mut page)
-                                    .map_err(|error| {
-                                        ProjectionError::Materialization(error.to_string())
-                                    })?;
-                            }
-                            let mut input = materialized_page_input(page);
-                            super::sqlite_materialization::canonicalize_page_blocks(&mut input);
-                            context.merged_replacements.insert(page_id, input);
-                        }
-                        Ok(None) => {
+        }
+        // Bind accepted-root absence for every affected page, and the complete
+        // accepted rendering for contested pages, through the same deterministic
+        // engine materializer used by `materialize_accepted_event`. This is one
+        // bounded per-page working set; no receiver-current SQLite row or second
+        // hidden-state representation participates. An immediately authored
+        // batch reuses its already validated retained outcomes.
+        let affected_pages = super::reference_catalog::affected_reference_sources(&effective);
+        if !affected_pages.is_empty() {
+            let transitions = effective_transition_index(&self);
+            let mut materializer = None;
+            for page_id in affected_pages {
+                let contested = context.contested_pages.contains(&page_id);
+                if !contested {
+                    if let Some(absent) = engine.accepted_author_projection_outcome(
+                        self.batch_id,
+                        self.post_frontier_root.state_digest(),
+                        page_id,
+                        |page| page.is_none(),
+                    ) {
+                        if absent {
                             context.merged_deletions.insert(page_id);
                         }
-                        Err(_) => {
-                            // Same unavailability contract as above: no
-                            // expectations at all, so validation refuses any
-                            // supplied materialization for contested pages.
-                            context.merged_replacements.clear();
-                            context.merged_deletions.clear();
-                            break;
+                        continue;
+                    }
+                }
+                let retained = if contested {
+                    engine.accepted_author_projection_outcome(
+                        self.batch_id,
+                        self.post_frontier_root.state_digest(),
+                        page_id,
+                        |page| page.cloned(),
+                    )
+                } else {
+                    None
+                };
+                let outcome = match retained {
+                    Some(outcome) => Ok(outcome),
+                    None => {
+                        if materializer.is_none() {
+                            materializer =
+                                match engine.accepted_root_materializer(&self.post_frontier_root) {
+                                    Ok(materializer) => Some(materializer),
+                                    Err(_) => {
+                                        context.merged_replacements.clear();
+                                        context.merged_deletions.clear();
+                                        break;
+                                    }
+                                };
                         }
+                        let materializer = materializer
+                            .as_mut()
+                            .expect("accepted materializer was initialized");
+                        if contested {
+                            materializer.materialize_page(page_id)
+                        } else {
+                            match materializer.page_state(page_id) {
+                                Ok(Some(super::PageState::Live { .. })) => continue,
+                                Ok(_) => Ok(None),
+                                Err(error) => Err(error),
+                            }
+                        }
+                    }
+                };
+                match outcome {
+                    Ok(Some(mut page)) if context.contested_pages.contains(&page_id) => {
+                        if let Some(transition) = transitions.get(&page_id) {
+                            transition
+                                .apply_to_materialized(&mut page)
+                                .map_err(|error| {
+                                    ProjectionError::Materialization(error.to_string())
+                                })?;
+                        }
+                        let mut input = materialized_page_input(page);
+                        super::sqlite_materialization::canonicalize_page_blocks(&mut input);
+                        context.merged_replacements.insert(page_id, input);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        context.merged_deletions.insert(page_id);
+                    }
+                    Err(_) => {
+                        // Partial accepted expectations cannot prove complete
+                        // validation. Clearing them preserves the prior
+                        // fail-closed behavior for contested and absent pages.
+                        context.merged_replacements.clear();
+                        context.merged_deletions.clear();
+                        break;
                     }
                 }
             }
@@ -1551,6 +1594,7 @@ fn materialize_accepted_event_with_stats(
             event.batch_id(),
             event.post_frontier_root().state_digest(),
             page_id,
+            |page| page.cloned(),
         );
         let outcome = match retained {
             Some(outcome) => outcome,
@@ -9502,12 +9546,12 @@ mod tests {
         AuthorBatch, BatchCausalDot, BatchDisposition, BatchOrigin, BlockId, BlockLocation,
         CausalPeerId, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentDependencies, DocumentId,
         LogseqIdentityMutation, LogseqUuid, ManagedPath, ManagedTextKind, MaterializationChange,
-        MaterializedBlockInput, MaterializedEntityId, MaterializedPageInput, MaterializedProperty,
-        MaterializedReference, MaterializedReferenceKind, MaterializedReferrerRow,
-        MaterializedTask, OperationBatch, OperationObject, OperationTransaction, PageId,
-        PageRename, PreparedBatch, ProjectionClaim, ProjectionEndpointBinding,
-        ProjectionEndpointId, ProjectionReceiptStore, ReferenceCatalogPolicyV1, SemanticOperation,
-        SessionId,
+        MaterializationError, MaterializedBlockInput, MaterializedEntityId, MaterializedPageInput,
+        MaterializedProperty, MaterializedReference, MaterializedReferenceKind,
+        MaterializedReferrerRow, MaterializedTask, OperationBatch, OperationObject,
+        OperationTransaction, PageId, PageRename, PreparedBatch, ProjectionClaim,
+        ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore,
+        ReferenceCatalogPolicyV1, SemanticOperation, SessionId,
     };
 
     struct TestDir(PathBuf);
@@ -10145,6 +10189,35 @@ mod tests {
             .unwrap(),
         );
         (ids, store, accepted_engine, path)
+    }
+
+    #[test]
+    fn accepted_visible_block_edit_still_refuses_a_missing_sqlite_replacement() {
+        let dir = TestDir::new("visible-missing-sqlite-replacement");
+        let seed = 0xc5102_3400;
+        let (ids, store, mut engine, _) = prepare_crash_case(&dir, seed);
+        let edit = engine
+            .prepare_fixture_transaction(
+                author(seed + 200),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block,
+                        home_document_id: test_block_home(ids.block),
+                    },
+                    content: "visible replacement remains mandatory".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &edit);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, edit.manifest().batch_id()).unwrap();
+        let missing = MaterializationChange::new(event.batch_id(), Vec::new(), Vec::new()).unwrap();
+        assert!(matches!(
+            missing.validate_for_event(&event),
+            Err(MaterializationError::Incomplete(ref detail))
+                if detail.contains("block change") && detail.contains("has no replacement")
+        ));
     }
 
     fn frontier(document_id: DocumentId, counter: u64, heads: Vec<BatchId>) -> FrontierV2 {

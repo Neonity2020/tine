@@ -648,6 +648,7 @@ fn concurrent_same_page_fallback_never_publishes_the_stale_local_draft_as_curren
         local_batch,
         root.state_digest(),
         local_page_id,
+        |page| page.cloned(),
     ) {
         Some(page) => page,
         None => engine

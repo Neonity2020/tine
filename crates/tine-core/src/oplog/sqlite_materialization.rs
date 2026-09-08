@@ -357,7 +357,10 @@ pub struct MaterializationChange {
 /// concurrent batch actually touched that document. Contested pages are not
 /// exempted from validation; they are validated against `merged_*`, the
 /// engine's own deterministic rendering at this event's accepted root,
-/// instead of the authored effect the merge superseded.
+/// instead of the authored effect the merge superseded. The deletion set also
+/// carries accepted-root absence for an uncontested affected page: SQLite has
+/// no visible replacement to compare for such a page, so that existing engine
+/// rendering proves omission is complete rather than a missing replacement.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EffectValidationContext {
     pub(crate) contested_pages: BTreeSet<PageId>,
@@ -682,6 +685,7 @@ impl MaterializationChange {
         let deletions = self.deletions.iter().copied().collect::<BTreeSet<_>>();
         let mut affected = BTreeSet::new();
         let mut required_deletions = BTreeSet::new();
+        let accepted_absent = |page_id: PageId| context.merged_deletions.contains(&page_id);
 
         for delta in effect.pages() {
             affected.insert(delta.page_id);
@@ -731,7 +735,7 @@ impl MaterializationChange {
         }
         for delta in effect.page_preambles() {
             affected.insert(delta.page_id);
-            if !exact(delta.page_id) {
+            if !exact(delta.page_id) || accepted_absent(delta.page_id) {
                 continue;
             }
             let page = replacements.get(&delta.page_id).ok_or_else(|| {
@@ -755,7 +759,10 @@ impl MaterializationChange {
         }
         for delta in effect.memberships() {
             affected.insert(delta.page_id);
-            if !exact(delta.page_id) || required_deletions.contains(&delta.page_id) {
+            if !exact(delta.page_id)
+                || required_deletions.contains(&delta.page_id)
+                || accepted_absent(delta.page_id)
+            {
                 continue;
             }
             let blocks = replacement_blocks.get(&delta.page_id).ok_or_else(|| {
@@ -801,7 +808,8 @@ impl MaterializationChange {
                 continue;
             };
             affected.insert(page_id);
-            if !exact(page_id) || required_deletions.contains(&page_id) {
+            if !exact(page_id) || required_deletions.contains(&page_id) || accepted_absent(page_id)
+            {
                 continue;
             }
             let blocks = replacement_blocks.get(&page_id).ok_or_else(|| {
@@ -884,8 +892,10 @@ impl MaterializationChange {
             )));
         }
         // A contested page's authored deletion polarity is superseded by the
-        // merge: the expected deletion set keeps the authored tombstones of
-        // every uncontested page and takes the merged answer for the rest.
+        // merge. An unchanged absent page has no page delta at all, so the same
+        // accepted-root absence proof supplies its derived deletion. Every
+        // other uncontested deletion remains byte-exact against the authored
+        // tombstone transition.
         let expected_deletions = required_deletions
             .iter()
             .copied()

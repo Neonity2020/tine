@@ -2111,13 +2111,16 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // open, bounded record read, exact preserve/create/replace publications,
     // nofollow lease revalidation and their import. No removals, new codec or
     // additional raw publication path; the directory open is registered above.
-    // Combined query/rebaselining development checkpoint: independently derived
-    // and reviewed the complete 457-row / 494-occurrence surface against both
-    // parents. Query changes add owned read snapshots, bound parameters and
-    // typed failures; retired reader/candidate sites are removed. The 23-row /
-    // 32-occurrence physical write inventory exactly matches rebaselining.
-    // v0.20.0 adds disposable query progress metadata, no authority format.
-    // This census does not qualify the rebaselining development checkpoint.
+    // Reconciled 2026-09-08 by running this scanner over both exact parents and
+    // the merge. The query parent and merge are byte-identical inventories at
+    // 457 rows / 494 occurrences; the accepted P4 parent has 444 / 482. The
+    // merge-minus-P4 multiset is 24 added and 11 removed rows: query snapshots,
+    // registry/export values and typed failures replace retired reader and
+    // lowering sites. The P4 structural delta introduces no further tuple over
+    // the query parent. All three physical-write inventories are byte-identical
+    // at 23 rows / 32 occurrences (digest 0a888e83c0a962b5a86731875d779e27cd0c53cc25b964149965799e7fe35f5e).
+    // The retained v0.20.0 dependency adds disposable query progress metadata,
+    // no authority format. This census does not qualify either parent.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "b5f105f71f286e9df44dafb7e5a5ed40ad75a0a9926c138e35955bb0f6a4e181",
