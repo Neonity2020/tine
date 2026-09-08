@@ -57,7 +57,10 @@ function harness(initial: ViewSettings, rows = ROWS, retainedAggregates?: readon
   const registry: RegistryAccess = {
     rows: () => rows,
     pending: () => false,
+    failure: () => null,
+    unavailable: () => false,
     request: () => {},
+    retry: () => {},
   };
   const mounted = mount(() => (
     <QueryDisplay

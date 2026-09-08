@@ -11,7 +11,7 @@ import {
   type JSX,
 } from "solid-js";
 import { Portal } from "solid-js/web";
-import { backend } from "../backend";
+import { backend, OperationCancelledError, QueryNotReadyError } from "../backend";
 import {
   builderRoot,
   currentAgg,
@@ -35,6 +35,7 @@ import type {
   ParsedQuery,
   Query,
   QueryPrintDialect,
+  RegistrySnapshot,
   RegistryRow,
   Span,
   ViewSettings,
@@ -74,6 +75,17 @@ import { dismissOnOutsidePointer, registerTransientLayer } from "../transientLay
 // footer.
 
 export type { RegistryAccess };
+
+/** One landed registry read, tagged with the graph scope and declaration
+ *  revision it answers — and carrying either the snapshot or the terminal
+ *  failure that replaced it. Both are scoped, so neither can be published for a
+ *  graph or a revision that has since been replaced. */
+interface RegistryRead {
+  scope: string;
+  key: string;
+  snapshot: RegistrySnapshot | null;
+  failure: Error | null;
+}
 
 /** The pair an edit session holds (§4.3.1). `query` carries the anchor, the
  *  filter, the diagnostics and the authored source — including the opaque
@@ -928,38 +940,86 @@ export function QueryBuilder(props: {
   //    save, instead of answering from a debounced document walk. The retry and
   //    its binding/epoch cancellation are `createReadyQueryResource`'s, exactly
   //    as for `query_run`; nothing mode-specific is decided here.
+  //  - **A read that FAILS is an answer the sheet has to give (RET2-UI).**
+  //    A terminal `query-unavailable` used to reject the resource, and the two
+  //    things that happen next are both wrong: `latest` RETHROWS a rejected
+  //    resource, so the field picker threw out of its own render and could not
+  //    be opened at all, and rows stayed `undefined`, which every consumer
+  //    reads as "still reading" — an indexing line that never ends. So a
+  //    terminal failure is captured as a VALUE here, which is what stops the
+  //    automatic retry, and is surfaced through `failure` below.
+  //
+  //    Readiness and cancellation are deliberately NOT captured. Readiness is
+  //    the shared owner's to retry (`runQueryWhenReady`), and a cancellation is
+  //    the ABSENCE of an answer for a superseded request — turning either into
+  //    a value would invent a second retry policy or publish a supersede as a
+  //    result.
   const [registrySnapshot] = createReadyQueryResource(
     () => {
       const key = registryKey();
       return key === undefined ? undefined : { scope: registryScope(), key };
     },
-    async (request) => ({
-      scope: request.scope,
-      key: request.key,
-      snapshot: await sharedQueryResult(
-        request.scope,
-        `query-registry\0${request.key}`,
-        () => backend().queryRegistry(),
-      ),
-    }),
+    async (request): Promise<RegistryRead> => {
+      try {
+        return {
+          scope: request.scope,
+          key: request.key,
+          snapshot: await sharedQueryResult(
+            request.scope,
+            `query-registry\0${request.key}`,
+            () => backend().queryRegistry(),
+          ),
+          failure: null,
+        };
+      } catch (error) {
+        if (error instanceof QueryNotReadyError || error instanceof OperationCancelledError) throw error;
+        return {
+          scope: request.scope,
+          key: request.key,
+          snapshot: null,
+          failure: error instanceof Error ? error : new Error(errorMessage(error)),
+        };
+      }
+    },
   );
-  // A type declaration changes operator semantics: rows are usable only for
-  // the current graph AND revision, including while a refresh is pending.
-  const registryRows = () => {
+  // A type declaration changes operator semantics: an answer is usable only for
+  // the current graph AND revision, including while a refresh is pending — and
+  // that is as true of a failure as of a snapshot, so a stale graph's error can
+  // no more be shown than its rows can.
+  const registryRead = (): RegistryRead | undefined => {
+    // Reading `latest` on an errored resource RETHROWS, which is how a failed
+    // read used to take the field picker's own render with it. Terminal
+    // failures are values above, so the only error left is a superseded
+    // request's cancellation — and both binding bumps (`onGraphRebound`, and
+    // `resetSaveState` behind `graphTransitioning`) re-key this source in the
+    // same synchronous update, so Solid discards that rejection rather than
+    // storing it. This is the net under that, never a state to render: a
+    // cancellation is the absence of an answer, not one.
+    if (registrySnapshot.error !== undefined) return undefined;
     const landed = registrySnapshot.latest;
     return landed && landed.scope === registryScope() && landed.key === registryKey()
-      ? landed.snapshot.rows : undefined;
+      ? landed : undefined;
   };
+  const registryRows = () => registryRead()?.snapshot?.rows;
+  const registryFailure = () => registryRead()?.failure ?? null;
   const registry: RegistryAccess = {
     rows: registryRows,
-    // **Undefined rows have two different meanings, and the UI must not read
+    // **Undefined rows have three different meanings, and the UI must not read
     // the wrong one.** With no sheet open there is deliberately no read at all
-    // (I-13), so `undefined` is "nobody asked". With a sheet open it is "the
-    // answer for THIS graph and THIS declaration revision has not landed" —
-    // and a surface that treats that as a known-empty graph shows a graph with
-    // no properties, or coerces a freshly declared key as text.
-    pending: () => registryKey() !== undefined && registryRows() === undefined,
+    // (I-13), so `undefined` is "nobody asked". With a sheet open it is either
+    // "the answer for THIS graph and THIS declaration revision has not landed"
+    // or "the read for it failed" — and a surface that treats either as a
+    // known-empty graph shows a graph with no properties, or coerces a freshly
+    // declared key as text.
+    pending: () => registryKey() !== undefined && registryRows() === undefined
+      && registryFailure() === null,
+    failure: registryFailure,
+    unavailable: () => registryKey() !== undefined && registryRows() === undefined,
     request: requestQueryRegistryRefresh,
+    // Explicit retry is the SAME owner as the declaration refresh, not a second
+    // one: it re-keys the one shared read, so every open builder recovers from
+    // one request and no builder grows a backoff or a cache of its own.
+    retry: requestQueryRegistryRefresh,
   };
   const suggestions = createMemo(() => suggestedKeys(registry.rows()));
   const vocabulary = () => (registry.rows() ?? []).map((row) => row.normalized_name);

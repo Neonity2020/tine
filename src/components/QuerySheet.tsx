@@ -112,11 +112,25 @@ export { stop, Listbox, type ListboxOption };
  *  declaration was written, re-read", and nothing else. */
 export interface RegistryAccess {
   rows: Accessor<RegistryRow[] | undefined>;
-  /** The read for the current graph/declaration revision is in flight. Every
-   *  edit whose meaning depends on a key's effective type waits for it rather
-   *  than falling back to the untyped `text` family (§6.3). */
+  /** The read for the current graph/declaration revision is in flight — the
+   *  index is indexing, recovering or applying a save, and the shared owner is
+   *  retrying it. This is the state that ENDS on its own. */
   pending: Accessor<boolean>;
+  /** The read for the current graph/declaration revision FAILED terminally.
+   *  Automatic retry has stopped; only `retry()` starts another. Carrying the
+   *  typed error rather than a boolean is what lets the sheet say WHICH failure
+   *  it was instead of inventing prose of its own. */
+  failure: Accessor<Error | null>;
+  /** There is no healthy registry for the current graph/revision — `pending()`
+   *  or `failure()`. Every edit whose meaning depends on a key's effective type
+   *  waits on THIS, not on `pending()` alone: falling back to the untyped
+   *  `text` family is exactly as wrong after a failure as during a read
+   *  (§6.3). */
+  unavailable: Accessor<boolean>;
   request: () => void;
+  /** Re-read after a terminal failure. It is `request()`'s owner, not a second
+   *  one: one shared read, one refresh, every open builder. */
+  retry: () => void;
 }
 
 const locKey = (l: number[]) => l.join(".");
@@ -1195,13 +1209,18 @@ function QueryRow(props: {
     const leaf = raw();
     return leaf ? diagnosticFor(props.sheet.query(), leaf) : undefined;
   };
-  /** **A property row's edits wait for the registry.** Its operator menu and its
-   *  value encoding are both `effectiveTypeOf` answers, and the fallback when
-   *  there is no row is the untyped `text` family — so editing while the read is
-   *  in flight would silently retype a `number` key, or a key whose declaration
-   *  was written a moment ago, as text. Nothing here is a NEW state: the row
-   *  keeps its own draft and reads exactly as it did (§6.3, I-20). */
-  const propertyPending = () => !!property() && props.sheet.registry.pending();
+  /** **A property row's edits wait for a HEALTHY registry.** Its operator menu
+   *  and its value encoding are both `effectiveTypeOf` answers, and the fallback
+   *  when there is no row is the untyped `text` family — so editing while the
+   *  read is in flight, or after it failed, would silently retype a `number`
+   *  key, or a key whose declaration was written a moment ago, as text. Nothing
+   *  here is a NEW state: the row keeps its own draft and reads exactly as it
+   *  did (§6.3, I-20). */
+  const propertyPending = () => !!property() && props.sheet.registry.unavailable();
+  /** Why the row is waiting, in the control's own tooltip: an indexing read
+   *  ends by itself, a failure does not, and the two must not read alike. */
+  const propertyWaitReason = () =>
+    props.sheet.registry.failure()?.message ?? "Reading this graph's properties…";
 
   const key = (purpose: string) => `${purpose}:${locKey(props.node.loc)}`;
   const menuOpen = (purpose: string) => props.sheet.openMenu() === key(purpose);
@@ -1271,7 +1290,7 @@ function QueryRow(props: {
    *  which is a complete condition the user can then narrow — rather than a
    *  leaf that claims a comparison nobody typed. */
   const setPropertyKey = (choice: VocabularyChoice & { kind: "property" }) => {
-    if (props.sheet.registry.pending()) return;
+    if (props.sheet.registry.unavailable()) return;
     const target = effectiveFor(props.sheet.registry, choice.key);
     const offered = propertyOperators(target).map((operator) => operator.id);
     const test = property();
@@ -1383,13 +1402,15 @@ function QueryRow(props: {
                 anchor={props.sheet.anchor()}
                 rows={props.sheet.registry.rows}
                 pending={props.sheet.registry.pending}
+                failure={props.sheet.registry.failure}
+                onRetry={props.sheet.registry.retry}
                 current={currentChoice()}
                 rootRef={rootRef}
                 onPick={(choice) => {
                   // A property pick needs the key's effective type to encode a
-                  // leaf. While the read is in flight the menu stays open with
-                  // its own line saying why, rather than committing text.
-                  if (choice.kind === "property" && props.sheet.registry.pending()) return;
+                  // leaf. While there is no healthy registry the menu stays open
+                  // with its own line saying why, rather than committing text.
+                  if (choice.kind === "property" && props.sheet.registry.unavailable()) return;
                   props.sheet.setOpenMenu(null);
                   if (choice.kind === "property") return setPropertyKey(choice);
                   // The filter sheet offers only the filter vocabulary; a
@@ -1416,7 +1437,7 @@ function QueryRow(props: {
             aria-expanded={menuOpen("op") ? "true" : "false"}
             aria-controls={opMenuId}
             disabled={props.node.disabled || propertyPending()}
-            title={propertyPending() ? "Reading this graph's properties…" : undefined}
+            title={propertyPending() ? propertyWaitReason() : undefined}
             onClick={(e) => {
               stop(e);
               toggle("op");
@@ -1693,13 +1714,16 @@ function AddCondition(props: {
   };
   const effective = createMemo(() => effectiveFor(props.sheet.registry, property()?.key));
   /** The chosen key's operators and value encoding are registry answers, so
-   *  while the read is in flight the editor keeps the key and the draft on
-   *  screen and refuses to commit — rather than encoding a `number` key, or one
-   *  whose declaration has just been written, as text (§6.3). */
-  const registryPending = () => props.sheet.registry.pending();
+   *  while there is no healthy registry the editor keeps the key and the draft
+   *  on screen and refuses to commit — rather than encoding a `number` key, or
+   *  one whose declaration has just been written, as text (§6.3). A terminal
+   *  failure holds the commit exactly as an in-flight read does; what differs
+   *  is what the editor SAYS, and that only `retry()` ends it. */
+  const registryFailure = () => props.sheet.registry.failure();
+  const registryUnavailable = () => props.sheet.registry.unavailable();
   const commitProperty = () => {
     const choice = property();
-    if (!choice || registryPending()) return;
+    if (!choice || registryUnavailable()) return;
     const filter = encodePropertyLeaf({
       id: propertyId(),
       key: choice.key,
@@ -1725,14 +1749,16 @@ function AddCondition(props: {
     setChosen(choice);
     // The family's first identity is pre-selected the moment the key is chosen,
     // so the common case needs no click (§7.4). Which family it is comes from
-    // the registry, so when the read is still in flight the pre-selection waits
+    // the registry, so while there is no healthy one the pre-selection waits
     // for it (below) instead of defaulting to text.
-    if (!registryPending()) setPropertyId(propertyOperators(effective())[0]?.id ?? "is");
+    if (!registryUnavailable()) setPropertyId(propertyOperators(effective())[0]?.id ?? "is");
   };
-  // The key stays chosen across the wait; the moment its rows land, the family's
-  // first identity is selected exactly as it would have been on the pick.
+  // The key stays chosen across the wait — through a readiness retry, through a
+  // failure, and through an explicit retry — and the moment its rows land the
+  // family's first identity is selected exactly as it would have been on the
+  // pick.
   createEffect(() => {
-    if (registryPending() || !property()) return;
+    if (registryUnavailable() || !property()) return;
     if (!propertyOperators(effective()).some((operator) => operator.id === propertyId())) {
       setPropertyId(propertyOperators(effective())[0]?.id ?? "is");
     }
@@ -1763,6 +1789,8 @@ function AddCondition(props: {
                 anchor={props.sheet.anchor()}
                 rows={props.sheet.registry.rows}
                 pending={props.sheet.registry.pending}
+                failure={props.sheet.registry.failure}
+                onRetry={props.sheet.registry.retry}
                 placeholder="Type to add a condition"
                 rootRef={rootRef}
                 onPick={choose}
@@ -1798,15 +1826,40 @@ function AddCondition(props: {
                         onDeclarationWritten={props.sheet.registry.request}
                       />
                       <Show
-                        when={!registryPending()}
+                        when={!registryUnavailable()}
                         fallback={
                           /* The key and the draft below stay exactly where the
                              user left them; only the choice of comparison waits,
                              because which comparisons exist is the registry's
-                             answer. */
-                          <div class="qs-registry-pending" role="status">
-                            Reading this graph's properties…
-                          </div>
+                             answer. A read still running says so and ends by
+                             itself; one that FAILED says what failed and offers
+                             the one control that starts another. */
+                          <Show
+                            when={registryFailure()}
+                            fallback={
+                              <div class="qs-registry-pending" role="status">
+                                Reading this graph's properties…
+                              </div>
+                            }
+                          >
+                            {(failure) => (
+                              <div class="qs-registry-failure" role="alert">
+                                <span class="qs-registry-failure-message">
+                                  This graph's properties could not be read. {failure().message}
+                                </span>
+                                <button
+                                  type="button"
+                                  class="qs-registry-retry"
+                                  onClick={(e) => {
+                                    stop(e);
+                                    props.sheet.registry.retry();
+                                  }}
+                                >
+                                  Try again
+                                </button>
+                              </div>
+                            )}
+                          </Show>
                         }
                       >
                         <Listbox
@@ -1832,7 +1885,7 @@ function AddCondition(props: {
                           autofocus
                           aria-label="Value"
                           placeholder="Value"
-                          disabled={registryPending()}
+                          disabled={registryUnavailable()}
                           value={propertyValues()[0] ?? ""}
                           onInput={(e) => setPropertyValues([e.currentTarget.value])}
                           onKeyDown={(e) => {
@@ -1843,7 +1896,7 @@ function AddCondition(props: {
                       <button
                         type="button"
                         class="qs-commit"
-                        disabled={registryPending()}
+                        disabled={registryUnavailable()}
                         onClick={commitProperty}
                       >
                         Add
