@@ -2,6 +2,18 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PUBLICATION-WINDOWS-PRIVATE-DIRECTORY",
+ "title": "Windows publication query storage does not inherit a permissive temporary-directory ACL",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 publication private-root correction" },
+ "platforms": ["windows"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/publish/private_directory.rs::tests::private_child_rejects_parent_permissions_and_preserves_existing_paths"],
+  "scenario": "query-engine.publication-windows-private-directory"
+ },
+ "notes": "Creates a private child below a permissive parent, validates actual protected owner-only ACL, and preserves an existing path on collision. Cross-compilation is separate from required hosted Windows runtime evidence."
+},
+{
  "id": "REG-QE-PUBLICATION-WRITER-LIFETIME",
  "title": "Publication retains temporary query resources through writer close timeout",
  "family": "query-engine",
@@ -11,7 +23,7 @@
   "tests": ["crates/tine-core/src/direct_projection.rs::tests::a_timed_out_close_retains_resources_until_the_writer_really_exits", "crates/tine-core/src/publish.rs::tests::publication_snapshot_query_index_is_owner_private_and_dies_with_its_root"],
   "scenario": "query-engine.publication-writer-lifetime"
  },
- "notes": "Real paused writer cannot release resources merely because a zero-duration wait expires; resources release after exit and late registration cannot leak. The Unix permission fixture does not prove the still-pending Windows private-root correction."
+ "notes": "Real paused writer cannot release resources merely because a zero-duration wait expires; resources release after exit and late registration cannot leak. Windows permissions have their own platform fixture."
 },
 {
  "id": "REG-QE-ACCEPTED-REGISTRY-FAILURE-STOPS-CAPTURE",

@@ -4444,23 +4444,34 @@ struct PublicationGraphSnapshot {
     root: Arc<PublicationSnapshotRoot>,
 }
 
+#[cfg(windows)]
+mod private_directory;
+
 /// Create `path` as a directory only its owner may read, write or traverse,
 /// failing if it already exists.
 ///
 /// The permission is chosen AT creation rather than relaxed afterwards, so no
 /// window exists in which the publication's private rows are readable by
-/// another account. On Windows the process temporary directory is already the
-/// per-user `%LOCALAPPDATA%\Temp`, whose ACL grants the owner, SYSTEM and
-/// administrators only; Rust exposes no portable API to narrow it further.
+/// another account. Windows uses an explicit protected DACL and validates it
+/// before the caller can write private rows; temp-directory inheritance is not
+/// a privacy guarantee.
 fn create_owner_private_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         fs::DirBuilder::new().mode(0o700).create(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        fs::create_dir(path)
+        private_directory::create(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private publication directories are unsupported",
+        ))
     }
 }
 

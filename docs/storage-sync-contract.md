@@ -674,6 +674,10 @@ temporary root, and the writer retains that owner until its connection and
 exclusive lease have closed. Expiration of the bounded close wait cannot remove
 the root beneath an active writer. A real paused-writer test checks retention
 through timeout, release at exit, and late registration after exit.
+The root is created with mode0700 on Unix. Windows supplies a protected
+inheritable owner-rights DACL at creation and reads it back before indexing;
+unsupported or unexpected ACLs fail setup while the directory is still empty.
+Existing directories are never reused or removed after a create collision.
 The projection writer reports stale indexed reads without claiming that query
 execution will fall back to traversal; public query adapters own typed recovery.
 Bounded block-referrer results are semantically bounded, not merely count
