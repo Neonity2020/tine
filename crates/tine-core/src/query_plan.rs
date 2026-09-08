@@ -1497,51 +1497,140 @@ fn page_base_score(
     }
 }
 
+/// Text-only rank for one page name or alias. This is deliberately one level
+/// below a page hit: the caller still groups the physical page name and its
+/// aliases, chooses exactly one winning text for that owner, and supplies the
+/// physical path/reference-name tie key after ranking owners globally.
+///
+/// Owner-local choice and global page rank are different comparisons. An
+/// admitted text equal to `page_exact` carries `exact_override`; that bit wins
+/// the owner-local choice even when name and alias both expose the same public
+/// Exact/1500 rank. It is not part of [`Self::global_order_key`], because the
+/// existing [`ScoredPage`] comparator globally orders only match class then the
+/// length-adjusted score. Equal ordinary aliases therefore remain stable when
+/// the caller replaces only on [`Self::is_better_owner_choice_than`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PageTextRank {
+    base_score: i32,
+    match_class: ObjectiveMatchClass,
+    exact_override: bool,
+}
+
+/// Width of [`PageTextRank::global_order_key`]: signed match-class rank followed
+/// by signed length-adjusted score, both in the existing comparator's order.
+const PAGE_RANK_KEY_LEN: usize = 4 + 4;
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PageTextRank {
+    pub(crate) fn base_score(&self) -> i32 {
+        self.base_score
+    }
+
+    pub(crate) fn match_class(&self) -> ObjectiveMatchClass {
+        self.match_class
+    }
+
+    pub(crate) fn is_exact_override(&self) -> bool {
+        self.exact_override
+    }
+
+    /// Strict owner-local comparison. Callers iterate the physical page name
+    /// first and aliases in source order, replacing only when this returns
+    /// true; that preserves the name on ordinary equal ties and the first alias
+    /// on equal alias ties while still honoring an exact alias override.
+    pub(crate) fn is_better_owner_choice_than(&self, other: &Self) -> bool {
+        self.exact_override > other.exact_override
+            || (self.exact_override == other.exact_override
+                && (self.match_class.rank() > other.match_class.rank()
+                    || (self.match_class == other.match_class
+                        && self.base_score > other.base_score)))
+    }
+
+    /// Existing final score for a physical page/reference name. This uses the
+    /// physical name's UTF-8 byte length even when the winning text is an alias,
+    /// exactly as [`execute_page_candidates`] has always done.
+    pub(crate) fn global_score(&self, physical_page_name: &str) -> i32 {
+        self.base_score - physical_page_name.len() as i32
+    }
+
+    /// Lossless global page-rank key. Ascending byte order is best first and is
+    /// exactly the first two terms of [`ScoredPage`] ordering. The owner-local
+    /// exact bit and the consumer-owned path/reference-name tie key are omitted
+    /// deliberately; neither is a global rank term.
+    pub(crate) fn global_order_key(&self, physical_page_name: &str) -> [u8; PAGE_RANK_KEY_LEN] {
+        let mut key = [0u8; PAGE_RANK_KEY_LEN];
+        key[0..4].copy_from_slice(&descending_i32_key(self.match_class.rank()));
+        key[4..8].copy_from_slice(&descending_i32_key(self.global_score(physical_page_name)));
+        key
+    }
+}
+
+fn rank_page_text_expr(plan: &QueryPlan, expr: &QueryExpr, text: &str) -> Option<PageTextRank> {
+    let folded = canonical_fold(text);
+    let (mut base_score, mut match_class) = page_base_score(plan, expr, text, &folded)?;
+    let exact_override = plan.page_exact.as_deref() == Some(folded.as_str());
+    if exact_override {
+        base_score = 1500;
+        match_class = ObjectiveMatchClass::Exact;
+    }
+    Some(PageTextRank {
+        base_score,
+        match_class,
+        exact_override,
+    })
+}
+
+/// Rank one exact page-name or alias text under a page branch without building
+/// spans, page inventory objects, graph state or result DTOs. Regex predicates
+/// use the plan's already-compiled regex map through [`page_base_score`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn rank_page_text(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    text: &str,
+) -> Option<PageTextRank> {
+    if branch.target != QueryTarget::Pages {
+        return None;
+    }
+    rank_page_text_expr(plan, &branch.predicate, text)
+}
+
+/// Produce the existing page-name evidence only after a text has been admitted.
+/// The caller passes the exact winning name/alias text, so evidence retains the
+/// original spelling and UTF-16 relationship exposed by current page hits.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn admitted_page_evidence(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    text: &str,
+) -> Option<Vec<MatchEvidence>> {
+    if branch.target != QueryTarget::Pages {
+        return None;
+    }
+    eval_expr(plan, &branch.predicate, TextField::PageName, text).map(|matched| matched.evidence)
+}
+
 fn best_page_match(
     plan: &QueryPlan,
     expr: &QueryExpr,
     page_name: &str,
     aliases: &[String],
 ) -> Option<(i32, ObjectiveMatchClass, String, Option<String>)> {
-    let page_match = page_base_score(plan, expr, page_name, &canonical_fold(page_name));
-    let mut best = page_match.map(|(score, class)| (score, class, page_name.to_string(), None));
+    let page_match = rank_page_text_expr(plan, expr, page_name);
+    let mut best = page_match.map(|rank| (rank, page_name.to_string(), None));
     for alias in aliases {
-        let Some((score, class)) = page_base_score(plan, expr, alias, &canonical_fold(alias))
-        else {
+        let Some(rank) = rank_page_text_expr(plan, expr, alias) else {
             continue;
         };
-        let replace = best.as_ref().is_none_or(|(best_score, best_class, _, _)| {
-            class.rank() > best_class.rank() || (class == *best_class && score > *best_score)
-        });
+        let replace = best
+            .as_ref()
+            .is_none_or(|(current, _, _)| rank.is_better_owner_choice_than(current));
         if replace {
-            best = Some((score, class, alias.clone(), Some(alias.clone())));
+            best = Some((rank, alias.clone(), Some(alias.clone())));
         }
     }
-    // Upgrade only an outcome that already satisfied the parsed expression.
-    // This repairs the objective class for ordinary multi-word titles without
-    // bypassing NOT/OR/regex membership semantics for syntax-looking names.
-    if let Some(exact) = plan.page_exact.as_deref() {
-        if page_match.is_some() && canonical_fold(page_name) == exact {
-            return Some((
-                1500,
-                ObjectiveMatchClass::Exact,
-                page_name.to_string(),
-                None,
-            ));
-        }
-        if let Some(alias) = aliases.iter().find(|alias| {
-            canonical_fold(alias) == exact
-                && page_base_score(plan, expr, alias, &canonical_fold(alias)).is_some()
-        }) {
-            return Some((
-                1500,
-                ObjectiveMatchClass::Exact,
-                alias.clone(),
-                Some(alias.clone()),
-            ));
-        }
-    }
-    best
+    best.map(|(rank, text, alias)| (rank.base_score, rank.match_class, text, alias))
 }
 
 fn execute_pages(
@@ -1664,14 +1753,8 @@ fn execute_page_candidates(
                     PageCandidate::File(index) => file_pages[index].clone(),
                     PageCandidate::Referenced(page) => page,
                 };
-                let evidence = eval_expr(
-                    plan,
-                    &branch.predicate,
-                    TextField::PageName,
-                    &winner.matched_text,
-                )
-                .map(|matched| matched.evidence)
-                .unwrap_or_default();
+                let evidence =
+                    admitted_page_evidence(plan, branch, &winner.matched_text).unwrap_or_default();
                 QueryHit::Page {
                     display_text: winner.matched_text,
                     page,
@@ -2858,6 +2941,344 @@ mod tests {
         });
         assert!(execution.cancelled);
         assert!(execution.hits.is_empty());
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Page text rank bridge: owner-local name/alias choice stays distinct
+    // from the global page ordering consumed by SQLite.
+    // -----------------------------------------------------------------
+
+    fn page_branch(plan: &QueryPlan) -> Option<&QueryBranch> {
+        plan.branches
+            .iter()
+            .find(|branch| branch.target == QueryTarget::Pages)
+    }
+
+    fn bridge_page_choice<'a>(
+        plan: &QueryPlan,
+        branch: &QueryBranch,
+        name: &'a str,
+        aliases: &'a [&'a str],
+    ) -> Option<(PageTextRank, &'a str, Option<&'a str>)> {
+        let mut best = rank_page_text(plan, branch, name).map(|rank| (rank, name, None));
+        for &alias in aliases {
+            let Some(rank) = rank_page_text(plan, branch, alias) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(current, _, _)| rank.is_better_owner_choice_than(current))
+            {
+                best = Some((rank, alias, Some(alias)));
+            }
+        }
+        best
+    }
+
+    // Independent pre-extraction owner-selection oracle from a6f49357. This
+    // deliberately does not call PageTextRank or its owner comparator.
+    fn legacy_page_choice(
+        plan: &QueryPlan,
+        expr: &QueryExpr,
+        page_name: &str,
+        aliases: &[String],
+    ) -> Option<(i32, ObjectiveMatchClass, String, Option<String>)> {
+        let page_match = page_base_score(plan, expr, page_name, &canonical_fold(page_name));
+        let mut best = page_match.map(|(score, class)| (score, class, page_name.to_string(), None));
+        for alias in aliases {
+            let Some((score, class)) = page_base_score(plan, expr, alias, &canonical_fold(alias))
+            else {
+                continue;
+            };
+            let replace = best.as_ref().is_none_or(|(best_score, best_class, _, _)| {
+                class.rank() > best_class.rank() || (class == *best_class && score > *best_score)
+            });
+            if replace {
+                best = Some((score, class, alias.clone(), Some(alias.clone())));
+            }
+        }
+        // Upgrade only an outcome that already satisfied the parsed expression.
+        // This repairs the objective class for ordinary multi-word titles without
+        // bypassing NOT/OR/regex membership semantics for syntax-looking names.
+        if let Some(exact) = plan.page_exact.as_deref() {
+            if page_match.is_some() && canonical_fold(page_name) == exact {
+                return Some((
+                    1500,
+                    ObjectiveMatchClass::Exact,
+                    page_name.to_string(),
+                    None,
+                ));
+            }
+            if let Some(alias) = aliases.iter().find(|alias| {
+                canonical_fold(alias) == exact
+                    && page_base_score(plan, expr, alias, &canonical_fold(alias)).is_some()
+            }) {
+                return Some((
+                    1500,
+                    ObjectiveMatchClass::Exact,
+                    alias.clone(),
+                    Some(alias.clone()),
+                ));
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn page_rank_bridge_matches_best_page_match_across_compiled_shapes() {
+        let cases = [
+            (
+                QueryPlan::page_name_fuzzy("opdf", 8),
+                "Opdf Notes",
+                vec!["Research Hub"],
+            ),
+            (
+                QueryPlan::friendly("foo ready", 8, 8),
+                "foo ready notes",
+                vec!["unrelated"],
+            ),
+            (
+                QueryPlan::friendly("zzz OR ready", 8, 8),
+                "ready page",
+                vec!["zzz alias"],
+            ),
+            (
+                QueryPlan::friendly("foo -draft", 8, 8),
+                "foo ready",
+                vec!["foo draft"],
+            ),
+            (
+                QueryPlan::friendly("/A[BC]+/", 8, 8),
+                "regex ABC",
+                vec!["regex ACC"],
+            ),
+            (
+                QueryPlan::friendly("foo -draft", 8, 8),
+                "foo -draft",
+                vec![],
+            ),
+        ];
+        for (plan, name, aliases) in &cases {
+            let branch = page_branch(plan).expect("the case must plan a page branch");
+            let owned_aliases = aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect::<Vec<_>>();
+            let expected = legacy_page_choice(plan, &branch.predicate, name, &owned_aliases);
+            let actual = bridge_page_choice(plan, branch, name, aliases);
+            assert_eq!(actual.is_some(), expected.is_some(), "name={name:?}");
+            if let (
+                Some((rank, text, alias)),
+                Some((score, class, expected_text, expected_alias)),
+            ) = (actual, expected)
+            {
+                assert_eq!((rank.base_score(), rank.match_class()), (score, class));
+                assert_eq!(text, expected_text);
+                assert_eq!(alias.map(str::to_string), expected_alias);
+            }
+        }
+
+        assert!(QueryPlan::friendly("", 8, 8).branches.is_empty());
+        assert!(QueryPlan::friendly("/(unclosed/", 8, 8).branches.is_empty());
+    }
+
+    #[test]
+    fn page_rank_bridge_owner_choice_keeps_exact_override_and_stable_equal_ties_separate() {
+        let override_plan = QueryPlan::friendly("foo OR bar", 8, 8);
+        let override_branch = page_branch(&override_plan).unwrap();
+        let name = rank_page_text(&override_plan, override_branch, "foo").unwrap();
+        let alias = rank_page_text(&override_plan, override_branch, "foo OR bar").unwrap();
+        assert_eq!(
+            (name.base_score(), name.match_class()),
+            (1500, ObjectiveMatchClass::Exact)
+        );
+        assert_eq!(
+            (alias.base_score(), alias.match_class()),
+            (1500, ObjectiveMatchClass::Exact)
+        );
+        assert!(!name.is_exact_override());
+        assert!(alias.is_exact_override());
+        assert!(alias.is_better_owner_choice_than(&name));
+        assert_eq!(
+            alias.global_order_key("Owner"),
+            name.global_order_key("Owner")
+        );
+        let selected =
+            bridge_page_choice(&override_plan, override_branch, "foo", &["foo OR bar"]).unwrap();
+        assert_eq!((selected.1, selected.2), ("foo OR bar", Some("foo OR bar")));
+
+        let equal_plan = QueryPlan::page_name_fuzzy("foo", 8);
+        let equal_branch = page_branch(&equal_plan).unwrap();
+        let name_wins =
+            bridge_page_choice(&equal_plan, equal_branch, "foo name", &["foo alias"]).unwrap();
+        assert_eq!((name_wins.1, name_wins.2), ("foo name", None));
+        let first_alias_wins = bridge_page_choice(
+            &equal_plan,
+            equal_branch,
+            "unrelated",
+            &["foo first", "foo later"],
+        )
+        .unwrap();
+        assert_eq!(
+            (first_alias_wins.1, first_alias_wins.2),
+            ("foo first", Some("foo first"))
+        );
+    }
+
+    #[test]
+    fn page_rank_bridge_blob_matches_scored_page_class_then_signed_score_order() {
+        let classes = [
+            ObjectiveMatchClass::Exact,
+            ObjectiveMatchClass::Prefix,
+            ObjectiveMatchClass::Substring,
+            ObjectiveMatchClass::Fuzzy,
+            ObjectiveMatchClass::BodyEvidence,
+        ];
+        let scores = [i32::MIN, -1, 0, 1, i32::MAX];
+        let ranks = classes
+            .into_iter()
+            .flat_map(|match_class| {
+                scores.into_iter().map(move |base_score| PageTextRank {
+                    base_score,
+                    match_class,
+                    exact_override: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        for left in &ranks {
+            for right in &ranks {
+                let left_page = ScoredPage {
+                    score: left.base_score,
+                    match_class: left.match_class,
+                    matched_text: String::new(),
+                    matched_alias: None,
+                    tie_key: String::new(),
+                    candidate: PageCandidate::Referenced(PageEntry {
+                        name: String::new(),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: String::new(),
+                        path: PathBuf::new(),
+                    }),
+                };
+                let right_page = ScoredPage {
+                    score: right.base_score,
+                    match_class: right.match_class,
+                    matched_text: String::new(),
+                    matched_alias: None,
+                    tie_key: String::new(),
+                    candidate: PageCandidate::Referenced(PageEntry {
+                        name: String::new(),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: String::new(),
+                        path: PathBuf::new(),
+                    }),
+                };
+                assert_eq!(
+                    left.global_order_key("").cmp(&right.global_order_key("")),
+                    right
+                        .match_class
+                        .rank()
+                        .cmp(&left.match_class.rank())
+                        .then_with(|| right.base_score.cmp(&left.base_score))
+                );
+                assert_eq!(
+                    left.global_order_key("") < right.global_order_key(""),
+                    left_page.is_better_than(&right_page)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_rank_bridge_rank_only_builds_no_evidence_and_admitted_evidence_is_utf16_exact() {
+        let plan = QueryPlan::page_name_fuzzy("caf\u{e9}", 8);
+        let branch = page_branch(&plan).unwrap();
+        let text = "\u{1D11E} CAFE\u{301}";
+        TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(0));
+        let rank = rank_page_text(&plan, branch, text).expect("canonical fold must match");
+        assert_eq!(rank.match_class(), ObjectiveMatchClass::Substring);
+        TEXT_EVIDENCE_EVALUATIONS
+            .with(|count| assert_eq!(count.get(), 0, "page rank selection must produce no spans"));
+        let evidence = admitted_page_evidence(&plan, branch, text).unwrap();
+        TEXT_EVIDENCE_EVALUATIONS
+            .with(|count| assert!(count.get() > 0, "the actual span producer must be observed"));
+        assert_eq!(evidence[0].spans, vec![MatchSpan { start: 3, end: 8 }]);
+        assert_eq!(evidence[0].field, TextField::PageName);
+
+        let block = plan
+            .branches
+            .iter()
+            .find(|candidate| candidate.target == QueryTarget::Blocks);
+        assert!(block.is_none(), "page-only plan has no block branch");
+        let mixed = QueryPlan::friendly("caf\u{e9}", 8, 8);
+        let block = mixed
+            .branches
+            .iter()
+            .find(|candidate| candidate.target == QueryTarget::Blocks)
+            .unwrap();
+        assert!(rank_page_text(&mixed, block, text).is_none());
+        assert!(admitted_page_evidence(&mixed, block, text).is_none());
+    }
+
+    #[test]
+    fn page_rank_bridge_handles_zero_limits_actual_alias_hits_and_virtual_names() {
+        let zero = QueryPlan::friendly("opdf", 0, 0);
+        let zero_branch = page_branch(&zero).unwrap();
+        assert!(rank_page_text(&zero, zero_branch, "Opdf Notes").is_some());
+
+        let (dir, graph) = fixture();
+        let plan = QueryPlan::friendly("Research Hub", 10, 0);
+        let branch = page_branch(&plan).unwrap();
+        let alias_rank = rank_page_text(&plan, branch, "research hub").unwrap();
+        let alias_hit = plan
+            .execute(&graph, || false)
+            .hits
+            .into_iter()
+            .find_map(|hit| match hit {
+                QueryHit::Page {
+                    page,
+                    display_text,
+                    score,
+                    match_class,
+                    matched_alias,
+                    ..
+                } if page.name == "Opdf Notes" => {
+                    Some((page, display_text, score, match_class, matched_alias))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(alias_hit.1, "research hub");
+        assert_eq!(alias_hit.2, alias_rank.global_score(&alias_hit.0.name));
+        assert_eq!(alias_hit.3, alias_rank.match_class());
+        assert_eq!(alias_hit.4.as_deref(), Some("research hub"));
+
+        let virtual_plan = QueryPlan::friendly("Virtual Opdf", 10, 0);
+        let virtual_branch = page_branch(&virtual_plan).unwrap();
+        let virtual_rank = rank_page_text(&virtual_plan, virtual_branch, "Virtual Opdf").unwrap();
+        let virtual_hit = virtual_plan
+            .execute(&graph, || false)
+            .hits
+            .into_iter()
+            .find_map(|hit| match hit {
+                QueryHit::Page {
+                    page,
+                    score,
+                    match_class,
+                    ..
+                } if page.name == "Virtual Opdf" => Some((page, score, match_class)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(virtual_hit.0.rel_path.is_empty());
+        assert_eq!(
+            virtual_hit.1,
+            virtual_rank.global_score(&virtual_hit.0.name)
+        );
+        assert_eq!(virtual_hit.2, virtual_rank.match_class());
         crate::test_support::remove_dir_all(dir);
     }
 
