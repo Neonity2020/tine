@@ -22,6 +22,7 @@ pub(crate) mod og;
 pub mod path_refs;
 pub mod print;
 pub mod registry;
+pub(crate) mod sort;
 // §5.1–§5.7's compiler. Its two acceptance gates live in `sql_gates_tests.rs`,
 // declared from `sql.rs` itself: the production-source scanner every census
 // guard shares recognises a `*_tests.rs` file included by a SIBLING under
@@ -55,6 +56,7 @@ use ir::{
     Anchor, Attr, CmpOp, Filter, Leaf, Quant, Query, Rel, SortDir, Source, Value, ViewSettings,
 };
 
+use self::sort::{compare_sort_decorations, lexical_property_sort_text, SortDecor};
 use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{
@@ -3058,20 +3060,15 @@ pub(crate) fn apply_result_view_directives<B: ResultViewBlock>(
                 ));
             }
         }
+        // Directions are view-owned, not part of a row's decoration. Materialize
+        // them once outside the comparator: no result text is parsed and no key
+        // storage is allocated during O(R log R) comparisons.
+        let ascending: Vec<bool> = opts.sort.iter().map(|(_, asc)| *asc).collect();
         flat.sort_by(|a, b| {
-            a.0.iter()
-                .zip(&b.0)
-                .zip(&opts.sort)
-                .map(|((left, right), (_, asc))| {
-                    let order = left.cmp(right);
-                    if *asc {
-                        order
-                    } else {
-                        order.reverse()
-                    }
-                })
-                .find(|order| !order.is_eq())
-                .unwrap_or_else(|| a.1.cmp(&b.1))
+            compare_sort_decorations(&a.0, &b.0, &ascending)
+                // Equal keys retain the original base-order position. Direction
+                // never reverses this tie, which is the existing stable contract.
+                .then_with(|| a.1.cmp(&b.1))
         });
         // Merge adjacent one-block groups that share a page (and kind) into a single
         // group, so consecutive same-page results render under one heading.
@@ -4448,15 +4445,6 @@ fn resolve_inputs(
     map
 }
 
-/// A result block's sort key: a numeric axis (recency, in Unix seconds) or a text
-/// value (priority/page/property/planning date). Within one sort every block uses
-/// the same variant; the derived `Ord` only ever compares like with like.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum SortDecor {
-    Num(i64),
-    Text(String),
-}
-
 /// Fields naming a block's position on the recency time-axis (journal day for
 /// journal pages, file mtime otherwise) — sorted numerically, not lexically.
 /// `modified` is the canonical token; `updated`/`updated-at`/`date` are aliases.
@@ -4514,20 +4502,18 @@ fn sort_key(b: &BlockDto, page: &str, field: &str) -> String {
         "scheduled" => b.scheduled.clone().unwrap_or_else(|| "~".to_string()),
         // Otherwise: a block property value (off the DTO's lsdoc properties — no
         // reparse, format-correct, audit P4), else the block's visible first line.
-        _ => {
-            let field = property_key_norm(field);
-            if let Some((_, v)) = b
-                .properties
+        _ => lexical_property_sort_text(
+            b.properties
                 .iter()
-                .find(|(k, _)| property_key_norm(k) == field)
-            {
-                return v.to_lowercase();
-            }
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+            field,
             // Fallback: visible text (the DTO carries no visible text; reparse, bounded
             // to sorted-result blocks via `sort_by_cached_key`).
-            let (_, visible) = crate::doc::block_sort_facets(&b.raw);
-            visible.lines().next().unwrap_or("").to_lowercase()
-        }
+            || {
+                let (_, visible) = crate::doc::block_sort_facets(&b.raw);
+                visible.lines().next().unwrap_or("").to_string()
+            },
+        ),
     }
 }
 
@@ -7097,6 +7083,62 @@ mod tests {
         let opts = QueryOpts::from_view(&view);
         assert_eq!(opts.sample, Some(5));
         assert_eq!(opts.sort, vec![("priority".to_string(), false)]);
+    }
+
+    #[test]
+    fn block_sort_special_fields_and_visible_fallback_keep_their_exact_meanings() {
+        let block = BlockDto {
+            raw: "VISIBLE Ä\nignored".into(),
+            priority: Some("b".into()),
+            scheduled: Some("2026-09-08".into()),
+            deadline: None,
+            properties: vec![
+                ("priority".into(), "property priority".into()),
+                ("page".into(), "property page".into()),
+                ("scheduled".into(), "property scheduled".into()),
+                ("deadline".into(), "property deadline".into()),
+            ],
+            ..BlockDto::default()
+        };
+        assert_eq!(sort_key(&block, "MIXED Page", "priority"), "B");
+        assert_eq!(sort_key(&block, "MIXED Page", "page"), "mixed page");
+        assert_eq!(sort_key(&block, "MIXED Page", "scheduled"), "2026-09-08");
+        assert_eq!(sort_key(&block, "MIXED Page", "deadline"), "~");
+        assert_eq!(sort_key(&block, "MIXED Page", "missing"), "visible ä");
+    }
+
+    #[test]
+    fn extracted_comparator_keeps_base_order_for_equal_recency_keys() {
+        let group = |page: &str, id: &str| ResultViewGroup {
+            page: page.into(),
+            kind: PageKind::Page,
+            blocks: vec![BlockDto {
+                id: id.into(),
+                raw: id.into(),
+                ..BlockDto::default()
+            }],
+            evidence: Vec::new(),
+        };
+        let groups = vec![
+            group("first", "a"),
+            group("newest", "b"),
+            group("second", "c"),
+        ];
+        let recency = HashMap::from([
+            ("first".to_string(), 10),
+            ("newest".to_string(), 20),
+            ("second".to_string(), 10),
+        ]);
+        let opts = QueryOpts::from_view(&ViewSettings {
+            sort: vec![(ir::Field::new("modified"), SortDir::Desc)],
+            ..ViewSettings::default()
+        });
+        let output = apply_result_view_directives(groups, &recency, &opts);
+        let ids: Vec<_> = output
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.id.as_str()))
+            .collect();
+        assert_eq!(ids, ["b", "a", "c"]);
     }
 
     #[test]
