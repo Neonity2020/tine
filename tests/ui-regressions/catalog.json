@@ -2,6 +2,28 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-QUERY-ASYNC-REORDER-FOCUS-20260908",
+      "title": "Keyboard reorder retains the moved handle after deferred query saves",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.queryUndoLifecycle.test.tsx",
+          "src/components/QuerySheet.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Baseline production with the new tests fails deferred reorder focus (manager48183); corrected production passes34 focused tests (49763). Focus restoration requires successful write and matching rendered root; anchor change, refused save and intentional outside focus invalidate the intent. TypeScript passes5280. Exact native journey remains required; this does not claim TODO result-scroll stability or delivery."
+    },
+    {
       "id": "UI-QUERY-PAGE-SNAPSHOT-UNDO-LIFETIME-20260908",
       "title": "Scoped page undo keeps the open query sheet mounted",
       "family": "query-builder",
