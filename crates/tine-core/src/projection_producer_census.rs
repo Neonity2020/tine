@@ -2121,9 +2121,17 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // at 23 rows / 32 occurrences (digest 0a888e83c0a962b5a86731875d779e27cd0c53cc25b964149965799e7fe35f5e).
     // The retained v0.20.0 dependency adds disposable query progress metadata,
     // no authority format. This census does not qualify either parent.
+    // Re-pinned 2026-09-08 (Direct producer coverage). The independently dumped
+    // d5498fb-to-working-tree multiset moves from 457 rows / 494 occurrences to
+    // 458 / 495: the direct_projection.rs import row is replaced by one widened
+    // with PhysicalProjectionQueryProgress and PhysicalProjectionQueryTarget,
+    // and PhysicalProjectionQueryProgress::new is added once. Those are the
+    // existing process-local coverage owner and its opaque target, not a SQLite
+    // writer or authority. The physical-write inventory remains byte-identical
+    // at 23 rows / 32 occurrences.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "b5f105f71f286e9df44dafb7e5a5ed40ad75a0a9926c138e35955bb0f6a4e181",
+        "e5f11f34e7d537c8e1f4067a5c41d41aeaa96cafe2bd9046b63e6f620ebbaf3e",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

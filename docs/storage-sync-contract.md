@@ -753,6 +753,22 @@ it does not duplicate text or construct output payload. The durable schema is
 unchanged. Regex program IDs distinguish the effective patterns of both
 syntaxes, and missing required visible text fails the read.
 
+**Direct producer coverage.** The existing coalesced queue records an opaque
+saved-query target before an exact delta or inventory enqueue returns. A
+completed, validated worker turn publishes its covered generation and actual
+SQLite query revision after fact/order writes, session identity and registry
+publication, even when later ordinary deltas are queued. Incomplete warm
+streams and failed writes publish no successful coverage. Unrepresented source
+invalidation withholds new targets until reconciliation; it does not cancel an
+already coherent read. Reset/replacement and changed producer parse config
+restart progress with the existing job drain; close or worker exit cancels
+progress waits. Same-config inventory reconciliation alone is not a lifecycle
+replacement. Progress waiting holds no query slot or SQLite transaction.
+This producer boundary is additive: dispatched queries still use the strict
+generation admission below until acquired-snapshot memo identity is switched
+with admission. Coverage alone is not permission to open during a partial
+producer turn or key a memo by its minimum requested generation.
+
 **What one dispatched query reads.** Capacity is acquired before SQLite opens
 the owned snapshot. The snapshot is validated against the exact current graph
 cache generation before and after its read transaction starts, then its
