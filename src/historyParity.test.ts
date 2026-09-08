@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { produce } from "solid-js/store";
 import * as historyStoreModule from "./store";
 import * as editorControllerModule from "./editorController";
 import { paletteCommands } from "./keybindings";
@@ -106,6 +107,26 @@ afterEach(() => {
 });
 
 describe("history parity", () => {
+  it("scoped snapshots retain the mounted page while restoring all optional metadata", async () => {
+    await store.loadFeed([page("A", [block("a", "original")])]);
+    store.setDoc(produce((state) => { delete state.pages[0].path; }));
+    setRoute("A");
+    const mountedPage = store.pageByName("A")!;
+    expect(Object.hasOwn(mountedPage, "path")).toBe(false);
+    store.withUndoUnit("query-sheet-edit", ["A"], () => {
+      store.setRaw("a", "edited");
+      store.setDoc("pages", 0, "path", "pages/A.md");
+    });
+    store.undo();
+    expect(store.pageByName("A")).toBe(mountedPage);
+    expect(store.doc.byId.a.raw).toBe("original");
+    expect(Object.hasOwn(mountedPage, "path")).toBe(false);
+    store.redo();
+    expect(store.pageByName("A")).toBe(mountedPage);
+    expect(store.doc.byId.a.raw).toBe("edited");
+    expect(mountedPage.path).toBe("pages/A.md");
+  });
+
   it("page-only undo/redo removes only A's newest interleaved raw/structural entries", async () => {
     await store.loadFeed([
       page("A", [block("a", "alpha")]),

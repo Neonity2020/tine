@@ -3304,8 +3304,15 @@ function applyEntry(e: UndoEntry): UndoEntry {
         for (const po of e.pageObjs) {
           const restored = clonePages([po])[0];
           const i = s.pages.findIndex((p) => p.name === po.name);
-          if (i >= 0) s.pages[i] = restored;
-          else s.pages.push(restored);
+          if (i >= 0) {
+            // Page views key their lifetime by this object. Restore its complete
+            // snapshot without unmounting open editors on ordinary undo/redo.
+            const current = s.pages[i];
+            for (const key of Object.keys(current)) {
+              if (!Object.hasOwn(restored, key)) Reflect.deleteProperty(current, key);
+            }
+            Object.assign(current, restored);
+          } else s.pages.push(restored);
         }
       })
     );
