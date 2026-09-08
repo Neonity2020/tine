@@ -13188,6 +13188,26 @@ fn shared_join_owns_ordinary_operation_until_atomic_enrollment_commit() {
     );
 }
 
+#[test]
+fn manager_empty_graph_activates_and_reopens_without_a_phantom_catalog_document() {
+    let fixture = ActivationFixture::empty("manager-empty-genesis", 0xefa01);
+    let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = active
+        .handle
+        .unwrap_or_else(|| panic!("empty activation: {:?}", active.status));
+    drive_initial_feed(&handle);
+    assert!(matches!(
+        handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(handle);
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+    assert!(matches!(
+        reopened.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+}
+
 fn activate_and_prepare_shared(fixture: &ActivationFixture) -> SyncSharedEnrollmentDescriptor {
     let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     let handle = active.handle.expect("fixture LocalActive");

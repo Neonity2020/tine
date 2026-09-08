@@ -44,7 +44,9 @@ the transition or the actor's live current-path catalog: filesystem delivery may
 legitimately change either while startup catch-up is settling. The accepted
 frontier's raw document count is not a page count because it also includes
 non-page managed documents. An empty graph
-legitimately proves readiness with an empty inventory.
+legitimately proves readiness with an empty inventory. Its untouched lazy catalog
+has no causal dependencies, so the immutable baseline and SQLite genesis bind
+zero documents; the catalog contributes one document once pages exist.
 
 Explicit activation is never an unexplained spinner. Before native activation,
 the frontend names pending-save flush, confirmation, and progress-listener

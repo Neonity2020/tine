@@ -2106,9 +2106,10 @@ impl CleanGenesisProjectionBuilder {
                 "clean SQLite genesis has no immutable baseline binding".into(),
             ));
         };
-        if root.acceptance_sequence() != 0
-            || genesis.document_count() != self.expected_pages as u64 + 1
-        {
+        // The lazy catalog has causal history only once at least one page
+        // was imported. An empty graph therefore binds zero documents.
+        let expected_documents = self.expected_pages as u64 + u64::from(self.expected_pages != 0);
+        if root.acceptance_sequence() != 0 || genesis.document_count() != expected_documents {
             return Err(ProjectionError::InvalidFrontier(
                 "clean SQLite genesis page count differs from its immutable baseline".into(),
             ));
