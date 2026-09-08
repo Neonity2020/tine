@@ -403,9 +403,11 @@ impl ProjectionShared {
 /// installed on its connection, and the identity policy input. Dropping the
 /// job releases the transaction and the capacity slot.
 pub(crate) struct DirectQueryJob<'a> {
+    // Field drop order is a lifecycle boundary: release the SQLite transaction
+    // before the admission slot can wake a projection replacement drain.
+    pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
     /// Held for its `Drop`: releasing the slot is the job's only exit.
     _slot: crate::query_jobs::JobSlot<'a>,
-    pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
@@ -2791,6 +2793,55 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn query_job_closes_snapshot_before_releasing_capacity() {
+        let path = std::env::temp_dir().join(format!("tine-query-drop-{}.sqlite", Uuid::new_v4()));
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE payload(value TEXT); INSERT INTO payload VALUES ('before');").unwrap();
+        let snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        let owner = crate::query_jobs::QueryJobOwner::new(1);
+        let slot = match owner.acquire() {
+            crate::query_jobs::Admission::Slot(slot) => slot,
+            _ => panic!("query admission"),
+        };
+        assert!(slot.register(snapshot.cancellation()));
+        let job = DirectQueryJob {
+            snapshot,
+            _slot: slot,
+            session_pages: Arc::new(HashSet::new()),
+        };
+        writer
+            .execute("UPDATE payload SET value='after'", [])
+            .unwrap();
+        let checkpoint = || {
+            writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(checkpoint(), 1, "fixture must retain a real WAL snapshot");
+        let (releasing, resume) = owner.pause_next_release_for_test();
+        let busy_at_release = std::thread::scope(|scope| {
+            let dropper = scope.spawn(move || drop(job));
+            releasing.recv_timeout(Duration::from_secs(3)).unwrap();
+            let busy = checkpoint();
+            // Resume before asserting: the old declaration order must fail,
+            // not leave the scope waiting forever for its paused dropper.
+            resume.send(()).unwrap();
+            dropper.join().unwrap();
+            busy
+        });
+        assert_eq!(owner.active(), 0);
+        drop(writer);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            busy_at_release, 0,
+            "slot release must follow SQLite transaction release"
+        );
     }
 
     #[test]
