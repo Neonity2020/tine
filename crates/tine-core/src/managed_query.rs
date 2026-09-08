@@ -90,6 +90,9 @@ pub(crate) struct ManagedQueryStamp {
     /// story. Every pending save moves it, so a memo entry or a capture is
     /// exact for the pending state it was taken under.
     pub(crate) overlay_revision: Option<u64>,
+    /// Rebuilding restarts revision numbering. The instance disambiguates
+    /// equal revisions of different files in both result and registry memos.
+    pub(crate) overlay_instance: Option<u64>,
 }
 
 /// The pending half of a capture (R5b): the overlay the executor opens and
@@ -952,7 +955,7 @@ fn probe_fts_ready(
 /// The ONE patched pending registry this runtime retains (R5c).
 ///
 /// Keyed by `(the capture's stamp, the accepted base's generation)`. The stamp
-/// carries `overlay_revision`, so a new save misses; it carries
+/// carries `overlay_revision` and `overlay_instance`, so a save or rebuild misses; it carries
 /// `acceptance_sequence` and `frontier_digest`, so an accepted batch misses;
 /// it carries `config_digest`, so a config edit misses. The base generation
 /// additionally separates the pre-first-build empty table from the first
@@ -1215,6 +1218,7 @@ mod tests {
             config_digest: ContentDigest::of(config.as_bytes()),
             today,
             overlay_revision: None,
+            overlay_instance: None,
         }
     }
 
@@ -1225,6 +1229,25 @@ mod tests {
             total,
             exceeded: false,
         }
+    }
+
+    #[test]
+    fn a_recreated_overlay_cannot_reuse_the_patched_registry() {
+        let mut first = stamp(1, "config", 0);
+        first.overlay_revision = Some(2);
+        first.overlay_instance = Some(10);
+        let second = ManagedQueryStamp {
+            overlay_instance: Some(11),
+            ..first.clone()
+        };
+        let registry = Arc::new(Registry::empty(&ParseConfig::default()));
+        let cache = PatchedRegistryCache::default();
+        cache.put(&first, 0, &registry);
+        assert!(Arc::ptr_eq(&cache.get(&first, 0).unwrap(), &registry));
+        assert!(
+            cache.get(&second, 0).is_none(),
+            "equal revision numbers do not identify the same overlay"
+        );
     }
 
     #[test]

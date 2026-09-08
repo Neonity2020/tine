@@ -2,6 +2,45 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-OVERLAY-INSTANCE-MEMO",
+ "title": "Recreated pending projections cannot reuse cached results or registry types from an older instance",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_recreated_pending_projection_cannot_reuse_an_older_instances_memo", "crates/tine-core/src/managed_query.rs::tests::a_recreated_overlay_cannot_reuse_the_patched_registry"],
+  "scenario": "query-engine.overlay-instance-memo",
+  "failBefore": "overlay-instance-before.log: pending edit plus rebuild returns an old empty answer0 instead of1 because revision numbers repeat"
+ },
+ "notes": "The effective stamp includes the overlay instance as well as revision. No durable schema change. Automatic repair scheduling is a separate unfinished campaign obligation."
+},
+{
+ "id": "REG-QE-OVERLAY-RETIRE-BEFORE-WRITER-WAIT",
+ "title": "Overlay retirement refuses new snapshots before waiting for its writer",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/managed_overlay.rs::tests::close_refuses_new_snapshots_before_waiting_for_the_writer"],
+  "scenario": "query-engine.overlay-retirement",
+  "failBefore": "overlay-retire-before.log: real teardown held at writer-channel boundary still admits a snapshot"
+ },
+ "notes": "Actor drain sites retire the old overlay first. This tests the overlay fence, not every accepted-projection replacement race."
+},
+{
+ "id": "REG-QE-PENDING-REBUILD-NO-APPLICATION-HYDRATION",
+ "title": "Pending projection reconstruction consumes authority materialization without parser or editor pages",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery review" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_projection_rebuild_does_not_construct_parser_or_editor_pages"],
+  "scenario": "query-engine.pending-rebuild-materialization",
+  "failBefore": "overlay-producer-before.log: rebuilding one pending page hydrates an application page before extracting the existing authority materialization"
+ },
+ "notes": "Shared pending materialization remains the sole producer. Editing retains its original parser/editor checks; rebuilding uses the materialized page directly and preserves exact query/oracle equality."
+},
+{
  "id": "REG-QE-ACCEPTED-REGISTRY-FAILURE-STOPS-CAPTURE",
  "title": "Failed accepted property metadata stops Managed query capture before execution",
  "family": "query-engine",

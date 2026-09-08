@@ -5647,6 +5647,16 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn rebuild_pending_overlay_for_test(&self) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply, receiver) = mpsc::channel();
+        self.send(ActorRequest::RebuildPendingOverlay { reply })?;
+        receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn install_managed_local_append_fault(
         &self,
         fault: ManagedLocalAppendFault,
@@ -10826,6 +10836,8 @@ enum ActorRequest {
     #[cfg(test)]
     ClosePendingOverlay { reply: mpsc::Sender<()> },
     #[cfg(test)]
+    RebuildPendingOverlay { reply: mpsc::Sender<()> },
+    #[cfg(test)]
     ApplicationPropertyRegistryProbe {
         reply: mpsc::Sender<ApplicationPropertyRegistryProbe>,
     },
@@ -11313,8 +11325,17 @@ fn run_actor_loop(
             }
             #[cfg(test)]
             ActorRequest::ClosePendingOverlay { reply } => {
+                actor.retire_pending_overlay();
                 actor.managed_query.jobs.cancel_all_and_drain();
                 actor.close_pending_overlay();
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::RebuildPendingOverlay { reply } => {
+                actor.retire_pending_overlay();
+                actor.managed_query.jobs.cancel_all_and_drain();
+                actor.install_pending_overlay();
                 let _ = reply.send(());
                 false
             }
@@ -13220,8 +13241,8 @@ fn managed_registry_page_key(page_id: PageId) -> String {
 impl RuntimeActor {
     /// (Re)create the pending-page overlay projection next to the active
     /// projection file and rebuild it from the authoritative pending set
-    /// (`latest_projection_frames`), page by page through the same pending
-    /// load the walk uses. Never reuses a file from an earlier process. A
+    /// (`latest_projection_frames`), page by page through the shared pending
+    /// materialization producer, without parser/editor views. Never reuses a file from an earlier process. A
     /// creation failure leaves no overlay installed: pending queries report
     /// projection unavailability rather than traversing or retrying forever.
     fn install_pending_overlay(&mut self) {
@@ -13258,17 +13279,13 @@ impl RuntimeActor {
                 overlay.mark_failed("pending overlay rebuild path");
                 continue;
             };
-            let load = match self.load_clean_foreground_pending_exact_ready(&parsed) {
-                Ok(Some(load)) => Ok(load),
-                Ok(None) => self.load_hot_application_exact_ready(&parsed),
-                Err(error) => Err(error),
-            };
-            match load {
-                Ok(ApplicationExactLoad::Loaded(current)) => {
-                    overlay.content(&path, Arc::new(current.editor.page.clone()));
-                }
-                Ok(ApplicationExactLoad::Missing) => overlay.tombstone(&path),
-                Ok(ApplicationExactLoad::Ambiguous) | Err(_) => {
+            match self.with_pending_materialized_page(&parsed, |page| {
+                Ok(page.map(|(page, _source)| Arc::new(page)))
+            }) {
+                Ok(Some(Some(page))) => overlay.content(&path, page),
+                Ok(Some(None)) => overlay.tombstone(&path),
+                Ok(None) => overlay.remove(&path),
+                Err(_) => {
                     overlay.mark_failed("pending overlay rebuild page");
                 }
             }
@@ -13280,6 +13297,17 @@ impl RuntimeActor {
         let overlay = self.managed_local.as_ref()?.pending_overlay.as_ref()?;
         let state = overlay.wait_flushed(overlay.latest_revision(), Duration::from_secs(10));
         Some((overlay.path().to_path_buf(), state))
+    }
+
+    /// Stop captures of this instance before draining jobs which already own it.
+    fn retire_pending_overlay(&self) {
+        if let Some(overlay) = self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| managed.pending_overlay.as_ref())
+        {
+            overlay.retire();
+        }
     }
 
     /// Stop and delete the pending overlay. Every off-actor query job has been
@@ -13301,6 +13329,7 @@ impl Drop for RuntimeActor {
         // truncates its WAL) when this actor drops; every off-actor query job
         // must be gone first. Idempotent, so the handle's `close` and this
         // drain compose in either order.
+        self.retire_pending_overlay();
         self.managed_query.jobs.cancel_all_and_drain();
         self.close_pending_overlay();
     }
@@ -16043,14 +16072,14 @@ impl RuntimeActor {
         // R5b: a pending suffix is part of the stamp, not a reason to have
         // none — its overlay revision. Without an overlay (creation failed)
         // the pending state has no stamp and every pending query walks.
-        let overlay_revision = match self.managed_local.as_ref() {
+        let (overlay_instance, overlay_revision) = match self.managed_local.as_ref() {
             Some(managed) if !managed.latest_projection_frames.is_empty() => {
                 match managed.pending_overlay.as_ref() {
-                    Some(overlay) => Some(overlay.latest_revision()),
+                    Some(overlay) => (Some(overlay.instance()), Some(overlay.latest_revision())),
                     None => return Ok(None),
                 }
             }
-            _ => None,
+            _ => (None, None),
         };
         let read = self.application_materialized_read_ready()?;
         let acceptance_sequence = read.acceptance_sequence();
@@ -16064,6 +16093,7 @@ impl RuntimeActor {
             config_digest: config.digest(),
             today: today.ordinal_key(),
             overlay_revision,
+            overlay_instance,
         }))
     }
 
@@ -17315,10 +17345,13 @@ impl RuntimeActor {
     /// derivative SQLite application catches up. The exact Markdown target is
     /// retained in the authenticated journal record; semantic page state is
     /// the clean engine suffix over the SQLite baseline claim source.
-    fn load_clean_foreground_pending_exact_ready(
+    fn with_pending_materialized_page<T>(
         &self,
         path: &ManagedPath,
-    ) -> Result<Option<ApplicationExactLoad>, SyncApplicationPageRequestError> {
+        consume: impl FnOnce(
+            Option<(MaterializedPage, &[u8])>,
+        ) -> Result<T, SyncApplicationPageRequestError>,
+    ) -> Result<Option<T>, SyncApplicationPageRequestError> {
         let Some(frame) = self
             .managed_local
             .as_ref()
@@ -17342,7 +17375,7 @@ impl RuntimeActor {
             ));
         };
         let Some(target) = intent.target().bytes() else {
-            return Ok(Some(ApplicationExactLoad::Missing));
+            return consume(None).map(Some);
         };
         let database = self
             .active_database()
@@ -17366,18 +17399,34 @@ impl RuntimeActor {
                 "application_load_pending_foreground_page_path",
             ));
         }
-        let parsed = self.graph.parse_exact_page_dto(path, target).map_err(|_| {
-            SyncApplicationPageRequestError::ActorRefusedAt(
-                "application_load_pending_foreground_parse",
+        consume(Some((materialized, target))).map(Some)
+    }
+
+    /// Editing needs the parser/editor views joined against the pending
+    /// authority. Projection production uses the same materialization above
+    /// directly, without constructing either of those application views.
+    fn load_clean_foreground_pending_exact_ready(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<Option<ApplicationExactLoad>, SyncApplicationPageRequestError> {
+        self.with_pending_materialized_page(path, |page| {
+            let Some((materialized, target)) = page else {
+                return Ok(ApplicationExactLoad::Missing);
+            };
+            let parsed = self.graph.parse_exact_page_dto(path, target).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt(
+                    "application_load_pending_foreground_parse",
+                )
+            })?;
+            let editor = editor_current_page_from_materialized(
+                materialized,
+                MAX_SYNC_APPLICATION_PAGE_BLOCKS,
             )
-        })?;
-        let editor =
-            editor_current_page_from_materialized(materialized, MAX_SYNC_APPLICATION_PAGE_BLOCKS)
-                .map_err(map_editor_application_error)?;
-        let current = join_application_page(parsed, editor)?;
-        Ok(Some(self.finish_managed_application_query_exact_load(
-            ApplicationExactLoad::Loaded(current),
-        )))
+            .map_err(map_editor_application_error)?;
+            let current = join_application_page(parsed, editor)?;
+            Ok(self
+                .finish_managed_application_query_exact_load(ApplicationExactLoad::Loaded(current)))
+        })
     }
 
     fn load_application_save_exact_ready(
@@ -24253,6 +24302,7 @@ impl RuntimeActor {
         // marker does not name. Every off-actor query job over the old file
         // is cancelled and drained first (R4), and the pending overlay that
         // sits next to the old file goes with it (R5b).
+        self.retire_pending_overlay();
         self.managed_query.jobs.cancel_all_and_drain();
         self.close_pending_overlay();
         self.clean.take();

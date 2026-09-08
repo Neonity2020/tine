@@ -869,8 +869,12 @@ whose latest projection frame is still pending — the same set the actor's
 frame map holds, no more. It is disposable in the strongest sense: it is
 deleted and recreated empty on every runtime open, deleted again on close,
 carries no frontier, no stamp and no authority, and is never read to decide
-anything the accepted file or the journal decides. The actor never writes it:
-every change to the pending set — a frame published, a page's post-save
+anything the accepted file or the journal decides.
+Reconstruction consumes the existing pending materialization directly, without
+parsing application pages or constructing editor DTOs. Before replacing an
+overlay, its instance is retired to new captures, then query jobs are drained,
+then its writer is joined and its files removed.
+The actor never writes it: every change to the pending set — a frame published, a page's post-save
 content, a deletion, a drain retiring the frame — is pushed as one revisioned
 update to a single overlay worker thread, which lowers the newest state per
 path through the same per-page lowering the accepted apply uses and publishes
@@ -880,7 +884,9 @@ is `incomplete`, and a lowering or write failure marks the whole overlay
 reports a bounded failure and never an answer. The revision the
 actor read when it stamped a query is the stamp's `overlay_revision`, so an
 answer is memoized under, and a capture validated against, the exact pending
-state it saw. A query is a read: it pushes nothing and advances no revision.
+state it saw. The stamp also includes `overlay_instance`: recreating the file
+can reuse revision numbers, but never result or patched-registry memo entries
+from the old instance. A query is a read: it pushes nothing and advances no revision.
 Coherence with the accepted file follows from acceptance itself — a pending
 path leaves the set only when its batch is accepted, which advances the
 acceptance sequence the capture's `open_managed` validates inside its read

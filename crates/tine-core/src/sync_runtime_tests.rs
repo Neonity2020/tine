@@ -31003,6 +31003,67 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
     );
 }
 
+#[test]
+fn ret2_pending_projection_rebuild_does_not_construct_parser_or_editor_pages() {
+    let fixture = r5a_fixture("ret2-pending-producer", 0x5a40);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO pending rebuild witness");
+    let expected = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    handle.rebuild_pending_overlay_for_test().unwrap();
+    let (_, state) = r5a_overlay(&handle);
+    assert!(state.failed.is_none(), "{state:?}");
+    assert!(state.incomplete.is_empty());
+    let work = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(
+        work.metadata_page_hydrations, 0,
+        "projection rebuild must not hydrate application pages: {work:?}"
+    );
+    assert_eq!(
+        work.result_page_hydrations, 0,
+        "projection rebuild must not hydrate query results: {work:?}"
+    );
+    handle.clear_application_simple_query_memo().unwrap();
+    let actual = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    r4a_assert_same("rebuilt pending projection", &actual, &expected);
+}
+
+#[test]
+fn ret2_recreated_pending_projection_cannot_reuse_an_older_instances_memo() {
+    let fixture = r5a_fixture("ret2-overlay-instance-memo", 0x5a41);
+    let handle = r4a_reopen(&fixture);
+    const QUERY: &str = "(content-regex \"after-instance\")";
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO before-instance");
+    let (_, first) = r5a_overlay(&handle);
+    assert_eq!(
+        r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES)
+            .unwrap()
+            .total,
+        0
+    );
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO after-instance");
+    let (_, edited) = r5a_overlay(&handle);
+    assert!(edited.flushed_revision > first.flushed_revision);
+    handle.rebuild_pending_overlay_for_test().unwrap();
+    let (_, rebuilt) = r5a_overlay(&handle);
+    assert_ne!(rebuilt.instance, first.instance);
+    assert_eq!(
+        rebuilt.flushed_revision, first.flushed_revision,
+        "recreation can reuse a revision number"
+    );
+    // Do not clear the memo or run the oracle before this assertion: the
+    // saved edit and replacement must invalidate it through actual identity.
+    let actual = r4a_navigate(&handle, QUERY, R5A_ROWS, R5A_BYTES).unwrap();
+    assert_eq!(
+        actual.total, 1,
+        "the new pending source must not reuse the old empty answer"
+    );
+    let oracle = r5a_walk(&handle, QUERY, R5A_ROWS, R5A_BYTES);
+    r4a_assert_same("new overlay instance", &actual, &oracle);
+}
+
 /// **R5c's headline fail-before.** Through R5b this test asserted the
 /// opposite: a pending query with a property leaf walked on the actor,
 /// uncaptured, census `(0, 0, 0, 0)`, with its injected outcome left
