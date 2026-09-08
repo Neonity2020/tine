@@ -28,6 +28,7 @@ pub(crate) struct CommittedRegistryCache {
 }
 
 /// Immutable input captured beside the SQL snapshot with this exact revision.
+#[derive(Clone)]
 pub(crate) struct RegistryCapture {
     incarnation: Arc<()>,
     revision: u64,
@@ -195,7 +196,7 @@ fn next_generation(previous: Option<&Registry>, built: &Registry) -> u64 {
 
 impl RegistryCapture {
     /// Call outside the producer and cache lock, on the captured job snapshot.
-    /// A cache hit checks cancellation without copying registry rows or reading SQL.
+    /// A cache hit validates the SQL revision without copying or rescanning registry rows.
     pub(crate) fn build(
         &self,
         snapshot: &mut PhysicalProjectionQuerySnapshot,
@@ -205,6 +206,21 @@ impl RegistryCapture {
             return Err(QueryExecutionError::Cancelled);
         }
         if config.digest() != self.config {
+            return Err(invalid());
+        }
+        let revision = snapshot.query_revision().map_err(|error| {
+            if snapshot.cancellation().is_cancelled() {
+                QueryExecutionError::Cancelled
+            } else if matches!(
+                error,
+                tine_storage::sqlite::MaterializationError::Corrupt(_)
+            ) {
+                invalid()
+            } else {
+                QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed)
+            }
+        })?;
+        if revision != self.revision {
             return Err(invalid());
         }
         match &self.base {
@@ -416,16 +432,16 @@ mod tests {
         database.initialize_schema().unwrap();
         drop(database);
         let config = ParseConfig::default();
-        let mut cache = CommittedRegistryCache::new(1, &config);
-        let full = cache.capture(1, &config).unwrap();
         let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        let revision = snapshot.query_revision().unwrap();
+        let mut cache = CommittedRegistryCache::new(revision, &config);
+        let full = cache.capture(revision, &config).unwrap();
         let built = full.build(&mut snapshot, &config).unwrap();
         assert!(built.rows().is_empty());
         let published = cache.publish(full, built).unwrap();
         drop(snapshot);
 
-        cache.committed(2, keys(&[]), keys(&[])).unwrap();
-        let hit = cache.capture(2, &config).unwrap();
+        let hit = cache.capture(revision, &config).unwrap();
         let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
         assert!(Arc::ptr_eq(
             &hit.build(&mut snapshot, &config).unwrap(),
@@ -438,6 +454,18 @@ mod tests {
         assert!(matches!(
             hit.build(&mut snapshot, &config),
             Err(QueryExecutionError::Cancelled)
+        ));
+        drop(snapshot);
+        // A matching config and cached base cannot authorize reading a different
+        // SQL image, even on the no-property-change cache-hit path.
+        cache.committed(revision + 1, keys(&[]), keys(&[])).unwrap();
+        let mismatched = cache.capture(revision + 1, &config).unwrap();
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        assert!(matches!(
+            mismatched.build(&mut snapshot, &config),
+            Err(QueryExecutionError::Unavailable(
+                QueryUnavailableReason::InvalidSnapshot
+            ))
         ));
         drop(snapshot);
         std::fs::remove_dir_all(root).unwrap();

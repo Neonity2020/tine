@@ -1,10 +1,11 @@
+use super::hot_engine::{test_block_home, MAX_HOT_NON_CATALOG_DOCUMENTS};
 use std::path::{Path, PathBuf};
 
 use crate::oplog::{
     AuthorBatch, BatchCausalDot, BatchDisposition, BatchError, BatchId, BatchInspection,
     BatchOrigin, BlockDelta, BlockLocation, BlockOwner, BlockRestore, CausalPeerId,
     ConflictResolutionIntent, ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId,
-    DocumentCausalDigest, DocumentDependencies, DocumentId, EngineError, FrontierV2,
+    DocumentCausalDigest, DocumentDependencies, DocumentId, DocumentKey, EngineError, FrontierV2,
     ImmutableHomeClaim, ImmutableHomeConflict, ImmutableHomeEvidence, LineageDigest,
     LogseqIdentityMutation, LogseqIdentityOrigin, LogseqIdentityTrigger, LogseqUuid,
     LogseqUuidResolution, ManagedPath, ManagedTextKind, MembershipClaim, MembershipDelta,
@@ -13,7 +14,8 @@ use crate::oplog::{
     PreparedBatch, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore,
     SemanticEffect, SemanticEffectDigest, SemanticError, SemanticOperation, SessionId,
     ShardedHotEngine, StoreError, ValidatedBatch, WorkspaceId, WorkspaceStatus,
-    MANAGED_ENTITY_SET_VERSION, OPERATION_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
+    WriterIncarnationId, MANAGED_ENTITY_SET_VERSION, OPERATION_SCHEMA_VERSION,
+    SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
 use crate::Graph;
 use loro::{ExportMode, LoroDoc};
@@ -75,6 +77,14 @@ impl Ids {
     fn engine(self) -> ShardedHotEngine {
         ShardedHotEngine::new(self.workspace, self.lineage, self.catalog)
     }
+
+    fn block_home_a(self) -> DocumentId {
+        test_block_home(self.block_a)
+    }
+
+    fn block_home_c(self) -> DocumentId {
+        test_block_home(self.block_c)
+    }
 }
 
 fn uuid(value: u128) -> Uuid {
@@ -85,12 +95,23 @@ fn path(value: &str) -> ManagedPath {
     ManagedPath::parse(value).unwrap()
 }
 
+fn claim_home(block_id: crate::oplog::BlockId, discriminator: DocumentId) -> DocumentId {
+    DocumentId::from_uuid(Uuid::from_u128(
+        0x4000_0000_0000_0000_0000_0000_0000_0000
+            ^ block_id.as_uuid().as_u128().rotate_left(64)
+            ^ discriminator.as_uuid().as_u128(),
+    ))
+}
+
 fn author(batch: u128, peer: u64) -> AuthorBatch {
     AuthorBatch {
         batch_id: BatchId::from_uuid(uuid(batch)),
         author_device_id: DeviceId::from_uuid(uuid(1_000 + peer as u128)),
         author_session_id: SessionId::from_uuid(uuid(2_000 + peer as u128)),
         crdt_peer_id: CrdtPeerId::from_u64(peer),
+        causal_peer_id: CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+            DeviceId::from_uuid(uuid(1_000 + peer as u128)),
+        )),
     }
 }
 
@@ -171,7 +192,7 @@ fn genesis(ids: Ids, engine: &ShardedHotEngine) -> PreparedBatch {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: ids.block_a,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(ids.block_a),
                     },
                     page_id: ids.page_a,
                     parent: None,
@@ -181,7 +202,7 @@ fn genesis(ids: Ids, engine: &ShardedHotEngine) -> PreparedBatch {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: ids.block_c,
-                        home_document_id: ids.home_c,
+                        home_document_id: test_block_home(ids.block_c),
                     },
                     page_id: ids.page_c,
                     parent: None,
@@ -238,7 +259,7 @@ fn create_blocks(
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: *block_id,
-                            home_document_id: *home_document_id,
+                            home_document_id: claim_home(*block_id, *home_document_id),
                         },
                         page_id: *page_id,
                         parent: None,
@@ -249,6 +270,546 @@ fn create_blocks(
                 .collect()),
         )
         .unwrap()
+}
+
+#[test]
+fn author_outline_builds_page_membership_once_for_many_independent_deletes() {
+    for blocks in [8_usize, 64] {
+        let ids = Ids::new();
+        let dir = TestDir::new(&format!("author-outline-delete-{blocks}"));
+        let archive_path = dir.path().join("archive");
+        let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
+        let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+            ObjectStore::open(&archive_path, ids.workspace).unwrap(),
+            ids.lineage,
+            ids.catalog,
+        );
+        let block_ids = (0..blocks)
+            .map(|index| crate::oplog::BlockId::from_uuid(uuid(70_000 + index as u128)))
+            .collect::<Vec<_>>();
+        let mut baseline_operations = vec![SemanticOperation::CreatePage {
+            page_id: ids.page_a,
+            home_document_id: ids.home_a,
+            name: crate::oplog::LogicalPageName::parse("Outline Deletes").unwrap(),
+            path: path("pages/outline-deletes.md"),
+            kind: ManagedTextKind::Page,
+        }];
+        baseline_operations.extend(block_ids.iter().enumerate().map(|(index, block_id)| {
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: *block_id,
+                    home_document_id: test_block_home(*block_id),
+                },
+                page_id: ids.page_a,
+                parent: None,
+                order: format!("{index:04}"),
+                content: format!("independent root {index}"),
+            }
+        }));
+        let baseline = engine
+            .prepare_fixture_transaction(
+                author(70_100 + blocks as u128, 70_100 + blocks as u64),
+                &tx(baseline_operations),
+            )
+            .unwrap();
+        publish_fixture(&writer, &baseline);
+        assert!(matches!(
+            engine
+                .stage_archive_batch(baseline.manifest().batch_id())
+                .unwrap()
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let before = engine.instrumentation();
+        let deletion = engine
+            .prepare_fixture_transaction(
+                author(70_200 + blocks as u128, 70_200 + blocks as u64),
+                &tx(block_ids
+                    .iter()
+                    .map(|block_id| SemanticOperation::DeleteSubtree {
+                        root_block_id: *block_id,
+                        page_id: ids.page_a,
+                    })
+                    .collect()),
+            )
+            .unwrap();
+        let after = engine.instrumentation();
+        let builds = after.author_outline_builds - before.author_outline_builds;
+        let membership_reads =
+            after.author_outline_membership_reads - before.author_outline_membership_reads;
+        let traversal_nodes =
+            after.author_outline_traversal_nodes - before.author_outline_traversal_nodes;
+        eprintln!(
+            "author outline blocks={blocks} builds={builds} membership_reads={membership_reads} traversal_nodes={traversal_nodes}"
+        );
+        assert_eq!(builds, 1);
+        assert_eq!(membership_reads, blocks);
+        assert_eq!(traversal_nodes, blocks);
+        publish_fixture(&writer, &deletion);
+        assert!(matches!(
+            engine
+                .stage_archive_batch(deletion.manifest().batch_id())
+                .unwrap()
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(engine
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .is_empty());
+
+        drop(engine);
+        let mut replay = ShardedHotEngine::with_clean_archive_store_for_test(
+            ObjectStore::open(&archive_path, ids.workspace).unwrap(),
+            ids.lineage,
+            ids.catalog,
+        );
+        for batch_id in [
+            baseline.manifest().batch_id(),
+            deletion.manifest().batch_id(),
+        ] {
+            assert!(matches!(
+                replay.stage_archive_batch(batch_id).unwrap().disposition,
+                BatchDisposition::Accepted { .. }
+            ));
+        }
+        assert!(replay
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .is_empty());
+    }
+}
+
+#[test]
+fn author_outline_tracks_mixed_operations_and_owner_transfer_in_order() {
+    let ids = Ids::new();
+    let dir = TestDir::new("author-outline-mixed");
+    let archive_path = dir.path().join("archive");
+    let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
+    let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
+        ObjectStore::open(&archive_path, ids.workspace).unwrap(),
+        ids.lineage,
+        ids.catalog,
+    );
+    let z = crate::oplog::BlockId::from_uuid(uuid(71_001));
+    let unchanged = crate::oplog::BlockId::from_uuid(uuid(71_002));
+    let root_b = crate::oplog::BlockId::from_uuid(uuid(71_003));
+    let transferred = crate::oplog::BlockId::from_uuid(uuid(71_004));
+    let created = crate::oplog::BlockId::from_uuid(uuid(71_005));
+    let location = |block_id| BlockLocation {
+        block_id,
+        home_document_id: test_block_home(block_id),
+    };
+    let baseline = engine
+        .prepare_fixture_transaction(
+            author(71_100, 71_100),
+            &tx(vec![
+                SemanticOperation::CreatePage {
+                    page_id: ids.page_a,
+                    home_document_id: ids.home_a,
+                    name: crate::oplog::LogicalPageName::parse("Outline A").unwrap(),
+                    path: path("pages/outline-a.md"),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: ids.page_b,
+                    home_document_id: ids.home_b,
+                    name: crate::oplog::LogicalPageName::parse("Outline B").unwrap(),
+                    path: path("pages/outline-b.md"),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(z),
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "z".into(),
+                    content: "same-page move anchor".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(unchanged),
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "w".into(),
+                    content: "unchanged restore".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(root_b),
+                    page_id: ids.page_b,
+                    parent: None,
+                    order: "r".into(),
+                    content: "deleted B root".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(transferred),
+                    page_id: ids.page_b,
+                    parent: Some(root_b),
+                    order: "y".into(),
+                    content: "surviving owner transfer".into(),
+                },
+            ]),
+        )
+        .unwrap();
+    publish_fixture(&writer, &baseline);
+    assert!(matches!(
+        engine
+            .stage_archive_batch(baseline.manifest().batch_id())
+            .unwrap()
+            .disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    let mixed = engine
+        .prepare_fixture_transaction(
+            author(71_101, 71_101),
+            &tx(vec![
+                // Same-page movement is a root-only reorder and does not need
+                // to prime A's full outline.
+                SemanticOperation::MoveSubtree {
+                    root: location(z),
+                    from_page_id: ids.page_a,
+                    to_page_id: ids.page_a,
+                    parent: None,
+                    order: "z-same-page".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(created),
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "n-created".into(),
+                    content: "created then moved without changing identity".into(),
+                },
+                SemanticOperation::ReorderBlock {
+                    block_id: created,
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "n-reordered".into(),
+                },
+                SemanticOperation::MoveSubtree {
+                    root: location(created),
+                    from_page_id: ids.page_a,
+                    to_page_id: ids.page_b,
+                    parent: None,
+                    order: "n-away".into(),
+                },
+                SemanticOperation::MoveSubtree {
+                    root: location(created),
+                    from_page_id: ids.page_b,
+                    to_page_id: ids.page_a,
+                    parent: None,
+                    order: "n-back".into(),
+                },
+                // B is loaded. Restore retains its old pair claim, so owner
+                // transfer must remove this child from B's derived outline.
+                SemanticOperation::RestoreSubtree {
+                    page_id: ids.page_a,
+                    blocks: vec![BlockRestore {
+                        block: location(transferred),
+                        claim: MembershipClaim {
+                            home_document_id: test_block_home(transferred),
+                            parent: None,
+                            order: "y-restored".into(),
+                        },
+                    }],
+                },
+                // This is a true no-op over otherwise untouched documents.
+                SemanticOperation::RestoreSubtree {
+                    page_id: ids.page_a,
+                    blocks: vec![BlockRestore {
+                        block: location(unchanged),
+                        claim: MembershipClaim {
+                            home_document_id: test_block_home(unchanged),
+                            parent: None,
+                            order: "w".into(),
+                        },
+                    }],
+                },
+                // If the retained inactive B pair still populated the loaded
+                // outline, deleting root_b would incorrectly delete transfer.
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: root_b,
+                    page_id: ids.page_b,
+                },
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: created,
+                    page_id: ids.page_a,
+                },
+            ]),
+        )
+        .unwrap();
+    let effect = semantic_effect(&mixed);
+    assert!(effect
+        .blocks()
+        .iter()
+        .all(|delta| delta.block_id != unchanged));
+    assert!(effect
+        .memberships()
+        .iter()
+        .all(|delta| delta.block_id != unchanged));
+    let unchanged_documents = std::collections::BTreeSet::from([
+        DocumentKey::Entity(test_block_home(unchanged)),
+        DocumentKey::Membership {
+            block_document_id: test_block_home(unchanged),
+            page_document_id: ids.home_a,
+        },
+    ]);
+    assert!(mixed
+        .objects()
+        .iter()
+        .all(|object| !unchanged_documents.contains(&object.document_id())));
+    publish_fixture(&writer, &mixed);
+    let mixed_outcome = engine
+        .stage_archive_batch(mixed.manifest().batch_id())
+        .unwrap();
+    assert!(
+        matches!(mixed_outcome.disposition, BatchDisposition::Accepted { .. }),
+        "mixed transaction outcome: {mixed_outcome:?}"
+    );
+    let page_a = engine.materialize_page(ids.page_a).unwrap();
+    assert_eq!(
+        page_a
+            .blocks
+            .iter()
+            .map(|block| (
+                block.block_id,
+                block.home_document_id,
+                block.content.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (unchanged, test_block_home(unchanged), "unchanged restore"),
+            (
+                transferred,
+                test_block_home(transferred),
+                "surviving owner transfer",
+            ),
+            (z, test_block_home(z), "same-page move anchor"),
+        ]
+    );
+    assert!(engine
+        .materialize_page(ids.page_b)
+        .unwrap()
+        .blocks
+        .is_empty());
+    assert!(matches!(
+        engine
+            .recover_block_state(test_block_home(created), created)
+            .unwrap()
+            .map(|state| state.owner),
+        Some(BlockOwner::Tombstone)
+    ));
+
+    drop(engine);
+    let mut replay = ShardedHotEngine::with_clean_archive_store_for_test(
+        ObjectStore::open(&archive_path, ids.workspace).unwrap(),
+        ids.lineage,
+        ids.catalog,
+    );
+    for batch_id in [baseline.manifest().batch_id(), mixed.manifest().batch_id()] {
+        assert!(matches!(
+            replay.stage_archive_batch(batch_id).unwrap().disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
+    assert_eq!(replay.materialize_page(ids.page_a).unwrap(), page_a);
+    assert!(replay
+        .materialize_page(ids.page_b)
+        .unwrap()
+        .blocks
+        .is_empty());
+}
+
+#[test]
+fn same_page_nested_move_writes_only_the_root_pair_and_preserves_concurrent_child_reorder() {
+    let ids = Ids::new();
+    let child = crate::oplog::BlockId::from_uuid(uuid(72_001));
+    let grandchild = crate::oplog::BlockId::from_uuid(uuid(72_002));
+    let location = |block_id| BlockLocation {
+        block_id,
+        home_document_id: test_block_home(block_id),
+    };
+    let dir = TestDir::new("same-page-nested-move");
+    let archive = store(&dir, ids);
+    let mut seed = ids.engine();
+    let baseline = seed
+        .prepare_fixture_transaction(
+            author(72_100, 72_100),
+            &tx(vec![
+                SemanticOperation::CreatePage {
+                    page_id: ids.page_a,
+                    home_document_id: ids.home_a,
+                    name: crate::oplog::LogicalPageName::parse("Nested Move").unwrap(),
+                    path: path("pages/nested-move.md"),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(ids.block_a),
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "root".into(),
+                    content: "root".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(child),
+                    page_id: ids.page_a,
+                    parent: Some(ids.block_a),
+                    order: "child".into(),
+                    content: "child".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: location(grandchild),
+                    page_id: ids.page_a,
+                    parent: Some(child),
+                    order: "grandchild".into(),
+                    content: "grandchild".into(),
+                },
+            ]),
+        )
+        .unwrap();
+    let baseline = ready(&archive, &baseline);
+    assert!(matches!(
+        seed.stage_ready(baseline.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    let wrong_home = seed.prepare_fixture_transaction(
+        author(72_101, 72_101),
+        &tx(vec![SemanticOperation::MoveSubtree {
+            root: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: test_block_home(child),
+            },
+            from_page_id: ids.page_a,
+            to_page_id: ids.page_a,
+            parent: None,
+            order: "wrong-home".into(),
+        }]),
+    );
+    assert!(matches!(
+        wrong_home,
+        Err(EngineError::HomeShardMismatch(block_id)) if block_id == ids.block_a
+    ));
+
+    let same_page_move = seed
+        .prepare_fixture_transaction(
+            author(72_102, 90_000),
+            &tx(vec![SemanticOperation::MoveSubtree {
+                root: location(ids.block_a),
+                from_page_id: ids.page_a,
+                to_page_id: ids.page_a,
+                parent: None,
+                order: "root-moved".into(),
+            }]),
+        )
+        .unwrap();
+    let changed_documents = same_page_move
+        .objects()
+        .iter()
+        .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
+        .map(OperationObject::document_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        changed_documents,
+        std::collections::BTreeSet::from([DocumentKey::Membership {
+            block_document_id: test_block_home(ids.block_a),
+            page_document_id: ids.home_a,
+        }])
+    );
+    let move_effect = semantic_effect(&same_page_move);
+    assert!(move_effect.blocks().is_empty());
+    assert!(matches!(
+        move_effect.memberships(),
+        [delta] if delta.block_id == ids.block_a && delta.page_id == ids.page_a
+    ));
+
+    let mut reorder_author = ids.engine();
+    assert!(matches!(
+        reorder_author.stage_ready(baseline.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let child_reorder = reorder_author
+        .prepare_fixture_transaction(
+            author(72_103, 80_000),
+            &tx(vec![SemanticOperation::ReorderBlock {
+                block_id: child,
+                page_id: ids.page_a,
+                parent: Some(ids.block_a),
+                order: "child-concurrent".into(),
+            }]),
+        )
+        .unwrap();
+    let same_page_move = ready(&archive, &same_page_move);
+    let child_reorder = ready(&archive, &child_reorder);
+    let apply = |first: ValidatedBatch, second: ValidatedBatch| {
+        let engine = apply_pair(ids, &baseline, first, second);
+        let page = engine.materialize_page(ids.page_a).unwrap();
+        assert_eq!(
+            page.blocks
+                .iter()
+                .find(|block| block.block_id == child)
+                .unwrap()
+                .order,
+            "child-concurrent"
+        );
+        assert_eq!(
+            page.blocks
+                .iter()
+                .find(|block| block.block_id == grandchild)
+                .unwrap()
+                .order,
+            "grandchild"
+        );
+        engine.canonical_snapshot().unwrap()
+    };
+    assert_eq!(
+        apply(same_page_move.clone(), child_reorder.clone()),
+        apply(child_reorder, same_page_move)
+    );
+}
+
+#[test]
+fn move_out_racing_source_page_deletion_converges_in_both_delivery_orders() {
+    let ids = Ids::new();
+    let dir = TestDir::new("move-out-source-page-delete");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let (moved, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(72_200, 72_200),
+        tx(vec![SemanticOperation::MoveSubtree {
+            root: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: test_block_home(ids.block_a),
+            },
+            from_page_id: ids.page_a,
+            to_page_id: ids.page_b,
+            parent: None,
+            order: "moved-out".into(),
+        }]),
+        author(72_201, 72_201),
+        tx(vec![SemanticOperation::DeletePage {
+            page_id: ids.page_a,
+        }]),
+    );
+    let apply = |first: ValidatedBatch, second: ValidatedBatch| {
+        let engine = apply_pair(ids, &baseline, first, second);
+        assert!(matches!(
+            engine.materialize_page(ids.page_a),
+            Err(EngineError::PageDeleted(page_id)) if page_id == ids.page_a
+        ));
+        let destination = engine.materialize_page(ids.page_b).unwrap();
+        assert!(destination.blocks.iter().any(|block| {
+            block.block_id == ids.block_a
+                && block.home_document_id == test_block_home(ids.block_a)
+                && block.content == "home A content"
+        }));
+        engine.canonical_snapshot().unwrap()
+    };
+    assert_eq!(apply(moved.clone(), deleted.clone()), apply(deleted, moved));
 }
 
 fn seed_engine(ids: Ids, store: &ObjectStore) -> (ShardedHotEngine, ValidatedBatch) {
@@ -559,6 +1120,18 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
             }]),
         )
         .unwrap();
+    let deletion_effect = semantic_effect(&deletion);
+    assert!(deletion_effect.blocks().is_empty());
+    assert!(deletion_effect.memberships().is_empty());
+    assert_eq!(
+        deletion
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
+            .map(OperationObject::document_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([DocumentKey::Entity(ids.home_a)])
+    );
     let deletion = ready(&archive, &deletion);
     assert!(matches!(
         engine.stage_ready(deletion.clone()).disposition,
@@ -570,7 +1143,7 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "tombstoned shard drift before revival".into(),
             }]),
@@ -580,6 +1153,10 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
     assert!(matches!(
         engine.stage_ready(drift.clone()).disposition,
         BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        engine.materialize_page(ids.page_a),
+        Err(EngineError::PageDeleted(page_id)) if page_id == ids.page_a
     ));
 
     let operations = engine
@@ -601,10 +1178,14 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
         crate::oplog::PageDeltaLifecycle::RevivePage
     );
     let revived = ready(&archive, &revived);
-    assert!(matches!(
-        engine.stage_ready(revived.clone()).disposition,
-        BatchDisposition::Accepted { .. }
-    ));
+    let revived_outcome = engine.stage_ready(revived.clone());
+    assert!(
+        matches!(
+            revived_outcome.disposition,
+            BatchDisposition::Accepted { .. }
+        ),
+        "revive outcome: {revived_outcome:?}"
+    );
     assert_eq!(engine.materialize_page(ids.page_a).unwrap(), expected);
 
     let mut peer = ids.engine();
@@ -662,7 +1243,7 @@ fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "concurrent remote edit during revival".into(),
             }]),
@@ -673,10 +1254,11 @@ fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
     let converge = |first: ValidatedBatch, second: ValidatedBatch| {
         let mut peer = ids.engine();
         for batch in [baseline.clone(), deletion.clone(), first, second] {
-            assert!(matches!(
-                peer.stage_ready(batch).disposition,
-                BatchDisposition::Accepted { .. }
-            ));
+            let outcome = peer.stage_ready(batch);
+            assert!(
+                matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+                "concurrent revive outcome: {outcome:?}"
+            );
         }
         peer.canonical_snapshot().unwrap()
     };
@@ -696,6 +1278,415 @@ fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
         .iter()
         .any(|block| block.block_id == ids.block_a
             && block.content == "concurrent remote edit during revival"));
+}
+
+#[test]
+fn block_birth_uses_its_causal_page_when_a_concurrent_delete_arrives_first() {
+    let ids = Ids::new();
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(40_250));
+    let block_home = test_block_home(block_id);
+    let dir = TestDir::new("birth-concurrent-page-delete");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let (created, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(40_251, 40_251),
+        tx(vec![SemanticOperation::CreateBlock {
+            block: BlockLocation {
+                block_id,
+                home_document_id: block_home,
+            },
+            page_id: ids.page_a,
+            parent: None,
+            order: "concurrent-birth".into(),
+            content: "created at the live causal base".into(),
+        }]),
+        author(40_252, 40_252),
+        tx(vec![SemanticOperation::DeletePage {
+            page_id: ids.page_a,
+        }]),
+    );
+
+    let apply = |first: ValidatedBatch, second: ValidatedBatch| {
+        let mut engine = ids.engine();
+        assert!(matches!(
+            engine.stage_ready(baseline.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        for batch in [first, second] {
+            let outcome = engine.stage_ready(batch);
+            assert!(
+                matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+                "a legitimate concurrent birth/delete branch was refused: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            engine
+                .recover_block_state(block_home, block_id)
+                .unwrap()
+                .unwrap()
+                .content,
+            "created at the live causal base"
+        );
+        engine.canonical_snapshot().unwrap()
+    };
+    assert_eq!(
+        apply(created.clone(), deleted.clone()),
+        apply(deleted, created)
+    );
+}
+
+#[test]
+fn same_batch_birth_and_deletion_retains_provenance_for_restore_and_replay() {
+    let ids = Ids::new();
+    let dir = TestDir::new("same-batch-birth-delete-restore");
+    let archive = store(&dir, ids);
+    let (mut engine, baseline) = seed_engine(ids, &archive);
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(40_300));
+    let block_home = test_block_home(block_id);
+    let retired = engine
+        .prepare_fixture_transaction(
+            author(40_301, 40_301),
+            &tx(vec![
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: block_home,
+                    },
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "born-retired".into(),
+                    content: "birth survives retirement".into(),
+                },
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id: ids.page_a,
+                },
+            ]),
+        )
+        .unwrap();
+    let retired_effect = semantic_effect(&retired);
+    let retired_block = retired_effect
+        .blocks()
+        .iter()
+        .find(|delta| delta.block_id == block_id)
+        .unwrap();
+    assert_eq!(
+        retired_block
+            .birth
+            .as_ref()
+            .map(|birth| (birth.page_id, birth.page_document_id)),
+        Some((ids.page_a, ids.home_a))
+    );
+    assert!(matches!(
+        retired_block.after.as_ref().map(|state| state.owner),
+        Some(crate::oplog::BlockOwner::Tombstone)
+    ));
+    let retired = ready(&archive, &retired);
+    let retired_outcome = engine.stage_ready(retired.clone());
+    assert!(
+        matches!(
+            retired_outcome.disposition,
+            BatchDisposition::Accepted { .. }
+        ),
+        "same-batch create/delete was refused: {retired_outcome:?}"
+    );
+
+    let restored = engine
+        .prepare_fixture_transaction(
+            author(40_302, 40_302),
+            &tx(vec![SemanticOperation::RestoreSubtree {
+                page_id: ids.page_a,
+                blocks: vec![BlockRestore {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: block_home,
+                    },
+                    claim: MembershipClaim {
+                        home_document_id: block_home,
+                        parent: None,
+                        order: "born-retired".into(),
+                    },
+                }],
+            }]),
+        )
+        .unwrap();
+    assert!(restored
+        .manifest()
+        .dependency_frontier()
+        .documents()
+        .iter()
+        .any(|document| document.document_id() == DocumentKey::Entity(block_home)));
+    let restored = ready(&archive, &restored);
+    let restored_outcome = engine.stage_ready(restored.clone());
+    assert!(
+        matches!(
+            restored_outcome.disposition,
+            BatchDisposition::Accepted { .. }
+        ),
+        "restore of same-batch-retired birth was refused: {restored_outcome:?}"
+    );
+    assert_eq!(
+        engine
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.block_id == block_id)
+            .unwrap()
+            .content,
+        "birth survives retirement"
+    );
+
+    let mut replay = ids.engine();
+    for batch in [baseline, retired, restored] {
+        let outcome = replay.stage_ready(batch);
+        assert!(
+            matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+            "birth/retirement replay refused: {outcome:?}"
+        );
+    }
+    assert_eq!(
+        replay
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.block_id == block_id)
+            .unwrap()
+            .content,
+        "birth survives retirement"
+    );
+}
+
+#[test]
+fn same_batch_page_and_block_create_delete_is_valid_and_replayable() {
+    let ids = Ids::new();
+    let page_id = crate::oplog::PageId::from_uuid(uuid(40_350));
+    let page_home = crate::oplog::DocumentId::from_uuid(uuid(40_351));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(40_352));
+    let block_home = test_block_home(block_id);
+    let dir = TestDir::new("same-batch-page-block-create-delete");
+    let archive = store(&dir, ids);
+    let mut engine = ids.engine();
+    let prepared = engine
+        .prepare_fixture_transaction(
+            author(40_353, 40_353),
+            &tx(vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id: page_home,
+                    name: crate::oplog::LogicalPageName::parse("Ephemeral Birth").unwrap(),
+                    path: path("pages/ephemeral-birth.md"),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: block_home,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "retained tombstone content".into(),
+                },
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ]),
+        )
+        .unwrap();
+    let effect = semantic_effect(&prepared);
+    assert!(matches!(
+        effect.pages(),
+        [delta] if delta.page_id == page_id
+            && delta.before.is_none()
+            && matches!(delta.after, Some(crate::oplog::PageState::Tombstone { .. }))
+    ));
+    assert!(matches!(
+        effect.blocks(),
+        [delta] if delta.block_id == block_id
+            && delta.birth.as_ref().is_some_and(|birth| birth.page_id == page_id && birth.page_document_id == page_home)
+            && matches!(delta.after.as_ref().map(|state| state.owner), Some(crate::oplog::BlockOwner::Tombstone))
+    ));
+    let accepted = ready(&archive, &prepared);
+    let outcome = engine.stage_ready(accepted.clone());
+    assert!(
+        matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+        "same-batch page/block create/delete was refused: {outcome:?}"
+    );
+    assert!(matches!(
+        engine.materialize_page(page_id),
+        Err(EngineError::PageDeleted(found)) if found == page_id
+    ));
+    assert!(matches!(
+        engine
+            .recover_block_state(block_home, block_id)
+            .unwrap()
+            .map(|state| state.owner),
+        Some(crate::oplog::BlockOwner::Tombstone)
+    ));
+
+    let mut replay = ids.engine();
+    let replay_outcome = replay.stage_ready(accepted);
+    assert!(matches!(
+        replay_outcome.disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        replay.materialize_page(page_id),
+        Err(EngineError::PageDeleted(found)) if found == page_id
+    ));
+}
+
+#[test]
+fn move_into_a_deleted_page_is_indexed_and_removed_by_exact_revival() {
+    let ids = Ids::new();
+    let dir = TestDir::new("deleted-page-owner-change-revive");
+    let archive = store(&dir, ids);
+    let (mut engine, _) = seed_engine(ids, &archive);
+    let predecessor = engine
+        .materialize_page_for_projection(ids.page_b)
+        .unwrap()
+        .frontier;
+    let deletion = engine
+        .prepare_fixture_transaction(
+            author(40_400, 40_400),
+            &tx(vec![SemanticOperation::DeletePage {
+                page_id: ids.page_b,
+            }]),
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &deletion)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let moved = engine
+        .prepare_fixture_transaction(
+            author(40_401, 40_401),
+            &tx(vec![SemanticOperation::MoveSubtree {
+                root: BlockLocation {
+                    block_id: ids.block_a,
+                    home_document_id: test_block_home(ids.block_a),
+                },
+                from_page_id: ids.page_a,
+                to_page_id: ids.page_b,
+                parent: None,
+                order: "moved-while-deleted".into(),
+            }]),
+        )
+        .unwrap();
+    let moved_outcome = engine.stage_ready(ready(&archive, &moved));
+    assert!(
+        matches!(moved_outcome.disposition, BatchDisposition::Accepted { .. }),
+        "move into deleted page was refused: {moved_outcome:?}"
+    );
+    assert!(matches!(
+        engine.materialize_page(ids.page_b),
+        Err(EngineError::PageDeleted(found)) if found == ids.page_b
+    ));
+    assert!(matches!(
+        engine
+            .recover_block_state(test_block_home(ids.block_a), ids.block_a)
+            .unwrap()
+            .map(|state| state.owner),
+        Some(crate::oplog::BlockOwner::Page(found)) if found == ids.page_b
+    ));
+
+    let operations = engine
+        .plan_revive_page_operations(ids.page_b, &predecessor, None)
+        .unwrap();
+    assert!(operations.iter().any(|operation| matches!(
+        operation,
+        SemanticOperation::DeleteSubtree { root_block_id, page_id }
+            if *root_block_id == ids.block_a && *page_id == ids.page_b
+    )));
+    let revival = engine
+        .prepare_fixture_transaction(author(40_402, 40_402), &tx(operations))
+        .unwrap();
+    let revival_outcome = engine.stage_ready(ready(&archive, &revival));
+    assert!(
+        matches!(
+            revival_outcome.disposition,
+            BatchDisposition::Accepted { .. }
+        ),
+        "exact revival after a deleted-page owner change was refused: {revival_outcome:?}"
+    );
+    assert!(engine
+        .materialize_page(ids.page_b)
+        .unwrap()
+        .blocks
+        .is_empty());
+    assert!(matches!(
+        engine
+            .recover_block_state(test_block_home(ids.block_a), ids.block_a)
+            .unwrap()
+            .map(|state| state.owner),
+        Some(crate::oplog::BlockOwner::Tombstone)
+    ));
+}
+
+#[test]
+fn old_pair_reorder_racing_a_move_converges_without_resurrecting_the_old_pair() {
+    let ids = Ids::new();
+    let dir = TestDir::new("old-pair-reorder-vs-move");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let (reordered, moved) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(40_450, 40_450),
+        tx(vec![SemanticOperation::ReorderBlock {
+            block_id: ids.block_a,
+            page_id: ids.page_a,
+            parent: None,
+            order: "old-pair-reorder".into(),
+        }]),
+        author(40_451, 40_451),
+        tx(vec![SemanticOperation::MoveSubtree {
+            root: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: test_block_home(ids.block_a),
+            },
+            from_page_id: ids.page_a,
+            to_page_id: ids.page_b,
+            parent: None,
+            order: "destination-move".into(),
+        }]),
+    );
+
+    let apply = |first: ValidatedBatch, second: ValidatedBatch| {
+        let mut engine = ids.engine();
+        assert!(matches!(
+            engine.stage_ready(baseline.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        for batch in [first, second] {
+            let outcome = engine.stage_ready(batch);
+            assert!(
+                matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+                "reorder/move branch was refused: {outcome:?}"
+            );
+        }
+        assert!(engine
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .is_empty());
+        let destination = engine.materialize_page(ids.page_b).unwrap();
+        assert_eq!(destination.blocks.len(), 1);
+        assert_eq!(destination.blocks[0].block_id, ids.block_a);
+        engine.canonical_snapshot().unwrap()
+    };
+    assert_eq!(
+        apply(reordered.clone(), moved.clone()),
+        apply(moved, reordered)
+    );
 }
 
 #[test]
@@ -815,29 +1806,30 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
         )
         .unwrap();
 
-    let create_catalog_payload: TestCrdtUpdatePayload = postcard::from_bytes(
+    let create_page_payload: TestCrdtUpdatePayload = postcard::from_bytes(
         create
             .objects()
             .iter()
             .find(|object| {
-                object.kind() == ObjectKind::CrdtUpdate && object.document_id() == ids.catalog
+                object.kind() == ObjectKind::CrdtUpdate
+                    && object.document_id() == DocumentKey::Entity(ids.home_a)
             })
             .unwrap()
             .payload(),
     )
     .unwrap();
-    let catalog = LoroDoc::new();
-    assert!(catalog
-        .import(&create_catalog_payload.raw_update)
+    let page_document = LoroDoc::new();
+    assert!(page_document
+        .import(&create_page_payload.raw_update)
         .unwrap()
         .pending
         .is_none());
-    let catalog_before = catalog.oplog_vv();
-    catalog.set_peer_id(42_001).unwrap();
-    catalog
-        .get_map("pages")
+    let page_before = page_document.oplog_vv();
+    page_document.set_peer_id(42_001).unwrap();
+    page_document
+        .get_map("meta")
         .insert(
-            &ids.page_a.to_string(),
+            "state",
             serde_json::to_string(&PageState::Tombstone {
                 name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                 home_document_id: ids.home_a,
@@ -846,9 +1838,9 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
             .unwrap(),
         )
         .unwrap();
-    catalog.commit();
-    let forged_catalog_update = catalog
-        .export(ExportMode::updates(&catalog_before))
+    page_document.commit();
+    let forged_page_update = page_document
+        .export(ExportMode::updates(&page_before))
         .unwrap();
 
     let declared = semantic_effect(&delete);
@@ -876,10 +1868,10 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
                 tampered_effect.clone(),
             )
             .unwrap(),
-            ObjectKind::CrdtUpdate if object.document_id() == ids.catalog => {
+            ObjectKind::CrdtUpdate if object.document_id() == DocumentKey::Entity(ids.home_a) => {
                 let mut payload: TestCrdtUpdatePayload =
                     postcard::from_bytes(object.payload()).unwrap();
-                payload.raw_update = forged_catalog_update.clone();
+                payload.raw_update = forged_page_update.clone();
                 OperationObject::new(
                     ids.workspace,
                     object.document_id(),
@@ -974,7 +1966,7 @@ fn page_preamble_is_authoritative_across_replay_move_and_rename() {
                 SemanticOperation::MoveSubtree {
                     root: BlockLocation {
                         block_id: ids.block_a,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(ids.block_a),
                     },
                     from_page_id: ids.page_a,
                     to_page_id: ids.page_b,
@@ -1086,7 +2078,40 @@ fn projection_write_authorization_requires_durable_engine_derived_state() {
         durable.stage_archive_batch(batch_id).unwrap().disposition,
         BatchDisposition::Accepted { .. }
     ));
+    let expected_state = durable.materialize_page_for_projection(ids.page_a).unwrap();
+    let head_occurrences = expected_state
+        .frontier
+        .documents()
+        .iter()
+        .map(|document| document.direct_dependency_heads().len())
+        .sum::<usize>();
+    let distinct_heads = expected_state
+        .frontier
+        .documents()
+        .iter()
+        .flat_map(|document| document.direct_dependency_heads().iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(distinct_heads, std::collections::BTreeSet::from([batch_id]));
+    assert!(
+        head_occurrences > distinct_heads.len(),
+        "the fixture must name one shared batch from multiple document frontiers"
+    );
+
+    let before = durable.instrumentation().store;
     let authorization = durable.authorize_projection_write(ids.page_a).unwrap();
+    let after = durable.instrumentation().store;
+    assert_eq!(authorization.state(), &expected_state);
+    assert_eq!(
+        after.inspected_manifest_operations - before.inspected_manifest_operations,
+        distinct_heads.len(),
+        "authorization must inspect each distinct direct batch exactly once; \
+         {head_occurrences} frontier occurrences named {distinct_heads:?}"
+    );
+    assert_eq!(
+        after.inspected_object_operations - before.inspected_object_operations,
+        prepared.manifest().required_objects().len(),
+        "the one distinct batch must still validate every required original object"
+    );
     assert_eq!(authorization.state().page.page_id, ids.page_a);
     assert!(!authorization.state().frontier.documents().is_empty());
     assert!(authorization
@@ -1096,6 +2121,18 @@ fn projection_write_authorization_requires_durable_engine_derived_state() {
         .iter()
         .flat_map(|document| document.direct_dependency_heads())
         .all(|head| *head == batch_id));
+
+    let missing_object = prepared.manifest().required_objects()[0].content_digest();
+    std::fs::remove_file(
+        archive_path
+            .join(super::sync_layout::ARCHIVE_OBJECTS_DIR)
+            .join(format!("{missing_object}.object")),
+    )
+    .unwrap();
+    assert!(matches!(
+        durable.authorize_projection_write(ids.page_a),
+        Err(EngineError::ProjectionFrontierNotDurable(found)) if found == batch_id
+    ));
 }
 
 #[test]
@@ -1106,7 +2143,7 @@ fn logseq_uuid_assignment_is_explicit_idempotent_replaceable_and_removable() {
     let (mut engine, _) = seed_engine(ids, &archive);
     let block = BlockLocation {
         block_id: ids.block_a,
-        home_document_id: ids.home_a,
+        home_document_id: test_block_home(ids.block_a),
     };
     let first = LogseqUuid::from_uuid(uuid(40_001));
     let second = LogseqUuid::from_uuid(uuid(40_002));
@@ -1231,7 +2268,7 @@ fn logseq_uuid_concurrent_assignment_converges_and_survives_move_delete() {
     let (_, baseline) = seed_engine(ids, &archive);
     let block = BlockLocation {
         block_id: ids.block_a,
-        home_document_id: ids.home_a,
+        home_document_id: test_block_home(ids.block_a),
     };
     let left_uuid = LogseqUuid::from_uuid(uuid(41_001));
     let right_uuid = LogseqUuid::from_uuid(uuid(41_002));
@@ -1300,7 +2337,7 @@ fn logseq_uuid_concurrent_assignment_converges_and_survives_move_delete() {
         BatchDisposition::Accepted { .. }
     ));
     assert_eq!(
-        ab.recover_block_state(ids.home_a, ids.block_a)
+        ab.recover_block_state(ids.block_home_a(), ids.block_a)
             .unwrap()
             .unwrap()
             .logseq_uuid,
@@ -1330,7 +2367,7 @@ fn logseq_uuid_restarts_and_replays_from_the_stable_home_shard() {
             &tx(vec![SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 mutation: LogseqIdentityMutation::AssignExternal {
                     logseq_uuid: assigned_uuid,
@@ -1362,7 +2399,7 @@ fn logseq_uuid_restarts_and_replays_from_the_stable_home_shard() {
     );
     assert_eq!(
         replay
-            .recover_block_state(ids.home_a, ids.block_a)
+            .recover_block_state(ids.block_home_a(), ids.block_a)
             .unwrap()
             .unwrap()
             .logseq_uuid,
@@ -1384,14 +2421,14 @@ fn projection_page_frontier_is_exact_and_same_batch_uuid_reference_is_atomic() {
                 SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
                         block_id: ids.block_a,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(ids.block_a),
                     },
                     mutation: LogseqIdentityMutation::Generate {
                         logseq_uuid: assigned_uuid,
                         trigger: LogseqIdentityTrigger::BlockReference {
                             referrer: BlockLocation {
                                 block_id: ids.block_c,
-                                home_document_id: ids.home_c,
+                                home_document_id: test_block_home(ids.block_c),
                             },
                         },
                     },
@@ -1399,7 +2436,7 @@ fn projection_page_frontier_is_exact_and_same_batch_uuid_reference_is_atomic() {
                 SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block_c,
-                        home_document_id: ids.home_c,
+                        home_document_id: test_block_home(ids.block_c),
                     },
                     content: format!("same-batch reference (({assigned_uuid}))"),
                 },
@@ -1414,7 +2451,13 @@ fn projection_page_frontier_is_exact_and_same_batch_uuid_reference_is_atomic() {
         .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
         .map(|object| object.document_id())
         .collect();
-    assert_eq!(updated_documents, vec![ids.home_a, ids.home_c]);
+    assert_eq!(
+        updated_documents,
+        vec![
+            DocumentKey::Entity(ids.block_home_a()),
+            DocumentKey::Entity(ids.block_home_c())
+        ]
+    );
     assert!(matches!(
         engine.stage_ready(ready(&archive, &anchored)).disposition,
         BatchDisposition::Accepted { no_op: false }
@@ -1434,12 +2477,22 @@ fn projection_page_frontier_is_exact_and_same_batch_uuid_reference_is_atomic() {
         .iter()
         .map(DocumentDependencies::document_id)
         .collect();
-    assert_eq!(page_a_documents, vec![ids.catalog, ids.home_a]);
+    assert_eq!(
+        page_a_documents,
+        vec![
+            DocumentKey::Entity(ids.home_a),
+            DocumentKey::Entity(ids.block_home_a()),
+            DocumentKey::Membership {
+                block_document_id: ids.block_home_a(),
+                page_document_id: ids.home_a,
+            },
+        ]
+    );
     assert!(page_a
         .frontier
         .documents()
         .iter()
-        .find(|document| document.document_id() == ids.home_a)
+        .find(|document| document.document_id() == DocumentKey::Entity(ids.block_home_a()))
         .unwrap()
         .direct_dependency_heads()
         .contains(&anchored_id));
@@ -1455,17 +2508,28 @@ fn projection_page_frontier_is_exact_and_same_batch_uuid_reference_is_atomic() {
         .iter()
         .map(DocumentDependencies::document_id)
         .collect();
-    assert_eq!(page_c_documents, vec![ids.catalog, ids.home_a, ids.home_c]);
+    assert_eq!(
+        page_c_documents,
+        vec![
+            DocumentKey::Entity(ids.home_c),
+            DocumentKey::Entity(ids.block_home_a()),
+            DocumentKey::Entity(ids.block_home_c()),
+            DocumentKey::Membership {
+                block_document_id: ids.block_home_c(),
+                page_document_id: ids.home_c,
+            },
+        ]
+    );
     assert!(page_c
         .frontier
         .documents()
         .iter()
-        .find(|document| document.document_id() == ids.home_c)
+        .find(|document| document.document_id() == DocumentKey::Entity(ids.block_home_c()))
         .unwrap()
         .direct_dependency_heads()
         .contains(&anchored_id));
-    assert!(!page_a_documents.contains(&ids.home_c));
-    assert!(page_c_documents.contains(&ids.home_a));
+    assert!(!page_a_documents.contains(&DocumentKey::Entity(ids.block_home_c())));
+    assert!(page_c_documents.contains(&DocumentKey::Entity(ids.block_home_a())));
 }
 
 #[test]
@@ -1476,11 +2540,11 @@ fn policy_generated_identity_requires_typed_same_batch_content_or_user_action() 
     let (mut engine, _) = seed_engine(ids, &archive);
     let target = BlockLocation {
         block_id: ids.block_a,
-        home_document_id: ids.home_a,
+        home_document_id: test_block_home(ids.block_a),
     };
     let referrer = BlockLocation {
         block_id: ids.block_c,
-        home_document_id: ids.home_c,
+        home_document_id: test_block_home(ids.block_c),
     };
     let embed_uuid = LogseqUuid::from_uuid(uuid(43_100));
 
@@ -1714,7 +2778,7 @@ fn policy_generated_identity_requires_typed_same_batch_content_or_user_action() 
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: exported_block,
-                        home_document_id: ids.home_b,
+                        home_document_id: test_block_home(exported_block),
                     },
                     page_id: ids.page_b,
                     parent: None,
@@ -1724,7 +2788,7 @@ fn policy_generated_identity_requires_typed_same_batch_content_or_user_action() 
                 SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
                         block_id: exported_block,
-                        home_document_id: ids.home_b,
+                        home_document_id: test_block_home(exported_block),
                     },
                     mutation: LogseqIdentityMutation::Generate {
                         logseq_uuid: exported_uuid,
@@ -1766,7 +2830,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
             &tx(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: block_b,
-                    home_document_id: ids.home_b,
+                    home_document_id: test_block_home(block_b),
                 },
                 page_id: ids.page_b,
                 parent: None,
@@ -1789,7 +2853,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
         tx(vec![SemanticOperation::MutateBlockLogseqIdentity {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             mutation: LogseqIdentityMutation::AssignExternal {
                 logseq_uuid: duplicate,
@@ -1799,7 +2863,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
         tx(vec![SemanticOperation::MutateBlockLogseqIdentity {
             block: BlockLocation {
                 block_id: block_b,
-                home_document_id: ids.home_b,
+                home_document_id: test_block_home(block_b),
             },
             mutation: LogseqIdentityMutation::AssignExternal {
                 logseq_uuid: duplicate,
@@ -1863,7 +2927,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_c,
-                    home_document_id: ids.home_c,
+                    home_document_id: test_block_home(ids.block_c),
                 },
                 content: format!("ambiguous (({duplicate}))"),
             }]),
@@ -1887,7 +2951,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
             &tx(vec![SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: block_b,
-                    home_document_id: ids.home_b,
+                    home_document_id: test_block_home(block_b),
                 },
                 mutation: LogseqIdentityMutation::RemoveExternal,
             }]),
@@ -1904,8 +2968,8 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
         .iter()
         .map(DocumentDependencies::document_id)
         .collect();
-    assert!(unique_documents.contains(&ids.home_a));
-    assert!(unique_documents.contains(&ids.home_b));
+    assert!(unique_documents.contains(&DocumentKey::Entity(ids.block_home_a())));
+    assert!(unique_documents.contains(&DocumentKey::Entity(test_block_home(block_b))));
     assert_eq!(unique_frontier.claim_evidence.len(), 1);
     assert_eq!(unique_frontier.claim_evidence[0].participants().len(), 2);
 
@@ -1915,7 +2979,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
             &tx(vec![SemanticOperation::MutateBlockLogseqIdentity {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 mutation: LogseqIdentityMutation::RemoveExternal,
             }]),
@@ -1936,8 +3000,8 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
         .iter()
         .map(DocumentDependencies::document_id)
         .collect();
-    assert!(removed_documents.contains(&ids.home_a));
-    assert!(removed_documents.contains(&ids.home_b));
+    assert!(removed_documents.contains(&DocumentKey::Entity(ids.block_home_a())));
+    assert!(removed_documents.contains(&DocumentKey::Entity(test_block_home(block_b))));
     assert_eq!(removed_frontier.claim_evidence[0].participants().len(), 2);
     assert_ne!(unique_frontier.frontier, removed_frontier.frontier);
 }
@@ -1956,7 +3020,7 @@ fn deleting_page_invalidates_uuid_claim_but_retains_participant_evidence() {
                 SemanticOperation::MutateBlockLogseqIdentity {
                     block: BlockLocation {
                         block_id: ids.block_a,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(ids.block_a),
                     },
                     mutation: LogseqIdentityMutation::AssignExternal {
                         logseq_uuid: claimed,
@@ -1965,7 +3029,7 @@ fn deleting_page_invalidates_uuid_claim_but_retains_participant_evidence() {
                 SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block_c,
-                        home_document_id: ids.home_c,
+                        home_document_id: test_block_home(ids.block_c),
                     },
                     content: format!("reference (({claimed}))"),
                 },
@@ -2024,7 +3088,7 @@ fn deleting_page_invalidates_uuid_claim_but_retains_participant_evidence() {
         .frontier
         .documents()
         .iter()
-        .any(|document| document.document_id() == ids.home_a));
+        .any(|document| document.document_id() == DocumentKey::Entity(ids.block_home_a())));
     replay.authorize_projection_write(ids.page_c).unwrap();
 }
 
@@ -2045,7 +3109,7 @@ fn store_backed_uuid_claim_lookup_stays_point_local_and_hot_memory_bounded() {
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(block_id),
             },
             page_id: ids.page_a,
             parent: None,
@@ -2055,7 +3119,7 @@ fn store_backed_uuid_claim_lookup_stays_point_local_and_hot_memory_bounded() {
         operations.push(SemanticOperation::MutateBlockLogseqIdentity {
             block: BlockLocation {
                 block_id,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(block_id),
             },
             mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
         });
@@ -2083,7 +3147,8 @@ fn store_backed_uuid_claim_lookup_stays_point_local_and_hot_memory_bounded() {
     assert!(matches!(
         replay.resolve_logseq_uuid(target_uuid),
         Ok(LogseqUuidResolution::Unique(claim))
-            if claim.block_id == target_block && claim.home_document_id == ids.home_a
+            if claim.block_id == target_block
+                && claim.home_document_id == test_block_home(target_block)
     ));
     let after = replay.instrumentation();
     assert_eq!(after.logseq_claim_hot_entries, CLAIMS);
@@ -2133,7 +3198,13 @@ fn rebuild(
         manifest.author_device_id(),
         manifest.author_session_id(),
         BatchOrigin::BootstrapImport,
-        BatchCausalDot::new(CausalPeerId::from_device_id(manifest.author_device_id()), 1).unwrap(),
+        BatchCausalDot::new(
+            CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+                manifest.author_device_id(),
+            )),
+            1,
+        )
+        .unwrap(),
         causal_dependency_heads,
         frontier,
         SemanticEffectDigest::of(semantic.payload()),
@@ -2170,7 +3241,13 @@ fn rebuild_as(
         manifest.author_device_id(),
         manifest.author_session_id(),
         BatchOrigin::BootstrapImport,
-        BatchCausalDot::new(CausalPeerId::from_device_id(manifest.author_device_id()), 1).unwrap(),
+        BatchCausalDot::new(
+            CausalPeerId::from_key(WriterIncarnationId::fixture_for_device(
+                manifest.author_device_id(),
+            )),
+            1,
+        )
+        .unwrap(),
         causal_dependency_heads,
         frontier,
         SemanticEffectDigest::of(semantic.payload()),
@@ -2184,7 +3261,7 @@ fn rebuild_as(
 struct TestCrdtUpdatePayload {
     schema_version: u32,
     batch_id: BatchId,
-    document_id: DocumentId,
+    document_id: DocumentKey,
     dependency_heads: Vec<BatchId>,
     batch_dependency_heads: Vec<BatchId>,
     causal_state_digest: Option<DocumentCausalDigest>,
@@ -2269,7 +3346,7 @@ fn moved_away_block_keeps_stable_home_and_page_read_loads_only_referenced_homes(
             &tx(vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 from_page_id: ids.page_a,
                 to_page_id: ids.page_b,
@@ -2290,12 +3367,15 @@ fn moved_away_block_keeps_stable_home_and_page_read_loads_only_referenced_homes(
         .is_empty());
     let page = engine.materialize_page(ids.page_b).unwrap();
     assert_eq!(page.blocks.len(), 1);
-    assert_eq!(page.blocks[0].home_document_id, ids.home_a);
+    assert_eq!(page.blocks[0].home_document_id, ids.block_home_a());
     assert_eq!(page.blocks[0].content, "home A content");
     assert_eq!(page.stats.catalog_documents_loaded, 1);
     assert_eq!(page.stats.membership_documents_loaded, 1);
-    assert_eq!(page.stats.distinct_home_documents, vec![ids.home_a]);
-    assert!(!page.stats.distinct_home_documents.contains(&ids.home_c));
+    assert_eq!(page.stats.distinct_home_documents, vec![ids.block_home_a()]);
+    assert!(!page
+        .stats
+        .distinct_home_documents
+        .contains(&ids.block_home_c()));
 }
 
 #[test]
@@ -2310,7 +3390,7 @@ fn malformed_unrelated_shard_rejects_without_poisoning_sparse_page_reads() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_c,
-                    home_document_id: ids.home_c,
+                    home_document_id: test_block_home(ids.block_c),
                 },
                 content: "will be malformed".into(),
             }]),
@@ -2345,7 +3425,7 @@ fn malformed_unrelated_shard_rejects_without_poisoning_sparse_page_reads() {
     ));
     let page = engine.materialize_page(ids.page_a).unwrap();
     assert_eq!(page.blocks[0].content, "home A content");
-    assert_eq!(page.stats.distinct_home_documents, vec![ids.home_a]);
+    assert_eq!(page.stats.distinct_home_documents, vec![ids.block_home_a()]);
 
     let dependent = engine
         .prepare_fixture_transaction(
@@ -2353,7 +3433,7 @@ fn malformed_unrelated_shard_rejects_without_poisoning_sparse_page_reads() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "must not publish".into(),
             }]),
@@ -2383,7 +3463,13 @@ fn malformed_unrelated_shard_rejects_without_poisoning_sparse_page_reads() {
 
 #[test]
 fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range_scan() {
-    const PAGES: usize = 70;
+    const CATALOG_DOCUMENTS: usize = 1;
+    const MAX_HOT_DOCUMENTS: usize = MAX_HOT_NON_CATALOG_DOCUMENTS + CATALOG_DOCUMENTS;
+    // Each page contributes its page entity, block entity, and membership
+    // document. Crossing half the non-catalog limit therefore retires every
+    // page entity plus a small margin of block entities, using fewer pages
+    // than the non-catalog document limit.
+    const PAGES: usize = MAX_HOT_NON_CATALOG_DOCUMENTS / 2 + 8;
     let ids = Ids::new();
     let dir = TestDir::new("cold-aged-page");
     let archive_path = dir.path().join("archive");
@@ -2407,7 +3493,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id,
-                home_document_id,
+                home_document_id: test_block_home(block_id),
             },
             page_id,
             parent: None,
@@ -2430,18 +3516,27 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
             .disposition,
         BatchDisposition::Accepted { .. }
     ));
-    assert!(engine.instrumentation().document_hot_entries <= 65);
+    assert!(engine.instrumentation().document_hot_entries <= MAX_HOT_DOCUMENTS);
 
-    let cold_page = PageId::from_uuid(uuid(80_000));
-    let cold_home = DocumentId::from_uuid(uuid(81_000));
-    let cold_block = crate::oplog::BlockId::from_uuid(uuid(82_000));
+    let cold_index = (0..PAGES)
+        .min_by_key(|index| {
+            test_block_home(crate::oplog::BlockId::from_uuid(uuid(
+                82_000 + *index as u128,
+            )))
+        })
+        .unwrap();
+    let cold_page = PageId::from_uuid(uuid(80_000 + cold_index as u128));
+    let cold_home = DocumentId::from_uuid(uuid(81_000 + cold_index as u128));
+    let cold_block = crate::oplog::BlockId::from_uuid(uuid(82_000 + cold_index as u128));
+    assert!(!engine.is_document_resident_for_test(DocumentKey::Entity(cold_home)));
+    assert!(!engine.is_document_resident_for_test(DocumentKey::Entity(test_block_home(cold_block))));
     let edit = author_engine
         .prepare_fixture_transaction(
             author(83_001, 83_000),
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: cold_block,
-                    home_document_id: cold_home,
+                    home_document_id: test_block_home(cold_block),
                 },
                 content: "edited after eviction".into(),
             }]),
@@ -2463,7 +3558,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
     let materialized = engine.materialize_page(cold_page).unwrap();
     assert_eq!(materialized.blocks[0].content, "edited after eviction");
     let instrumentation = engine.instrumentation();
-    assert!(instrumentation.document_hot_entries <= 65);
+    assert!(instrumentation.document_hot_entries <= MAX_HOT_DOCUMENTS);
 
     let genesis_id = genesis.manifest().batch_id();
     let edit_id = edit.manifest().batch_id();
@@ -2481,7 +3576,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
             BatchDisposition::Accepted { .. }
         ));
     }
-    assert!(replay.instrumentation().document_hot_entries <= 65);
+    assert!(replay.instrumentation().document_hot_entries <= MAX_HOT_DOCUMENTS);
     assert_eq!(
         replay.materialize_page(cold_page).unwrap().blocks[0].content,
         "edited after eviction"
@@ -2493,7 +3588,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: cold_block,
-                    home_document_id: cold_home,
+                    home_document_id: test_block_home(cold_block),
                 },
                 content: "authored after cold replay".into(),
             }]),
@@ -2511,7 +3606,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
         replay.materialize_page(cold_page).unwrap().blocks[0].content,
         "authored after cold replay"
     );
-    assert!(replay.instrumentation().document_hot_entries <= 65);
+    assert!(replay.instrumentation().document_hot_entries <= MAX_HOT_DOCUMENTS);
 }
 
 #[test]
@@ -2556,7 +3651,7 @@ fn external_cold_replay_concurrent_old_base_map_and_text_edits_converge() {
         tx(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             content: "concurrent left text".into(),
         }]),
@@ -2564,7 +3659,7 @@ fn external_cold_replay_concurrent_old_base_map_and_text_edits_converge() {
         tx(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             content: "concurrent right text".into(),
         }]),
@@ -2648,7 +3743,7 @@ fn late_block_creation_after_long_causal_chain_uses_bounded_semantic_replay() {
             &tx(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 page_id: ids.page_a,
                 parent: None,
@@ -2739,14 +3834,13 @@ fn materialization_block_collection_has_one_owner_and_no_owned_arena() {
     let region = &source[start..end];
 
     assert_eq!(
-        region.matches("let members = read_memberships(").count(),
+        region.matches("fn materialize_page_blocks").count(),
         1,
-        "I-12: the from-state and hot paths must share one membership/block collection loop; imitate materialize_page_blocks in oplog/hot_engine.rs"
+        "I-12: one helper owns membership and block collection"
     );
-    assert_eq!(
-        region.matches("let mut by_home =").count(),
-        1,
-        "I-12: the home grouping loop must have one owner; imitate materialize_page_blocks in oplog/hot_engine.rs"
+    assert!(
+        !region.contains("let mut by_home ="),
+        "the one-document-per-block layout must not rebuild the retired shard grouping"
     );
     assert_eq!(
         region.matches("self.materialize_page_blocks(").count(),
@@ -2758,7 +3852,7 @@ fn materialization_block_collection_has_one_owner_and_no_owned_arena() {
         "I-9: the owned arm must hold at most one hot-document clone at a time (oplog/hot_engine.rs materialize_page_blocks)"
     );
     assert!(
-        region.contains(".then(|| document(*home_document_id))"),
+        region.contains("let home = document(home_id)?;"),
         "I-9: the borrowed arm must resolve documents lazily per home (oplog/hot_engine.rs materialize_page_blocks)"
     );
     assert!(
@@ -2931,6 +4025,8 @@ fn crdt_payload_is_bound_to_batch_and_same_batch_replay_is_a_duplicate_noop() {
 fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order() {
     let ids = Ids::new();
     let block_id = crate::oplog::BlockId::from_uuid(uuid(32));
+    let block_home_a = claim_home(block_id, ids.home_a);
+    let block_home_b = claim_home(block_id, ids.home_b);
     let dir = TestDir::new("concurrent-immutable-home-conflict");
     let archive_path = dir.path().join("archive");
     let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
@@ -2980,7 +4076,7 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             &tx(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_a,
+                    home_document_id: block_home_a,
                 },
                 page_id: ids.page_a,
                 parent: None,
@@ -2995,7 +4091,7 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             &tx(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_b,
+                    home_document_id: block_home_b,
                 },
                 page_id: ids.page_b,
                 parent: None,
@@ -3031,7 +4127,7 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_a,
+                    home_document_id: block_home_a,
                 },
                 content: "later content A".into(),
             }]),
@@ -3043,7 +4139,7 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_b,
+                    home_document_id: block_home_b,
                 },
                 content: "later content B".into(),
             }]),
@@ -3064,8 +4160,8 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
 
     let expected = ImmutableHomeEvidence::new(vec![ImmutableHomeConflict::new(
         block_id,
-        ImmutableHomeClaim::new(batch_a_id, ids.home_a),
-        ImmutableHomeClaim::new(batch_b_id, ids.home_b),
+        ImmutableHomeClaim::new(batch_a_id, block_home_a),
+        ImmutableHomeClaim::new(batch_b_id, block_home_b),
     )]);
     for (mut engine, staged, conflicting) in [
         (author_a, dependent_b.clone(), batch_b.clone()),
@@ -3109,7 +4205,7 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             Err(EngineError::WorkspaceBlocked(found)) if found == expected_handle
         ));
         assert!(matches!(
-            engine.recover_block_state(ids.home_a, block_id),
+            engine.recover_block_state(block_home_a, block_id),
             Err(EngineError::WorkspaceBlocked(found)) if found == expected_handle
         ));
         assert_eq!(engine.status().accepted_batch_ids().unwrap().len(), 2);
@@ -3208,13 +4304,25 @@ fn crossed_concurrent_identity_collisions_converge_live_and_from_fresh_store() {
     let expected = ImmutableHomeEvidence::new(vec![
         ImmutableHomeConflict::new(
             block_x,
-            ImmutableHomeClaim::new(prepared_a.manifest().batch_id(), ids.home_a),
-            ImmutableHomeClaim::new(prepared_b.manifest().batch_id(), ids.home_b),
+            ImmutableHomeClaim::new(
+                prepared_a.manifest().batch_id(),
+                claim_home(block_x, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                prepared_b.manifest().batch_id(),
+                claim_home(block_x, ids.home_b),
+            ),
         ),
         ImmutableHomeConflict::new(
             block_y,
-            ImmutableHomeClaim::new(prepared_b.manifest().batch_id(), ids.home_a),
-            ImmutableHomeClaim::new(prepared_a.manifest().batch_id(), ids.home_b),
+            ImmutableHomeClaim::new(
+                prepared_b.manifest().batch_id(),
+                claim_home(block_y, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                prepared_a.manifest().batch_id(),
+                claim_home(block_y, ids.home_b),
+            ),
         ),
     ]);
 
@@ -3288,7 +4396,7 @@ fn concurrent_same_home_duplicate_creation_converges_after_fresh_replay() {
             &tx(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_a,
+                    home_document_id: claim_home(block_id, ids.home_a),
                 },
                 page_id: ids.page_a,
                 parent: None,
@@ -3418,9 +4526,18 @@ fn three_concurrent_identity_claims_and_later_blocked_ingress_have_one_evidence_
     let expected = ImmutableHomeEvidence::new(vec![ImmutableHomeConflict::from_claims(
         block_id,
         [
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(211)), ids.home_a),
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(212)), ids.home_b),
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(213)), ids.home_c),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(211)),
+                claim_home(block_id, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(212)),
+                claim_home(block_id, ids.home_b),
+            ),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(213)),
+                claim_home(block_id, ids.home_c),
+            ),
         ],
     )]);
     assert_eq!(evidence, vec![expected; permutations.len()]);
@@ -3480,13 +4597,25 @@ fn correction6_four_independent_claims_retain_complete_evidence_in_all_orders() 
     let expected = ImmutableHomeEvidence::new(vec![
         ImmutableHomeConflict::new(
             block_x,
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(241)), ids.home_a),
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(242)), ids.home_b),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(241)),
+                claim_home(block_x, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(242)),
+                claim_home(block_x, ids.home_b),
+            ),
         ),
         ImmutableHomeConflict::new(
             block_y,
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(243)), ids.home_a),
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(244)), ids.home_b),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(243)),
+                claim_home(block_y, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(244)),
+                claim_home(block_y, ids.home_b),
+            ),
         ),
     ]);
 
@@ -3521,7 +4650,7 @@ fn correction6_four_independent_claims_retain_complete_evidence_in_all_orders() 
         assert_eq!(instrumentation.conflict_hot_entries, 2);
         assert_eq!(instrumentation.batch_status_hot_entries, 5);
         assert_eq!(instrumentation.ready_payload_hot_entries, 0);
-        assert!(instrumentation.document_hot_entries <= 65);
+        assert!(instrumentation.document_hot_entries <= MAX_HOT_NON_CATALOG_DOCUMENTS + 1);
         assert_eq!(paged_fatal_evidence(&receiver), Some(expected.clone()));
     }
 }
@@ -3577,11 +4706,30 @@ fn correction6_blocked_frontier_validates_child_before_parent_and_finds_new_conf
     chain_author.stage_ready(parent_ready.clone());
     // The child BatchId deliberately sorts before its parent so blocked
     // draining must reach a fixed point instead of relying on BatchId order.
-    let child = create_blocks(
-        &chain_author,
-        259,
-        &[(conflict_y, ids.page_a, ids.home_a, "child")],
-    );
+    let child = chain_author
+        .prepare_fixture_transaction(
+            author(259, 259),
+            &tx(vec![
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: parent_block,
+                        home_document_id: claim_home(parent_block, ids.home_a),
+                    },
+                    content: "child depends on parent".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: conflict_y,
+                        home_document_id: claim_home(conflict_y, ids.home_a),
+                    },
+                    page_id: ids.page_a,
+                    parent: None,
+                    order: "child".into(),
+                    content: "child conflict".into(),
+                },
+            ]),
+        )
+        .unwrap();
     let child_ready = ready(&archive, &child);
 
     let mut receiver = ids.engine();
@@ -3611,13 +4759,25 @@ fn correction6_blocked_frontier_validates_child_before_parent_and_finds_new_conf
     let expected = ImmutableHomeEvidence::new(vec![
         ImmutableHomeConflict::new(
             conflict_x,
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(251)), ids.home_a),
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(252)), ids.home_b),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(251)),
+                claim_home(conflict_x, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(252)),
+                claim_home(conflict_x, ids.home_b),
+            ),
         ),
         ImmutableHomeConflict::new(
             conflict_y,
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(259)), ids.home_a),
-            ImmutableHomeClaim::new(BatchId::from_uuid(uuid(253)), ids.home_b),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(259)),
+                claim_home(conflict_y, ids.home_a),
+            ),
+            ImmutableHomeClaim::new(
+                BatchId::from_uuid(uuid(253)),
+                claim_home(conflict_y, ids.home_b),
+            ),
         ),
     ]);
     assert_eq!(receiver.fatal_evidence(), Some(&expected));
@@ -3736,7 +4896,7 @@ fn correction6_quarantined_parent_makes_causal_duplicate_child_reject() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: causal_duplicate,
-                    home_document_id: ids.home_a,
+                    home_document_id: claim_home(causal_duplicate, ids.home_a),
                 },
                 content: "dependency template".into(),
             }]),
@@ -3747,7 +4907,9 @@ fn correction6_quarantined_parent_makes_causal_duplicate_child_reject() {
         .dependency_frontier()
         .documents()
         .iter()
-        .find(|entry| entry.document_id() == ids.home_a)
+        .find(|entry| {
+            entry.document_id() == DocumentKey::Entity(claim_home(causal_duplicate, ids.home_a))
+        })
         .unwrap()
         .clone();
 
@@ -3833,7 +4995,7 @@ fn author_refuses_same_batch_cross_home_duplicate_without_retained_claim() {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id: ids.page_a,
                 parent: None,
@@ -3843,7 +5005,7 @@ fn author_refuses_same_batch_cross_home_duplicate_without_retained_claim() {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: ids.home_b,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id: ids.page_b,
                 parent: None,
@@ -3891,11 +5053,30 @@ fn mid_drain_acceptance_and_blocked_duplicate_report_truthful_batch_dispositions
     );
     let dependency_ready = ready(&archive, &dependency);
     author_b.stage_ready(dependency_ready.clone());
-    let claim_b = create_blocks(
-        &author_b,
-        233,
-        &[(conflict_id, ids.page_b, ids.home_b, "b")],
-    );
+    let claim_b = author_b
+        .prepare_fixture_transaction(
+            author(233, 233),
+            &tx(vec![
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: dependency_id,
+                        home_document_id: claim_home(dependency_id, ids.home_b),
+                    },
+                    content: "claim depends on dependency".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: conflict_id,
+                        home_document_id: claim_home(conflict_id, ids.home_b),
+                    },
+                    page_id: ids.page_b,
+                    parent: None,
+                    order: "b".into(),
+                    content: "conflicting claim".into(),
+                },
+            ]),
+        )
+        .unwrap();
     let claim_b_ready = ready(&archive, &claim_b);
 
     let mut receiver = ids.engine();
@@ -3972,7 +5153,7 @@ fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: child,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(child),
                     },
                     page_id: ids.page_a,
                     parent: Some(ids.block_a),
@@ -3990,7 +5171,7 @@ fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
                 SemanticOperation::MoveSubtree {
                     root: BlockLocation {
                         block_id: ids.block_a,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(ids.block_a),
                     },
                     from_page_id: ids.page_a,
                     to_page_id: ids.page_b,
@@ -4019,7 +5200,7 @@ fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
                 block_rewrites: vec![crate::oplog::BlockContentRewrite {
                     block: BlockLocation {
                         block_id: child,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(child),
                     },
                     new_content: "ref [[A Renamed]]".into(),
                 }],
@@ -4030,10 +5211,14 @@ fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
             }]),
         )
         .unwrap();
-    assert!(matches!(
-        engine.stage_ready(ready(&archive, &renamed)).disposition,
-        BatchDisposition::Accepted { .. }
-    ));
+    let renamed_outcome = engine.stage_ready(ready(&archive, &renamed));
+    assert!(
+        matches!(
+            renamed_outcome.disposition,
+            BatchDisposition::Accepted { .. }
+        ),
+        "rename outcome: {renamed_outcome:?}"
+    );
     let page_b = engine.materialize_page(ids.page_b).unwrap();
     assert_eq!(page_b.blocks.len(), 2);
     let child = page_b
@@ -4097,7 +5282,7 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: ids.block_a,
-                        home_document_id: ids.home_a,
+                        home_document_id: test_block_home(ids.block_a),
                     },
                     page_id: ids.page_a,
                     parent: None,
@@ -4107,7 +5292,7 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: child_block,
-                        home_document_id: ids.home_b,
+                        home_document_id: test_block_home(child_block),
                     },
                     page_id: ids.page_b,
                     parent: None,
@@ -4122,6 +5307,24 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
         BatchDisposition::Accepted { .. }
     ));
 
+    let mut block_rewrites = vec![
+        crate::oplog::BlockContentRewrite {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: test_block_home(ids.block_a),
+            },
+            new_content: "see [[Domain/Child]]".into(),
+        },
+        crate::oplog::BlockContentRewrite {
+            block: BlockLocation {
+                block_id: child_block,
+                home_document_id: test_block_home(child_block),
+            },
+            new_content: "back to [[Domain]]".into(),
+        },
+    ];
+    block_rewrites
+        .sort_unstable_by_key(|rewrite| (rewrite.block.home_document_id, rewrite.block.block_id));
     let rename = engine
         .prepare_fixture_transaction(
             author(43_001, 43_001),
@@ -4138,22 +5341,7 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
                         new_path: path("pages/domain___child.md"),
                     },
                 ],
-                block_rewrites: vec![
-                    crate::oplog::BlockContentRewrite {
-                        block: BlockLocation {
-                            block_id: ids.block_a,
-                            home_document_id: ids.home_a,
-                        },
-                        new_content: "see [[Domain/Child]]".into(),
-                    },
-                    crate::oplog::BlockContentRewrite {
-                        block: BlockLocation {
-                            block_id: child_block,
-                            home_document_id: ids.home_b,
-                        },
-                        new_content: "back to [[Domain]]".into(),
-                    },
-                ],
+                block_rewrites,
                 page_preamble_rewrites: vec![
                     crate::oplog::PagePreambleRewrite {
                         page_id: ids.page_a,
@@ -4245,7 +5433,7 @@ fn rename_shape_state_and_wire_validation_fail_before_mutation() {
     }
     let block = BlockLocation {
         block_id: ids.block_a,
-        home_document_id: ids.home_a,
+        home_document_id: test_block_home(ids.block_a),
     };
     assert!(
         OperationTransaction::new(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
@@ -4412,7 +5600,7 @@ fn causal_frontier_and_semantic_effect_tampering_fail_closed_at_ready_boundary()
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "edited".into(),
             }]),
@@ -4573,7 +5761,7 @@ fn concurrent_move_move_and_move_edit_converge_in_both_delivery_orders() {
     let move_b = tx(vec![SemanticOperation::MoveSubtree {
         root: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         from_page_id: ids.page_a,
         to_page_id: ids.page_b,
@@ -4583,7 +5771,7 @@ fn concurrent_move_move_and_move_edit_converge_in_both_delivery_orders() {
     let move_c = tx(vec![SemanticOperation::MoveSubtree {
         root: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         from_page_id: ids.page_a,
         to_page_id: ids.page_c,
@@ -4614,7 +5802,7 @@ fn concurrent_move_move_and_move_edit_converge_in_both_delivery_orders() {
     let edit = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "concurrent edit survives move".into(),
     }]);
@@ -4647,7 +5835,7 @@ fn move_delete_result(move_peer: u64, delete_peer: u64) -> (bool, bool) {
     let moved = tx(vec![SemanticOperation::MoveSubtree {
         root: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         from_page_id: ids.page_a,
         to_page_id: ids.page_b,
@@ -4706,7 +5894,7 @@ fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) -> bool {
             &tx(vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 from_page_id: ids.page_a,
                 to_page_id: ids.page_b,
@@ -4733,7 +5921,7 @@ fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) -> bool {
             &tx(vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 from_page_id: ids.page_b,
                 to_page_id: ids.page_c,
@@ -4790,7 +5978,7 @@ fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) -> bool {
         .iter()
         .find(|block| block.block_id == ids.block_a);
     if let Some(block) = moved_block {
-        assert_eq!(block.home_document_id, ids.home_a);
+        assert_eq!(block.home_document_id, ids.block_home_a());
         assert_eq!(block.content, "home A content");
     }
     moved_block.is_some()
@@ -4819,7 +6007,7 @@ fn delete_edit_retains_recoverable_crdt_content_but_hides_membership() {
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "recoverable concurrent content".into(),
     }]);
@@ -4845,7 +6033,7 @@ fn delete_edit_retains_recoverable_crdt_content_but_hides_membership() {
         .iter()
         .all(|block| block.block_id != ids.block_a));
     let recovered = engine
-        .recover_block_state(ids.home_a, ids.block_a)
+        .recover_block_state(ids.block_home_a(), ids.block_a)
         .unwrap()
         .expect("tombstoned home content remains in immutable CRDT history");
     assert_eq!(recovered.owner, BlockOwner::Tombstone);
@@ -5290,7 +6478,7 @@ fn causal_batch_waits_then_validates_at_declared_frontier_not_delivery_current()
             &tx(vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 from_page_id: ids.page_a,
                 to_page_id: ids.page_b,
@@ -5307,7 +6495,7 @@ fn causal_batch_waits_then_validates_at_declared_frontier_not_delivery_current()
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "dependent edit".into(),
             }]),
@@ -5366,7 +6554,7 @@ fn duplicate_of_still_staged_batch_truthfully_repeats_missing_dependencies() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "dependency".into(),
             }]),
@@ -5380,7 +6568,7 @@ fn duplicate_of_still_staged_batch_truthfully_repeats_missing_dependencies() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "dependent".into(),
             }]),
@@ -5418,7 +6606,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "intermediate".into(),
             }]),
@@ -5432,7 +6620,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "advanced update".into(),
             }]),
@@ -5447,7 +6635,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "baseline template".into(),
             }]),
@@ -5475,7 +6663,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "baseline update".into(),
             }]),
@@ -5487,7 +6675,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "advanced template".into(),
             }]),
@@ -5516,7 +6704,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "delivery-current concurrency".into(),
             }]),
@@ -5528,7 +6716,7 @@ fn crdt_update_requires_exact_declared_base_but_not_delivery_current() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "target wins".into(),
             }]),
@@ -5561,7 +6749,7 @@ fn compact_frontier_rejects_nonmaximal_heads_and_inexact_peer_counters() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "intermediate".into(),
             }]),
@@ -5575,7 +6763,7 @@ fn compact_frontier_rejects_nonmaximal_heads_and_inexact_peer_counters() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "descendant".into(),
             }]),
@@ -5632,7 +6820,7 @@ fn compact_frontier_rejects_nonmaximal_heads_and_inexact_peer_counters() {
             .disposition,
         BatchDisposition::Rejected {
             error: EngineError::FrontierVectorMismatch(document_id),
-        } if document_id == ids.home_a
+        } if document_id == DocumentKey::Entity(ids.block_home_a())
     ));
 }
 
@@ -5651,7 +6839,7 @@ fn compact_frontier_rejects_unrelated_maximal_document_head() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_c,
-                    home_document_id: ids.home_c,
+                    home_document_id: test_block_home(ids.block_c),
                 },
                 content: "unrelated accepted head".into(),
             }]),
@@ -5667,16 +6855,16 @@ fn compact_frontier_rejects_unrelated_maximal_document_head() {
             &tx(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 content: "target edit".into(),
             }]),
         )
         .unwrap();
     let exact = &target.manifest().dependency_frontier().documents()[0];
-    assert_eq!(exact.document_id(), ids.home_a);
+    assert_eq!(exact.document_id(), DocumentKey::Entity(ids.block_home_a()));
     let smuggled = DocumentDependencies::new(
-        ids.home_a,
+        DocumentKey::Entity(ids.block_home_a()),
         exact.peer_counters().to_vec(),
         vec![unrelated.manifest().batch_id()],
     )
@@ -5692,7 +6880,7 @@ fn compact_frontier_rejects_unrelated_maximal_document_head() {
             .disposition,
         BatchDisposition::Rejected {
             error: EngineError::InexactDocumentDependencyHeads { document_id },
-        } if document_id == ids.home_a
+        } if document_id == DocumentKey::Entity(ids.block_home_a())
     ));
 }
 
@@ -5710,14 +6898,14 @@ fn randomized_replica_delivery_orders_converge_and_duplicates_are_noops() {
         tx(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             content: "randomized concurrent edit".into(),
         }]),
         tx(vec![SemanticOperation::MoveSubtree {
             root: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             from_page_id: ids.page_a,
             to_page_id: ids.page_c,
@@ -5786,7 +6974,7 @@ fn restore_subtree_resurrects_a_tombstoned_block_with_the_concurrent_edit_text()
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "offline edit racing deletion".into(),
     }]);
@@ -5818,10 +7006,10 @@ fn restore_subtree_resurrects_a_tombstoned_block_with_the_concurrent_edit_text()
         blocks: vec![BlockRestore {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             claim: MembershipClaim {
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
                 parent: None,
                 order: "a".into(),
             },
@@ -5889,10 +7077,10 @@ fn independently_authored_equal_restores_converge_to_one_visible_block() {
             blocks: vec![BlockRestore {
                 block: BlockLocation {
                     block_id: ids.block_a,
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                 },
                 claim: MembershipClaim {
-                    home_document_id: ids.home_a,
+                    home_document_id: test_block_home(ids.block_a),
                     parent: None,
                     order: "a".into(),
                 },
@@ -5933,7 +7121,7 @@ fn restore_subtree_reasserts_a_move_over_a_concurrent_delete() {
     let moved = tx(vec![SemanticOperation::MoveSubtree {
         root: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         from_page_id: ids.page_a,
         to_page_id: ids.page_b,
@@ -5958,10 +7146,10 @@ fn restore_subtree_reasserts_a_move_over_a_concurrent_delete() {
         blocks: vec![BlockRestore {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             claim: MembershipClaim {
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
                 parent: None,
                 order: "z".into(),
             },
@@ -6014,7 +7202,7 @@ fn conflict_intents_detect_edit_delete_and_move_delete_races() {
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "offline edit racing deletion".into(),
     }]);
@@ -6083,7 +7271,7 @@ fn conflict_intents_detect_edit_delete_and_move_delete_races() {
     let moved = tx(vec![SemanticOperation::MoveSubtree {
         root: BlockLocation {
             block_id: ids.block_c,
-            home_document_id: ids.home_c,
+            home_document_id: test_block_home(ids.block_c),
         },
         from_page_id: ids.page_c,
         to_page_id: ids.page_b,
@@ -6146,7 +7334,7 @@ fn projection_supersession_distinguishes_a_linear_prefix_from_a_later_concurrent
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "offline edit racing deletion".into(),
     }]);
@@ -6200,14 +7388,14 @@ fn nested_concurrent_deletions_still_derive_keep_both_when_the_merge_lands_on_on
     let wider = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "home".into(),
     }]);
     let narrower = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "home content".into(),
     }]);
@@ -6274,7 +7462,7 @@ fn a_post_race_redelete_settles_an_edit_delete_pair_without_resurrection() {
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "edit racing the delete".into(),
     }]);
@@ -6305,10 +7493,10 @@ fn a_post_race_redelete_settles_an_edit_delete_pair_without_resurrection() {
         blocks: vec![BlockRestore {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             claim: MembershipClaim {
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
                 parent: None,
                 order: "a".into(),
             },
@@ -6376,14 +7564,14 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
     let first = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "first offline text".into(),
     }]);
     let second = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "second offline text".into(),
     }]);
@@ -6440,7 +7628,7 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
     let resolution = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: keep.into(),
     }]);
@@ -6475,14 +7663,14 @@ fn conflict_intents_classify_text_overlap_and_stay_silent_on_disjoint_edits() {
     let prefix = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_c,
-            home_document_id: ids.home_c,
+            home_document_id: test_block_home(ids.block_c),
         },
         content: "UNRELATED content".into(),
     }]);
     let suffix = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_c,
-            home_document_id: ids.home_c,
+            home_document_id: test_block_home(ids.block_c),
         },
         content: "unrelated CONTENT".into(),
     }]);
@@ -6519,7 +7707,7 @@ fn a3_conflict_history_load_samples(history_size: usize) -> (usize, Vec<usize>) 
         let transaction = tx(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id: ids.block_c,
-                home_document_id: ids.home_c,
+                home_document_id: test_block_home(ids.block_c),
             },
             content: format!("unrelated history {index}"),
         }]);
@@ -6550,7 +7738,7 @@ fn a3_conflict_history_load_samples(history_size: usize) -> (usize, Vec<usize>) 
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "A3 offline edit".into(),
     }]);
@@ -6639,7 +7827,7 @@ fn conflict_resolution_is_invariant_to_concurrent_batch_delivery_order() {
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "permuted concurrent edit".into(),
     }]);
@@ -6663,7 +7851,7 @@ fn conflict_resolution_is_invariant_to_concurrent_batch_delivery_order() {
         let transaction = tx(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id: ids.block_a,
-                home_document_id: ids.home_a,
+                home_document_id: test_block_home(ids.block_a),
             },
             content: "causal child of the permuted edit".into(),
         }]);
@@ -6733,7 +7921,7 @@ fn conflict_history_index_rebuild_matches_incremental_resolution_results() {
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "A3 rebuilt conflict".into(),
     }]);
@@ -6782,7 +7970,7 @@ fn conflict_backlog_reseed_does_not_rebuild_the_conflict_history_index() {
     let edited = tx(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
             block_id: ids.block_a,
-            home_document_id: ids.home_a,
+            home_document_id: test_block_home(ids.block_a),
         },
         content: "A3 reseed without rebuild".into(),
     }]);
@@ -6983,7 +8171,9 @@ fn a4_page_operations_continue_past_the_removed_cap() {
             &tx(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: crate::oplog::BlockId::from_uuid(uuid(0xa4_8000)),
-                    home_document_id: a4_home_id(0),
+                    home_document_id: test_block_home(crate::oplog::BlockId::from_uuid(uuid(
+                        0xa4_8000,
+                    ))),
                 },
                 page_id: a4_page_id(0),
                 parent: None,
@@ -7141,7 +8331,9 @@ fn a4_block_claims_grow_past_the_removed_cap_through_acceptance() {
                             block_id: crate::oplog::BlockId::from_uuid(uuid(
                                 0xa4_c000_0000 + index as u128,
                             )),
-                            home_document_id: a4_home_id(0),
+                            home_document_id: test_block_home(crate::oplog::BlockId::from_uuid(
+                                uuid(0xa4_c000_0000 + index as u128),
+                            )),
                         },
                         page_id: a4_page_id(0),
                         parent: None,
@@ -7375,17 +8567,24 @@ specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md, and the `a4_*` guards
     }
 
     /// Was this save reported to the user as durable?
-    fn save_new(handle: &SyncRuntimeHandle, name: &str, body: &str) -> bool {
-        matches!(
+    /// Save one new page and report the exact outcome. A refusal here is a
+    /// legal census answer, so the reason has to survive into the assertion
+    /// message rather than being folded into a bare `false`.
+    fn save_new(handle: &SyncRuntimeHandle, name: &str, body: &str) -> String {
+        format!(
+            "{:?}",
             handle.save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::New {
                     name: name.to_owned(),
                     page_kind: SyncPageKind::Page,
                 },
                 page: page(name, body),
-            }),
-            Ok(crate::sync_runtime::SyncApplicationPageSaveOutcome::Saved { .. })
+            })
         )
+    }
+
+    fn saved(outcome: &str) -> bool {
+        outcome.starts_with("Ok(Saved")
     }
 
     /// Run drain turns until the managed-local journal has no pending record.
@@ -7460,7 +8659,7 @@ specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md, and the `a4_*` guards
         let handle = activate(&fixture);
 
         let first = save_new(&handle, "Alpha", "first");
-        assert!(first, "the first page must save");
+        assert!(saved(&first), "the first page must save: {first}");
         // No drain turn here: the first record is journal-durable and not yet
         // accepted while the second is drafted.
         let second = save_new(&handle, "/Alpha", "second");
@@ -7482,10 +8681,8 @@ specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md, and the `a4_*` guards
         let handle = activate(&fixture);
 
         for index in 0..4 {
-            assert!(
-                save_new(&handle, &format!("Burst {index}"), &format!("body {index}")),
-                "burst create {index} must save"
-            );
+            let outcome = save_new(&handle, &format!("Burst {index}"), &format!("body {index}"));
+            assert!(saved(&outcome), "burst create {index} must save: {outcome}");
         }
         let renamed =
             handle.mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
@@ -7503,4 +8700,1411 @@ specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md, and the `a4_*` guards
             "four creates and a rename with no drain turn in between",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// P3 own-endpoint completion boundary.
+//
+// The receiver half of the absence decision is qualified in
+// `oplog::receiver_absence_summary`. This module qualifies the *own* half
+// through a real engine open, stage, flush and prune: the R16-C2 prune policy
+// asks two questions per local key, and both must be point questions. If the
+// policy ever re-enumerates historical receiver paths, or if the decision map
+// keeps every identity this activation completed resident, the flat assertions
+// below fail.
+// ---------------------------------------------------------------------------
+
+mod p3_own_completion {
+    use super::{seed_engine, store, uuid, DocumentKey, Ids, TestDir};
+    use crate::oplog::absence_decision::AbsenceDecision;
+    use crate::oplog::current_action_roots::{
+        ProjectionActionCursor, ACTION_NAMESPACE as ABSENCE_NAMESPACE,
+    };
+    use crate::oplog::receiver_absence_summary::{
+        HistoryAccess, ROWS_NAMESPACE, ROW_PREFIX, SUMMARY_NAMESPACE,
+    };
+    use crate::oplog::{
+        BlobDescription, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentDependencies, DocumentId,
+        FrontierV2, ManagedPath, ObjectStore, PageId, ProjectionEndpointBinding,
+        ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition, ProjectionReceiptStore,
+        ProjectionTargetKind, ShardedHotEngine, WorkspaceId,
+    };
+    use crate::Graph;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// One frontier on a single shared document, so two counters on the same
+    /// peer are strictly comparable and a receiver answer can dominate an own
+    /// answer on the same key.
+    fn frontier(counter: u64) -> FrontierV2 {
+        FrontierV2::new(vec![DocumentDependencies::new(
+            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x9f_0001))),
+            vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(9), counter)],
+            Vec::new(),
+        )
+        .unwrap()])
+        .unwrap()
+    }
+
+    fn intent(
+        workspace: WorkspaceId,
+        page_id: PageId,
+        managed_path: &str,
+        counter: u64,
+        kind: ProjectionTargetKind,
+    ) -> ProjectionIntent {
+        ProjectionIntent::new(
+            workspace,
+            page_id,
+            ManagedPath::parse(managed_path).unwrap(),
+            frontier(counter),
+            Vec::new(),
+            ProjectionPrecondition::Absent,
+            kind,
+            match kind {
+                ProjectionTargetKind::Present => {
+                    BlobDescription::of(format!("- {managed_path} {counter}\n").as_bytes())
+                }
+                ProjectionTargetKind::Absent => BlobDescription::of(&[]),
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// A real clean-runtime-shaped engine: accepted genesis pages, an attached
+    /// operation archive, an enrolled projection endpoint, the device-local
+    /// own-endpoint completion chain, and the receiver absence decision map.
+    struct Opened {
+        _dir: TestDir,
+        _graph: Graph,
+        _receipts: ProjectionReceiptStore,
+        engine: ShardedHotEngine,
+        ids: Ids,
+    }
+
+    fn open(label: &str) -> Opened {
+        let dir = TestDir::new(label);
+        let ids = Ids::new();
+        let archive = store(&dir, ids);
+        let (mut engine, _batch) = seed_engine(ids, &archive);
+        engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap(),
+            )
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        let graph = Graph::open(&dir.path().join("graph"));
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(uuid(0x9f_0202)),
+            DeviceId::from_uuid(uuid(0x9f_0203)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &dir.path().join("receipts"),
+            ids.workspace,
+            endpoint,
+        )
+        .unwrap();
+        engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+        engine.open_local_completion_index(&archive).unwrap();
+        engine.open_absence_decision_map(&receipts).unwrap();
+        // Compact on every flush so each flush actually runs the prune policy.
+        engine.force_local_completion_compaction_for_test(1);
+        Opened {
+            _dir: dir,
+            _graph: graph,
+            _receipts: receipts,
+            engine,
+            ids,
+        }
+    }
+
+    /// A reopenable archive + receipt pair, so a damaged derived index can be
+    /// observed at one engine open and repaired at the next.
+    struct Fixture {
+        _dir: TestDir,
+        root: PathBuf,
+        graph_root: PathBuf,
+        graph: Graph,
+        receipts: ProjectionReceiptStore,
+        ids: Ids,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let dir = TestDir::new(label);
+            let ids = Ids::new();
+            let root = dir.path().join("store");
+            let graph_root = dir.path().join("graph");
+            std::fs::create_dir_all(&graph_root).unwrap();
+            let graph = Graph::open(&graph_root);
+            let archive = ObjectStore::open(&root, ids.workspace).unwrap();
+            let endpoint = ProjectionEndpointBinding::enroll_graph(
+                &graph,
+                ProjectionEndpointId::from_uuid(uuid(0x9f_0302)),
+                DeviceId::from_uuid(uuid(0x9f_0303)),
+            )
+            .unwrap();
+            let receipts = ProjectionReceiptStore::open_for_endpoint(
+                &dir.path().join("receipts"),
+                ids.workspace,
+                endpoint,
+            )
+            .unwrap();
+            // Production managed opens install the durable discovery cursor
+            // before any receipt can be authored.
+            receipts.attach_action_cursor(std::sync::Arc::new(
+                ProjectionActionCursor::open(&archive).unwrap(),
+            ));
+            Self {
+                _dir: dir,
+                root,
+                graph_root,
+                graph,
+                receipts,
+                ids,
+            }
+        }
+
+        /// A fresh engine over the same archive: this is the reopen.
+        fn absence_engine(&self) -> ShardedHotEngine {
+            let mut engine = self.ids.engine();
+            engine
+                .attach_clean_archive_store(
+                    ObjectStore::open(&self.root, self.ids.workspace).unwrap(),
+                )
+                .unwrap();
+            engine
+        }
+
+        /// Publish one real receiver receipt — intent, attempt, projection,
+        /// completion — and notify the engine exactly as production does.
+        fn publish_receiver_receipt(
+            &self,
+            engine: &mut ShardedHotEngine,
+            page_id: PageId,
+            managed_path: &ManagedPath,
+            counter: u64,
+            kind: ProjectionTargetKind,
+        ) -> ProjectionIntent {
+            let target = match kind {
+                ProjectionTargetKind::Present => {
+                    format!("- {managed_path} {counter}\n").into_bytes()
+                }
+                ProjectionTargetKind::Absent => Vec::new(),
+            };
+            let built = intent(
+                self.ids.workspace,
+                page_id,
+                managed_path.as_str(),
+                counter,
+                kind,
+            );
+            self.receipts.publish_intent(&built, None).unwrap();
+            engine.note_receiver_projection_intent(&built).unwrap();
+            let reservation = self.receipts.reserve_attempt(&built).unwrap();
+            let mut authority = self
+                .receipts
+                .begin_mutation(&built, Some(&reservation))
+                .unwrap();
+            let proof = self
+                .graph
+                .write_page_projection(
+                    built.path().as_str(),
+                    None,
+                    target.as_slice(),
+                    &mut authority,
+                )
+                .unwrap();
+            self.receipts
+                .publish_completion(authority, &built, &proof)
+                .unwrap();
+            engine.note_receiver_projection_completion(&built).unwrap();
+            built
+        }
+
+        fn rows_dir(&self) -> PathBuf {
+            self.root.join(ABSENCE_NAMESPACE).join(ROWS_NAMESPACE)
+        }
+
+        fn summary_dir(&self) -> PathBuf {
+            self.root.join(ABSENCE_NAMESPACE).join(SUMMARY_NAMESPACE)
+        }
+
+        fn row_object_paths(&self) -> Vec<PathBuf> {
+            Self::entries_with_prefix(&self.rows_dir(), ROW_PREFIX)
+        }
+
+        fn summary_object_paths(&self) -> Vec<PathBuf> {
+            Self::entries_with_prefix(&self.summary_dir(), "")
+        }
+
+        fn entries_with_prefix(directory: &Path, prefix: &str) -> Vec<PathBuf> {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return Vec::new();
+            };
+            let mut found = entries
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(prefix))
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        }
+    }
+
+    /// What one steady flush costs and holds once `distinct` historical
+    /// identities exist behind fixed live pages and fixed retained work.
+    ///
+    /// `objects_read` is deliberately outside the equality: the durable rows
+    /// live in authenticated maps, so one point read walks O(log H) nodes. That
+    /// term is the persistent-bytes allowance D-5 grants, not resident state.
+    #[derive(Debug, Eq, PartialEq)]
+    struct SteadyFlush {
+        local_entries: usize,
+        resident_absence_rows: usize,
+        point_lookups: usize,
+    }
+
+    /// The byte/object side of the same steady flush, kept apart from the
+    /// resident equality so a logarithmic term can be bounded as logarithmic.
+    #[derive(Debug)]
+    struct SteadyObjects {
+        flush_objects_read: usize,
+        total: HistoryAccess,
+    }
+
+    fn measure(distinct: usize) -> (SteadyFlush, SteadyObjects) {
+        let mut opened = open(&format!("p3-own-completion-{distinct}"));
+        let ids = opened.ids;
+        let engine = &mut opened.engine;
+        let live_a = "pages/A.md";
+        let live_b = "pages/B.md";
+
+        // `distinct` receiver-completed historical identities on one live page:
+        // H grows, G/T/P/O do not. Each of these becomes a durable point row.
+        for index in 0..distinct {
+            // Alternating kinds so the reopened answers below have to be
+            // exact in both directions: a receiver-confirmed absence permits a
+            // later create, a receiver-confirmed presence must keep deferring.
+            let receiver = intent(
+                ids.workspace,
+                ids.page_a,
+                &format!("pages/A-old-{index}.md"),
+                2 * index as u64 + 2,
+                if index % 2 == 0 {
+                    ProjectionTargetKind::Absent
+                } else {
+                    ProjectionTargetKind::Present
+                },
+            );
+            engine.note_receiver_projection_intent(&receiver).unwrap();
+            engine
+                .note_receiver_projection_completion(&receiver)
+                .unwrap();
+        }
+
+        // Own-endpoint completions this activation performed. Two families are
+        // prunable — one with receiver history underneath it and a dominated
+        // frontier, one with no receiver history at all — and two are the live
+        // answers the index must keep.
+        for index in 0..distinct {
+            let dominated = intent(
+                ids.workspace,
+                ids.page_a,
+                &format!("pages/A-old-{index}.md"),
+                2 * index as u64 + 1,
+                ProjectionTargetKind::Absent,
+            );
+            assert!(engine
+                .stage_local_projection_completion(&dominated)
+                .unwrap());
+            let orphan = intent(
+                ids.workspace,
+                ids.page_a,
+                &format!("pages/A-stale-{index}.md"),
+                index as u64 + 1,
+                ProjectionTargetKind::Absent,
+            );
+            assert!(engine.stage_local_projection_completion(&orphan).unwrap());
+        }
+        for (page_id, live) in [(ids.page_a, live_a), (ids.page_b, live_b)] {
+            let present = intent(
+                ids.workspace,
+                page_id,
+                live,
+                1,
+                ProjectionTargetKind::Present,
+            );
+            assert!(engine.stage_local_projection_completion(&present).unwrap());
+        }
+        assert!(engine
+            .flush_local_projection_completions(BTreeSet::new())
+            .unwrap());
+        assert_eq!(
+            engine.local_completion_entry_count_for_test(),
+            2,
+            "the prune policy must keep exactly the two live answers at \
+{distinct} historical identities"
+        );
+
+        // The steady flush: fixed live pages, fixed (empty) retained work, one
+        // new own completion per live page.
+        let before = engine.receiver_history_access_for_test().unwrap();
+        for (page_id, live) in [(ids.page_a, live_a), (ids.page_b, live_b)] {
+            let present = intent(
+                ids.workspace,
+                page_id,
+                live,
+                2,
+                ProjectionTargetKind::Present,
+            );
+            assert!(engine.stage_local_projection_completion(&present).unwrap());
+        }
+        assert!(engine
+            .flush_local_projection_completions(BTreeSet::new())
+            .unwrap());
+        let after = engine.receiver_history_access_for_test().unwrap();
+
+        // The historical identities are still exactly answerable: pruning own
+        // evidence never resurrects a path the receiver released.
+        for index in 0..distinct {
+            let historical = ManagedPath::parse(&format!("pages/A-old-{index}.md")).unwrap();
+            let expected = if index % 2 == 0 {
+                AbsenceDecision::Create
+            } else {
+                AbsenceDecision::DeferredAbsence
+            };
+            assert_eq!(
+                engine
+                    .receiver_absence_decision(ids.page_a, &historical)
+                    .unwrap(),
+                expected,
+                "historical path {historical} must stay exactly answerable after \
+its own evidence was pruned"
+            );
+            assert!(!engine
+                .restored_generation_requires_absence_deferral(ids.page_a, &historical)
+                .unwrap());
+        }
+        let unknown = ManagedPath::parse("pages/Never projected.md").unwrap();
+        assert_eq!(
+            engine
+                .receiver_absence_decision(ids.page_c, &unknown)
+                .unwrap(),
+            AbsenceDecision::Create
+        );
+
+        (
+            SteadyFlush {
+                local_entries: engine.local_completion_entry_count_for_test(),
+                resident_absence_rows: engine.resident_absence_row_count_for_test(),
+                point_lookups: after.point_lookups - before.point_lookups,
+            },
+            SteadyObjects {
+                flush_objects_read: after.objects_read - before.objects_read,
+                total: after,
+            },
+        )
+    }
+
+    /// The own-endpoint half of the P3 bound, measured on a real engine.
+    ///
+    /// Eight and sixty-four distinct completed identities behind the same two
+    /// live pages and the same (empty) retained set must cost the same steady
+    /// flush and hold the same resident state.
+    #[test]
+    fn own_completion_flush_and_prune_are_flat_across_distinct_completed_identities() {
+        let (small, small_total) = measure(8);
+        let (large, large_total) = measure(64);
+        eprintln!("own-completion steady flush at 8 identities: {small:?} total {small_total:?}");
+        eprintln!("own-completion steady flush at 64 identities: {large:?} total {large_total:?}");
+        assert_eq!(
+            small, large,
+            "the own-endpoint prune policy grew with completed history"
+        );
+        // Three point reads per surviving local key: one when the completion is
+        // staged, one for the prune policy's R16-C2 question, one when the map
+        // is re-derived from what survived. A constant per live key, and the
+        // equality above already proves it does not move with history.
+        assert!(
+            small.point_lookups <= 4 * small.local_entries,
+            "the prune policy must ask a constant number of point questions per \
+live local key, not one per history row: {} reads for {} keys",
+            small.point_lookups,
+            small.local_entries
+        );
+        // Eight times the history may cost at most twice the objects per steady
+        // flush: a logarithmic walk, not a scan.
+        assert!(
+            large_total.flush_objects_read < 2 * small_total.flush_objects_read,
+            "steady flush object reads grew faster than the map depth: \
+{} at 8 identities, {} at 64",
+            small_total.flush_objects_read,
+            large_total.flush_objects_read
+        );
+        // Eight times the identities may cost at most eight times the point
+        // reads in total. Any step that enumerated the history would make the
+        // whole run quadratic in it instead.
+        assert!(
+            large_total.total.point_lookups <= 8 * small_total.total.point_lookups,
+            "total point reads grew faster than the work performed: {} for 8 \
+identities, {} for 64",
+            small_total.total.point_lookups,
+            large_total.total.point_lookups
+        );
+    }
+
+    /// The damaged-index contract, through a real engine open.
+    ///
+    /// The unit-level controls in `oplog::receiver_absence_summary` prove the
+    /// index's own behaviour. This proves the engine boundary the production
+    /// callers actually use: a row the authenticated root names but disk cannot
+    /// supply is refused **by name** rather than answered `Create` — answering
+    /// `Create` would recreate a file the receiver deleted — the derived roots
+    /// are retired, and the next engine open runs the counted repair from
+    /// retained receipts and returns the exact old answer.
+    #[test]
+    fn a_damaged_row_refuses_at_the_engine_then_repairs_at_the_next_engine_open() {
+        let fixture = Fixture::new("p3-engine-damage-repair");
+        let gone = ManagedPath::parse("pages/Receiver deleted me.md").unwrap();
+        let present = ManagedPath::parse("pages/Receiver keeps me.md").unwrap();
+
+        let mut engine = fixture.absence_engine();
+        engine.open_absence_decision_map(&fixture.receipts).unwrap();
+        let deleted = fixture.publish_receiver_receipt(
+            &mut engine,
+            fixture.ids.page_a,
+            &gone,
+            1,
+            ProjectionTargetKind::Present,
+        );
+        let kept = fixture.publish_receiver_receipt(
+            &mut engine,
+            fixture.ids.page_b,
+            &present,
+            1,
+            ProjectionTargetKind::Present,
+        );
+        assert_eq!(
+            engine
+                .receiver_absence_decision(fixture.ids.page_a, &gone)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence
+        );
+        drop(engine);
+
+        // Damage exactly one durable row.
+        let rows = fixture.row_object_paths();
+        assert_eq!(rows.len(), 2, "one row per completed receiver identity");
+        std::fs::remove_file(&rows[0]).unwrap();
+
+        let probe = fixture.absence_engine();
+        probe.open_absence_decision_map(&fixture.receipts).unwrap();
+        let probe_stats = probe
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("the managed path records its open attribution");
+        assert_eq!(
+            probe_stats.full_catalog_passes, 0,
+            "a deleted leaf row is not visible at open: it must be found at its own \
+point read, not hidden by an unrelated rebuild: {probe_stats:?}"
+        );
+        let answers = [
+            probe.receiver_absence_decision(fixture.ids.page_a, &gone),
+            probe.receiver_absence_decision(fixture.ids.page_b, &present),
+        ];
+        let refusals = answers
+            .iter()
+            .filter(|answer| answer.is_err())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "exactly the damaged identity refuses: {answers:?}"
+        );
+        let refusal = format!("{:?}", refusals[0]);
+        assert!(
+            refusal.contains("missing row object"),
+            "the refusal must name the damage, not be a bare error: {refusal}"
+        );
+        for answer in &answers {
+            assert!(
+                answer
+                    .as_ref()
+                    .is_ok_and(|decision| *decision == AbsenceDecision::DeferredAbsence)
+                    || answer.is_err(),
+                "a missing row is never permission to recreate a deleted file: {answers:?}"
+            );
+        }
+        assert!(
+            fixture.summary_object_paths().is_empty(),
+            "a proven-damaged index must retire its roots so the next open repairs"
+        );
+        drop(probe);
+
+        // The next engine open repairs from retained receipts and answers both
+        // identities exactly. Nothing was resurrected at any point.
+        let mut repaired = fixture.absence_engine();
+        repaired
+            .open_absence_decision_map(&fixture.receipts)
+            .unwrap();
+        let stats = repaired
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("the managed path records its open attribution");
+        assert_eq!(
+            stats.full_catalog_passes, 1,
+            "the repair must be one named counted pass, not a silent reopen: {stats:?}"
+        );
+        assert!(stats.rebuilt);
+        assert_eq!(
+            repaired
+                .receiver_absence_decision(fixture.ids.page_a, &gone)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence,
+            "the deleted page must still defer after the repair"
+        );
+        assert_eq!(
+            repaired
+                .receiver_absence_decision(fixture.ids.page_b, &present)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence
+        );
+        assert_eq!(repaired.resident_absence_row_count_for_test(), 0);
+        assert_eq!(deleted.page_id(), fixture.ids.page_a);
+        assert_eq!(kept.page_id(), fixture.ids.page_b);
+
+        // And the repaired index is the ordinary bounded path again.
+        drop(repaired);
+        let mut steady = fixture.absence_engine();
+        steady.open_absence_decision_map(&fixture.receipts).unwrap();
+        let steady_stats = steady
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("the managed path records its open attribution");
+        assert_eq!(steady_stats.full_catalog_passes, 0, "{steady_stats:?}");
+        assert_eq!(
+            steady
+                .receiver_absence_decision(fixture.ids.page_a, &gone)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence
+        );
+    }
+
+    /// Historical path enumeration must not come back into the prune policy.
+    ///
+    /// The measured tests above would catch a re-enumeration, but only for the
+    /// shapes they build. This names the rule at the one site that has to hold
+    /// it: the policy asks its questions per *local* key, through the point
+    /// API, and never materializes a receiver history or completion vector.
+    #[test]
+    fn the_prune_policy_asks_point_questions_and_never_enumerates_history() {
+        let source = include_str!("hot_engine.rs");
+        let body = source
+            .split_once("pub(crate) fn flush_local_projection_completions(")
+            .expect("the own-endpoint flush has one producer")
+            .1
+            .split_once("\n    }\n")
+            .expect("its body is brace-terminated")
+            .0;
+        assert!(
+            body.contains("observed_page_paths()"),
+            "the policy must be driven by the local index's own keys"
+        );
+        assert!(
+            body.contains("receiver_row_anchors(&key)"),
+            "the policy must ask its receiver question one exact key at a time"
+        );
+        for forbidden in [
+            "resident_receiver_rows",
+            "receiver_summary_entries",
+            "receiver_history_paths",
+            "receiver_completion_anchors",
+            "validated_catalog",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the own-endpoint prune policy must not enumerate receiver \
+history through {forbidden}"
+            );
+        }
+    }
+
+    /// Retained own work is what keeps an entry, not history. A retained intent
+    /// on a path that is no longer live survives the prune; the same entry
+    /// without the retention does not.
+    #[test]
+    fn retained_own_work_survives_the_prune_and_unretained_history_does_not() {
+        let mut opened = open("p3-own-completion-retention");
+        let ids = opened.ids;
+        let engine = &mut opened.engine;
+        let retained = intent(
+            ids.workspace,
+            ids.page_a,
+            "pages/A-retired.md",
+            5,
+            ProjectionTargetKind::Absent,
+        );
+        let dropped = intent(
+            ids.workspace,
+            ids.page_b,
+            "pages/B-retired.md",
+            6,
+            ProjectionTargetKind::Absent,
+        );
+        assert!(engine.stage_local_projection_completion(&retained).unwrap());
+        assert!(engine.stage_local_projection_completion(&dropped).unwrap());
+        let keep = BTreeSet::from([retained.id().unwrap()]);
+        assert!(engine.flush_local_projection_completions(keep).unwrap());
+        assert_eq!(engine.local_completion_entry_count_for_test(), 1);
+        assert!(engine
+            .local_completed_projection_intent_ids()
+            .contains(&retained.id().unwrap()));
+        assert!(!engine
+            .local_completed_projection_intent_ids()
+            .contains(&dropped.id().unwrap()));
+    }
+}
+
+// Persistent CRDT writer lanes (rebaselining prerequisite P1).
+//
+// The rebaselining design bounds resident state by `P` = participating peer
+// identities. A fresh peer per batch makes `P` grow with edit count and keeps
+// that growth inside every shallow snapshot and every later manifest's before
+// vector, so sealing can never retire it. These tests hold the engine half of
+// the repair: one persistent lane per (device, role), and receiver-side lane
+// ownership that is derived from first admitted use, installed atomically with
+// the batch that used it, and enforced on every later use.
+// ---------------------------------------------------------------------------
+
+/// One author batch that deliberately does NOT tie its device to its peer, so a
+/// test can construct the duplicated-writer-identity case that
+/// `author()` cannot express. Its causal writer incarnation is the device's
+/// stable fixture incarnation, i.e. "this device never lost its record".
+fn author_on_lane(batch: u128, device: u128, peer: u64) -> AuthorBatch {
+    author_on_incarnation(batch, device, peer, b"stable")
+}
+
+/// The same, with an EXPLICIT writer incarnation label.
+///
+/// This is how a fixture expresses what production expresses by saving a random
+/// `WriterIncarnationId`: the enrolled device is unchanged, while a distinct
+/// label is a distinct authoring incarnation — exactly what a lost or torn
+/// private writer record produces. Two labels are two causal chains.
+fn author_on_incarnation(batch: u128, device: u128, peer: u64, incarnation: &[u8]) -> AuthorBatch {
+    AuthorBatch {
+        batch_id: BatchId::from_uuid(uuid(batch)),
+        author_device_id: DeviceId::from_uuid(uuid(device)),
+        author_session_id: SessionId::from_uuid(uuid(2_000 + device)),
+        crdt_peer_id: CrdtPeerId::from_u64(peer),
+        causal_peer_id: CausalPeerId::from_key(WriterIncarnationId::fixture_labelled(
+            &[&device.to_be_bytes()[..], incarnation].concat(),
+        )),
+    }
+}
+
+fn block_in(
+    engine: &ShardedHotEngine,
+    author: AuthorBatch,
+    block: crate::oplog::BlockId,
+    page_id: PageId,
+    home_document_id: DocumentId,
+    order: &str,
+    content: &str,
+) -> PreparedBatch {
+    engine
+        .prepare_fixture_transaction(
+            author,
+            &tx(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: test_block_home(block),
+                },
+                page_id,
+                parent: None,
+                order: order.into(),
+                content: content.into(),
+            }]),
+        )
+        .unwrap()
+}
+
+/// A long local burst on ONE lane leaves exactly one writer entry in the edited
+/// document, with strictly increasing counters. This is the property the whole
+/// repair exists for: under the retired fresh-peer-per-batch rule the same
+/// program leaves one entry per batch, forever, even after a shallow cut.
+#[test]
+fn a_local_burst_on_one_writer_lane_keeps_one_peer_and_strictly_increasing_counters() {
+    let ids = Ids::new();
+    let dir = TestDir::new("writer-lane-burst");
+    let archive = store(&dir, ids);
+    let (mut engine, _) = seed_engine(ids, &archive);
+    let lane = 0xA11E_0001_u64;
+    let device = 5_001_u128;
+
+    let mut previous_counter = 0_i32;
+    for index in 0..64_u128 {
+        let prepared = engine
+            .prepare_fixture_transaction(
+                author_on_lane(70_000 + index, device, lane),
+                &tx(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block_a,
+                        home_document_id: ids.block_home_a(),
+                    },
+                    content: format!("burst {index}"),
+                }]),
+            )
+            .unwrap();
+        let batch = ready(&archive, &prepared);
+        assert!(
+            matches!(
+                engine.stage_ready(batch).disposition,
+                BatchDisposition::Accepted { .. }
+            ),
+            "burst batch {index} is accepted on the persistent lane"
+        );
+        let document = engine
+            .accepted_document_version_vector_for_test(DocumentKey::Entity(ids.block_home_a()))
+            .unwrap();
+        let counter = document
+            .iter()
+            .find(|(peer, _)| **peer == lane)
+            .map(|(_, counter)| *counter)
+            .expect("the lane advanced the edited document");
+        assert!(
+            counter > previous_counter,
+            "lane counters must strictly increase: {previous_counter} -> {counter}"
+        );
+        previous_counter = counter;
+    }
+
+    let peers = engine
+        .accepted_document_peer_ids_for_test(DocumentKey::Entity(ids.block_home_a()))
+        .unwrap();
+    assert_eq!(
+        peers.iter().filter(|peer| peer.as_u64() == lane).count(),
+        1,
+        "one lane entry after 64 batches, not one per batch: {peers:?}"
+    );
+    // The genesis author plus this one lane. A fresh peer per batch would have
+    // left 65 entries here and in every later manifest before-vector.
+    assert!(peers.len() <= 2, "unexpected writer growth: {peers:?}");
+    assert_eq!(engine.crdt_lane_count(), 2, "genesis author plus one lane");
+}
+
+/// Another author's lane is refused, in either delivery order, and the refusal
+/// happens before any live CRDT document changes. Exactly one of two forks of
+/// the same lane identity survives — the duplicated-writer-identity case.
+#[test]
+fn a_foreign_or_forked_writer_lane_is_refused_without_changing_any_document() {
+    for reversed in [false, true] {
+        let ids = Ids::new();
+        let dir = TestDir::new(if reversed {
+            "writer-lane-foreign-reversed"
+        } else {
+            "writer-lane-foreign"
+        });
+        let archive = store(&dir, ids);
+        let (mut engine, _) = seed_engine(ids, &archive);
+        let lane = 0xA11E_0002_u64;
+
+        // Two devices claim the same CRDT writer lane, in unrelated documents,
+        // so neither batch depends on the other's state.
+        let owner = block_in(
+            &engine,
+            author_on_lane(71_001, 5_101, lane),
+            crate::oplog::BlockId::from_uuid(uuid(81_001)),
+            ids.page_a,
+            ids.home_a,
+            "z1",
+            "owner edit",
+        );
+        // The impostor is prepared on a peer engine that has not yet seen the
+        // owner, exactly as a cloned device identity would produce it.
+        let impostor = block_in(
+            &seed_engine(ids, &archive).0,
+            author_on_lane(71_002, 5_102, lane),
+            crate::oplog::BlockId::from_uuid(uuid(81_002)),
+            ids.page_c,
+            ids.home_c,
+            "z2",
+            "impostor edit",
+        );
+        let (first, second) = if reversed {
+            (&impostor, &owner)
+        } else {
+            (&owner, &impostor)
+        };
+        let first_device = first.manifest().author_device_id();
+
+        let accepted = ready(&archive, first);
+        assert!(matches!(
+            engine.stage_ready(accepted).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let owned = engine
+            .crdt_lane_owner(CrdtPeerId::from_u64(lane))
+            .expect("first admitted use binds the lane");
+        assert_eq!(owned.device_id, first_device);
+
+        let target_document = if reversed { ids.home_a } else { ids.home_c };
+        let before_pages = engine
+            .accepted_document_peer_ids_for_test(DocumentKey::Entity(target_document))
+            .unwrap();
+
+        let refused = ready(&archive, second);
+        let disposition = engine.stage_ready(refused).disposition;
+        match disposition {
+            BatchDisposition::Rejected {
+                error: EngineError::CrdtLaneNotOwned { peer_id, owned, .. },
+            } => {
+                assert_eq!(peer_id, CrdtPeerId::from_u64(lane));
+                assert_eq!(owned.device_id, first_device);
+            }
+            other => panic!("a foreign writer lane must be refused, found {other:?}"),
+        }
+        // Whole-batch atomicity: no CRDT fragment of the refused batch became
+        // accepted, and the ownership binding did not move.
+        assert_eq!(
+            engine
+                .accepted_document_peer_ids_for_test(DocumentKey::Entity(target_document))
+                .unwrap(),
+            before_pages
+        );
+        assert_eq!(
+            engine
+                .crdt_lane_owner(CrdtPeerId::from_u64(lane))
+                .unwrap()
+                .device_id,
+            first_device
+        );
+        // The refused original stays in the archive for recovery.
+        assert!(matches!(
+            archive.inspect_batch(second.manifest().batch_id()).unwrap(),
+            BatchInspection::Ready(_)
+        ));
+    }
+}
+
+/// Incoming edits cannot turn a reserved baseline identity into a device lane.
+#[test]
+fn delivered_batches_cannot_claim_reserved_genesis_writer_peers() {
+    for lane in [0x5449_4e45_4745_4e31, 0x5449_4e45_4745_4e32] {
+        let ids = Ids::new();
+        let dir = TestDir::new("writer-lane-reserved-genesis");
+        let archive = store(&dir, ids);
+        let (mut engine, _) = seed_engine(ids, &archive);
+        let before = engine
+            .accepted_document_version_vector_for_test(DocumentKey::Entity(ids.home_a))
+            .unwrap();
+        let lane_count = engine.crdt_lane_count();
+        let peer_count = engine.causal_peer_count();
+        let prepared = block_in(
+            &engine,
+            author_on_lane(71_101, 5_111, lane),
+            crate::oplog::BlockId::from_uuid(uuid(81_101)),
+            ids.page_a,
+            ids.home_a,
+            "z1",
+            "reserved peer edit",
+        );
+        let outcome = engine.stage_ready(ready(&archive, &prepared)).disposition;
+        assert!(
+            matches!(
+                outcome,
+                BatchDisposition::Rejected {
+                    error: EngineError::CrdtLaneUnauthorizedOrigin { .. },
+                }
+            ),
+            "delivered reserved writer peer {lane:x} must be refused: {outcome:?}"
+        );
+        assert_eq!(
+            engine
+                .accepted_document_version_vector_for_test(DocumentKey::Entity(ids.home_a))
+                .unwrap(),
+            before
+        );
+        assert_eq!(engine.crdt_lane_count(), lane_count);
+        assert_eq!(engine.causal_peer_count(), peer_count);
+        assert!(matches!(
+            archive
+                .inspect_batch(prepared.manifest().batch_id())
+                .unwrap(),
+            BatchInspection::Ready(_)
+        ));
+    }
+}
+
+/// One device's ordinary lane and its external-import lane are separate
+/// identities, and neither may be advanced under the other's role.
+#[test]
+fn one_device_keeps_separate_local_and_external_import_lanes() {
+    let ids = Ids::new();
+    let dir = TestDir::new("writer-lane-roles");
+    let archive = store(&dir, ids);
+    let (mut engine, _) = seed_engine(ids, &archive);
+    let seed_lane_count = engine.crdt_lane_count();
+    let device = 5_201_u128;
+    let local_lane = 0xA11E_0003_u64;
+
+    let local = block_in(
+        &engine,
+        author_on_lane(72_001, device, local_lane),
+        crate::oplog::BlockId::from_uuid(uuid(82_001)),
+        ids.page_a,
+        ids.home_a,
+        "r1",
+        "local edit",
+    );
+    let batch = ready(&archive, &local);
+    assert!(matches!(
+        engine.stage_ready(batch).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let owner = engine
+        .crdt_lane_owner(CrdtPeerId::from_u64(local_lane))
+        .unwrap();
+    assert_eq!(owner.device_id, DeviceId::from_uuid(uuid(device)));
+    assert_eq!(owner.role, crate::oplog::writer_lane::WriterRole::Local);
+
+    // The same device cannot reuse its ordinary lane as an import lane: role
+    // separation is what keeps external-editor provenance separable, and it is
+    // enforced by the same accepted-state binding, at draft time, before any
+    // batch material is assembled.
+    let reused = engine.prepare_fixture_transaction_with_origin(
+        author_on_lane(72_002, device, local_lane),
+        BatchOrigin::ExternalReconciliation {
+            import_id: crate::oplog::ImportId::from_digest([9; 32]),
+        },
+        &tx(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: test_block_home(ids.block_a),
+            },
+            content: "import edit".into(),
+        }]),
+    );
+    match reused {
+        Err(EngineError::CrdtLaneNotOwned { owned, claimed, .. }) => {
+            assert_eq!(owned.role, crate::oplog::writer_lane::WriterRole::Local);
+            assert_eq!(
+                claimed.role,
+                crate::oplog::writer_lane::WriterRole::External
+            );
+            assert_eq!(owned.device_id, claimed.device_id);
+        }
+        Err(other) => panic!("role separation must be enforced, found {other:?}"),
+        Ok(_) => panic!("role separation must be enforced"),
+    }
+
+    // The ordinary lane itself keeps working under its own role: refusal was
+    // about the role, not about the lane having been used before.
+    let again = block_in(
+        &engine,
+        author_on_lane(72_003, device, local_lane),
+        crate::oplog::BlockId::from_uuid(uuid(82_003)),
+        ids.page_a,
+        ids.home_a,
+        "r3",
+        "second local edit",
+    );
+    let batch = ready(&archive, &again);
+    assert!(matches!(
+        engine.stage_ready(batch).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        engine.crdt_lane_count(),
+        seed_lane_count + 1,
+        "reusing the admitted local lane must not register another lane; genesis retains its own \
+         owner"
+    );
+}
+
+/// Manager `p1-causal-loss-review/regression-test.rs`, incorporated with
+/// explicit fixture incarnation selection.
+///
+/// One enrolled device publishes work, then loses its private writer record and
+/// reopens an OLDER graph copy that cannot see that work. The rebuild mints a
+/// fresh writer incarnation (here: an explicit distinct fixture label, which is
+/// what the durable record's random `WriterIncarnationId` produces in
+/// production), so the two independently prepared publications must NOT land on
+/// one `BatchCausalDot` — which is precisely the alias the manager's isolated
+/// control reproduced. Both branches then deliver in either arrival order, keep
+/// their exact original IDs, and bind to the SAME enrolled author device.
+#[test]
+fn manager_lost_writer_record_and_stale_archive_preserve_both_original_branches() {
+    for reversed in [false, true] {
+        let ids = Ids::new();
+        let dir = TestDir::new(if reversed {
+            "manager-lost-writer-causal-chain-reversed"
+        } else {
+            "manager-lost-writer-causal-chain"
+        });
+        let archive = store(&dir, ids);
+        let (mut original, genesis) = seed_engine(ids, &archive);
+        let device = 5_501_u128;
+        let old_prefix = original
+            .prepare_fixture_transaction(
+                author_on_incarnation(75_001, device, 0xA11E_0015, b"before-loss"),
+                &tx(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block_a,
+                        home_document_id: ids.block_home_a(),
+                    },
+                    content: "acknowledged before private state loss".into(),
+                }]),
+            )
+            .unwrap();
+        assert!(matches!(
+            original
+                .stage_ready(ready(&archive, &old_prefix))
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+
+        // Reopening an OLDER graph copy with the writer record lost mints a
+        // fresh Loro lane AND a fresh causal writer incarnation, while the
+        // enrolled device identity is unchanged.
+        let mut stale_rebuild = ids.engine();
+        assert!(matches!(
+            stale_rebuild.stage_ready(genesis.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let new_work = stale_rebuild
+            .prepare_fixture_transaction(
+                author_on_incarnation(75_002, device, 0xA11E_0016, b"after-loss"),
+                &tx(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block_a,
+                        home_document_id: ids.block_home_a(),
+                    },
+                    content: "acknowledged after private state loss".into(),
+                }]),
+            )
+            .unwrap();
+        assert_ne!(
+            old_prefix.manifest().causal_dot(),
+            new_work.manifest().causal_dot(),
+            "independent acknowledged publications by fresh lanes must not share one Tine causal \
+             identity after private record loss"
+        );
+        assert_ne!(
+            old_prefix.manifest().causal_dot().peer_id(),
+            new_work.manifest().causal_dot().peer_id(),
+            "the fresh incarnation is a distinct causal peer, not a reused counter"
+        );
+        assert_eq!(
+            old_prefix.manifest().author_device_id(),
+            new_work.manifest().author_device_id(),
+            "only the lost writer incarnation changes; the enrolled author device does not"
+        );
+
+        let mut receiver = ids.engine();
+        assert!(matches!(
+            receiver.stage_ready(genesis.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let seed_lane_count = receiver.crdt_lane_count();
+        let seed_incarnations = receiver.causal_peer_count();
+        let (first, second) = if reversed {
+            (&new_work, &old_prefix)
+        } else {
+            (&old_prefix, &new_work)
+        };
+        assert!(matches!(
+            receiver.stage_ready(ready(&archive, first)).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let result = receiver.stage_ready(ready(&archive, second)).disposition;
+        assert!(
+            matches!(result, BatchDisposition::Accepted { .. }),
+            "fresh CRDT lanes after private record loss must not alias the old Tine causal dot; \
+             reversed={reversed}, old={:?}, new={:?}, result={result:?}",
+            old_prefix.manifest().causal_dot(),
+            new_work.manifest().causal_dot()
+        );
+
+        // Both originals are present with their exact IDs; neither branch had
+        // to wait for the other, and neither erased the other's obligations.
+        let accepted = receiver.status().accepted_batch_ids().unwrap();
+        for prepared in [&old_prefix, &new_work] {
+            assert!(
+                accepted.contains(&prepared.manifest().batch_id()),
+                "the original batch id survives delivery: {:?}",
+                prepared.manifest().batch_id()
+            );
+        }
+        let peers = receiver
+            .accepted_document_peer_ids_for_test(DocumentKey::Entity(ids.block_home_a()))
+            .unwrap();
+        for lane in [0xA11E_0015_u64, 0xA11E_0016_u64] {
+            assert!(
+                peers.contains(&CrdtPeerId::from_u64(lane)),
+                "both the retired and the fresh lane advanced the document: {peers:?}"
+            );
+            let owner = receiver
+                .crdt_lane_owner(CrdtPeerId::from_u64(lane))
+                .unwrap_or_else(|| panic!("lane {lane:x} is bound by its first admitted use"));
+            assert_eq!(owner.device_id, DeviceId::from_uuid(uuid(device)));
+            assert_eq!(owner.role, crate::oplog::writer_lane::WriterRole::Local);
+        }
+        // Both incarnations bind to the one enrolled author device, and the
+        // rebuild costs exactly one additional writer identity — the
+        // bounded-by-incarnations `P` term, not a per-batch term.
+        for prepared in [&old_prefix, &new_work] {
+            assert_eq!(
+                receiver.causal_peer_owner(prepared.manifest().causal_dot().peer_id()),
+                Some(DeviceId::from_uuid(uuid(device))),
+                "a causal writer incarnation binds to its enrolled author device"
+            );
+        }
+        assert_eq!(receiver.crdt_lane_count(), seed_lane_count + 2);
+        assert_eq!(
+            receiver.causal_peer_count(),
+            seed_incarnations + 2,
+            "one real writer incarnation change costs exactly one P entry"
+        );
+    }
+}
+
+/// The other half of the same boundary: WITHIN one incarnation, a conflicting
+/// same-dot claim is a fork and is refused before any live fragment, ownership
+/// or effect change — while an ordinary duplicate replay of the original bytes
+/// still succeeds. Sparse counter containment cannot tell these apart; the
+/// exact accepted per-peer tip can.
+#[test]
+fn a_same_incarnation_same_dot_fork_is_refused_and_the_original_bytes_are_retained() {
+    let ids = Ids::new();
+    let dir = TestDir::new("same-dot-fork");
+    let archive = store(&dir, ids);
+    let (mut author, genesis) = seed_engine(ids, &archive);
+    let device = 5_601_u128;
+
+    let original = block_in(
+        &author,
+        author_on_incarnation(76_001, device, 0xA11E_0017, b"one"),
+        crate::oplog::BlockId::from_uuid(uuid(86_001)),
+        ids.page_a,
+        ids.home_a,
+        "f1",
+        "original bytes",
+    );
+    assert!(matches!(
+        author.stage_ready(ready(&archive, &original)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // A second engine that never saw the original prepares a DIFFERENT batch on
+    // the SAME incarnation, so it lands on the same (peer, counter). This is
+    // what a duplicated or forged private writer record produces.
+    let mut forker = ids.engine();
+    assert!(matches!(
+        forker.stage_ready(genesis.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let fork = block_in(
+        &forker,
+        author_on_incarnation(76_002, device, 0xA11E_0017, b"one"),
+        crate::oplog::BlockId::from_uuid(uuid(86_002)),
+        ids.page_a,
+        ids.home_a,
+        "f2",
+        "forked bytes",
+    );
+    assert_eq!(
+        fork.manifest().causal_dot(),
+        original.manifest().causal_dot(),
+        "the fixture really does construct a same-dot conflict"
+    );
+    assert_ne!(fork.manifest().batch_id(), original.manifest().batch_id());
+
+    let mut receiver = ids.engine();
+    assert!(matches!(
+        receiver.stage_ready(genesis).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let original_ready = ready(&archive, &original);
+    assert!(matches!(
+        receiver.stage_ready(original_ready.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let before = receiver.canonical_snapshot().unwrap();
+    let accepted_before = receiver.status().accepted_batch_ids().unwrap();
+
+    let refused = receiver.stage_ready(ready(&archive, &fork)).disposition;
+    assert!(
+        matches!(
+            refused,
+            BatchDisposition::Rejected {
+                error: EngineError::CausalDotFork { .. }
+            }
+        ),
+        "a conflicting same-dot claim is a fork, not a duplicate: {refused:?}"
+    );
+    // Nothing accepted moved, and no fragment of any accepted document changed.
+    assert_eq!(receiver.canonical_snapshot().unwrap(), before);
+    assert_eq!(
+        receiver.status().accepted_batch_ids().unwrap(),
+        accepted_before
+    );
+    // The rejected original bytes are preserved in the archive, unmodified.
+    assert!(matches!(
+        archive.inspect_batch(fork.manifest().batch_id()).unwrap(),
+        BatchInspection::Ready(_)
+    ));
+    // And a normal duplicate replay of the real original still succeeds.
+    assert!(matches!(
+        receiver.stage_ready(original_ready).disposition,
+        BatchDisposition::DuplicateAccepted { .. }
+    ));
+}
+
+/// A foreign device claiming an incarnation this graph already bound is refused
+/// through the same accepted-ownership machinery, atomically and before any
+/// visible change. The incarnation stays bound to its original author.
+#[test]
+fn a_foreign_device_cannot_claim_an_already_bound_causal_writer_incarnation() {
+    let ids = Ids::new();
+    let dir = TestDir::new("foreign-causal-key");
+    let archive = store(&dir, ids);
+    let (mut author, genesis) = seed_engine(ids, &archive);
+    let owner_device = 5_701_u128;
+    let thief_device = 5_702_u128;
+    let incarnation = b"shared-label";
+
+    let owned = block_in(
+        &author,
+        author_on_incarnation(77_001, owner_device, 0xA11E_0018, incarnation),
+        crate::oplog::BlockId::from_uuid(uuid(87_001)),
+        ids.page_a,
+        ids.home_a,
+        "t1",
+        "owner edit",
+    );
+    assert!(matches!(
+        author.stage_ready(ready(&archive, &owned)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // A different enrolled device authors under the SAME causal key. Its Loro
+    // lane is its own, so only the causal identity is stolen.
+    let mut thief = ids.engine();
+    assert!(matches!(
+        thief.stage_ready(genesis.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let mut stolen_author = author_on_incarnation(77_002, thief_device, 0xA11E_0019, b"thief");
+    stolen_author.causal_peer_id = owned.manifest().causal_dot().peer_id();
+    let stolen = block_in(
+        &thief,
+        stolen_author,
+        crate::oplog::BlockId::from_uuid(uuid(87_002)),
+        ids.page_a,
+        ids.home_a,
+        "t2",
+        "stolen causal key",
+    );
+    assert_eq!(
+        stolen.manifest().causal_dot().peer_id(),
+        owned.manifest().causal_dot().peer_id()
+    );
+    assert_ne!(
+        stolen.manifest().author_device_id(),
+        owned.manifest().author_device_id()
+    );
+
+    let mut receiver = ids.engine();
+    assert!(matches!(
+        receiver.stage_ready(genesis).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        receiver.stage_ready(ready(&archive, &owned)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let before = receiver.canonical_snapshot().unwrap();
+    let refused = receiver.stage_ready(ready(&archive, &stolen)).disposition;
+    assert!(
+        matches!(
+            refused,
+            BatchDisposition::Rejected {
+                error: EngineError::CausalPeerNotOwned { .. }
+            }
+        ),
+        "another author may not advance a bound writer incarnation: {refused:?}"
+    );
+    assert_eq!(receiver.canonical_snapshot().unwrap(), before);
+    assert_eq!(
+        receiver.causal_peer_owner(owned.manifest().causal_dot().peer_id()),
+        Some(DeviceId::from_uuid(uuid(owner_device))),
+        "the refused claim did not rebind the incarnation"
+    );
+    assert!(matches!(
+        archive.inspect_batch(stolen.manifest().batch_id()).unwrap(),
+        BatchInspection::Ready(_)
+    ));
+}
+
+/// Lane ownership is rebuilt by full accepted replay: a receiver that opened
+/// without a checkpoint still knows who owns every lane.
+#[test]
+fn writer_lane_ownership_is_rebuilt_by_full_accepted_replay() {
+    let ids = Ids::new();
+    let dir = TestDir::new("writer-lane-restore");
+    let archive = store(&dir, ids);
+    let (mut engine, genesis_batch) = seed_engine(ids, &archive);
+    let lane = 0xA11E_0004_u64;
+    let device = 5_301_u128;
+
+    let owner = block_in(
+        &engine,
+        author_on_lane(73_001, device, lane),
+        crate::oplog::BlockId::from_uuid(uuid(83_001)),
+        ids.page_a,
+        ids.home_a,
+        "s1",
+        "owner edit",
+    );
+    let batch = ready(&archive, &owner);
+    assert!(matches!(
+        engine.stage_ready(batch).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let expected = engine.crdt_lane_owner(CrdtPeerId::from_u64(lane)).unwrap();
+
+    // Full accepted replay rebuilds the same map from original bytes. (The
+    // checkpoint-restored half of the same property is proved separately, on
+    // the checkpoint state section itself.)
+    let mut replayed = ids.engine();
+    let genesis_ready = match archive
+        .inspect_batch(genesis_batch.manifest().batch_id())
+        .unwrap()
+    {
+        BatchInspection::Ready(batch) => batch,
+        other => panic!("genesis remains Ready: {other:?}"),
+    };
+    assert!(matches!(
+        replayed.stage_ready(genesis_ready).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let owner_ready = match archive.inspect_batch(owner.manifest().batch_id()).unwrap() {
+        BatchInspection::Ready(batch) => batch,
+        other => panic!("owner batch remains Ready: {other:?}"),
+    };
+    assert!(matches!(
+        replayed.stage_ready(owner_ready).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        replayed.crdt_lane_owner(CrdtPeerId::from_u64(lane)),
+        Some(expected),
+        "full accepted replay rebuilds lane ownership"
+    );
 }

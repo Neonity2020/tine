@@ -13,22 +13,24 @@ use crate::Graph;
 
 use super::absence_sweep::{SweepError, SweepRecorder};
 use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
+use super::hot_engine::prepared_manifest_fingerprint;
 use super::hot_engine::{LocalAuthorCapture, ReconciliationNeeded};
 use super::import::plan_clean_affected_import;
 use super::local_active::{
     CleanRuntimeSession, LocalRuntimeAdmission, RuntimePromotionError, RuntimeRevocation,
     WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
 };
+use super::writer_lane::{WriterLaneError, WriterLaneTip, WriterRole};
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
-    ContentDigest, CrdtPeerId, ImportPlanStatus, OperationTransaction, PageId, PreparedBatch,
-    ProjectionEndpointBinding, ProjectionReceiptStore, SessionId, ShardedHotEngine, SqliteFrontier,
+    CausalPeerId, ContentDigest, CrdtPeerId, ImportPlanStatus, OperationTransaction, PageId,
+    PreparedBatch, ProjectionEndpointBinding, ProjectionReceiptStore, SessionId, ShardedHotEngine,
+    SqliteFrontier,
 };
 #[cfg(test)]
 use super::{ObjectStore, RebuildSource, TailOverlay};
 use crate::oplog::projection_turn_journal::ProjectionTurnJournalState;
 
-const CRDT_PEER_PROBE_BUDGET: u64 = 8;
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TrustedLocalPreparationStageTimings {
@@ -483,6 +485,7 @@ fn execute_clean_local_inner(
             let failure =
                 OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string());
             if matches!(archive.inspect_batch(batch_id), Ok(BatchInspection::Absent)) {
+                admission.note_writer_lane_reservation_absent(batch_id);
                 published.cancel_prepublication();
                 return Err(failure);
             }
@@ -686,6 +689,10 @@ impl OperationalCoordinator {
                     error.to_string(),
                 );
                 if matches!(archive.inspect_batch(batch_id), Ok(BatchInspection::Absent)) {
+                    // Proved never durable: the lane may reuse this counter.
+                    // Anything else stays an unproved outcome and continues to
+                    // block the lane until a reopen resolves it.
+                    admission.note_writer_lane_reservation_absent(batch_id);
                     published.cancel_prepublication();
                     return Err(failure);
                 }
@@ -818,14 +825,19 @@ impl OperationalCoordinator {
                 format!("clean SQLite identity candidates are unavailable: {error}"),
             )
         })?;
-        let (author, draft) = draft_with_bounded_peer_candidates(
+        let external_lane = admission
+            .writer_lane_peer(WriterRole::External)
+            .map_err(classify_authorization_failure)?;
+        let causal_peer = admission
+            .writer_lane_causal_peer()
+            .map_err(classify_authorization_failure)?;
+        let (author, draft) = draft_on_writer_lane(
             engine,
             endpoint,
             &material,
             Some(&claim_source),
-            |attempt| {
-                CrdtPeerId::external_import_candidate(engine.workspace_id(), import_id, attempt)
-            },
+            external_lane,
+            causal_peer,
         )?;
         drop(claim_source);
         fault(OperationalFaultPoint::AfterDraft)?;
@@ -858,6 +870,16 @@ impl OperationalCoordinator {
             &admission,
             WorkspaceAuthorityBoundary::Publication,
             OperationalPhase::Publication,
+        )?;
+        // Manager correction 1: external publication is manifest-first, so the
+        // exact archive commit below — not any local journal append — is this
+        // path's durable prefix. The reservation precedes it.
+        reserve_writer_lane_for_publication(
+            &admission,
+            engine,
+            WriterRole::External,
+            external_lane,
+            &prepared,
         )?;
         let published = guard.into_published_latch();
         let batch_id = author.batch_id;
@@ -1100,13 +1122,14 @@ fn prepare_local_inner(
 
     #[cfg(test)]
     let draft_started = Instant::now();
-    let (batch_id, author_device_id, author_session_id, draft) = match source {
+    let (batch_id, author_device_id, author_session_id, local_lane, draft) = match source {
         LocalDraftSource::Promoted { batch_id } => {
             let authority = admission
                 .mint_local_author_authority(graph, engine, endpoint)
                 .map_err(classify_authorization_failure)?;
             let author_device_id = authority.device_id();
             let author_session_id = authority.session_id();
+            let local_lane = authority.crdt_peer_id();
             let (batch_id, draft) = match batch_id {
                 Some(batch_id) => engine.draft_admitted_local_author_transaction_with_batch_id(
                     &authority,
@@ -1127,7 +1150,13 @@ fn prepare_local_inner(
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
             })?;
-            (batch_id, author_device_id, author_session_id, draft)
+            (
+                batch_id,
+                author_device_id,
+                author_session_id,
+                Some(local_lane),
+                draft,
+            )
         }
         #[cfg(test)]
         LocalDraftSource::Raw(author) => {
@@ -1146,6 +1175,9 @@ fn prepare_local_inner(
                 author.batch_id,
                 author.author_device_id,
                 author.author_session_id,
+                // The raw-author fixture hatch deliberately supplies its own
+                // peer, so it has no admitted lane to reserve.
+                None,
                 draft,
             )
         }
@@ -1192,6 +1224,20 @@ fn prepare_local_inner(
             OperationalPhase::Finalize,
             "finalized batch lost its exact local-author identity",
         ));
+    }
+    // The trusted-local commit boundary makes this exact prepared batch durable
+    // in the foreground journal without returning here, and `execute_clean_local`
+    // publishes the same batch straight into the archive. Reserving the lane at
+    // the end of preparation therefore precedes BOTH durable publications with
+    // one call site, and the batch's causal dot is already final.
+    if let Some(local_lane) = local_lane {
+        reserve_writer_lane_for_publication(
+            admission,
+            engine,
+            WriterRole::Local,
+            local_lane,
+            &prepared,
+        )?;
     }
     fault(OperationalFaultPoint::AfterFinalize)?;
     #[cfg(test)]
@@ -1394,50 +1440,107 @@ fn resume_clean_published(
     }
 }
 
-fn draft_with_bounded_peer_candidates(
+/// Durably reserve the exact batch that is about to become outwardly visible.
+///
+/// This is the ONE added foreground durability barrier on a publishing turn:
+/// a fixed-size exact replacement of the device-private lane record, before the
+/// trusted local journal append or the external archive manifest commit. It
+/// re-proves workspace authority first, so a runtime that lost its lease cannot
+/// reserve, and it refuses outright when a previous reservation has no proved
+/// outcome — authoring past an unknown publication is exactly what would reuse
+/// counters that may already be visible elsewhere.
+fn reserve_writer_lane_for_publication(
+    admission: &LocalRuntimeAdmission<'_>,
+    engine: &ShardedHotEngine,
+    role: WriterRole,
+    peer: CrdtPeerId,
+    prepared: &PreparedBatch,
+) -> Result<(), OperationalCoordinatorError> {
+    let manifest = prepared.manifest();
+    // The coverage question is about the incarnation this batch actually
+    // authored under, not the enrolled device: one device may have published
+    // under several incarnations, and only this one's prefix decides.
+    let proved = engine.own_causal_dot_high_water(manifest.causal_dot().peer_id());
+    // Steady state: the previous reservation was absorbed by the live prefix,
+    // so this is pure memory and reads no archive.
+    if let Some((stale, counter)) = admission.pending_writer_lane_reservation() {
+        if counter > proved
+            && engine.archive_store_capability().is_some_and(|archive| {
+                matches!(
+                    archive.inspect_batch(stale.batch_id),
+                    Ok(BatchInspection::Absent)
+                )
+            })
+        {
+            admission.note_writer_lane_reservation_absent(stale.batch_id);
+        }
+    }
+    // The reservation names the exact publication, not merely a counter: an
+    // integer alone cannot distinguish "my batch reached the store" from "a
+    // different batch took my dot".
+    let tip = WriterLaneTip {
+        batch_id: manifest.batch_id(),
+        manifest_digest: prepared_manifest_fingerprint(prepared),
+    };
+    admission
+        .reserve_writer_lane(role, peer, tip, manifest.causal_dot().counter(), proved)
+        .map_err(|error| match error {
+            RuntimePromotionError::WriterLane(WriterLaneError::Uncontinuable(detail)) => {
+                OperationalCoordinatorError::retained_block(
+                    OperationalPhase::Publication,
+                    detail,
+                    RetainedBlockReason::StableBinding,
+                )
+            }
+            other => classify_authorization_failure(other),
+        })
+}
+
+/// Draft one external reconciliation on this endpoint's persistent import lane.
+///
+/// The bounded fresh-peer probe this replaced existed only to find a peer that
+/// was *absent* from every affected document. That was the fresh-peer-per-import
+/// invariant, and it is exactly what made a repeatedly reconciled document carry
+/// one version-vector entry per import forever. `ImportId` keeps every other
+/// role it had — deterministic `BatchId`, synthetic author session, observation
+/// document — so import idempotence is untouched; only the CRDT peer stops
+/// being per-import.
+fn draft_on_writer_lane(
     engine: &ShardedHotEngine,
     endpoint: ProjectionEndpointBinding,
     material: &super::import::ImportExecutionMaterial,
     claim_source: Option<&dyn super::hot_engine::ProjectionClaimSource>,
-    mut candidate_at: impl FnMut(u64) -> CrdtPeerId,
+    crdt_peer_id: CrdtPeerId,
+    causal_peer_id: CausalPeerId,
 ) -> Result<(AuthorBatch, super::AuthorTransactionDraft), OperationalCoordinatorError> {
-    for attempt in 0..CRDT_PEER_PROBE_BUDGET {
-        let crdt_peer_id = candidate_at(attempt);
-        if crdt_peer_id.as_u64() == 0 {
-            continue;
-        }
-        let author = AuthorBatch {
-            batch_id: material.batch_id(),
-            author_device_id: endpoint.device_id(),
-            author_session_id: SessionId::for_external_import_author(
-                engine.workspace_id(),
-                material.import_id(),
-            ),
-            crdt_peer_id,
-        };
-        let drafted = match claim_source {
-            Some(source) => {
-                engine.draft_clean_external_import_transaction(author, material.clone(), source)
-            }
-            None => engine.draft_external_import_transaction(author, material.clone()),
-        };
-        match drafted {
-            Ok(draft) => return Ok((author, draft)),
-            Err(super::EngineError::CrdtPeerCollision(collision)) if collision == crdt_peer_id => {}
-            Err(error) => {
-                return Err(OperationalCoordinatorError::new(
-                    OperationalPhase::Draft,
-                    error.to_string(),
-                ));
-            }
-        }
+    if crdt_peer_id.as_u64() == 0 {
+        return Err(OperationalCoordinatorError::new(
+            OperationalPhase::Draft,
+            "the admitted external-import writer lane has no CRDT peer",
+        ));
     }
-    Err(OperationalCoordinatorError::new(
-        OperationalPhase::Draft,
-        format!(
-            "no collision-free nonzero CRDT peer in the bounded {CRDT_PEER_PROBE_BUDGET}-candidate probe"
+    let author = AuthorBatch {
+        batch_id: material.batch_id(),
+        author_device_id: endpoint.device_id(),
+        author_session_id: SessionId::for_external_import_author(
+            engine.workspace_id(),
+            material.import_id(),
         ),
-    ))
+        crdt_peer_id,
+        // The external role keeps its own Loro lane but shares this device's
+        // ONE causal chain, so an import's counter continues the same sequence
+        // as ordinary local work. `ImportId` keeps every other role it had.
+        causal_peer_id,
+    };
+    let drafted = match claim_source {
+        Some(source) => {
+            engine.draft_clean_external_import_transaction(author, material.clone(), source)
+        }
+        None => engine.draft_external_import_transaction(author, material.clone()),
+    };
+    drafted.map(|draft| (author, draft)).map_err(|error| {
+        OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
+    })
 }
 
 fn verify_projection_bindings(
@@ -1569,6 +1672,16 @@ fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinat
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
+    use crate::oplog::hot_engine::test_block_home;
+    /// Explicit, stable fixture writer incarnation for the import lane.
+    /// Production reads the saved one from the durable lane record.
+    fn fixture_import_incarnation(endpoint: ProjectionEndpointBinding) -> CausalPeerId {
+        CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+            endpoint.device_id(),
+        ))
+    }
+
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1634,6 +1747,7 @@ mod tests {
         page_id: PageId,
         home_document_id: DocumentId,
         block_id: BlockId,
+        block_home_document_id: DocumentId,
         path: String,
     }
 
@@ -1781,6 +1895,10 @@ mod tests {
             let page = runtime.engine().materialize_page(page_id).unwrap();
             let home_document_id = page.home_document_id;
             let block_id = page.blocks[0].block_id;
+            // Each block owns its own immutable document, so the accepted home
+            // comes from the materialized block; it is not derivable from the
+            // page or from the block ID.
+            let block_home_document_id = page.blocks[0].home_document_id;
             Self {
                 projection_turns:
                     crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
@@ -1800,6 +1918,7 @@ mod tests {
                 page_id,
                 home_document_id,
                 block_id,
+                block_home_document_id,
                 path: path.into(),
             }
         }
@@ -1820,7 +1939,7 @@ mod tests {
             OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: self.block_id,
-                    home_document_id: self.home_document_id,
+                    home_document_id: self.block_home_document_id,
                 },
                 content: content.into(),
             }])
@@ -1833,6 +1952,11 @@ mod tests {
                 author_device_id: self.runtime.endpoint().device_id(),
                 author_session_id: SessionId::from_uuid(Uuid::from_u128(seed + 1)),
                 crdt_peer_id: CrdtPeerId::from_u64((seed as u64).saturating_add(10_001)),
+                causal_peer_id: CausalPeerId::from_key(
+                    crate::oplog::WriterIncarnationId::fixture_for_device(
+                        self.runtime.endpoint().device_id(),
+                    ),
+                ),
             }
         }
 
@@ -1935,6 +2059,7 @@ mod tests {
                 page_id,
                 home_document_id: _,
                 block_id: _,
+                block_home_document_id: _,
                 path,
             } = self;
             let endpoint = receipts.endpoint_binding().unwrap();
@@ -2016,6 +2141,10 @@ mod tests {
             let page = runtime.engine().materialize_page(page_id).unwrap();
             let home_document_id = page.home_document_id;
             let block_id = page.blocks[0].block_id;
+            // Each block owns its own immutable document, so the accepted home
+            // comes from the materialized block; it is not derivable from the
+            // page or from the block ID.
+            let block_home_document_id = page.blocks[0].home_document_id;
             Self {
                 _root,
                 graph_root,
@@ -2032,6 +2161,7 @@ mod tests {
                 page_id,
                 home_document_id,
                 block_id,
+                block_home_document_id,
                 path,
             }
         }
@@ -2402,7 +2532,14 @@ mod tests {
             );
             assert_eq!(observed.refused, None);
             assert_eq!(observed.optimized_catalog_copies, 0);
-            assert!(observed.oracle_catalog_copies >= 1);
+            // The previous derivation reproduced the whole-graph catalog on
+            // every ordinary edit, so this used to be the >= 1 side of a
+            // differential proof. The graph document now carries only fixed
+            // lineage/workspace metadata and no per-page rows, so an ordinary
+            // block edit reproduces it in NEITHER derivation. Asserting the
+            // exact zero is the stronger current statement: it fails if any
+            // graph-sized catalog reproduction is reintroduced on this path.
+            assert_eq!(observed.oracle_catalog_copies, 0);
             let state = fixture.execute_local(&edit).unwrap();
             settle_clean_local(&mut fixture, state);
             let expected = if path.ends_with(".org") {
@@ -2417,7 +2554,9 @@ mod tests {
             let insert = OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(Uuid::from_u128(44_900 + index as u128)),
-                    home_document_id: fixture.home_document_id,
+                    home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(
+                        44_900 + index as u128,
+                    ))),
                 },
                 page_id: fixture.page_id,
                 parent: None,
@@ -2432,7 +2571,14 @@ mod tests {
             );
             assert_eq!(observed.refused, None);
             assert_eq!(observed.optimized_catalog_copies, 0);
-            assert!(observed.oracle_catalog_copies >= 1);
+            // The previous derivation reproduced the whole-graph catalog on
+            // every ordinary edit, so this used to be the >= 1 side of a
+            // differential proof. The graph document now carries only fixed
+            // lineage/workspace metadata and no per-page rows, so an ordinary
+            // block edit reproduces it in NEITHER derivation. Asserting the
+            // exact zero is the stronger current statement: it fails if any
+            // graph-sized catalog reproduction is reintroduced on this path.
+            assert_eq!(observed.oracle_catalog_copies, 0);
             let state = fixture.execute_local(&insert).unwrap();
             settle_clean_local(&mut fixture, state);
             fixture.assert_clean_drained();
@@ -2904,11 +3050,83 @@ mod tests {
         ));
     }
 
+    /// Semantic replacement for the retired bounded fresh-peer probe.
+    ///
+    /// That test proved the probe skipped a zero/genesis candidate and gave up
+    /// after eight collisions. Both properties belonged to the fresh-peer
+    /// invariant: a colliding peer meant "already present in an affected
+    /// document", which under persistent lanes is the NORMAL and required case.
+    /// The property that replaces them is the one the rebaselining bound
+    /// actually needs — repeated imports of the same document reuse one import
+    /// lane, so its version vector does not grow per import — plus the refusals
+    /// that stand in for the retired collision arm: the zero peer, and a peer
+    /// belonging to somebody else's lane.
     #[test]
-    fn crdt_peer_probe_is_bounded_for_zero_collision_and_exhaustion_clean() {
-        let fixture = CleanCoordinatorFixture::new("peer-probe");
+    fn repeated_external_imports_reuse_one_import_lane_and_refuse_foreign_peers() {
+        let mut fixture = CleanCoordinatorFixture::new("import-lane");
         let path = fixture.path.clone();
-        fixture.overwrite(b"- peer probe edit\n");
+        let endpoint = fixture.engine().projection_endpoint_binding().unwrap();
+        let mut peers = std::collections::BTreeSet::new();
+        for revision in 0..3 {
+            fixture.overwrite(format!("- import lane edit {revision}\n").as_bytes());
+            expect_clean_external_complete(fixture.execute_external(&[&path]).unwrap());
+            // Page identity and block content now live in separate documents,
+            // so the lane that authored this reconciliation is read from every
+            // document the page currently comprises, not from one page shard.
+            let page = fixture.engine().materialize_page(fixture.page_id).unwrap();
+            for document in std::iter::once(page.home_document_id)
+                .chain(page.blocks.iter().map(|block| block.home_document_id))
+            {
+                peers.extend(
+                    fixture
+                        .engine()
+                        .accepted_document_peer_ids_for_test(DocumentKey::Entity(document))
+                        .unwrap(),
+                );
+            }
+        }
+        // Lanes are qualified by the first admission, so read them afterwards.
+        let lane = fixture
+            .runtime
+            .writer_lanes()
+            .peer(WriterRole::External)
+            .unwrap();
+        let local_lane = fixture
+            .runtime
+            .writer_lanes()
+            .peer(WriterRole::Local)
+            .unwrap();
+        assert_ne!(lane, local_lane);
+        // Three reconciliations of one page, one import lane. A fresh peer per
+        // import would have left three.
+        assert!(peers.contains(&lane), "import lane authored the document");
+        assert_eq!(
+            peers.iter().filter(|peer| **peer == lane).count(),
+            1,
+            "one import lane, not one peer per import: {peers:?}"
+        );
+        assert_eq!(
+            fixture
+                .engine()
+                .crdt_lane_owner(lane)
+                .map(|owner| owner.role),
+            Some(WriterRole::External)
+        );
+
+        // The retired collision arm's replacements. Refusing a foreign lane is
+        // an ACCEPTED-STATE question, so the ordinary lane has to have actually
+        // authored something before "an import may not advance it" can mean
+        // anything; an unused lane is unowned and refuses nobody.
+        expect_clean_local_complete(fixture.local_edit("- local lane owner edit\n").unwrap());
+        assert_eq!(
+            fixture
+                .engine()
+                .crdt_lane_owner(local_lane)
+                .map(|owner| owner.role),
+            Some(WriterRole::Local),
+            "the ordinary lane is bound by its own first admitted use"
+        );
+        fixture.overwrite(b"- refusal probe\n");
         let plan = plan_clean_affected_import(
             &fixture.graph,
             fixture.engine(),
@@ -2916,32 +3134,38 @@ mod tests {
             &[&path],
         );
         let material = plan.into_execution_material().unwrap();
-        let endpoint = fixture.engine().projection_endpoint_binding().unwrap();
         let claim_source = fixture.database().materialized_read().unwrap();
-        let genesis_peer = 0x5449_4e45_4745_4e31;
-        let candidates = [0, genesis_peer, genesis_peer + 1];
-        let (author, _) = draft_with_bounded_peer_candidates(
+        let zero = match draft_on_writer_lane(
             fixture.engine(),
             endpoint,
             &material,
             Some(&claim_source),
-            |attempt| CrdtPeerId::from_u64(candidates[usize::try_from(attempt).unwrap().min(2)]),
-        )
-        .unwrap();
-        assert_eq!(author.crdt_peer_id, CrdtPeerId::from_u64(genesis_peer + 1));
-
-        let exhausted = match draft_with_bounded_peer_candidates(
-            fixture.engine(),
-            endpoint,
-            &material,
-            Some(&claim_source),
-            |_| CrdtPeerId::from_u64(genesis_peer),
+            CrdtPeerId::from_u64(0),
+            fixture_import_incarnation(endpoint),
         ) {
             Err(error) => error,
-            Ok(_) => panic!("colliding bounded peer probe unexpectedly succeeded"),
+            Ok(_) => panic!("the zero peer is never a lane"),
         };
-        assert_eq!(exhausted.phase(), OperationalPhase::Draft);
-        assert!(exhausted.detail().contains("bounded 8-candidate probe"));
+        assert_eq!(zero.phase(), OperationalPhase::Draft);
+
+        let foreign = match draft_on_writer_lane(
+            fixture.engine(),
+            endpoint,
+            &material,
+            Some(&claim_source),
+            local_lane,
+            fixture_import_incarnation(endpoint),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an import may not advance this device's local lane"),
+        };
+        assert_eq!(foreign.phase(), OperationalPhase::Draft);
+        assert!(
+            foreign.detail().contains("writer lane"),
+            "{}",
+            foreign.detail()
+        );
+        drop(claim_source);
         fixture.graph.probe_managed_text_writer().unwrap();
     }
 

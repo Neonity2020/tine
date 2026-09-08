@@ -775,6 +775,7 @@ mod fixtures {
             vec![BlockDelta {
                 block_id,
                 home_document_id,
+                birth: None,
                 before: Some(state(&before)),
                 after: Some(state(&after)),
             }],

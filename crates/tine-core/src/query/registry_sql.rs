@@ -81,12 +81,12 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_statement_count() {
+pub(crate) fn reset_statement_count() {
     STATEMENTS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn statement_count() -> usize {
+pub(crate) fn statement_count() -> usize {
     STATEMENTS.with(std::cell::Cell::get)
 }
 

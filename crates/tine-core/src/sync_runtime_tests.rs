@@ -2,11 +2,16 @@ use super::*;
 use crate::model::Format;
 use crate::oplog::absence_sweep::SweepActionState;
 use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
+use crate::oplog::hot_engine::test_block_home;
+use crate::oplog::DocumentKey;
 use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+#[path = "live_write_benchmark.rs"]
+mod live_write_benchmark;
 
 fn production_function_and_constructor_census() -> (
     Vec<(String, String)>,
@@ -3237,14 +3242,11 @@ fn clean_foreground_journal_compacts_and_reopens_after_threshold() {
     ));
 }
 
-/// The bounded hot-document cache may evict a page after unrelated pages
-/// are edited. Re-materializing that page from accepted history must leave
-/// its latest manifested projection usable as the predecessor of another
-/// ordinary save. This is deliberately wider than the 64-document hot
-/// cache; staying at or below the cache limit would never exercise the
-/// history-backed materialization path.
+/// Saving unrelated pages must preserve the accepted projection predecessor
+/// for another ordinary save of the first page. This fixture does not assert
+/// eviction; the configured-cap cold-document tests cover actual nonresidency.
 #[test]
-fn clean_foreground_page_can_be_saved_again_after_hot_document_eviction() {
+fn clean_foreground_page_can_be_saved_again_after_unrelated_page_edits() {
     const EDITED_PAGES: usize = 65;
     let fixture = ActivationFixture::scaled_with_blocks(
         "clean-foreground-save-after-hot-eviction",
@@ -3275,11 +3277,11 @@ fn clean_foreground_page_can_be_saved_again_after_hot_document_eviction() {
         &handle,
         first,
         revision,
-        "second accepted edit after hot-document eviction",
+        "second accepted edit after unrelated page edits",
     );
     assert_eq!(
         saved.blocks[0].raw,
-        "second accepted edit after hot-document eviction"
+        "second accepted edit after unrelated page edits"
     );
     drain_managed_local(&handle);
     assert!(matches!(
@@ -5023,7 +5025,9 @@ fn copy_provider_head_covering(
     relative
 }
 
-fn provider_head_covers(
+// A published clean head reports accepted tips. It does not advertise the
+// retired manifest-recovery record, nor certify independent archive retention.
+fn provider_head_names_tip(
     fixture: &ActivationFixture,
     author_device_id: DeviceId,
     batch_id: BatchId,
@@ -5041,9 +5045,10 @@ fn provider_head_covers(
         );
         SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap()).is_ok_and(
             |head| {
-                head.author_device_id() == author_device_id
+                head.workspace_id() == fixture.request.identities.workspace_id
+                    && head.lineage_digest() == fixture.request.identities.lineage_digest
+                    && head.author_device_id() == author_device_id
                     && head.frontier_tips().contains(&batch_id)
-                    && head.has_current_manifest_recovery_coverage()
             },
         )
     })
@@ -5594,7 +5599,7 @@ fn real_store_oracle_transaction(
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id,
                 parent: None,
@@ -5664,7 +5669,7 @@ fn real_store_oracle_transaction(
             vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: page.home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id: page.page_id,
                 parent: Some(BlockId::from_uuid(Uuid::from_u128(seed + 0x13))),
@@ -6052,7 +6057,7 @@ fn run_absence_sweep_recovery_oracle() {
 
 fn run_restore_recovery_oracle() {
     restore_revives_the_same_page_projects_it_and_survives_a_second_reopen();
-    over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor();
+    over_limit_restore_rediffs_case("sweep-restore-chunks-oracle", 0xc5102_1000);
     post_restore_external_deletion_defers_through_frontier_maximal_present_evidence();
 }
 
@@ -7321,12 +7326,114 @@ fn restore_revives_the_same_page_projects_it_and_survives_a_second_reopen() {
 
 #[test]
 fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor() {
+    over_limit_restore_rediffs_case("sweep-restore-chunks", 0xc5102);
+}
+
+#[test]
+fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
+    for (case, blocks) in [("small", 8_usize), ("larger", 64_usize)] {
+        let fixture = ActivationFixture::empty(
+            &format!("baseline-page-read-{case}"),
+            0xc5102_2000 + blocks as u128,
+        );
+        let path = "notes/Baseline Page Read.md";
+        let source = (0..blocks)
+            .map(|index| format!("- baseline block {index:04}\n"))
+            .collect::<String>();
+        fs::write(fixture.graph_root.join(path), source).unwrap();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("baseline read fixture activates");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let open_request = reopen_request(&fixture.request);
+        let resources = open_clean_runtime_resources(&open_request)
+            .unwrap()
+            .expect("baseline read fixture reopens");
+        let managed_path = ManagedPath::parse(path.to_owned()).unwrap();
+        let page_id = resources
+            .runtime
+            .database()
+            .materialized_read()
+            .unwrap()
+            .pages_by_path(&managed_path, 2)
+            .unwrap()
+            .pop()
+            .expect("reopened projection contains the baseline page")
+            .page_id;
+        let engine = resources.runtime.engine();
+        let before = engine.lazy_genesis_page_capsule_decodes_for_test();
+        let first = engine.materialize_page(page_id).unwrap();
+        let after_first = engine.lazy_genesis_page_capsule_decodes_for_test();
+        assert_eq!(
+            after_first - before,
+            1,
+            "one top-level materialization must decode one baseline capsule for {blocks} blocks"
+        );
+        assert_eq!(first.blocks.len(), blocks);
+        assert!(first.blocks.iter().enumerate().all(|(index, block)| {
+            block.content == format!("baseline block {index:04}")
+                && block.block_id.as_uuid() != Uuid::nil()
+                && block.home_document_id.as_uuid() != Uuid::nil()
+        }));
+
+        let first_identity_and_content = first
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.block_id,
+                    block.home_document_id,
+                    block.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let second = engine.materialize_page(page_id).unwrap();
+        let after_second = engine.lazy_genesis_page_capsule_decodes_for_test();
+        eprintln!(
+            "baseline page read case={case} blocks={blocks} first_scope_decodes={} second_scope_decodes={}",
+            after_first - before,
+            after_second - after_first
+        );
+        assert_eq!(
+            after_second - after_first,
+            1,
+            "a subsequent top-level materialization must begin a fresh read scope"
+        );
+        assert_eq!(
+            second
+                .blocks
+                .iter()
+                .map(|block| (
+                    block.block_id,
+                    block.home_document_id,
+                    block.content.clone()
+                ))
+                .collect::<Vec<_>>(),
+            first_identity_and_content
+        );
+    }
+}
+
+fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
     // The equivalence oracle invokes this same scenario as well. Its fixed
     // workspace identity keys global crash-cut hooks, so parallel invocations
     // otherwise consume each other's cuts despite using separate directories.
     static SCENARIO: Mutex<()> = Mutex::new(());
     let _scenario = SCENARIO.lock().unwrap();
-    let fixture = ActivationFixture::nested_unicode("sweep-restore-chunks", 0xc5102);
+    let phase = |name: &str| {
+        if std::env::var_os("TINE_PHASE_TRACE").is_some() {
+            eprintln!("RESTORE PHASE {label} {name}");
+        }
+    };
+    phase("first-activation-start");
+    let fixture = ActivationFixture::nested_unicode(label, seed);
     let mut source = String::new();
     for index in 0..1_100 {
         source.push_str(&format!("- original block {index:04}\n"));
@@ -7336,18 +7443,26 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
 
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     let handle = activated.handle.expect("chunk fixture activates");
+    phase("first-activation-complete");
+    phase("initial-feed-start");
     drive_initial_feed(&handle);
+    phase("initial-feed-complete");
+    phase("initial-shutdown-start");
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
     drop(handle);
+    phase("initial-shutdown-complete");
 
+    phase("first-reopen-start");
     let open_request = reopen_request(&fixture.request);
     let resources = open_clean_runtime_resources(&open_request)
         .unwrap()
         .expect("chunk fixture reopens");
+    phase("first-reopen-resources-complete");
     let identities = open_request.clean_identities.clone().unwrap();
+    phase("first-runtime-actor-start");
     let mut actor = RuntimeActor::from_clean_resources(
         open_request,
         identities,
@@ -7356,7 +7471,9 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .unwrap();
+    phase("first-runtime-actor-complete");
     let root = ManagedPath::parse("Root.md".to_owned()).unwrap();
+    phase("first-page-lookup-start");
     let page_id = actor
         .clean
         .as_ref()
@@ -7370,6 +7487,8 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         .pop()
         .unwrap()
         .page_id;
+    phase("first-page-lookup-complete");
+    phase("first-page-materialize-start");
     let page = actor
         .clean
         .as_ref()
@@ -7379,15 +7498,22 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         .materialize_page(page_id)
         .unwrap();
     assert_eq!(page.blocks.len(), 1_100);
+    phase("first-page-materialize-complete");
 
+    phase("external-delete-start");
     fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
+    phase("external-delete-complete");
+    phase("external-delete-observe-start");
     actor
         .observe(vec![
             SyncWatcherObservation::managed_path("Root.md").unwrap()
         ])
         .unwrap();
-    for _ in 0..64 {
+    phase("external-delete-observe-complete");
+    for tick_ordinal in 0..64 {
+        phase(&format!("external-delete-tick-{tick_ordinal}-start"));
         let tick = actor.tick();
+        phase(&format!("external-delete-tick-{tick_ordinal}-complete"));
         assert!(!matches!(tick, SyncRuntimeTick::Terminal(_)), "{tick:?}");
         if !actor.clean.as_ref().unwrap().watcher_status().pending {
             break;
@@ -7400,6 +7526,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
     );
 
     for (chunk_ordinal, blocks) in page.blocks.chunks(400).enumerate() {
+        phase(&format!("edit-chunk-{chunk_ordinal}-start"));
         let operations = blocks
             .iter()
             .map(|block| SemanticOperation::EditBlockContent {
@@ -7418,6 +7545,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
                     ..
                 }
         ));
+        phase(&format!("edit-chunk-{chunk_ordinal}-complete"));
     }
 
     admit_after_restore_chunks_for_test(
@@ -7433,10 +7561,12 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         Some(1),
     );
     fail_once_after_restore_progress(fixture.request.identities.workspace_id);
+    phase("restore-entry");
     assert_eq!(
         actor.restore_absence_sweep(sweep_id),
         Err(SyncRuntimeRequestError::ActorUnavailable)
     );
+    phase("restore-interrupted-exit");
     assert!(
         actor.publication_barrier_active(),
         "a crash cut between chunks must not release the sweep hold"
@@ -7454,12 +7584,16 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         } if remaining_operation_watermark > RESTORE_CHUNK_OPERATION_LIMIT as u64
     )));
     drop(actor);
+    phase("interrupted-actor-dropped");
 
+    phase("second-reopen-start");
     let open_request = reopen_request(&fixture.request);
     let resources = open_clean_runtime_resources(&open_request)
         .unwrap()
         .expect("interrupted restore reopens");
+    phase("second-reopen-resources-complete");
     let identities = open_request.clean_identities.clone().unwrap();
+    phase("second-runtime-actor-start");
     let resumed = RuntimeActor::from_clean_resources(
         open_request,
         identities,
@@ -7468,6 +7602,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
         Arc::new(crate::managed_query::ManagedQueryShared::default()),
     )
     .expect("startup resumes the durable restore cursor");
+    phase("second-runtime-actor-complete");
     assert_eq!(
         fs::read(fixture.graph_root.join("Root.md")).unwrap(),
         expected
@@ -7492,6 +7627,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
             ..
         } if chunk_ordinal >= 2
     )));
+    phase("case-complete");
 }
 
 #[test]
@@ -9207,6 +9343,96 @@ fn managed_rename_uses_the_canonical_fold_for_final_sigma_names() {
 }
 
 #[test]
+fn pending_rename_and_delete_releases_mask_the_accepted_sqlite_name_owner() {
+    let fixture = ActivationFixture::nested_unicode("pending-name-release-mask", 0xa1774);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let opened = SyncRuntimeHandle::open_from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+    );
+    let handle = opened.handle.expect("clean actor handle opens");
+
+    let (rename_source, _) = accepted_new_application_page(
+        &handle,
+        "Pending Release Rename Source",
+        vec![BlockDto {
+            id: "pending-release-rename-block".into(),
+            raw: "rename body".into(),
+            ..BlockDto::default()
+        }],
+    );
+    drain_managed_local(&handle);
+    let (delete_source, _) = accepted_new_application_page(
+        &handle,
+        "Pending Release Delete Source",
+        vec![BlockDto {
+            id: "pending-release-delete-block".into(),
+            raw: "delete body".into(),
+            ..BlockDto::default()
+        }],
+    );
+    drain_managed_local(&handle);
+
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                old: "Pending Release Rename Source".into(),
+                new: "Pending Release Rename Target".into(),
+                expected_path: Some(rename_source.path),
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied
+    );
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Pending Release Rename Source".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: None,
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied,
+        "a pending rename release must mask the accepted SQLite owner"
+    );
+
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Pending Release Delete Source".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: Some(delete_source.path),
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied
+    );
+    assert_eq!(
+        handle
+            .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                name: "Pending Release Delete Source".into(),
+                page_kind: SyncPageKind::Page,
+                expected_path: None,
+            })
+            .unwrap(),
+        SyncApplicationUnitOutcome::Applied,
+        "a pending delete release must mask the accepted SQLite owner"
+    );
+
+    drain_managed_local(&handle);
+    let (renamed, _) =
+        load_application_logical(&handle, "Pending Release Rename Target", SyncPageKind::Page);
+    assert_eq!(renamed.blocks[0].raw, "rename body");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
 fn clean_runtime_serves_regime_neutral_graph_pdf_and_guide_journeys() {
     let fixture = ActivationFixture::nested_unicode("clean-runtime-app-journeys", 0xa1772);
     fs::create_dir_all(fixture.graph_root.join("assets")).unwrap();
@@ -9551,6 +9777,755 @@ fn public_cold_open_prefers_clean_marker_without_discovering_legacy_enrollment()
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Persistent CRDT writer lanes on the RUNNING clean-runtime path (P1).
+//
+// The store's own tests prove the record's algebra against a fabricated proof.
+// These prove the live thing: a real activation, real application saves, a real
+// clean cold open, a real checkpoint open — and the durable record read straight
+// off the device-private application runtime root, because that record, not any
+// in-memory value, is what a restart continues from.
+// ---------------------------------------------------------------------------
+
+/// The one retained lane record for a fixture's single device.
+fn lane_record(
+    fixture: &ActivationFixture,
+) -> (
+    String,
+    Vec<u8>,
+    crate::oplog::writer_lane::WriterLaneRecordView,
+) {
+    let mut records =
+        crate::oplog::writer_lane::retained_lane_records(&fixture.request.application_runtime_root);
+    assert_eq!(
+        records.len(),
+        1,
+        "one device authors one lane record: {records:?}"
+    );
+    let (name, bytes, view) = records.remove(0);
+    let view = view.expect("the retained lane record decodes");
+    (name, bytes, view)
+}
+
+/// The highest own causal dot this record has put in flight: the confirmed
+/// floor, or the live reservation above it. A record written at reservation
+/// time necessarily lags its own reservation by one, because the reservation
+/// IS the dot whose outcome is not yet known.
+fn lane_own_high_water(view: &crate::oplog::writer_lane::WriterLaneRecordView) -> u64 {
+    view.reserved
+        .map_or(view.confirmed_own_counter, |(_, counter)| {
+            counter.max(view.confirmed_own_counter)
+        })
+}
+
+fn lane_record_path(fixture: &ActivationFixture, name: &str) -> PathBuf {
+    let namespace = fixture
+        .request
+        .application_runtime_root
+        .join("crdt-writer-lanes");
+    let lane = std::fs::read_dir(&namespace)
+        .unwrap()
+        .flatten()
+        .next()
+        .expect("the lane namespace holds this workspace/lineage directory")
+        .path();
+    lane.join(name)
+}
+
+/// Manager correction D, on the live path: an ordinary restart AND a checkpoint
+/// restart both continue the same two saved lanes. A checkpoint open that
+/// observed an empty ephemeral causal map as counter zero would rotate the
+/// lane and restart the device's own dot chain; this asserts it does neither,
+/// while `checkpoint_opens == 1` proves the reopen really came from a
+/// checkpoint rather than a full replay.
+#[test]
+fn clean_and_checkpoint_reopens_continue_one_persistent_writer_lane() {
+    let fixture = ActivationFixture::nested_unicode("writer-lane-live-reopen", 0xa178_c000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.expect("writer-lane fixture activates");
+    drive_initial_feed(&handle);
+
+    // Genesis activation mints the lanes before any authoring can happen.
+    let (_, _, minted) = lane_record(&fixture);
+    assert_eq!(minted.incarnation, 0);
+    assert_ne!(minted.local_peer, minted.external_peer);
+
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let (page, revision) = save_application_block_text(&handle, page, revision, "lane edit one");
+    let (_, _) = save_application_block_text(&handle, page, revision, "lane edit two");
+    drain_managed_local(&handle);
+    drop(handle);
+
+    let (_, _, authored) = lane_record(&fixture);
+    assert_eq!(authored.local_peer, minted.local_peer);
+    assert_eq!(authored.incarnation, 0);
+    assert_eq!(
+        authored.incarnation_id, minted.incarnation_id,
+        "authoring uses the saved causal writer incarnation; it never mints one per batch"
+    );
+    assert!(
+        lane_own_high_water(&authored) >= 1,
+        "acknowledged local commits advance the device's own causal chain: {authored:?}"
+    );
+
+    // Force the first restart through full replay: foreground saves may have
+    // already published a disposable clean checkpoint. Original archive bytes
+    // and the acknowledged journal are preserved; the fixture removes only the
+    // derived checkpoint directory while no runtime holds it (D-3).
+    let checkpoint_directory = clean_operation_archive_directory(&fixture.request.archive_root)
+        .join("clean-open-checkpoint-v1");
+    if checkpoint_directory.exists() {
+        fs::remove_dir_all(&checkpoint_directory).unwrap();
+    }
+    let mut first_counters = None;
+    let first =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_counters = Some(counters);
+            }
+        });
+    assert_eq!(first.status, SyncRuntimeOpenStatus::Active);
+    let first_handle = first.handle.expect("the first clean cold open succeeds");
+    let first_counters = first_counters.expect("the first clean open reports counters");
+    assert_eq!(
+        first_counters.full_replay_opens, 1,
+        "the first restart is a full accepted replay: {first_counters:?}"
+    );
+    let (restored, revision) = load_application_exact(&first_handle, "Root.md");
+    assert_eq!(restored.blocks[0].raw, "lane edit two");
+    let (_, _, reopened) = lane_record(&fixture);
+    assert_eq!(reopened.local_peer, minted.local_peer);
+    assert_eq!(reopened.external_peer, minted.external_peer);
+    assert_eq!(reopened.incarnation, 0);
+    assert_eq!(
+        reopened.incarnation_id, minted.incarnation_id,
+        "a healthy restart continues the SAME causal writer incarnation"
+    );
+    assert_eq!(
+        lane_own_high_water(&reopened),
+        lane_own_high_water(&authored),
+        "an ordinary restart neither loses nor invents own causal dots"
+    );
+
+    // More acknowledged work on the SAME lane, then a checkpointed restart.
+    let (_, _) = save_application_block_text(&first_handle, restored, revision, "lane edit three");
+    drain_managed_local(&first_handle);
+    let (_, _, before_checkpoint) = lane_record(&fixture);
+    assert!(lane_own_high_water(&before_checkpoint) > lane_own_high_water(&authored));
+    drop(first_handle);
+
+    let mut second_counters = None;
+    let second =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_counters = Some(counters);
+            }
+        });
+    assert_eq!(second.status, SyncRuntimeOpenStatus::Active);
+    let second_handle = second.handle.expect("the checkpointed clean open succeeds");
+    let second_counters = second_counters.expect("the checkpointed open reports counters");
+    assert_eq!(
+        second_counters.checkpoint_opens, 1,
+        "this reopen must be the checkpoint path, not a full replay: {second_counters:?}"
+    );
+    let (checkpointed, revision) = load_application_exact(&second_handle, "Root.md");
+    assert_eq!(checkpointed.blocks[0].raw, "lane edit three");
+
+    let (_, _, after_checkpoint) = lane_record(&fixture);
+    assert_eq!(
+        after_checkpoint.local_peer, minted.local_peer,
+        "a checkpoint reopen must not rotate the writer lane"
+    );
+    assert_eq!(after_checkpoint.incarnation, 0);
+    assert_eq!(
+        after_checkpoint.incarnation_id, minted.incarnation_id,
+        "a checkpoint reopen must not retire the causal writer incarnation"
+    );
+    assert_eq!(
+        lane_own_high_water(&after_checkpoint),
+        lane_own_high_water(&before_checkpoint),
+        "a checkpoint reopen must not restart this device's own causal chain at zero"
+    );
+
+    // Authoring still continues on that same lane after the checkpoint open.
+    let (_, _) =
+        save_application_block_text(&second_handle, checkpointed, revision, "lane edit four");
+    drain_managed_local(&second_handle);
+    let (_, _, continued) = lane_record(&fixture);
+    assert_eq!(continued.local_peer, minted.local_peer);
+    assert_eq!(continued.incarnation, 0);
+    assert_eq!(continued.incarnation_id, minted.incarnation_id);
+    assert!(lane_own_high_water(&continued) > lane_own_high_water(&after_checkpoint));
+    assert!(matches!(
+        second_handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+/// Manager correction B/E plus the causal-identity correction, on the live
+/// path: a lost record and an undecodable record, each after an ACKNOWLEDGED
+/// edit. Neither may hand back the two Loro lanes the acknowledged edit already
+/// published under, neither may hand back the CAUSAL writer incarnation those
+/// dots were spent on, neither may lose that edit, and the original bytes of a
+/// damaged record are preserved.
+///
+/// The recovered record deliberately does NOT try to re-derive the old
+/// incarnation's counter: the whole point of retiring the incarnation is that
+/// the new one starts its own chain at zero, so no dot can ever alias an older
+/// one whose bytes this device can no longer see. The enrolled device identity
+/// is untouched throughout — only the incarnation changes.
+#[test]
+fn lost_or_damaged_lane_record_rebuilds_without_reissuing_a_published_lane() {
+    for (case, damage) in [("lost", None), ("torn", Some(&b"torn record"[..]))]
+        .into_iter()
+        .enumerate()
+        .map(|(index, case)| (index, case))
+    {
+        let (label, bytes) = damage;
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("writer-lane-live-{label}"),
+            0xa178_d000 + case as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("damage fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let (_, _) = save_application_block_text(&handle, page, revision, "acknowledged edit");
+        drain_managed_local(&handle);
+        drop(handle);
+
+        let (name, original, published) = lane_record(&fixture);
+        assert!(lane_own_high_water(&published) >= 1);
+        let path = lane_record_path(&fixture, &name);
+
+        match bytes {
+            None => std::fs::remove_file(&path).unwrap(),
+            Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+        }
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "an acknowledged commit never becomes a permanent reopen failure (I-10)"
+        );
+        let handle = reopened.handle.expect("the damaged-record reopen succeeds");
+        let (restored, revision) = load_application_exact(&handle, "Root.md");
+        assert_eq!(
+            restored.blocks[0].raw, "acknowledged edit",
+            "{label}: the acknowledged edit survives lane-record damage"
+        );
+
+        let (_, rebuilt_bytes, rebuilt) = lane_record(&fixture);
+        assert_ne!(
+            rebuilt.local_peer, published.local_peer,
+            "{label}: a record that cannot qualify its published prefix must not reissue its lane"
+        );
+        assert_ne!(
+            rebuilt.external_peer, published.external_peer,
+            "{label}: both lanes are replaced"
+        );
+        assert_ne!(rebuilt_bytes, original);
+        assert_ne!(
+            rebuilt.incarnation_id, published.incarnation_id,
+            "{label}: a lost or torn record must never reissue the causal writer incarnation \
+             whose dots are already published"
+        );
+        assert_eq!(
+            rebuilt.confirmed_own_counter, 0,
+            "{label}: the replacement incarnation starts its OWN chain rather than adopting a \
+             counter it cannot prove: {rebuilt:?}"
+        );
+        if let Some(bytes) = bytes {
+            let superseded = lane_record_path(
+                &fixture,
+                &format!(
+                    "{name}.superseded-{}",
+                    crate::oplog::ContentDigest::of(bytes)
+                ),
+            );
+            assert_eq!(
+                std::fs::read(&superseded).unwrap(),
+                bytes,
+                "{label}: undecodable original bytes are preserved as a backup (D-1/D-3)"
+            );
+        }
+
+        // Newly authored work on the replacement lane still commits, above
+        // every own dot the old lane already spent.
+        let (_, _) = save_application_block_text(&handle, restored, revision, "post-repair edit");
+        drain_managed_local(&handle);
+        let (_, _, after) = lane_record(&fixture);
+        assert_eq!(after.local_peer, rebuilt.local_peer);
+        assert_eq!(
+            after.incarnation_id, rebuilt.incarnation_id,
+            "{label}: post-repair authoring stays on the ONE replacement incarnation"
+        );
+        assert!(
+            lane_own_high_water(&after) > 0,
+            "{label}: the replacement incarnation really authors on its own chain: {after:?}"
+        );
+        let (final_page, _) = load_application_exact(&handle, "Root.md");
+        assert_eq!(final_page.blocks[0].raw, "post-repair edit");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+}
+
+/// Restore a device directory from an earlier copy the way a file-level backup
+/// restore does: file CONTENT goes back, while a directory that still exists
+/// keeps its identity. The device-private projection receipt store is bound to
+/// the identity of the directory it was created in, so a "restore" that
+/// recreated those directories would be a different store rather than an older
+/// one, and the runtime would rightly refuse to open it.
+fn restore_tree_in_place(source: &Path, target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    let mut restored = HashSet::new();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        restored.insert(entry.file_name());
+        let child = target.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            if child.is_file() {
+                fs::remove_file(&child).unwrap();
+            }
+            restore_tree_in_place(&entry.path(), &child);
+        } else {
+            if child.is_dir() {
+                fs::remove_dir_all(&child).unwrap();
+            }
+            fs::copy(entry.path(), &child).unwrap();
+        }
+    }
+    for entry in fs::read_dir(target).unwrap() {
+        let entry = entry.unwrap();
+        if restored.contains(&entry.file_name()) {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            fs::remove_dir_all(entry.path()).unwrap();
+        } else {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+}
+
+/// The exact bytes a fixture published for one batch, straight off its
+/// provider outbox.
+fn outbox_manifest_bytes(fixture: &ActivationFixture, batch_id: BatchId) -> Vec<u8> {
+    fs::read(
+        fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{batch_id}.manifest")),
+    )
+    .unwrap()
+}
+
+fn outbox_manifest(fixture: &ActivationFixture, batch_id: BatchId) -> OperationBatch {
+    OperationBatch::decode(&outbox_manifest_bytes(fixture, batch_id)).unwrap()
+}
+
+/// The archived manifest bytes this device holds for a batch, read from the
+/// clean operation archive rather than from any outbox relay.
+fn archived_manifest_bytes(fixture: &ActivationFixture, batch_id: BatchId) -> Vec<u8> {
+    ObjectStore::open(
+        &clean_operation_archive_directory(&fixture.request.archive_root),
+        fixture.request.identities.workspace_id,
+    )
+    .unwrap()
+    .read_manifest_bytes(batch_id)
+    .unwrap()
+}
+
+/// The causal-identity correction on a REAL two-device clean runtime, not an
+/// engine fixture.
+///
+/// One device publishes an epoch of work, the OTHER device acknowledges and
+/// retains it, and then the author is restored from a copy of its own device
+/// directory that is OLDER than that epoch, with its device-private writer
+/// record lost or torn. The older copy cannot see the work it already
+/// published, so nothing on this device can prove that own prefix. Recovery
+/// must therefore retire the causal writer incarnation instead of resuming its
+/// counters: the replacement starts its own chain at zero and immediately
+/// reuses counters the retired chain already spent, so ONLY the distinct
+/// incarnation keeps the two epochs apart. Nothing about the device, the
+/// endpoint or the enrolment moves.
+///
+/// The delivery-order sweep runs on the RECOVERED device, because that is where
+/// aliasing would occur: its own now-unknown older work returns from the peer
+/// either before or after it authors the replacement epoch, and both orders must
+/// admit both originals under their original ids. (The pure-receiver order sweep
+/// is proved at the engine level by
+/// `manager_lost_writer_record_and_stale_archive_preserve_both_original_branches`.)
+#[test]
+fn a_lost_writer_record_keeps_an_older_published_epoch_causally_apart() {
+    /// The single batch a fixture published since `before`.
+    fn published_since(fixture: &ActivationFixture, before: &BTreeSet<String>) -> BatchId {
+        let published: Vec<BatchId> = outbox_manifest_ids(fixture)
+            .difference(before)
+            .map(|name| outbox_manifest_batch_id(fixture, name))
+            .collect();
+        assert_eq!(
+            published.len(),
+            1,
+            "this turn must publish exactly one batch: {published:?}"
+        );
+        published[0]
+    }
+
+    fn run_case(
+        label: &str,
+        seed: u128,
+        torn: bool,
+        old_history_first: bool,
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let damage = if torn { "torn" } else { "lost" };
+        let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+        let base_path = "notes/lost-writer-epoch-base.md";
+        let old_path = "Root.md";
+        let visible_paths = [base_path, old_path];
+
+        let (base_batch, base_page_id, base_block_id, base_document_id) = submit_shared_page(
+            &first_handle,
+            seed + 0x20,
+            "Lost Writer Epoch Base",
+            base_path,
+            "shared base text",
+        );
+        publish_shared_batch(&first_handle, &first, base_batch);
+        settle_shared_provider(&first_handle);
+        deliver_provider_to_receiver(&first, &second, &second_handle);
+
+        // The older copy is taken from a SAFELY shut-down device, before the
+        // epoch it will turn out to be older than — a restored backup.
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(first_handle);
+        let older_copy = PathBuf::from(format!("{}-older-copy", first.root.display()));
+        copy_tree_for_probe(&first.root, &older_copy);
+
+        // Epoch one: authored, acknowledged, published, and retained by the
+        // other device, which never loses it.
+        let first_handle = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let (_, _, published_record) = lane_record(&first);
+        let before_old = outbox_manifest_ids(&first);
+        let (old_page, old_revision) = load_application_exact(&first_handle, old_path);
+        let _ =
+            save_application_block_text(&first_handle, old_page, old_revision, "old epoch text");
+        drain_managed_local(&first_handle);
+        settle_shared_provider(&first_handle);
+        let old_batch = published_since(&first, &before_old);
+        let old_manifest_bytes = outbox_manifest_bytes(&first, old_batch);
+        let old_manifest = outbox_manifest(&first, old_batch);
+        assert_eq!(
+            old_manifest.causal_dot().peer_id().key(),
+            published_record.incarnation_id,
+            "{damage}: the published epoch names the SAVED causal writer incarnation"
+        );
+        deliver_offline_provider_history(&first, &second, &second_handle, old_batch);
+        assert!(
+            String::from_utf8(fs::read(second.graph_root.join(old_path)).unwrap())
+                .unwrap()
+                .contains("old epoch text"),
+            "{damage}: the other device must hold the acknowledged old work"
+        );
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(first_handle);
+
+        // Restore the older copy over the whole device: archive, journals,
+        // projection, graph text and outbox all go back before epoch one.
+        restore_tree_in_place(&older_copy, &first.root);
+        assert!(
+            !first
+                .request
+                .provider_root
+                .join(format!("outbox/manifests/{old_batch}.manifest"))
+                .exists()
+                && !String::from_utf8(fs::read(first.graph_root.join(old_path)).unwrap())
+                    .unwrap()
+                    .contains("old epoch text"),
+            "{damage}: the older copy must not contain the epoch it predates"
+        );
+
+        let (name, original_bytes, restored_record) = lane_record(&first);
+        assert_eq!(
+            restored_record.incarnation_id, published_record.incarnation_id,
+            "{damage}: the older copy still carries the incarnation that published epoch one"
+        );
+        let record_path = lane_record_path(&first, &name);
+        if torn {
+            fs::write(&record_path, b"torn writer record").unwrap();
+        } else {
+            fs::remove_file(&record_path).unwrap();
+        }
+
+        let first_handle = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let (_, rebuilt_bytes, rebuilt) = lane_record(&first);
+        assert_ne!(
+            rebuilt.incarnation_id, published_record.incarnation_id,
+            "{damage}: an unprovable own prefix must retire the causal writer incarnation"
+        );
+        assert_ne!(rebuilt.local_peer, published_record.local_peer);
+        assert_ne!(rebuilt.external_peer, published_record.external_peer);
+        assert_ne!(rebuilt_bytes, original_bytes);
+        assert_eq!(
+            rebuilt.confirmed_own_counter, 0,
+            "{damage}: the replacement incarnation starts its OWN chain: {rebuilt:?}"
+        );
+        if torn {
+            let superseded = lane_record_path(
+                &first,
+                &format!(
+                    "{name}.superseded-{}",
+                    crate::oplog::ContentDigest::of(b"torn writer record")
+                ),
+            );
+            assert_eq!(
+                fs::read(&superseded).unwrap(),
+                b"torn writer record",
+                "{damage}: undecodable original bytes are preserved as a backup (D-1/D-3)"
+            );
+        }
+
+        if old_history_first {
+            deliver_offline_provider_history(&second, &first, &first_handle, old_batch);
+            assert!(
+                String::from_utf8(fs::read(first.graph_root.join(old_path)).unwrap())
+                    .unwrap()
+                    .contains("old epoch text"),
+                "{damage}: unknown own older work is admissible under its original identity"
+            );
+        }
+
+        // Epoch two: an ordinary LOCAL batch carrying two operations, then
+        // EXTERNAL editor work. Both belong to the one replacement incarnation.
+        let new_local_batch = submit_durable(
+            &first_handle,
+            vec![
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(Uuid::from_u128(seed + 0x60)),
+                        home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(
+                            seed + 0x60,
+                        ))),
+                    },
+                    page_id: base_page_id,
+                    parent: None,
+                    order: "c".into(),
+                    content: "new epoch local text".into(),
+                },
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: base_block_id,
+                        home_document_id: test_block_home(base_block_id),
+                    },
+                    content: "base text rewritten by the replacement epoch".into(),
+                },
+            ],
+        );
+        publish_shared_batch(&first_handle, &first, new_local_batch);
+        settle_shared_provider(&first_handle);
+
+        let before_external = outbox_manifest_ids(&first);
+        let mut external_body = fs::read(first.graph_root.join(base_path)).unwrap();
+        external_body.extend_from_slice(b"- new epoch external text\n");
+        let _ = admit_shared_page(&first_handle, &first, base_path, &external_body);
+        let new_external_batch = published_since(&first, &before_external);
+
+        if !old_history_first {
+            deliver_offline_provider_history(&second, &first, &first_handle, old_batch);
+            assert!(
+                String::from_utf8(fs::read(first.graph_root.join(old_path)).unwrap())
+                    .unwrap()
+                    .contains("old epoch text"),
+                "{damage}: unknown own older work is admissible under its original identity"
+            );
+        }
+        deliver_offline_provider_history(&first, &second, &second_handle, new_local_batch);
+        deliver_offline_provider_history(&first, &second, &second_handle, new_external_batch);
+
+        // ONE enrolled author device; TWO causal writer incarnations; ONE
+        // sequential chain shared by the local and the external batch.
+        let new_local_manifest = outbox_manifest(&first, new_local_batch);
+        let new_external_manifest = outbox_manifest(&first, new_external_batch);
+        for manifest in [&new_local_manifest, &new_external_manifest] {
+            assert_eq!(
+                manifest.author_device_id(),
+                old_manifest.author_device_id(),
+                "{damage}: only the writer incarnation may change, never the enrolled author"
+            );
+            assert_eq!(
+                manifest.causal_dot().peer_id().key(),
+                rebuilt.incarnation_id,
+                "{damage}: every origin of one incarnation authors on its saved identity"
+            );
+            assert_ne!(
+                manifest.causal_dot().peer_id(),
+                old_manifest.causal_dot().peer_id(),
+                "{damage}: the retired epoch keeps its own causal identity"
+            );
+        }
+
+        // The sharpest statement of the correction: the replacement chain
+        // deliberately REUSES counters the retired chain already spent. Only
+        // the distinct writer incarnation keeps those batches apart; a causal
+        // peer derived from the enrolled device would alias them outright.
+        let base_manifest = outbox_manifest(&first, base_batch);
+        assert_eq!(
+            base_manifest.causal_dot().peer_id(),
+            old_manifest.causal_dot().peer_id(),
+            "{damage}: the base and the lost epoch were authored by ONE incarnation"
+        );
+        assert_eq!(
+            base_manifest.causal_dot().counter(),
+            new_local_manifest.causal_dot().counter(),
+            "{damage}: the replacement chain restarts over counters the retired chain spent"
+        );
+        assert_eq!(
+            new_external_manifest.causal_dot().counter(),
+            new_local_manifest.causal_dot().counter() + 1,
+            "{damage}: the ordinary and external batches are consecutive on ONE chain"
+        );
+
+        // Both epochs descend from the SHARED base rather than one from the
+        // other: concurrent siblings of one device, not a forked chain.
+        assert!(new_local_manifest
+            .causal_dependency_heads()
+            .contains(&base_batch));
+        assert!(!old_manifest
+            .causal_dependency_heads()
+            .contains(&new_local_batch));
+
+        let converged = assert_converged_and_reopen_stable(
+            &first,
+            &second,
+            first_handle,
+            second_handle,
+            &visible_paths,
+        );
+        let base_text = String::from_utf8(
+            converged[base_path]
+                .clone()
+                .expect("the base page survives on both devices"),
+        )
+        .unwrap();
+        for fragment in [
+            "base text rewritten by the replacement epoch",
+            "new epoch local text",
+            "new epoch external text",
+        ] {
+            assert!(
+                base_text.contains(fragment),
+                "{damage}: a whole batch lands or none of it does; {fragment:?} missing from \
+                 {base_text:?}"
+            );
+        }
+        assert!(String::from_utf8(
+            converged[old_path]
+                .clone()
+                .expect("the retained old epoch survives on both devices")
+        )
+        .unwrap()
+        .contains("old epoch text"));
+
+        // Original identities AND original bytes: both devices hold the exact
+        // manifest the retired incarnation published, under its original id.
+        for fixture in [&first, &second] {
+            assert_eq!(
+                archived_manifest_bytes(fixture, old_batch),
+                old_manifest_bytes,
+                "{damage}: the original bytes of the retired epoch are preserved verbatim"
+            );
+        }
+
+        // Continuation after the required checkpoint/replay reopen: the
+        // replacement incarnation is still the one that authors, it keeps
+        // advancing its own chain, and the work it authors on the RETURNED
+        // page proves the retired epoch is genuinely in this device's ancestry
+        // under its original batch id.
+        let (_, _, after_reopen) = lane_record(&first);
+        assert_eq!(
+            after_reopen.incarnation_id, rebuilt.incarnation_id,
+            "{damage}: admitting the returned epoch must not rotate the replacement incarnation"
+        );
+        let continued_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let before_continuation = outbox_manifest_ids(&first);
+        let (continued_page, continued_revision) =
+            load_application_exact(&continued_handle, old_path);
+        let _ = save_application_block_text(
+            &continued_handle,
+            continued_page,
+            continued_revision,
+            "continuation text",
+        );
+        drain_managed_local(&continued_handle);
+        settle_shared_provider(&continued_handle);
+        let continuation_batch = published_since(&first, &before_continuation);
+        let continuation_manifest = outbox_manifest(&first, continuation_batch);
+        assert_eq!(
+            continuation_manifest.author_device_id(),
+            old_manifest.author_device_id()
+        );
+        assert!(
+            continuation_manifest
+                .causal_dependency_heads()
+                .contains(&old_batch),
+            "{damage}: the returned epoch is genuinely in ancestry under its original id: {:?}",
+            continuation_manifest.causal_dependency_heads()
+        );
+        assert_eq!(
+            continuation_manifest.causal_dot().peer_id().key(),
+            rebuilt.incarnation_id,
+            "{damage}: a reopen continues the SAME replacement incarnation"
+        );
+        assert!(
+            continuation_manifest.causal_dot().counter()
+                > new_external_manifest.causal_dot().counter(),
+            "{damage}: the replacement chain advances sequentially across reopens"
+        );
+        let (_, _, continued_record) = lane_record(&first);
+        assert_eq!(continued_record.incarnation_id, rebuilt.incarnation_id);
+        assert!(lane_own_high_water(&continued_record) > lane_own_high_water(&after_reopen));
+        assert!(matches!(
+            continued_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        converged
+    }
+
+    for (index, torn) in [false, true].into_iter().enumerate() {
+        let damage = if torn { "torn" } else { "lost" };
+        let seed = 0xa178_e000 + index as u128 * 0x1000;
+        let old_first = run_case(
+            &format!("writer-epoch-{damage}-old-first"),
+            seed,
+            torn,
+            true,
+        );
+        let new_first = run_case(
+            &format!("writer-epoch-{damage}-new-first"),
+            seed + 0x800,
+            torn,
+            false,
+        );
+        assert_eq!(
+            old_first, new_first,
+            "{damage}: both delivery orders must converge to the same visible graph text"
+        );
+    }
 }
 
 #[test]
@@ -12288,7 +13263,7 @@ fn shared_provider_clean_two_device_unicode_join_and_restart() {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: shared_block,
-                    home_document_id: shared_document,
+                    home_document_id: test_block_home(shared_block),
                 },
                 page_id: shared_page,
                 parent: None,
@@ -12916,7 +13891,20 @@ fn pending_generation_join_fixture(
     SyncSharedEnrollmentDescriptor,
 ) {
     let initiator = make_shared_fixture(&format!("{label}-initiator"), seed);
-    let mut joiner = make_shared_fixture(&format!("{label}-joiner"), seed);
+    let joiner = make_shared_fixture(&format!("{label}-joiner"), seed);
+    pending_generation_join_from_fixtures(initiator, joiner, seed)
+}
+
+fn pending_generation_join_from_fixtures(
+    initiator: ActivationFixture,
+    mut joiner: ActivationFixture,
+    seed: u128,
+) -> (
+    ActivationFixture,
+    ActivationFixture,
+    SyncRuntimeHandle,
+    SyncSharedEnrollmentDescriptor,
+) {
     joiner.request.identities.endpoint_id =
         ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
     joiner.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
@@ -12950,6 +13938,149 @@ fn pending_generation_join_fixture(
     let handle = active.handle.expect("generation-cut joiner LocalActive");
     drive_initial_feed(&handle);
     (initiator, joiner, handle, descriptor)
+}
+
+#[test]
+#[ignore = "manual release gate: rebaselining foundations on an anonymized corpus copy"]
+fn rebaselining_foundations_real_corpus_gate() {
+    use crate::oplog::checkpoint_generation::{
+        SealedDocumentRoster, SealedGenerationStagingStore, TineAcceptedEvidenceDecoder,
+    };
+    use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
+    assert!(!cfg!(debug_assertions), "release-only corpus gate");
+    let source = real_graph_copy_source_from_env("TINE_REBASELINING_GRAPH_COPY");
+    let seed = 0xc200_0000;
+    let initiator = ActivationFixture::copied_graph("rebaseline-corpus-initiator", seed, &source);
+    let joiner = ActivationFixture::copied_graph("rebaseline-corpus-joiner", seed, &source);
+    let (initiator, joiner, handle, descriptor) =
+        pending_generation_join_from_fixtures(initiator, joiner, seed);
+    let expected = user_graph_bytes(&initiator.graph_root);
+    let started = Instant::now();
+    handle
+        .join_shared(descriptor)
+        .expect("corpus join installs complete authority");
+    let join_ms = started.elapsed().as_millis();
+    assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
+    assert_eq!(
+        read_activation_marker(&joiner.request.enrollment_root)
+            .unwrap()
+            .unwrap()
+            .generation(),
+        1
+    );
+    assert!(matches!(
+        handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(handle);
+    let reopened = open_clean_runtime_resources(&reopen_request(&joiner.request))
+        .unwrap()
+        .unwrap();
+    let engine = reopened.runtime.engine();
+    let before = engine.canonical_snapshot().unwrap();
+    let staging_root = joiner.root.join("sealed-generation-staging");
+    fs::create_dir_all(&staging_root).unwrap();
+    let directory =
+        cap_std::fs::Dir::open_ambient_dir(&staging_root, cap_std::ambient_authority()).unwrap();
+    let started = Instant::now();
+    let mut nodes = SealedGenerationStagingStore::open(&directory).unwrap();
+    let cutoff = engine
+        .build_sealed_accepted_cutoff(&mut nodes, None)
+        .unwrap();
+    let disk_nodes = nodes.finish().unwrap();
+    let cutoff_ms = started.elapsed().as_millis();
+    let reader = SealedAcceptedIndexReader::new(&disk_nodes);
+    for sequence in 1..=cutoff.roots().sequence.len {
+        let (batch_id, evidence) = engine.accepted_batch_entry_at(sequence).unwrap().unwrap();
+        let proof = reader
+            .prove_membership(
+                cutoff.roots(),
+                sequence,
+                batch_id.as_uuid().into_bytes(),
+                &TineAcceptedEvidenceDecoder,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.status.exact_evidence_bytes,
+            evidence.unwrap().encode_canonical().unwrap()
+        );
+    }
+    assert_eq!(cutoff.frontier(), &engine.accepted_frontier_root().unwrap());
+    let compact_started = Instant::now();
+    let mut capsule_store = SealedGenerationStagingStore::open(&directory).unwrap();
+    let mut roster = SealedDocumentRoster::empty();
+    let mut compact_bytes = 0usize;
+    let mut compact_documents = 0usize;
+    for document_id in std::iter::once(engine.catalog_document_id()).chain(
+        before
+            .pages
+            .iter()
+            .map(|(_, state)| state.home_document_id()),
+    ) {
+        let compact = engine
+            .build_compact_accepted_document(&cutoff, DocumentKey::Entity(document_id))
+            .unwrap();
+        assert_eq!(
+            compact.cutoff_state_digest(),
+            cutoff.frontier().state_digest()
+        );
+        assert_eq!(
+            compact.dependencies().document_id(),
+            DocumentKey::Entity(document_id)
+        );
+        roster = roster
+            .with_document(&mut capsule_store, &cutoff, &compact)
+            .unwrap();
+        compact_bytes += compact.checkpoint().len();
+        compact_documents += 1;
+    }
+    drop(capsule_store.finish().unwrap());
+    let compact_ms = compact_started.elapsed().as_millis();
+    let capsule_started = Instant::now();
+    for document_id in std::iter::once(engine.catalog_document_id()).chain(
+        before
+            .pages
+            .iter()
+            .map(|(_, state)| state.home_document_id()),
+    ) {
+        let (dependencies, _) = roster
+            .load_document(
+                &disk_nodes,
+                DocumentKey::Entity(engine.catalog_document_id()),
+                DocumentKey::Entity(document_id),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Some(dependencies),
+            engine
+                .accepted_frontier_document(cutoff.frontier(), DocumentKey::Entity(document_id))
+                .unwrap()
+        );
+    }
+    let capsule_reopen_ms = capsule_started.elapsed().as_millis();
+    let inherited_started = Instant::now();
+    let mut unchanged_store = SealedGenerationStagingStore::open(&directory).unwrap();
+    let (unchanged, written) = engine
+        .build_compact_document_roster(&cutoff, &mut unchanged_store, Some(roster))
+        .unwrap();
+    assert_eq!(
+        written, 0,
+        "unchanged corpus must not recompact any document"
+    );
+    drop(unchanged_store.finish().unwrap());
+    let inherited_roster_ms = inherited_started.elapsed().as_millis();
+    let full_oracle_started = Instant::now();
+    engine
+        .qualify_full_document_roster(&cutoff, unchanged, &disk_nodes)
+        .unwrap();
+    let full_roster_oracle_ms = full_oracle_started.elapsed().as_millis();
+    assert_eq!(compact_documents, before.pages.len() + 1);
+    assert_eq!(engine.canonical_snapshot().unwrap(), before);
+    assert_eq!(user_graph_bytes(&joiner.graph_root), expected);
+    eprintln!("rebaselining_foundations files={} pages={} blocks={} accepted={} join_ms={join_ms} cutoff_ms={cutoff_ms} compact_documents={compact_documents} compact_bytes={compact_bytes} compact_ms={compact_ms} capsule_reopen_ms={capsule_reopen_ms} inherited_roster_ms={inherited_roster_ms} full_roster_oracle_ms={full_roster_oracle_ms}",
+        expected.len(), before.pages.len(), before.blocks.len(), cutoff.roots().sequence.len);
 }
 
 #[test]
@@ -13063,6 +14194,61 @@ fn shared_join_owns_ordinary_operation_until_atomic_enrollment_commit() {
     assert!(
         owner.join().unwrap().is_ok(),
         "status changed the outcome of the enrollment owner"
+    );
+}
+
+#[test]
+fn manager_empty_graph_activates_and_reopens_without_a_phantom_catalog_document() {
+    let fixture = ActivationFixture::empty("manager-empty-genesis", 0xefa01);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let expected_key = DocumentKey::Entity(fixture.request.identities.catalog_document_id);
+    let frontier = resources.runtime.engine().exact_frontier().unwrap();
+    assert_eq!(frontier.documents().len(), 1);
+    assert_eq!(frontier.documents()[0].document_id(), expected_key);
+    assert_eq!(
+        resources
+            .runtime
+            .engine()
+            .graph_document_identity_for_test()
+            .unwrap(),
+        (
+            expected_key,
+            fixture.request.identities.workspace_id,
+            fixture.request.identities.lineage_digest,
+        )
+    );
+    let snapshot = resources.runtime.engine().canonical_snapshot().unwrap();
+    assert!(snapshot.pages.is_empty());
+    assert!(snapshot.blocks.is_empty());
+    assert!(snapshot.memberships.is_empty());
+    let read = resources.runtime.database().materialized_read().unwrap();
+    assert!(read.pages(None, 1).unwrap().is_empty());
+    drop(read);
+    assert_eq!(
+        resources.runtime.database().frontier_root().unwrap(),
+        resources.runtime.engine().accepted_frontier_root().unwrap()
+    );
+    drop(resources);
+
+    let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
+        .unwrap()
+        .expect("empty activation marker cold-opens");
+    assert_eq!(
+        reopened
+            .runtime
+            .engine()
+            .graph_document_identity_for_test()
+            .unwrap(),
+        (
+            expected_key,
+            fixture.request.identities.workspace_id,
+            fixture.request.identities.lineage_digest,
+        )
+    );
+    assert_eq!(
+        reopened.runtime.database().frontier_root().unwrap(),
+        reopened.runtime.engine().accepted_frontier_root().unwrap()
     );
 }
 
@@ -13400,12 +14586,14 @@ fn android_private_directory_durability_is_explicit_at_every_exception() {
         // Re-pinned 2026-09-07. `object_store.rs` retains only the helper's
         // own definition; its six former call sites, and every call in
         // `hot_engine.rs` and `page_name_index.rs`, took the strict authority
-        // helper instead. Two run-local rebuildable indexes remain the whole
-        // reconstructible exception set.
+        // helper instead. Current-action discovery and point-addressed absence
+        // rows add only reconstructible directories; original receipts remain
+        // under their existing strict publication authority.
         BTreeMap::from([
+            ("oplog/current_action_roots.rs".to_owned(), 3),
             ("oplog/local_completion_index.rs".to_owned(), 3),
             ("oplog/object_store.rs".to_owned(), 1),
-            ("oplog/receiver_absence_summary.rs".to_owned(), 5),
+            ("oplog/receiver_absence_summary.rs".to_owned(), 6),
         ]),
         "every reconstructible private-directory exception must remain in the audited census"
     );
@@ -14623,7 +15811,7 @@ fn submit_shared_page(
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 page_id,
                 parent: None,
@@ -15171,7 +16359,7 @@ fn receiver_completion_defers_closed_window_external_deletion_case(
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: document_id,
+                home_document_id: test_block_home(block_id),
             },
             content: "receiver updated bytes must not resurrect".into(),
         }],
@@ -15266,7 +16454,7 @@ fn receiver_incomplete_update_maps_absent_terminal_to_deferral_case() {
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: document_id,
+                home_document_id: test_block_home(block_id),
             },
             content: "receiver recovery target".into(),
         }],
@@ -15503,7 +16691,7 @@ fn provider_edit_projects_markdown_beside_a_concurrent_external_admission() {
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: document_id,
+                home_document_id: test_block_home(block_id),
             },
             content: "second".into(),
         }],
@@ -15570,7 +16758,7 @@ fn provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_adm
         vec![SemanticOperation::MoveSubtree {
             root: BlockLocation {
                 block_id: moved_block,
-                home_document_id: source_document,
+                home_document_id: test_block_home(moved_block),
             },
             from_page_id: source_page_id,
             to_page_id: target_page_id,
@@ -15782,7 +16970,7 @@ fn provider_cross_page_move_then_delete_converges_on_the_receiver() {
             SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 from_page_id: source_page_id,
                 to_page_id: target_page_id,
@@ -16780,6 +17968,109 @@ fn two_offline_devices_union_reordered_frontier_heads_without_history_scan() {
 }
 
 #[test]
+fn foreign_path_changes_converge_while_a_foreground_page_creation_is_journal_pending() {
+    let (first, second, first_handle, second_handle) =
+        joined_shared_pair("portable-path-pending-local-create", 0xe950);
+    let (remote_batch, ..) = submit_shared_page(
+        &second_handle,
+        0xe970,
+        "Remote path",
+        "notes/Remote path.md",
+        "remote original",
+    );
+    publish_shared_batch(&second_handle, &second, remote_batch);
+    settle_shared_provider(&second_handle);
+
+    let local_name = "Pending local path";
+    let saved = first_handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: local_name.into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(
+                local_name,
+                SyncPageKind::Page,
+                None,
+                vec![BlockDto {
+                    id: "pending-local-block".into(),
+                    raw: "local original".into(),
+                    ..BlockDto::default()
+                }],
+            ),
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+        panic!("foreground creation did not save: {saved:?}");
+    };
+    let local_path = page.path;
+    assert_eq!(
+        first_handle.status().unwrap().managed_local_pending,
+        1,
+        "this is an actual undrained foreground journal, not accepted history"
+    );
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    first_handle.observe_provider().unwrap();
+    assert_eq!(
+        first_handle.status().unwrap().managed_local_pending,
+        1,
+        "provider observation must arrive while the original local frame is pending"
+    );
+    settle_shared_provider(&first_handle);
+    assert_eq!(first_handle.status().unwrap().managed_local_pending, 0);
+    assert_eq!(
+        load_application_exact(&first_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+    assert_eq!(
+        load_application_exact(&first_handle, "notes/Remote path.md")
+            .0
+            .blocks[0]
+            .raw,
+        "remote original"
+    );
+    copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+    second_handle.observe_provider().unwrap();
+    settle_shared_provider(&second_handle);
+    assert_eq!(
+        load_application_exact(&second_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+
+    let (later_batch, ..) = submit_shared_page(
+        &second_handle,
+        0xe980,
+        "After drain",
+        "notes/After drain.md",
+        "later remote original",
+    );
+    publish_shared_batch(&second_handle, &second, later_batch);
+    settle_shared_provider(&second_handle);
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    first_handle.observe_provider().unwrap();
+    settle_shared_provider(&first_handle);
+    assert_eq!(
+        load_application_exact(&first_handle, "notes/After drain.md")
+            .0
+            .blocks[0]
+            .raw,
+        "later remote original"
+    );
+    assert_eq!(
+        load_application_exact(&first_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+    assert!(matches!(
+        first_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    assert!(matches!(
+        second_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+}
+
+#[test]
 fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
     let (first, second, first_handle, second_handle) =
         joined_shared_pair("provider-two-offline-authors", 0xe400);
@@ -16850,8 +18141,32 @@ fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
 
     copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
     copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
-    let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
-    let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+    let mut first_open_counters = None;
+    let first_merged = active_handle(SyncRuntimeHandle::open_with_progress(
+        reopen_request(&first.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_open_counters = Some(counters);
+            }
+        },
+    ));
+    let mut second_open_counters = None;
+    let second_merged = active_handle(SyncRuntimeHandle::open_with_progress(
+        reopen_request(&second.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_open_counters = Some(counters);
+            }
+        },
+    ));
+    for counters in [first_open_counters, second_open_counters] {
+        let counters = counters.expect("each returning author reports its actual open path");
+        assert_eq!(
+            counters.checkpoint_opens, 1,
+            "foreign path changes must also work after checkpoint restoration"
+        );
+        assert_eq!(counters.full_replay_opens, 0);
+    }
     for _ in 0..1_024 {
         let first_tick = first_merged.tick().unwrap();
         let second_tick = second_merged.tick().unwrap();
@@ -17188,7 +18503,7 @@ fn concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantic
 
 #[test]
 fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions() {
-    fn run_case(label: &str, seed: u128, first_is_explicit: bool) -> bool {
+    fn run_case(label: &str, seed: u128, explicit_should_win: bool) -> bool {
         let (first, second, first_handle, second_handle) = joined_empty_shared_pair(label, seed);
         let target_path = "notes/Café Plan.md";
         let target_page_id = admit_shared_page(
@@ -17200,6 +18515,26 @@ fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_dire
         copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
         second_handle.observe_provider().unwrap();
         settle_shared_provider(&second_handle);
+
+        // Both updates start from the same semantic version. Concurrent exact
+        // titles are selected by the greatest immutable (causal dot, batch
+        // id), so qualify the assignment from the two durable writer records
+        // and their next dots. Endpoint role and the unrelated Loro lane value
+        // are not winner guarantees.
+        let first_lane = lane_record(&first).2;
+        let second_lane = lane_record(&second).2;
+        let first_dot = crate::oplog::BatchCausalDot::new(
+            crate::oplog::CausalPeerId::from_key(first_lane.incarnation_id),
+            lane_own_high_water(&first_lane) + 1,
+        )
+        .unwrap();
+        let second_dot = crate::oplog::BatchCausalDot::new(
+            crate::oplog::CausalPeerId::from_key(second_lane.incarnation_id),
+            lane_own_high_water(&second_lane) + 1,
+        )
+        .unwrap();
+        assert_ne!(first_dot, second_dot);
+        let first_is_explicit = (first_dot > second_dot) == explicit_should_win;
 
         for (handle, explicit) in [
             (&first_handle, first_is_explicit),
@@ -17281,15 +18616,15 @@ fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_dire
             second_merged.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+        assert_eq!(
+            explicit_won, explicit_should_win,
+            "the peer-qualified concurrent title fixture selected the wrong native register winner"
+        );
         explicit_won
     }
 
-    let first_assignment = run_case("explicit-fallback-first-explicit", 0xe800, true);
-    let reversed_assignment = run_case("explicit-fallback-first-fallback", 0xe900, false);
-    assert_ne!(
-        first_assignment, reversed_assignment,
-        "swapping explicit/fallback over fixed endpoint provenance must exercise both winners"
-    );
+    assert!(run_case("explicit-fallback-explicit-wins", 0xe800, true));
+    assert!(!run_case("explicit-fallback-filename-wins", 0xe900, false));
 }
 
 #[test]
@@ -17312,7 +18647,7 @@ fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         vec![SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: BlockId::from_uuid(Uuid::from_u128(0xb304)),
-                home_document_id: document_id,
+                home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(0xb304))),
             },
             page_id,
             parent: None,
@@ -17325,7 +18660,7 @@ fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         vec![SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: BlockId::from_uuid(Uuid::from_u128(0xb305)),
-                home_document_id: document_id,
+                home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(0xb305))),
             },
             page_id,
             parent: None,
@@ -18019,7 +19354,7 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
         publish_shared_batch(&author_handle, &author, batch_id);
         for _ in 0..256 {
             let _ = author_handle.tick().unwrap();
-            if provider_head_covers(&author, author.request.identities.device_id, batch_id)
+            if provider_head_names_tip(&author, author.request.identities.device_id, batch_id)
                 && provider_intent_count_for(&author, author.request.identities.device_id) == 0
             {
                 break;
@@ -18033,7 +19368,7 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     }
     let latest_local = *local_batches.last().unwrap();
     assert!(
-        provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+        provider_head_names_tip(&author, author.request.identities.device_id, latest_local,),
         "own durable frontier did not advance while foreign objects were withheld; \
              covered own intent counts after each publication were {intent_counts:?}"
     );
@@ -18053,12 +19388,14 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     drop(author_handle);
     let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
     assert!(
-        provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+        provider_head_names_tip(&author, author.request.identities.device_id, latest_local,),
         "restart lost the durable own frontier published during foreign delay"
     );
     let mut restarted_incomplete = false;
+    let mut restart_tick_counts = BTreeMap::<String, usize>::new();
     for _ in 0..1_024 {
         let tick = restarted.tick().unwrap();
+        *restart_tick_counts.entry(format!("{tick:?}")).or_default() += 1;
         assert!(
             !matches!(
                 tick,
@@ -18077,7 +19414,8 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     }
     assert!(
         restarted_incomplete,
-        "restart forgot the visibly incomplete foreign manifest"
+        "restart forgot the visibly incomplete foreign manifest: ticks={restart_tick_counts:?}, status={:?}",
+        restarted.status().unwrap()
     );
     let late_delivery = copy_provider_batch(
         &delayed_peer,
@@ -19372,7 +20710,7 @@ fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "first offline text".into(),
             }],
@@ -19382,7 +20720,7 @@ fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "second offline text".into(),
             }],
@@ -19513,7 +20851,7 @@ fn two_offline_edit_delete_histories_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "offline edit racing deletion".into(),
             }],
@@ -19590,7 +20928,7 @@ fn two_offline_move_delete_histories_converge_in_both_delivery_orders() {
             vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 from_page_id: source_page_id,
                 to_page_id: target_page_id,
@@ -19687,7 +21025,7 @@ fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() 
                 block_rewrites: vec![crate::oplog::BlockContentRewrite {
                     block: BlockLocation {
                         block_id: referrer_block,
-                        home_document_id: referrer_document,
+                        home_document_id: test_block_home(referrer_block),
                     },
                     new_content: "referrer [[Rename Referrer Target Renamed]]".into(),
                 }],
@@ -19699,7 +21037,7 @@ fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() 
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: referrer_block,
-                    home_document_id: referrer_document,
+                    home_document_id: test_block_home(referrer_block),
                 },
                 content: "ordinary referrer edit [[Rename Referrer Target]]".into(),
             }],
@@ -19768,7 +21106,7 @@ fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "ALPHA beta gamma".into(),
             }],
@@ -19778,7 +21116,7 @@ fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id,
+                    home_document_id: test_block_home(block_id),
                 },
                 content: "alpha beta GAMMA".into(),
             }],
@@ -20205,6 +21543,239 @@ fn a_foreground_journal_frame_projects_into_the_same_projection_turn_view() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[test]
+fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots() {
+    let fixture = ActivationFixture::nested_unicode("foreground-birth-replay", 0xa1c0_1000);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        open_request.clone(),
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+
+    // Existing page, newly born block: the page document is authority read by
+    // the operation but is not updated. The two new roles have no pre-state.
+    let (mut existing, existing_revision) = match actor
+        .load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "Root.md".into(),
+            },
+        })
+        .unwrap()
+    {
+        SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+        other => panic!("existing birth-authority page did not load: {other:?}"),
+    };
+    existing.blocks.push(BlockDto {
+        id: "temporary-read-authority-birth".into(),
+        raw: "born under a read-only page dependency".into(),
+        ..BlockDto::default()
+    });
+    assert!(matches!(
+        actor
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: existing.path.clone(),
+                    revision: existing_revision,
+                },
+                page: existing,
+            })
+            .unwrap(),
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+
+    // Newly born page and block: all three document roles are absent from the
+    // pre-frontier and must replay from their canonical empty Loro bases.
+    let born_name = "Journal Birth Page";
+    let born_page = new_application_page(
+        born_name,
+        SyncPageKind::Page,
+        None,
+        vec![BlockDto {
+            id: "temporary-page-birth-block".into(),
+            raw: "born with its page".into(),
+            ..BlockDto::default()
+        }],
+    );
+    assert!(matches!(
+        actor
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: born_name.into(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: born_page,
+            })
+            .unwrap(),
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+
+    let frames = actor
+        .managed_local
+        .as_ref()
+        .expect("foreground birth actor retains its journal")
+        .frames
+        .iter()
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 2);
+    let existing_record = crate::oplog::decode_managed_local_record(frames[0]).unwrap();
+    let page_record = crate::oplog::decode_managed_local_record(frames[1]).unwrap();
+
+    let existing_page_id = existing_record.projection().intent().page_id();
+    let existing_page_home = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .materialize_page(existing_page_id)
+        .unwrap()
+        .home_document_id;
+    let existing_birth = existing_record
+        .semantic_effect_for_test()
+        .blocks()
+        .iter()
+        .find(|delta| delta.before.is_none() && delta.after.is_some())
+        .expect("existing-page record creates one block");
+    let existing_block_id = existing_birth.block_id;
+    let existing_block_home = existing_birth.home_document_id;
+    let existing_membership = DocumentKey::Membership {
+        block_document_id: existing_block_home,
+        page_document_id: existing_page_home,
+    };
+    let existing_pre = existing_record
+        .prepared_batch()
+        .manifest()
+        .dependency_frontier();
+    assert!(existing_pre
+        .documents()
+        .iter()
+        .any(|dependency| dependency.document_id() == DocumentKey::Entity(existing_page_home)));
+    assert!(!existing_pre.documents().iter().any(|dependency| {
+        matches!(
+            dependency.document_id(),
+            document_id if document_id == DocumentKey::Entity(existing_block_home)
+                || document_id == existing_membership
+        )
+    }));
+    let existing_witnesses = existing_record.crdt_update_witnesses_for_test();
+    assert!(!existing_witnesses
+        .iter()
+        .any(|(document_id, _)| *document_id == DocumentKey::Entity(existing_page_home)));
+    for document_id in [
+        DocumentKey::Entity(existing_block_home),
+        existing_membership,
+    ] {
+        assert_eq!(
+            existing_witnesses
+                .iter()
+                .find(|(candidate, _)| *candidate == document_id)
+                .map(|(_, witness)| *witness),
+            Some(false),
+            "a born document has an absent causal-state witness"
+        );
+    }
+
+    let born_page_id = page_record.projection().intent().page_id();
+    let born_page_state = page_record
+        .semantic_effect_for_test()
+        .pages()
+        .iter()
+        .find(|delta| delta.page_id == born_page_id)
+        .and_then(|delta| delta.after.as_ref())
+        .expect("page-birth record creates its page");
+    let born_page_home = born_page_state.home_document_id();
+    let born_block = page_record
+        .semantic_effect_for_test()
+        .blocks()
+        .iter()
+        .find(|delta| delta.before.is_none() && delta.after.is_some())
+        .expect("page-birth record creates its block");
+    let born_block_id = born_block.block_id;
+    let born_block_home = born_block.home_document_id;
+    let born_membership = DocumentKey::Membership {
+        block_document_id: born_block_home,
+        page_document_id: born_page_home,
+    };
+    let born_keys = [
+        DocumentKey::Entity(born_page_home),
+        DocumentKey::Entity(born_block_home),
+        born_membership,
+    ];
+    let page_pre = page_record
+        .prepared_batch()
+        .manifest()
+        .dependency_frontier();
+    assert!(born_keys.iter().all(|document_id| !page_pre
+        .documents()
+        .iter()
+        .any(|dependency| dependency.document_id() == *document_id)));
+    let page_witnesses = page_record.crdt_update_witnesses_for_test();
+    for document_id in born_keys {
+        assert_eq!(
+            page_witnesses
+                .iter()
+                .find(|(candidate, _)| *candidate == document_id)
+                .map(|(_, witness)| *witness),
+            Some(false),
+            "each page-forest birth role has an absent causal-state witness"
+        );
+    }
+
+    let existing_root_before = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .block_document_root_value_for_test(existing_block_id)
+        .unwrap();
+    let born_root_before = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .block_document_root_value_for_test(born_block_id)
+        .unwrap();
+    drop(actor);
+
+    let reopened = open_clean_runtime_resources(&open_request)
+        .unwrap()
+        .expect("both journal-durable births crash-replay");
+    let engine = reopened.runtime.engine();
+    assert_eq!(
+        engine
+            .block_document_root_value_for_test(existing_block_id)
+            .unwrap(),
+        existing_root_before
+    );
+    assert_eq!(
+        engine
+            .block_document_root_value_for_test(born_block_id)
+            .unwrap(),
+        born_root_before
+    );
+    let existing_page = engine.materialize_page(existing_page_id).unwrap();
+    assert!(existing_page.blocks.iter().any(|block| {
+        block.block_id == existing_block_id
+            && block.home_document_id == existing_block_home
+            && block.content == "born under a read-only page dependency"
+    }));
+    let born_page = engine.materialize_page(born_page_id).unwrap();
+    assert!(born_page.blocks.iter().any(|block| {
+        block.block_id == born_block_id
+            && block.home_document_id == born_block_home
+            && block.content == "born with its page"
+    }));
 }
 
 #[test]
@@ -30006,6 +31577,7 @@ fn c7b_navigation_overlay_pending_paths_load_at_most_once_per_request() {
 
 pub(crate) mod c7b_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(crate) static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -30013,10 +31585,26 @@ pub(crate) mod c7b_alloc {
 
     pub(crate) struct Counting;
 
+    thread_local! {
+        static THREAD_ENABLED: Cell<bool> = const { Cell::new(false) };
+        static THREAD_CALLS: Cell<usize> = const { Cell::new(0) };
+        static THREAD_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn note_thread_allocation(bytes: usize) {
+        let _ = THREAD_ENABLED.try_with(|enabled| {
+            if enabled.get() {
+                THREAD_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+                THREAD_BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
+            }
+        });
+    }
+
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             CALLS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            note_thread_allocation(layout.size());
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -30025,12 +31613,43 @@ pub(crate) mod c7b_alloc {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             CALLS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
+            note_thread_allocation(new_size.saturating_sub(layout.size()));
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
 
     pub(crate) fn snapshot() -> (usize, usize) {
         (CALLS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+    }
+
+    struct ThreadMeasurementGuard;
+
+    impl ThreadMeasurementGuard {
+        fn begin() -> Self {
+            THREAD_ENABLED.with(|enabled| {
+                assert!(!enabled.replace(true), "nested allocation measurement");
+            });
+            THREAD_CALLS.with(|calls| calls.set(0));
+            THREAD_BYTES.with(|bytes| bytes.set(0));
+            Self
+        }
+    }
+
+    impl Drop for ThreadMeasurementGuard {
+        fn drop(&mut self) {
+            THREAD_ENABLED.with(|enabled| enabled.set(false));
+        }
+    }
+
+    /// Attribute allocations made synchronously by `operation` to its calling
+    /// test thread. Other parallel tests continue contributing only to the
+    /// legacy process-wide C7b totals.
+    pub(crate) fn measure_thread<T>(operation: impl FnOnce() -> T) -> (T, (usize, usize)) {
+        let guard = ThreadMeasurementGuard::begin();
+        let result = operation();
+        let sample = (THREAD_CALLS.with(Cell::get), THREAD_BYTES.with(Cell::get));
+        drop(guard);
+        (result, sample)
     }
 }
 
@@ -37787,4 +39406,187 @@ fn ret2_an_actor_edit_turn_completes_while_a_public_advanced_selection_waits() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[path = "rebaselining_layout_tests.rs"]
+mod rebaselining_layout;
+
+#[test]
+fn cold_archive_republication_uses_accepted_names_and_preserves_original_bytes() {
+    let fixture = ActivationFixture::nested_unicode("cold-archive-republication", 0xa1d8);
+    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
+    let open_request = reopen_request(&fixture.request);
+    let identities = open_request.clean_identities.clone().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        open_request,
+        identities,
+        resources,
+        SyncRuntimeRecovery::CleanActivation,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+    let (mut page, revision) = match actor
+        .load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "Root.md".into(),
+            },
+        })
+        .unwrap()
+    {
+        SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+        other => panic!("fixture page did not load: {other:?}"),
+    };
+    page.blocks[0].raw = "original accepted cold publication".into();
+    actor
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    actor.clean_shutdown().unwrap();
+    let accepted = actor
+        .active_engine()
+        .unwrap()
+        .status()
+        .accepted_batch_ids()
+        .unwrap();
+    assert!(!accepted.is_empty());
+    let store = actor.retained_archive_store().unwrap();
+    let mut expected = BTreeMap::new();
+    let mut object_digests = BTreeSet::new();
+    for batch_id in &accepted {
+        let manifest = store.read_manifest(*batch_id).unwrap().unwrap();
+        expected.insert(
+            format!("manifests/{batch_id}.manifest"),
+            store.read_manifest_bytes(*batch_id).unwrap(),
+        );
+        for object in manifest.required_objects() {
+            let digest = object.content_digest();
+            expected.insert(
+                format!("objects/{digest}.object"),
+                store.read_object_bytes(digest).unwrap(),
+            );
+            object_digests.insert(digest);
+        }
+    }
+    // A physically committed but unaccepted original must not be advertised by
+    // whole accepted-history publication merely because its file is present.
+    let extra_id = BatchId::from_uuid(Uuid::from_u128(0xa1d8_ff));
+    let effect = crate::oplog::SemanticEffect::new(vec![], vec![], vec![])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let object = OperationObject::new(
+        fixture.request.identities.workspace_id,
+        DocumentKey::Entity(fixture.request.identities.catalog_document_id),
+        crate::oplog::ObjectKind::SemanticEffect,
+        effect.clone(),
+    )
+    .unwrap();
+    let extra_manifest = OperationBatch::new_with_causality(
+        fixture.request.identities.workspace_id,
+        fixture.request.identities.lineage_digest,
+        extra_id,
+        fixture.request.identities.device_id,
+        fixture.request.identities.session_id,
+        crate::oplog::BatchOrigin::LocalMutation,
+        crate::oplog::BatchCausalDot::new(
+            crate::oplog::CausalPeerId::from_key(
+                crate::oplog::WriterIncarnationId::fixture_for_device(
+                    fixture.request.identities.device_id,
+                ),
+            ),
+            1,
+        )
+        .unwrap(),
+        vec![],
+        crate::oplog::FrontierV2::new(vec![]).unwrap(),
+        crate::oplog::SemanticEffectDigest::of(&effect),
+        vec![object.descriptor().unwrap()],
+    )
+    .unwrap();
+    store
+        .publish_prepared_fixture(
+            &crate::oplog::PreparedBatch::new(extra_manifest, vec![object]).unwrap(),
+        )
+        .unwrap();
+    store
+        .publish_cold_history_for_batches(&accepted.iter().copied().collect())
+        .unwrap();
+    for batch_id in &accepted {
+        fs::remove_file(
+            store
+                .root_path()
+                .join("batches")
+                .join(format!("{batch_id}.manifest")),
+        )
+        .unwrap();
+    }
+    for digest in object_digests {
+        fs::remove_file(
+            store
+                .root_path()
+                .join("objects")
+                .join(format!("{digest}.object")),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        store.committed_manifests().unwrap().len(),
+        1,
+        "only the unaccepted original remains in the hot manifest directory"
+    );
+    for complete in [false, true] {
+        let root = fixture.root.join(if complete {
+            "cold-complete-provider"
+        } else {
+            "cold-single-provider"
+        });
+        let journal = fixture
+            .root
+            .join(if complete {
+                "cold-complete-device"
+            } else {
+                "cold-single-device"
+            })
+            .join("journal");
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let mut provider = SharedProviderTransport::open(&root, &journal).unwrap();
+        if complete {
+            publish_complete_clean_archive(
+                &store,
+                &mut provider,
+                fixture.request.identities.workspace_id,
+                fixture.request.identities.lineage_digest,
+                &accepted,
+            )
+            .unwrap();
+        } else {
+            for batch_id in &accepted {
+                publish_clean_archive_batch(
+                    &store,
+                    &mut provider,
+                    fixture.request.identities.workspace_id,
+                    fixture.request.identities.lineage_digest,
+                    *batch_id,
+                )
+                .unwrap();
+            }
+        }
+        for (path, bytes) in &expected {
+            assert_eq!(
+                fs::read(root.join("outbox").join(path)).unwrap(),
+                *bytes,
+                "republication must preserve exact original bytes: {path}"
+            );
+        }
+        assert!(!root
+            .join("outbox/manifests")
+            .join(format!("{extra_id}.manifest"))
+            .exists());
+    }
 }

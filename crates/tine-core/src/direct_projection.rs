@@ -2,6 +2,8 @@ use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::oplog::query_cursor::drain_after;
+use crate::query::registry_cache::{CommittedRegistryCache, RegistryCapture};
+use crate::query::registry_sql::{self, PageRegistryMetadata};
 use crate::query::PropertyFacetAccumulator;
 use crate::query_jobs::{
     OwnedAdmission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY, QUERY_JOB_WAIT,
@@ -23,6 +25,13 @@ use uuid::Uuid;
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
 type PageRevisions = Arc<HashMap<PathBuf, String>>;
+
+struct CommittedRegistryOwner {
+    cache: CommittedRegistryCache,
+    config: Arc<ParseConfig>,
+}
+
+type SharedCommittedRegistry = Arc<Mutex<Option<CommittedRegistryOwner>>>;
 
 // This is the parser-fact extractor identity, not an on-disk schema version.
 // Bump it whenever unchanged source bytes must be lowered into new/different
@@ -319,6 +328,7 @@ struct ProjectionShared {
     /// apply, and a job clones the `Arc` at snapshot acquisition — never a
     /// live lookup during output.
     session_pages: Mutex<Arc<HashSet<[u8; 16]>>>,
+    committed_registry: SharedCommittedRegistry,
     /// The generation at which §5.10's FTS-building signal was last observed
     /// READY. Readiness is monotonic within one projection file — the index
     /// owner finishes the build and never un-finishes it, and a rebuild
@@ -445,7 +455,7 @@ fn capture_query_job(
             ))
         }
     };
-    let snapshot = match PhysicalProjectionQuerySnapshot::open_direct(&shared.path, validate) {
+    let mut snapshot = match PhysicalProjectionQuerySnapshot::open_direct(&shared.path, validate) {
         Ok(snapshot) => snapshot,
         // The validator is the only `Incomplete` this call can produce and
         // it means the generation moved: not a defect. Anything else is
@@ -457,6 +467,20 @@ fn capture_query_job(
         return QueryJobOpen::Cancelled;
     }
     let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
+    let registry = {
+        let owner = shared.committed_registry.lock().unwrap();
+        let Some(owner) = owner.as_ref() else {
+            return QueryJobOpen::NotReady;
+        };
+        let capture = snapshot
+            .query_revision()
+            .ok()
+            .and_then(|revision| owner.cache.capture(revision, &owner.config).ok());
+        let Some(capture) = capture else {
+            return QueryJobOpen::Failed;
+        };
+        capture
+    };
     if !shared.ready_at(cache_generation) {
         return QueryJobOpen::NotReady;
     }
@@ -466,6 +490,8 @@ fn capture_query_job(
         _slot: slot,
         snapshot,
         session_pages,
+        registry: Some(registry),
+        registry_owner: Arc::clone(&shared.committed_registry),
     })
 }
 
@@ -483,6 +509,8 @@ pub(crate) struct DirectQueryJob {
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    registry: Option<RegistryCapture>,
+    registry_owner: SharedCommittedRegistry,
 }
 
 impl DirectQueryJob {
@@ -491,10 +519,23 @@ impl DirectQueryJob {
     pub(crate) fn read_registry(
         &mut self,
         config: &ParseConfig,
-    ) -> Result<crate::query::registry::Registry, crate::query::QueryExecutionError> {
+    ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         #[cfg(test)]
         REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
-        crate::query::registry_sql::read_registry(&mut self.snapshot, config)
+        let capture =
+            self.registry
+                .as_ref()
+                .ok_or(crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                ))?;
+        let built = capture.build(&mut self.snapshot, config)?;
+        let mut owner = self.registry_owner.lock().unwrap();
+        // A failed/replaced producer cannot seed its successor from this job.
+        // The captured result itself remains coherent with the owned read.
+        match owner.as_mut() {
+            Some(owner) => owner.cache.publish(capture.clone(), built),
+            None => Ok(built),
+        }
     }
 }
 
@@ -582,6 +623,7 @@ impl DirectProjection {
             statement_seam: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
+            committed_registry: Arc::new(Mutex::new(None)),
             fts_ready_at: AtomicU64::new(0),
             fts_ever_ready: AtomicBool::new(false),
             worker_available: AtomicBool::new(true),
@@ -1936,6 +1978,25 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let had_full = full.is_some();
         let had_warm = warm.is_some();
         let stream_closed = order.is_some();
+        let registry_config = full
+            .as_ref()
+            .map(|full| Arc::clone(&full.parse_config))
+            .or_else(|| warm.as_ref().map(|warm| Arc::clone(&warm.parse_config)))
+            .or_else(|| {
+                deltas
+                    .values()
+                    .filter_map(|(generation, delta)| match delta {
+                        PageDelta::Replace { parse_config, .. } => Some((generation, parse_config)),
+                        PageDelta::Delete { .. } => None,
+                    })
+                    .max_by_key(|(generation, _)| *generation)
+                    .map(|(_, config)| Arc::clone(config))
+            });
+        let registry_reset = had_full || had_warm || rebuild || requires_full_rebuild;
+        let touched_pages = deltas
+            .values()
+            .map(|(_, delta)| page_id(&delta.entry().rel_path))
+            .collect::<std::collections::BTreeSet<_>>();
         #[cfg(test)]
         run_before_apply_pending_hook();
         let applied: Result<AppliedTurn, String> =
@@ -1966,6 +2027,18 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         database.reset().map_err(|error| error.to_string())?;
                         writer_slot = Some(database);
                     }
+                    let registry_before = if !registry_reset
+                        && !touched_pages.is_empty()
+                        && shared.committed_registry.lock().unwrap().is_some()
+                    {
+                        let mut snapshot =
+                            PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
+                                .map_err(|error| error.to_string())?;
+                        registry_sql::read_page_registry_metadata(&mut snapshot, &touched_pages)
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        PageRegistryMetadata::new()
+                    };
                     let mut applied =
                         apply_pending(writer_slot.as_mut().unwrap(), full, warm.as_ref(), deltas)?;
                     // R6: the stream's closing turn (or a `Clean` warm turn, or a
@@ -2000,12 +2073,61 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                             )
                             .map_err(|error| error.to_string())?;
                     }
+                    // All SQL writes, including the separate ordering transaction,
+                    // have completed. No maintenance transaction survives a write.
+                    let revision = {
+                        let mut snapshot =
+                            PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
+                                .map_err(|error| error.to_string())?;
+                        snapshot
+                            .query_revision()
+                            .map_err(|error| error.to_string())?
+                    };
+                    #[cfg(test)]
+                    if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
+                        hook();
+                    }
+                    shared.record_session_pages(&applied.pages);
+                    let changes =
+                        registry_sql::registry_changes(&registry_before, &applied.registry_pages);
+                    let mut registry = shared.committed_registry.lock().unwrap();
+                    let config = registry_config
+                        .as_ref()
+                        .cloned()
+                        .or_else(|| registry.as_ref().map(|owner| Arc::clone(&owner.config)));
+                    if let Some(config) = config {
+                        match registry.as_mut() {
+                            Some(owner)
+                                if !registry_reset && owner.config.digest() == config.digest() =>
+                            {
+                                owner
+                                    .cache
+                                    .committed(
+                                        revision,
+                                        changes.normalized_keys,
+                                        changes.declaration_page_names,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            Some(owner) => {
+                                owner.cache.reset(revision, &config);
+                                owner.config = config;
+                            }
+                            None => {
+                                *registry = Some(CommittedRegistryOwner {
+                                    cache: CommittedRegistryCache::new(revision, &config),
+                                    config,
+                                })
+                            }
+                        }
+                    }
                     Ok(applied)
                 })()
             };
         let applied = match applied {
             Ok(applied) => applied,
             Err(error) => {
+                shared.committed_registry.lock().unwrap().take();
                 requires_full_rebuild = true;
                 shared.ready.store(false, Ordering::Release);
                 shared.worker_failed.store(true, Ordering::Release);
@@ -2025,11 +2147,6 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 continue;
             }
         };
-        #[cfg(test)]
-        if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
-            hook();
-        }
-        shared.record_session_pages(&applied.pages);
         if had_full || had_warm {
             requires_full_rebuild = false;
         }
@@ -2123,6 +2240,7 @@ struct AppliedPages {
 #[derive(Default)]
 struct AppliedTurn {
     pages: AppliedPages,
+    registry_pages: PageRegistryMetadata,
     /// R6: the warm validation's verdict, when this turn ran one.
     warm_outcome: Option<WarmOutcome>,
     /// R6: this turn lowered replacements that carried no order position
@@ -2306,6 +2424,10 @@ fn apply_pending(
                             applied.relowered_structurally.push(page.page_id)
                         }
                     }
+                    turn.registry_pages.insert(
+                        page.page_id,
+                        registry_sql::registry_metadata_from_physical_page(&page)?,
+                    );
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
@@ -2806,6 +2928,8 @@ mod tests {
             snapshot,
             _slot: slot,
             session_pages: Arc::new(HashSet::new()),
+            registry: None,
+            registry_owner: Arc::new(Mutex::new(None)),
         };
         writer
             .execute("UPDATE payload SET value='after'", [])
@@ -2998,16 +3122,16 @@ mod tests {
         // `(journal)` and `"points"` below are deliberately in the list because
         // one is unselective and the other is an unbounded content predicate,
         // and §5.9 routes both to the statement anyway.
-        for query in [
-            "(and (task TODO) (page source))",
-            "(property status active)",
-            "(page-property category work)",
-            "(page source)",
-            "(namespace Project)",
-            "(journal)",
-            "(and (property status active) (page source))",
-            "(or (page source) (page Target))",
-            "\"points\"",
+        for (query, expected_captures) in [
+            ("(and (task TODO) (page source))", 1),
+            ("(property status active)", 2),
+            ("(page-property category work)", 2),
+            ("(page source)", 1),
+            ("(namespace Project)", 1),
+            ("(journal)", 1),
+            ("(and (property status active) (page source))", 2),
+            ("(or (page source) (page Target))", 1),
+            ("\"points\"", 1),
         ] {
             let oracle = crate::query::run_query_bounded(&graph, query, 100, 1_000_000);
             let statements_before = graph.direct_projection_statement_reads_test();
@@ -3028,8 +3152,8 @@ mod tests {
             );
             assert_eq!(
                 graph.direct_projection_statement_reads_test(),
-                statements_before + 1,
-                "{query}: exactly one dispatched statement must answer"
+                statements_before + expected_captures,
+                "{query}: result snapshot plus property metadata snapshot when needed"
             );
             assert_eq!(
                 crate::query::full_graph_query_evaluations(),
@@ -3569,8 +3693,8 @@ mod tests {
         );
         assert_eq!(
             graph.direct_projection_statement_reads_test(),
-            statements_before + 1,
-            "the recovered projection must answer through the statement again"
+            statements_before + 2,
+            "property memo metadata and result each acquire an owned SQL snapshot"
         );
         assert_eq!(
             graph.direct_projection_fallback_reads_test(),
@@ -3903,16 +4027,22 @@ mod tests {
         // reaches the full-graph evaluator.
         let graph_page_count = graph.with_pages(|pages| pages.len());
         let mut answered = 0usize;
-        for query in [
-            "(page-ref \"B4 Indexed Target\")",
-            "(and (task TODO) (page \"B4 Indexed Source\"))",
-            "(property b4-facet yes)",
-            "(page-property b4-page-facet yes)",
-            "(page \"B4 Indexed Source\")",
-            "(namespace B4)",
-            "(journal)",
-            "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
-            "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
+        for (query, expected_captures) in [
+            ("(page-ref \"B4 Indexed Target\")", 1),
+            ("(and (task TODO) (page \"B4 Indexed Source\"))", 1),
+            ("(property b4-facet yes)", 2),
+            ("(page-property b4-page-facet yes)", 2),
+            ("(page \"B4 Indexed Source\")", 1),
+            ("(namespace B4)", 1),
+            ("(journal)", 1),
+            (
+                "(and (property b4-facet yes) (page \"B4 Indexed Source\"))",
+                2,
+            ),
+            (
+                "(or (page \"B4 Indexed Source\") (page \"B4 Indexed Target\"))",
+                1,
+            ),
         ] {
             let oracle = crate::query::run_query_bounded(&graph, query, 20_000, 32 * 1024 * 1024);
             let statements_before = graph.direct_projection_statement_reads_test();
@@ -3931,8 +4061,8 @@ mod tests {
             answered += 1;
             assert_eq!(
                 graph.direct_projection_statement_reads_test(),
-                statements_before + 1,
-                "{query}: exactly one statement must answer"
+                statements_before + expected_captures,
+                "{query}: result snapshot plus property metadata snapshot when needed"
             );
             assert_eq!(
                 graph.direct_projection_fallback_reads_test(),
@@ -4958,7 +5088,12 @@ mod tests {
             "None of these\nbranches evaluates the parsed graph or fabricates an empty success.",
             // Snapshot, metadata and ordered result reads (I-13, I-15).
             "Capacity is acquired before SQLite opens\nthe owned snapshot.",
-            "when the table is not\nalready current, the job reads it from its own snapshot before lowering",
+            "using the actual storage query revision and parse config",
+            "This owner is separate from the editor registry",
+            "Text-only edits with unchanged metadata reuse the registry without a full or per-key scan",
+            "All turn writes and identity publication precede cache revision publication",
+            "validating its actual revision even on cache hits",
+            "Older coherent reads cannot overwrite newer publications or clear newer dirty keys",
             "Ready query selection\nand result construction load NO `Document`, read NO source text and consult no\nparsed graph.",
             "Recovery source-inventory work is counted separately.",
             "Its descriptor wrapper does: Direct\nblock answers carry `query_page_order.position` and\n`query_block_results.preorder` and end with `ORDER BY` on those columns",
@@ -5291,14 +5426,92 @@ mod tests {
             old.rows_equal(&retained),
             "later edits preserve the acquired read"
         );
+        drop(new_job);
+        let QueryJobOpen::Job(mut current_job) = projection.open_query_job(new_generation) else {
+            panic!("current snapshot must remain ready");
+        };
         assert!(
-            new.rows_equal(&graph.property_registry()),
-            "old readers cannot overwrite the new registry"
+            Arc::ptr_eq(&new, &current_job.read_registry(&config).unwrap()),
+            "old readers cannot overwrite the committed registry cache"
         );
         assert!(
             !graph.has_parsed_cache_test(),
             "registry reads retain no Documents"
         );
+    }
+
+    #[test]
+    fn query_registry_live_text_edits_reuse_cache_and_property_edits_patch_it() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("registry-live-delta");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Source.md"), "score:: 1\n- TODO task\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let config = graph.config.parse_config();
+        let read = || {
+            let QueryJobOpen::Job(mut job) = projection.open_query_job(graph.cache_generation())
+            else {
+                panic!("ready query snapshot");
+            };
+            let registry = job.read_registry(&config).unwrap();
+            (job, registry)
+        };
+        let (job, initial) = read();
+        drop(job);
+        let editor_registry = graph.property_registry();
+        assert!(initial.rows_equal(&editor_registry));
+        assert!(!Arc::ptr_eq(&initial, &editor_registry));
+        assert!(
+            Arc::ptr_eq(
+                &initial,
+                &graph
+                    .query_property_registry_current(graph.cache_generation())
+                    .unwrap()
+            ),
+            "public registry must use the committed owner even when an editor cache is current"
+        );
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "Source")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "DONE task".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        registry_sql::reset_statement_count();
+        let (job, text_edit) = read();
+        assert!(Arc::ptr_eq(&initial, &text_edit));
+        assert_eq!(
+            registry_sql::statement_count(),
+            0,
+            "text-only edits perform no full or per-key registry SQL scan"
+        );
+        drop(job);
+
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.pre_block = Some("score:: word\n".into());
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        registry_sql::reset_statement_count();
+        let (mut job, property_edit) = read();
+        assert_eq!(
+            registry_sql::statement_count(),
+            2,
+            "one key patch reads properties and declarations"
+        );
+        assert!(!initial.rows_equal(&property_edit));
+        let full = registry_sql::read_registry(&mut job.snapshot, &config).unwrap();
+        assert!(property_edit.rows_equal(&full));
+        assert!(property_edit.generation() > initial.generation());
     }
 
     #[test]
@@ -5773,6 +5986,7 @@ mod tests {
             statement_seam: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
+            committed_registry: Arc::new(Mutex::new(None)),
             fts_ready_at: AtomicU64::new(0),
             fts_ever_ready: AtomicBool::new(false),
             worker_available: AtomicBool::new(true),

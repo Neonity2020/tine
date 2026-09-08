@@ -133,8 +133,11 @@ pub(crate) struct LocalCompletionFlushStats {
 pub(crate) struct LocalCompletionPruningContext {
     pub(crate) live_page_paths: BTreeSet<(PageId, ManagedPath)>,
     pub(crate) retained_intents: BTreeSet<ProjectionIntentId>,
-    pub(crate) receiver_history_paths: BTreeSet<AbsenceDecisionKey>,
-    pub(crate) receiver_completions: Vec<AbsenceCompletionAnchor>,
+    /// Durable receiver completion anchors for exactly the keys this index
+    /// holds, point-read one key at a time. A present key with an empty vector
+    /// means "receiver evidence exists here, but no completion anchor": the
+    /// R16-C2 rule still applies. An absent key means no receiver evidence.
+    pub(crate) receiver_rows: BTreeMap<AbsenceDecisionKey, Vec<AbsenceCompletionAnchor>>,
 }
 
 #[derive(Debug)]
@@ -854,9 +857,9 @@ fn prune_entries(
             return true;
         }
         let key = (stored.entry.page_id, stored.entry.path.clone());
-        if !pruning.receiver_history_paths.contains(&key) {
+        let Some(receiver_anchors) = pruning.receiver_rows.get(&key) else {
             return false;
-        }
+        };
         let dominated_by_local =
             local_entries
                 .iter()
@@ -865,10 +868,8 @@ fn prune_entries(
                         && other_id != intent_id
                         && frontier_strictly_dominates(other_frontier, &stored.entry.post_frontier)
                 });
-        let dominated_by_receiver = pruning.receiver_completions.iter().any(|receiver| {
-            receiver.page_id == stored.entry.page_id
-                && receiver.path == stored.entry.path
-                && frontier_strictly_dominates(&receiver.frontier, &stored.entry.post_frontier)
+        let dominated_by_receiver = receiver_anchors.iter().any(|receiver| {
+            frontier_strictly_dominates(&receiver.frontier, &stored.entry.post_frontier)
         });
         // R16-C2: while receiver history exists underneath this key, retain
         // every locally maximal answer. Pruning it could expose an older
@@ -922,6 +923,7 @@ fn name_set_digest<'a>(names: impl Iterator<Item = &'a str>) -> ContentDigest {
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
     use std::path::{Path, PathBuf};
 
     use uuid::Uuid;
@@ -984,7 +986,7 @@ mod tests {
         target_kind: ProjectionTargetKind,
     ) -> ProjectionIntent {
         let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentId::from_uuid(Uuid::from_u128(0xc2_1002)),
+            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc2_1002))),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(17), version)],
             Vec::new(),
         )
@@ -1174,8 +1176,9 @@ mod tests {
         index.stage_completed(&local_absent).unwrap();
         let receiver_anchor = AbsenceCompletionAnchor::from_intent(&receiver_present).unwrap();
         let pruning = LocalCompletionPruningContext {
-            receiver_history_paths: [receiver_anchor.key()].into_iter().collect(),
-            receiver_completions: vec![receiver_anchor.clone()],
+            receiver_rows: [(receiver_anchor.key(), vec![receiver_anchor.clone()])]
+                .into_iter()
+                .collect(),
             ..LocalCompletionPruningContext::default()
         };
         index.flush(0, &pruning).unwrap();
@@ -1186,16 +1189,20 @@ mod tests {
             .record_receiver_completion(&receiver_present)
             .unwrap();
         for entry in index.completed_entries() {
-            merged.record_local_completion(AbsenceCompletionAnchor {
-                intent_id: entry.intent_id,
-                page_id: entry.page_id,
-                path: entry.path,
-                target_kind: entry.target_kind,
-                frontier: entry.post_frontier,
-            });
+            merged
+                .record_local_completion(AbsenceCompletionAnchor {
+                    intent_id: entry.intent_id,
+                    page_id: entry.page_id,
+                    path: entry.path,
+                    target_kind: entry.target_kind,
+                    frontier: entry.post_frontier,
+                })
+                .unwrap();
         }
         assert_eq!(
-            merged.decision(local_absent.page_id(), local_absent.path()),
+            merged
+                .decision(local_absent.page_id(), local_absent.path())
+                .unwrap(),
             AbsenceDecision::Create,
             "pruning the local Absent row would expose the older receiver Present completion"
         );

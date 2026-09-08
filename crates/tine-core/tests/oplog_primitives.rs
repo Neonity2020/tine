@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use tine_core::oplog::{
     AnnotatedIdentity, BatchId, BlobDescription, BlockId, CrdtPeerCounter, CrdtPeerId, DeviceId,
-    DocumentDependencies, DocumentId, FrontierV2, ImportId, ImportInventoryEntry,
+    DocumentDependencies, DocumentId, DocumentKey, FrontierV2, ImportId, ImportInventoryEntry,
     ImportInventoryState, ImportLocator, LogseqUuid, ManagedPath, ManagedTextKind, PageId,
     PortablePathKey, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion,
     ProjectionIntent, ProjectionPrecondition, ReceiptError, SessionId, StructuralLocator,
@@ -63,13 +63,17 @@ fn annotation(
 fn sample_intent() -> ProjectionIntent {
     let frontier = FrontierV2::new(vec![
         DocumentDependencies::new(
-            document(20),
+            DocumentKey::Entity(document(20)),
             vec![peer(9, 12), peer(2, 7)],
             vec![batch(4), batch(3)],
         )
         .unwrap(),
-        DocumentDependencies::new(document(10), vec![peer(5, 8)], vec![batch(2), batch(1)])
-            .unwrap(),
+        DocumentDependencies::new(
+            DocumentKey::Entity(document(10)),
+            vec![peer(5, 8)],
+            vec![batch(2), batch(1)],
+        )
+        .unwrap(),
     ])
     .unwrap();
 
@@ -430,21 +434,39 @@ fn decode_rejects_duplicate_document_and_batch_dependencies() {
 
     assert!(matches!(
         FrontierV2::new(vec![
-            DocumentDependencies::new(document(1), vec![peer(1, 1)], vec![batch(1)]).unwrap(),
-            DocumentDependencies::new(document(1), vec![peer(2, 1)], vec![batch(2)]).unwrap(),
+            DocumentDependencies::new(
+                DocumentKey::Entity(document(1)),
+                vec![peer(1, 1)],
+                vec![batch(1)]
+            )
+            .unwrap(),
+            DocumentDependencies::new(
+                DocumentKey::Entity(document(1)),
+                vec![peer(2, 1)],
+                vec![batch(2)]
+            )
+            .unwrap(),
         ]),
         Err(ReceiptError::DuplicateDocument(_))
     ));
     assert!(matches!(
-        DocumentDependencies::new(document(1), vec![peer(1, 1)], vec![batch(1), batch(1)]),
+        DocumentDependencies::new(
+            DocumentKey::Entity(document(1)),
+            vec![peer(1, 1)],
+            vec![batch(1), batch(1)]
+        ),
         Err(ReceiptError::DuplicateDependency(_))
     ));
     assert!(matches!(
-        DocumentDependencies::new(document(1), vec![peer(1, 1), peer(1, 2)], vec![batch(1)]),
+        DocumentDependencies::new(
+            DocumentKey::Entity(document(1)),
+            vec![peer(1, 1), peer(1, 2)],
+            vec![batch(1)]
+        ),
         Err(ReceiptError::DuplicateCrdtPeer(_))
     ));
     assert!(matches!(
-        DocumentDependencies::new(document(1), vec![], vec![]),
+        DocumentDependencies::new(DocumentKey::Entity(document(1)), vec![], vec![]),
         Err(ReceiptError::EmptyDocumentFrontier(_))
     ));
 }
@@ -452,7 +474,7 @@ fn decode_rejects_duplicate_document_and_batch_dependencies() {
 #[test]
 fn frontier_construction_is_canonical_and_true_empty_baseline_is_valid() {
     let first = DocumentDependencies::new(
-        document(1),
+        DocumentKey::Entity(document(1)),
         vec![peer(9, 4), peer(2, 8)],
         vec![batch(7), batch(3)],
     )
@@ -461,7 +483,7 @@ fn frontier_construction_is_canonical_and_true_empty_baseline_is_valid() {
     assert_eq!(first.direct_dependency_heads(), &[batch(3), batch(7)]);
 
     let equivalent = DocumentDependencies::new(
-        document(1),
+        DocumentKey::Entity(document(1)),
         vec![peer(2, 8), peer(9, 4)],
         vec![batch(3), batch(7)],
     )
@@ -478,8 +500,13 @@ fn frontier_construction_is_canonical_and_true_empty_baseline_is_valid() {
         ProjectionIntent::decode(&empty_intent.encode().unwrap()).unwrap(),
         empty_intent
     );
-    assert!(DocumentDependencies::new(document(2), vec![peer(1, 0)], vec![]).is_ok());
-    assert!(DocumentDependencies::new(document(3), vec![], vec![batch(1)]).is_ok());
+    assert!(
+        DocumentDependencies::new(DocumentKey::Entity(document(2)), vec![peer(1, 0)], vec![])
+            .is_ok()
+    );
+    assert!(
+        DocumentDependencies::new(DocumentKey::Entity(document(3)), vec![], vec![batch(1)]).is_ok()
+    );
 }
 
 #[test]
@@ -507,7 +534,7 @@ fn frontier_decode_recomputes_causal_digest_and_rejects_malformed_entries() {
         page(1),
         ManagedPath::parse("pages/a.md").unwrap(),
         FrontierV2::new(vec![DocumentDependencies::new(
-            document(1),
+            DocumentKey::Entity(document(1)),
             vec![peer(1, 0)],
             vec![],
         )
@@ -725,7 +752,7 @@ fn projection_intent_id_binds_peer_counters_and_direct_dependency_heads() {
     let make_intent = |peer_id, max_counter, dependencies| {
         intent_with_frontier(
             FrontierV2::new(vec![DocumentDependencies::new(
-                document(10),
+                DocumentKey::Entity(document(10)),
                 vec![peer(peer_id, max_counter)],
                 dependencies,
             )

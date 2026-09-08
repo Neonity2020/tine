@@ -11,7 +11,9 @@ pub(crate) mod absence_decision;
 pub(crate) mod absence_sweep;
 pub(crate) mod batch;
 pub(crate) mod checkpoint_generation;
+pub(crate) mod cold_object_store;
 pub(crate) mod conflict_history;
+pub(crate) mod current_action_roots;
 pub(crate) mod discovery;
 pub(crate) mod enrollment;
 pub(crate) mod external_import;
@@ -45,6 +47,8 @@ pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
+/// The single current live document layout.
+pub(crate) mod retirable_document;
 pub(crate) mod semantic;
 pub(crate) mod sqlite;
 mod sqlite_identity;
@@ -119,8 +123,8 @@ pub use hot_engine::{
 pub(crate) use hot_engine::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
 pub use identity::{
     BatchId, BlockId, CanonicalArchiveResourceId, CanonicalGraphResourceId, CrdtPeerId, DeviceId,
-    DocumentId, ImportId, LogseqUuid, PageId, ProjectionEndpointId, ProjectionReceiptStoreId,
-    SessionId, WorkspaceId,
+    DocumentId, DocumentKey, ImportId, LogseqUuid, PageId, ProjectionEndpointId,
+    ProjectionReceiptStoreId, SessionId, WorkspaceId, WriterIncarnationId,
 };
 pub use import::{
     classify_conflict_copy, inventory_affected, inventory_initial_shadow, BlockImportMatch,
@@ -185,9 +189,9 @@ pub use reference_catalog::{
 pub use refusal::ManagedStorageRefusalScenario;
 pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
-    BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,
-    LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageDeltaLifecycle,
-    PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
+    BlockBirth, BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName,
+    LogicalPageNameError, LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta,
+    PageDeltaLifecycle, PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
     PolicyGeneratedAnchorReason, SemanticEffect, SemanticError, VisibleMembership,
     CATALOG_PAGE_STATE_SCHEMA_VERSION, MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION,
     SEMANTIC_EFFECT_SCHEMA_VERSION,
@@ -256,13 +260,11 @@ mod external_surface_tests {
         let digest = Sha256::digest(public_uses.join("\n").as_bytes());
         assert_eq!(
             format!("{digest:x}"),
-            // Re-pinned 2026-09-05 (query engine P1-a2): `MaterializedPlanning`
-            // joins the materialization re-export list. It is the block's
-            // `[#A]`/`SCHEDULED:`/`DEADLINE:` facet, carried independently of
-            // `MaterializedTask` (§3.2 M2). Derived by re-running this
-            // function's own extraction over `HEAD` and the working tree: one
-            // name added, none removed, still 20 declarations.
-            "22323e60fe472f16d8f78a7e617feba02c823b9fa2455307e1869e47be6c01df",
+            // Re-pinned for the one current birth-authority schema:
+            // `BlockBirth` joins the semantic re-exports because it is the
+            // public field type of `BlockDelta::birth`. No declaration was
+            // added or removed; there are still exactly 20.
+            "1074d14285efc91d1a65478dc8052cd60ec906d87d868b8f5b1255d88e9897cd",
             "the exact public oplog re-export surface changed"
         );
 
@@ -278,3 +280,5 @@ mod external_surface_tests {
         );
     }
 }
+
+pub(crate) mod writer_lane;

@@ -7,9 +7,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::receipt::validate_annotations;
 use super::{
-    AnnotatedIdentity, BatchId, BatchOrigin, DocumentId, ImportId, ManagedPath, ManagedTextKind,
-    ObjectKind, OperationBatch, OperationObject, PortablePathIndexRoot, PortablePathKeyDigest,
-    ReceiptError, WorkspaceId, PORTABLE_PATH_KEY_VERSION,
+    AnnotatedIdentity, BatchId, BatchOrigin, DocumentId, DocumentKey, ImportId, ManagedPath,
+    ManagedTextKind, ObjectKind, OperationBatch, OperationObject, PortablePathIndexRoot,
+    PortablePathKeyDigest, ReceiptError, WorkspaceId, PORTABLE_PATH_KEY_VERSION,
 };
 
 pub(crate) const EXTERNAL_IMPORT_OBSERVATION_SCHEMA_VERSION: u32 = 1;
@@ -375,8 +375,11 @@ impl ExternalImportObservation {
         &self.entries
     }
 
-    pub(crate) fn descriptor_document_id(&self) -> DocumentId {
-        DocumentId::for_external_import_observation(self.workspace_id, self.import_id)
+    pub(crate) fn descriptor_document_id(&self) -> DocumentKey {
+        DocumentKey::Entity(DocumentId::for_external_import_observation(
+            self.workspace_id,
+            self.import_id,
+        ))
     }
 
     fn validate(&self) -> Result<(), ExternalImportObservationError> {
@@ -527,10 +530,10 @@ pub(crate) enum ExternalImportObservationError {
         found: ImportId,
     },
     DescriptorDocumentMismatch {
-        expected: DocumentId,
-        found: DocumentId,
+        expected: DocumentKey,
+        found: DocumentKey,
     },
-    DuplicateObservation(DocumentId),
+    DuplicateObservation(DocumentKey),
 }
 
 impl fmt::Display for ExternalImportObservationError {
@@ -839,14 +842,14 @@ mod tests {
     fn prepared_with_observation(
         observation: &ExternalImportObservation,
         object_workspace: WorkspaceId,
-        object_document: DocumentId,
+        object_document: DocumentKey,
         manifest_workspace: WorkspaceId,
         manifest_batch: BatchId,
     ) -> Result<super::super::PreparedBatch, BatchError> {
         let semantic_payload = b"semantic";
         let semantic = OperationObject::new(
             manifest_workspace,
-            document(7),
+            DocumentKey::Entity(document(7)),
             ObjectKind::SemanticEffect,
             semantic_payload.to_vec(),
         )
@@ -874,7 +877,13 @@ mod tests {
             BatchOrigin::ExternalReconciliation {
                 import_id: observation.import_id,
             },
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
             Vec::new(),
             FrontierV2::default(),
             SemanticEffectDigest::of(semantic_payload),
@@ -903,7 +912,7 @@ mod tests {
         let semantic_payload = b"semantic";
         let semantic = OperationObject::new(
             workspace_id,
-            document(7),
+            DocumentKey::Entity(document(7)),
             ObjectKind::SemanticEffect,
             semantic_payload.to_vec(),
         )
@@ -922,7 +931,13 @@ mod tests {
             device,
             SessionId::from_uuid(Uuid::from_u128(9)),
             origin,
-            BatchCausalDot::new(CausalPeerId::from_device_id(device), 1).unwrap(),
+            BatchCausalDot::new(
+                CausalPeerId::from_key(crate::oplog::WriterIncarnationId::fixture_for_device(
+                    device,
+                )),
+                1,
+            )
+            .unwrap(),
             Vec::new(),
             FrontierV2::default(),
             SemanticEffectDigest::of(semantic_payload),
@@ -977,7 +992,7 @@ mod tests {
         let encoded = object.encode().unwrap();
         assert_eq!(
             hex(&encoded),
-            "54494e454f424a32000000c100000000000000dc7b22656e76656c6f70655f736368656d615f76657273696f6e223a322c22776f726b73706163655f6964223a2230303030303030302d303030302d303030302d303030302d303030303030303030303031222c22646f63756d656e745f6964223a2263663764373534352d386566622d383265312d613466622d626234386635306631633965222c226b696e64223a2265787465726e616c5f696d706f72745f6f62736572766174696f6e222c22656e6372797074696f6e223a226e6f6e65227d54494e4545494f31011000000000000000000000000000000001103f7d7a8e2e708edd93045a6e11671c7f4031313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131014066333130653831633365303235643132643836326333323764366165646666643731353636346231306661643336656363613163613733666238306534316633010a70616765732f612e6d640075aecadc1aff7d757f2ca9b5e5963c473e640702365f473e50e13d5043fe052f0159c0f5d0c05e8278f780ab280d825c65d721a57f437e5d688652781cc2299baa"
+            "54494e454f424a32000000cc00000000000000dc7b22656e76656c6f70655f736368656d615f76657273696f6e223a322c22776f726b73706163655f6964223a2230303030303030302d303030302d303030302d303030302d303030303030303030303031222c22646f63756d656e745f6964223a7b22656e74697479223a2263663764373534352d386566622d383265312d613466622d626234386635306631633965227d2c226b696e64223a2265787465726e616c5f696d706f72745f6f62736572766174696f6e222c22656e6372797074696f6e223a226e6f6e65227d54494e4545494f31011000000000000000000000000000000001103f7d7a8e2e708edd93045a6e11671c7f4031313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131014066333130653831633365303235643132643836326333323764366165646666643731353636346231306661643336656363613163613733666238306534316633010a70616765732f612e6d640075aecadc1aff7d757f2ca9b5e5963c473e640702365f473e50e13d5043fe052f016c45542f6b4e02c22984e2249b728a3f13a665856b959b7a3c8f7e668de65d03"
         );
         assert_eq!(OperationObject::decode(&encoded).unwrap(), object);
     }
@@ -1202,7 +1217,7 @@ mod tests {
             prepared_with_observation(
                 &observation,
                 workspace_id,
-                document(999),
+                DocumentKey::Entity(document(999)),
                 workspace_id,
                 observation.source_batch_id(),
             ),

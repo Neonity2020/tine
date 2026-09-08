@@ -6,11 +6,13 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::current_action_roots::{CurrentActionRoots, SweepRetentionPin};
 use super::hot_engine::{
     CleanImportProjectionPredecessor, DeferredAbsenceObservation, ProjectionClaimSource,
 };
 use super::object_store::{
     ensure_directory_nofollow, open_dir_nofollow, read_optional_regular, require_regular_entry,
+    sync_dir_required,
 };
 use super::projection_manifest::{validate_projection_object_set, ManifestProjectionTarget};
 use super::{
@@ -25,6 +27,11 @@ const SWEEP_SCHEMA_VERSION: u32 = 1;
 const SWEEP_NAMESPACE: &str = "sweeps";
 const MAX_SWEEP_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const SWEEP_VERSION_DIGITS: usize = 20;
+const ROOTS_NAMESPACE: &str = "sweep-action-roots-v1";
+const ROOTS_PREFIX: &str = "sweep-action-roots-";
+const ROOTS_SUFFIX: &str = ".roots";
+const ROOTS_SCHEMA_VERSION: u32 = 1;
+const MAX_ROOTS_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,11 +270,85 @@ impl SweepRecorder for NoopSweepRecorder {
     }
 }
 
+/// Accepted-batch membership as a point question.
+///
+/// The old open built the complete accepted batch-id set purely so that member
+/// reconciliation could ask "was this deletion accepted?" a handful of times.
+/// That materialized an O(accepted history) collection on every ordinary open
+/// to answer a bounded number of point queries, so the seam is now the query
+/// itself and the caller decides how to answer it.
+pub(crate) trait AcceptedBatchMembership {
+    fn is_accepted(&self, batch_id: BatchId) -> Result<bool, SweepError>;
+}
+
+impl AcceptedBatchMembership for BTreeSet<BatchId> {
+    fn is_accepted(&self, batch_id: BatchId) -> Result<bool, SweepError> {
+        Ok(self.contains(&batch_id))
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SweepManagerOpenStats {
+    /// Sweep record filenames enumerated. Zero on a healthy open: the active
+    /// roots replaced the lifetime directory walk.
+    pub(crate) names_observed: usize,
+    /// Sweep chain objects decoded, including bounded catch-up probes.
+    pub(crate) chain_objects_read: usize,
+    /// Chains resident after open. Bounded by unfinished actions and explicit
+    /// pending Restore, never by retained sweep history.
+    pub(crate) active_chains: usize,
+    /// Terminal chains the roots account for without loading them. They stay
+    /// point-addressable by sweep id.
+    pub(crate) retired_chains: u64,
+    /// The roots object was missing or damaged and was rebuilt from retained
+    /// sweep records. A named, counted repair, never a refusal (D-3, I-10).
+    pub(crate) repaired: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveSweepPin {
+    version: u64,
+    digest: ContentDigest,
+    record: SweepRecord,
+}
+
+/// The complete current-action roster for absence sweeps.
+///
+/// `active` is a complete root, not a delta chain: every sweep that still owes
+/// work or awaits an explicit user disposition is present with its exact chain
+/// version and digest. Terminal chains are counted and otherwise absent; their
+/// records remain on disk and are reachable by exact sweep id, which is what
+/// keeps historical Restore available without keeping every old record
+/// resident.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SweepActionRootsObject {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    generation: u64,
+    previous_digest: Option<ContentDigest>,
+    active: Vec<ActiveSweepPin>,
+    retired_chains: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RootsName {
+    name: String,
+    digest: ContentDigest,
+}
+
 pub(crate) struct SweepManager {
     store: ObjectStore,
     directory: Dir,
+    roots_directory: Dir,
     workspace_id: WorkspaceId,
     chains: BTreeMap<Uuid, SweepChain>,
+    roots_generation: u64,
+    roots_tail_digest: Option<ContentDigest>,
+    roots_names: BTreeMap<u64, RootsName>,
+    retired_chains: u64,
+    open_stats: SweepManagerOpenStats,
     notifications: Vec<SweepNotification>,
     /// Process-local acknowledgement that the one wake for an expired grace
     /// deadline ran. The record's timestamp remains the authority; this set
@@ -282,32 +363,214 @@ impl SweepManager {
     /// residue never become record authority.
     pub(crate) fn open(
         store: &ObjectStore,
-        accepted_batch_ids: &BTreeSet<BatchId>,
+        membership: &dyn AcceptedBatchMembership,
     ) -> Result<Self, SweepError> {
         let root = store.private_derived_root_capability()?;
         ensure_directory_nofollow(&root, SWEEP_NAMESPACE)?;
         let directory = open_dir_nofollow(&root, SWEEP_NAMESPACE)?;
-        let names = enumerate_names(&directory)?;
+        // The active-sweep roots object is derived, but `absence_sweep.rs` is
+        // pinned as a durable-authority module by
+        // `android_private_directory_durability_is_explicit_at_every_exception`,
+        // so its directory takes the strict one-time authority barrier rather
+        // than the reconstructible exception.
+        ensure_directory_nofollow(&directory, ROOTS_NAMESPACE)?;
+        let roots_directory = open_dir_nofollow(&directory, ROOTS_NAMESPACE)?;
         let workspace_id = store.workspace_id();
-        let chains = reconstruct_chains(&directory, workspace_id, &names)?;
+
+        let mut stats = SweepManagerOpenStats::default();
         let mut manager = Self {
             store: store.duplicate_retained_capability()?,
             directory,
+            roots_directory,
             workspace_id,
-            chains,
+            chains: BTreeMap::new(),
+            roots_generation: 0,
+            roots_tail_digest: None,
+            roots_names: BTreeMap::new(),
+            retired_chains: 0,
+            open_stats: SweepManagerOpenStats::default(),
             notifications: Vec::new(),
             settled_grace_deadlines: BTreeSet::new(),
         };
-        manager.reconcile_uncommitted_members(accepted_batch_ids)?;
+
+        let resumed = manager.resume_from_roots(&mut stats).unwrap_or(false);
+        if !resumed {
+            stats.repaired = true;
+            manager.rebuild_roots_from_records(&mut stats)?;
+        }
+        stats.active_chains = manager.chains.len();
+        stats.retired_chains = manager.retired_chains;
+        manager.open_stats = stats;
+
+        manager.reconcile_uncommitted_members(membership)?;
         manager.process_deadlines_at(now_unix_ms()?)?;
         manager.repeat_resumed_notifications();
+        if manager.open_stats.repaired {
+            manager.install_roots()?;
+        }
         Ok(manager)
     }
 
-    /// How many sweep chains this manager reconstructed at open. Diagnostic
+    /// Resume the bounded active roster. Reads one roots object and, for each
+    /// active pin, chases forward only as far as a crash could have left that
+    /// chain ahead of its roots. No directory enumeration, no terminal chain.
+    fn resume_from_roots(&mut self, stats: &mut SweepManagerOpenStats) -> Result<bool, SweepError> {
+        let names = enumerate_roots_names(&self.roots_directory)?;
+        let Some((&generation, latest)) = names.last_key_value() else {
+            return Ok(false);
+        };
+        let bytes = read_optional_regular(
+            &self.roots_directory,
+            &latest.name,
+            MAX_ROOTS_OBJECT_BYTES,
+            None,
+        )?
+        .ok_or_else(|| SweepError::Invalid("sweep action roots disappeared during open".into()))?;
+        if ContentDigest::of(&bytes) != latest.digest {
+            return Err(SweepError::Invalid(
+                "sweep action roots filename digest mismatch".into(),
+            ));
+        }
+        let object = decode_bound_roots(&bytes, self.workspace_id, generation)?;
+        match (
+            object.previous_digest,
+            names.range(..generation).next_back(),
+        ) {
+            (None, None) => {}
+            (Some(expected), Some((_, previous))) if previous.digest == expected => {}
+            _ => {
+                return Err(SweepError::Invalid(
+                    "sweep action roots chain is torn".into(),
+                ))
+            }
+        }
+
+        for pin in object.active {
+            let sweep_id = pin.record.sweep_id;
+            let start = SweepChain {
+                version: pin.version,
+                digest: pin.digest,
+                record: pin.record,
+            };
+            // Chase forward with no cap. Catch-up reads only the versions of
+            // the one sweep it was asked about, by exact name, and stops at the
+            // first absent or torn version — so a long catch-up is bounded
+            // point work, never a reason to reconstruct every chain ever
+            // written. Occupancy is not damage (D-5).
+            let current = advance_chain(
+                &self.directory,
+                self.workspace_id,
+                sweep_id,
+                Some(start),
+                u64::MAX,
+                stats,
+            )?;
+            if self.chains.insert(sweep_id, current).is_some() {
+                return Err(SweepError::Invalid(
+                    "sweep action roots repeat a sweep".into(),
+                ));
+            }
+        }
+        self.retired_chains = object.retired_chains;
+        self.roots_generation = generation;
+        self.roots_tail_digest = Some(ContentDigest::of(&bytes));
+        self.roots_names = names;
+        Ok(true)
+    }
+
+    /// The named repair: one enumeration of retained sweep records, exactly
+    /// the work every open used to do unconditionally.
+    fn rebuild_roots_from_records(
+        &mut self,
+        stats: &mut SweepManagerOpenStats,
+    ) -> Result<(), SweepError> {
+        let names = enumerate_names(&self.directory)?;
+        stats.names_observed = names.values().map(Vec::len).sum();
+        let chains = reconstruct_chains(&self.directory, self.workspace_id, &names, stats)?;
+        let now = now_unix_ms()?;
+        let mut retired = 0_u64;
+        self.chains = chains
+            .into_iter()
+            .filter(|(_, chain)| {
+                if is_terminal_record(&chain.record, now) {
+                    retired = retired.saturating_add(1);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        self.retired_chains = retired;
+        // The rebuilt roster supersedes every prior roots object; start a
+        // fresh chain rather than pretending to continue a damaged one.
+        clear_roots_chain(&self.roots_directory)?;
+        self.roots_names.clear();
+        self.roots_generation = 0;
+        self.roots_tail_digest = None;
+        Ok(())
+    }
+
+    pub(crate) fn open_stats(&self) -> &SweepManagerOpenStats {
+        &self.open_stats
+    }
+
+    /// How many sweep chains this manager holds resident. Diagnostic
     /// attribution only; no caller branches on it.
     pub(crate) fn chain_count(&self) -> usize {
         self.chains.len()
+    }
+
+    /// Unfinished sweep work and explicit pending Restore, with the exact
+    /// Restore pins a generation capture must retain.
+    pub(crate) fn current_action_roots(&self) -> CurrentActionRoots {
+        let mut pins = Vec::new();
+        for (sweep_id, chain) in &self.chains {
+            let pending = latest_pending_action(&chain.record);
+            for member in &chain.record.members {
+                pins.push(SweepRetentionPin::from_member(*sweep_id, member, pending));
+            }
+        }
+        CurrentActionRoots {
+            actionable_intents: Vec::new(),
+            sweep_pins: pins,
+        }
+    }
+
+    /// Point-load one sweep's chain by exact id, active or terminal.
+    ///
+    /// A completed sweep leaves the active roster but never leaves the store:
+    /// its records are read by exact name, which is what keeps historical
+    /// Restore available without keeping every old record resident.
+    fn load_historical_chain(&self, sweep_id: Uuid) -> Result<Option<SweepChain>, SweepError> {
+        let mut stats = SweepManagerOpenStats::default();
+        let first = object_name(sweep_id, 1);
+        if read_optional_regular(&self.directory, &first, MAX_SWEEP_OBJECT_BYTES, None)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(advance_chain(
+            &self.directory,
+            self.workspace_id,
+            sweep_id,
+            None,
+            u64::MAX,
+            &mut stats,
+        )?))
+    }
+
+    /// Reload one sweep into the active roster so an explicit user action can
+    /// run against it. Restore after completion is a first-class case: the
+    /// disposition is durable history, and choosing to act on it again makes
+    /// the chain current work once more.
+    fn activate(&mut self, sweep_id: Uuid) -> Result<(), SweepError> {
+        if self.chains.contains_key(&sweep_id) {
+            return Ok(());
+        }
+        let chain = self
+            .load_historical_chain(sweep_id)?
+            .ok_or_else(|| SweepError::Invalid(format!("unknown sweep {sweep_id}")))?;
+        self.chains.insert(sweep_id, chain);
+        self.retired_chains = self.retired_chains.saturating_sub(1);
+        Ok(())
     }
 
     pub(crate) fn publication_barrier_active(&self) -> bool {
@@ -421,6 +684,9 @@ impl SweepManager {
         &mut self,
         sweep_id: Uuid,
     ) -> Result<(Uuid, Vec<(PageId, ManagedPath)>), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         if let Some(action_id) = self.pending_reapply_action_for(sweep_id) {
             let pages = self.chains[&sweep_id]
                 .record
@@ -457,6 +723,9 @@ impl SweepManager {
         &mut self,
         sweep_id: Uuid,
     ) -> Result<SweepRestoreAction, SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let record = self
             .chains
             .get(&sweep_id)
@@ -513,6 +782,9 @@ impl SweepManager {
         authored_batch_ids: Vec<BatchId>,
         cursor: SweepRestoreCursor,
     ) -> Result<(), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let now = now_unix_ms()?;
         let mut record = self
             .chains
@@ -537,6 +809,9 @@ impl SweepManager {
         sweep_id: Uuid,
         action_id: Uuid,
     ) -> Result<(), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let now = now_unix_ms()?;
         let mut record = self
             .chains
@@ -560,6 +835,9 @@ impl SweepManager {
         action_id: Uuid,
         reason: String,
     ) -> Result<(), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let now = now_unix_ms()?;
         let mut record = self
             .chains
@@ -608,6 +886,9 @@ impl SweepManager {
         action_id: Uuid,
         authored_batch_ids: Vec<BatchId>,
     ) -> Result<(), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let now = now_unix_ms()?;
         let mut record = self
             .chains
@@ -640,6 +921,9 @@ impl SweepManager {
         action_id: Uuid,
         reason: String,
     ) -> Result<(), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let now = now_unix_ms()?;
         let mut record = self
             .chains
@@ -657,6 +941,9 @@ impl SweepManager {
     }
 
     pub(crate) fn dispose_keep_deletion(&mut self, sweep_id: Uuid) -> Result<(), SweepError> {
+        // Acting on a completed sweep is a first-class case: reload its
+        // durable chain into the active roster before authoring anything.
+        self.activate(sweep_id)?;
         let now = now_unix_ms()?;
         let mut record = self
             .chains
@@ -814,24 +1101,37 @@ impl SweepManager {
         Ok(changed)
     }
 
+    /// Drop members whose deletion batch never became accepted.
+    ///
+    /// Only the active roster is reconciled, and membership is asked as a
+    /// point question per uncommitted member — normally none at all. A
+    /// terminal chain has no uncommitted member left to reconcile, so this no
+    /// longer needs the complete accepted batch set to exist.
     fn reconcile_uncommitted_members(
         &mut self,
-        accepted_batch_ids: &BTreeSet<BatchId>,
+        membership: &dyn AcceptedBatchMembership,
     ) -> Result<(), SweepError> {
-        let updates = self
-            .chains
-            .values()
-            .filter_map(|chain| {
+        let mut updates = Vec::new();
+        for chain in self.chains.values() {
+            let mut retained = Vec::with_capacity(chain.record.members.len());
+            let mut dropped = false;
+            for member in &chain.record.members {
+                let keep = match member.deletion_batch_id {
+                    None => true,
+                    Some(batch_id) => membership.is_accepted(batch_id)?,
+                };
+                if keep {
+                    retained.push(member.clone());
+                } else {
+                    dropped = true;
+                }
+            }
+            if dropped {
                 let mut record = chain.record.clone();
-                let before = record.members.len();
-                record.members.retain(|member| {
-                    member
-                        .deletion_batch_id
-                        .is_none_or(|batch_id| accepted_batch_ids.contains(&batch_id))
-                });
-                (record.members.len() != before).then_some(record)
-            })
-            .collect::<Vec<_>>();
+                record.members = retained;
+                updates.push(record);
+            }
+        }
         for record in updates {
             self.append_record(record)?;
         }
@@ -915,6 +1215,86 @@ impl SweepManager {
                 record,
             },
         );
+        // The record is durable first, the roots second. A crash between the
+        // two leaves the roots one version behind, which the bounded
+        // catch-up probe at open resolves; the reverse order would let the
+        // roots claim a record that does not exist.
+        self.install_roots()
+    }
+
+    /// Republish the bounded active roster at the existing sweep commit
+    /// boundary.
+    fn install_roots(&mut self) -> Result<(), SweepError> {
+        let now = now_unix_ms()?;
+        let terminal = self
+            .chains
+            .iter()
+            .filter(|(_, chain)| is_terminal_record(&chain.record, now))
+            .map(|(sweep_id, _)| *sweep_id)
+            .collect::<Vec<_>>();
+        // A terminal chain stays on disk and stays point-addressable; it just
+        // stops being current actionable state.
+        let mut active = self
+            .chains
+            .iter()
+            .filter(|(sweep_id, _)| !terminal.contains(sweep_id))
+            .map(|(_, chain)| ActiveSweepPin {
+                version: chain.version,
+                digest: chain.digest,
+                record: chain.record.clone(),
+            })
+            .collect::<Vec<_>>();
+        active.sort_by_key(|pin| pin.record.sweep_id);
+        let generation = self
+            .roots_generation
+            .checked_add(1)
+            .ok_or_else(|| SweepError::Invalid("sweep action roots generation overflow".into()))?;
+        let object = SweepActionRootsObject {
+            schema_version: ROOTS_SCHEMA_VERSION,
+            workspace_id: self.workspace_id,
+            generation,
+            previous_digest: self.roots_tail_digest,
+            active,
+            retired_chains: self.retired_chains.saturating_add(terminal.len() as u64),
+        };
+        let bytes = encode_roots(&object)?;
+        if bytes.len() as u64 > MAX_ROOTS_OBJECT_BYTES {
+            return Err(SweepError::Invalid(
+                "sweep action roots exceed their bounded object limit".into(),
+            ));
+        }
+        let digest = ContentDigest::of(&bytes);
+        let name = roots_object_name(generation, digest);
+        self.store.publish_coalesced_private_derived(
+            &self.roots_directory,
+            &[(name.as_str(), bytes.as_slice(), MAX_ROOTS_OBJECT_BYTES)],
+            "sweep action roots object",
+        )?;
+        self.roots_generation = generation;
+        self.roots_tail_digest = Some(digest);
+        self.roots_names
+            .insert(generation, RootsName { name, digest });
+        self.prune_roots_chain()
+    }
+
+    fn prune_roots_chain(&mut self) -> Result<(), SweepError> {
+        let obsolete = self
+            .roots_names
+            .iter()
+            .rev()
+            .skip(2)
+            .map(|(generation, name)| (*generation, name.name.clone()))
+            .collect::<Vec<_>>();
+        for (generation, name) in &obsolete {
+            match self.roots_directory.remove_file(name) {
+                Ok(()) | Err(_) => {
+                    self.roots_names.remove(generation);
+                }
+            }
+        }
+        if !obsolete.is_empty() {
+            sync_dir_required(&self.roots_directory)?;
+        }
         Ok(())
     }
 }
@@ -1044,6 +1424,7 @@ fn reconstruct_chains(
     directory: &Dir,
     workspace_id: WorkspaceId,
     names: &BTreeMap<Uuid, Vec<SweepName>>,
+    stats: &mut SweepManagerOpenStats,
 ) -> Result<BTreeMap<Uuid, SweepChain>, SweepError> {
     let mut chains = BTreeMap::new();
     for (sweep_id, versions) in names {
@@ -1055,6 +1436,7 @@ fn reconstruct_chains(
             else {
                 break;
             };
+            stats.chain_objects_read = stats.chain_objects_read.saturating_add(1);
             let Ok(object) = decode_bound_object(
                 &bytes,
                 workspace_id,
@@ -1079,6 +1461,192 @@ fn reconstruct_chains(
         }
     }
     Ok(chains)
+}
+
+/// Walk one sweep chain forward by exact name from a known-good point.
+///
+/// This is the point-addressable read that replaces reconstructing every
+/// chain: it touches only the versions of the one sweep it was asked about,
+/// and stops at the first version that is absent or torn. `start` of `None`
+/// begins at version 1, which is how a terminal chain is loaded on demand.
+fn advance_chain(
+    directory: &Dir,
+    workspace_id: WorkspaceId,
+    sweep_id: Uuid,
+    start: Option<SweepChain>,
+    max_versions: u64,
+    stats: &mut SweepManagerOpenStats,
+) -> Result<SweepChain, SweepError> {
+    let mut current = start;
+    let mut steps = 0_u64;
+    loop {
+        let next_version = current.as_ref().map_or(1, |chain| {
+            chain
+                .version
+                .checked_add(1)
+                .expect("validated sweep version")
+        });
+        if steps >= max_versions {
+            break;
+        }
+        let name = object_name(sweep_id, next_version);
+        let Some(bytes) = read_optional_regular(directory, &name, MAX_SWEEP_OBJECT_BYTES, None)?
+        else {
+            break;
+        };
+        stats.chain_objects_read = stats.chain_objects_read.saturating_add(1);
+        let previous_digest = current.as_ref().map(|chain| chain.digest);
+        let Ok(object) = decode_bound_object(
+            &bytes,
+            workspace_id,
+            sweep_id,
+            next_version,
+            previous_digest,
+        ) else {
+            // A torn tail cannot invalidate the preceding immutable version.
+            break;
+        };
+        current = Some(SweepChain {
+            version: next_version,
+            digest: ContentDigest::of(&bytes),
+            record: object.record,
+        });
+        steps = steps.saturating_add(1);
+    }
+    current.ok_or_else(|| SweepError::Invalid(format!("sweep {sweep_id} has no valid record")))
+}
+
+/// Nothing current can still act on this chain.
+///
+/// It is closed, no barrier is active, no action is unfinished, and either the
+/// user already chose a disposition or the record never crossed the
+/// user-surfacing boundary at all — a quiet tier-1 record has no disposition
+/// to await, so holding it active forever would be exactly the append-forever
+/// term this replaces. The record itself is never deleted.
+fn is_terminal_record(record: &SweepRecord, now_unix_ms: u64) -> bool {
+    !record.is_open()
+        && !record.barrier_active_at(now_unix_ms)
+        && latest_pending_action(record).is_none()
+        && (record.disposed_at_unix_ms.is_some() || !record.tier.surfaced())
+}
+
+/// The kind of the one action still owed, if any.
+fn latest_pending_action(record: &SweepRecord) -> Option<SweepActionKind> {
+    let mut latest = BTreeMap::<Uuid, (SweepActionKind, &SweepActionState)>::new();
+    for action in &record.actions {
+        latest.insert(action.action_id, (action.action, &action.state));
+    }
+    latest.into_values().find_map(|(kind, state)| {
+        matches!(
+            state,
+            SweepActionState::Started | SweepActionState::Progress { .. }
+        )
+        .then_some(kind)
+    })
+}
+
+fn encode_roots(object: &SweepActionRootsObject) -> Result<Vec<u8>, SweepError> {
+    postcard::to_allocvec(object).map_err(|error| SweepError::Encode(error.to_string()))
+}
+
+fn decode_bound_roots(
+    bytes: &[u8],
+    workspace_id: WorkspaceId,
+    generation: u64,
+) -> Result<SweepActionRootsObject, SweepError> {
+    let object: SweepActionRootsObject =
+        postcard::from_bytes(bytes).map_err(|error| SweepError::Invalid(error.to_string()))?;
+    if encode_roots(&object)? != bytes
+        || object.schema_version != ROOTS_SCHEMA_VERSION
+        || object.workspace_id != workspace_id
+        || object.generation != generation
+        || !object
+            .active
+            .windows(2)
+            .all(|pair| pair[0].record.sweep_id < pair[1].record.sweep_id)
+        || object.active.iter().any(|pin| pin.version == 0)
+    {
+        return Err(SweepError::Invalid(
+            "sweep action roots binding or canonical encoding mismatch".into(),
+        ));
+    }
+    Ok(object)
+}
+
+fn roots_object_name(generation: u64, digest: ContentDigest) -> String {
+    format!("{ROOTS_PREFIX}{generation:020}-{digest}{ROOTS_SUFFIX}")
+}
+
+fn enumerate_roots_names(directory: &Dir) -> Result<BTreeMap<u64, RootsName>, SweepError> {
+    let mut names = BTreeMap::new();
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(ROOTS_PREFIX) {
+            continue;
+        }
+        require_regular_entry(&entry.file_type()?, &name)?;
+        let (generation, parsed) = parse_roots_name(&name)?;
+        if names.insert(generation, parsed).is_some() {
+            return Err(SweepError::Invalid(
+                "sweep action roots generation twin".into(),
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn parse_roots_name(name: &str) -> Result<(u64, RootsName), SweepError> {
+    let body = name
+        .strip_prefix(ROOTS_PREFIX)
+        .and_then(|value| value.strip_suffix(ROOTS_SUFFIX))
+        .ok_or_else(|| SweepError::Invalid("invalid sweep action roots name".into()))?;
+    let (digits, digest_hex) = body
+        .split_once('-')
+        .ok_or_else(|| SweepError::Invalid("sweep action roots name lacks a digest".into()))?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SweepError::Invalid(
+            "non-canonical sweep action roots generation".into(),
+        ));
+    }
+    let digest = super::identity::parse_digest(digest_hex)
+        .map(ContentDigest::from_bytes)
+        .map_err(|error| SweepError::Invalid(error.to_string()))?;
+    let generation = digits
+        .parse::<u64>()
+        .map_err(|error| SweepError::Invalid(error.to_string()))?;
+    if generation == 0 || roots_object_name(generation, digest) != name {
+        return Err(SweepError::Invalid(
+            "non-canonical sweep action roots name".into(),
+        ));
+    }
+    Ok((
+        generation,
+        RootsName {
+            name: name.to_owned(),
+            digest,
+        },
+    ))
+}
+
+fn clear_roots_chain(directory: &Dir) -> Result<(), SweepError> {
+    let mut removed = false;
+    for entry in directory.entries()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(ROOTS_PREFIX) {
+            continue;
+        }
+        if directory.remove_file(name).is_ok() {
+            removed = true;
+        }
+    }
+    if removed {
+        sync_dir_required(directory)?;
+    }
+    Ok(())
 }
 
 fn object_name(sweep_id: Uuid, version: u64) -> String {
@@ -1176,6 +1744,7 @@ pub(crate) fn assert_torn_sweep_tail_recovers_for_oracle() {
 
 #[cfg(test)]
 mod tests {
+    use super::super::identity::DocumentKey;
     use super::*;
 
     #[test]
@@ -1231,6 +1800,221 @@ mod tests {
     /// in that same turn must carry the REAL page count: a zero denominator
     /// collapses the tier-3 threshold to one and turns a single external
     /// deletion into a spurious mass-deletion hold.
+    struct SweepRoot {
+        path: std::path::PathBuf,
+        store: ObjectStore,
+    }
+
+    impl SweepRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("tine-sweep-{label}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xc4_f100));
+            let store = ObjectStore::open(&path, workspace_id).unwrap();
+            Self { path, store }
+        }
+
+        fn manager(&self) -> SweepManager {
+            SweepManager::open(&self.store, &BTreeSet::new()).unwrap()
+        }
+    }
+
+    impl Drop for SweepRoot {
+        fn drop(&mut self) {
+            crate::test_support::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A distinctive predecessor frontier, so an equality assertion below
+    /// cannot pass against a default or a recomputed value.
+    fn predecessor_frontier(counter: u64) -> FrontierV2 {
+        FrontierV2::new(vec![super::super::DocumentDependencies::new(
+            DocumentKey::Entity(super::super::DocumentId::from_uuid(Uuid::from_u128(
+                0xc4_f201,
+            ))),
+            vec![super::super::CrdtPeerCounter::new(
+                super::super::CrdtPeerId::from_u64(11),
+                counter,
+            )],
+            vec![BatchId::from_uuid(Uuid::from_u128(0xc4_f301))],
+        )
+        .unwrap()])
+        .unwrap()
+    }
+
+    fn sweep_member(counter: u64) -> SweepMember {
+        SweepMember {
+            path: ManagedPath::parse("pages/retired.md").unwrap(),
+            page_id: PageId::from_uuid(Uuid::from_u128(0xc4_f401)),
+            deletion_batch_id: None,
+            predecessor_accepted_state: SweepAcceptedStateReference {
+                page_id: PageId::from_uuid(Uuid::from_u128(0xc4_f501)),
+                frontier: predecessor_frontier(counter),
+            },
+            prior_present_intent_id: Some(ProjectionIntentId::from_marker_digest([0x5a; 32])),
+        }
+    }
+
+    fn seeded_record(sweep_id: Uuid, now: u64, member: SweepMember) -> SweepRecord {
+        SweepRecord {
+            sweep_id,
+            opened_at_unix_ms: now,
+            last_observation_at_unix_ms: now,
+            closed_at_unix_ms: None,
+            pages_at_open: 100,
+            tier: SweepTier::Tier2,
+            grace_deadline_unix_ms: None,
+            disposed_at_unix_ms: None,
+            members: vec![member],
+            actions: Vec::new(),
+        }
+    }
+
+    /// A completed sweep leaves current actionable state, and its exact
+    /// Restore predecessor survives that departure.
+    ///
+    /// This exercises the actual post-completion Restore entry point rather
+    /// than comparing capsule digests: `begin_restore` reloads the terminal
+    /// chain by exact sweep id and must hand back the member verbatim —
+    /// predecessor page identity, predecessor `FrontierV2` with its dependency
+    /// heads, and the best-effort prior present intent.
+    #[test]
+    fn a_disposed_sweep_leaves_active_roots_and_restore_still_reads_its_exact_predecessor() {
+        let root = SweepRoot::new("restore-after-completion");
+        let sweep_id = Uuid::new_v4();
+        let member = sweep_member(7);
+        let now = now_unix_ms().unwrap();
+
+        let mut manager = root.manager();
+        manager
+            .append_record(seeded_record(sweep_id, now, member.clone()))
+            .unwrap();
+        let pins = manager.current_action_roots();
+        assert_eq!(pins.sweep_pins.len(), 1, "an open sweep is current work");
+        assert_eq!(
+            pins.sweep_pins[0].predecessor_frontier,
+            member.predecessor_accepted_state.frontier
+        );
+        let closure = pins.retention_closure();
+        assert!(
+            closure
+                .documents
+                .contains(&member.predecessor_accepted_state.frontier.documents()[0].document_id())
+                && closure
+                    .batches
+                    .contains(&BatchId::from_uuid(Uuid::from_u128(0xc4_f301))),
+            "the retention closure names the predecessor's document and dependency head"
+        );
+
+        // The user chooses a disposition: the record is terminal.
+        let mut disposed = manager.record(sweep_id).unwrap().clone();
+        disposed.closed_at_unix_ms = Some(now);
+        disposed.disposed_at_unix_ms = Some(now);
+        manager.append_record(disposed).unwrap();
+        drop(manager);
+
+        let mut reopened = root.manager();
+        assert_eq!(
+            reopened.open_stats().names_observed,
+            0,
+            "a healthy open enumerates no sweep record filename: {:?}",
+            reopened.open_stats()
+        );
+        assert!(!reopened.open_stats().repaired);
+        assert_eq!(
+            reopened.chain_count(),
+            0,
+            "a disposed sweep is no longer current actionable state"
+        );
+        assert_eq!(reopened.open_stats().retired_chains, 1);
+        assert!(
+            reopened.current_action_roots().sweep_pins.is_empty(),
+            "history alone pins nothing in the current-action roots"
+        );
+
+        // Restore after completion: the original record is still authority.
+        let action = reopened.begin_restore(sweep_id).unwrap();
+        assert_eq!(
+            action.members,
+            vec![member.clone()],
+            "post-completion Restore must read the exact recorded predecessor state"
+        );
+        assert_eq!(
+            action.members[0].predecessor_accepted_state.frontier,
+            predecessor_frontier(7)
+        );
+        assert_eq!(
+            action.members[0].prior_present_intent_id,
+            member.prior_present_intent_id
+        );
+        assert_eq!(
+            reopened.current_action_roots().sweep_pins.len(),
+            1,
+            "an explicit pending Restore is current actionable state again"
+        );
+    }
+
+    /// A Restore interrupted mid-flight resumes from its durable cursor, and
+    /// the chain stays in the active roots across the crash.
+    #[test]
+    fn a_partial_restore_resumes_from_its_durable_cursor_after_a_reopen() {
+        let root = SweepRoot::new("partial-restore-resume");
+        let sweep_id = Uuid::new_v4();
+        let member = sweep_member(9);
+        let now = now_unix_ms().unwrap();
+
+        let mut manager = root.manager();
+        manager
+            .append_record(seeded_record(sweep_id, now, member.clone()))
+            .unwrap();
+        let started = manager.begin_restore(sweep_id).unwrap();
+        let authored = vec![BatchId::from_uuid(Uuid::from_u128(0xc4_f601))];
+        let cursor = SweepRestoreCursor {
+            chunk_ordinal: 3,
+            remaining_operation_watermark: 41,
+            nondecreasing_retries: 0,
+        };
+        manager
+            .record_restore_progress(
+                sweep_id,
+                started.action_id,
+                authored.clone(),
+                cursor.clone(),
+            )
+            .unwrap();
+        drop(manager);
+
+        let reopened = root.manager();
+        assert_eq!(
+            reopened.open_stats().names_observed,
+            0,
+            "resuming an unfinished action reads the roots, not the record directory"
+        );
+        assert_eq!(reopened.chain_count(), 1);
+        assert_eq!(
+            reopened.pending_restore_actions(),
+            vec![(sweep_id, started.action_id)],
+            "the unfinished Restore is still owed after the reopen"
+        );
+        let pins = reopened.current_action_roots().sweep_pins;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].pending_action, Some(SweepActionKind::Restore));
+        assert_eq!(
+            pins[0].predecessor_frontier,
+            member.predecessor_accepted_state.frontier
+        );
+
+        let mut reopened = reopened;
+        let resumed = reopened.begin_restore(sweep_id).unwrap();
+        assert_eq!(
+            resumed.action_id, started.action_id,
+            "no second action opens"
+        );
+        assert_eq!(resumed.authored_batch_ids, authored);
+        assert_eq!(resumed.cursor, Some(cursor));
+        assert!(!resumed.completed);
+    }
+
     #[test]
     fn a_fresh_observation_after_an_elapsed_window_opens_with_the_real_page_count() {
         use crate::oplog::{CrdtPeerCounter, CrdtPeerId, DocumentDependencies, DocumentId};
@@ -1247,7 +2031,7 @@ mod tests {
         manager.append_record(aged).unwrap();
 
         let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentId::from_uuid(Uuid::from_u128(0xc4f003)),
+            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc4f003))),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(3), 1)],
             Vec::new(),
         )

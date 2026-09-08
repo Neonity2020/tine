@@ -48,8 +48,8 @@ use crate::model::{
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
 use crate::oplog::absence_sweep::{
-    SweepActionKind, SweepActionState, SweepError, SweepManager, SweepMember, SweepRecord,
-    SweepRestoreCursor, SweepTier,
+    AcceptedBatchMembership, SweepActionKind, SweepActionState, SweepError, SweepManager,
+    SweepMember, SweepRecord, SweepRestoreCursor, SweepTier,
 };
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
@@ -1742,6 +1742,54 @@ pub struct SyncRuntimeRecoveryDiagnostics {
 
 /// Content-free work counters for one clean managed cold open.
 ///
+/// Accepted-batch membership for absence-sweep reconciliation, resolved only
+/// if a sweep actually asks.
+///
+/// The old open materialized the complete accepted batch-id set on every
+/// ordinary open so that member reconciliation could ask a handful of point
+/// questions. A healthy open has no uncommitted sweep member at all, so it now
+/// asks nothing and pays nothing.
+///
+/// P3 manager seam: the exact API that would make this a true `O(log n)` point
+/// query is an accepted-status lookup on the engine, e.g.
+/// `EngineStatus::accepted_batch_is_accepted(BatchId) -> Result<bool, EngineError>`
+/// backed by the sealed accepted-status map root that
+/// `tine_storage::sealed_accepted_index::SealedAcceptedIndexReader::status`
+/// already implements. `hot_engine.rs` owns that region, so this adapter keeps
+/// the fallback linear build behind a first-use gate instead.
+struct LazyAcceptedBatchMembership<'a> {
+    engine: &'a ShardedHotEngine,
+    resolved: std::cell::RefCell<Option<BTreeSet<BatchId>>>,
+}
+
+impl<'a> LazyAcceptedBatchMembership<'a> {
+    const fn new(engine: &'a ShardedHotEngine) -> Self {
+        Self {
+            engine,
+            resolved: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl AcceptedBatchMembership for LazyAcceptedBatchMembership<'_> {
+    fn is_accepted(&self, batch_id: BatchId) -> Result<bool, SweepError> {
+        let mut resolved = self.resolved.borrow_mut();
+        if resolved.is_none() {
+            let accepted = self
+                .engine
+                .status()
+                .accepted_batch_ids()
+                .map_err(|error| SweepError::Invalid(error.to_string()))?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            *resolved = Some(accepted);
+        }
+        Ok(resolved
+            .as_ref()
+            .is_some_and(|accepted| accepted.contains(&batch_id)))
+    }
+}
+
 /// Every field counts work the open actually performed — directory names
 /// observed, evidence bodies decoded, history entries replayed. Nothing here
 /// is read back by the open path: these values are produced after the work
@@ -1771,10 +1819,37 @@ pub struct SyncRuntimeCleanOpenCounters {
     pub checkpoint_payload_bytes: usize,
     /// Published frontier minus durable checkpoint frontier after open.
     pub checkpoint_durable_lag: u64,
-    /// Sweep chains reconstructed from the private derived root.
+    /// Sweep chains resident after open: unfinished actions and explicit
+    /// pending Restore only. Terminal chains stay point-addressable on disk.
     pub sweep_chains: usize,
-    /// Receipt evidence FILENAMES observed by the names-only horizon scan.
+    /// Sweep record FILENAMES enumerated. Zero on a healthy open; non-zero
+    /// means the named active-roots repair ran.
+    pub sweep_record_names: usize,
+    /// Sweep chain objects decoded, including bounded roots catch-up probes.
+    pub sweep_chain_objects_read: usize,
+    /// The sweep active roots were missing or damaged and were rebuilt.
+    pub sweep_roots_repaired: bool,
+    /// Terminal sweep chains the roots account for without loading them.
+    pub sweep_retired_chains: u64,
+    /// Sweeps named by the bounded retention closure at open.
+    pub current_action_sweep_pins: usize,
+    /// Distinct documents the retention closure pins for a later Restore.
+    pub current_action_retained_documents: usize,
+    /// Receipt obligations still owed: durable intents with no completion.
+    pub current_action_receipt_obligations: usize,
+    /// Receipt evidence FILENAMES enumerated. Zero on a healthy open; the
+    /// bounded current-action cursor replaced the lifetime horizon scan, so a
+    /// non-zero value means the named repair ran.
     pub receipt_evidence_names: usize,
+    /// Uncovered receipt marks the durable current-action cursor offered.
+    pub receipt_cursor_marks: usize,
+    /// The current-action cursor could not prove bounded coverage for the
+    /// receipt roots at open, so the named repair ran.
+    pub receipt_cursor_unavailable: bool,
+    /// Durable roots installations the receipt catch-up performed. More than
+    /// one means a legitimately large uncovered window was streamed in
+    /// resumable chunks rather than reconstructed from history.
+    pub receipt_cursor_resume_installs: usize,
     /// Receipt evidence BODIES read and decoded (intent + completion rows).
     pub receipt_content_reads: usize,
     /// Complete `validated_catalog()` passes over the receipt store.
@@ -7691,13 +7766,15 @@ fn activate_clean_runtime_resources_retaining_archive(
     engine
         .open_local_completion_index(&store)
         .map_err(CleanOpenError::from)?;
-    let accepted_batch_ids = engine
-        .status()
-        .accepted_batch_ids()
-        .map_err(CleanOpenError::from)?
-        .into_iter()
-        .collect();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
+    let action_cursor = std::sync::Arc::new(
+        crate::oplog::current_action_roots::ProjectionActionCursor::open(&store)
+            .map_err(CleanOpenError::from)?,
+    );
+    receipts.attach_action_cursor(std::sync::Arc::clone(&action_cursor));
+    let sweeps = {
+        let membership = LazyAcceptedBatchMembership::new(&engine);
+        SweepManager::open(&store, &membership).map_err(CleanOpenError::from)?
+    };
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
@@ -7714,6 +7791,19 @@ fn activate_clean_runtime_resources_retaining_archive(
         &graph,
         &mut runtime,
     )?;
+    // Genesis activation: accepted history is the immutable baseline and the
+    // journal has just been created, so the proved own prefix is zero and this
+    // endpoint's lane record is minted here, before any authoring.
+    let writer_lanes = qualify_clean_writer_lanes(
+        &request.application_runtime_root,
+        &binding,
+        endpoint,
+        runtime.engine(),
+        &store,
+    )?;
+    runtime
+        .install_writer_lanes(writer_lanes)
+        .map_err(CleanOpenError::from)?;
     let projection_turns = open_projection_turn_journal(
         &request.application_runtime_root,
         binding.workspace_id(),
@@ -8141,15 +8231,43 @@ fn open_clean_runtime_resources_with_progress(
     // workspace lease before either journal drain or any actor publication
     // path can run. Open/in-grace records therefore re-establish the barrier
     // before retained outbound work becomes runnable.
-    let accepted_batch_ids: BTreeSet<_> = engine
-        .status()
-        .accepted_batch_ids()
-        .map_err(CleanOpenError::from)?
-        .into_iter()
-        .collect();
-    counters.accepted_batches = accepted_batch_ids.len();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
+    let action_cursor = std::sync::Arc::new(
+        crate::oplog::current_action_roots::ProjectionActionCursor::open(&store)
+            .map_err(CleanOpenError::from)?,
+    );
+    receipts.attach_action_cursor(std::sync::Arc::clone(&action_cursor));
+    counters.accepted_batches = usize::try_from(
+        engine
+            .accepted_batch_count()
+            .map_err(CleanOpenError::from)?,
+    )
+    .unwrap_or(usize::MAX);
+    let sweeps = {
+        let membership = LazyAcceptedBatchMembership::new(&engine);
+        SweepManager::open(&store, &membership).map_err(CleanOpenError::from)?
+    };
     counters.sweep_chains = sweeps.chain_count();
+    {
+        let stats = sweeps.open_stats();
+        counters.sweep_record_names = stats.names_observed;
+        counters.sweep_chain_objects_read = stats.chain_objects_read;
+        counters.sweep_roots_repaired = stats.repaired;
+        counters.sweep_retired_chains = stats.retired_chains;
+    }
+    // The bounded retention closure a generation capture must honour. It is
+    // computed from the active roots alone, so it never walks retained
+    // history, and it names every document and dependency head an unfinished
+    // action or explicit pending Restore still pins.
+    //
+    // P3 manager handoff: `checkpoint_generation.rs` is the owner that should
+    // consume `SweepManager::current_action_roots()` /
+    // `CurrentActionRoots::retention_closure()` when it captures a generation;
+    // this open only measures it.
+    {
+        let closure = sweeps.current_action_roots().retention_closure();
+        counters.current_action_sweep_pins = closure.sweeps.len();
+        counters.current_action_retained_documents = closure.documents.len();
+    }
     counters.local_completion_entries = engine.local_completion_entry_count();
     if let Some(stats) = engine.local_completion_open_stats() {
         counters.local_completion_names = stats.names_observed;
@@ -8222,6 +8340,10 @@ fn open_clean_runtime_resources_with_progress(
         counters.summary_rebuilt = stats.rebuilt;
         counters.summary_delta_completions = stats.delta_completions;
         counters.summary_delta_intents = stats.delta_intents;
+        counters.receipt_cursor_marks = stats.cursor_marks_observed;
+        counters.receipt_cursor_unavailable = stats.cursor_unavailable;
+        counters.receipt_cursor_resume_installs = stats.cursor_resume_installs;
+        counters.current_action_receipt_obligations = stats.actionable_intents;
     }
     trace.phase(
         SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,
@@ -8259,7 +8381,22 @@ fn open_clean_runtime_resources_with_progress(
     );
     // Repair -> actor assembly boundary: the pre-actor window ends with zero
     // buffered entries, independent of how long actor construction takes.
-    let runtime = completion_guard.finish()?;
+    let mut runtime = completion_guard.finish()?;
+    // Every journal frame and every accepted manifest is now inside the engine,
+    // so the reconstructed own-dot chain is this reopen's exact durable prefix.
+    // A normal restart continues the retained lanes here; only a rebuild that
+    // cannot cover that prefix mints a new incarnation, durably, before the
+    // runtime becomes writable.
+    let writer_lanes = qualify_clean_writer_lanes(
+        &request.application_runtime_root,
+        &binding,
+        endpoint,
+        runtime.engine(),
+        &store,
+    )?;
+    runtime
+        .install_writer_lanes(writer_lanes)
+        .map_err(CleanOpenError::from)?;
     trace.phase(SyncRuntimeCleanOpenStage::CompletionFlush, stage_progress);
     let archive = store.instrumentation();
     counters.archive_directory_enumerations = archive.directory_enumerations;
@@ -9697,10 +9834,23 @@ fn publish_complete_clean_archive(
     provider: &mut SharedProviderTransport,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
+    accepted_batch_ids: &[BatchId],
 ) -> Result<(), SyncRuntimeRequestError> {
-    let manifests = store
-        .committed_manifests()
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    // This is explicit whole-archive publication. The accepted roster supplies
+    // logical names; physical hot/cold placement cannot change its membership.
+    let manifests = accepted_batch_ids
+        .iter()
+        .map(|batch_id| {
+            store
+                .resolve_logical_manifest(*batch_id)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                .ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(format!(
+                        "clean accepted manifest {batch_id} is absent during archive publication"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for manifest in &manifests {
         if manifest.workspace_id() != workspace_id || manifest.lineage_digest() != lineage_digest {
             return Err(SyncRuntimeRequestError::ActorRefused(format!(
@@ -9710,14 +9860,14 @@ fn publish_complete_clean_archive(
         }
         for object in manifest.required_objects() {
             let bytes = store
-                .read_object_bytes(object.content_digest())
+                .resolve_logical_object_bytes(object.content_digest())
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
         }
     }
     for manifest in manifests {
         let bytes = store
-            .read_manifest_bytes(manifest.batch_id())
+            .resolve_logical_manifest_bytes(manifest.batch_id())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         if OperationBatch::decode(&bytes)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
@@ -10735,7 +10885,7 @@ fn publish_clean_archive_batch(
     batch_id: BatchId,
 ) -> Result<(), SyncRuntimeRequestError> {
     let validated = match store
-        .inspect_batch(batch_id)
+        .inspect_batch_with_cold_history(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     {
         crate::oplog::BatchInspection::Ready(validated) => validated,
@@ -10760,12 +10910,12 @@ fn publish_clean_archive_batch(
     }
     for object in validated.manifest().required_objects() {
         let bytes = store
-            .read_object_bytes(object.content_digest())
+            .resolve_logical_object_bytes(object.content_digest())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
     }
     let bytes = store
-        .read_manifest_bytes(batch_id)
+        .resolve_logical_manifest_bytes(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     publish_clean_manifest_exact(provider, batch_id, &bytes)
 }
@@ -11940,6 +12090,16 @@ impl ManagedLocalPendingIndex {
     fn record(&self, batch_id: BatchId) -> Option<&ManagedLocalRecord> {
         self.records_by_batch.get(&batch_id)
     }
+
+    fn latest_projection_target(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+    ) -> Option<&Option<Vec<u8>>> {
+        self.projection_targets
+            .get(&(path.as_str().to_owned(), page_id))
+            .and_then(|targets| targets.values().next_back())
+    }
 }
 
 impl ManagedLocalSuccessorIndex for ManagedLocalPendingIndex {
@@ -12705,6 +12865,106 @@ fn clean_undrained_object_repair_coverage(
     Ok(covered)
 }
 
+/// This device's own durable prefix, as the writer-lane record's coverage
+/// proof sees it.
+///
+/// `proved_own_counter` is the reconstructed gap-free `BatchCausalDot` chain
+/// for this device across restored accepted history AND the drained local
+/// journal, so it covers both commit paths. The durability question is only
+/// ever asked about the single reserved batch that the chain does not already
+/// cover, and it is asked of the archive: a local batch that reached the
+/// journal is already inside the chain, so an archive-absent reserved batch
+/// provably never became durable on either path.
+use crate::oplog::writer_lane::WriterLanes;
+
+struct CleanWriterLanePrefix<'a> {
+    engine: &'a ShardedHotEngine,
+    archive: &'a ObjectStore,
+}
+
+impl crate::oplog::writer_lane::WriterLanePrefixProof for CleanWriterLanePrefix<'_> {
+    /// Asked about the SAVED causal writer incarnation, never about the
+    /// enrolled device: a rebuilt device may have published under an earlier
+    /// incarnation whose chain this copy neither owns nor continues.
+    fn proved_own_counter(&self, peer: crate::oplog::CausalPeerId) -> u64 {
+        self.engine.own_causal_dot_high_water(peer)
+    }
+
+    /// The reserved dot is freed only by proving that this EXACT publication
+    /// never happened. A committed manifest under the reserved `BatchId` whose
+    /// fingerprint is not the reserved one answers a different question than
+    /// the one asked, so it is undecidable rather than present-or-absent.
+    fn reserved_batch_durability(
+        &self,
+        tip: crate::oplog::writer_lane::WriterLaneTip,
+    ) -> crate::oplog::writer_lane::ReservedBatchDurability {
+        use crate::oplog::writer_lane::ReservedBatchDurability;
+        let manifest = match self.archive.inspect_batch(tip.batch_id) {
+            Ok(crate::oplog::BatchInspection::Absent) => return ReservedBatchDurability::Absent,
+            Ok(crate::oplog::BatchInspection::Staged { manifest, .. }) => manifest,
+            Ok(crate::oplog::BatchInspection::Ready(batch)) => batch.manifest().clone(),
+            // Cannot decide: the dot stays spent.
+            Err(_) => return ReservedBatchDurability::Undecidable,
+        };
+        match manifest.encode() {
+            Ok(bytes) if ContentDigest::of(&bytes) == tip.manifest_digest => {
+                ReservedBatchDurability::Present
+            }
+            _ => ReservedBatchDurability::Undecidable,
+        }
+    }
+}
+
+/// Qualify this device's persistent CRDT writer lanes for one clean runtime.
+///
+/// Called only after accepted history is restored and the foreground journal is
+/// drained, because that state IS the own-prefix coverage proof. The record
+/// lives in the device-private application runtime root next to the journals —
+/// app-data keyed by graph, never the graph directory and never `.tine-sync`
+/// (D-11): a writer lane must not travel with the graph.
+fn qualify_clean_writer_lanes(
+    application_runtime_root: &Path,
+    binding: &ActorRuntimeBinding,
+    endpoint: ProjectionEndpointBinding,
+    engine: &ShardedHotEngine,
+    archive: &ObjectStore,
+) -> Result<WriterLanes, String> {
+    use crate::oplog::writer_lane::{WriterLaneBinding, WriterLaneStore, WRITER_LANE_NAMESPACE};
+
+    if !application_runtime_root.exists() {
+        fs::create_dir_all(application_runtime_root)
+            .map_err(|error| format!("cannot create CRDT writer lane root: {error}"))?;
+    }
+    let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
+        .map_err(|error| format!("cannot retain CRDT writer lane root: {error}"))?;
+    ensure_directory_nofollow(&root, WRITER_LANE_NAMESPACE).map_err(CleanOpenError::from)?;
+    let namespace =
+        open_dir_nofollow(&root, WRITER_LANE_NAMESPACE).map_err(CleanOpenError::from)?;
+    let lane_binding = WriterLaneBinding {
+        workspace_id: binding.workspace_id(),
+        lineage: binding.lineage_digest(),
+        device_id: binding.device_id(),
+        endpoint_id: endpoint.endpoint_id(),
+    };
+    let directory_name = lane_binding.directory_name();
+    ensure_directory_nofollow(&namespace, &directory_name).map_err(CleanOpenError::from)?;
+    let directory = open_dir_nofollow(&namespace, &directory_name).map_err(CleanOpenError::from)?;
+    let proof = CleanWriterLanePrefix { engine, archive };
+    let store = WriterLaneStore::open(directory, lane_binding, &proof)
+        .map_err(|error| format!("cannot qualify CRDT writer lanes: {error}"))?;
+    if runtime_debug_diagnostics_enabled() {
+        eprintln!(
+            "CRDT writer lanes qualified: disposition={:?} incarnation={} incarnation_id={} \
+             proved_own_counter={}",
+            store.disposition(),
+            store.incarnation(),
+            store.incarnation_id(),
+            engine.own_causal_dot_high_water(store.causal_peer()),
+        );
+    }
+    Ok(WriterLanes::Durable(store))
+}
+
 fn open_clean_foreground_journal(
     application_runtime_root: &Path,
     binding: &ActorRuntimeBinding,
@@ -13436,6 +13696,7 @@ enum ApplicationPublicationSettlement {
     Deferred(SyncEditorDeferred),
 }
 
+#[derive(Debug)]
 enum EditorNameState {
     Missing {
         name: LogicalPageName,
@@ -14042,14 +14303,43 @@ impl RuntimeActor {
         page_kind: SyncPageKind,
         format: Format,
     ) -> Result<EditorNameState, SyncEditorRequestError> {
-        editor_name_state_for_format_with_engine(
-            self.active_engine()
-                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncEditorRequestError::ActorUnavailable)?;
+        let logical_name = LogicalPageName::parse(name.clone()).map_err(|_| {
+            SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
+        })?;
+        let point_is_known = engine
+            .page_name_point_is_known(&logical_name)
+            .map_err(|_| {
+                SyncEditorRequestError::ActorRefusedAt("editor_name_state_point_presence")
+            })?;
+        let current = editor_name_state_for_format_with_engine(
+            engine,
             &self.graph,
-            name,
+            name.clone(),
             page_kind,
             format,
-        )
+        )?;
+        if !point_is_known
+            && matches!(
+                current,
+                EditorNameState::Missing { .. } | EditorNameState::PathOccupied
+            )
+        {
+            // Operation-free lazy genesis deliberately carries no resident
+            // page-name ownership rows. The exact-frontier SQLite projection
+            // is its bounded point index until an accepted name transition
+            // exists; pending/local owners above still win before this
+            // fallback is consulted.
+            match self.active_projected_editor_name_state(name, page_kind)? {
+                projected @ (EditorNameState::Exact(_) | EditorNameState::Ambiguous) => {
+                    return Ok(projected)
+                }
+                EditorNameState::Missing { .. } | EditorNameState::PathOccupied => {}
+            }
+        }
+        Ok(current)
     }
 
     fn load_active_preferred_application_page(
@@ -14057,6 +14347,70 @@ impl RuntimeActor {
         page_id: PageId,
         projected_available: bool,
     ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| !managed.latest_projection_frames.is_empty())
+        {
+            let path = self
+                .active_engine()
+                .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
+                .current_live_page_path(page_id)
+                .map_err(|_| SyncEditorRequestError::ActorRefusedAt("pending_page_path"))?;
+            if let Some(path) = path {
+                match self
+                    .load_clean_foreground_pending_exact_ready(&path)
+                    .map_err(|error| match error {
+                        SyncApplicationPageRequestError::RequestTooLarge(size) => {
+                            SyncEditorRequestError::RequestTooLarge(size)
+                        }
+                        SyncApplicationPageRequestError::ActorUnavailable => {
+                            SyncEditorRequestError::ActorUnavailable
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedAt(stage) => {
+                            SyncEditorRequestError::ActorRefusedAt(stage)
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedWithCode(code) => {
+                            SyncEditorRequestError::ActorRefusedWithCode(code)
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code } => {
+                            SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
+                        }
+                        SyncApplicationPageRequestError::ActorRefusedWithDebugDetail {
+                            code,
+                            debug_detail,
+                        } => SyncEditorRequestError::ActorRefusedWithDebugDetail {
+                            code,
+                            debug_detail,
+                        },
+                        SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+                            stage,
+                            code,
+                            debug_detail,
+                        } => SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+                            stage,
+                            code,
+                            debug_detail,
+                        },
+                        SyncApplicationPageRequestError::QueryExecution(_) => {
+                            SyncEditorRequestError::ActorRefusedAt("pending_page_query_load")
+                        }
+                        SyncApplicationPageRequestError::InvalidRequest(_)
+                        | SyncApplicationPageRequestError::ActorRefused => {
+                            SyncEditorRequestError::ActorRefusedAt("pending_page_load")
+                        }
+                    })? {
+                    Some(ApplicationExactLoad::Loaded(current))
+                        if current.editor.page.page_id == page_id =>
+                    {
+                        return Ok(Some(current));
+                    }
+                    Some(ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous)
+                    | None
+                    | Some(ApplicationExactLoad::Loaded(_)) => {}
+                }
+            }
+        }
         load_preferred_source_authenticated_application_page_from_parts(
             self.active_engine()
                 .map_err(|_| SyncEditorRequestError::ActorUnavailable)?,
@@ -14066,6 +14420,27 @@ impl RuntimeActor {
             page_id,
             projected_available,
         )
+    }
+
+    /// The exact projection bytes that an editor mutation must use as its
+    /// predecessor. A journal-durable local successor is authoritative before
+    /// its derivative filesystem projection catches up, and the pending index
+    /// answers this point query without decoding or walking the journal.
+    fn read_active_projection_input(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+    ) -> Result<Option<Vec<u8>>, SyncEditorRequestError> {
+        if let Some(target) = self.managed_local.as_ref().and_then(|managed| {
+            managed
+                .pending_index
+                .latest_projection_target(path, page_id)
+        }) {
+            return Ok(target.clone());
+        }
+        self.graph.read_projection_input(path).map_err(|_| {
+            SyncEditorRequestError::ActorRefusedAt("reading the current Markdown or Org projection")
+        })
     }
 
     fn load_active_current_source_application_page(
@@ -17609,6 +17984,9 @@ impl RuntimeActor {
                 )
             })?;
             let load = match self.load_clean_foreground_pending_exact_ready(&path)? {
+                Some(ApplicationExactLoad::Loaded(current)) => ApplicationExactLoad::Loaded(
+                    self.finish_managed_application_query_metadata_page_hydration(current),
+                ),
                 Some(load) => load,
                 None => self.load_hot_application_exact_ready(&path)?,
             };
@@ -17968,7 +18346,7 @@ impl RuntimeActor {
             )
         })?;
         if let Some(current) = self.load_clean_foreground_pending_exact_ready(&path)? {
-            return Ok(current);
+            return Ok(self.finish_managed_application_query_exact_load(current));
         }
         let read = self.application_materialized_read_ready()?;
         if let [page] = read
@@ -19911,14 +20289,14 @@ impl RuntimeActor {
         page_kind: SyncPageKind,
         expected_path: Option<&str>,
     ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
-        let page_id = match self
+        let name_state = self
             .active_editor_name_state_for_format(
                 name.to_owned(),
                 page_kind,
                 self.graph.preferred_format(),
             )
-            .map_err(map_editor_application_error)?
-        {
+            .map_err(map_editor_application_error)?;
+        let page_id = match name_state {
             EditorNameState::Exact(page_id) => page_id,
             // Retrying an already accepted unpinned delete is harmless.  An
             // expected path means the caller was deleting one precise loaded
@@ -21514,13 +21892,7 @@ impl RuntimeActor {
                     #[cfg(test)]
                     let exact_base_started = Instant::now();
                     let base = self
-                        .graph
-                        .read_projection_input(&current.page.path)
-                        .map_err(|_| {
-                            SyncEditorRequestError::ActorRefusedAt(
-                                "reading the current Markdown or Org projection",
-                            )
-                        })?
+                        .read_active_projection_input(&current.page.path, current.page.page_id)?
                         .ok_or(SyncEditorRequestError::ActorRefusedAt(
                             "reading the current Markdown or Org projection",
                         ))?;
@@ -23657,7 +24029,11 @@ impl RuntimeActor {
                                         pair.min_batch,
                                         pair.max_batch,
                                     ),
-                                    home_document_id: page.home_document_id,
+                                    home_document_id: DocumentId::for_conflict_sibling(
+                                        block.block_id,
+                                        pair.min_batch,
+                                        pair.max_batch,
+                                    ),
                                 },
                                 page_id,
                                 parent: original.parent,
@@ -24040,11 +24416,16 @@ impl RuntimeActor {
                 Ok(head) => head,
                 Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
             };
+            let accepted_batch_ids = match engine.status().accepted_batch_ids() {
+                Ok(ids) => ids,
+                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
+            };
             let repaired = publish_complete_clean_archive(
                 &store,
                 self.provider.as_mut().expect("provider checked"),
                 descriptor.workspace_id(),
                 descriptor.lineage_digest(),
+                &accepted_batch_ids,
             )
             .and_then(|()| {
                 publish_clean_descriptor_exact(
@@ -24183,7 +24564,7 @@ impl RuntimeActor {
             };
             let mut missing_dependency = false;
             for dependency in manifest.causal_dependency_heads().iter().rev() {
-                let retained = match store.inspect_batch(*dependency) {
+                let retained = match store.inspect_batch_with_cold_history(*dependency) {
                     Ok(crate::oplog::BatchInspection::Ready(_)) => true,
                     Ok(
                         crate::oplog::BatchInspection::Absent
@@ -24878,11 +25259,17 @@ impl RuntimeActor {
             shared_namespace_digest(self.binding.workspace_id()),
         )
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let accepted_batch_ids = self
+            .active_engine()?
+            .status()
+            .accepted_batch_ids()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         publish_complete_clean_archive(
             &store,
             &mut provider,
             self.binding.workspace_id(),
             self.binding.lineage_digest(),
+            &accepted_batch_ids,
         )?;
         publish_clean_descriptor_exact(&mut provider, &descriptor)?;
         let head =
@@ -26838,7 +27225,7 @@ fn build_existing_editor_transaction(
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: resolved[index],
-                home_document_id: current.page.home_document_id,
+                home_document_id: DocumentId::new(),
             },
             page_id: current.page.page_id,
             parent: desired[index].0,
@@ -27067,7 +27454,7 @@ fn build_new_editor_transaction(
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: resolved[index],
-                home_document_id,
+                home_document_id: DocumentId::new(),
             },
             page_id,
             parent: desired[index].0,
@@ -27306,4 +27693,4 @@ fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
 
 #[cfg(test)]
 #[path = "sync_runtime_tests.rs"]
-mod tests;
+pub(crate) mod tests;

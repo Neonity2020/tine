@@ -932,7 +932,9 @@ fn capture_activation_page_records(
             let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
             terminal_blocks.push(super::MaterializedBlockInput {
                 block_id,
-                home_document_id,
+                // Each block is born in its own document, distinct from the
+                // page's, so the pair of the two addresses its membership.
+                home_document_id: DocumentId::for_unmatched_import_block(workspace_id, block_id),
                 parent,
                 order: imported_order(tree.nodes[index].sibling_position),
                 content: std::mem::take(&mut tree.nodes[index].raw),
@@ -1029,8 +1031,8 @@ fn lazy_genesis_page_input(
         kind: record.page.kind,
         preamble: record.page.preamble.clone(),
         blocks,
-        document_checkpoint: Vec::new(),
-        document_dependencies: None,
+        document_checkpoints: Vec::new(),
+        document_dependencies: Vec::new(),
         sqlite_receipt: crate::oplog::lazy_genesis::LazyGenesisSqliteReceiptV1::new(
             &record.exact_source_bytes,
             sqlite_page,
@@ -1097,7 +1099,8 @@ fn build_lazy_genesis_from_activation_records(
         source_capture,
         working,
     )?;
-    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    let mut checkpoints =
+        LazyGenesisCheckpointBuilder::new(catalog_document_id, workspace_id, lineage_digest)?;
     for page_id in pages.path_order() {
         let record = pages.page(*page_id)?.ok_or_else(|| {
             BootstrapStreamingImportError::InvalidOperation(
@@ -1117,9 +1120,10 @@ fn build_lazy_genesis_from_activation_records(
             .collect();
         let sqlite_page = record.sqlite_page();
         let mut page = lazy_genesis_page_input(&record, &sqlite_page)?;
-        let (checkpoint, dependencies) = checkpoints.push_page(&page, &page_assignments)?;
-        page.document_checkpoint = checkpoint;
-        page.document_dependencies = Some(dependencies);
+        let (document_checkpoints, document_dependencies) =
+            checkpoints.push_page(&page, &page_assignments)?;
+        page.document_checkpoints = document_checkpoints;
+        page.document_dependencies = document_dependencies;
         lazy_genesis.push(page)?;
     }
     let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
@@ -1254,7 +1258,8 @@ fn build_clean_activation_candidates(
         source_capture,
         working,
     )?;
-    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
+    let mut checkpoints =
+        LazyGenesisCheckpointBuilder::new(catalog_document_id, workspace_id, lineage_digest)?;
     let mut sqlite = super::sqlite::CleanGenesisProjectionBuilder::new(
         database_path,
         super::ProjectionClaim::current(workspace_id, lineage_digest),
@@ -1285,13 +1290,14 @@ fn build_clean_activation_candidates(
         instrumentation.record_and_input_micros = instrumentation
             .record_and_input_micros
             .saturating_add(elapsed_micros(record_started));
-        let (checkpoint, dependencies) = checkpoints.push_page_with_instrumentation(
-            &capsule,
-            &page_assignments,
-            &mut instrumentation.checkpoint,
-        )?;
-        capsule.document_checkpoint = checkpoint;
-        capsule.document_dependencies = Some(dependencies);
+        let (document_checkpoints, document_dependencies) = checkpoints
+            .push_page_with_instrumentation(
+                &capsule,
+                &page_assignments,
+                &mut instrumentation.checkpoint,
+            )?;
+        capsule.document_checkpoints = document_checkpoints;
+        capsule.document_dependencies = document_dependencies;
         let baseline_started = Instant::now();
         baseline.push(capsule)?;
         instrumentation.baseline_pack_micros = instrumentation
@@ -3682,16 +3688,40 @@ fn plan_import(
         .iter()
         .map(|page| page.path().clone())
         .collect::<BTreeSet<_>>();
-    let deferred_absences = completed
-        .iter()
-        .filter(|page| {
-            matches!(
-                inventory.entries().get(page.path()),
-                Some(RawObservation::Absent)
-            ) && engine.restored_generation_requires_absence_deferral(page.page_id(), page.path())
-        })
-        .map(|page| (page.page_id(), page.path().clone()))
-        .collect::<BTreeSet<_>>();
+    // The restored-generation question is one point read of that page's own
+    // durable receiver row, so it is asked per candidate rather than filtered
+    // against a resident history map; a damaged row refuses by name here
+    // instead of silently dropping the deferral.
+    let mut deferred_absences = BTreeSet::new();
+    for page in completed.iter() {
+        if !matches!(
+            inventory.entries().get(page.path()),
+            Some(RawObservation::Absent)
+        ) {
+            continue;
+        }
+        match engine.restored_generation_requires_absence_deferral(page.page_id(), page.path()) {
+            Ok(true) => {
+                deferred_absences.insert((page.page_id(), page.path().clone()));
+            }
+            Ok(false) => {}
+            // Derived receiver-history damage is a named in-scope refusal
+            // (I-8), never an unrecorded "no deferral": deciding without that
+            // row could recreate a page the receiver deleted. The engine has
+            // already armed the instrumented rebuild, so the next open heals.
+            Err(error) => {
+                return blocked_authority_error(
+                    Some(inventory),
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(page.path()),
+                        error.to_string(),
+                    ),
+                    instrumentation,
+                )
+            }
+        }
+    }
     for (page_id, path) in &deferred_absences {
         engine.note_deferred_absence_observation(*page_id, path);
     }
@@ -4282,6 +4312,10 @@ fn build_execution_material(
     }
 
     let desired_pages = &page_transition.pages;
+    let desired_page_ids = desired_pages
+        .values()
+        .map(|page| page.page_id)
+        .collect::<BTreeSet<_>>();
 
     let trees = &parsed_documents.current;
 
@@ -4376,14 +4410,23 @@ fn build_execution_material(
                             })?;
                             (block_id, true, current.block.home_document_id)
                         }
-                        None => (
-                            import_id.unmatched_block_id(&ImportLocator::block(
+                        None => {
+                            // A newly imported block is born in its OWN
+                            // document, never in the page's: the ordered pair
+                            // of the two is what addresses its membership.
+                            let block_id = import_id.unmatched_block_id(&ImportLocator::block(
                                 path.clone(),
                                 locator.clone(),
-                            )),
-                            false,
-                            page.home_document_id,
-                        ),
+                            ));
+                            (
+                                block_id,
+                                false,
+                                DocumentId::for_unmatched_import_block(
+                                    scope.workspace_id,
+                                    block_id,
+                                ),
+                            )
+                        }
                     };
                     if desired_node_ids
                         .insert((path.clone(), index), block_id)
@@ -4560,7 +4603,9 @@ fn build_execution_material(
     let mut deletions = current_blocks
         .iter()
         .filter_map(|(block_id, current)| {
-            if deferred_page_ids.contains(&current.page_id) {
+            if deferred_page_ids.contains(&current.page_id)
+                || !desired_page_ids.contains(&current.page_id)
+            {
                 return None;
             }
             (!desired_blocks.contains_key(block_id)
@@ -4647,10 +4692,6 @@ fn build_execution_material(
         }
     }
 
-    let desired_page_ids = desired_pages
-        .values()
-        .map(|page| page.page_id)
-        .collect::<BTreeSet<_>>();
     for page_id in current_pages.keys() {
         if !desired_page_ids.contains(page_id) && !deferred_page_ids.contains(page_id) {
             push_operation(
@@ -7418,12 +7459,98 @@ mod tests {
             .unwrap()
             .transaction()
             .operations;
-        assert!(delete_transaction
-            .iter()
-            .any(|operation| matches!(operation, SemanticOperation::DeleteSubtree { .. })));
+        assert!(
+            !delete_transaction
+                .iter()
+                .any(|operation| matches!(operation, SemanticOperation::DeleteSubtree { .. })),
+            "whole-file deletion is represented only by page liveness"
+        );
         assert!(delete_transaction
             .iter()
             .any(|operation| matches!(operation, SemanticOperation::DeletePage { .. })));
+
+        let moved_uuid = LogseqUuid::from_uuid(Uuid::from_u128(74_200));
+        let move_out = CleanSnapshotFixture::new_with_initial_uuid(
+            "execution-move-out-delete-source",
+            &["pages/source.md", "pages/destination.md"],
+            Some(moved_uuid),
+        );
+        fs::remove_file(move_out.graph_root.join("pages/source.md")).unwrap();
+        fs::write(
+            move_out.graph_root.join("pages/destination.md"),
+            format!("- page 1\n- moved from deleted source\n  id:: {moved_uuid}\n"),
+        )
+        .unwrap();
+        let move_out_plan = move_out.plan(&["pages/source.md", "pages/destination.md"]);
+        let move_out_operations = &move_out_plan
+            .execution_material()
+            .unwrap()
+            .transaction()
+            .operations;
+        let move_index = move_out_operations
+            .iter()
+            .position(|operation| matches!(operation, SemanticOperation::MoveSubtree { .. }))
+            .expect("the anchored block moves to the retained page");
+        let page_delete_index = move_out_operations
+            .iter()
+            .position(|operation| matches!(operation, SemanticOperation::DeletePage { .. }))
+            .expect("the source page is tombstoned");
+        assert!(move_index < page_delete_index);
+        assert!(!move_out_operations
+            .iter()
+            .any(|operation| matches!(operation, SemanticOperation::DeleteSubtree { .. })));
+
+        let partially_deleted = CleanSnapshotFixture::new_with_graph_config_names_and_contents(
+            "execution-partial-page-delete",
+            &["pages/partial.md"],
+            "{}",
+            &["Partial"],
+            &["retained root\n- removed child"],
+        );
+        fs::write(
+            partially_deleted.graph_root.join("pages/partial.md"),
+            b"title:: Partial\n\n- retained root\n",
+        )
+        .unwrap();
+        let partial_plan = partially_deleted.plan(&["pages/partial.md"]);
+        let partial_transaction = &partial_plan
+            .execution_material()
+            .unwrap()
+            .transaction()
+            .operations;
+        assert!(partial_transaction
+            .iter()
+            .any(|operation| matches!(operation, SemanticOperation::DeleteSubtree { .. })));
+        assert!(!partial_transaction
+            .iter()
+            .any(|operation| matches!(operation, SemanticOperation::DeletePage { .. })));
+    }
+
+    #[test]
+    fn external_delete_last_page_retains_blocks_through_cold_reopen_clean() {
+        let mut fixture =
+            CleanSnapshotFixture::new("external-delete-last-page-reopen", &["pages/last.md"]);
+        let page_id = fixture.page_id(0);
+        let original = fixture.engine().materialize_page(page_id).unwrap();
+        assert!(!original.blocks.is_empty());
+        fs::remove_file(fixture.graph_root.join("pages/last.md")).unwrap();
+        fixture.apply_external_paths(&["pages/last.md"]);
+        let reopened = fixture.reopen_after_config_change();
+        {
+            let engine = reopened.engine();
+            assert!(matches!(
+                engine.materialize_page(page_id),
+                Err(crate::oplog::EngineError::PageDeleted(deleted)) if deleted == page_id
+            ));
+            for block in &original.blocks {
+                let retained = engine
+                    .recover_block_state(block.home_document_id, block.block_id)
+                    .unwrap()
+                    .expect("whole-page deletion retains original block state");
+                assert_eq!(retained.owner, crate::oplog::BlockOwner::Page(page_id));
+                assert_eq!(retained.content, block.content);
+            }
+        }
     }
 
     #[test]
@@ -8079,6 +8206,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_412)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_413),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 material,
             )
@@ -8122,6 +8252,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_414)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_415),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 replacement_material,
             )
@@ -8159,6 +8292,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_416)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_417),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 removal_material,
             )
@@ -8212,6 +8348,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_420)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_421),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 chain_material,
             )
@@ -8244,6 +8383,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_422)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_423),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 reuse_material,
             )
@@ -8278,6 +8420,9 @@ mod tests {
                     author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
                     author_session_id: SessionId::from_uuid(Uuid::from_u128(9_424)),
                     crdt_peer_id: CrdtPeerId::from_u64(9_425),
+                    causal_peer_id: crate::oplog::CausalPeerId::from_key(
+                        crate::oplog::WriterIncarnationId::fixture_labelled(b"import-fixture"),
+                    ),
                 },
                 cycle_material,
             )

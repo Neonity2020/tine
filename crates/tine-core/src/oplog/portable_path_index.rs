@@ -189,7 +189,12 @@ impl PortablePathRecord {
     }
 }
 
-fn exact_path_digest(path: &ManagedPath) -> ContentDigest {
+/// Domain-separated full-width digest of the EXACT managed path bytes.
+///
+/// Exposed to the crate so the receiver absence history keys its composed
+/// authenticated maps on the same value this index already derives, instead of
+/// growing a second exact-path key derivation.
+pub(crate) fn exact_path_digest(path: &ManagedPath) -> ContentDigest {
     let mut bytes = b"tine/exact-managed-path/v1\0".to_vec();
     bytes.extend_from_slice(&(path.as_str().len() as u64).to_be_bytes());
     bytes.extend_from_slice(path.as_str().as_bytes());

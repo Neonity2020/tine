@@ -16736,19 +16736,8 @@ impl Graph {
         if job.snapshot.cancellation().is_cancelled() {
             return Err(crate::query::QueryExecutionError::Cancelled);
         }
-        {
-            let guard = self.property_registry.read().unwrap();
-            if let Some(state) = guard.as_ref() {
-                if state.source_generation == source_generation
-                    && state.registry.config_digest() == config.digest()
-                    && !state.declarations_dirty
-                {
-                    return Ok(Arc::clone(&state.registry));
-                }
-            }
-        }
-        let built = job.read_registry(config)?;
-        Ok(self.publish_property_registry(built, source_generation))
+        let _ = source_generation; // SQL image identity is owned by the captured job.
+        job.read_registry(config)
     }
 
     /// A page was saved. When its name IS a property key, the registry's
@@ -16898,12 +16887,9 @@ impl Graph {
     /// §6.2's registry for the CURRENT source generation, SQL-only and
     /// fallible (RET2).
     ///
-    /// The published snapshot is returned when it already describes this source
-    /// generation and parse config and no property-key page was saved since —
-    /// which is the same fast path `query_property_registry_at` takes inside a
-    /// job, so a reader that comes here and an execution that comes there share
-    /// ONE table (D-4/D-14, no second producer). Otherwise one owned query job
-    /// reads it through `DirectQueryJob::read_registry`.
+    /// One owned job captures the committed registry owner and SQL image.
+    /// Its cache can reuse unchanged metadata without borrowing the editor
+    /// registry or its debounce state.
     ///
     /// It never falls back to `Graph::property_registry`: that refresh walks
     /// parsed documents when the projection is not ready and serves a ~250 ms
@@ -16911,20 +16897,9 @@ impl Graph {
     /// execution used.
     pub(crate) fn query_property_registry_current(
         &self,
-        source_generation: u64,
+        _source_generation: u64,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         let config = self.config.parse_config();
-        {
-            let guard = self.property_registry.read().unwrap();
-            if let Some(state) = guard.as_ref() {
-                if state.source_generation == source_generation
-                    && state.registry.config_digest() == config.digest()
-                    && !state.declarations_dirty
-                {
-                    return Ok(Arc::clone(&state.registry));
-                }
-            }
-        }
         self.dispatch_direct_query(|| {
             self.direct_projection_query_job(|job, generation, _| {
                 self.query_property_registry_at(generation, &config, job)

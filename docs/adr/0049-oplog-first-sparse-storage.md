@@ -2,6 +2,7 @@
 
 - **Status:** Accepted — architecture/format selection; implementation and LocalActive remain gated
 - **Date:** 2026-07-22
+- **Partially superseded by:** [ADR 0060](0060-qualified-generations-and-indefinite-cold-history.md) for retirement of redundant hot representations; indefinite logical history is preserved.
 - **Supersedes:** [ADR 0048](0048-compatible-managed-sync.md)
 
 > **Implementation note (2026-08-31):** The physical Patricia indexes,

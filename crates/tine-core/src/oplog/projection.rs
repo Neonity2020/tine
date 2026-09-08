@@ -23,10 +23,10 @@ use std::io;
 use super::object_store::BatchInspection;
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlobDescription, BlockId,
-    CleanTombstoneAuthorization, EngineError, LogseqIdentityOrigin, LogseqUuid, ManagedPath,
-    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
-    MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore, PageId,
-    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
+    CleanTombstoneAuthorization, DocumentKey, EngineError, LogseqIdentityOrigin, LogseqUuid,
+    ManagedPath, ManifestProjectionPrecondition, ManifestProjectionTarget,
+    ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
+    PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
     ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
     ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionTurn,
     ProjectionWork, ProjectionWorkTarget, ReceiptError, SequenceDomain, ShardedHotEngine,
@@ -1819,7 +1819,9 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         && !engine
             .accepted_batch_revives_page(source.source_batch_id(), source.page_id())
             .map_err(ProjectionError::Engine)?
-        && engine.receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
+        && engine
+            .receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
+            .map_err(ProjectionError::Engine)?
             == super::absence_decision::AbsenceDecision::DeferredAbsence
     {
         engine.note_deferred_absence_observation(plan.intent().page_id(), plan.intent().path());
@@ -4439,7 +4441,7 @@ mod tests {
                         logseq_uuid,
                         vec![ProjectionClaimParticipant::new(
                             block.block_id,
-                            block.home_document_id,
+                            DocumentKey::Entity(block.home_document_id),
                         )],
                     )
                     .unwrap()
@@ -4450,7 +4452,7 @@ mod tests {
             FrontierV2::default()
         } else {
             FrontierV2::new(vec![DocumentDependencies::new(
-                home_document_id,
+                DocumentKey::Entity(home_document_id),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(80_003), 0)],
                 Vec::new(),
             )

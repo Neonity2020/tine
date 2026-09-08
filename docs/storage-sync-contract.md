@@ -43,8 +43,10 @@ Readiness never compares against a cached Direct Files inventory captured before
 the transition or the actor's live current-path catalog: filesystem delivery may
 legitimately change either while startup catch-up is settling. The accepted
 frontier's raw document count is not a page count because it also includes
-non-page managed documents. An empty graph
-legitimately proves readiness with an empty inventory.
+non-page managed documents. An empty graph legitimately proves readiness with an
+empty page inventory. Its immutable baseline and SQLite genesis still bind the
+one fixed graph-metadata document carrying workspace and lineage identity; they
+bind zero page, block, or membership documents.
 
 Explicit activation is never an unexplained spinner. Before native activation,
 the frontend names pending-save flush, confirmation, and progress-listener
@@ -302,7 +304,8 @@ Managed storage selection, and no byte is written into the user's graph.
 | `archive/operations.<generation>/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit and join installation | causal replay and publication through the marker generation resolver | content-addressed objects plus manifest-last batches | authoritative append-only tail paired with the same marker-named baseline generation; unreferenced generations are reconstructible join residue and are reclaimed on open |
 | `archive/operations.<generation>/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
 | `archive/operations.<generation>/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
-| `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
+| `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision roots | immutable generation-named summary chain v1 naming the absence-history root | disposable receiver roots acceleration; retained receipt records are truth and rebuild it |
+| `archive/operations.<generation>/sweeps/receiver-absence-rows-v1/` | the same receiver open/completion machinery under the workspace lease | point-addressable absence history by exact `(PageId, ManagedPath)` | immutable content-addressed records and authenticated map nodes v1 | disposable derived index; retained receipt records are truth and rebuild it |
 | `archive/operations.<generation>/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
@@ -754,9 +757,19 @@ syntaxes, and missing required visible text fails the read.
 the owned snapshot. The snapshot is validated against the exact current graph
 cache generation before and after its read transaction starts, then its
 interrupt handle and the snapshot-scoped `session_pages` identity set are
-registered with the job owner. A property-bearing query uses the registry
-published for that graph generation and parse config; when the table is not
-already current, the job reads it from its own snapshot before lowering. A
+registered with the job owner. A property-bearing Direct query captures its
+committed registry cache alongside the SQL snapshot, using the actual storage
+query revision and parse config. This owner is separate from the editor registry.
+The first read builds the registry from SQL; successful page deltas invalidate
+only changed property keys and declaration-page dependencies. The producer
+compares touched-page metadata before writing with its physical materialization
+inputs, releasing the maintenance snapshot before the write. Text-only edits
+with unchanged metadata reuse the registry without a full or per-key scan.
+Full initialization, recovery, and config replacement invalidate the cache.
+All turn writes and identity publication precede cache revision publication;
+failed turns discard the owner. Query workers build or patch on their owned
+snapshot, validating its actual revision even on cache hits. Older coherent
+reads cannot overwrite newer publications or clear newer dirty keys. A
 query without a property leaf uses the empty registry because no predicate can
 observe its types. The answer then uses one descriptor statement plus payload
 batches for the ids the budget ADMITS — never a candidate superset, never a
@@ -1366,13 +1379,76 @@ arm clones at most one non-page home at a time (no all-home arena), preserves
 the existing distinct-home statistics, and alone applies the current accepted
 exact-title selection; historical and prospective state materialization does
 not consult that later root.
-The single catalog checkpoint is constructed by the same direct terminal-state
-builder, and the sealed manifest binds its non-derivable catalog document ID.
+The single graph-metadata checkpoint is constructed by the same direct
+terminal-state builder, and the sealed manifest binds its non-derivable graph
+document ID. That checkpoint is the fixed **graph metadata document**, not a UUID-keyed
+page/block catalog. It is created for every baseline, including an empty graph,
+and binds the exact workspace, lineage, and graph document address. Therefore an
+empty activation has exactly one accepted document (graph metadata) and zero
+page, block, and membership documents; SQLite construction and cold reopen must
+preserve that same root rather than treating the baseline as a zero-document
+special case.
+
+Interactive state uses one fixed document layout. A page has its immutable
+`DocumentIdentity::Page`, one live-or-tombstone page-state register, preamble,
+and checkpoint. A block has its own immutable entity document, a stable root
+text container, fixed identity fields, owner register, and immutable
+`BlockBirth { page_id, page_document_id }`. A membership is the exact
+`(block_document_id,page_document_id)` document with an optional claim register.
+The block birth is authenticated in semantic-effect schema 7 against the page
+identity at the batch's declared causal base; deletion, Restore, replay, and
+owner moves never rewrite it or the root text `ContainerID`. Page and membership
+state no longer live in a whole-graph catalog document.
+
+Authored multi-operation transactions use one transaction-local page outline,
+initialized lazily from the existing current-owner and pair-claim producer. The
+same owner and membership write seams advance that outline after each operation;
+there is no second authority or fixture-only producer. Its adjacency is a
+`BTreeSet<BlockId>` per parent. Subtree selection therefore returns canonical
+BlockId-sorted rows without repeatedly sorting wide sibling lists, while every
+row retains the complete block identity, immutable entity home, exact page home,
+and native membership claim. A cross-page `MoveSubtree` updates every selected
+owner and source/destination pair in transaction order. A same-page
+`MoveSubtree` is only the existing root `ReorderBlock` mutation after the exact
+root-home check: it changes that root pair and never rewrites descendant pairs
+or entity owners, so an independent child reorder remains independent.
+
+Whole-file external deletion is represented by `DeletePage` alone. It
+tombstones page state and leaves the original block entity documents, root text,
+owners, and membership-pair documents available to historical materialization
+and Restore; page liveness is what hides them. Moving a subtree to another live
+or newly created page still occurs before the source page tombstone and keeps its
+identity. Removing only part of a still-live page remains `DeleteSubtree` and
+does change the selected block owners and membership pairs. Deferred pages keep
+their existing behavior. A path rename preserves its matched `PageId` and is
+therefore not a whole-file page deletion.
+
+Every `PreparedBatch` constructor proves that the existing canonical manifest
+encoder accepts the manifest before returning the publishable value. Oversize
+uses the existing typed `ManifestTooLarge` error and unchanged 1 MiB limit; it
+does not cache another encoding or define a second serializer. Whole-batch
+pending/error handling remains the existing route. This contract does not add
+chunking or promise support for an arbitrary oversized atomic batch.
+
 These checkpoints are baseline semantic/causal state, not fabricated interactive
 history: their construction authors no `SemanticOperation`, batch, ordinary
 mutation receipt, partition, or detached bootstrap part. Untouched page
 checkpoints remain unopened in the lazy pack until a page read or first ordinary
 operation needs one.
+
+Within one top-level point-operation read scope, the engine may retain the raw
+checkpoint bytes from at most one decoded baseline page, bound to the exact
+baseline root and original `PageId`. The manifest-derived full `DocumentKey`
+index resolves entity and membership checkpoints without scanning unrelated
+page descriptors. Repeated requests for documents from that page clone only
+the requested checkpoint bytes; exact source bytes, blocks, SQLite receipts,
+and mutable CRDT documents are not retained. Starting another top-level
+materialization clears this memo and therefore rereads and revalidates the
+capsule. A different root or page replaces it. Accepted dependency heads and
+the current overlay remain authoritative, so an edited cold document never
+falls back to its initial baseline checkpoint, and a moved block's baseline
+location remains its immutable original-page storage location rather than
+current ownership.
 
 Reading one baseline page costs that page, not the pack. A sealed segment pack
 is written once and never rewritten, so its whole-pack digest is proved against
@@ -1621,6 +1697,18 @@ Patricia path or page-name index to duplicate SQLite ownership. A content or
 path-only edit of an existing physical same-name page does not reacquire its
 logical name; only a creation or exact-title change enters name-acquisition
 preflight.
+
+An incoming projection intent's portable-path root describes the author's whole
+index at authoring time. It is retained as part of the original intent and its
+derived work identity; it is not proof of the receiver's whole index. Receiver
+admission validates the exact path/key binding, agreement among the batch's
+intents, semantic projection transition, and occupied/released per-key causal
+records. It does not compare global roots or use whole-device causal clocks as
+a proxy for that comparison: unrelated accepted or journaled work may differ.
+The receiver derives its own path index through the existing per-key transition.
+Own journal replay still requires each record's root to match its local prefix
+transition, and reuse of an own projection candidate keeps its same-context check.
+No incoming root changes path ownership, release ancestry, or conflict ranking.
 
 One canonical page name has one owner, and a graph may legitimately hold more
 than one physical file for it. Activation already resolves that: it selects one
@@ -1961,7 +2049,7 @@ already complete for this class.
 | `EngineError::RejectedDependency` | U | Every dependency of a local batch is an accepted batch or an earlier record of the same journal-durable prefix. |
 | `EngineError::DuplicateDocumentUpdate` | U | `updates` is a map built by the foreground; the draft validates the same object set. |
 | `EngineError::MissingDocument` | U | A non-empty page effect puts the catalog in `updates` by construction; `affected_projection_pages` equality is proven at draft. |
-| `EngineError::CrdtUpdateBaseMismatch` | U | `validate_update_base` runs at draft and maps this exact error to `ManagedLocalRecordError::StaleBase` before the append. |
+| `EngineError::CrdtUpdateBaseMismatch` | U | `validate_update_base` runs at draft and maps this exact error to `ManagedLocalRecordError::StaleBase` before the append. It checks both the exact starting frontier and each carried peer range: its start counter equals the retained before-vector counter, its end is strictly greater, and every start has an end. Loro metadata supplies the ranges; replayed overlapping operations cannot establish a new writer binding. |
 | `EngineError::BlockAlreadyExists` | U | The draft checks accepted claims **and** `local_overlay.block_claims`, so it already sees claims introduced by journal-durable records. |
 | `EngineError::MalformedDocument` | U | Document-shape checks over documents the draft built and already validated with `validate_shard` / `validate_immutable_shard_identity`. |
 | `EngineError::ProjectionManifest` | U | `validate_managed_local_projection_candidate` re-renders every intent deterministically and compares target bytes and annotations before the append. |
@@ -2167,14 +2255,252 @@ canonical authenticated-map priority/node algorithm has one owner,
 SQLite. The same module owns the one current sealed batch/status/sequence/causal
 encoding and its bounded cross-checking reader; its caller-provided Tine
 evidence decoder validates the one current accepted-evidence encoding without
-reversing the crate dependency. The R1a adapter has no filesystem/publication
-capability, so a live checkpoint-generation marker remains impossible until a
-later cut deliberately changes that tested boundary. The physical layer has
+reversing the crate dependency. The **R1b accepted-cutoff builder** streams engine
+accepted rows through the same row writer as A5, starting at a sequence-zero
+frontier or continuing a previously built cutoff. It checks contiguous evidence,
+exact predecessor/target frontiers, unique batch membership, the resulting
+causal batch-map root and the new status/sequence/causal point proof. Continuation
+reads persistent index paths and the new row, not the covered status/sequence
+inventory. Failed appends leave predecessor roots unchanged; unreachable
+construction nodes do not confer authority. The cutoff also binds exact highest
+accepted `(peer, counter, batch)` tips through the shared causal-tip value digest
+and authenticated map. Delta builds update only affected peer paths; older
+accepted counters cannot lower a tip. Empty-tail continuation retains exact tips.
+Damaged tip nodes or conflicting batches at one tip fail before candidate roots
+advance. The O(peers) in-process records are not yet live authoring input.
+This is an inert, in-process staging
+surface with no new on-disk format, serialized cutoff token, cache-payload
+adoption or live scheduler/cutover caller. The engine's capture reads the existing
+accepted-row seam without encoding documents. A separate inert per-document builder
+uses the existing accepted-root loader and document validators, exports a shallow
+snapshot at the exact accepted frontier, then imports it into a fresh document.
+Qualification requires exact version vectors, oplog frontiers, root and nested
+container IDs, map values and text deltas. Run-local Loro allocation slots are
+excluded from identity. It never recreates documents from visible page text. This
+synchronous staging proof has no installation path and makes no COW actor-budget
+claim; old concurrent branches still require full-ancestry recovery.
+The engine-level recovery fixture now reconstructs original accepted ancestry,
+includes acknowledged post-cutoff work, admits two independently returning peers
+through normal replay, and recompacts all affected documents. It covers a block
+moved to another page while retaining its original home shard. Its negative control
+omits the post-cutoff tail and detects the resulting lost edit. This proves the
+isolated engine recipe, not durable installation, missing-history recovery, actor
+concurrency, or shared retirement.
+This is not yet a complete durable
+generation: capsules, retention facts, independent disk qualification and the COW
+actor epoch remain prerequisites to enabling cutover. The physical layer has
 one current SQLite schema for both the live disposable projection and a
 separately built checkpoint candidate, plus a read-only injected sealed-history
 reader. It has no prior-schema enum, reader, compatibility fixture, or
 migration path. An unrecognized pre-0.7 private store is preserved as a backup
 and rebuilt from the untouched Markdown/Org tree by Tine.
+
+The **sealed generation staging directory** now persists the existing canonical
+node/record bytes as `sealed-v2-<kind>-<digest>` files under a caller-owned private
+directory capability. The numeric kinds are the same five codes used by A5's
+adapter; there is no second node codec. Its point reader does not enumerate the
+directory. Reads reject non-regular/symlink entries through the shared reader and
+retain the current checkpoint's 512-MiB per-record read ceiling. This is staging
+layout, not the complete authoritative generation format.
+
+Construction reuses `ExactImmutablePublicationBatch` on Linux. Windows, macOS,
+iOS, Android and other targets use retained `DurableDirectoryPublication` with
+`publish_new_exact_single_writer`; this preserves Windows write-through and
+Android private-directory rename fallback. Pending bytes use the existing memory
+adapter. It flushes at 8 MiB or 64 objects, bounding both payload
+memory and retained directory capabilities. A larger legal single record flushes
+alone; these batch budgets do not cap graph size or total history. Failed writes
+poison the construction handle; dropping it never installs a generation marker.
+Successful finish completes the shared durability protocol. Fresh canonical
+membership qualification still follows: a durability receipt is not an integrity
+proof, and merely opening a directory is not generation adoption. Collision,
+missing/corrupt record, no-follow, publication-fault and retry tests preserve
+predecessor roots. Complete generation commits and live cutover remain absent.
+
+The staged **document capsule roster** uses `SealedDocumentMap` over the shared
+full-key authenticated map. `DocumentKey::Entity` encodes as the `0x01` tag plus
+its UUID (17 bytes), while `DocumentKey::Membership` encodes as the `0x02` tag
+plus the complete `(block_document_id, page_document_id)` pair (33 bytes). That
+lossless encoding is `AuthenticatedMapKey`; entity and membership entries share
+one root, preserve meaningful-byte lexicographic ordering, and never hash or
+truncate an address. The live capsule producer supplies both domains. Logical
+retirement uses the certified shared `remove_map` operation, which removes only
+the addressed search path while preserving older immutable roots; it never
+physically deletes objects. Construction reads pending staged nodes before
+on-disk nodes, and a fresh complete-key census independently rebuilds the shared
+root and verifies its count. A map value addresses one canonical postcard record
+`{schema=1, dependencies: DocumentDependencies, checkpoint: BlobDescription}`.
+Descriptor and actual CRDT checkpoint blobs share the `capsule-v1-<digest>`
+content-addressed staging namespace and the same bounded publication machinery.
+The descriptor preserves exact accepted heads and counters; it contains no
+run-local cutoff digest. A changed document replaces only its roster search path;
+unchanged values remain shared. Catalog identity and roster completeness must still
+be bound and qualified by the enclosing complete generation.
+
+Point reopening checks canonical current descriptor encoding, digest, document
+identity, exact checkpoint length/digest, CRDT import completeness, schema/shape
+and version vector through the existing catalog/shard validators. It never
+reconstructs a CRDT from projected text. A forged in-memory cutoff cannot be
+serialized through this surface; producer input remains an engine-qualified compact
+document bound to the current cutoff. This is still staging, with no active marker
+or engine installation caller.
+
+The explicit full-roster builder enumerates the engine's complete accepted
+document set, including the fixed graph metadata document and retained entity or
+membership documents that need not appear in the live graph. It checks the
+current accepted cutoff and exact document count. A lazy-genesis baseline always
+contains the graph metadata document, even with no pages; an ordinary in-memory
+test engine with no installed baseline may still have the genuinely empty root.
+An inherited descriptor with identical canonical dependencies avoids CRDT loading
+and republishing; changed documents update the existing roster paths. This initial
+builder still enumerates O(documents) metadata and is not the R1c bounded actor COW
+capture or the later delta-only qualification path.
+
+The full bootstrap/repair oracle independently derives the canonical roster root
+from the exact accepted document keys, so extra entries cannot hide behind a forged
+count. Each persisted document must then match accepted dependencies and the
+source CRDT's stable container identities, frontiers, map values and text deltas.
+Both the per-document compact producer and full-roster oracle reuse one equivalence
+checker. These are explicit construction/repair operations, with no live runtime
+caller or generation installation capability. Complete generation binding and
+retention closure remain prerequisites for adoption.
+
+### Additive cold whole-object history and one read resolution
+
+R2's cold tier is a **physical** layer below the existing object model. It changes
+where a logical object's bytes live and nothing else: canonical `OperationObject`
+and `OperationBatch` bytes, their content digests, their `ObjectDescriptor`s and
+their `BatchId`s are preserved verbatim, and every read re-proves them. There is
+one current representation and no migration path; an unrecognized private store is
+still backed up and rebuilt.
+
+Layout, under the retained archive capability beside `clean-open-checkpoint-v1`:
+
+```
+<archive>/cold-history-v1/
+  pack-v1-<uuid>            immutable pack file
+  sealed-v2-<kind>-<digest> shared authenticated-map nodes
+  current                   canonical root marker, installed last
+```
+
+A pack is `record* footer footer_len:u64be "TINECLD1"`. A record is
+`sha256(payload):32 payload_len:u64be payload`, so one ranged read self-verifies
+its payload. The footer makes each pack self-describing, which is what keeps the
+locator index disposable derived state: `repack_cold_history` rebuilds every root
+from pack footers alone. Packs are built to a 4 MiB construction target; that is a
+target, never an occupancy cap, and one larger legal record is packed alone.
+
+`ColdLocatorV1` is exactly `pack_uuid:16 offset:u64be length:u64be` = 32 bytes, so
+it occupies the shared authenticated map's fixed value slot directly. No side blob
+and no filesystem object exists per logical record: many small records share one
+pack and one point read.
+
+Two key domains compose the same shared canonical UUID map; there is no second
+tree, no tuple hashing and no SHA-256 truncated into a UUID. This cold object
+index remains its own two-level 256-bit content-digest composition; unlike it,
+`SealedDocumentMap` now stores each lossless tagged entity or full membership
+address directly in one shared authenticated map. The **object domain** carries
+the full 256-bit digest through an outer map keyed by
+`sha256[0..16]`; its value locates a canonical postcard **inner-root descriptor**
+`{schema=1, root: {count, root_key, root_digest}}` packed with the same physical
+pack machinery, and that descriptor names an inner authenticated map keyed by
+`sha256[16..32]` whose values are the record locators. An outer entry therefore
+holds a whole map, not a list: the number of objects sharing one 128-bit prefix is
+unbounded, there is no bucket byte cap and no fixed-occupancy refusal, and
+lookup cost under a prefix is a map path rather than a scan. The descriptor's
+fixed 256-byte read bound is the codec size of that constant structure and is
+independent of prefix occupancy, history size or graph size. The **manifest
+domain** keys the map by the `BatchId` UUID and locates the record directly. One
+object lookup costs `O(log n)` outer map-node reads, one bounded descriptor read,
+`O(log m)` inner map-node reads and one bounded payload read — two pack reads
+however large history or a prefix grows; one manifest lookup costs exactly one.
+No pack, manifest or object namespace is enumerated on any lookup path.
+
+Publication is **additive**: nothing here retires a hot original, and a repack
+publishes new packs and swaps the root while leaving the predecessor packs in
+place (publish-new-before-retire-old). Enabling deletion needs the generation,
+fallback and retention proofs that follow. Publication order is payload pack
+bytes, then the inner prefix maps, then the packed inner-root descriptors, then
+the outer and manifest maps, then the root marker; before the marker installs,
+every staged pack and index node is unreferenced residue and the predecessor root
+is untouched, so an interrupted publication never becomes authority through
+filename presence.
+
+A repeated identity is "already archived" only when its **bytes** are
+byte-identical to what cold history already holds, compared through the shared
+reader. A `BatchId` is an identity, not a content address: two valid canonical
+manifests may legitimately carry the same `BatchId` and differ (a different
+`SessionId` alone suffices), so a repeated `BatchId` with different bytes is a
+collision, refused as `ColdManifestConflict` with the batch named. The exactness
+comparison runs before any record is appended, so a refused conflict leaves the
+predecessor root, the original bytes and the pack set exactly as they were.
+Publication, repack and footer reconstruction all apply the same rule; object
+records are additionally bound by their content digest, which every read
+re-proves. Republishing byte-identical content is a counted no-op that leaves the
+roots byte-identical.
+
+The root marker is derived state; the self-describing packs are the truth. No
+cold directory, or a cold directory with neither marker nor packs, is ordinary
+absence. A cold directory whose packs survive but whose marker is **gone** is a
+named damaged state, `StoreError::ColdHistoryRootMissing` — never ordinary
+absence, and never a licence to publish a fresh empty-based root over the old
+history: reads, publication and repack all refuse it by that name. A **torn or
+otherwise malformed** marker over surviving packs is the same damaged class:
+ordinary reads reject it as `ColdHistoryIndexUnavailable`, and repair treats it
+exactly like a missing one.
+
+`repair_cold_history_root` is the explicit recovery for both. It reads the raw
+marker bytes once — using them only as the audited replacement guard for the
+marker-last swap, never as history — rebuilds the locator index from the pack
+footers, and reuses every surviving record exactly where it already lies, without
+rewriting, relocating or re-encoding a byte. A healthy marker makes it a bounded
+no-op. A damaged marker with **no** surviving pack is never replaced with an
+empty history: there is nothing to rebuild from, so it refuses and leaves the
+bytes alone. Repair is the only operation that enumerates cold history; healthy
+opens stay bounded point operations, and the damaged-state check short-circuits
+at the first pack it sees. Throughout a damaged state and its repair, the hot
+tier and current state stay usable.
+
+Read resolution has exactly one implementation, on `ObjectStore`. Ordinary reads
+-- `inspect_batch`, `read_object`, `read_object_bytes`, `read_manifest`,
+`read_manifest_bytes`, `contains_object` -- are **hot-only** and have no cold
+branch at all: page open/save/move, the SQLite applier, projection payload pins
+and the operational coordinator's admission path can never reach a pack byte, and
+`ObjectStoreStats::cold_object_reads` / `cold_manifest_reads` are the oracle for
+that. The **indexed-cold** surface is `resolve_logical_object_bytes`,
+`resolve_logical_object`, `resolve_logical_manifest_bytes`,
+`resolve_logical_manifest`, `contains_logical_object` and
+`inspect_batch_with_cold_history`: each reads the hot original first and falls
+through to one indexed cold lookup. It is reserved for the named historical
+consumers -- Restore, historical admission, republication, previous-generation
+fallback and full replay. SQLite projection rebuild (the full replay of accepted
+history) resolves through it today; the remaining historical consumers are routed
+as their owning modules are cut over.
+
+Missing or corrupt cold data is history authority, never active-state authority.
+A damaged pack, record, locator or map node refuses with the affected logical
+object named (`cold logical object <digest> is unavailable: …` /
+`cold logical manifest <batch> is unavailable: …`), while every other object, the
+whole hot tier and current state stay usable; a damaged or noncanonical root
+marker refuses only the index. An archive that has never relocated anything is
+ordinary absence, not a refusal. No asset bytes enter these packs.
+
+The separate **live graph document closure** is captured at an exact accepted
+cutoff from the existing canonical graph view: catalog (when accepted), live page
+homes, and every visible block/membership's immutable home. Deleted page homes
+remain live when they own moved blocks. Fully historical shards are excluded from
+this eager graph closure while their archive/history obligations remain intact.
+Stale closures are refused. Full-history and live-closure roster construction and
+qualification share the same entry writer and equivalence checker; the selected
+key set is explicit and cannot substitute for full accepted-history completeness.
+
+This capture still uses the current canonical graph view and is a bootstrap seam,
+not bounded ordinary maintenance. A fixed-live create/delete probe demonstrates
+that the current catalog's application tombstone values survive shallow snapshots.
+The live capsule count can be bounded while that one catalog capsule still grows.
+Historical catalog representation, retention roots and incremental capture must be
+resolved before this closure is used for live adoption or portable join; no ordinary
+runtime caller exists yet.
 
 Provider frontier publication likewise consumes an incrementally maintained
 set of direct frontier tips rather than materializing every document frontier.
@@ -2437,6 +2763,13 @@ keyed by `(page, path)`. Its answer is the frontier-maximal completion across
 both halves; a defensive incomparable maximal set with mixed target kinds
 chooses the reversible Present/defer direction.
 
+The completed receiver half of that map is **not resident**: it is the
+point-addressable `receiver-absence-rows-v1` index of §3.2d, read one exact
+`(page, path)` at a time and merged with the bounded live overlay by the same
+single decision algorithm. What the roots object carries, and what the map holds
+in memory, is current work — unfinished receiver intents plus the already-pruned
+own-endpoint completion evidence.
+
 Normal Managed opens attach the clean archive store **before** they open the
 absence-decision map, on both the activation and the clean-reopen path, so
 `archive_store == None` — whose full-validated-catalog fallback
@@ -2663,6 +2996,237 @@ and returns a failed backend action for an explicit re-run. It never records a
 partial restore as successful. The final step recomputes and asserts an empty
 whole-page diff before appending Completed. Startup automatically resumes
 Started or Progress actions from their durable cursor.
+
+### 3.2d Current-action roots, the receipt discovery cursor, and Restore pins
+
+Ordinary open answers "what work is still owed?" from **current-action roots**,
+never by enumerating retained history. Two roots objects exist, both under
+`archive/operations.<generation>/sweeps/`:
+
+* `receiver-absence-summary-v1/` holds the receiver receipt roots: the exact set
+  of durable receiver intents that have no completion, the cursor coverage, and
+  the **root of the point-addressable absence history** described below. It does
+  not carry completed receiver decisions. Schema 4.
+* `receiver-absence-rows-v1/` holds that history: one immutable record per
+  `(PageId, exact ManagedPath)` receiver decision, addressed through three
+  composed `tine_storage::sealed_accepted_index` authenticated maps — page id,
+  then the high and low halves of `portable_path_index::exact_path_digest` of the
+  exact path bytes. Page identity and managed-path identity stay separately
+  keyed and full width: nothing truncates, and no tuple is hashed into a single
+  key. Every record carries and revalidates the identity it is bound to, so a
+  substituted record fails rather than answering for another page or path.
+* `sweep-action-roots-v1/` holds the complete active sweep roster: every sweep
+  that is open, barrier-active, has an unfinished action, or awaits an explicit
+  user disposition, each pinned with its exact chain version and digest.
+  Terminal chains are counted and otherwise absent. Their records are never
+  deleted and stay point-addressable by exact sweep id, which is how Restore
+  after completion still reads the original record.
+
+A healthy open enumerates **no** receipt evidence filename and **no** sweep
+record filename, decodes no terminal sweep chain, and reconstructs nothing. It
+reads one roots object per producer (plus its chain predecessor for the digest
+check) and resolves only the work the discovery cursor still points at.
+
+**Completed absence history is on disk, not in memory.** Neither the ordinary
+open nor an ordinary receipt update serializes or materializes the historical
+decisions. One absence answer is one point read of that key's record merged with
+the bounded live overlay, and it is not cached afterwards, so repeated point
+loads cannot accumulate. Exactly one decision algorithm runs, over the historical
+record and the live overlay alike. Persistent bytes may grow with history — D-5
+grants that, and rebaselining is the terminal bound — while resident state tracks
+current and pending work only: unfinished receiver intents, the already-pruned
+device-local completion evidence, and rows whose durable write-through failed.
+Committing a receiver completion retires that intent from the resident set, and
+flushing the own-endpoint completion chain re-derives the resident own half from
+whatever the chain's prune kept, so a long activation converges on the same
+bounded state the next open would seed. Publishing the record and the map nodes
+precedes publishing the roots object that names the new root, so a crash leaves
+unreferenced objects rather than a root pointing at bytes that were never
+written. The receiver receipt publication's pinned barrier budget is 31, of
+which 4 are the discovery cursor's and 2 are the separate row-namespace
+publication that a multi-namespace `ObjectStore::publish_coalesced_private_derived`
+would remove.
+
+**A missing record is damage, never permission.** The authenticated map root is
+the membership authority, so a record the root names but disk cannot supply is
+detectable damage. It is refused by name, never answered `Create` — that would
+recreate a file the receiver deleted — and it retires the derived roots so the
+next open runs the named counted repair from retained receipts. Every point-read
+caller routes damage the same way, including the own-endpoint completion prune,
+so a row discovered missing while pruning cannot become an endless reopen
+refusal. Once an activation has proven the index damaged, it publishes nothing
+further over it: later receipts in that activation would otherwise restore an
+apparently healthy roots chain and cancel the repair the damage requires. Those
+receipts stay durable truth in the receipt store and are folded by the repair. Every
+counter is reported on the clean-open trace: `receipt_evidence_names`,
+`receipt_cursor_marks`, `sweep_record_names`, `sweep_chain_objects_read`,
+`sweep_roots_repaired`, `sweep_retired_chains`,
+`current_action_receipt_obligations`, `current_action_sweep_pins` and
+`current_action_retained_documents`.
+
+**The discovery cursor.** A receipt is truth; the roots are a disposable cache
+of it, so the window between publishing a receipt and folding it into the roots
+needs its own durable record. `sweeps/current-action-cursor-v1/` holds one
+**head** object — a random `incarnation` plus the monotone `reserved` sequence —
+and one **mark** per receipt publication, named by that sequence. The receipt
+store reserves the mark *before* it publishes an intent or a completion; the
+mark and the advanced head are staged into one coalesced audited publication,
+so a reservation costs the same barriers as the mark alone. A reservation that
+cannot be made durable repudiates the head rather than letting a later open
+prove coverage it does not have.
+
+**Coverage is durable state, not an observation.** Each roots object records
+the exact `{incarnation, covered_through}` it has folded, published by the same
+write that publishes the state it claims to cover. An open trusts the roots
+only when the cursor's incarnation matches, no reservation between
+`covered_through` and the durable head is missing, and every mark binds its own
+name. Recreating a lost cursor directory mints a new incarnation, so it can
+never be mistaken for "everything was already covered", and that binding
+survives a second crash inside the repair window — an in-memory
+"directory was created" flag does not. A lost individual mark is a detected
+sequence gap; a torn mark fails its name/content binding.
+
+Any of those conditions takes one **named, counted repair**: a single validated
+pass over retained receipt truth that rebuilds the roots, records the new
+coverage, and returns the next open to the bounded path. It is never a refusal
+(D-3, I-10), never disguised as ordinary work, and never permanent.
+
+**Occupancy is not damage.** There is no cap on outstanding work. A legitimately
+large uncovered window is streamed in chunks of at most 256 reservations, with
+the roots — and the coverage watermark inside them — installed durably after
+each chunk, so a crash mid-catch-up resumes at the last installed chunk instead
+of restarting or falling back to history. Marks are reclaimed only at the
+minimum watermark over every *registered* consumer, so one producer can never
+clear the only discovery mark for another that has not caught up.
+
+**Restore pins.** `CurrentActionRoots::retention_closure()` is the bounded
+interface a generation capture reads: the documents, dependency heads, pages,
+intents and sweeps that unfinished actions and explicit pending Restore still
+require. Membership means "cold relocation must keep this logical object
+reachable", not "keep this record active". Completing a sweep removes it from
+current actionable state; it does not erase its Restore predecessor page
+identity, its predecessor `FrontierV2`, or its prior intent, all of which the
+original record still carries verbatim and `begin_restore` reads back by exact
+sweep id. Historical restoreability alone never keeps a record active.
+
+### 3.2e Persistent CRDT writer lanes
+
+Every CRDT operation a device publishes is authored by a *writer lane*, not by a
+fresh per-batch peer. One device holds exactly two lanes per admitted endpoint:
+`Local` (every ordinary mutation and maintenance seal) and `External` (external
+editor reconciliation). Lanes are reused across transactions, imports, seals and
+ordinary restarts, which is what keeps a repeatedly edited document's version
+vector — and every later manifest's before-vector, and every shallow snapshot —
+O(writers) instead of O(edits). `ImportId` keeps its batch, session and
+observation roles; only the CRDT peer stops being per-import.
+
+Alongside those two Loro peers the same record saves a third identity: one
+**causal writer incarnation** (`WriterIncarnationId`, a UUID). It is the
+`CausalPeerKey` of `CoreDurableBatchContract`, so a manifest's `BatchCausalDot`
+names an incarnation, never the enrolled `DeviceId`. Device, endpoint and
+enrolment identity are untouched by any of this: `OperationBatch::author_device_id`
+still carries the one enrolled device, and one device may own several
+incarnations over its lifetime. Every batch of one incarnation — ordinary,
+local-journal, external and seal alike — shares that incarnation's single
+sequential counter chain; the two Loro roles stay distinct within it.
+
+**Allocation.** Every one of the three identities is allocated at random and
+then saved, never derived. A derived identity would let a rebuild that has lost
+the record recreate the very lane — or the very causal chain — whose published
+prefix it can no longer qualify. Production never hashes a `DeviceId` into an
+incarnation and never allocates one per batch, session or import; only tests may
+pin explicit stable fixture incarnations. The two deterministic lazy-genesis
+peers and the zero peer are never allocated.
+
+**Where the record lives.** One postcard record of at most 1 KiB per device, in
+the device-private application runtime root under `crdt-writer-lanes/lanes-<workspace>-<lineage>/writer-lanes-<device>.postcard`.
+It is app-data keyed by graph: it must not travel with the graph and it is never
+in the graph directory or in `.tine-sync` (D-11). It is not a receiver-visible
+proof of anything.
+
+**Exclusion.** No archive lease covers this namespace — two honest concurrent
+graph copies of one workspace hold two independent archive-rooted
+`WorkspaceRuntimeLease`s and would both reach the same record. Exclusion is
+therefore taken here, with the existing platform lease helper on
+`writer-lanes-<device>.lock`, and re-proved (held handle identity versus the
+currently named file) before every peer vend and every reservation. Exact-byte
+replacement is a torn-write guard, never a cross-process compare-and-swap.
+
+**Prefix durability.** The record carries a monotone `confirmed_own_counter` —
+the highest `BatchCausalDot` counter proved durable **for the saved
+incarnation**, qualified by that `CausalPeerId` and not by the device — plus at
+most one `reservation` bound to the exact `(BatchId, manifest digest)` of the
+batch about to become outwardly visible. The reservation is published before the
+trusted local journal append and before the external archive manifest commit, so
+it covers both commit paths with one barrier. It is idempotent for the same
+batch. Cost: one `replace_exact` of a fixed-size record per publishing turn —
+one temp-file `sync_all` plus one directory fsync — and nothing at all on a
+retry of an already reserved batch.
+
+**Continuation and rotation.** On open, authoritative accepted history plus the
+drained local journal supply the covered own counter **for the saved
+incarnation**; the accepted path and the trusted local-journal path each keep
+their own durability question. At most one dot can be ambiguous, and it is
+resolved by asking the archive about the exact reserved manifest fingerprint.
+Provably absent frees the dot. Anything else — durable but unrestored,
+unanswerable, a different manifest under the reserved id, or more than one
+unaccounted dot — spends it.
+
+A covered record continues its saved lanes and its saved incarnation. An
+uncovered one is **retired whole**: a fresh incarnation and two fresh Loro peers
+are saved (incarnation ordinal + 1, `confirmed_own_counter` back to zero) before
+any new authoring. Recovery is a new causal identity, never a reused counter, so
+the unprovable older prefix keeps its own identity forever and the replacement
+chain may freely restart over counters the retired chain already spent. That is
+what makes it safe to author immediately: there is no retained floor, no refused
+publication, no permanent wait for a missing offline device, and no dropped
+pending work — pending original bytes still drain and replay through the one
+existing path. The cost of a rotation is exactly one extra causal peer `P`, paid
+only for a real writer incarnation. A missing record mints a fresh incarnation
+on the same terms; an undecodable one is preserved under
+`<record>.superseded-<digest>` and rebuilt (D-1/D-3). Repeating the reopen over
+unchanged unprovable state mints one incarnation per open, not one per batch.
+Reading, repair and reopen are never blocked by any of this (I-10).
+
+**Ownership admission (receiver side).** A private lane record is not receiver
+authority. Each admitted batch's CRDT payloads are read for the peers they
+advance — `validate_update_base` has already proved each carried range starts at
+the base document's counter for that peer and ends strictly above it, so the
+update's partial end vector *is* the set of lanes it advances. Those peers are
+bound to `(author device, origin role)` on first admitted use, atomically with
+the batch that used it, and enforced on every later use, on both the accepted
+path and the trusted local-journal prefix, before any live document is touched.
+A batch claiming another device's lane, or the same device's other role, is
+refused whole (`EngineError::CrdtLaneNotOwned`) with its original bytes intact
+in the archive. Bootstrap import predates every lane: it neither claims nor binds
+one.
+
+Incoming ordinary and external batches may not advance the zero peer or either
+immutable lazy-genesis peer. Receiver admission uses the same reserved-peer set
+as private writer allocation and record validation, and refuses the whole batch
+before installing any document or ownership binding. Rejected originals remain
+available through the archive.
+
+The causal writer incarnation is admitted by the same machinery, in the same
+place, before any live fragment, ownership or effect changes. On first admitted
+use the batch's `CausalPeerId` is bound to its enrolled author device; a later
+batch of a *different* author claiming that incarnation is refused whole
+(`EngineError::CausalPeerNotOwned`). Ownership alone is not enough, because a
+sparse accepted clock covers counters without naming exact `BatchId`s: a
+gap-free accepted tip for that incarnation additionally refuses any batch whose
+claimed counter is at or below the tip unless it is the known original for that
+dot (`EngineError::CausalDotFork`). Ordinary duplicate replay of the original
+bytes therefore still succeeds, while conflicting bytes or a conflicting
+`BatchId` on an already-spent dot are rejected with the original accepted
+fragment untouched and the rejected bytes retained. Both maps are bounded by
+writer incarnations, are carried in the clean checkpoint state section
+(schema 3), and are rebuilt identically by full accepted replay — one tree, no
+second index.
+
+**Schema.** This is one coherent current format with no reader for the previous
+one (D-1): `OPERATION_SCHEMA_VERSION` 9, writer-lane record schema 2, clean
+checkpoint state schema 3. Every persisted point-index key encoding carries the
+full 16-byte incarnation UUID; none of them truncates or hashes it.
 
 ### 2.10a Durability barriers by artifact class
 
@@ -3773,3 +4337,29 @@ blob was removed from outside the ledger — antivirus quarantine, a disk
 cleaner, a partial restore. Such an entry is dead metadata whose lookups
 already answer `None`; reclaiming it is hygiene, and the ledger never warns,
 refuses, or reports a missing blob to the user.
+
+### Join activation marker replacement
+
+A semantically verified shared join holds the workspace writer lease and replaces
+its activation marker through `tine-storage::DurableDirectoryPublication::replace_exact`.
+The old marker remains named until the atomic replacement; there is no intermediate
+rename to a `.prior` name. Exact replacement bytes permit an idempotent retry after
+an uncertain outcome. Missing, malformed or unrelated markers fail closed. The
+old authority generation remains available before the commit point, and installed
+replacement authority is reopened after it. This fixes the existing join path; it
+does not enable archive rebaselining or prove its future retention closure.
+
+
+### Indexed historical callers after cold relocation
+
+Accepted engine replay, accepted projection-work reconstruction and retained
+projection-intent loading use the single ObjectStore logical resolver. Current
+projection payload pins and admission readbacks remain hot. Relocation therefore
+preserves historical logical presence without treating a cold directory listing as
+an accepted roster. Explicit full-archive provider repair/sharing publication takes
+accepted batch IDs from the engine and resolves those exact originals; it does not
+publish every physically committed hot manifest. Single-batch history republication
+and retained dependency recovery use the same resolver. Original manifest/object
+bytes remain unchanged and manifests are published after their required objects.
+These are historical read-path changes, not authorization for hot deletion or a
+claim that portable baseline join and bounded active generations are installed.

@@ -1024,6 +1024,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
+        // Current-action roots reclaim only covered cursor marks and obsolete
+        // derived roots; original receipt and sweep records remain retained.
+        (
+            "crates/tine-core/src/oplog/absence_sweep.rs",
+            "cap.remove_file",
+            2,
+        ),
+        (
+            "crates/tine-core/src/oplog/current_action_roots.rs",
+            "cap.remove_file",
+            3,
+        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
@@ -1050,13 +1062,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/lazy_genesis.rs",
             "fs.remove_file",
-            4,
+            2,
         ),
-        ("crates/tine-core/src/oplog/lazy_genesis.rs", "fs.rename", 6),
+        // Join marker replacement now crosses the shared durable boundary.
+        ("crates/tine-core/src/oplog/lazy_genesis.rs", "fs.rename", 3),
         (
             "crates/tine-core/src/oplog/lazy_genesis.rs",
             "open.create_new",
-            6,
+            5,
         ),
         (
             "crates/tine-core/src/oplog/local_completion_index.rs",
@@ -1146,7 +1159,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/receiver_absence_summary.rs",
             "cap.remove_file",
-            2,
+            3,
         ),
         ("crates/tine-core/src/oplog/sqlite.rs", "cap.create_dir", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "fs.create_dir", 1),
@@ -1197,9 +1210,12 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ),
         ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 7),
         (
+            // +1 (5 -> 6): the clean open/activation path ensures the
+            // device-private application runtime root exists before qualifying
+            // this endpoint's persistent CRDT writer lanes (P1).
             "crates/tine-core/src/sync_runtime.rs",
             "fs.create_dir_all",
-            5,
+            6,
         ),
         (
             "crates/tine-core/src/sync_runtime.rs",
@@ -1613,11 +1629,29 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         (
             "crates/tine-core/src/oplog/checkpoint_generation.rs",
             "durable_directory.open",
+            2,
+        ),
+        (
+            "crates/tine-core/src/oplog/checkpoint_generation.rs",
+            "immutable.batch",
             1,
+        ),
+        // The cold resolver publishes immutable packs and its guarded roots
+        // through existing durable-directory handles; no raw writer is added.
+        (
+            "crates/tine-core/src/oplog/cold_object_store.rs",
+            "durable_directory.open",
+            2,
         ),
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
+            1,
+        ),
+        // The join marker uses the shared exact atomic replacement primitive.
+        (
+            "crates/tine-core/src/oplog/lazy_genesis.rs",
+            "durable_directory.open",
             1,
         ),
         (
@@ -1661,6 +1695,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             1,
         ),
         (
+            // New row: the device-private CRDT writer-lane record reaches the
+            // audited durable publication family through the same shared
+            // primitive as every other authority (D-7), and never through a
+            // bespoke temp+rename (P1).
+            "crates/tine-core/src/oplog/writer_lane.rs",
+            "durable_directory.open",
+            1,
+        ),
+        (
             "crates/tine-core/src/sync_runtime.rs",
             "durable_directory.open",
             4,
@@ -1688,7 +1731,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.16.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.20.0\""));
     // Re-pinned 2026-09-02 (wave-3 packet B4): B4 added read-only
     // `open_read_only`, `property_facet_rows_after`, and `PhysicalEntityId`
     // callers without updating this census, so checkpoint 15abd615 was red here.
@@ -2025,9 +2068,59 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // Restoring those tuples reproduces the accepted 8821a0de digest exactly;
     // all surviving entries and the write-crossing table remain unchanged.
     // The adapters now compile only for the independent test oracle.
+    // Re-pinned 2026-09-07 (rebaselining R1b/1). Reviewed the production
+    // checkpoint_generation.rs diff: the existing sealed row writer is shared
+    // with the inert cutoff builder; empty roots and point membership readers
+    // qualify each delta. Imports move with that extraction. No physical write
+    // boundary changes: the independently pinned table above still matches.
+    // Join marker fix adds exactly one fully qualified shared publication open
+    // in lazy_genesis.rs. Its replace_exact method replaces the removed private
+    // two-rename protocol; g_a pins the removed raw mutation sites separately.
+    // R1b/2 adds the shared CausalTipRecordV2 constructor and one qualified
+    // SealedAcceptedIndexWriter::new call for the per-peer map. Both are in
+    // checkpoint_generation.rs; no physical write boundary changes.
+    // R1b/3 reviewed staging diff: one shared bounded regular point read,
+    // one immutable batch constructor and one retained private-directory open.
+    // The latter uses the existing single-writer publication method outside
+    // Linux. No new raw writes; the physical boundary table above adds those
+    // two constructors. Remaining changes are shared store/error type paths.
+    // R1b/4: reviewed the document-roster delta. Two more shared bounded reads
+    // resolve descriptor and checkpoint blobs; shared map reader/writer imports
+    // and the empty root serve the roster. Staging error conversion moves into
+    // the shared named-bytes helper. No additional physical write constructor
+    // or raw mutation: capsules reuse the same bounded publication handle.
+    // R1b/5: the full document-key oracle imports the existing shared
+    // authenticated_map_root and point reader, deriving the root from exactly
+    // the accepted keys. Descriptor reading moved into one reuse helper.
+    // Reviewed source adds no write boundary, raw mutation or alternate codec.
+    // Retirable document-map foundation: roster map imports and point reads
+    // move from checkpoint_generation into sealed_document_map. Full membership
+    // keys compose existing maps; their shared writer handles entity and nested
+    // pair upsert/removal. One shared bounded read loads the inner descriptor;
+    // canonical full-key qualification reuses authenticated_map_root. Reviewed
+    // the complete staged source delta: no new physical publication boundary,
+    // raw mutation, alternate tree or second object codec is introduced.
+    // Cold history and receiver point rows reuse the shared map reader/writer
+    // and audited directory publisher. Compared the complete multiset against
+    // the 404-row foundation inventory: 28 additions (18 cold resolver,
+    // 10 receiver history), no removals or changes elsewhere. The cold resolver
+    // adds the two durable-directory opens registered above; receiver rows use
+    // the existing ObjectStore publication boundary.
+    // P1 writer incarnation record: reviewed the complete 432 -> 439 row
+    // multiset. Seven additions, all in writer_lane.rs: one shared directory
+    // open, bounded record read, exact preserve/create/replace publications,
+    // nofollow lease revalidation and their import. No removals, new codec or
+    // additional raw publication path; the directory open is registered above.
+    // Combined query/rebaselining development checkpoint: independently derived
+    // and reviewed the complete 457-row / 494-occurrence surface against both
+    // parents. Query changes add owned read snapshots, bound parameters and
+    // typed failures; retired reader/candidate sites are removed. The 23-row /
+    // 32-occurrence physical write inventory exactly matches rebaselining.
+    // v0.20.0 adds disposable query progress metadata, no authority format.
+    // This census does not qualify the rebaselining development checkpoint.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1e466caf947007f2cafa3b2bb407f9ab9576a8b1a2060b452b0daae36ea405ba",
+        "b5f105f71f286e9df44dafb7e5a5ed40ad75a0a9926c138e35955bb0f6a4e181",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

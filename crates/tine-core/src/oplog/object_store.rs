@@ -29,7 +29,7 @@ use super::sync_layout::{
     ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, LINEAGE_CLAIM_FILE,
 };
 use super::{
-    BatchError, BatchId, BatchOrigin, ContentDigest, LineageDigest, ObjectDescriptor,
+    BatchError, BatchId, BatchOrigin, ContentDigest, DocumentKey, LineageDigest, ObjectDescriptor,
     OperationBatch, OperationObject, PreparedBatch, ValidatedBatch, WorkspaceId,
     MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
@@ -208,6 +208,11 @@ pub struct ObjectStoreStats {
     pub inspected_manifest_bytes: usize,
     pub inspected_object_operations: usize,
     pub inspected_object_bytes: usize,
+    /// Logical objects resolved out of cold packs. Ordinary hot paths must
+    /// leave this at zero; it is the oracle for MS-02's per-consumer
+    /// hot-only / indexed-cold classification.
+    pub cold_object_reads: usize,
+    pub cold_manifest_reads: usize,
 }
 
 #[derive(Debug, Default)]
@@ -220,6 +225,26 @@ struct StoreCounters {
     inspected_manifest_bytes: AtomicUsize,
     inspected_object_operations: AtomicUsize,
     inspected_object_bytes: AtomicUsize,
+    cold_object_reads: AtomicUsize,
+    cold_manifest_reads: AtomicUsize,
+}
+
+/// How one logical read is permitted to resolve its bytes.
+///
+/// MS-02 5.3 gives every consumer a permanent hot-only / indexed-cold /
+/// forbidden classification. This type is where that classification lives in
+/// code: an ordinary path cannot reach a pack byte by accident, because the
+/// hot-only reader has no cold branch at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalReadClass {
+    /// Hot originals only. An absent hot name is ordinary absence. Page
+    /// open/save/move, the SQLite applier, projection payload pins and the
+    /// operational coordinator's admission path all read this way.
+    HotOnly,
+    /// Hot original first, then one indexed cold lookup bounded by this
+    /// object's own index path and byte range. Never an enumeration, never a
+    /// history scan.
+    HotThenIndexedCold,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -718,8 +743,21 @@ impl ObjectStore {
 
     /// Inspect a single manifest and validate every present required object.
     /// Missing objects stage the batch; corrupt or mismatched objects reject it.
+    ///
+    /// This is the ordinary hot-only path: it never touches the cold locator
+    /// index or a pack byte. Named historical consumers use
+    /// [`Self::inspect_batch_with_cold_history`] instead.
     #[track_caller]
     pub fn inspect_batch(&self, batch_id: BatchId) -> Result<BatchInspection, StoreError> {
+        self.inspect_batch_impl(batch_id, LogicalReadClass::HotOnly)
+    }
+
+    #[track_caller]
+    fn inspect_batch_impl(
+        &self,
+        batch_id: BatchId,
+        class: LogicalReadClass,
+    ) -> Result<BatchInspection, StoreError> {
         INSPECT_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
         let site = super::inspect_site_trace_enabled().then(|| {
             let caller = std::panic::Location::caller();
@@ -729,8 +767,16 @@ impl ObjectStore {
         let filename = manifest_filename(batch_id);
         let manifest_bytes =
             match read_optional_regular(&batches, &filename, MAX_MANIFEST_BYTES as u64, None)? {
-                None => return Ok(BatchInspection::Absent),
                 Some(bytes) => bytes,
+                None => match class {
+                    LogicalReadClass::HotOnly => return Ok(BatchInspection::Absent),
+                    LogicalReadClass::HotThenIndexedCold => {
+                        match self.cold_manifest_bytes(batch_id)? {
+                            Some(bytes) => bytes,
+                            None => return Ok(BatchInspection::Absent),
+                        }
+                    }
+                },
             };
         self.counters
             .inspected_manifest_operations
@@ -767,15 +813,29 @@ impl ObjectStore {
                 .inspected_object_operations
                 .fetch_add(1, Ordering::Relaxed);
             let filename = object_filename(descriptor.content_digest());
-            let Some(bytes) = read_optional_regular(
+            let hot = read_optional_regular(
                 &objects_dir,
                 &filename,
                 MAX_OBJECT_BYTES as u64,
                 Some(descriptor.encoded_byte_length()),
-            )?
-            else {
-                missing.push(descriptor.clone());
-                continue;
+            )?;
+            let bytes = match hot {
+                Some(bytes) => bytes,
+                None => match class {
+                    LogicalReadClass::HotOnly => {
+                        missing.push(descriptor.clone());
+                        continue;
+                    }
+                    LogicalReadClass::HotThenIndexedCold => {
+                        match self.cold_object_bytes(descriptor.content_digest())? {
+                            Some(bytes) => bytes,
+                            None => {
+                                missing.push(descriptor.clone());
+                                continue;
+                            }
+                        }
+                    }
+                },
             };
             self.counters
                 .inspected_object_bytes
@@ -823,7 +883,7 @@ impl ObjectStore {
     pub(crate) fn reload_accepted_document_object(
         &self,
         manifest: &OperationBatch,
-        document_id: super::DocumentId,
+        document_id: super::DocumentKey,
     ) -> Result<OperationObject, StoreError> {
         let batch_id = manifest.batch_id();
         let descriptor = manifest
@@ -1454,6 +1514,264 @@ impl ObjectStore {
     }
 }
 
+/// The single logical-object resolver.
+///
+/// Production already consumes it: SQLite projection rebuild -- the full replay
+/// of accepted history -- resolves its manifests, semantic effects and whole
+/// batches here (`oplog::sqlite::AcceptedBatchEvent::{from_accepted,
+/// from_indexed}`). The remaining indexed-cold consumers -- Restore, historical
+/// admission, republication and previous-generation fallback -- live in
+/// `sync_runtime.rs` and `hot_engine.rs`, which other live lanes own; RECEIPT.md
+/// hands those exact call sites to the manager. `#[allow(dead_code)]` covers the
+/// members only that gap and the maintenance entry points still reach.
+#[allow(dead_code)]
+impl ObjectStore {
+    /// Inspect a batch whose hot originals may already have been relocated.
+    ///
+    /// Identical to [`Self::inspect_batch`] except that an absent hot manifest
+    /// or object falls through to the single cold resolver. Reserved for the
+    /// named indexed-cold consumers -- Restore, historical admission,
+    /// republication, previous-generation fallback and full replay.
+    #[track_caller]
+    pub(crate) fn inspect_batch_with_cold_history(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<BatchInspection, StoreError> {
+        self.inspect_batch_impl(batch_id, LogicalReadClass::HotThenIndexedCold)
+    }
+
+    // -----------------------------------------------------------------------
+    // The single logical-object resolver
+    //
+    // Every logical read in this crate already funnels through this type, so
+    // routing the cold tier here -- rather than into any consumer -- is what
+    // makes "one resolver, no hidden second reader" structural rather than a
+    // convention. `read_object`/`read_manifest`/`inspect_batch` stay hot-only;
+    // the `resolve_*` family below is the indexed-cold surface, and nothing
+    // else in the crate opens a pack.
+    // -----------------------------------------------------------------------
+
+    /// Hot object bytes, or `None` when the hot name is absent. Integrity is
+    /// still proved for a present object.
+    fn optional_hot_object_bytes(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        let Some(bytes) = read_optional_regular(
+            &objects,
+            &object_filename(digest),
+            MAX_OBJECT_BYTES as u64,
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        if ContentDigest::of(&bytes) != digest {
+            return Err(StoreError::ObjectPathMismatch(digest));
+        }
+        let object = OperationObject::decode(&bytes)?;
+        if object.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: object.workspace_id(),
+            });
+        }
+        Ok(Some(bytes))
+    }
+
+    fn optional_hot_manifest_bytes(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let batches = self.open_namespace(BATCHES_DIR)?;
+        read_optional_regular(
+            &batches,
+            &manifest_filename(batch_id),
+            MAX_MANIFEST_BYTES as u64,
+            None,
+        )
+    }
+
+    /// One indexed cold object lookup. Absence of any cold history at all is
+    /// `None`, not a refusal: an archive that never relocated anything is
+    /// healthy.
+    fn cold_object_bytes(&self, digest: ContentDigest) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(reader) = super::cold_object_store::ColdHistoryReader::open(self)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = reader.object_bytes(digest)? else {
+            return Ok(None);
+        };
+        // Cold bytes are the canonical original: re-prove the content address
+        // and workspace binding exactly as the hot reader does.
+        if ContentDigest::of(&bytes) != digest {
+            return Err(StoreError::ObjectPathMismatch(digest));
+        }
+        let object = OperationObject::decode(&bytes)?;
+        if object.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: object.workspace_id(),
+            });
+        }
+        self.counters
+            .cold_object_reads
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(bytes))
+    }
+
+    fn cold_manifest_bytes(&self, batch_id: BatchId) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(reader) = super::cold_object_store::ColdHistoryReader::open(self)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = reader.manifest_bytes(batch_id)? else {
+            return Ok(None);
+        };
+        let manifest = OperationBatch::decode(&bytes)?;
+        if manifest.batch_id() != batch_id {
+            return Err(StoreError::ManifestPathMismatch {
+                expected: batch_id,
+                found: manifest.batch_id(),
+            });
+        }
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            });
+        }
+        self.counters
+            .cold_manifest_reads
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(bytes))
+    }
+
+    /// Resolve one logical object's exact canonical bytes, hot original first.
+    ///
+    /// Reserved for the named indexed-cold consumers. Work is bounded by this
+    /// object's index path and byte range; no pack or manifest namespace is
+    /// enumerated, and unrelated history is never touched.
+    pub(crate) fn resolve_logical_object_bytes(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<Vec<u8>, StoreError> {
+        if let Some(bytes) = self.optional_hot_object_bytes(digest)? {
+            self.counters
+                .inspected_object_operations
+                .fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .inspected_object_bytes
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+            return Ok(bytes);
+        }
+        self.cold_object_bytes(digest)?
+            .ok_or(StoreError::ColdObjectUnavailable {
+                digest,
+                reason: "no hot original and no cold locator".into(),
+            })
+    }
+
+    /// Resolve and decode one logical object, hot original first.
+    pub(crate) fn resolve_logical_object(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<OperationObject, StoreError> {
+        Ok(OperationObject::decode(
+            &self.resolve_logical_object_bytes(digest)?,
+        )?)
+    }
+
+    /// Resolve one batch manifest's exact canonical bytes, hot original first.
+    pub(crate) fn resolve_logical_manifest_bytes(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<u8>, StoreError> {
+        if let Some(bytes) = self.optional_hot_manifest_bytes(batch_id)? {
+            let manifest = OperationBatch::decode(&bytes)?;
+            if manifest.batch_id() != batch_id {
+                return Err(StoreError::ManifestPathMismatch {
+                    expected: batch_id,
+                    found: manifest.batch_id(),
+                });
+            }
+            if manifest.workspace_id() != self.workspace_id {
+                return Err(StoreError::WorkspaceMismatch {
+                    expected: self.workspace_id,
+                    found: manifest.workspace_id(),
+                });
+            }
+            return Ok(bytes);
+        }
+        self.cold_manifest_bytes(batch_id)?
+            .ok_or(StoreError::ColdManifestUnavailable {
+                batch_id,
+                reason: "no hot original and no cold locator".into(),
+            })
+    }
+
+    /// Resolve and decode one batch manifest, hot original first. `None` means
+    /// the batch is unknown to both tiers.
+    pub(crate) fn resolve_logical_manifest(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<OperationBatch>, StoreError> {
+        if let Some(manifest) = self.read_manifest(batch_id)? {
+            return Ok(Some(manifest));
+        }
+        let Some(bytes) = self.cold_manifest_bytes(batch_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(OperationBatch::decode(&bytes)?))
+    }
+
+    /// Whether this logical object is retrievable from either tier.
+    pub(crate) fn contains_logical_object(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<bool, StoreError> {
+        if self.contains_object(digest)? {
+            return Ok(true);
+        }
+        Ok(self.cold_object_bytes(digest)?.is_some())
+    }
+
+    /// Additively relocate these batches' exact hot originals into cold packs.
+    /// Nothing hot is removed here; see `cold_object_store` for why.
+    pub(crate) fn publish_cold_history_for_batches(
+        &self,
+        batches: &BTreeSet<BatchId>,
+    ) -> Result<super::cold_object_store::ColdPublicationOutcome, StoreError> {
+        super::cold_object_store::publish_cold_history_for_batches(self, batches)
+    }
+
+    /// Republish every cold record into fresh packs and rebuild the locator
+    /// index from pack footers alone.
+    pub(crate) fn repack_cold_history(
+        &self,
+    ) -> Result<super::cold_object_store::ColdPublicationOutcome, StoreError> {
+        super::cold_object_store::repack_cold_history(self)
+    }
+
+    /// Recover a lost cold-history root marker from the preserved packs.
+    ///
+    /// The explicit damaged-state operation behind
+    /// [`StoreError::ColdHistoryRootMissing`]. Healthy archives are untouched.
+    pub(crate) fn repair_cold_history_root(
+        &self,
+    ) -> Result<super::cold_object_store::ColdRepairOutcome, StoreError> {
+        super::cold_object_store::repair_cold_history_root(self)
+    }
+
+    /// The current cold lookup roots, or `None` when this archive has never
+    /// relocated anything.
+    pub(crate) fn cold_history_roots(
+        &self,
+    ) -> Result<Option<super::cold_object_store::ColdHistoryRootsV1>, StoreError> {
+        Ok(super::cold_object_store::ColdHistoryReader::open(self)?.map(|reader| reader.roots()))
+    }
+}
+
 impl StoreCounters {
     fn snapshot(&self) -> ObjectStoreStats {
         ObjectStoreStats {
@@ -1467,6 +1785,8 @@ impl StoreCounters {
             inspected_manifest_bytes: self.inspected_manifest_bytes.load(Ordering::Relaxed),
             inspected_object_operations: self.inspected_object_operations.load(Ordering::Relaxed),
             inspected_object_bytes: self.inspected_object_bytes.load(Ordering::Relaxed),
+            cold_object_reads: self.cold_object_reads.load(Ordering::Relaxed),
+            cold_manifest_reads: self.cold_manifest_reads.load(Ordering::Relaxed),
         }
     }
 }
@@ -1563,7 +1883,7 @@ pub enum StoreError {
     },
     AcceptedDocumentUpdateMissing {
         batch_id: BatchId,
-        document_id: super::DocumentId,
+        document_id: super::DocumentKey,
     },
     UpgradeRequired {
         store: &'static str,
@@ -1587,6 +1907,33 @@ pub enum StoreError {
     MisboundPageNameCatalogFrontier,
     LineageClaimCollision(LineageDigest),
     ImmutableCollision(&'static str),
+    /// The cold locator index itself could not be read. Hot and current state
+    /// remain usable; only indexed historical lookups are affected.
+    ColdHistoryIndexUnavailable(String),
+    /// Cold packs are preserved but their derived root marker is gone. This is
+    /// a named repair condition (I-8), never ordinary absence: the packs are
+    /// self-describing, so `repair_cold_history_root` recovers the index from
+    /// them. Hot and current state remain usable throughout.
+    ColdHistoryRootMissing,
+    /// Two different canonical manifests claim the same `BatchId`. A `BatchId`
+    /// is an identity, not a content address, so this is a collision and never
+    /// a successfully archived exact copy. The predecessor bytes are preserved.
+    ColdManifestConflict {
+        batch_id: BatchId,
+        reason: String,
+    },
+    /// This exact logical object is not retrievable from cold history. The
+    /// refusal names the affected logical object (I-8) and leaves every other
+    /// object, hot or cold, unaffected.
+    ColdObjectUnavailable {
+        digest: ContentDigest,
+        reason: String,
+    },
+    /// This exact batch manifest is not retrievable from cold history.
+    ColdManifestUnavailable {
+        batch_id: BatchId,
+        reason: String,
+    },
     BootstrapBatchRequiresDirectPublication,
     InactiveBootstrapHistory,
     StoredLengthMismatch {
@@ -1683,6 +2030,25 @@ impl fmt::Display for StoreError {
             Self::ImmutableCollision(kind) => {
                 write!(f, "immutable {kind} collision")
             }
+            Self::ColdHistoryIndexUnavailable(reason) => {
+                write!(f, "cold history index is unavailable: {reason}")
+            }
+            Self::ColdHistoryRootMissing => f.write_str(
+                "cold history packs are preserved but their root marker is missing: \
+                 repair the cold history index before publishing or reading it",
+            ),
+            Self::ColdManifestConflict { batch_id, reason } => write!(
+                f,
+                "cold logical manifest {batch_id} conflicts with archived history: {reason}"
+            ),
+            Self::ColdObjectUnavailable { digest, reason } => write!(
+                f,
+                "cold logical object {digest} is unavailable: {reason}"
+            ),
+            Self::ColdManifestUnavailable { batch_id, reason } => write!(
+                f,
+                "cold logical manifest {batch_id} is unavailable: {reason}"
+            ),
             Self::BootstrapBatchRequiresDirectPublication => {
                 f.write_str("bootstrap batches require bootstrap-specific direct publication")
             }

@@ -945,11 +945,14 @@ mod tests {
         BatchId::from_uuid(Uuid::from_u128(value))
     }
 
+    /// Explicit, order-stable fixture writer incarnations. The deterministic
+    /// tie-break these tests exercise compares `(causal dot, batch ID)`, so the
+    /// fixture keeps peer ordering following `value` exactly as before.
     fn dot(value: u64) -> BatchCausalDot {
         BatchCausalDot::new(
-            CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(
-                10_000 + u128::from(value),
-            ))),
+            CausalPeerId::from_key(crate::oplog::WriterIncarnationId::from_uuid(
+                Uuid::from_u128(10_000 + u128::from(value)),
+            )),
             value,
         )
         .unwrap()
