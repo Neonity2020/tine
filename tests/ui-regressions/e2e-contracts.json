@@ -1,6 +1,18 @@
 {
  "schemaVersion": 1,
  "scenarios": {
+  "scripts/e2e-query-result-scroll.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Completing a TODO in a long multiline query removes that result while preserving surviving result components and the reader's visible place.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": ["Subpixel layout rounding within the harness tolerance."],
+   "nonRequirements": ["This synthetic control is not proof of the cause of every reported query scroll jump."],
+   "stability": "stable"
+  },
   "scripts/e2e-alias.mjs": {
    "contracts": [
     {

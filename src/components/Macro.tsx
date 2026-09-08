@@ -1001,25 +1001,48 @@ export function QueryMacro(props: {
     if (!answer.rows.length) return "Nothing in this graph matches this query.";
     return null;
   };
-  // A `(sort-by …)` query is sorted GLOBALLY by the engine and returned as one
-  // block per group in that order — so the list view must render flat (a single
-  // ordered sequence with a per-row page breadcrumb), not grouped by page, or the
-  // global order would be lost to page headers.
-  // The engine sorts GLOBALLY when the view carries a sort, returning one block
-  // per group in that order — so the list view must render flat (one ordered
-  // sequence with a per-row breadcrumb) or the global order is lost to page
-  // headers. Which is read off the parsed view, not re-detected in the text.
+  // Sorted results retain the engine's global sequence. Page-level sorting can
+  // still return several blocks per group; presentation cannot assume every
+  // group is one row or use its changing membership as a component identity.
   const globalSort = createMemo(() => (view().sort ?? []).length > 0);
-  const queryGroupKey = (group: RefGroup, flat: boolean) =>
-    flat
-      ? `${group.kind}\0${group.page}\0${group.path ?? ""}\0${group.blocks.map((block) => block.id).join("\0")}`
-      : `${group.kind}\0${group.page}\0${group.path ?? ""}`;
+  const queryGroupKey = (group: RefGroup) =>
+    JSON.stringify([group.kind, group.page, group.path ?? ""]);
   const groupedQueryByKey = createMemo(() =>
-    new Map((groups() ?? []).map((group) => [queryGroupKey(group, false), group] as const))
+    new Map((groups() ?? []).map((group) => [queryGroupKey(group), group] as const))
   );
-  const flatQueryByKey = createMemo(() =>
-    new Map((groups() ?? []).map((group) => [queryGroupKey(group, true), group] as const))
-  );
+  // Retain group ownership through membership edits. Page-level sorts can
+  // return several blocks in a group; block-level sorts can split a page into
+  // many groups. Match by surviving physical block identities in linear work,
+  // rather than putting the whole membership list into a component key. Keep
+  // LiveRefGroup boundaries intact for navigation, disclosure and lazy loading.
+  let nextFlatGroupKey = 0;
+  const flatQueryByKey = createMemo((previous: Map<string, RefGroup> | undefined) => {
+    const previousOwners = new Map<string, Map<string, string>>();
+    for (const [key, group] of previous ?? []) {
+      const pageKey = queryGroupKey(group);
+      let owners = previousOwners.get(pageKey);
+      if (!owners) { owners = new Map(); previousOwners.set(pageKey, owners); }
+      for (const block of group.blocks) {
+        owners.set(block.id, key);
+      }
+    }
+    const next = new Map<string, RefGroup>();
+    for (const group of groups() ?? []) {
+      const overlaps = new Map<string, number>();
+      const owners = previousOwners.get(queryGroupKey(group));
+      for (const block of group.blocks) {
+        const owner = owners?.get(block.id);
+        if (owner !== undefined && !next.has(owner)) overlaps.set(owner, (overlaps.get(owner) ?? 0) + 1);
+      }
+      let retained: string | undefined;
+      let largest = 0;
+      for (const [key, count] of overlaps) {
+        if (count > largest) { retained = key; largest = count; }
+      }
+      next.set(retained ?? `query-group-${nextFlatGroupKey++}`, group);
+    }
+    return next;
+  });
   const [sortCol, setSortCol] = createSignal<string>("");
   const [sortDir, setSortDir] = createSignal(1);
 

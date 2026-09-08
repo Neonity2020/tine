@@ -2,6 +2,32 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-QUERY-TODO-SCROLL-POSITION-20260907",
+      "title": "Completing a TODO in a long multiline query should preserve the reader's place",
+      "family": "query-results",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "reported",
+      "coverage": { "tests": [], "scenario": "query.todo-scroll-position", "failBefore": "unavailable" },
+      "notes": "User reports a jump after completing a result. Synthetic native grouped, same-host, incremental-scroll and page-sorted controls have not reproduced viewport movement. Page sorting did reproduce a related remount defect, tracked separately; correcting it does not close this report. Exact query, view and platform remain pending. Campaign QUERY-RESULT-SCROLL-REPORT.md records evidence."
+    },
+    {
+      "id": "UI-QUERY-SORTED-GROUP-CONTINUITY-20260908",
+      "title": "Removing a sorted query result preserves surviving result components",
+      "family": "query-results",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/components/QueryMacro.test.tsx::keeps sorted result nodes mounted when another result disappears"],
+        "scenario": "query.sorted-group-continuity",
+        "failBefore": "proven"
+      },
+      "notes": "Page-sorted native TODO control loses unchanged row/group DOM identity after completing one member, while measured viewport geometry stays unchanged. Render regression fails before and passes after retaining group ownership through surviving physical block IDs. Original group boundaries, navigation and lazy mounting stay intact. Native after verification remains pending; this is not a claim that the user's viewport-jump report is fixed."
+    },
+    {
       "id": "UI-PDF-READER-POSITION-LOST-ON-ZOOM-20260904",
       "title": "Zooming a PDF no longer throws the reader back to page 1, and the reading position survives a relaunch",
       "family": "pdf-reader-routes",

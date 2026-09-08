@@ -193,6 +193,47 @@ function loadAdvancedQueryDoc(queryRaw: string) {
 }
 
 describe("QueryMacro sheet integration", () => {
+  it("keeps sorted result nodes mounted when another result disappears", async () => {
+    const form = "(task TODO) (sort-by page asc)";
+    setDoc({
+      byId: {
+        query: node("query", `{{query ${form}}}`, null),
+        "hit-a": node("hit-a", "TODO First\nMultiline first detail", null),
+        "hit-b": node("hit-b", "TODO Second\nMultiline second detail", null),
+        "hit-c": node("hit-c", "TODO Third\nMultiline third detail", null),
+      },
+      pages: [page(["query", "hit-a", "hit-b", "hit-c"])],
+      feed: ["Sheet"], loaded: true,
+    });
+    backendReadsQueries({ [form]: { form, view: { sort: [["page", "asc"]] } } });
+    let ids = ["hit-a", "hit-b", "hit-c"];
+    const run = vi.spyOn(backend(), "queryRun").mockImplementation(async () => blockResult(queryGroups(ids)));
+    const { root, dispose } = mount(() => <Block id="query" />);
+    const result = (id: string) => root.querySelector(`.query-group [data-block-id="${id}"]`);
+    try {
+      await vi.waitFor(() => expect(result("hit-c")).not.toBeNull());
+      const first = result("hit-a")!;
+      const last = result("hit-c")!;
+      expect(root.querySelectorAll(".query-crumb")).toHaveLength(1);
+      ids = ["hit-a", "hit-c"];
+      bumpDataRev();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(result("hit-b")).toBeNull());
+      expect(first.isConnected).toBe(true);
+      expect(result("hit-a")).toBe(first);
+      expect(result("hit-c")).toBe(last);
+      // Removing the first member must not just transfer the unstable group
+      // key to the next member and recreate the rest of the page again.
+      ids = ["hit-c"];
+      bumpDataRev();
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(result("hit-a")).toBeNull());
+      expect(result("hit-c")).toBe(last);
+      expect(last.isConnected).toBe(true);
+      expect(root.querySelectorAll(".query-crumb")).toHaveLength(1);
+    } finally { dispose(); }
+  });
+
   it("shows bounded ancestor context for list-query hits", async () => {
     setDoc({
       byId: {
