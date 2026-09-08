@@ -228,8 +228,15 @@ impl QueryJobOwner {
 
     /// Refuse every future admission, then drain. Used when the graph closes.
     pub(crate) fn close(&self) {
+        let fence = self.begin_close();
+        self.wait_for_drain(fence);
+    }
+
+    /// Close admission before the producer rejects its queued captures. The
+    /// caller drops those leases before waiting outside its queue lock.
+    pub(crate) fn begin_close(&self) -> QueryDrainFence {
         self.state.lock().unwrap().closed = true;
-        self.cancel_all_and_drain();
+        self.begin_drain()
     }
 
     #[cfg(test)]
