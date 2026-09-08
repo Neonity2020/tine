@@ -23,9 +23,10 @@
 //! AST. `sqlparser`'s `Display` cannot produce either of the two things the
 //! canonical form is defined by — `[[x]]` restored for a `refs` leaf, and the
 //! K10 line layout with `-- ` prefixes — so a rebuilt AST would be
-//! post-processed into unrecognisability. The round-trip property
-//! (`parse(print(q)).normalized() == q.normalized()`) is what actually pins
-//! this printer, and it is asserted below over every shape the parsers build.
+//! post-processed into unrecognisability. Semantic round-trip is pinned over
+//! every parser shape, and editable TQL additionally preserves n-ary sibling
+//! lists and explicit same-operator parentheses exactly: those boundaries are
+//! controls in the query sheet even when boolean evaluation could flatten them.
 
 use crate::query::ir::{
     Anchor, Attr, CmpOp, Diagnostic, DiagnosticKind, Filter, Leaf, Quant, Query, Rel, SortDir,
@@ -170,12 +171,11 @@ fn with_options(form: String, options: &str) -> String {
 /// the anchor alone says the same thing. Every `Off` prints inline as `off(…)`;
 /// the `-- ` layout is the pane's, not the document's.
 fn print_tql_macro(query: &Query) -> String {
-    let query = query.normalized();
     let anchor = match query.anchor {
         Anchor::Block => "@block",
         Anchor::Page => "@page",
     };
-    if query.filter == Filter::True {
+    if tql_root_is_true(&query.filter) {
         return anchor.to_string();
     }
     format!("{anchor} and {}", tql_expr(&query.filter, Prec::Or))
@@ -195,16 +195,14 @@ enum Prec {
 }
 
 pub fn print_tql(query: &Query) -> String {
-    // The canonical form is the normalized tree: identity operands (the
-    // `Filter::True` a view directive contributes, an empty `and`) are not part
-    // of what the author wrote, and printing them back would make the round
-    // trip depend on parser bookkeeping.
-    let query = &query.normalized();
+    // Print the editable tree itself. `Query::normalized()` is appropriate for
+    // semantic comparison and OG's simplified form, but it flattens an explicit
+    // same-kind child group that the sheet must recover after save.
     let anchor = match query.anchor {
         Anchor::Block => "",
         Anchor::Page => "@page",
     };
-    if query.filter == Filter::True {
+    if tql_root_is_true(&query.filter) {
         return if anchor.is_empty() {
             "@block".to_string()
         } else {
@@ -234,6 +232,10 @@ fn root_operands(filter: &Filter) -> Vec<&Filter> {
     }
 }
 
+fn tql_root_is_true(filter: &Filter) -> bool {
+    matches!(filter, Filter::True) || matches!(filter, Filter::And { items } if items.is_empty())
+}
+
 fn contains_off(filter: &&Filter) -> bool {
     matches!(filter, Filter::Off { .. })
 }
@@ -242,9 +244,9 @@ fn contains_off(filter: &&Filter) -> bool {
 /// lines prefixed `-- `, and a bare `--` between two consecutive root `Off`
 /// siblings so the pre-pass reads them back as two nodes (N2).
 fn print_tql_layered(filter: &Filter) -> String {
-    let connector = match filter {
-        Filter::Or { .. } => "or ",
-        _ => "and ",
+    let (connector, parent) = match filter {
+        Filter::Or { .. } => ("or ", Prec::Or),
+        _ => ("and ", Prec::And),
     };
     let operands = root_operands(filter);
     let mut lines: Vec<String> = Vec::new();
@@ -256,11 +258,14 @@ fn print_tql_layered(filter: &Filter) -> String {
                 if previous_was_off {
                     lines.push("--".to_string());
                 }
-                lines.push(format!("-- {lead}{}", tql_expr(inner, Prec::And)));
+                lines.push(format!(
+                    "-- {lead}{}",
+                    tql_expr(off_content(inner), Prec::And)
+                ));
                 previous_was_off = true;
             }
             other => {
-                lines.push(format!("{lead}{}", tql_expr(other, Prec::And)));
+                lines.push(format!("{lead}{}", tql_group_item(other, parent)));
                 previous_was_off = false;
             }
         }
@@ -274,6 +279,28 @@ fn parens(text: String, needed: bool) -> String {
     } else {
         text
     }
+}
+
+/// Keep a same-operator child visibly parenthesized. Precedence alone cannot
+/// distinguish `a and (b and c)` from `a and b and c`, but the sheet can: the
+/// former is a nested authored group and the latter is three siblings.
+fn tql_group_item(filter: &Filter, parent: Prec) -> String {
+    let text = tql_expr(filter, parent);
+    let same_group = match parent {
+        Prec::And => matches!(filter, Filter::And { .. }),
+        Prec::Or => matches!(filter, Filter::Or { .. }),
+        Prec::Not | Prec::Atom => false,
+    };
+    parens(text, same_group)
+}
+
+// Repeated disabling has one persisted representation. Keep this narrow
+// canonicalization separate from boolean group structure, which is editable.
+fn off_content(mut filter: &Filter) -> &Filter {
+    while let Filter::Off { inner } = filter {
+        filter = inner;
+    }
+    filter
 }
 
 fn tql_expr(filter: &Filter, context: Prec) -> String {
@@ -290,23 +317,29 @@ fn tql_expr(filter: &Filter, context: Prec) -> String {
         ),
         // Below the root every `Off` prints inline as the function form, which
         // is legal TQL (§4.2.3) and is what the parser reads back.
-        Filter::Off { inner } => format!("off({})", tql_expr(inner, Prec::Or)),
+        Filter::Off { inner } => format!("off({})", tql_expr(off_content(inner), Prec::Or)),
         Filter::Not { inner } => parens(
             format!("not {}", tql_expr(inner, Prec::Not)),
             context > Prec::Not,
         ),
         Filter::And { items } => {
+            if items.is_empty() {
+                return "true".to_string();
+            }
             let text = items
                 .iter()
-                .map(|item| tql_expr(item, Prec::And))
+                .map(|item| tql_group_item(item, Prec::And))
                 .collect::<Vec<_>>()
                 .join(" and ");
             parens(text, context > Prec::And)
         }
         Filter::Or { items } => {
+            if items.is_empty() {
+                return "false".to_string();
+            }
             let text = items
                 .iter()
-                .map(|item| tql_expr(item, Prec::Or))
+                .map(|item| tql_group_item(item, Prec::Or))
                 .collect::<Vec<_>>()
                 .join(" or ");
             parens(text, context > Prec::Or)
@@ -949,6 +982,108 @@ mod tests {
             query.normalized(),
             "{source} printed as {printed:?}"
         );
+    }
+
+    /// The sheet edits group boundaries, so semantic normalization is too weak
+    /// for its persisted TQL. This checks the actual filter returned to the UI.
+    fn round_trips_exactly(source: &str) {
+        let query = tql(source);
+        assert!(
+            !query.is_invalid(),
+            "{source} did not parse: {:?}",
+            query.diagnostics
+        );
+
+        let pane = print_tql(&query);
+        let pane_again = tql(&pane);
+        assert_eq!(
+            pane_again.filter, query.filter,
+            "{source} printed in the pane as {pane:?}"
+        );
+
+        let persisted = query_print(
+            &query,
+            &ViewSettings::default(),
+            PrintDialect::TqlMacro,
+            false,
+        )
+        .unwrap_or_else(|diagnostic| panic!("{source} was refused: {diagnostic:?}"));
+        let macro_again = tql(&persisted);
+        assert_eq!(
+            macro_again.filter, query.filter,
+            "{source} printed in the macro as {persisted:?}",
+        );
+    }
+
+    #[test]
+    fn tql_preserves_flat_chains_and_explicit_group_boundaries_exactly() {
+        for source in [
+            "#a and #b and #c",
+            "#a and #b and #c and #d",
+            "#a or #b or #c",
+            "#a or #b or #c or #d",
+            "#a and (#b and #c) and #d",
+            "#a or (#b or #c) or #d",
+            "#a and (#b or #c) and #d",
+            "off(#a) and (#b and #c) and not (#d or #e)",
+        ] {
+            round_trips_exactly(source);
+        }
+    }
+
+    #[test]
+    fn repeated_off_collapses_without_flattening_its_authored_group() {
+        let query = tql("off(off(#a and (#b and #c)))");
+        let expected = tql("off(#a and (#b and #c))");
+        assert_eq!(tql(&print_tql(&query)).filter, expected.filter);
+        assert_eq!(tql(&print_tql_macro(&query)).filter, expected.filter);
+    }
+
+    #[test]
+    fn layered_tql_keeps_a_same_kind_group_beside_an_off_sibling() {
+        let query = tql("off(#a) and (#b and #c) and #d");
+        let printed = print_tql(&query);
+        assert!(
+            printed.contains("and ([[b]] and [[c]])"),
+            "printed as {printed:?}"
+        );
+        assert_eq!(tql(&printed).filter, query.filter);
+    }
+
+    #[test]
+    fn reopened_structural_tql_accepts_an_edit_and_round_trips_again() {
+        let original = tql("off(#a) and (#b or #c) and (#d and #e)");
+        let first = query_print(
+            &original,
+            &ViewSettings::default(),
+            PrintDialect::TqlMacro,
+            false,
+        )
+        .expect("the first save is representable");
+        let mut reopened = tql(&first);
+        assert_eq!(reopened.filter, original.filter);
+
+        let Filter::And { items } = &mut reopened.filter else {
+            panic!("the reopened root is the authored all-of group");
+        };
+        items.push(Filter::page_ref("f"));
+        let edited = reopened.filter.clone();
+        let second = query_print(
+            &reopened,
+            &ViewSettings::default(),
+            PrintDialect::TqlMacro,
+            false,
+        )
+        .expect("the edited save is representable");
+        assert_eq!(tql(&second).filter, edited);
+    }
+
+    #[test]
+    fn p6_tql_printer_preserves_an_explicit_same_kind_group() {
+        let query = tql("#a and (#b and #c) and #d");
+        let printed = print_tql(&query);
+        let again = tql(&printed);
+        assert_eq!(again.filter, query.filter, "printed as {printed:?}");
     }
 
     #[test]

@@ -68,7 +68,6 @@ pub(crate) fn parse_tql_with_options(
             }
             None => {
                 let mut lower = Lower {
-                    anchor: pre.anchor,
                     diagnostics: &mut diagnostics,
                     registry,
                     disabled_depth: 0,
@@ -648,7 +647,6 @@ enum Target {
 }
 
 struct Lower<'a> {
-    anchor: Anchor,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// The snapshot `UnknownIdent` suggestions are drawn from (§4.2.2, §6.2).
     /// Never consulted for anything else: the vocabulary is the whitelist in
@@ -706,15 +704,58 @@ impl Lower<'_> {
                 left,
                 op: BinaryOperator::And,
                 right,
-            } => Filter::and(vec![self.filter(left, scope), self.filter(right, scope)]),
+            } => {
+                let mut items = Vec::new();
+                self.and_items(left, scope, &mut items);
+                self.and_items(right, scope, &mut items);
+                Filter::and(items)
+            }
             Expr::BinaryOp {
                 left,
                 op: BinaryOperator::Or,
                 right,
-            } => Filter::or(vec![self.filter(left, scope), self.filter(right, scope)]),
+            } => {
+                let mut items = Vec::new();
+                self.or_items(left, scope, &mut items);
+                self.or_items(right, scope, &mut items);
+                Filter::or(items)
+            }
             // Everything else is ONE condition of the author's, which is the
             // unit §7.4 retains when it does not apply to the anchor.
             leaf => self.leaf(leaf, scope),
+        }
+    }
+
+    /// sqlparser represents an unparenthesized boolean chain as a binary tree.
+    /// That associativity is parser bookkeeping, not an authored query-sheet
+    /// group: collect one n-ary group while a same-kind child is directly part
+    /// of the chain. `Expr::Nested` deliberately stops this walk, so explicit
+    /// parentheses survive as a nested same-kind group.
+    fn and_items(&mut self, expr: &Expr, scope: Scope, items: &mut Vec<Filter>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                self.and_items(left, scope, items);
+                self.and_items(right, scope, items);
+            }
+            other => items.push(self.filter(other, scope)),
+        }
+    }
+
+    fn or_items(&mut self, expr: &Expr, scope: Scope, items: &mut Vec<Filter>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => {
+                self.or_items(left, scope, items);
+                self.or_items(right, scope, items);
+            }
+            other => items.push(self.filter(other, scope)),
         }
     }
 
@@ -1006,10 +1047,11 @@ impl Lower<'_> {
         }
     }
 
-    /// A page-row leaf reached from a block row needs the `page` hop; at the
-    /// `@page` anchor the page row IS the current row.
+    /// `through_page` means an actual hop from the CURRENT block row. It is
+    /// resolved while the target is read, rather than from the query's outer
+    /// anchor: inside `@page and any(blocks, ...)` the current row is a block.
     fn hop(&mut self, through_page: bool, filter: Filter) -> Filter {
-        if through_page && self.anchor == Anchor::Block {
+        if through_page {
             Filter::rel(Rel::Page, Quant::Any, filter)
         } else {
             filter
@@ -1031,7 +1073,7 @@ impl Lower<'_> {
                         ty,
                     }),
                     Scope::Page => page_attr(&name).map(|(attr, ty)| Target::Attr {
-                        through_page: true,
+                        through_page: false,
                         attr,
                         ty,
                     }),
@@ -1063,11 +1105,11 @@ impl Lower<'_> {
                 let args = function_args(function);
                 match (name.as_str(), args.len()) {
                     ("prop", 1) => self.string_arg(args[0]).map(|key| Target::Prop {
-                        through_page: scope == Scope::Page,
+                        through_page: false,
                         key: crate::doc::property_key_norm(&key),
                     }),
                     ("page_prop", 1) => self.string_arg(args[0]).map(|key| Target::Prop {
-                        through_page: true,
+                        through_page: scope == Scope::Block,
                         key: crate::doc::property_key_norm(&key),
                     }),
                     _ => {
@@ -1270,7 +1312,7 @@ impl Lower<'_> {
                             Filter::attr(Attr::Value, CmpOp::Eq, Value::text(tag)),
                         ]),
                     );
-                    self.hop(true, leaf)
+                    self.hop(scope == Scope::Block, leaf)
                 }
                 None => Filter::False,
             },
@@ -1349,7 +1391,7 @@ impl Lower<'_> {
                         atom,
                     ]),
                 );
-                return self.hop(name == "page_prop" || scope == Scope::Page, leaf);
+                return self.hop(name == "page_prop" && scope == Scope::Block, leaf);
             }
         }
         let Expr::Identifier(ident) = over else {
@@ -1701,6 +1743,21 @@ mod tests {
         query.diagnostics
     }
 
+    fn content(text: &str) -> Filter {
+        Filter::attr(Attr::Content, CmpOp::Like, Value::text(text))
+    }
+
+    fn property(key: &str, quant: Quant, op: CmpOp, value: Value) -> Filter {
+        Filter::rel(
+            Rel::Props,
+            quant,
+            Filter::and(vec![
+                Filter::attr(Attr::Key, CmpOp::Eq, Value::text(key)),
+                Filter::attr(Attr::Value, op, value),
+            ]),
+        )
+    }
+
     // -- §4.2.2 probe set ---------------------------------------------------
 
     #[test]
@@ -1726,6 +1783,158 @@ mod tests {
             ok("#x and #y"),
             Filter::and(vec![Filter::page_ref("x"), Filter::page_ref("y")])
         );
+    }
+
+    #[test]
+    fn unparenthesized_boolean_chains_are_nary_but_parenthesized_groups_survive() {
+        let alpha = || content("%alpha%");
+        let beta = || content("%beta%");
+        let gamma = || content("%gamma%");
+        let delta = || content("%delta%");
+
+        assert_eq!(
+            ok("off(content like '%alpha%') and content like '%beta%' and content like '%gamma%' and content like '%delta%'"),
+            Filter::and(vec![Filter::off(alpha()), beta(), gamma(), delta()]),
+        );
+        assert_eq!(
+            ok("content like '%alpha%' or content like '%beta%' or content like '%gamma%' or content like '%delta%'"),
+            Filter::or(vec![alpha(), beta(), gamma(), delta()]),
+        );
+        assert_eq!(
+            ok("content like '%alpha%' and (content like '%beta%' and content like '%gamma%') and content like '%delta%'"),
+            Filter::and(vec![
+                alpha(),
+                Filter::and(vec![beta(), gamma()]),
+                delta(),
+            ]),
+        );
+        assert_eq!(
+            ok("(content like '%alpha%' or content like '%beta%') or content like '%gamma%' or content like '%delta%'"),
+            Filter::or(vec![
+                Filter::or(vec![alpha(), beta()]),
+                gamma(),
+                delta(),
+            ]),
+        );
+    }
+
+    #[test]
+    fn page_hops_follow_the_current_nested_scope() {
+        let page_status = || property("status", Quant::Any, CmpOp::Eq, Value::text("active"));
+        let page_name = || Filter::attr(Attr::Name, CmpOp::Eq, Value::text("Projects"));
+
+        // At a page row, both the ordinary and explicit spellings name that
+        // current page. Neither gains a Page(Page(...)) hop.
+        assert_eq!(ok("@page and prop('status') = 'active'"), page_status());
+        assert_eq!(
+            ok("@page and page_prop('status') = 'active'"),
+            page_status()
+        );
+        assert_eq!(ok("@page and name = 'Projects'"), page_name());
+        assert_eq!(
+            ok("@block and page_prop('status') = 'active'"),
+            Filter::rel(Rel::Page, Quant::Any, page_status()),
+        );
+        assert_eq!(
+            ok("@block and page.name = 'Projects'"),
+            Filter::rel(Rel::Page, Quant::Any, page_name()),
+        );
+
+        // `blocks` switches the current row to Block even though the outer
+        // anchor remains Page. Explicit page targets must hop back from there.
+        assert_eq!(
+            ok("@page and any(blocks, page_prop('status') = 'active')"),
+            Filter::rel(
+                Rel::Blocks,
+                Quant::Any,
+                Filter::rel(Rel::Page, Quant::Any, page_status()),
+            ),
+        );
+        assert_eq!(
+            ok("@page and any(blocks, page.name = 'Projects')"),
+            Filter::rel(
+                Rel::Blocks,
+                Quant::Any,
+                Filter::rel(Rel::Page, Quant::Any, page_name()),
+            ),
+        );
+
+        // An ordinary property inside `blocks` stays on the current block.
+        assert_eq!(
+            ok("@page and any(blocks, prop('status') = 'active')"),
+            Filter::rel(Rel::Blocks, Quant::Any, page_status()),
+        );
+    }
+
+    #[test]
+    fn quantified_page_properties_and_page_tags_use_the_same_current_scope_rule() {
+        for (name, quant) in [
+            ("any", Quant::Any),
+            ("every", Quant::Every),
+            ("none", Quant::None),
+        ] {
+            let expected = property("status", quant, CmpOp::Eq, Value::text("active"));
+            assert_eq!(
+                ok(&format!(
+                    "@page and {name}(prop('status'), value = 'active')"
+                )),
+                expected,
+            );
+            assert_eq!(
+                ok(&format!(
+                    "@page and any(blocks, {name}(page_prop('status'), value = 'active'))"
+                )),
+                Filter::rel(
+                    Rel::Blocks,
+                    Quant::Any,
+                    Filter::rel(Rel::Page, Quant::Any, expected),
+                ),
+            );
+        }
+
+        let tag = || property("tags", Quant::Any, CmpOp::Eq, Value::text("work"));
+        assert_eq!(ok("@page and page_tag('work')"), tag());
+        assert_eq!(
+            ok("@block and page_tag('work')"),
+            Filter::rel(Rel::Page, Quant::Any, tag()),
+        );
+        assert_eq!(
+            ok("@page and any(blocks, page_tag('work'))"),
+            Filter::rel(
+                Rel::Blocks,
+                Quant::Any,
+                Filter::rel(Rel::Page, Quant::Any, tag()),
+            ),
+        );
+    }
+
+    #[test]
+    fn p6_flat_boolean_chain_and_nested_current_scope_are_structural() {
+        let flat = ok("off(content like '%alpha%') and content like '%beta%' and content like '%gamma%' and content like '%delta%'");
+        let Filter::And { items } = flat else {
+            panic!("expected And")
+        };
+        assert_eq!(items.len(), 4, "an unparenthesized chain is four siblings");
+        assert!(matches!(items.first(), Some(Filter::Off { .. })));
+
+        let nested = ok("@page and any(blocks, page_prop('status') = 'active')");
+        let Filter::Leaf {
+            leaf:
+                Leaf::Rel {
+                    rel: Rel::Blocks,
+                    pred,
+                    ..
+                },
+        } = nested
+        else {
+            panic!("expected page Blocks relation");
+        };
+        assert!(matches!(
+            pred.as_ref(),
+            Filter::Leaf {
+                leaf: Leaf::Rel { rel: Rel::Page, .. }
+            }
+        ));
     }
 
     #[test]

@@ -7146,6 +7146,28 @@
    "status": "reported",
    "coverage": {"tests": []},
    "notes": "Reported, not reproduced end-to-end: recorded 2026-09-07 while retiring the W6 red corpus, from source reading rather than a failing test (the tests that used to assert this contract were deleted — they asserted the pre-05db8c67 Direct-save admission walk, not this path). The two-pass initial shadow capture at crates/tine-core/src/model.rs:10593-10613 refuses with io::ErrorKind::Interrupted(\"managed inventory changed during initial shadow capture\") when its two passes disagree, which an external editor or a sync client writing into the graph can cause. On the DIRECT save path that refusal is retried four times and then surfaced as DirectSaveFailureCode::PrecheckInterrupted (model.rs:10643-10661), a retryable class. On the MANAGED activation path it is not: oplog::import::inventory_initial_shadow (crates/tine-core/src/oplog/import.rs:2230-2252) maps every io error that is not a \"bound exceeded\" InvalidData to InventoryError::UnsafeEntry, which becomes ImportBlockReason::UnsafeInput (import.rs:4749) and ImportPlanStatus::Blocked. So a transient two-pass disagreement is reported to the user as unsafe INPUT — a permanent-shaped block naming their graph as the problem — rather than as a retryable interruption. No test asserts either shape today. Needs a card and a reproducing test; the fix would be in crates/tine-core/src/oplog/import.rs, outside this packet’s write set."
+  },
+{
+   "id": "REG-QE-TQL-STRUCTURE-AND-CURRENT-SCOPE-001",
+   "title": "Persisted TQL retains editable groups and resolves page hops from the current nested row",
+   "family": "query-engine",
+   "sources": {"issues": [], "commits": [], "internal": "P6 native root diagnostic and PageBlocks89744"},
+   "platforms": ["all"],
+   "layer": "rust-core",
+   "status": "fixing",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/query/tql.rs::tests::unparenthesized_boolean_chains_are_nary_but_parenthesized_groups_survive",
+     "crates/tine-core/src/query/tql.rs::tests::page_hops_follow_the_current_nested_scope",
+     "crates/tine-core/src/query/tql.rs::tests::quantified_page_properties_and_page_tags_use_the_same_current_scope_rule",
+     "crates/tine-core/src/query/print.rs::tests::tql_preserves_flat_chains_and_explicit_group_boundaries_exactly",
+     "crates/tine-core/src/query/print.rs::tests::layered_tql_keeps_a_same_kind_group_beside_an_off_sibling",
+     "crates/tine-core/src/query/print.rs::tests::reopened_structural_tql_accepts_an_edit_and_round_trips_again"
+    ],
+    "scenario": "query-engine.tql-structure-and-current-scope",
+    "failBefore": "manager-native-root-diagnostic exits 1 with a flat four-row query reopened as nested binary groups; PageBlocks89744 returns no page for a matching nested page_prop"
+   },
+   "notes": "The P6 native journey persisted the right one-line tine-query and kept its sheet open, but sqlparser's binary associativity leaked into the editable IR. TQL lowering also decided Page hops from the outer anchor, so page_prop inside an @page blocks relation stayed on the block. The correction preserves explicit same-operator parentheses, flattens only unparenthesized parser chains, and resolves page targets from the current Scope. Exact manager-owned Rust and native pass-after evidence remains pending."
   }
 ]
 }
