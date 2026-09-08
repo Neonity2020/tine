@@ -876,6 +876,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             ("fs.remove_file", "fs::remove_file("),
             ("fs.create_dir", "fs::create_dir("),
             ("fs.create_dir_all", "fs::create_dir_all("),
+            ("fs.dir_builder", "DirBuilder::new("),
             ("fs.hard_link", "fs::hard_link("),
             ("fs.remove_dir", "fs::remove_dir("),
             ("fs.remove_dir_all", "fs::remove_dir_all("),
@@ -893,6 +894,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             ("file.create", "File::create("),
             ("file.set_len", ".set_len("),
             ("windows.MoveFileW", "MoveFileW("),
+            ("windows.CreateDirectoryW", "CreateDirectoryW("),
             ("windows.NtSetInformationFile", "NtSetInformationFile("),
             (
                 "windows.SetFileInformationByHandle",
@@ -1178,9 +1180,21 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/publish.rs", "cap.create_dir", 2),
         ("crates/tine-core/src/publish.rs", "cap.create_dir_all", 1),
         ("crates/tine-core/src/publish.rs", "cap.rename", 2),
-        ("crates/tine-core/src/publish.rs", "fs.create_dir", 1),
+        // Owner-private temporary query storage: Unix creates through a mode
+        // 0700 builder; Windows creates with an explicit protected DACL.
+        ("crates/tine-core/src/publish.rs", "fs.dir_builder", 1),
         ("crates/tine-core/src/publish.rs", "fs.remove_dir_all", 1),
         ("crates/tine-core/src/publish.rs", "open.create_new", 1),
+        (
+            "crates/tine-core/src/publish/private_directory.rs",
+            "fs.remove_dir",
+            1,
+        ),
+        (
+            "crates/tine-core/src/publish/private_directory.rs",
+            "windows.CreateDirectoryW",
+            1,
+        ),
         ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 7),
         (
             "crates/tine-core/src/sync_runtime.rs",
@@ -2000,9 +2014,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // It streams narrow registry metadata on the existing read-only snapshot;
     // no writable storage entrypoint or write-crossing table entry changed.
     // This is a new reviewed surface change, not an inherited test failure.
+    // RET2 assembly: the former digest did not describe the Direct checkpoint
+    // 1350514c. Reconstructing that checkpoint's source with this same scanner
+    // yields exactly the current inventory (8821a0de..., no tuple delta).
+    // The write-crossing table above is unchanged. This corrects the checkpoint
+    // expectation; it does not add a new storage writer to the accepted set.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "f01051e75f980068945b7a975972c17a661048ef999b5532056806f1f7ae8ed2",
+        "8821a0de876d78e4efef5252ac5d1df0e0647405707dc97c2f06ee0d67c1c88d",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
