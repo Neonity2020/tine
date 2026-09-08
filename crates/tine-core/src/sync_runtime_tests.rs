@@ -31200,6 +31200,63 @@ fn ret2_pending_repair_install_uses_authority_after_acceptance() {
 }
 
 #[test]
+fn ret2_pending_registry_cache_follows_the_opened_snapshot_not_the_capture() {
+    let fixture = r5c_fixture("ret2-registry-snapshot", 0x5a55);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Solo.md", "TODO queued registry witness");
+    const QUERY: &str = "(property score 1)";
+    let capture = || match handle
+        .application_request(|reply| ActorRequest::ApplicationSimpleQueryTurn {
+            query: QUERY.to_owned(),
+            max_rows: R5A_ROWS,
+            max_bytes: R5A_BYTES,
+            reply,
+        })
+        .unwrap()
+    {
+        SimpleQueryTurn::Captured(capture) => capture,
+        _ => panic!("uncached pending query must capture"),
+    };
+    let first = capture();
+    let second = capture();
+    assert_eq!(first.stamp, second.stamp);
+    let execute = |capture: &crate::managed_query::ManagedQueryCapture| match handle
+        .inner
+        .managed_query
+        .execute(capture)
+    {
+        crate::managed_query::ManagedQueryOutcome::Answered(answer) => {
+            answer.into_blocks().unwrap()
+        }
+        other => panic!("queued SQL query did not answer: {other:?}"),
+    };
+    assert_eq!(execute(&first).total, 1, "numeric 01 equals 1");
+    let (mut page, revision) = load_application_exact(&handle, "notes/score.md");
+    page.pre_block = Some("tine.type:: text".to_owned());
+    assert!(matches!(
+        handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap(),
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+    let (_, opened) = r5a_overlay(&handle);
+    assert!(Some(opened.flushed_revision) > second.stamp.overlay_revision);
+    let actual = execute(&second);
+    let expected = r5a_walk(&handle, QUERY, R5A_ROWS, R5A_BYTES);
+    assert_eq!(expected.total, 0, "text 01 differs from 1");
+    assert_eq!(
+        actual.total, expected.total,
+        "the second read must use its own snapshot's type"
+    );
+}
+
+#[test]
 fn ret2_pending_projection_rebuild_does_not_construct_parser_or_editor_pages() {
     let fixture = r5a_fixture("ret2-pending-producer", 0x5a40);
     let handle = r4a_reopen(&fixture);

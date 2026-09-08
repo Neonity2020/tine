@@ -651,11 +651,21 @@ fn execute_pending_on_slot(
     // patched HERE, under these two snapshots and this mask, over exactly the
     // keys the pending pages can have changed. A query with no property leaf
     // reads no effective type at all (C6) and carries the empty registry.
-    let registry =
-        match patched_registry(capture, &mut accepted, &mut overlay, &mask, census, patched) {
-            Ok(registry) => registry,
-            Err(outcome) => return outcome,
-        };
+    let mut registry_stamp = capture.stamp.clone();
+    registry_stamp.overlay_instance = Some(state.instance);
+    registry_stamp.overlay_revision = Some(state.flushed_revision);
+    let registry = match patched_registry(
+        capture,
+        &registry_stamp,
+        &mut accepted,
+        &mut overlay,
+        &mask,
+        census,
+        patched,
+    ) {
+        Ok(registry) => registry,
+        Err(outcome) => return outcome,
+    };
     // (4) Readiness PER SOURCE. The overlay's `fts_ready` is 1 by schema
     // seeding, but it is probed with the same statement and the same mapping
     // anyway: a file that says otherwise is damaged, not "still building".
@@ -839,6 +849,7 @@ fn execute_pending_on_slot(
 /// wrong table); a cancelled read is `Cancelled`, exactly as the probes are.
 fn patched_registry(
     capture: &ManagedQueryCapture,
+    snapshot_stamp: &ManagedQueryStamp,
     accepted: &mut PhysicalProjectionQuerySnapshot,
     overlay: &mut PhysicalProjectionQuerySnapshot,
     mask: &[[u8; 16]],
@@ -849,7 +860,7 @@ fn patched_registry(
         return Ok(Arc::clone(&capture.registry));
     }
     let base_generation = capture.registry.generation();
-    if let Some(hit) = cache.get(&capture.stamp, base_generation) {
+    if let Some(hit) = cache.get(snapshot_stamp, base_generation) {
         return Ok(hit);
     }
     let built = crate::managed_registry_patch::patched_pending_registry(
@@ -867,7 +878,7 @@ fn patched_registry(
     })?;
     census.note_registry_patch();
     let built = Arc::new(built);
-    cache.put(&capture.stamp, base_generation, &built);
+    cache.put(snapshot_stamp, base_generation, &built);
     Ok(built)
 }
 

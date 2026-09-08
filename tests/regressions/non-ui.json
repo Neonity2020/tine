@@ -2,6 +2,19 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PENDING-REGISTRY-OPENED-SNAPSHOT",
+ "title": "Queued queries use property types from their own opened SQLite snapshot",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager snapshot identity audit" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_registry_cache_follows_the_opened_snapshot_not_the_capture"],
+  "scenario": "query-engine.pending-registry-opened-snapshot",
+  "failBefore": "registry-snapshot-before.log: second queued query returns one numeric match after its snapshot has changed the declaration to text; oracle returns zero"
+ },
+ "notes": "Two identical actor captures execute on different pending revisions. The shared registry cache must follow opened snapshot identity, not the earlier requested revision."
+},
+{
  "id": "REG-QE-PENDING-REPAIR-PUBLIC-ROUTES",
  "title": "Pending projection repair retries public SQL routes and terminates failed creation",
  "family": "query-engine",

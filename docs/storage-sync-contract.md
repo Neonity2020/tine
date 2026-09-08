@@ -904,6 +904,13 @@ acceptance sequence the capture's `open_managed` validates inside its read
 transaction, so a snapshot that opens `Current` was captured before any
 pending page it masks could have moved.
 
+The patched registry cache is keyed by the overlay instance and flushed revision
+actually opened, together with accepted/config/base-registry identity. An older
+capture may legally open a later overlay; its requested revision cannot identify
+that later registry. A deterministic test queues two equal captures, changes a
+numeric declaration to text between their executions, and checks that each
+answer uses the type in its own opened snapshot.
+
 Managed captures include the query owner's admission epoch from their actor
 turn. A projection lifecycle drain cancels those captures even when their
 workers have not started waiting for capacity. Newly captured work can enter
