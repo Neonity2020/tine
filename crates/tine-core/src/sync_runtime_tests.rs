@@ -13542,12 +13542,14 @@ fn android_private_directory_durability_is_explicit_at_every_exception() {
         // Re-pinned 2026-09-07. `object_store.rs` retains only the helper's
         // own definition; its six former call sites, and every call in
         // `hot_engine.rs` and `page_name_index.rs`, took the strict authority
-        // helper instead. Two run-local rebuildable indexes remain the whole
-        // reconstructible exception set.
+        // helper instead. Current-action discovery and point-addressed absence
+        // rows add only reconstructible directories; original receipts remain
+        // under their existing strict publication authority.
         BTreeMap::from([
+            ("oplog/current_action_roots.rs".to_owned(), 3),
             ("oplog/local_completion_index.rs".to_owned(), 3),
             ("oplog/object_store.rs".to_owned(), 1),
-            ("oplog/receiver_absence_summary.rs".to_owned(), 5),
+            ("oplog/receiver_absence_summary.rs".to_owned(), 6),
         ]),
         "every reconstructible private-directory exception must remain in the audited census"
     );

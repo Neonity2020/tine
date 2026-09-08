@@ -21,6 +21,27 @@ use tine_storage::{
 use uuid::Uuid;
 
 use super::absence_decision::{AbsenceCompletionAnchor, AbsenceDecision, AbsenceDecisionMap};
+
+/// Name a receiver-history point-read failure and arm the rebuild.
+///
+/// Every caller of a point read routes its error here, not just the decision
+/// entry points: a missing row found while pruning own completions is the same
+/// damage as one found while deciding, and swallowing it into a plain receipt
+/// error would leave the derived index unretired and the next open refusing
+/// again. Retiring makes that next open run the counted repair (D-3, I-10), and
+/// the caller still gets a named refusal rather than a silent `Create` (I-8).
+fn absence_repair_error(
+    map: &AbsenceDecisionMap,
+    error: super::absence_decision::AbsenceDecisionError,
+) -> EngineError {
+    if matches!(
+        error,
+        super::absence_decision::AbsenceDecisionError::History(_)
+    ) {
+        map.retire_damaged_history();
+    }
+    EngineError::Receipt(error.to_string())
+}
 use super::conflict_history::{
     causal_clock_contains_dot, ConflictHistoryBatch, ConflictHistoryIndex, ProjectionCreateKey,
 };
@@ -8622,10 +8643,10 @@ impl ShardedHotEngine {
             for entry in catalog {
                 if entry.completion.is_some() {
                     map.record_receiver_completion(&entry.intent)
-                        .map_err(|error| EngineError::Receipt(error.to_string()))?;
+                        .map_err(|error| absence_repair_error(&map, error))?;
                 } else {
                     map.record_receiver_intent(&entry.intent)
-                        .map_err(|error| EngineError::Receipt(error.to_string()))?;
+                        .map_err(|error| absence_repair_error(&map, error))?;
                 }
             }
             map
@@ -8635,40 +8656,52 @@ impl ShardedHotEngine {
             .as_ref()
             .map_or_else(Vec::new, LocalCompletionIndex::completed_entries)
         {
-            map.record_local_completion(AbsenceCompletionAnchor {
+            let anchor = AbsenceCompletionAnchor {
                 intent_id: entry.intent_id,
                 page_id: entry.page_id,
                 path: entry.path,
                 target_kind: entry.target_kind,
                 frontier: entry.post_frontier,
-            });
+            };
+            map.record_local_completion(anchor)
+                .map_err(|error| absence_repair_error(&map, error))?;
         }
         *self.absence_decision_map.borrow_mut() = Some(map);
         Ok(())
     }
 
+    /// The absence answer for one exact page/path.
+    ///
+    /// Completed receiver history is not resident: this is one point read of
+    /// that page's durable row merged with the bounded live overlay. A row that
+    /// cannot be read is damage, so it retires the derived roots (the next open
+    /// runs the named, counted rebuild) and refuses this decision by name. It
+    /// is never quietly answered `Create`, which would resurrect a page the
+    /// receiver deleted.
     pub(crate) fn receiver_absence_decision(
         &self,
         page_id: PageId,
         path: &ManagedPath,
-    ) -> AbsenceDecision {
-        let decision = self
-            .absence_decision_map
-            .borrow()
-            .as_ref()
-            .map_or(AbsenceDecision::Create, |map| map.decision(page_id, path));
-        decision
+    ) -> Result<AbsenceDecision, EngineError> {
+        let borrowed = self.absence_decision_map.borrow();
+        let Some(map) = borrowed.as_ref() else {
+            return Ok(AbsenceDecision::Create);
+        };
+        map.decision(page_id, path)
+            .map_err(|error| absence_repair_error(map, error))
     }
 
     pub(crate) fn restored_generation_requires_absence_deferral(
         &self,
         page_id: PageId,
         path: &ManagedPath,
-    ) -> bool {
-        self.absence_decision_map
-            .borrow()
-            .as_ref()
-            .is_some_and(|map| map.restored_generation_requires_deferral(page_id, path))
+    ) -> Result<bool, EngineError> {
+        let borrowed = self.absence_decision_map.borrow();
+        let Some(map) = borrowed.as_ref() else {
+            return Ok(false);
+        };
+        map.restored_generation_requires_deferral(page_id, path)
+            .map_err(|error| absence_repair_error(map, error))
     }
 
     pub(crate) fn note_deferred_absence_observation(&self, page_id: PageId, path: &ManagedPath) {
@@ -8712,10 +8745,6 @@ impl ShardedHotEngine {
         &self,
         intent: &ProjectionIntent,
     ) -> Result<(), EngineError> {
-        if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
-            map.record_receiver_intent(intent)
-                .map_err(|error| EngineError::Receipt(error.to_string()))?;
-        }
         let summary_failed = self
             .receiver_absence_summary
             .borrow_mut()
@@ -8724,6 +8753,10 @@ impl ShardedHotEngine {
         if summary_failed {
             self.receiver_absence_summary.borrow_mut().take();
         }
+        if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+            map.record_receiver_intent(intent)
+                .map_err(|error| absence_repair_error(map, error))?;
+        }
         Ok(())
     }
 
@@ -8731,19 +8764,32 @@ impl ShardedHotEngine {
         &self,
         intent: &ProjectionIntent,
     ) -> Result<(), EngineError> {
-        if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
-            map.record_receiver_completion(intent)
-                .map_err(|error| EngineError::Receipt(error.to_string()))?;
-        }
-        let summary_failed = self
-            .receiver_absence_summary
-            .borrow_mut()
-            .as_mut()
-            .is_some_and(|summary| summary.record_completion(intent).is_err());
-        if summary_failed {
+        // Durable write-through first: an accepted completion becomes a point
+        // row on disk, and the decision map then answers from that row instead
+        // of holding it resident. Only when no durable index exists — a generic
+        // engine, or a write-through that failed — does the row stay resident,
+        // and that residency is bounded by those failures, not by history.
+        let durable = match self.receiver_absence_summary.borrow_mut().as_mut() {
+            Some(summary) => summary.record_completion(intent).is_ok(),
+            None => false,
+        };
+        if durable {
+            // The obligation is finished. Drop its resident incomplete row, or
+            // the map would hold one entry per completed receiver intent — the
+            // history term the point rows exist to keep off the heap — and keep
+            // offering finished work as incomplete.
+            if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+                map.retire_receiver_intent(intent)
+                    .map_err(|error| EngineError::Receipt(error.to_string()))?;
+            }
+        } else {
             // The receiver completion is already durable truth. Cache failure
-            // is crash-equivalent and heals from the filename horizon.
+            // is crash-equivalent and heals through the current-action cursor.
             self.receiver_absence_summary.borrow_mut().take();
+            if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+                map.record_receiver_completion(intent)
+                    .map_err(|error| absence_repair_error(map, error))?;
+            }
         }
         Ok(())
     }
@@ -8797,10 +8843,10 @@ impl ShardedHotEngine {
             })?;
         if staged {
             if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
-                map.record_local_completion(
-                    AbsenceCompletionAnchor::from_intent(intent)
-                        .map_err(|error| EngineError::Receipt(error.to_string()))?,
-                );
+                let anchor = AbsenceCompletionAnchor::from_intent(intent)
+                    .map_err(|error| EngineError::Receipt(error.to_string()))?;
+                map.record_local_completion(anchor)
+                    .map_err(|error| absence_repair_error(map, error))?;
             }
         }
         Ok(staged)
@@ -8853,25 +8899,66 @@ impl ShardedHotEngine {
                 Err(error) => return Err(error),
             }
         }
+        // The R16-C2 prune rule asks two questions per *local* entry key:
+        // does receiver evidence exist underneath it, and does a receiver
+        // completion dominate this local answer. Both are point questions, so
+        // they are answered with one point read per key the local index
+        // actually holds — bounded by the already-pruned local set — instead of
+        // materializing the complete receiver history and completion vectors.
+        let mut receiver_rows = BTreeMap::new();
+        {
+            let borrowed = self.absence_decision_map.borrow();
+            if let Some(map) = borrowed.as_ref() {
+                for key in self
+                    .local_completion_index
+                    .as_ref()
+                    .expect("the local completion index was checked above")
+                    .observed_page_paths()
+                {
+                    if let Some(anchors) = map
+                        .receiver_row_anchors(&key)
+                        .map_err(|error| absence_repair_error(map, error))?
+                    {
+                        receiver_rows.insert(key, anchors);
+                    }
+                }
+            }
+        }
         let pruning = LocalCompletionPruningContext {
             live_page_paths,
             retained_intents,
-            receiver_history_paths: self
-                .absence_decision_map
-                .borrow()
-                .as_ref()
-                .map_or_else(BTreeSet::new, AbsenceDecisionMap::receiver_history_paths),
-            receiver_completions: self
-                .absence_decision_map
-                .borrow()
-                .as_ref()
-                .map_or_else(Vec::new, AbsenceDecisionMap::receiver_completion_anchors),
+            receiver_rows,
         };
-        self.local_completion_index
+        let flushed = self
+            .local_completion_index
             .as_mut()
             .expect("the local completion index was checked above")
             .flush(live_pages.len(), &pruning)
-            .map_err(|error| EngineError::Archive(error.to_string()))
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        // A flush that compacted has just pruned own-endpoint evidence. Re-derive
+        // the decision map's own half from what survived, so a long activation
+        // holds exactly the bounded set the next open would seed from the same
+        // index rather than every identity this activation completed.
+        if flushed {
+            let anchors = self
+                .local_completion_index
+                .as_ref()
+                .map_or_else(Vec::new, LocalCompletionIndex::completed_entries)
+                .into_iter()
+                .map(|entry| AbsenceCompletionAnchor {
+                    intent_id: entry.intent_id,
+                    page_id: entry.page_id,
+                    path: entry.path,
+                    target_kind: entry.target_kind,
+                    frontier: entry.post_frontier,
+                })
+                .collect::<Vec<_>>();
+            if let Some(map) = self.absence_decision_map.borrow_mut().as_mut() {
+                map.reseed_local_completions(anchors)
+                    .map_err(|error| absence_repair_error(map, error))?;
+            }
+        }
+        Ok(flushed)
     }
 
     #[cfg(test)]
@@ -8900,6 +8987,38 @@ impl ShardedHotEngine {
         self.local_completion_index
             .as_ref()
             .map_or(0, LocalCompletionIndex::entry_count_for_test)
+    }
+
+    /// Force the own-endpoint chain to compact — and therefore to run the
+    /// R16-C2 prune policy — on the next flush, so a growth test measures the
+    /// prune path itself instead of the ordinary delta-append fast path.
+    #[cfg(test)]
+    pub(crate) fn force_local_completion_compaction_for_test(&mut self, threshold: u64) {
+        if let Some(index) = self.local_completion_index.as_mut() {
+            index.force_compaction_threshold_for_test(threshold);
+        }
+    }
+
+    /// Durable receiver-history read/write attribution since this engine
+    /// attached its summary cache: point lookups, objects and bytes.
+    #[cfg(test)]
+    pub(crate) fn receiver_history_access_for_test(
+        &self,
+    ) -> Option<super::receiver_absence_summary::HistoryAccess> {
+        self.receiver_absence_summary
+            .borrow()
+            .as_ref()
+            .map(|summary| summary.history().access())
+    }
+
+    /// How many absence rows the decision map is holding in memory. Completed
+    /// receiver history is not resident, so this tracks current/pending work.
+    #[cfg(test)]
+    pub(crate) fn resident_absence_row_count_for_test(&self) -> usize {
+        self.absence_decision_map
+            .borrow()
+            .as_ref()
+            .map_or(0, AbsenceDecisionMap::resident_row_count)
     }
 
     fn current_catalog_document(&self) -> Result<Option<&LoroDoc>, EngineError> {

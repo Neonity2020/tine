@@ -1819,7 +1819,9 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         && !engine
             .accepted_batch_revives_page(source.source_batch_id(), source.page_id())
             .map_err(ProjectionError::Engine)?
-        && engine.receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
+        && engine
+            .receiver_absence_decision(plan.intent().page_id(), plan.intent().path())
+            .map_err(ProjectionError::Engine)?
             == super::absence_decision::AbsenceDecision::DeferredAbsence
     {
         engine.note_deferred_absence_observation(plan.intent().page_id(), plan.intent().path());

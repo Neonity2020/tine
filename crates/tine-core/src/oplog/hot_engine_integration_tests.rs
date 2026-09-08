@@ -7504,3 +7504,672 @@ specs/campaigns/2026-09-invariant-sweep/A4-fix-dossier.md, and the `a4_*` guards
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P3 own-endpoint completion boundary.
+//
+// The receiver half of the absence decision is qualified in
+// `oplog::receiver_absence_summary`. This module qualifies the *own* half
+// through a real engine open, stage, flush and prune: the R16-C2 prune policy
+// asks two questions per local key, and both must be point questions. If the
+// policy ever re-enumerates historical receiver paths, or if the decision map
+// keeps every identity this activation completed resident, the flat assertions
+// below fail.
+// ---------------------------------------------------------------------------
+
+mod p3_own_completion {
+    use super::{seed_engine, store, uuid, Ids, TestDir};
+    use crate::oplog::absence_decision::AbsenceDecision;
+    use crate::oplog::current_action_roots::{
+        ProjectionActionCursor, ACTION_NAMESPACE as ABSENCE_NAMESPACE,
+    };
+    use crate::oplog::receiver_absence_summary::{
+        HistoryAccess, ROWS_NAMESPACE, ROW_PREFIX, SUMMARY_NAMESPACE,
+    };
+    use crate::oplog::{
+        BlobDescription, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentDependencies, DocumentId,
+        FrontierV2, ManagedPath, ObjectStore, PageId, ProjectionEndpointBinding,
+        ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition, ProjectionReceiptStore,
+        ProjectionTargetKind, ShardedHotEngine, WorkspaceId,
+    };
+    use crate::Graph;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// One frontier on a single shared document, so two counters on the same
+    /// peer are strictly comparable and a receiver answer can dominate an own
+    /// answer on the same key.
+    fn frontier(counter: u64) -> FrontierV2 {
+        FrontierV2::new(vec![DocumentDependencies::new(
+            DocumentId::from_uuid(uuid(0x9f_0001)),
+            vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(9), counter)],
+            Vec::new(),
+        )
+        .unwrap()])
+        .unwrap()
+    }
+
+    fn intent(
+        workspace: WorkspaceId,
+        page_id: PageId,
+        managed_path: &str,
+        counter: u64,
+        kind: ProjectionTargetKind,
+    ) -> ProjectionIntent {
+        ProjectionIntent::new(
+            workspace,
+            page_id,
+            ManagedPath::parse(managed_path).unwrap(),
+            frontier(counter),
+            Vec::new(),
+            ProjectionPrecondition::Absent,
+            kind,
+            match kind {
+                ProjectionTargetKind::Present => {
+                    BlobDescription::of(format!("- {managed_path} {counter}\n").as_bytes())
+                }
+                ProjectionTargetKind::Absent => BlobDescription::of(&[]),
+            },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// A real clean-runtime-shaped engine: accepted genesis pages, an attached
+    /// operation archive, an enrolled projection endpoint, the device-local
+    /// own-endpoint completion chain, and the receiver absence decision map.
+    struct Opened {
+        _dir: TestDir,
+        _graph: Graph,
+        _receipts: ProjectionReceiptStore,
+        engine: ShardedHotEngine,
+        ids: Ids,
+    }
+
+    fn open(label: &str) -> Opened {
+        let dir = TestDir::new(label);
+        let ids = Ids::new();
+        let archive = store(&dir, ids);
+        let (mut engine, _batch) = seed_engine(ids, &archive);
+        engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&dir.path().join("store"), ids.workspace).unwrap(),
+            )
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        let graph = Graph::open(&dir.path().join("graph"));
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(uuid(0x9f_0202)),
+            DeviceId::from_uuid(uuid(0x9f_0203)),
+        )
+        .unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &dir.path().join("receipts"),
+            ids.workspace,
+            endpoint,
+        )
+        .unwrap();
+        engine
+            .attach_clean_projection_endpoint(&graph, &receipts)
+            .unwrap();
+        engine.open_local_completion_index(&archive).unwrap();
+        engine.open_absence_decision_map(&receipts).unwrap();
+        // Compact on every flush so each flush actually runs the prune policy.
+        engine.force_local_completion_compaction_for_test(1);
+        Opened {
+            _dir: dir,
+            _graph: graph,
+            _receipts: receipts,
+            engine,
+            ids,
+        }
+    }
+
+    /// A reopenable archive + receipt pair, so a damaged derived index can be
+    /// observed at one engine open and repaired at the next.
+    struct Fixture {
+        _dir: TestDir,
+        root: PathBuf,
+        graph_root: PathBuf,
+        graph: Graph,
+        receipts: ProjectionReceiptStore,
+        ids: Ids,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let dir = TestDir::new(label);
+            let ids = Ids::new();
+            let root = dir.path().join("store");
+            let graph_root = dir.path().join("graph");
+            std::fs::create_dir_all(&graph_root).unwrap();
+            let graph = Graph::open(&graph_root);
+            let archive = ObjectStore::open(&root, ids.workspace).unwrap();
+            let endpoint = ProjectionEndpointBinding::enroll_graph(
+                &graph,
+                ProjectionEndpointId::from_uuid(uuid(0x9f_0302)),
+                DeviceId::from_uuid(uuid(0x9f_0303)),
+            )
+            .unwrap();
+            let receipts = ProjectionReceiptStore::open_for_endpoint(
+                &dir.path().join("receipts"),
+                ids.workspace,
+                endpoint,
+            )
+            .unwrap();
+            // Production managed opens install the durable discovery cursor
+            // before any receipt can be authored.
+            receipts.attach_action_cursor(std::sync::Arc::new(
+                ProjectionActionCursor::open(&archive).unwrap(),
+            ));
+            Self {
+                _dir: dir,
+                root,
+                graph_root,
+                graph,
+                receipts,
+                ids,
+            }
+        }
+
+        /// A fresh engine over the same archive: this is the reopen.
+        fn absence_engine(&self) -> ShardedHotEngine {
+            let mut engine = self.ids.engine();
+            engine
+                .attach_clean_archive_store(
+                    ObjectStore::open(&self.root, self.ids.workspace).unwrap(),
+                )
+                .unwrap();
+            engine
+        }
+
+        /// Publish one real receiver receipt — intent, attempt, projection,
+        /// completion — and notify the engine exactly as production does.
+        fn publish_receiver_receipt(
+            &self,
+            engine: &mut ShardedHotEngine,
+            page_id: PageId,
+            managed_path: &ManagedPath,
+            counter: u64,
+            kind: ProjectionTargetKind,
+        ) -> ProjectionIntent {
+            let target = match kind {
+                ProjectionTargetKind::Present => {
+                    format!("- {managed_path} {counter}\n").into_bytes()
+                }
+                ProjectionTargetKind::Absent => Vec::new(),
+            };
+            let built = intent(
+                self.ids.workspace,
+                page_id,
+                managed_path.as_str(),
+                counter,
+                kind,
+            );
+            self.receipts.publish_intent(&built, None).unwrap();
+            engine.note_receiver_projection_intent(&built).unwrap();
+            let reservation = self.receipts.reserve_attempt(&built).unwrap();
+            let mut authority = self
+                .receipts
+                .begin_mutation(&built, Some(&reservation))
+                .unwrap();
+            let proof = self
+                .graph
+                .write_page_projection(
+                    built.path().as_str(),
+                    None,
+                    target.as_slice(),
+                    &mut authority,
+                )
+                .unwrap();
+            self.receipts
+                .publish_completion(authority, &built, &proof)
+                .unwrap();
+            engine.note_receiver_projection_completion(&built).unwrap();
+            built
+        }
+
+        fn rows_dir(&self) -> PathBuf {
+            self.root.join(ABSENCE_NAMESPACE).join(ROWS_NAMESPACE)
+        }
+
+        fn summary_dir(&self) -> PathBuf {
+            self.root.join(ABSENCE_NAMESPACE).join(SUMMARY_NAMESPACE)
+        }
+
+        fn row_object_paths(&self) -> Vec<PathBuf> {
+            Self::entries_with_prefix(&self.rows_dir(), ROW_PREFIX)
+        }
+
+        fn summary_object_paths(&self) -> Vec<PathBuf> {
+            Self::entries_with_prefix(&self.summary_dir(), "")
+        }
+
+        fn entries_with_prefix(directory: &Path, prefix: &str) -> Vec<PathBuf> {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return Vec::new();
+            };
+            let mut found = entries
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(prefix))
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        }
+    }
+
+    /// What one steady flush costs and holds once `distinct` historical
+    /// identities exist behind fixed live pages and fixed retained work.
+    ///
+    /// `objects_read` is deliberately outside the equality: the durable rows
+    /// live in authenticated maps, so one point read walks O(log H) nodes. That
+    /// term is the persistent-bytes allowance D-5 grants, not resident state.
+    #[derive(Debug, Eq, PartialEq)]
+    struct SteadyFlush {
+        local_entries: usize,
+        resident_absence_rows: usize,
+        point_lookups: usize,
+    }
+
+    /// The byte/object side of the same steady flush, kept apart from the
+    /// resident equality so a logarithmic term can be bounded as logarithmic.
+    #[derive(Debug)]
+    struct SteadyObjects {
+        flush_objects_read: usize,
+        total: HistoryAccess,
+    }
+
+    fn measure(distinct: usize) -> (SteadyFlush, SteadyObjects) {
+        let mut opened = open(&format!("p3-own-completion-{distinct}"));
+        let ids = opened.ids;
+        let engine = &mut opened.engine;
+        let live_a = "pages/A.md";
+        let live_b = "pages/B.md";
+
+        // `distinct` receiver-completed historical identities on one live page:
+        // H grows, G/T/P/O do not. Each of these becomes a durable point row.
+        for index in 0..distinct {
+            // Alternating kinds so the reopened answers below have to be
+            // exact in both directions: a receiver-confirmed absence permits a
+            // later create, a receiver-confirmed presence must keep deferring.
+            let receiver = intent(
+                ids.workspace,
+                ids.page_a,
+                &format!("pages/A-old-{index}.md"),
+                2 * index as u64 + 2,
+                if index % 2 == 0 {
+                    ProjectionTargetKind::Absent
+                } else {
+                    ProjectionTargetKind::Present
+                },
+            );
+            engine.note_receiver_projection_intent(&receiver).unwrap();
+            engine
+                .note_receiver_projection_completion(&receiver)
+                .unwrap();
+        }
+
+        // Own-endpoint completions this activation performed. Two families are
+        // prunable — one with receiver history underneath it and a dominated
+        // frontier, one with no receiver history at all — and two are the live
+        // answers the index must keep.
+        for index in 0..distinct {
+            let dominated = intent(
+                ids.workspace,
+                ids.page_a,
+                &format!("pages/A-old-{index}.md"),
+                2 * index as u64 + 1,
+                ProjectionTargetKind::Absent,
+            );
+            assert!(engine
+                .stage_local_projection_completion(&dominated)
+                .unwrap());
+            let orphan = intent(
+                ids.workspace,
+                ids.page_a,
+                &format!("pages/A-stale-{index}.md"),
+                index as u64 + 1,
+                ProjectionTargetKind::Absent,
+            );
+            assert!(engine.stage_local_projection_completion(&orphan).unwrap());
+        }
+        for (page_id, live) in [(ids.page_a, live_a), (ids.page_b, live_b)] {
+            let present = intent(
+                ids.workspace,
+                page_id,
+                live,
+                1,
+                ProjectionTargetKind::Present,
+            );
+            assert!(engine.stage_local_projection_completion(&present).unwrap());
+        }
+        assert!(engine
+            .flush_local_projection_completions(BTreeSet::new())
+            .unwrap());
+        assert_eq!(
+            engine.local_completion_entry_count_for_test(),
+            2,
+            "the prune policy must keep exactly the two live answers at \
+{distinct} historical identities"
+        );
+
+        // The steady flush: fixed live pages, fixed (empty) retained work, one
+        // new own completion per live page.
+        let before = engine.receiver_history_access_for_test().unwrap();
+        for (page_id, live) in [(ids.page_a, live_a), (ids.page_b, live_b)] {
+            let present = intent(
+                ids.workspace,
+                page_id,
+                live,
+                2,
+                ProjectionTargetKind::Present,
+            );
+            assert!(engine.stage_local_projection_completion(&present).unwrap());
+        }
+        assert!(engine
+            .flush_local_projection_completions(BTreeSet::new())
+            .unwrap());
+        let after = engine.receiver_history_access_for_test().unwrap();
+
+        // The historical identities are still exactly answerable: pruning own
+        // evidence never resurrects a path the receiver released.
+        for index in 0..distinct {
+            let historical = ManagedPath::parse(&format!("pages/A-old-{index}.md")).unwrap();
+            let expected = if index % 2 == 0 {
+                AbsenceDecision::Create
+            } else {
+                AbsenceDecision::DeferredAbsence
+            };
+            assert_eq!(
+                engine
+                    .receiver_absence_decision(ids.page_a, &historical)
+                    .unwrap(),
+                expected,
+                "historical path {historical} must stay exactly answerable after \
+its own evidence was pruned"
+            );
+            assert!(!engine
+                .restored_generation_requires_absence_deferral(ids.page_a, &historical)
+                .unwrap());
+        }
+        let unknown = ManagedPath::parse("pages/Never projected.md").unwrap();
+        assert_eq!(
+            engine
+                .receiver_absence_decision(ids.page_c, &unknown)
+                .unwrap(),
+            AbsenceDecision::Create
+        );
+
+        (
+            SteadyFlush {
+                local_entries: engine.local_completion_entry_count_for_test(),
+                resident_absence_rows: engine.resident_absence_row_count_for_test(),
+                point_lookups: after.point_lookups - before.point_lookups,
+            },
+            SteadyObjects {
+                flush_objects_read: after.objects_read - before.objects_read,
+                total: after,
+            },
+        )
+    }
+
+    /// The own-endpoint half of the P3 bound, measured on a real engine.
+    ///
+    /// Eight and sixty-four distinct completed identities behind the same two
+    /// live pages and the same (empty) retained set must cost the same steady
+    /// flush and hold the same resident state.
+    #[test]
+    fn own_completion_flush_and_prune_are_flat_across_distinct_completed_identities() {
+        let (small, small_total) = measure(8);
+        let (large, large_total) = measure(64);
+        eprintln!("own-completion steady flush at 8 identities: {small:?} total {small_total:?}");
+        eprintln!("own-completion steady flush at 64 identities: {large:?} total {large_total:?}");
+        assert_eq!(
+            small, large,
+            "the own-endpoint prune policy grew with completed history"
+        );
+        // Three point reads per surviving local key: one when the completion is
+        // staged, one for the prune policy's R16-C2 question, one when the map
+        // is re-derived from what survived. A constant per live key, and the
+        // equality above already proves it does not move with history.
+        assert!(
+            small.point_lookups <= 4 * small.local_entries,
+            "the prune policy must ask a constant number of point questions per \
+live local key, not one per history row: {} reads for {} keys",
+            small.point_lookups,
+            small.local_entries
+        );
+        // Eight times the history may cost at most twice the objects per steady
+        // flush: a logarithmic walk, not a scan.
+        assert!(
+            large_total.flush_objects_read < 2 * small_total.flush_objects_read,
+            "steady flush object reads grew faster than the map depth: \
+{} at 8 identities, {} at 64",
+            small_total.flush_objects_read,
+            large_total.flush_objects_read
+        );
+        // Eight times the identities may cost at most eight times the point
+        // reads in total. Any step that enumerated the history would make the
+        // whole run quadratic in it instead.
+        assert!(
+            large_total.total.point_lookups <= 8 * small_total.total.point_lookups,
+            "total point reads grew faster than the work performed: {} for 8 \
+identities, {} for 64",
+            small_total.total.point_lookups,
+            large_total.total.point_lookups
+        );
+    }
+
+    /// The damaged-index contract, through a real engine open.
+    ///
+    /// The unit-level controls in `oplog::receiver_absence_summary` prove the
+    /// index's own behaviour. This proves the engine boundary the production
+    /// callers actually use: a row the authenticated root names but disk cannot
+    /// supply is refused **by name** rather than answered `Create` — answering
+    /// `Create` would recreate a file the receiver deleted — the derived roots
+    /// are retired, and the next engine open runs the counted repair from
+    /// retained receipts and returns the exact old answer.
+    #[test]
+    fn a_damaged_row_refuses_at_the_engine_then_repairs_at_the_next_engine_open() {
+        let fixture = Fixture::new("p3-engine-damage-repair");
+        let gone = ManagedPath::parse("pages/Receiver deleted me.md").unwrap();
+        let present = ManagedPath::parse("pages/Receiver keeps me.md").unwrap();
+
+        let mut engine = fixture.absence_engine();
+        engine.open_absence_decision_map(&fixture.receipts).unwrap();
+        let deleted = fixture.publish_receiver_receipt(
+            &mut engine,
+            fixture.ids.page_a,
+            &gone,
+            1,
+            ProjectionTargetKind::Present,
+        );
+        let kept = fixture.publish_receiver_receipt(
+            &mut engine,
+            fixture.ids.page_b,
+            &present,
+            1,
+            ProjectionTargetKind::Present,
+        );
+        assert_eq!(
+            engine
+                .receiver_absence_decision(fixture.ids.page_a, &gone)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence
+        );
+        drop(engine);
+
+        // Damage exactly one durable row.
+        let rows = fixture.row_object_paths();
+        assert_eq!(rows.len(), 2, "one row per completed receiver identity");
+        std::fs::remove_file(&rows[0]).unwrap();
+
+        let probe = fixture.absence_engine();
+        probe.open_absence_decision_map(&fixture.receipts).unwrap();
+        let probe_stats = probe
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("the managed path records its open attribution");
+        assert_eq!(
+            probe_stats.full_catalog_passes, 0,
+            "a deleted leaf row is not visible at open: it must be found at its own \
+point read, not hidden by an unrelated rebuild: {probe_stats:?}"
+        );
+        let answers = [
+            probe.receiver_absence_decision(fixture.ids.page_a, &gone),
+            probe.receiver_absence_decision(fixture.ids.page_b, &present),
+        ];
+        let refusals = answers
+            .iter()
+            .filter(|answer| answer.is_err())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "exactly the damaged identity refuses: {answers:?}"
+        );
+        let refusal = format!("{:?}", refusals[0]);
+        assert!(
+            refusal.contains("missing row object"),
+            "the refusal must name the damage, not be a bare error: {refusal}"
+        );
+        for answer in &answers {
+            assert!(
+                answer
+                    .as_ref()
+                    .is_ok_and(|decision| *decision == AbsenceDecision::DeferredAbsence)
+                    || answer.is_err(),
+                "a missing row is never permission to recreate a deleted file: {answers:?}"
+            );
+        }
+        assert!(
+            fixture.summary_object_paths().is_empty(),
+            "a proven-damaged index must retire its roots so the next open repairs"
+        );
+        drop(probe);
+
+        // The next engine open repairs from retained receipts and answers both
+        // identities exactly. Nothing was resurrected at any point.
+        let mut repaired = fixture.absence_engine();
+        repaired
+            .open_absence_decision_map(&fixture.receipts)
+            .unwrap();
+        let stats = repaired
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("the managed path records its open attribution");
+        assert_eq!(
+            stats.full_catalog_passes, 1,
+            "the repair must be one named counted pass, not a silent reopen: {stats:?}"
+        );
+        assert!(stats.rebuilt);
+        assert_eq!(
+            repaired
+                .receiver_absence_decision(fixture.ids.page_a, &gone)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence,
+            "the deleted page must still defer after the repair"
+        );
+        assert_eq!(
+            repaired
+                .receiver_absence_decision(fixture.ids.page_b, &present)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence
+        );
+        assert_eq!(repaired.resident_absence_row_count_for_test(), 0);
+        assert_eq!(deleted.page_id(), fixture.ids.page_a);
+        assert_eq!(kept.page_id(), fixture.ids.page_b);
+
+        // And the repaired index is the ordinary bounded path again.
+        drop(repaired);
+        let mut steady = fixture.absence_engine();
+        steady.open_absence_decision_map(&fixture.receipts).unwrap();
+        let steady_stats = steady
+            .receiver_absence_summary_open_stats_for_test()
+            .expect("the managed path records its open attribution");
+        assert_eq!(steady_stats.full_catalog_passes, 0, "{steady_stats:?}");
+        assert_eq!(
+            steady
+                .receiver_absence_decision(fixture.ids.page_a, &gone)
+                .unwrap(),
+            AbsenceDecision::DeferredAbsence
+        );
+    }
+
+    /// Historical path enumeration must not come back into the prune policy.
+    ///
+    /// The measured tests above would catch a re-enumeration, but only for the
+    /// shapes they build. This names the rule at the one site that has to hold
+    /// it: the policy asks its questions per *local* key, through the point
+    /// API, and never materializes a receiver history or completion vector.
+    #[test]
+    fn the_prune_policy_asks_point_questions_and_never_enumerates_history() {
+        let source = include_str!("hot_engine.rs");
+        let body = source
+            .split_once("pub(crate) fn flush_local_projection_completions(")
+            .expect("the own-endpoint flush has one producer")
+            .1
+            .split_once("\n    }\n")
+            .expect("its body is brace-terminated")
+            .0;
+        assert!(
+            body.contains("observed_page_paths()"),
+            "the policy must be driven by the local index's own keys"
+        );
+        assert!(
+            body.contains("receiver_row_anchors(&key)"),
+            "the policy must ask its receiver question one exact key at a time"
+        );
+        for forbidden in [
+            "resident_receiver_rows",
+            "receiver_summary_entries",
+            "receiver_history_paths",
+            "receiver_completion_anchors",
+            "validated_catalog",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the own-endpoint prune policy must not enumerate receiver \
+history through {forbidden}"
+            );
+        }
+    }
+
+    /// Retained own work is what keeps an entry, not history. A retained intent
+    /// on a path that is no longer live survives the prune; the same entry
+    /// without the retention does not.
+    #[test]
+    fn retained_own_work_survives_the_prune_and_unretained_history_does_not() {
+        let mut opened = open("p3-own-completion-retention");
+        let ids = opened.ids;
+        let engine = &mut opened.engine;
+        let retained = intent(
+            ids.workspace,
+            ids.page_a,
+            "pages/A-retired.md",
+            5,
+            ProjectionTargetKind::Absent,
+        );
+        let dropped = intent(
+            ids.workspace,
+            ids.page_b,
+            "pages/B-retired.md",
+            6,
+            ProjectionTargetKind::Absent,
+        );
+        assert!(engine.stage_local_projection_completion(&retained).unwrap());
+        assert!(engine.stage_local_projection_completion(&dropped).unwrap());
+        let keep = BTreeSet::from([retained.id().unwrap()]);
+        assert!(engine.flush_local_projection_completions(keep).unwrap());
+        assert_eq!(engine.local_completion_entry_count_for_test(), 1);
+        assert!(engine
+            .local_completed_projection_intent_ids()
+            .contains(&retained.id().unwrap()));
+        assert!(!engine
+            .local_completed_projection_intent_ids()
+            .contains(&dropped.id().unwrap()));
+    }
+}

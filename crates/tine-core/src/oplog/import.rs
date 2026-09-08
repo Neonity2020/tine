@@ -3682,16 +3682,40 @@ fn plan_import(
         .iter()
         .map(|page| page.path().clone())
         .collect::<BTreeSet<_>>();
-    let deferred_absences = completed
-        .iter()
-        .filter(|page| {
-            matches!(
-                inventory.entries().get(page.path()),
-                Some(RawObservation::Absent)
-            ) && engine.restored_generation_requires_absence_deferral(page.page_id(), page.path())
-        })
-        .map(|page| (page.page_id(), page.path().clone()))
-        .collect::<BTreeSet<_>>();
+    // The restored-generation question is one point read of that page's own
+    // durable receiver row, so it is asked per candidate rather than filtered
+    // against a resident history map; a damaged row refuses by name here
+    // instead of silently dropping the deferral.
+    let mut deferred_absences = BTreeSet::new();
+    for page in completed.iter() {
+        if !matches!(
+            inventory.entries().get(page.path()),
+            Some(RawObservation::Absent)
+        ) {
+            continue;
+        }
+        match engine.restored_generation_requires_absence_deferral(page.page_id(), page.path()) {
+            Ok(true) => {
+                deferred_absences.insert((page.page_id(), page.path().clone()));
+            }
+            Ok(false) => {}
+            // Derived receiver-history damage is a named in-scope refusal
+            // (I-8), never an unrecorded "no deferral": deciding without that
+            // row could recreate a page the receiver deleted. The engine has
+            // already armed the instrumented rebuild, so the next open heals.
+            Err(error) => {
+                return blocked_authority_error(
+                    Some(inventory),
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(page.path()),
+                        error.to_string(),
+                    ),
+                    instrumentation,
+                )
+            }
+        }
+    }
     for (page_id, path) in &deferred_absences {
         engine.note_deferred_absence_observation(*page_id, path);
     }

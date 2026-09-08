@@ -13,6 +13,7 @@ pub(crate) mod batch;
 pub(crate) mod checkpoint_generation;
 pub(crate) mod cold_object_store;
 pub(crate) mod conflict_history;
+pub(crate) mod current_action_roots;
 pub(crate) mod discovery;
 pub(crate) mod enrollment;
 pub(crate) mod external_import;

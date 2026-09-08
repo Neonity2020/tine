@@ -304,7 +304,8 @@ Managed storage selection, and no byte is written into the user's graph.
 | `archive/operations.<generation>/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit and join installation | causal replay and publication through the marker generation resolver | content-addressed objects plus manifest-last batches | authoritative append-only tail paired with the same marker-named baseline generation; unreferenced generations are reconstructible join residue and are reclaimed on open |
 | `archive/operations.<generation>/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
 | `archive/operations.<generation>/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
-| `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision map | immutable generation-named summary chain v1 with a completion+intent evidence-filename horizon | disposable receiver map acceleration; retained receipt records are truth and rebuild it |
+| `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision roots | immutable generation-named summary chain v1 naming the absence-history root | disposable receiver roots acceleration; retained receipt records are truth and rebuild it |
+| `archive/operations.<generation>/sweeps/receiver-absence-rows-v1/` | the same receiver open/completion machinery under the workspace lease | point-addressable absence history by exact `(PageId, ManagedPath)` | immutable content-addressed records and authenticated map nodes v1 | disposable derived index; retained receipt records are truth and rebuild it |
 | `archive/operations.<generation>/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
@@ -2539,6 +2540,13 @@ keyed by `(page, path)`. Its answer is the frontier-maximal completion across
 both halves; a defensive incomparable maximal set with mixed target kinds
 chooses the reversible Present/defer direction.
 
+The completed receiver half of that map is **not resident**: it is the
+point-addressable `receiver-absence-rows-v1` index of §3.2d, read one exact
+`(page, path)` at a time and merged with the bounded live overlay by the same
+single decision algorithm. What the roots object carries, and what the map holds
+in memory, is current work — unfinished receiver intents plus the already-pruned
+own-endpoint completion evidence.
+
 Normal Managed opens attach the clean archive store **before** they open the
 absence-decision map, on both the activation and the clean-reopen path, so
 `archive_store == None` — whose full-validated-catalog fallback
@@ -2765,6 +2773,118 @@ and returns a failed backend action for an explicit re-run. It never records a
 partial restore as successful. The final step recomputes and asserts an empty
 whole-page diff before appending Completed. Startup automatically resumes
 Started or Progress actions from their durable cursor.
+
+### 3.2d Current-action roots, the receipt discovery cursor, and Restore pins
+
+Ordinary open answers "what work is still owed?" from **current-action roots**,
+never by enumerating retained history. Two roots objects exist, both under
+`archive/operations.<generation>/sweeps/`:
+
+* `receiver-absence-summary-v1/` holds the receiver receipt roots: the exact set
+  of durable receiver intents that have no completion, the cursor coverage, and
+  the **root of the point-addressable absence history** described below. It does
+  not carry completed receiver decisions. Schema 4.
+* `receiver-absence-rows-v1/` holds that history: one immutable record per
+  `(PageId, exact ManagedPath)` receiver decision, addressed through three
+  composed `tine_storage::sealed_accepted_index` authenticated maps — page id,
+  then the high and low halves of `portable_path_index::exact_path_digest` of the
+  exact path bytes. Page identity and managed-path identity stay separately
+  keyed and full width: nothing truncates, and no tuple is hashed into a single
+  key. Every record carries and revalidates the identity it is bound to, so a
+  substituted record fails rather than answering for another page or path.
+* `sweep-action-roots-v1/` holds the complete active sweep roster: every sweep
+  that is open, barrier-active, has an unfinished action, or awaits an explicit
+  user disposition, each pinned with its exact chain version and digest.
+  Terminal chains are counted and otherwise absent. Their records are never
+  deleted and stay point-addressable by exact sweep id, which is how Restore
+  after completion still reads the original record.
+
+A healthy open enumerates **no** receipt evidence filename and **no** sweep
+record filename, decodes no terminal sweep chain, and reconstructs nothing. It
+reads one roots object per producer (plus its chain predecessor for the digest
+check) and resolves only the work the discovery cursor still points at.
+
+**Completed absence history is on disk, not in memory.** Neither the ordinary
+open nor an ordinary receipt update serializes or materializes the historical
+decisions. One absence answer is one point read of that key's record merged with
+the bounded live overlay, and it is not cached afterwards, so repeated point
+loads cannot accumulate. Exactly one decision algorithm runs, over the historical
+record and the live overlay alike. Persistent bytes may grow with history — D-5
+grants that, and rebaselining is the terminal bound — while resident state tracks
+current and pending work only: unfinished receiver intents, the already-pruned
+device-local completion evidence, and rows whose durable write-through failed.
+Committing a receiver completion retires that intent from the resident set, and
+flushing the own-endpoint completion chain re-derives the resident own half from
+whatever the chain's prune kept, so a long activation converges on the same
+bounded state the next open would seed. Publishing the record and the map nodes
+precedes publishing the roots object that names the new root, so a crash leaves
+unreferenced objects rather than a root pointing at bytes that were never
+written. The receiver receipt publication's pinned barrier budget is 31, of
+which 4 are the discovery cursor's and 2 are the separate row-namespace
+publication that a multi-namespace `ObjectStore::publish_coalesced_private_derived`
+would remove.
+
+**A missing record is damage, never permission.** The authenticated map root is
+the membership authority, so a record the root names but disk cannot supply is
+detectable damage. It is refused by name, never answered `Create` — that would
+recreate a file the receiver deleted — and it retires the derived roots so the
+next open runs the named counted repair from retained receipts. Every point-read
+caller routes damage the same way, including the own-endpoint completion prune,
+so a row discovered missing while pruning cannot become an endless reopen
+refusal. Once an activation has proven the index damaged, it publishes nothing
+further over it: later receipts in that activation would otherwise restore an
+apparently healthy roots chain and cancel the repair the damage requires. Those
+receipts stay durable truth in the receipt store and are folded by the repair. Every
+counter is reported on the clean-open trace: `receipt_evidence_names`,
+`receipt_cursor_marks`, `sweep_record_names`, `sweep_chain_objects_read`,
+`sweep_roots_repaired`, `sweep_retired_chains`,
+`current_action_receipt_obligations`, `current_action_sweep_pins` and
+`current_action_retained_documents`.
+
+**The discovery cursor.** A receipt is truth; the roots are a disposable cache
+of it, so the window between publishing a receipt and folding it into the roots
+needs its own durable record. `sweeps/current-action-cursor-v1/` holds one
+**head** object — a random `incarnation` plus the monotone `reserved` sequence —
+and one **mark** per receipt publication, named by that sequence. The receipt
+store reserves the mark *before* it publishes an intent or a completion; the
+mark and the advanced head are staged into one coalesced audited publication,
+so a reservation costs the same barriers as the mark alone. A reservation that
+cannot be made durable repudiates the head rather than letting a later open
+prove coverage it does not have.
+
+**Coverage is durable state, not an observation.** Each roots object records
+the exact `{incarnation, covered_through}` it has folded, published by the same
+write that publishes the state it claims to cover. An open trusts the roots
+only when the cursor's incarnation matches, no reservation between
+`covered_through` and the durable head is missing, and every mark binds its own
+name. Recreating a lost cursor directory mints a new incarnation, so it can
+never be mistaken for "everything was already covered", and that binding
+survives a second crash inside the repair window — an in-memory
+"directory was created" flag does not. A lost individual mark is a detected
+sequence gap; a torn mark fails its name/content binding.
+
+Any of those conditions takes one **named, counted repair**: a single validated
+pass over retained receipt truth that rebuilds the roots, records the new
+coverage, and returns the next open to the bounded path. It is never a refusal
+(D-3, I-10), never disguised as ordinary work, and never permanent.
+
+**Occupancy is not damage.** There is no cap on outstanding work. A legitimately
+large uncovered window is streamed in chunks of at most 256 reservations, with
+the roots — and the coverage watermark inside them — installed durably after
+each chunk, so a crash mid-catch-up resumes at the last installed chunk instead
+of restarting or falling back to history. Marks are reclaimed only at the
+minimum watermark over every *registered* consumer, so one producer can never
+clear the only discovery mark for another that has not caught up.
+
+**Restore pins.** `CurrentActionRoots::retention_closure()` is the bounded
+interface a generation capture reads: the documents, dependency heads, pages,
+intents and sweeps that unfinished actions and explicit pending Restore still
+require. Membership means "cold relocation must keep this logical object
+reachable", not "keep this record active". Completing a sweep removes it from
+current actionable state; it does not erase its Restore predecessor page
+identity, its predecessor `FrontierV2`, or its prior intent, all of which the
+original record still carries verbatim and `begin_restore` reads back by exact
+sweep id. Historical restoreability alone never keeps a record active.
 
 ### 2.10a Durability barriers by artifact class
 

@@ -1444,6 +1444,17 @@ impl ProjectionIntentId {
         Self(digest)
     }
 
+    /// Rebuild a lookup key from a durable filename or current-action cursor
+    /// mark.
+    ///
+    /// This mints no authority. Every consumer resolves the key through the
+    /// receipt store, which reloads the intent and refuses when the decoded
+    /// intent's own id does not equal the key it was asked for, so an
+    /// arbitrary digest can only ever resolve to "no such intent".
+    pub(crate) const fn from_marker_digest(digest: [u8; 32]) -> Self {
+        Self::from_digest(digest)
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

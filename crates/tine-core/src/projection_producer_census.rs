@@ -1022,6 +1022,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
+        // Current-action roots reclaim only covered cursor marks and obsolete
+        // derived roots; original receipt and sweep records remain retained.
+        (
+            "crates/tine-core/src/oplog/absence_sweep.rs",
+            "cap.remove_file",
+            2,
+        ),
+        (
+            "crates/tine-core/src/oplog/current_action_roots.rs",
+            "cap.remove_file",
+            3,
+        ),
         ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
         (
             "crates/tine-core/src/oplog/import.rs",
@@ -1145,7 +1157,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/receiver_absence_summary.rs",
             "cap.remove_file",
-            2,
+            3,
         ),
         ("crates/tine-core/src/oplog/sqlite.rs", "cap.create_dir", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "fs.create_dir", 1),
@@ -1607,6 +1619,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             "immutable.batch",
             1,
         ),
+        // The cold resolver publishes immutable packs and its guarded roots
+        // through existing durable-directory handles; no raw writer is added.
+        (
+            "crates/tine-core/src/oplog/cold_object_store.rs",
+            "durable_directory.open",
+            2,
+        ),
         (
             "crates/tine-core/src/oplog/hot_engine.rs",
             "journal.managed_append",
@@ -2025,9 +2044,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // canonical full-key qualification reuses authenticated_map_root. Reviewed
     // the complete staged source delta: no new physical publication boundary,
     // raw mutation, alternate tree or second object codec is introduced.
+    // Cold history and receiver point rows reuse the shared map reader/writer
+    // and audited directory publisher. Compared the complete multiset against
+    // the 404-row foundation inventory: 28 additions (18 cold resolver,
+    // 10 receiver history), no removals or changes elsewhere. The cold resolver
+    // adds the two durable-directory opens registered above; receiver rows use
+    // the existing ObjectStore publication boundary.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "9cb4cb5527cf6ae3f90fc7f3683241eddef0ed466dc36f3a6492db87068b8b2f",
+        "777e2a4d6601dca2e439da79da90cddc0f40ae31ac1005a9904714e7a81f23f9",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

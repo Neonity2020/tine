@@ -48,8 +48,8 @@ use crate::model::{
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
 use crate::oplog::absence_sweep::{
-    SweepActionKind, SweepActionState, SweepError, SweepManager, SweepMember, SweepRecord,
-    SweepRestoreCursor, SweepTier,
+    AcceptedBatchMembership, SweepActionKind, SweepActionState, SweepError, SweepManager,
+    SweepMember, SweepRecord, SweepRestoreCursor, SweepTier,
 };
 use crate::oplog::discovery::{
     classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
@@ -1742,6 +1742,54 @@ pub struct SyncRuntimeRecoveryDiagnostics {
 
 /// Content-free work counters for one clean managed cold open.
 ///
+/// Accepted-batch membership for absence-sweep reconciliation, resolved only
+/// if a sweep actually asks.
+///
+/// The old open materialized the complete accepted batch-id set on every
+/// ordinary open so that member reconciliation could ask a handful of point
+/// questions. A healthy open has no uncommitted sweep member at all, so it now
+/// asks nothing and pays nothing.
+///
+/// P3 manager seam: the exact API that would make this a true `O(log n)` point
+/// query is an accepted-status lookup on the engine, e.g.
+/// `EngineStatus::accepted_batch_is_accepted(BatchId) -> Result<bool, EngineError>`
+/// backed by the sealed accepted-status map root that
+/// `tine_storage::sealed_accepted_index::SealedAcceptedIndexReader::status`
+/// already implements. `hot_engine.rs` owns that region, so this adapter keeps
+/// the fallback linear build behind a first-use gate instead.
+struct LazyAcceptedBatchMembership<'a> {
+    engine: &'a ShardedHotEngine,
+    resolved: std::cell::RefCell<Option<BTreeSet<BatchId>>>,
+}
+
+impl<'a> LazyAcceptedBatchMembership<'a> {
+    const fn new(engine: &'a ShardedHotEngine) -> Self {
+        Self {
+            engine,
+            resolved: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl AcceptedBatchMembership for LazyAcceptedBatchMembership<'_> {
+    fn is_accepted(&self, batch_id: BatchId) -> Result<bool, SweepError> {
+        let mut resolved = self.resolved.borrow_mut();
+        if resolved.is_none() {
+            let accepted = self
+                .engine
+                .status()
+                .accepted_batch_ids()
+                .map_err(|error| SweepError::Invalid(error.to_string()))?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            *resolved = Some(accepted);
+        }
+        Ok(resolved
+            .as_ref()
+            .is_some_and(|accepted| accepted.contains(&batch_id)))
+    }
+}
+
 /// Every field counts work the open actually performed — directory names
 /// observed, evidence bodies decoded, history entries replayed. Nothing here
 /// is read back by the open path: these values are produced after the work
@@ -1771,10 +1819,37 @@ pub struct SyncRuntimeCleanOpenCounters {
     pub checkpoint_payload_bytes: usize,
     /// Published frontier minus durable checkpoint frontier after open.
     pub checkpoint_durable_lag: u64,
-    /// Sweep chains reconstructed from the private derived root.
+    /// Sweep chains resident after open: unfinished actions and explicit
+    /// pending Restore only. Terminal chains stay point-addressable on disk.
     pub sweep_chains: usize,
-    /// Receipt evidence FILENAMES observed by the names-only horizon scan.
+    /// Sweep record FILENAMES enumerated. Zero on a healthy open; non-zero
+    /// means the named active-roots repair ran.
+    pub sweep_record_names: usize,
+    /// Sweep chain objects decoded, including bounded roots catch-up probes.
+    pub sweep_chain_objects_read: usize,
+    /// The sweep active roots were missing or damaged and were rebuilt.
+    pub sweep_roots_repaired: bool,
+    /// Terminal sweep chains the roots account for without loading them.
+    pub sweep_retired_chains: u64,
+    /// Sweeps named by the bounded retention closure at open.
+    pub current_action_sweep_pins: usize,
+    /// Distinct documents the retention closure pins for a later Restore.
+    pub current_action_retained_documents: usize,
+    /// Receipt obligations still owed: durable intents with no completion.
+    pub current_action_receipt_obligations: usize,
+    /// Receipt evidence FILENAMES enumerated. Zero on a healthy open; the
+    /// bounded current-action cursor replaced the lifetime horizon scan, so a
+    /// non-zero value means the named repair ran.
     pub receipt_evidence_names: usize,
+    /// Uncovered receipt marks the durable current-action cursor offered.
+    pub receipt_cursor_marks: usize,
+    /// The current-action cursor could not prove bounded coverage for the
+    /// receipt roots at open, so the named repair ran.
+    pub receipt_cursor_unavailable: bool,
+    /// Durable roots installations the receipt catch-up performed. More than
+    /// one means a legitimately large uncovered window was streamed in
+    /// resumable chunks rather than reconstructed from history.
+    pub receipt_cursor_resume_installs: usize,
     /// Receipt evidence BODIES read and decoded (intent + completion rows).
     pub receipt_content_reads: usize,
     /// Complete `validated_catalog()` passes over the receipt store.
@@ -7053,13 +7128,15 @@ fn activate_clean_runtime_resources_retaining_archive(
     engine
         .open_local_completion_index(&store)
         .map_err(CleanOpenError::from)?;
-    let accepted_batch_ids = engine
-        .status()
-        .accepted_batch_ids()
-        .map_err(CleanOpenError::from)?
-        .into_iter()
-        .collect();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
+    let action_cursor = std::sync::Arc::new(
+        crate::oplog::current_action_roots::ProjectionActionCursor::open(&store)
+            .map_err(CleanOpenError::from)?,
+    );
+    receipts.attach_action_cursor(std::sync::Arc::clone(&action_cursor));
+    let sweeps = {
+        let membership = LazyAcceptedBatchMembership::new(&engine);
+        SweepManager::open(&store, &membership).map_err(CleanOpenError::from)?
+    };
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
@@ -7503,15 +7580,43 @@ fn open_clean_runtime_resources_with_progress(
     // workspace lease before either journal drain or any actor publication
     // path can run. Open/in-grace records therefore re-establish the barrier
     // before retained outbound work becomes runnable.
-    let accepted_batch_ids: BTreeSet<_> = engine
-        .status()
-        .accepted_batch_ids()
-        .map_err(CleanOpenError::from)?
-        .into_iter()
-        .collect();
-    counters.accepted_batches = accepted_batch_ids.len();
-    let sweeps = SweepManager::open(&store, &accepted_batch_ids).map_err(CleanOpenError::from)?;
+    let action_cursor = std::sync::Arc::new(
+        crate::oplog::current_action_roots::ProjectionActionCursor::open(&store)
+            .map_err(CleanOpenError::from)?,
+    );
+    receipts.attach_action_cursor(std::sync::Arc::clone(&action_cursor));
+    counters.accepted_batches = usize::try_from(
+        engine
+            .accepted_batch_count()
+            .map_err(CleanOpenError::from)?,
+    )
+    .unwrap_or(usize::MAX);
+    let sweeps = {
+        let membership = LazyAcceptedBatchMembership::new(&engine);
+        SweepManager::open(&store, &membership).map_err(CleanOpenError::from)?
+    };
     counters.sweep_chains = sweeps.chain_count();
+    {
+        let stats = sweeps.open_stats();
+        counters.sweep_record_names = stats.names_observed;
+        counters.sweep_chain_objects_read = stats.chain_objects_read;
+        counters.sweep_roots_repaired = stats.repaired;
+        counters.sweep_retired_chains = stats.retired_chains;
+    }
+    // The bounded retention closure a generation capture must honour. It is
+    // computed from the active roots alone, so it never walks retained
+    // history, and it names every document and dependency head an unfinished
+    // action or explicit pending Restore still pins.
+    //
+    // P3 manager handoff: `checkpoint_generation.rs` is the owner that should
+    // consume `SweepManager::current_action_roots()` /
+    // `CurrentActionRoots::retention_closure()` when it captures a generation;
+    // this open only measures it.
+    {
+        let closure = sweeps.current_action_roots().retention_closure();
+        counters.current_action_sweep_pins = closure.sweeps.len();
+        counters.current_action_retained_documents = closure.documents.len();
+    }
     counters.local_completion_entries = engine.local_completion_entry_count();
     if let Some(stats) = engine.local_completion_open_stats() {
         counters.local_completion_names = stats.names_observed;
@@ -7584,6 +7689,10 @@ fn open_clean_runtime_resources_with_progress(
         counters.summary_rebuilt = stats.rebuilt;
         counters.summary_delta_completions = stats.delta_completions;
         counters.summary_delta_intents = stats.delta_intents;
+        counters.receipt_cursor_marks = stats.cursor_marks_observed;
+        counters.receipt_cursor_unavailable = stats.cursor_unavailable;
+        counters.receipt_cursor_resume_installs = stats.cursor_resume_installs;
+        counters.current_action_receipt_obligations = stats.actionable_intents;
     }
     trace.phase(
         SyncRuntimeCleanOpenStage::AbsenceDecisionMapOpen,

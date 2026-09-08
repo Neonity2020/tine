@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::current_action_roots::{ProjectionActionCursor, ProjectionActionKind};
 use super::object_store::{
     is_temp_name, open_dir_nofollow as open_dir_nofollow_strict,
     publish_immutable_exact as publish_immutable_exact_strict,
@@ -1167,6 +1168,11 @@ pub struct ProjectionReceiptStore {
     capability: Dir,
     namespaces: ReceiptNamespaces,
     retired_own_endpoint_intents: RwLock<BTreeSet<ProjectionIntentId>>,
+    /// Durable write-ahead cursor for receipt publications, installed by the
+    /// managed open that owns the workspace archive. A generic/offline store
+    /// has none and keeps the full-catalog current-action path, exactly as it
+    /// keeps the no-archive absence-map fallback.
+    action_cursor: RwLock<Option<std::sync::Arc<ProjectionActionCursor>>>,
 }
 
 /// Private one-shot authority spanning one exact graph operation and its
@@ -1531,7 +1537,48 @@ impl ProjectionReceiptStore {
             capability,
             namespaces,
             retired_own_endpoint_intents: RwLock::new(BTreeSet::new()),
+            action_cursor: RwLock::new(None),
         })
+    }
+
+    /// Install the durable current-action cursor before any publication.
+    ///
+    /// The managed open attaches this while it holds the workspace lease and
+    /// before the actor can author a receipt, so every production publication
+    /// is write-ahead recorded.
+    pub(crate) fn attach_action_cursor(&self, cursor: std::sync::Arc<ProjectionActionCursor>) {
+        *self
+            .action_cursor
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cursor);
+    }
+
+    pub(crate) fn action_cursor(&self) -> Option<std::sync::Arc<ProjectionActionCursor>> {
+        self.action_cursor
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Reserve the write-ahead mark for one receipt publication.
+    ///
+    /// A cursor failure is not a publication failure: the receipt is truth and
+    /// the cursor is a disposable derived pointer (D-3). Losing the mark costs
+    /// one instrumented rebuild at the next open, never a refusal to publish
+    /// durable evidence (I-10).
+    ///
+    /// What a failed reservation must NOT do is leave a cursor that can still
+    /// *prove* coverage: the receipt below is about to become durable with no
+    /// discovery mark, so the cursor repudiates its own durable head. The next
+    /// open then mints a new incarnation, finds no roots claim matching it,
+    /// and rebuilds from retained receipts — which is exactly where that
+    /// unmarked receipt is found.
+    fn reserve_action_mark(&self, intent_id: ProjectionIntentId, kind: ProjectionActionKind) {
+        if let Some(cursor) = self.action_cursor() {
+            if cursor.reserve(intent_id, kind).is_err() {
+                cursor.repudiate();
+            }
+        }
     }
 
     pub fn root_path(&self) -> &Path {
@@ -1661,6 +1708,7 @@ impl ProjectionReceiptStore {
             self.intent_namespace(ATTEMPTS_DIR, intent_id)?;
             self.intent_namespace(FORENSICS_DIR, intent_id)?;
         }
+        self.reserve_action_mark(intent_id, ProjectionActionKind::Intent);
         publish_immutable_exact(&intents, &intent_name, &bytes, "projection intent")?;
         Ok(intent_id)
     }
@@ -2141,6 +2189,7 @@ impl ProjectionReceiptStore {
                 bytes.len() as u64,
                 MAX_PROJECTION_EVIDENCE_BYTES,
             )?;
+            self.reserve_action_mark(intent_id, ProjectionActionKind::Completion);
             publish_immutable_exact(
                 &authority.completions,
                 &completion_filename(intent_id),
@@ -2681,90 +2730,6 @@ impl ProjectionReceiptStore {
             }
         }
         Ok(names)
-    }
-
-    /// Read exactly the newly published receiver intents (no completion yet)
-    /// not represented by a current summary.
-    pub(crate) fn absence_summary_intent_delta(
-        &self,
-        newly_intended_names: &BTreeSet<String>,
-    ) -> Result<Vec<ProjectionIntent>, ProjectionStoreError> {
-        let intents_dir = self.namespace(INTENTS_DIR)?;
-        let mut intents = Vec::new();
-        for intent_name in newly_intended_names {
-            require_canonical_evidence_name(intent_name, ".intent")?;
-            let bytes = read_optional_regular(
-                &intents_dir,
-                intent_name,
-                MAX_PROJECTION_EVIDENCE_BYTES,
-                None,
-            )?
-            .ok_or_else(|| {
-                ProjectionStoreError::UnsafeEntry(format!(
-                    "projection intent disappeared after names snapshot: {intent_name}"
-                ))
-            })?;
-            let intent = ProjectionIntent::decode(&bytes)?;
-            self.require_workspace(&intent)?;
-            if intent.encode()? != bytes || intent_filename(intent.id()?) != *intent_name {
-                return Err(ProjectionStoreError::PathBindingMismatch(
-                    "projection intent",
-                ));
-            }
-            intents.push(intent);
-        }
-        Ok(intents)
-    }
-
-    /// Read exactly the newly completed receiver rows not represented by a
-    /// current summary. The matching intent filename is derived directly from
-    /// each completion name; no lifetime intent-directory walk occurs.
-    pub(crate) fn absence_summary_catalog_delta(
-        &self,
-        newly_completed_names: &BTreeSet<String>,
-    ) -> Result<Vec<ProjectionCatalogEntry>, ProjectionStoreError> {
-        let intents_dir = self.namespace(INTENTS_DIR)?;
-        let mut rows = Vec::new();
-        for completion_name in newly_completed_names {
-            require_canonical_evidence_name(completion_name, ".completion")?;
-            let intent_name = format!(
-                "{}.intent",
-                completion_name
-                    .strip_suffix(".completion")
-                    .expect("suffix was checked")
-            );
-            let bytes = read_optional_regular(
-                &intents_dir,
-                &intent_name,
-                MAX_PROJECTION_EVIDENCE_BYTES,
-                None,
-            )?
-            .ok_or_else(|| {
-                ProjectionStoreError::UnsafeEntry(format!(
-                    "projection completion has no matching intent: {completion_name}"
-                ))
-            })?;
-            let intent = ProjectionIntent::decode(&bytes)?;
-            self.require_workspace(&intent)?;
-            if intent.encode()? != bytes
-                || intent_filename(intent.id()?) != intent_name
-                || completion_filename(intent.id()?) != *completion_name
-            {
-                return Err(ProjectionStoreError::PathBindingMismatch(
-                    "projection intent",
-                ));
-            }
-            let completion = self.load_completion(&intent)?.ok_or_else(|| {
-                ProjectionStoreError::UnsafeEntry(format!(
-                    "projection completion disappeared after names snapshot: {completion_name}"
-                ))
-            })?;
-            rows.push(ProjectionCatalogEntry {
-                intent,
-                completion: Some(completion),
-            });
-        }
-        Ok(rows)
     }
 
     /// Reconstruct completion only from an authorized replay and Graph's fresh
@@ -5483,6 +5448,15 @@ mod tests {
     fn absence_decision_map_steady_open_skips_the_full_receiver_catalog() {
         let fixture = Fixture::new("absence-summary-map-cost-fail-before");
         let archive_path = fixture.root.join("operations");
+        // Production attaches the durable current-action cursor while it holds
+        // the workspace lease and before any actor work; without it a managed
+        // open has no bounded coverage proof and correctly repairs every time.
+        fixture.store.attach_action_cursor(std::sync::Arc::new(
+            ProjectionActionCursor::open(
+                &ObjectStore::open(&archive_path, fixture.store.workspace_id()).unwrap(),
+            )
+            .unwrap(),
+        ));
         let mut rebuild_engine = ShardedHotEngine::new(
             fixture.store.workspace_id(),
             LineageDigest::of(b"absence-summary-map-cost"),
