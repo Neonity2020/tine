@@ -31004,6 +31004,125 @@ fn r5b_a_pending_local_suffix_is_captured_and_the_overlay_holds_the_pending_page
 }
 
 #[test]
+fn ret2_pending_repair_leaves_actor_edits_responsive_while_old_jobs_drain() {
+    let fixture = r5a_fixture("ret2-repair-edit", 0x5a50);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO before repair");
+    let (path, old) = r5a_overlay(&handle);
+    fs::remove_file(path).unwrap();
+    let crate::query_jobs::Admission::Slot(held) = handle.inner.managed_query.jobs.acquire() else {
+        panic!("held reader")
+    };
+    let mut held = Some(held);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let start = std::thread::scope(|scope| {
+        let query = scope.spawn(|| {
+            let result =
+                handle.application_request(|reply| ActorRequest::BeginPendingProjectionRepair {
+                    instance: old.instance,
+                    reply,
+                });
+            sender.send(result).unwrap();
+        });
+        let start = receiver.recv_timeout(Duration::from_secs(5));
+        if start.is_err() {
+            drop(held.take());
+        }
+        query.join().unwrap();
+        start
+            .expect("begin must return while the old job is still held")
+            .unwrap()
+            .unwrap()
+    });
+    assert!(held.as_ref().unwrap().is_cancelled());
+    // This save must finish before releasing the old query's capacity. It
+    // changes the authority after repair capture and before reconstruction.
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO during repair witness");
+    drop(held.take());
+    handle.complete_pending_projection_repair(start).unwrap();
+    let actual = r4a_navigate(
+        &handle,
+        "(content-regex \"during repair witness\")",
+        R5A_ROWS,
+        R5A_BYTES,
+    )
+    .unwrap();
+    assert_eq!(actual.total, 1);
+    let expected = r5a_walk(
+        &handle,
+        "(content-regex \"during repair witness\")",
+        R5A_ROWS,
+        R5A_BYTES,
+    );
+    r4a_assert_same("edit while repair drains", &actual, &expected);
+}
+
+#[test]
+fn ret2_shutdown_cleans_a_registered_but_uninstalled_repair_candidate() {
+    let fixture = r5a_fixture("ret2-repair-shutdown", 0x5a51);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO shutdown repair witness");
+    let (path, old) = r5a_overlay(&handle);
+    let start = handle
+        .application_request(|reply| ActorRequest::BeginPendingProjectionRepair {
+            instance: old.instance,
+            reply,
+        })
+        .unwrap()
+        .unwrap();
+    let shared = &handle.inner.managed_query;
+    shared.jobs.wait_for_drain(start.fence);
+    let crate::query_jobs::Admission::Slot(slot) = shared.jobs.acquire() else {
+        panic!("creation slot")
+    };
+    shared
+        .pending_repair
+        .prepare_candidate(start.token, &start.path, start.config, &slot)
+        .unwrap();
+    drop(slot);
+    assert!(path.exists());
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+    assert!(!path.exists(), "uninstalled candidate leaked past shutdown");
+    assert!(shared.pending_repair.finish(start.token).is_none());
+    let reopened = r4a_reopen(&fixture);
+    let (new_path, _) = r5a_overlay(&reopened);
+    assert_eq!(new_path, path);
+    shared.pending_repair.cleanup();
+    assert!(
+        new_path.exists(),
+        "old cleanup removed the new runtime's overlay"
+    );
+}
+
+#[test]
+fn ret2_pending_repair_restores_a_missing_projection_without_document_hydration() {
+    let fixture = r5a_fixture("ret2-actor-repair", 0x5a49);
+    let handle = r4a_reopen(&fixture);
+    r5a_pending_append(&handle, "notes/Delta.md", "TODO actor repair witness");
+    let expected = r5a_walk(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES);
+    let (path, old) = r5a_overlay(&handle);
+    handle.clear_application_simple_query_memo().unwrap();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).is_err());
+    // Exercise the real handle/actor protocol explicitly. Automatic failure
+    // retry in the common query driver is a subsequent integration step.
+    handle.repair_pending_projection(old.instance).unwrap();
+    let (_, repaired) = r5a_overlay(&handle);
+    assert_ne!(old.instance, repaired.instance);
+    let actual = r4a_navigate(&handle, "(task TODO)", R5A_ROWS, R5A_BYTES).unwrap();
+    r4a_assert_same("repaired pending projection", &actual, &expected);
+    let work = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(work.metadata_page_hydrations, 0, "{work:?}");
+    assert_eq!(work.result_page_hydrations, 0, "{work:?}");
+}
+
+#[test]
 fn ret2_pending_projection_rebuild_does_not_construct_parser_or_editor_pages() {
     let fixture = r5a_fixture("ret2-pending-producer", 0x5a40);
     let handle = r4a_reopen(&fixture);

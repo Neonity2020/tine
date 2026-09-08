@@ -4641,6 +4641,55 @@ impl SyncRuntimeHandle {
         })
     }
 
+    /// Reconstruct a failed pending projection without holding the actor or a
+    /// read transaction. Query dispatch calls this only after its failed read
+    /// has released every snapshot and capacity slot.
+    fn repair_pending_projection(
+        &self,
+        instance: u64,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let Some(start) = self.application_request(|reply| {
+            ActorRequest::BeginPendingProjectionRepair { instance, reply }
+        })?
+        else {
+            return Ok(());
+        };
+        self.complete_pending_projection_repair(start)
+    }
+
+    fn complete_pending_projection_repair(
+        &self,
+        start: PendingRepairStart,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let shared = &self.inner.managed_query;
+        shared.jobs.wait_for_drain(start.fence);
+        let slot = match shared.jobs.acquire() {
+            crate::query_jobs::Admission::Slot(slot) => slot,
+            crate::query_jobs::Admission::Cancelled => {
+                shared.pending_repair.fail(start.token);
+                return Err(pending_repair_error(
+                    crate::managed_overlay::PendingRepairStatus::Retired,
+                ));
+            }
+            crate::query_jobs::Admission::Busy => {
+                shared.pending_repair.fail(start.token);
+                return Err(pending_repair_error(
+                    crate::managed_overlay::PendingRepairStatus::Failed,
+                ));
+            }
+        };
+        let prepared =
+            shared
+                .pending_repair
+                .prepare_candidate(start.token, &start.path, start.config, &slot);
+        drop(slot);
+        prepared.map_err(pending_repair_error)?;
+        self.application_request(|reply| ActorRequest::FinishPendingProjectionRepair {
+            token: start.token,
+            reply,
+        })
+    }
+
     /// The Managed simple-query route (R4, SPEC §5.9).
     ///
     /// Phase one is an actor turn that holds `operation` exactly as every
@@ -10837,6 +10886,14 @@ enum ActorRequest {
     ClosePendingOverlay { reply: mpsc::Sender<()> },
     #[cfg(test)]
     RebuildPendingOverlay { reply: mpsc::Sender<()> },
+    BeginPendingProjectionRepair {
+        instance: u64,
+        reply: mpsc::Sender<Result<Option<PendingRepairStart>, SyncApplicationPageRequestError>>,
+    },
+    FinishPendingProjectionRepair {
+        token: crate::managed_overlay::PendingRepairToken,
+        reply: mpsc::Sender<Result<(), SyncApplicationPageRequestError>>,
+    },
     #[cfg(test)]
     ApplicationPropertyRegistryProbe {
         reply: mpsc::Sender<ApplicationPropertyRegistryProbe>,
@@ -10866,6 +10923,34 @@ enum ActorRequest {
     CleanShutdown {
         reply: mpsc::Sender<Result<SyncShutdownOutcome, SyncRuntimeRequestError>>,
     },
+}
+
+struct PendingRepairStart {
+    token: crate::managed_overlay::PendingRepairToken,
+    fence: crate::query_jobs::QueryDrainFence,
+    path: PathBuf,
+    config: crate::config::ParseConfig,
+}
+
+fn pending_repair_error(
+    status: crate::managed_overlay::PendingRepairStatus,
+) -> SyncApplicationPageRequestError {
+    use crate::managed_overlay::PendingRepairStatus;
+    match status {
+        PendingRepairStatus::Working => SyncApplicationPageRequestError::QueryExecution(
+            crate::query::QueryExecutionError::NotReady(
+                crate::query::QueryReadinessReason::Recovering,
+            ),
+        ),
+        PendingRepairStatus::Failed => {
+            query_unavailable(crate::query::QueryUnavailableReason::ReadFailed)
+        }
+        PendingRepairStatus::Idle | PendingRepairStatus::Retired => {
+            SyncApplicationPageRequestError::QueryExecution(
+                crate::query::QueryExecutionError::Cancelled,
+            )
+        }
+    }
 }
 
 fn actor_thread_from_clean_resources(
@@ -10916,6 +11001,11 @@ fn run_actor_loop(
             .chain(actor.sweep_deadline_remaining())
             .chain(
                 actor
+                    .pending_overlay_rebuild_has_work()
+                    .then_some(Duration::from_millis(10)),
+            )
+            .chain(
+                actor
                     .search_index_build_has_work()
                     .then_some(Duration::from_millis(10)),
             )
@@ -10923,6 +11013,7 @@ fn run_actor_loop(
         let request = match receiver.recv_timeout(timeout) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                actor.advance_pending_overlay_rebuild();
                 if actor
                     .managed_local
                     .as_ref()
@@ -11331,6 +11422,14 @@ fn run_actor_loop(
                 let _ = reply.send(());
                 false
             }
+            ActorRequest::BeginPendingProjectionRepair { instance, reply } => {
+                let _ = reply.send(actor.begin_pending_projection_repair(instance));
+                false
+            }
+            ActorRequest::FinishPendingProjectionRepair { token, reply } => {
+                let _ = reply.send(actor.finish_pending_projection_repair(token));
+                false
+            }
             #[cfg(test)]
             ActorRequest::RebuildPendingOverlay { reply } => {
                 actor.retire_pending_overlay();
@@ -11407,6 +11506,9 @@ fn run_actor_loop(
             actor.terminal = Some(error);
         }
         actor.publish_absence_sweep_changes();
+        if !should_stop {
+            actor.advance_pending_overlay_rebuild();
+        }
         *shared_status.write().unwrap() = actor.snapshot();
         if should_stop {
             break;
@@ -11595,6 +11697,7 @@ struct ManagedLocalRuntimeState {
     /// `None` only when the overlay could not be created; pending queries
     /// then walk exactly as before R5.
     pending_overlay: Option<Arc<crate::managed_overlay::PendingOverlay>>,
+    pending_overlay_rebuild: VecDeque<String>,
     checkpoint: ManagedLocalDrainCheckpoint,
     checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
@@ -12374,6 +12477,7 @@ fn open_clean_foreground_journal(
         // Installed by the actor once it owns the projection file
         // (`install_pending_overlay`): the overlay sits next to that file.
         pending_overlay: None,
+        pending_overlay_rebuild: VecDeque::new(),
         checkpoint,
         checkpoint_batch_id,
         continuation: None,
@@ -13292,6 +13396,103 @@ impl RuntimeActor {
         }
     }
 
+    fn begin_pending_projection_repair(
+        &mut self,
+        instance: u64,
+    ) -> Result<Option<PendingRepairStart>, SyncApplicationPageRequestError> {
+        let state = self.managed_query.pending_repair.status();
+        if state != crate::managed_overlay::PendingRepairStatus::Idle {
+            return Err(pending_repair_error(state));
+        }
+        let old = match self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| managed.pending_overlay.as_ref())
+        {
+            Some(overlay) if overlay.instance() == instance => Arc::clone(overlay),
+            _ => return Ok(None),
+        };
+        let path = self
+            .active_database()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+            .path()
+            .to_path_buf();
+        let config = self.graph.config.parse_config();
+        let token = self
+            .managed_query
+            .pending_repair
+            .begin(old)
+            .ok_or_else(|| pending_repair_error(self.managed_query.pending_repair.status()))?;
+        if let Some(managed) = self.managed_local.as_mut() {
+            managed.pending_overlay.take();
+            managed.pending_overlay_rebuild.clear();
+        }
+        let fence = self.managed_query.jobs.begin_drain();
+        Ok(Some(PendingRepairStart {
+            token,
+            fence,
+            path,
+            config,
+        }))
+    }
+
+    fn finish_pending_projection_repair(
+        &mut self,
+        token: crate::managed_overlay::PendingRepairToken,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        let Some(managed) = self.managed_local.as_mut() else {
+            return Err(pending_repair_error(
+                crate::managed_overlay::PendingRepairStatus::Retired,
+            ));
+        };
+        let candidate = self
+            .managed_query
+            .pending_repair
+            .finish(token)
+            .ok_or_else(|| pending_repair_error(self.managed_query.pending_repair.status()))?;
+        managed.pending_overlay_rebuild =
+            managed.latest_projection_frames.keys().cloned().collect();
+        for path in &managed.pending_overlay_rebuild {
+            candidate.announce(path);
+        }
+        managed.pending_overlay = Some(candidate);
+        Ok(())
+    }
+
+    fn pending_overlay_rebuild_has_work(&self) -> bool {
+        self.managed_local
+            .as_ref()
+            .is_some_and(|managed| !managed.pending_overlay_rebuild.is_empty())
+    }
+
+    /// One authoritative page per actor turn, also progressed during idle time.
+    /// A disconnected original query caller cannot strand reconstruction.
+    fn advance_pending_overlay_rebuild(&mut self) {
+        let work = self.managed_local.as_mut().and_then(|managed| {
+            let overlay = managed.pending_overlay.as_ref()?.clone();
+            let path = managed.pending_overlay_rebuild.pop_front()?;
+            Some((overlay, path))
+        });
+        let Some((overlay, path)) = work else { return };
+        let rebuilt = ManagedPath::parse(path.clone()).ok().and_then(|parsed| {
+            self.with_pending_materialized_page(&parsed, |page| {
+                Ok(page.map(|(page, _)| Arc::new(page)))
+            })
+            .ok()
+        });
+        match rebuilt {
+            Some(Some(Some(page))) => overlay.content(&path, page),
+            Some(Some(None)) => overlay.tombstone(&path),
+            Some(None) => overlay.remove(&path),
+            None => {
+                overlay.mark_failed("pending overlay repair page");
+                if let Some(managed) = self.managed_local.as_mut() {
+                    managed.pending_overlay_rebuild.clear();
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     fn pending_overlay_state(&self) -> Option<(PathBuf, crate::managed_overlay::OverlayState)> {
         let overlay = self.managed_local.as_ref()?.pending_overlay.as_ref()?;
@@ -13301,6 +13502,7 @@ impl RuntimeActor {
 
     /// Stop captures of this instance before draining jobs which already own it.
     fn retire_pending_overlay(&self) {
+        self.managed_query.pending_repair.retire();
         if let Some(overlay) = self
             .managed_local
             .as_ref()
@@ -13313,6 +13515,10 @@ impl RuntimeActor {
     /// Stop and delete the pending overlay. Every off-actor query job has been
     /// drained by the caller (I-21); the overlay's own close joins its worker.
     fn close_pending_overlay(&mut self) {
+        self.managed_query.pending_repair.cleanup();
+        if let Some(managed) = self.managed_local.as_mut() {
+            managed.pending_overlay_rebuild.clear();
+        }
         if let Some(overlay) = self
             .managed_local
             .as_mut()
@@ -16070,6 +16276,26 @@ impl RuntimeActor {
         today: crate::date::JournalDate,
     ) -> Result<Option<crate::managed_query::ManagedQueryStamp>, SyncApplicationPageRequestError>
     {
+        match self.managed_query.pending_repair.status() {
+            crate::managed_overlay::PendingRepairStatus::Working => {
+                return Err(SyncApplicationPageRequestError::QueryExecution(
+                    crate::query::QueryExecutionError::NotReady(
+                        crate::query::QueryReadinessReason::Recovering,
+                    ),
+                ))
+            }
+            crate::managed_overlay::PendingRepairStatus::Failed => {
+                return Err(query_unavailable(
+                    crate::query::QueryUnavailableReason::ReadFailed,
+                ))
+            }
+            crate::managed_overlay::PendingRepairStatus::Retired => {
+                return Err(SyncApplicationPageRequestError::QueryExecution(
+                    crate::query::QueryExecutionError::Cancelled,
+                ))
+            }
+            crate::managed_overlay::PendingRepairStatus::Idle => {}
+        }
         // R5b: a pending suffix is part of the stamp, not a reason to have
         // none — its overlay revision. Without an overlay (creation failed)
         // the pending state has no stamp and every pending query walks.

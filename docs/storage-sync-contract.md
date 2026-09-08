@@ -915,7 +915,18 @@ responsibility before that guard can be released. Retirement prevents later
 registration; cleanup after the drain closes retained instances. A failed
 creation remains terminal until lifecycle cleanup. The owner tests cover
 transfer, stale tokens, retirement before registration and actual creation
-failure. This primitive does not yet schedule automatic query recovery.
+failure.
+
+The actor repair protocol captures a fence and immutable preparation inputs in
+a short begin turn. The handle waits and creates/registers the candidate off
+the actor, releasing its capacity guard before requesting installation. The
+actor announces the latest pending path set and reconstructs one authoritative
+page between requests or during idle work, using the existing materialization
+producer. Retirement covers both the current overlay and an uninstalled repair
+candidate before job drainage; cleanup follows drainage. Tests exercise a real
+missing file, an edit while an old query slot is held, and shutdown before
+candidate installation. The protocol is not yet triggered automatically by the
+common query failure handler.
 
 Overlay teardown serializes worker join and file removal once per instance.
 Repeated close calls on a retained old instance cannot remove a replacement at

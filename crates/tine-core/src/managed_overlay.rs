@@ -187,6 +187,17 @@ pub(crate) enum PendingRepairStatus {
 }
 
 impl PendingOverlayRepair {
+    pub(crate) fn fail(&self, token: PendingRepairToken) {
+        if let Some(entry) = self
+            .entry
+            .lock()
+            .unwrap()
+            .as_mut()
+            .filter(|entry| entry.token == token && !entry.retired)
+        {
+            entry.failed = true;
+        }
+    }
     pub(crate) fn status(&self) -> PendingRepairStatus {
         match self.entry.lock().unwrap().as_ref() {
             None => PendingRepairStatus::Idle,

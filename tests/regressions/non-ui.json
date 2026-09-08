@@ -2,6 +2,18 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-PENDING-REPAIR-ACTOR-PROTOCOL",
+ "title": "Pending projection reconstruction preserves concurrent edits and candidate teardown",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager actor repair protocol" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_restores_a_missing_projection_without_document_hydration", "crates/tine-core/src/sync_runtime_tests.rs::ret2_pending_repair_leaves_actor_edits_responsive_while_old_jobs_drain", "crates/tine-core/src/sync_runtime_tests.rs::ret2_shutdown_cleans_a_registered_but_uninstalled_repair_candidate"],
+  "scenario": "query-engine.pending-repair-actor-protocol"
+ },
+ "notes": "Exercises explicit protocol entry and real SQL afterward. Automatic query-failure retry is not yet connected. Further acceptance/rename/config replacement interleavings remain campaign gates."
+},
+{
  "id": "REG-QE-PENDING-REPAIR-OWNERSHIP",
  "title": "Pending repair candidates have one teardown owner before actor installation",
  "family": "query-engine",

@@ -998,6 +998,7 @@ pub(crate) struct ManagedQueryShared {
     pub(crate) census: ManagedQueryCensus,
     pub(crate) memo: Mutex<ApplicationSimpleQueryMemo>,
     pub(crate) patched_registry: PatchedRegistryCache,
+    pub(crate) pending_repair: crate::managed_overlay::PendingOverlayRepair,
     /// Test hook: the outcomes the handle uses INSTEAD of executing the next
     /// captures, in order. Lets a test drive every handle-side transition
     /// (`Stale` re-capture, the third `Stale`, `Busy`, `Cancelled`, `Failed`)
