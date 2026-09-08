@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  normalizeFriendlyPageMatchScope,
   normalizeQueryDisplayDraft,
   queryDisplaySettings,
+  queryResultDisplaySettings,
   QUERY_DISPLAY_MAX_FIELD,
   QUERY_DISPLAY_MAX_LIST,
   QUERY_DISPLAY_MAX_SAMPLE,
   type QueryDisplayDraft,
 } from "./queryDisplayDraft";
 import type { ViewSettings } from "./queryIr";
+import type { QueryRoute } from "../router";
 
 const norm = normalizeQueryDisplayDraft;
 
@@ -272,5 +275,61 @@ describe("queryDisplaySettings", () => {
     const inherited = queryDisplaySettings(undefined, parsed, "table");
     expect(inherited.columns).not.toBe(parsed.columns);
     expect(inherited.sort![0]).not.toBe(parsed.sort![0]);
+  });
+});
+
+describe("Friendly page match scope", () => {
+  it("accepts only the three exact membership modes", () => {
+    for (const scope of ["names", "content", "both"] as const) {
+      expect(normalizeFriendlyPageMatchScope(scope)).toBe(scope);
+    }
+    for (const bad of [undefined, null, "", "name", "all", "NAMES", 1, {}]) {
+      expect(normalizeFriendlyPageMatchScope(bad)).toBeNull();
+    }
+  });
+});
+
+describe("mixed page/block display settings", () => {
+  const route = (overrides: Partial<QueryRoute> = {}): QueryRoute => ({
+    kind: "query",
+    id: "query-mixed",
+    sourceKind: "search",
+    source: "alpha",
+    presentation: "table",
+    display: { columns: ["prop:owner"], sort: [["priority", "asc"]] },
+    ...overrides,
+  });
+  const parsed: ViewSettings = {
+    view: "search",
+    columns: ["state"],
+    group_by: "prop:area",
+  };
+
+  it("gives old singular routes the same settings for both result families", () => {
+    const old = route();
+    expect(queryResultDisplaySettings(old, parsed, "page"))
+      .toEqual({ view: "table", columns: ["prop:owner"], sort: [["priority", "asc"]] });
+    expect(queryResultDisplaySettings(old, parsed, "block"))
+      .toEqual({ view: "table", columns: ["prop:owner"], sort: [["priority", "asc"]] });
+  });
+
+  it("resolves scoped presentation and draft independently", () => {
+    const mixed = route({
+      pagePresentation: "board",
+      pageDisplay: { group_by: "prop:area" },
+      blockPresentation: "list",
+      blockDisplay: { sample: 8 },
+    });
+    expect(queryResultDisplaySettings(mixed, parsed, "page"))
+      .toEqual({ view: "board", group_by: "prop:area" });
+    expect(queryResultDisplaySettings(mixed, parsed, "block"))
+      .toEqual({ view: "list", sample: 8 });
+  });
+
+  it("distinguishes an absent scoped draft from a present empty one", () => {
+    const mixed = route({ pageDisplay: {} });
+    expect(queryResultDisplaySettings(mixed, parsed, "page")).toEqual({ view: "table" });
+    expect(queryResultDisplaySettings(mixed, parsed, "block"))
+      .toEqual({ view: "table", columns: ["prop:owner"], sort: [["priority", "asc"]] });
   });
 });

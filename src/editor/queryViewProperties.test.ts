@@ -16,12 +16,16 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  QUERY_DISPLAY_PROPERTY_NAMESPACES,
+  QUERY_PAGE_MATCH_SCOPE_PROPERTY,
   canonicalGroupField,
   isLegacyBareColumnList,
   legacyGroupField,
   mergeQueryAggregateValue,
   queryColumnTokens,
   queryDisplayPropertyWrites,
+  queryPageMatchScopePropertyPatch,
+  queryScopedDisplayPropertyPatch,
   queryViewPropertyPatch,
   resolveQueryColumns,
   resolveQueryGrouping,
@@ -288,6 +292,168 @@ describe("the lossless query view-property patch", () => {
       view: {},
       properties: [["tine.columns", ""], ["tine.fields", "page;status"]],
     })).toEqual([]);
+  });
+});
+
+describe("scoped page/block display property patches", () => {
+  it("maps the legacy grammar onto the approved page and block keys", () => {
+    expect(QUERY_DISPLAY_PROPERTY_NAMESPACES).toEqual({
+      legacy: {
+        view: "tine.view", marker: null, sort: "tine.sort",
+        grouping: "tine.group-field", columns: "tine.columns",
+        aggregates: "tine.col-aggregates", sample: "tine.sample",
+      },
+      page: {
+        view: "tine.page-view", marker: "tine.page-display", sort: "tine.page-sort",
+        grouping: "tine.page-group-field", columns: "tine.page-columns",
+        aggregates: "tine.page-col-aggregates", sample: "tine.page-sample",
+      },
+      block: {
+        view: "tine.block-view", marker: "tine.block-display", sort: "tine.block-sort",
+        grouping: "tine.block-group-field", columns: "tine.block-columns",
+        aggregates: "tine.block-col-aggregates", sample: "tine.block-sample",
+      },
+    });
+    expect(QUERY_PAGE_MATCH_SCOPE_PROPERTY).toBe("tine.page-match-scope");
+  });
+
+  it("writes the same canonical values as the singular writer under a namespace", () => {
+    const display = {
+      sort: [["priority", "desc"]] as [string, "asc" | "desc"][],
+      group_by: "prop:area",
+      columns: ["name", "prop:owner"],
+      aggregates: [["", "count"], ["prop:cost", "sum"]] as [string, "count" | "sum" | "avg"][],
+      sample: 12,
+    };
+    const legacy = Object.fromEntries(queryViewPropertyPatch({
+      view: { view: "table", ...display },
+      properties: [],
+    }));
+    const scoped = Object.fromEntries(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      presentation: "table",
+      display,
+      properties: [],
+    }));
+
+    expect(scoped).toEqual({
+      "tine.page-view": legacy["tine.view"],
+      "tine.page-display": "1",
+      "tine.page-sort": legacy["tine.sort"],
+      "tine.page-group-field": legacy["tine.group-field"],
+      "tine.page-columns": legacy["tine.columns"],
+      "tine.page-col-aggregates": legacy["tine.col-aggregates"],
+      "tine.page-sample": legacy["tine.sample"],
+    });
+  });
+
+  it("keeps explicit empty lists distinct from an empty draft and an absent scope", () => {
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      display: { sort: [], columns: [], aggregates: [] },
+      properties: [],
+    })).toEqual([
+      ["tine.page-display", "1"],
+      ["tine.page-sort", ""],
+      ["tine.page-columns", ""],
+      ["tine.page-col-aggregates", ""],
+    ]);
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      display: {},
+      properties: [],
+    })).toEqual([["tine.page-display", "1"]]);
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      properties: [],
+    })).toEqual([]);
+  });
+
+  it("removes recognized aggregates without deleting unknown authored segments", () => {
+    const properties: PropertyPairs = [
+      ["tine.page-display", "1"],
+      ["tine.page-col-aggregates", "count; estimate=median ;hours=sum"],
+    ];
+
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      display: { aggregates: [] },
+      properties,
+    })).toEqual([["tine.page-col-aggregates", " estimate=median "]]);
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      display: {},
+      properties,
+    })).toEqual([["tine.page-col-aggregates", " estimate=median "]]);
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      properties,
+    })).toEqual([
+      ["tine.page-display", null],
+      ["tine.page-col-aggregates", " estimate=median "],
+    ]);
+  });
+
+  it("writes a marker-only empty draft and preserves other scope and unknown bytes", () => {
+    const properties: PropertyPairs = [
+      ["tine.page-sort", "priority desc"],
+      ["tine.page-group-field", "prop:area"],
+      ["tine.page-columns", "name;prop:owner"],
+      ["tine.page-col-aggregates", "count;estimate=median"],
+      ["tine.page-sample", "12"],
+      ["tine.block-sort", "deadline asc"],
+      ["tine.page-future", "untouched"],
+      ["author.key", "exact bytes"],
+    ];
+    const writes = Object.fromEntries(queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      display: {},
+      properties,
+    }));
+
+    expect(writes).toEqual({
+      "tine.page-display": "1",
+      "tine.page-sort": null,
+      "tine.page-group-field": null,
+      "tine.page-columns": null,
+      "tine.page-col-aggregates": "estimate=median",
+      "tine.page-sample": null,
+    });
+    expect(Object.keys(writes).some((key) => key.startsWith("tine.block-"))).toBe(false);
+    expect(Object.hasOwn(writes, "tine.page-future")).toBe(false);
+    expect(Object.hasOwn(writes, "author.key")).toBe(false);
+  });
+
+  it("removes an absent draft override while treating presentation independently", () => {
+    const properties: PropertyPairs = [
+      ["tine.block-view", "board"],
+      ["tine.block-display", "1"],
+      ["tine.block-sort", "priority desc"],
+      ["tine.block-col-aggregates", "hours=sum;estimate=median"],
+    ];
+    expect(queryScopedDisplayPropertyPatch({
+      namespace: "block",
+      presentation: "list",
+      properties,
+    })).toEqual([
+      ["tine.block-view", "list"],
+      ["tine.block-display", null],
+      ["tine.block-sort", null],
+      ["tine.block-col-aggregates", "estimate=median"],
+    ]);
+  });
+
+  it("keeps explicit names membership distinct from absence", () => {
+    expect(queryPageMatchScopePropertyPatch({ scope: "names", properties: [] }))
+      .toEqual([["tine.page-match-scope", "names"]]);
+    expect(queryPageMatchScopePropertyPatch({
+      scope: "names",
+      properties: [["tine.page-match-scope", " names "]],
+    })).toEqual([]);
+    expect(queryPageMatchScopePropertyPatch({ properties: [] })).toEqual([]);
+    expect(queryPageMatchScopePropertyPatch({
+      properties: [["tine.page-match-scope", "names"]],
+    })).toEqual([["tine.page-match-scope", null]]);
   });
 });
 

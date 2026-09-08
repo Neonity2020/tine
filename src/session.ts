@@ -1,12 +1,17 @@
 import { backend } from "./backend";
 import { isSinglePaneShell } from "./nativeChrome";
-import { normalizeQueryDisplayDraft, type QueryDisplayDraft } from "./editor/queryDisplayDraft";
+import {
+  normalizeFriendlyPageMatchScope,
+  normalizeQueryDisplayDraft,
+} from "./editor/queryDisplayDraft";
 import {
   installSessionPersistence,
   mintPdfViewId,
+  normalizeQueryPresentation,
   sameRoute,
   type PaneSnapshot,
   type PdfRoute,
+  type QueryRoute,
   type Route,
   type SerializedTab,
 } from "./router";
@@ -83,10 +88,32 @@ function invalidPersistedPdf(message: string): Route {
  *  route with a valid source and presentation, and losing a tab (or a whole
  *  pane's layout) over a display choice would be the disproportionate refusal
  *  D-3 rules out — a draft is disposable, the route is not. */
-function persistableQueryDisplay(display: unknown): { display?: QueryDisplayDraft } {
+type QueryDisplayRouteKey = "display" | "pageDisplay" | "blockDisplay";
+
+function persistableQueryDisplay<K extends QueryDisplayRouteKey>(
+  key: K,
+  display: unknown,
+): Partial<Pick<QueryRoute, K>> {
   if (display === undefined) return {};
   const normalized = normalizeQueryDisplayDraft(display);
-  return normalized ? { display: normalized } : {};
+  return normalized ? { [key]: normalized } as Pick<QueryRoute, K> : {};
+}
+
+type QueryPresentationRouteKey = "pagePresentation" | "blockPresentation";
+
+function persistableQueryPresentation<K extends QueryPresentationRouteKey>(
+  key: K,
+  value: unknown,
+): Partial<Pick<QueryRoute, K>> {
+  if (value === undefined) return {};
+  const normalized = normalizeQueryPresentation(value);
+  return normalized ? { [key]: normalized } as Pick<QueryRoute, K> : {};
+}
+
+function persistablePageMatchScope(value: unknown): Pick<QueryRoute, "pageMatchScope"> | {} {
+  if (value === undefined) return {};
+  const normalized = normalizeFriendlyPageMatchScope(value);
+  return normalized ? { pageMatchScope: normalized } : {};
 }
 
 function validRoute(r: unknown, seenViewIds: Set<string>): Route | null {
@@ -94,15 +121,20 @@ function validRoute(r: unknown, seenViewIds: Set<string>): Route | null {
   const o = r as Record<string, unknown>;
   if (o.kind === "journals") return { kind: "journals" };
   if (o.kind === "query") {
+    const presentation = normalizeQueryPresentation(o.presentation);
     if (!(typeof o.id === "string" && o.id.length > 0 && o.id.length <= 128
       && (o.sourceKind === "search" || o.sourceKind === "dsl")
       && typeof o.source === "string" && o.source.length <= 65_536
-      && (o.presentation === "search" || o.presentation === "list"
-        || o.presentation === "table" || o.presentation === "board"))) return null;
+      && presentation)) return null;
     return {
       kind: "query", id: o.id, sourceKind: o.sourceKind,
-      source: o.source, presentation: o.presentation,
-      ...persistableQueryDisplay(o.display),
+      source: o.source, presentation,
+      ...persistableQueryDisplay("display", o.display),
+      ...persistableQueryPresentation("pagePresentation", o.pagePresentation),
+      ...persistableQueryDisplay("pageDisplay", o.pageDisplay),
+      ...persistableQueryPresentation("blockPresentation", o.blockPresentation),
+      ...persistableQueryDisplay("blockDisplay", o.blockDisplay),
+      ...persistablePageMatchScope(o.pageMatchScope),
     };
   }
   if (o.kind === "invalid") {
@@ -244,7 +276,12 @@ function serializeRoute(route: Route): Route {
     return {
       kind: "query", id: route.id, sourceKind: route.sourceKind,
       source: route.source, presentation: route.presentation,
-      ...persistableQueryDisplay(route.display),
+      ...persistableQueryDisplay("display", route.display),
+      ...persistableQueryPresentation("pagePresentation", route.pagePresentation),
+      ...persistableQueryDisplay("pageDisplay", route.pageDisplay),
+      ...persistableQueryPresentation("blockPresentation", route.blockPresentation),
+      ...persistableQueryDisplay("blockDisplay", route.blockDisplay),
+      ...persistablePageMatchScope(route.pageMatchScope),
     };
   }
   if (route.kind === "pdf") {

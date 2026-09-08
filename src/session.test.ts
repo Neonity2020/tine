@@ -346,6 +346,115 @@ describe("persisted split session", () => {
     expect(written.display).toEqual({ columns: ["prop:a"], sort: [["priority", "asc"]] });
   });
 
+  it("round-trips independent page and block display state with explicit names membership", () => {
+    const route = {
+      kind: "query",
+      id: "query-mixed",
+      sourceKind: "search",
+      source: "launch",
+      presentation: "search",
+      display: { columns: ["prop:legacy"] },
+      pagePresentation: "table",
+      pageDisplay: {},
+      blockPresentation: "list",
+      blockDisplay: { sort: [["priority", "desc"]], sample: 12 },
+      pageMatchScope: "names",
+    };
+    const parsed = parsePersistedSession(JSON.stringify({
+      tabs: [{ history: [route], pos: 0, pinned: false }],
+      activeIndex: 0,
+    }))!;
+
+    expect(parsed.snapshots.get("main")?.tabs[0].history[0]).toEqual(route);
+    resetPaneLayoutToSingle(parsed.snapshots.get("main")!);
+    const again = parsePersistedSession(JSON.stringify(buildPersistedSession()))!;
+    expect(again.snapshots.get("main")?.tabs[0].history[0]).toEqual(route);
+    expect(JSON.stringify(again)).not.toContain("results");
+    expect(JSON.stringify(again)).not.toContain("metadata");
+  });
+
+  it("drops only malformed optional scoped fields and never broadens bad membership", () => {
+    const restored = parsePersistedSession(JSON.stringify({
+      tabs: [{
+        history: [{
+          kind: "query",
+          id: "query-partial-scope",
+          sourceKind: "search",
+          source: "alpha",
+          presentation: "table",
+          display: { columns: ["prop:legacy"] },
+          pagePresentation: "gallery",
+          pageDisplay: { columns: ["bad;field"] },
+          blockPresentation: "list",
+          blockDisplay: { columns: ["prop:owner"] },
+          pageMatchScope: "both-and-more",
+        }],
+        pos: 0,
+        pinned: true,
+      }],
+      activeIndex: 0,
+    }))!;
+    const route = restored.snapshots.get("main")!.tabs[0].history[0];
+
+    expect(route).toEqual({
+      kind: "query",
+      id: "query-partial-scope",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "table",
+      display: { columns: ["prop:legacy"] },
+      blockPresentation: "list",
+      blockDisplay: { columns: ["prop:owner"] },
+    });
+    expect(restored.snapshots.get("main")!.tabs[0].pinned).toBe(true);
+    expect(Object.hasOwn(route, "pageMatchScope")).toBe(false);
+  });
+
+  it("serializes fresh copies of every singular and scoped display list", () => {
+    const display = { columns: ["prop:legacy"] };
+    const pageDisplay = {
+      columns: ["name"],
+      sort: [["name", "asc"]] as [string, "asc" | "desc"][],
+    };
+    const blockDisplay = {
+      aggregates: [["prop:cost", "sum"]] as [string, "count" | "sum" | "avg"][],
+    };
+    resetPaneLayoutToSingle({
+      tabs: [{
+        history: [{
+          kind: "query",
+          id: "query-copy-scopes",
+          sourceKind: "search",
+          source: "alpha",
+          presentation: "table",
+          display,
+          pageDisplay,
+          blockDisplay,
+        }],
+        pos: 0,
+        pinned: false,
+      }],
+      activeIndex: 0,
+    });
+
+    const written = buildPersistedSession().tabs[0].history[0];
+    if (written.kind !== "query") throw new Error("expected persisted query route");
+    expect(written.display).toEqual(display);
+    expect(written.pageDisplay).toEqual(pageDisplay);
+    expect(written.blockDisplay).toEqual(blockDisplay);
+    expect(written.display!.columns).not.toBe(display.columns);
+    expect(written.pageDisplay!.columns).not.toBe(pageDisplay.columns);
+    expect(written.pageDisplay!.sort![0]).not.toBe(pageDisplay.sort[0]);
+    expect(written.blockDisplay!.aggregates![0]).not.toBe(blockDisplay.aggregates[0]);
+
+    display.columns.push("prop:changed");
+    pageDisplay.sort[0][1] = "desc";
+    blockDisplay.aggregates[0][1] = "avg";
+    expect(written.display).toEqual({ columns: ["prop:legacy"] });
+    expect(written.pageDisplay).toEqual({ columns: ["name"], sort: [["name", "asc"]] });
+    expect(written.blockDisplay).toEqual({ aggregates: [["prop:cost", "sum"]] });
+  });
+
   it("round-trips graph-scoped Favorites and Recent disclosure state and defaults legacy sessions open", () => {
     setRecentPages([{ name: "Twin", kind: "page", path: "pages/client-b/Twin.md" }]);
     setFavoritesSectionExpanded(false);
