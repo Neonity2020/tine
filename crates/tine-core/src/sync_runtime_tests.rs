@@ -5001,7 +5001,9 @@ fn copy_provider_head_covering(
     relative
 }
 
-fn provider_head_covers(
+// A published clean head reports accepted tips. It does not advertise the
+// retired manifest-recovery record, nor certify independent archive retention.
+fn provider_head_names_tip(
     fixture: &ActivationFixture,
     author_device_id: DeviceId,
     batch_id: BatchId,
@@ -5019,9 +5021,10 @@ fn provider_head_covers(
         );
         SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap()).is_ok_and(
             |head| {
-                head.author_device_id() == author_device_id
+                head.workspace_id() == fixture.request.identities.workspace_id
+                    && head.lineage_digest() == fixture.request.identities.lineage_digest
+                    && head.author_device_id() == author_device_id
                     && head.frontier_tips().contains(&batch_id)
-                    && head.has_current_manifest_recovery_coverage()
             },
         )
     })
@@ -17671,6 +17674,109 @@ fn two_offline_devices_union_reordered_frontier_heads_without_history_scan() {
 }
 
 #[test]
+fn foreign_path_changes_converge_while_a_foreground_page_creation_is_journal_pending() {
+    let (first, second, first_handle, second_handle) =
+        joined_shared_pair("portable-path-pending-local-create", 0xe950);
+    let (remote_batch, ..) = submit_shared_page(
+        &second_handle,
+        0xe970,
+        "Remote path",
+        "notes/Remote path.md",
+        "remote original",
+    );
+    publish_shared_batch(&second_handle, &second, remote_batch);
+    settle_shared_provider(&second_handle);
+
+    let local_name = "Pending local path";
+    let saved = first_handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name: local_name.into(),
+                page_kind: SyncPageKind::Page,
+            },
+            page: new_application_page(
+                local_name,
+                SyncPageKind::Page,
+                None,
+                vec![BlockDto {
+                    id: "pending-local-block".into(),
+                    raw: "local original".into(),
+                    ..BlockDto::default()
+                }],
+            ),
+        })
+        .unwrap();
+    let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+        panic!("foreground creation did not save: {saved:?}");
+    };
+    let local_path = page.path;
+    assert_eq!(
+        first_handle.status().unwrap().managed_local_pending,
+        1,
+        "this is an actual undrained foreground journal, not accepted history"
+    );
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    first_handle.observe_provider().unwrap();
+    assert_eq!(
+        first_handle.status().unwrap().managed_local_pending,
+        1,
+        "provider observation must arrive while the original local frame is pending"
+    );
+    settle_shared_provider(&first_handle);
+    assert_eq!(first_handle.status().unwrap().managed_local_pending, 0);
+    assert_eq!(
+        load_application_exact(&first_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+    assert_eq!(
+        load_application_exact(&first_handle, "notes/Remote path.md")
+            .0
+            .blocks[0]
+            .raw,
+        "remote original"
+    );
+    copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+    second_handle.observe_provider().unwrap();
+    settle_shared_provider(&second_handle);
+    assert_eq!(
+        load_application_exact(&second_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+
+    let (later_batch, ..) = submit_shared_page(
+        &second_handle,
+        0xe980,
+        "After drain",
+        "notes/After drain.md",
+        "later remote original",
+    );
+    publish_shared_batch(&second_handle, &second, later_batch);
+    settle_shared_provider(&second_handle);
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    first_handle.observe_provider().unwrap();
+    settle_shared_provider(&first_handle);
+    assert_eq!(
+        load_application_exact(&first_handle, "notes/After drain.md")
+            .0
+            .blocks[0]
+            .raw,
+        "later remote original"
+    );
+    assert_eq!(
+        load_application_exact(&first_handle, &local_path).0.blocks[0].raw,
+        "local original"
+    );
+    assert!(matches!(
+        first_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    assert!(matches!(
+        second_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+}
+
+#[test]
 fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
     let (first, second, first_handle, second_handle) =
         joined_shared_pair("provider-two-offline-authors", 0xe400);
@@ -17741,8 +17847,32 @@ fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
 
     copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
     copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
-    let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
-    let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+    let mut first_open_counters = None;
+    let first_merged = active_handle(SyncRuntimeHandle::open_with_progress(
+        reopen_request(&first.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                first_open_counters = Some(counters);
+            }
+        },
+    ));
+    let mut second_open_counters = None;
+    let second_merged = active_handle(SyncRuntimeHandle::open_with_progress(
+        reopen_request(&second.request),
+        |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                second_open_counters = Some(counters);
+            }
+        },
+    ));
+    for counters in [first_open_counters, second_open_counters] {
+        let counters = counters.expect("each returning author reports its actual open path");
+        assert_eq!(
+            counters.checkpoint_opens, 1,
+            "foreign path changes must also work after checkpoint restoration"
+        );
+        assert_eq!(counters.full_replay_opens, 0);
+    }
     for _ in 0..1_024 {
         let first_tick = first_merged.tick().unwrap();
         let second_tick = second_merged.tick().unwrap();
@@ -18910,7 +19040,7 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
         publish_shared_batch(&author_handle, &author, batch_id);
         for _ in 0..256 {
             let _ = author_handle.tick().unwrap();
-            if provider_head_covers(&author, author.request.identities.device_id, batch_id)
+            if provider_head_names_tip(&author, author.request.identities.device_id, batch_id)
                 && provider_intent_count_for(&author, author.request.identities.device_id) == 0
             {
                 break;
@@ -18924,7 +19054,7 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     }
     let latest_local = *local_batches.last().unwrap();
     assert!(
-        provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+        provider_head_names_tip(&author, author.request.identities.device_id, latest_local,),
         "own durable frontier did not advance while foreign objects were withheld; \
              covered own intent counts after each publication were {intent_counts:?}"
     );
@@ -18944,12 +19074,14 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     drop(author_handle);
     let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
     assert!(
-        provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+        provider_head_names_tip(&author, author.request.identities.device_id, latest_local,),
         "restart lost the durable own frontier published during foreign delay"
     );
     let mut restarted_incomplete = false;
+    let mut restart_tick_counts = BTreeMap::<String, usize>::new();
     for _ in 0..1_024 {
         let tick = restarted.tick().unwrap();
+        *restart_tick_counts.entry(format!("{tick:?}")).or_default() += 1;
         assert!(
             !matches!(
                 tick,
@@ -18968,7 +19100,8 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
     }
     assert!(
         restarted_incomplete,
-        "restart forgot the visibly incomplete foreign manifest"
+        "restart forgot the visibly incomplete foreign manifest: ticks={restart_tick_counts:?}, status={:?}",
+        restarted.status().unwrap()
     );
     let late_delivery = copy_provider_batch(
         &delayed_peer,

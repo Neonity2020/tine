@@ -2060,3 +2060,256 @@ fn large_disjoint_delete_create_sets_use_indexed_anchored_page_work() {
         "indexed disjoint-set work ceiling exceeded: {work:?}"
     );
 }
+
+// Transported roots identify the author's context. Own journal replay, in
+// contrast, must reproduce the exact locally appended prefix transition.
+#[test]
+fn transported_path_root_is_metadata_but_local_journal_checks_its_prefix() {
+    use crate::oplog::{
+        BatchDisposition, ContentDigest, EngineError, ManifestedProjectionIntent, ObjectKind,
+        OperationBatch, OperationObject, PortablePathIndexRoot,
+    };
+    for unrelated_first in [false, true] {
+        let mut fixture = AuthorityFixture::new(
+            "portable-root-comparable-context",
+            vec![
+                PageSpec {
+                    path: "pages/A.md".into(),
+                    blocks: vec![BlockSpec::root("alpha", "a")],
+                    name: Some("A".into()),
+                    preamble: None,
+                },
+                PageSpec {
+                    path: "pages/B.md".into(),
+                    blocks: vec![BlockSpec::root("beta", "a")],
+                    name: Some("B".into()),
+                    preamble: None,
+                },
+            ],
+        );
+        let edit = |page: usize, content: &str| {
+            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: fixture.pages[page].block_ids[0],
+                    home_document_id: fixture.pages[page].home_document_id,
+                },
+                content: content.into(),
+            }])
+            .unwrap()
+        };
+        let unrelated = fixture.prepare_transaction(&edit(1, "unrelated content"), 0xe912, 0xe912);
+        let original = fixture.prepare_transaction(&edit(0, "candidate content"), 0xe911, 0xe911);
+        let false_root =
+            PortablePathIndexRoot::from_digest(ContentDigest::of(b"not the current path index"));
+        let mut changed_intents = 0;
+        let objects = original
+            .objects()
+            .iter()
+            .map(|object| {
+                if object.kind() != ObjectKind::ProjectionIntent {
+                    return object.clone();
+                }
+                let intent = ManifestedProjectionIntent::decode(object.payload()).unwrap();
+                assert_ne!(intent.portable_path_index_root(), false_root);
+                changed_intents += 1;
+                let replacement = ManifestedProjectionIntent::new(
+                    intent.workspace_id(),
+                    intent.source_batch_id(),
+                    intent.source_author_device_id(),
+                    intent.source_author_session_id(),
+                    intent.source_endpoint_id(),
+                    intent.page_id(),
+                    intent.path().clone(),
+                    false_root,
+                    intent.precondition().clone(),
+                    intent.render_base().cloned(),
+                    intent.target().clone(),
+                    intent.post_frontier().clone(),
+                    intent.claim_evidence().to_vec(),
+                )
+                .unwrap();
+                OperationObject::new(
+                    object.workspace_id(),
+                    object.document_id(),
+                    object.kind(),
+                    replacement.encode().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            changed_intents > 0,
+            "the production author must emit actual projection intents"
+        );
+        let m = original.manifest();
+        let manifest = OperationBatch::new_with_causality(
+            m.workspace_id(),
+            m.lineage_digest(),
+            m.batch_id(),
+            m.author_device_id(),
+            m.author_session_id(),
+            m.origin(),
+            m.causal_dot(),
+            m.causal_dependency_heads().to_vec(),
+            m.dependency_frontier().clone(),
+            m.semantic_effect_digest(),
+            objects
+                .iter()
+                .map(OperationObject::descriptor)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .unwrap();
+        let altered = PreparedBatch::new(manifest, objects).unwrap();
+        let store = fixture.engine.archive_store().unwrap();
+        store.publish_prepared_fixture(&unrelated).unwrap();
+        store.publish_prepared_fixture(&altered).unwrap();
+        let mut session = fixture
+            .engine
+            .0
+            .admit_clean_mutation(&fixture.graph)
+            .unwrap();
+        let (_, engine, _) = session.parts().unwrap();
+        let before_root = engine.portable_path_index_root().unwrap();
+        let prefix = engine.managed_local_prefix_state();
+        let prepared = engine
+            .prepare_managed_local_record(altered.clone(), prefix.next_sequence)
+            .unwrap();
+        let frame = tine_storage::LocalJournalFrame::new(
+            altered.manifest().author_device_id().as_uuid(),
+            prefix.next_sequence,
+            prepared.payload_kind(),
+            prepared.journal_payload().to_vec(),
+        );
+        assert!(
+            matches!(engine.replay_managed_local_record(&frame),
+            Err(crate::oplog::ManagedLocalRecordError::Engine(EngineError::ProjectionManifest(ref detail)))
+                if detail == "managed-local projection portable-path binding differs from its prefix transition"),
+            "own recovered journal records must still match their exact local prefix"
+        );
+        assert_eq!(engine.managed_local_prefix_state(), prefix);
+        if unrelated_first {
+            assert!(matches!(
+                engine
+                    .stage_ready(ValidatedBatch::new(unrelated))
+                    .disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+            assert_eq!(
+                engine.portable_path_index_root().unwrap(),
+                before_root,
+                "unrelated content leaves the same path context"
+            );
+        }
+        let result = engine
+            .stage_ready(ValidatedBatch::new(altered))
+            .disposition();
+        assert!(matches!(result, BatchDisposition::Accepted { .. }),
+            "transported context metadata must not grant or refuse receiver path authority ({unrelated_first}): {result:?}");
+        assert_eq!(engine.portable_path_index_root().unwrap(), before_root);
+    }
+}
+
+#[test]
+fn concurrent_rename_and_other_page_edit_keep_author_intents_and_converge() {
+    use crate::oplog::BatchDisposition;
+    for rename_first in [true, false] {
+        let mut fixture = AuthorityFixture::new(
+            "portable-root-concurrent-pages",
+            vec![
+                PageSpec {
+                    path: "pages/A.md".into(),
+                    blocks: vec![BlockSpec::root("alpha", "a")],
+                    name: Some("A".into()),
+                    preamble: None,
+                },
+                PageSpec {
+                    path: "pages/B.md".into(),
+                    blocks: vec![BlockSpec::root("beta", "a")],
+                    name: Some("B".into()),
+                    preamble: None,
+                },
+            ],
+        );
+        let rename_tx = OperationTransaction::new(vec![SemanticOperation::EditPagePath {
+            page_id: fixture.pages[0].page_id,
+            path: ManagedPath::parse("pages/Renamed.md").unwrap(),
+        }])
+        .unwrap();
+        let edit_tx = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: fixture.pages[1].block_ids[0],
+                home_document_id: fixture.pages[1].home_document_id,
+            },
+            content: "independent edit".into(),
+        }])
+        .unwrap();
+        let rename = fixture.prepare_transaction(&rename_tx, 0xe921, 0xe921);
+        let edit = fixture.prepare_transaction(&edit_tx, 0xe922, 0xe922);
+        let mut retained = Vec::new();
+        {
+            let store = fixture.engine.archive_store().unwrap();
+            for batch in [&rename, &edit] {
+                assert!(
+                    batch
+                        .objects()
+                        .iter()
+                        .any(|object| object.kind() == crate::oplog::ObjectKind::ProjectionIntent),
+                    "both production authors must carry actual projection intents"
+                );
+                store.publish_prepared_fixture(batch).unwrap();
+                retained.push((
+                    batch.manifest().batch_id(),
+                    batch.manifest().encode().unwrap(),
+                ));
+            }
+        }
+        let page_a = fixture.pages[0].page_id;
+        let page_b = fixture.pages[1].page_id;
+        let mut session = fixture
+            .engine
+            .0
+            .admit_clean_mutation(&fixture.graph)
+            .unwrap();
+        let (_, engine, _) = session.parts().unwrap();
+        let batches = if rename_first {
+            [rename, edit]
+        } else {
+            [edit, rename]
+        };
+        for batch in batches {
+            let outcome = engine.stage_ready(ValidatedBatch::new(batch)).disposition();
+            assert!(matches!(outcome, BatchDisposition::Accepted { .. }),
+                "independent rename and content edits must converge in either order ({rename_first}): {outcome:?}");
+        }
+        let root = engine.accepted_frontier_root().unwrap();
+        let mut materializer = engine.accepted_root_materializer(&root).unwrap();
+        assert_eq!(
+            materializer
+                .materialize_page(page_a)
+                .unwrap()
+                .unwrap()
+                .path
+                .as_str(),
+            "pages/Renamed.md"
+        );
+        assert_eq!(
+            materializer
+                .materialize_page(page_b)
+                .unwrap()
+                .unwrap()
+                .blocks[0]
+                .content,
+            "independent edit"
+        );
+        let store = engine.archive_store().unwrap();
+        for (batch_id, original) in retained {
+            match store.inspect_batch(batch_id).unwrap() {
+                crate::oplog::BatchInspection::Ready(batch) => {
+                    assert_eq!(batch.manifest().encode().unwrap(), original)
+                }
+                other => panic!("original author intent must remain available: {other:?}"),
+            }
+        }
+    }
+}

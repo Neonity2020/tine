@@ -16554,9 +16554,6 @@ impl ShardedHotEngine {
     fn validate_manifested_portable_path_binding(
         &self,
         batch_id: BatchId,
-        frontier: &FrontierV2,
-        candidate: &PortablePathPublicationCandidate,
-        terminal_conflict: bool,
     ) -> Result<(), EngineError> {
         let batch = &self.archive[&batch_id];
         let projection = super::projection_manifest::validate_projection_object_set(
@@ -16583,17 +16580,14 @@ impl ShardedHotEngine {
                 None => manifested_root = Some(intent.portable_path_index_root()),
             }
         }
-        if terminal_conflict || manifested_root.is_none() {
-            return Ok(());
-        }
-        let manifested_root = manifested_root.expect("checked manifested portable-path root");
-        if manifested_root == candidate.root {
-            return Ok(());
-        }
-        let _ = frontier;
-        Err(EngineError::ProjectionManifest(
-            "projection intent portable-path index binding mismatch".into(),
-        ))
+        // The root describes the author's whole index, including unrelated
+        // paths outside this manifest's causal dependencies. A receiver with
+        // concurrent accepted or journaled work has a different root. Path
+        // authority comes from prepare_portable_path_updates and the exact
+        // semantic/projection transition, not equality of these two contexts.
+        // Own-journal prefix validation and same-context projection reuse
+        // retain their separate exact root checks.
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -20279,12 +20273,7 @@ impl ShardedHotEngine {
                 timing.identity_page_names_nanos.saturating_add(elapsed);
         });
         let identity_binding_started = self.replay_timing_started();
-        self.validate_manifested_portable_path_binding(
-            batch_id,
-            &frontier,
-            &portable_paths,
-            !portable_paths.conflicts.is_empty(),
-        )?;
+        self.validate_manifested_portable_path_binding(batch_id)?;
         self.record_replay_timing_elapsed(identity_binding_started, |timing, elapsed| {
             timing.identity_binding_nanos = timing.identity_binding_nanos.saturating_add(elapsed);
         });
@@ -31425,6 +31414,20 @@ pub(crate) mod validation_tests {
             "prepare_portable_path_updates",
             "commit_portable_path_updates",
         );
+        let binding = function(
+            "validate_manifested_portable_path_binding",
+            "validate_manifested_base_from_documents",
+        );
+        for forbidden in [
+            "collect_batch_ancestry",
+            "ephemeral_causal_chain",
+            "derive_inline_causal_clock",
+            "current_portable_path_root",
+            "candidate.root",
+        ] {
+            assert!(!binding.contains(forbidden),
+                "manifest key binding must not compare unrelated receiver state through {forbidden}");
+        }
         assert!(portable.contains("portable_path_records_many(&requested)"));
         assert!(
             !portable.contains("clone_validation_document")

@@ -1489,6 +1489,18 @@ path-only edit of an existing physical same-name page does not reacquire its
 logical name; only a creation or exact-title change enters name-acquisition
 preflight.
 
+An incoming projection intent's portable-path root describes the author's whole
+index at authoring time. It is retained as part of the original intent and its
+derived work identity; it is not proof of the receiver's whole index. Receiver
+admission validates the exact path/key binding, agreement among the batch's
+intents, semantic projection transition, and occupied/released per-key causal
+records. It does not compare global roots or use whole-device causal clocks as
+a proxy for that comparison: unrelated accepted or journaled work may differ.
+The receiver derives its own path index through the existing per-key transition.
+Own journal replay still requires each record's root to match its local prefix
+transition, and reuse of an own projection candidate keeps its same-context check.
+No incoming root changes path ownership, release ancestry, or conflict ranking.
+
 One canonical page name has one owner, and a graph may legitimately hold more
 than one physical file for it. Activation already resolves that: it selects one
 authoritative source per canonical page name and per portable path in exact-path
