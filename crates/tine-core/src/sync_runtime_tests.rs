@@ -7306,6 +7306,11 @@ fn restore_revives_the_same_page_projects_it_and_survives_a_second_reopen() {
 
 #[test]
 fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor() {
+    // The equivalence oracle invokes this same scenario as well. Its fixed
+    // workspace identity keys global crash-cut hooks, so parallel invocations
+    // otherwise consume each other's cuts despite using separate directories.
+    static SCENARIO: Mutex<()> = Mutex::new(());
+    let _scenario = SCENARIO.lock().unwrap();
     let fixture = ActivationFixture::nested_unicode("sweep-restore-chunks", 0xc5102);
     let mut source = String::new();
     for index in 0..1_100 {
