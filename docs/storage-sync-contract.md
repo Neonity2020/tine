@@ -900,6 +900,15 @@ the new epoch; ordinary edits do not change it. The regression
 `ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain`
 checks cancellation before snapshot opening and a fresh SQL answer afterward.
 
+The job owner can split cancellation from waiting: `begin_drain` marks the
+current admission generation cancelled and returns a `QueryDrainFence`;
+`wait_for_drain` waits only for slots admitted before that fence, including
+slots without registered SQLite handles. New admissions remain live and cannot
+extend that fence's wait. Existing `cancel_all_and_drain` callers additionally
+retain their full-idle barrier. The barrier test
+`a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions` pins this
+distinction. Automatic pending recovery scheduling is a separate integration.
+
 Overlay teardown serializes worker join and file removal once per instance.
 Repeated close calls on a retained old instance cannot remove a replacement at
 the same disposable path. This is checked by

@@ -27,6 +27,7 @@
 //! runs on its caller's thread (Tauri's `spawn_blocking` for Direct commands);
 //! the owner never spawns.
 
+use std::collections::BTreeSet;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tine_storage::sqlite::PhysicalProjectionQueryCancellation;
@@ -42,7 +43,7 @@ pub(crate) const QUERY_JOB_WAIT: Duration = Duration::from_secs(30);
 struct JobState {
     /// Slots currently held (admitted jobs, whether or not they have opened
     /// their snapshot yet).
-    active: usize,
+    active: BTreeSet<u64>,
     /// Monotonic admission counter; also the id space for `handles`.
     next_id: u64,
     /// Every job admitted with `id < cancelled_below` is cancelled. A job that
@@ -59,6 +60,8 @@ struct JobState {
     drain_epoch: u64,
     #[cfg(test)]
     waiting_started: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    drain_waiting_started: Option<std::sync::mpsc::Sender<()>>,
 }
 
 pub(crate) struct QueryJobOwner {
@@ -71,6 +74,11 @@ pub(crate) struct QueryJobOwner {
 /// edits do not change it; projection lifecycle drains do.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueryJobEpoch(u64);
+
+/// A cancellation boundary whose completion can be awaited outside the actor.
+/// Includes admitted jobs which have not opened or registered a snapshot yet.
+#[derive(Clone, Copy)]
+pub(crate) struct QueryDrainFence(u64);
 
 /// The outcome of asking for a slot.
 pub(crate) enum Admission<'a> {
@@ -93,7 +101,7 @@ impl QueryJobOwner {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(JobState {
-                active: 0,
+                active: BTreeSet::new(),
                 next_id: 1,
                 cancelled_below: 0,
                 handles: Vec::new(),
@@ -101,6 +109,8 @@ impl QueryJobOwner {
                 drain_epoch: 0,
                 #[cfg(test)]
                 waiting_started: None,
+                #[cfg(test)]
+                drain_waiting_started: None,
             }),
             changed: Condvar::new(),
             capacity: capacity.max(1),
@@ -130,10 +140,10 @@ impl QueryJobOwner {
             if state.closed || state.drain_epoch != epoch.0 {
                 return Admission::Cancelled;
             }
-            if state.active < self.capacity {
-                state.active += 1;
+            if state.active.len() < self.capacity {
                 let id = state.next_id;
                 state.next_id += 1;
+                state.active.insert(id);
                 return Admission::Slot(JobSlot { owner: self, id });
             }
             let now = Instant::now();
@@ -149,9 +159,9 @@ impl QueryJobOwner {
         }
     }
 
-    /// Cancel every job — active and waiting — and block until no slot is held.
-    /// Idempotent; safe to call with no jobs.
-    pub(crate) fn cancel_all_and_drain(&self) {
+    /// Cancel the currently admitted and queued work without waiting for it.
+    /// Captures made after this boundary belong to a new admission epoch.
+    pub(crate) fn begin_drain(&self) -> QueryDrainFence {
         let mut state = self.state.lock().unwrap();
         state.cancelled_below = state.next_id;
         state.drain_epoch += 1;
@@ -159,7 +169,30 @@ impl QueryJobOwner {
             cancellation.cancel();
         }
         self.changed.notify_all();
-        while state.active > 0 {
+        QueryDrainFence(state.cancelled_below)
+    }
+
+    /// Wait only for work covered by this fence. Never cancels newer work,
+    /// and newer admissions cannot prolong this wait.
+    pub(crate) fn wait_for_drain(&self, fence: QueryDrainFence) {
+        let mut state = self.state.lock().unwrap();
+        while state.active.range(..fence.0).next().is_some() {
+            #[cfg(test)]
+            if let Some(started) = state.drain_waiting_started.take() {
+                started.send(()).unwrap();
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    /// Cancel current work and retain the existing full-idle replacement
+    /// barrier. Callers using the split fence API instead control admission
+    /// to the replacement while its old readers drain off the actor.
+    pub(crate) fn cancel_all_and_drain(&self) {
+        let fence = self.begin_drain();
+        self.wait_for_drain(fence);
+        let mut state = self.state.lock().unwrap();
+        while !state.active.is_empty() {
             state = self.changed.wait(state).unwrap();
         }
     }
@@ -172,7 +205,7 @@ impl QueryJobOwner {
 
     #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
-        self.state.lock().unwrap().active
+        self.state.lock().unwrap().active.len()
     }
 }
 
@@ -207,7 +240,7 @@ impl Drop for JobSlot<'_> {
     fn drop(&mut self) {
         let mut state = self.owner.state.lock().unwrap();
         state.handles.retain(|(id, _)| *id != self.id);
-        state.active -= 1;
+        state.active.remove(&self.id);
         self.owner.changed.notify_all();
     }
 }
@@ -320,7 +353,7 @@ mod tests {
             Admission::Slot(slot) => slot,
             _ => panic!("admission"),
         };
-        owner2.cancel_all_and_drain_nonblocking_for_test();
+        owner2.begin_drain();
         let late_snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
         let cancellation = late_snapshot.cancellation();
         assert!(!early.register(cancellation.clone()));
@@ -332,17 +365,41 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    impl QueryJobOwner {
-        /// Test-only: mark every admitted job cancelled without waiting for the
-        /// slots to be released.
-        fn cancel_all_and_drain_nonblocking_for_test(&self) {
-            let mut state = self.state.lock().unwrap();
-            state.cancelled_below = state.next_id;
-            state.drain_epoch += 1;
-            for (_, cancellation) in &state.handles {
-                cancellation.cancel();
-            }
-        }
+    #[test]
+    fn a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions() {
+        let owner = QueryJobOwner::new(2);
+        let Admission::Slot(old) = owner.acquire() else {
+            panic!("old admission")
+        };
+        let fence = owner.begin_drain();
+        assert!(old.is_cancelled());
+        let Admission::Slot(new) = owner.acquire() else {
+            panic!("new admission")
+        };
+        let (finished, received) = mpsc::channel();
+        let (waiting, started) = mpsc::channel();
+        owner.state.lock().unwrap().drain_waiting_started = Some(waiting);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                owner.wait_for_drain(fence);
+                finished.send(()).unwrap();
+            });
+            let waited_for_old = started.recv_timeout(Duration::from_secs(5)).is_ok();
+            let not_finished_early = received.try_recv().is_err();
+            drop(old);
+            let completes_with_new_held = received.recv_timeout(Duration::from_secs(5)).is_ok();
+            let new_is_live = !new.is_cancelled();
+            // Release before assertions, including on failure, so the control
+            // cannot deadlock the scoped waiter on the new slot.
+            drop(new);
+            waiter.join().unwrap();
+            assert!(
+                waited_for_old && not_finished_early,
+                "old unregistered slot was not drained"
+            );
+            assert!(completes_with_new_held, "new work prolonged the old fence");
+            assert!(new_is_live, "waiting on the old fence cancelled new work");
+        });
     }
 
     #[test]

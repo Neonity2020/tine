@@ -2,6 +2,18 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-QE-DRAIN-FENCE-ADMISSION",
+ "title": "A split cancellation fence drains old slots without cancelling or waiting for newer work",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "RET2 manager recovery admission contract" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/src/query_jobs.rs::tests::a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions"],
+  "scenario": "query-engine.drain-fence-admission"
+ },
+ "notes": "New split API, verified with an actual wait-entry barrier and old/new held slots. Existing full-idle replacement calls keep their barrier. Automatic repair wiring remains separate."
+},
+{
  "id": "REG-QE-OVERLAY-RECLOSE-REPLACEMENT",
  "title": "Repeated teardown of an old overlay cannot delete its replacement",
  "family": "query-engine",
