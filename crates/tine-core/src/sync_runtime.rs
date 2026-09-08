@@ -4831,7 +4831,7 @@ impl SyncRuntimeHandle {
     ///
     /// Phase one is an actor turn that holds `operation` exactly as every
     /// navigation request does and returns a deferred turn, an answer (memo hit
-    /// or `Plan::Empty`), or a [`crate::managed_query::ManagedQueryCapture`]. Phase
+    /// or an invalid-input refusal), or a [`crate::managed_query::ManagedQueryCapture`]. Phase
     /// two runs [`crate::managed_query::execute_managed_query`] on the CALLING
     /// thread — the Tauri `spawn_blocking` thread or the test thread, never a
     /// new one — after `application_request` has released `operation`, so the
@@ -16459,14 +16459,12 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SimpleQueryTurn, SyncApplicationPageRequestError> {
-        use crate::query::SimpleQueryCandidatePlan as Plan;
         if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SimpleQueryTurn::Deferred(state));
         }
-        if matches!(
-            crate::query::simple_query_candidate_plan(query),
-            Plan::Empty
-        ) {
+        let today = crate::date::JournalDate::today();
+        let (parsed, view) = crate::query::parse_query_source(query, today);
+        if parsed.is_invalid() {
             return Ok(SimpleQueryTurn::Answered(SyncApplicationBoundedRefGroups {
                 groups: Vec::new(),
                 total: 0,
@@ -16477,7 +16475,8 @@ impl RuntimeActor {
         // because that is the base the off-actor executor patches. RET2 leaves
         // this as the ONLY preparation a production turn makes; the merged
         // table is now re-taken by the `#[cfg(test)]` oracle alone.
-        let prepared = self.application_simple_query_prepared(query, max_rows, max_bytes)?;
+        let prepared =
+            self.application_simple_query_prepared_ir(parsed, view, today, max_rows, max_bytes)?;
         // No stamp: a pending local suffix exists and NO overlay could be
         // created for it, so there is nothing to read the pending pages from.
         // RET2: that is a bounded unavailability, not endless pending and not
@@ -16619,6 +16618,7 @@ impl RuntimeActor {
     /// table the actor-side walk had to coerce against is now needed only by
     /// the `#[cfg(test)]` oracle, which re-takes it through
     /// [`Self::prepared_for_walk`].
+    #[cfg(test)]
     fn application_simple_query_prepared(
         &self,
         query: &str,
@@ -16627,6 +16627,17 @@ impl RuntimeActor {
     ) -> Result<PreparedSimpleQuery, SyncApplicationPageRequestError> {
         let today = crate::date::JournalDate::today();
         let (parsed, view) = crate::query::parse_query_source(query, today);
+        self.application_simple_query_prepared_ir(parsed, view, today, max_rows, max_bytes)
+    }
+
+    fn application_simple_query_prepared_ir(
+        &self,
+        parsed: crate::query::ir::Query,
+        view: crate::query::ir::ViewSettings,
+        today: crate::date::JournalDate,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<PreparedSimpleQuery, SyncApplicationPageRequestError> {
         let profile = crate::query::ConstructionProfile::from_view(&view);
         let config = self.graph.config.parse_config();
         let props = parsed.filter.has_props_leaf();

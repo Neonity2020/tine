@@ -2019,9 +2019,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // yields exactly the current inventory (8821a0de..., no tuple delta).
     // The write-crossing table above is unchanged. This corrects the checkpoint
     // expectation; it does not add a new storage writer to the accepted set.
+    // Candidate retirement removes exactly two query_lowering.rs entries:
+    // the sqlite import (PhysicalReadError, PhysicalEntityId,
+    // SqliteGraphProjectionRead) and PhysicalEntityId::Page, each count one.
+    // Restoring those tuples reproduces the accepted 8821a0de digest exactly;
+    // all surviving entries and the write-crossing table remain unchanged.
+    // The adapters now compile only for the independent test oracle.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "8821a0de876d78e4efef5252ac5d1df0e0647405707dc97c2f06ee0d67c1c88d",
+        "1e466caf947007f2cafa3b2bb407f9ab9576a8b1a2060b452b0daae36ea405ba",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

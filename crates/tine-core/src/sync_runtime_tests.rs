@@ -31721,6 +31721,37 @@ fn r4a_navigate(
         })
 }
 
+#[test]
+fn ret2_invalid_simple_source_is_refused_before_query_job_acquisition() {
+    let fixture = r4a_fast_corpus_fixture("ret2-invalid-before-job", 0x4a59);
+    let handle = r4a_reopen(&fixture);
+    let source = "(";
+    assert!(
+        crate::query::parse_query_source(source, crate::date::JournalDate::today())
+            .0
+            .is_invalid()
+    );
+    handle.inner.managed_query.jobs.close();
+    handle.reset_managed_query_census();
+    let answer = r4a_navigate(&handle, source, R4B_ROWS, R4B_BYTES).unwrap();
+    assert!(answer.groups.is_empty());
+    assert_eq!(answer.total, 0);
+    assert!(!answer.exceeded);
+    let census = handle.managed_query_census();
+    assert_eq!(
+        (
+            census.statement_reads,
+            census.failed_reads,
+            census.fallback_reads
+        ),
+        (0, 0, 0)
+    );
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
 /// Full-DTO equality between two answers of the SAME backend: group order,
 /// page names, every `BlockDto` field, `total` and `exceeded`. No
 /// canonicalization -- both sides are Managed, so a difference is a defect

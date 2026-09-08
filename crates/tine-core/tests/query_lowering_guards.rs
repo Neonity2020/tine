@@ -6,6 +6,7 @@ use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 
 const LOWERING: &str = "crates/tine-core/src/oplog/query_lowering.rs";
+const CURSOR: &str = "crates/tine-core/src/oplog/query_cursor.rs";
 const DIRECT: &str = "crates/tine-core/src/direct_projection.rs";
 
 fn sources() -> BTreeMap<String, String> {
@@ -151,7 +152,11 @@ const NON_OWNED_DRAINS: &[DrainOwner] = &[
 #[test]
 fn hand_written_cursor_drains_are_pinned() {
     let source = sources();
-    let lowering = &source[LOWERING];
+    assert!(
+        source[LOWERING].is_empty(),
+        "candidate adapters must remain oracle-only"
+    );
+    let lowering = std::fs::read_to_string(repo_root().join(LOWERING)).unwrap();
     assert_eq!(
         lowering.matches("drain_after(").count(),
         10,
@@ -159,8 +164,13 @@ fn hand_written_cursor_drains_are_pinned() {
     );
     assert_eq!(
         lowering.matches("loop {").count(),
+        0,
+        "I-12: oracle adapters must delegate their cursor loops"
+    );
+    assert_eq!(
+        source[CURSOR].matches("loop {").count(),
         1,
-        "I-12: only drain_after itself may own a cursor loop in {LOWERING}"
+        "I-12: the shared production cursor owner contains the drain loop"
     );
 
     let direct = &source[DIRECT];
@@ -242,12 +252,6 @@ fn containing_symbol(source: &str, offset: usize) -> String {
 }
 
 fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static str) {
-    if file == LOWERING {
-        return (
-            "shared-lowering-adapter",
-            "SimpleQueryCandidatePlan page candidates",
-        );
-    }
     if file == "crates/tine-core/src/oplog/sqlite_materialization.rs" {
         return (
             "facade-forwarder",
@@ -366,36 +370,6 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             question: question.into(),
         }));
     };
-    for owner in [
-        "SqliteMaterializedRead<'_>",
-        "SqliteGraphProjectionRead<'_>",
-    ] {
-        for (symbol, family) in [
-            ("task_candidate_pages", "task_candidate_pages_after"),
-            ("page_referrer_candidates", "page_referrer_candidates_after"),
-            (
-                "block_property_candidates",
-                "block_property_candidates_after",
-            ),
-            ("page_property_candidates", "property_facet_rows_after"),
-            (
-                "navigation_pages",
-                if owner.starts_with("SqliteMaterialized") {
-                    "navigation_pages_after"
-                } else {
-                    "navigation_pages_after_with_header_validation"
-                },
-            ),
-        ] {
-            add(
-                family,
-                LOWERING,
-                &format!("{owner}::{symbol}"),
-                "shared-lowering-adapter",
-                "SimpleQueryCandidatePlan page candidates",
-            );
-        }
-    }
     for family in [
         "navigation_pages_after_with_header_validation",
         "page_referrer_candidates_after",
@@ -508,11 +482,13 @@ fn simple_query_read_family_census_is_exact() {
         "I-11/I-12: remove the vacuous five-file co-occurrence guard and keep this whole-production-tree exact census"
     );
     assert_eq!(
-        source[LOWERING]
-            .matches("impl SimpleQuerySqlRead for ")
-            .count(),
+        raw_lowering.matches("impl SimpleQuerySqlRead for ").count(),
         2,
-        "I-12: exactly the Managed and Direct adapters implement SimpleQuerySqlRead"
+        "I-12: exactly the Managed and Direct oracle adapters implement SimpleQuerySqlRead"
+    );
+    assert!(
+        source[LOWERING].is_empty(),
+        "oracle adapters must not compile in production"
     );
     let expected = expected_census();
     assert_exact_census(&source, &expected);

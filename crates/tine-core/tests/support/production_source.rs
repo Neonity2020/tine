@@ -60,9 +60,8 @@ pub fn test_only_include(path: &Path) -> bool {
     let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    if !file.ends_with("_tests.rs") {
-        return false;
-    }
+    // Compilation follows the module declaration, even when an oracle keeps
+    // its original filename after its production consumers have retired.
     let stem = file.trim_end_matches(".rs");
     let escaped_file = regex::escape(file);
     let escaped_stem = regex::escape(stem);

@@ -3011,62 +3011,14 @@ pub(crate) struct ApplicationQueryPage {
     pub(crate) recency: i64,
 }
 
-// RETIREMENT-CANDIDATE: the pre-SQL candidate planner for the walk.
-//
-// WHAT MAY BE DELETED: `SimpleQueryCandidateSource`, `SimpleQueryCandidatePlan`
-// and `simple_query_candidate_plan`, together with the consumers that exist
-// only to feed them — managed storage's candidate-page selection and the
-// shared `oplog::query_lowering::lower_simple_query_candidate_plan` it calls.
-// They are a page PRE-FILTER for the walk, never an answer.
-//
-// The rest of this note's earlier list is GONE, not pending. RET2 deleted the
-// Direct consumer (`direct_projection`'s `simple_query_candidate_paths`) with
-// the Direct walk it pre-filtered, which left the sparse task family with no
-// production consumer on either backend; the RET2 correction then deleted that
-// family outright — `SparseTaskQueryEligibility`,
-// `sparse_task_query_eligibility`, its two source guards, the parser sparse
-// runner (`ParserSparseQueryCandidate`, `ApplicationSparseQueryPage`,
-// `ApplicationSparseQueryError`, `run_parser_sparse_task_query_bounded`),
-// `SimpleQueryCandidatePlan::is_page_ref_only`, and the two `og` shape guards
-// (`tokens_only`, `is_single_expression`) that existed only for them. A living
-// contract or a census that NAMES dead code is a reason to correct the
-// document, never a reason to keep the code.
-//
-// WHAT SURVIVES, AND FOR WHOM: exactly two readers.
-//   * PRODUCTION — `sync_runtime::application_simple_query_turn` tests for
-//     `Plan::Empty` and answers an unmatchable query without touching a page.
-//     This is the only production consumer left, and it reads no
-//     `SimpleQueryCandidateSource`.
-//   * TEST-ONLY (cfg test) — `application_simple_query_pages_ready`, the independent
-//     answer R4a/R5a's parity gates compare the Managed executor against. It is
-//     the only reader of `Plan::Indexed`'s sources, through the shared lowering.
-// Confining the whole family to `cfg(test)` therefore needs the production
-// `Plan::Empty` arm rewritten in the actor turn, which is a Managed-owned
-// region; recorded here rather than guessed at.
-//
-// CONDITION FOR DELETION: the same card as the walk itself,
-// `PVTI_lAHOAAbLVc4BhPsyzg5gS_0`, one step earlier. A planner that narrows which
-// pages the walk visits has no purpose once the SQL lowering (SPEC §5) answers
-// the query directly from indices — the lowering's own plan supersedes it, and
-// keeping both means two independent opinions about which rows can match, which
-// is exactly the second interpretation I-12 forbids. Concretely: when
-// `run_query_result` reaches SQL for a query shape, that shape's candidate plan
-// is dead code.
-//
-// WHAT CURRENTLY BLOCKS DELETION: the walk is still Managed Storage's answer
-// for an unaccepted local overlay (see the marker on `run_pred_bounded_over`),
-// and on a large graph the walk without this planner reads every page of the
-// graph for every keystroke in a query block. The planner is what keeps
-// `(task TODO)` and `[[Page]]` — the two shapes almost every real query uses —
-// off the full-graph path THERE. On Direct Files it blocks nothing any more.
-// Deleting it before Managed's lowering ships would not remove a code path; it
-// would make the shipped product visibly slower on exactly the queries people
-// write.
-//
+// Candidate planning exists only for the independent test oracle. Production
+// parses once and checks that IR's validity before acquiring its SQL snapshot.
+// The public executor census enforces that these declarations are test-only.
 /// One reconstructible, page-complete candidate source for a managed simple
 /// query. These facts only choose pages; the exact current parser DTO remains
 /// authoritative for block membership and result shape.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg(test)]
 pub(crate) enum SimpleQueryCandidateSource {
     Task(String),
     PageRef(String),
@@ -3078,6 +3030,7 @@ pub(crate) enum SimpleQueryCandidateSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum SimpleQueryCandidatePlan {
     Empty,
     Indexed(Vec<SimpleQueryCandidateSource>),
@@ -3089,6 +3042,7 @@ pub(crate) enum SimpleQueryCandidatePlan {
 /// page selected by at least one source. AND may choose one complete child; OR
 /// may union only when every branch is complete. Valid shapes that cannot be
 /// narrowed use the explicit all-page plan; invalid shapes need no page reads.
+#[cfg(test)]
 pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandidatePlan {
     type Sources = std::collections::BTreeSet<SimpleQueryCandidateSource>;
     fn one(source: SimpleQueryCandidateSource) -> Option<Sources> {

@@ -645,9 +645,8 @@ The switched read families are literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
 inventory used by autocomplete and navigation. They also include the shared
 property-facet rows used by the query builder and editor autocomplete, and the
-PageRef simple-query candidate plan, which managed storage lowers through the same SQL read family in
-both storage regimes and which Direct Files no longer uses for a query at all
-(see the Direct Files query route below). The switched families further include page aliases and
+PageRef simple-query candidate plan in the independent test oracle. Both production
+query backends now select results through SQL. The switched families further include page aliases and
 real-page ownership, explicit backlink and safely tokenizable unlinked-reference
 candidate selection, persisted/runtime block-identity lookup, block-referrer
 candidates, and distinct-referrer counts. Once current, these families
@@ -806,25 +805,12 @@ entry when that page could contribute to the entry's own IR, judged by the same
 evaluator the query itself uses; a `tine.type::` change on a property-key page
 advances the registry generation and so evicts every typed query over that key.
 
-Managed storage still routes a `SimpleQueryCandidatePlan::Indexed` query through
-the candidate page set the shared lowering returns, evaluating only those pages
-unless the candidate set is larger than one thirty-second of the graph's page
-count or 32 pages, whichever is greater, in which case the projection read is
-abandoned and the parser fallback runs instead. `Empty` returns without
-projection or graph access. `All` uses the parser whole-graph evaluator.
-
-That cutoff is a cost decision, not a correctness one: both routes return the
-same answer, and abandoning simply returns the query to the behaviour it had
-before the route existed. It exists because the shared lowering returns a page
-SUPERSET rather than the answer, so an unselective plan names most of the graph;
-measured on the 1,045-file anonymized corpus, routing such a plan cost
-1.08 -> 11.19 ms for a non-sparse task query and 0.46 -> 3.31 ms for `(journal)`,
-while every plan below the cutoff got between 1.6x and 13x faster. The cutoff
-scales with the graph because the walk it replaces costs one cheap in-memory
-predicate per page, so the route only wins while the candidate set is a small
-fraction of the whole. The Direct Files route above removes the reason for that
-cutoff rather than its symptom, and the cutoff goes with the candidate plan when
-managed storage stops using it.
+Managed production queries no longer construct a candidate-page plan or apply
+its selectivity cutoff. A simple query is parsed once; invalid input returns its
+semantic empty refusal before any snapshot or registry acquisition, while valid
+IR enters the captured SQL route. Candidate types and lowering remain test-only
+for the independent oracle. Production metadata cursor reads and oracle lowering
+share the unchanged `query_cursor::drain_after` advancement and batch-retry owner.
 
 **A Managed simple query over the accepted frontier runs off the actor.** A
 simple query whose evidence is wholly the accepted frontier — no pending local

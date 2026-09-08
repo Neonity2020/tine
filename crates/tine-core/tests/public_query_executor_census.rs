@@ -310,3 +310,40 @@ fn a_walk_inside_a_cfg_test_region_is_not_counted() {
         "the shared walker must blank `#[cfg(test)]` regions in place"
     );
 }
+
+#[test]
+fn candidate_planning_is_only_an_oracle_and_the_cursor_owner_remains_shared() {
+    let root = repo_root();
+    let declarations = Regex::new(
+        r"(?:enum|trait|fn)\s+(?:SimpleQueryCandidateSource|SimpleQueryCandidatePlan|SimpleQuerySqlRead|simple_query_candidate_plan|lower_simple_query_candidate_plan)\b",
+    ).unwrap();
+    let offenders = production_source_files()
+        .into_iter()
+        .filter_map(|path| {
+            declarations
+                .is_match(&compiled_source(&path))
+                .then(|| relative_path(&root, &path))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        offenders.is_empty(),
+        "production still includes the candidate planner: {offenders:?}"
+    );
+    let direct = compiled_source(&root.join("crates/tine-core/src/direct_projection.rs"));
+    assert!(direct.contains("query_cursor::drain_after"));
+}
+
+#[test]
+fn an_oracle_module_is_test_only_without_a_test_filename_suffix() {
+    let directory =
+        std::env::temp_dir().join(format!("tine-oracle-module-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let oracle = directory.join("oracle.rs");
+    let parent = directory.join("mod.rs");
+    std::fs::write(&oracle, "pub fn selected() {}\n").unwrap();
+    std::fs::write(&parent, "#[cfg(test)]\npub(crate) mod oracle;\n").unwrap();
+    assert!(compiled_source(&oracle).is_empty());
+    std::fs::write(&parent, "pub(crate) mod oracle;\n").unwrap();
+    assert!(compiled_source(&oracle).contains("fn selected()"));
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -1,7 +1,7 @@
 use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
-use crate::oplog::query_lowering::drain_after;
+use crate::oplog::query_cursor::drain_after;
 use crate::query::PropertyFacetAccumulator;
 use crate::query_jobs::{Admission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY};
 use fs2::FileExt as _;

@@ -2,6 +2,23 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-QUERY-CANDIDATE-ORACLE-ONLY-20260908",
+      "title": "Production query requests do not run the retired candidate planner",
+      "family": "query-results",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/public_query_executor_census.rs::candidate_planning_is_only_an_oracle_and_the_cursor_owner_remains_shared",
+          "crates/tine-core/src/sync_runtime_tests.rs::ret2_invalid_simple_source_is_refused_before_query_job_acquisition"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "The production-source guard fails before retiring the candidate planner. Managed requests parse once and refuse invalid input before acquiring a database job; valid requests use the shared SQL executor. Candidate types and adapters remain test-only oracle support. Direct and oracle cursor consumers share the unchanged production drain helper."
+    },
+    {
       "id": "UI-QUERY-TODO-SCROLL-POSITION-20260907",
       "title": "Completing a TODO in a long multiline query should preserve the reader's place",
       "family": "query-results",
