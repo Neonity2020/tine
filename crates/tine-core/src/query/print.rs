@@ -659,8 +659,9 @@ fn print_og(query: &Query, view: &ViewSettings, has_options: bool) -> Result<Str
 /// `toDsl`'s root rule: a single-child `and` simplifies to the child, matching
 /// OG `simplify-query`; an empty root is the empty string.
 fn og_form(query: &Query) -> Option<String> {
-    let normalized = query.normalized();
-    let filter = &normalized.filter;
+    // Print the editable tree itself. `Query::normalized()` is the execution
+    // equivalence form and deliberately flattens authored same-kind groups.
+    let filter = &query.filter;
     // `@page` is OG's `blocks?` rule reading false — the anchor is implied by
     // the heads, so a page-anchored filter is printable exactly when every one
     // of its leaves is a page-row head.
@@ -674,6 +675,9 @@ fn og_form(query: &Query) -> Option<String> {
 
 fn og_clause(filter: &Filter, anchor: Anchor) -> Option<String> {
     match filter {
+        // OG has no boolean literal and an empty nested group is one. The root
+        // empty `And` is handled as the historical empty query in `og_form`.
+        Filter::And { items } | Filter::Or { items } if items.is_empty() => None,
         Filter::And { items } | Filter::Or { items } => {
             let head = if matches!(filter, Filter::And { .. }) {
                 "and"
@@ -1258,6 +1262,49 @@ mod tests {
         assert_eq!(again_view, view, "{source} printed as {printed:?}");
     }
 
+    /// Group boundaries are authored state, so normalized equality is not a
+    /// sufficient save/reopen oracle for the builder's OG output.
+    fn og_round_trips_exactly(source: &str, expected: &str) {
+        let (query, view) = og(source);
+        assert!(
+            !query.is_invalid(),
+            "{source} did not parse: {:?}",
+            query.diagnostics
+        );
+        let printed = query_print(&query, &view, PrintDialect::Og, false)
+            .unwrap_or_else(|d| panic!("{source} is not OG-printable: {d:?}"));
+        assert_eq!(printed, expected);
+        let (again, again_view) = og(&printed);
+        assert_eq!(
+            again.anchor, query.anchor,
+            "{source} printed as {printed:?}"
+        );
+        assert_eq!(
+            again.filter, query.filter,
+            "{source} printed as {printed:?}"
+        );
+        assert_eq!(again_view, view, "{source} printed as {printed:?}");
+    }
+
+    #[test]
+    fn og_save_reopen_preserves_authored_boolean_groups_exactly() {
+        for source in [
+            "(and (and \"beta\" \"alpha\") (and \"gamma\" \"delta\"))",
+            "(or (or [[beta]] [[alpha]]) (or [[gamma]] [[delta]]))",
+            "(not (and (and [[beta]] [[alpha]]) [[gamma]]))",
+            "(and (and (page Alpha) (page Beta)) \"needle\")",
+            "(and (and (namespace Alpha) (namespace Beta)) (namespace Gamma))",
+        ] {
+            og_round_trips_exactly(source, source);
+        }
+    }
+
+    #[test]
+    fn og_group_roundtrip_keeps_directives_and_opaque_options_once() {
+        let source = "(and (and (page Alpha) (page Beta)) (page Gamma)) (sort-by page asc) {:title \"Grouped\" :collapsed? true}";
+        og_round_trips_exactly(source, source);
+    }
+
     #[test]
     fn og_expressible_queries_round_trip_through_the_og_printer() {
         for source in [
@@ -1318,18 +1365,18 @@ mod tests {
     /// instead would take away a form the author can legitimately write.
     #[test]
     fn a_page_ref_form_stays_readable_when_anything_follows_it() {
-        for source in [
-            "[[a]] (sort-by page asc)",
-            "[[a]] {:title \"T\"}",
-            "[[a]] (sort-by page asc) {:title \"T\"}",
+        for (source, expected) in [
+            ("[[a]] (sort-by page asc)", "(and [[a]]) (sort-by page asc)"),
+            ("[[a]] {:title \"T\"}", "(and [[a]]) {:title \"T\"}"),
+            (
+                "[[a]] (sort-by page asc) {:title \"T\"}",
+                "(and [[a]]) (sort-by page asc) {:title \"T\"}",
+            ),
         ] {
             let (query, view) = macro_query(source);
             let printed = query_print(&query, &view, PrintDialect::Og, false)
                 .unwrap_or_else(|d| panic!("{source} refused: {d:?}"));
-            assert!(
-                printed.starts_with("(and [[a]])"),
-                "{source} printed as {printed}"
-            );
+            assert_eq!(printed, expected);
             let (again, _) = macro_query(&printed);
             assert_eq!(again.normalized(), query.normalized(), "{source}");
         }
