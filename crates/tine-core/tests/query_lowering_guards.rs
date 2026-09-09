@@ -421,18 +421,21 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             "page_inventory",
             "Direct page inventory for list_pages",
         ),
-        (
-            "property_facet_rows_after",
-            "crates/tine-core/src/sync_runtime.rs",
-            "build_application_property_registry",
-            "managed registry snapshot property rows",
-        ),
-        (
-            "navigation_pages_after",
-            "crates/tine-core/src/sync_runtime.rs",
-            "build_application_property_registry",
-            "managed registry snapshot page map",
-        ),
+        // RETIRED (recorded during the S3 Q5 closure, 2026-09-09). The two
+        // `build_application_property_registry` rows described a PRODUCTION
+        // managed read. They are not one any more: every managed
+        // property-registry function in `sync_runtime.rs` -- all ten, from
+        // `accepted_property_registry_ready` through
+        // `serve_application_property_registry` -- is now `#[cfg(test)]`, so
+        // `compiled_source()` correctly stops seeing their calls. Production
+        // carries the registry through `managed_query.rs` (the R4 captured
+        // query path) instead, and the sync_runtime family survives only as
+        // the parity oracle.
+        //
+        // The classify() arm above still documents R5c's move and is kept as
+        // history; it is simply no longer reached. Found the same way the RET3
+        // walk sources were: this guard was ALREADY red, so the migration that
+        // invalidated the pin went unremarked.
         (
             "page_referrer_candidates_after",
             DIRECT,

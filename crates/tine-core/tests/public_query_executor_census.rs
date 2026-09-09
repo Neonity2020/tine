@@ -188,19 +188,24 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
     // compiled only under test, as the parity oracle
     // `RuntimeActor::application_complete_page_advanced_query` reaches. Direct
     // Files' `run_advanced_query_bounded` is untouched and is still RET3's.)
-    (
-        "crates/tine-core/src/query.rs",
-        "export_query_subtrees",
-        1,
-        "RET3: the export reader over Direct Files, reached by the \
-         `export_query_subtrees` command's Direct arm",
-    ),
-    (
-        "crates/tine-core/src/query.rs",
-        "export_application_query_subtrees",
-        1,
-        "RET3: the export reader over Managed storage",
-    ),
+    // RET3 IS RETIRED (S3 campaign Q2, "Print queries from the current main
+    // image on both backends"; recorded here during the Q5 closure, 2026-09-09).
+    // Both export readers are gone from production:
+    //
+    //   * `export_application_query_subtrees` — the Managed arm — no longer
+    //     exists at all. It survives only as a string in this census and in
+    //     `sync_runtime_tests.rs`.
+    //   * `export_query_subtrees` — the Direct arm — still exists in
+    //     `query.rs`, but it and `export_query_subtrees_over` are now
+    //     `#[cfg(test)]`: an independent WALK ORACLE, not a production read.
+    //     The shipped path is `model.rs::export_query_subtrees` over
+    //     `export_execute::PreparedExportBatch`, on one SQLite snapshot.
+    //
+    // This deletion is the retirement, exactly as the panic message below asks
+    // for. It was found late because `production_walk_sources_are_pinned` was
+    // ALREADY red for other rows when Q2 landed, so nothing flagged the change
+    // at the time — a pre-existing red hid a real retirement for three packets.
+    // If a future reader wants the walk back, it is the oracle, under cfg(test).
     // Counterfactual corpus modes now compile only in ignored unit tests.
     // scripts/query-oracle-dump.py preserves their reproducible TSV command.
 ];
