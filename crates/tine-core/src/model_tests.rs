@@ -10411,6 +10411,8 @@ fn bounded_query_reexecutes_and_observes_every_edit() {
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still an ordinary note".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
     let after_unrelated = todo_tasks();
     assert_eq!(
         serde_json::to_vec(first.groups.as_ref()).unwrap(),
@@ -10423,6 +10425,8 @@ fn bounded_query_reexecutes_and_observes_every_edit() {
     let mut tasks = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
     tasks.blocks[0].raw = "DONE ship".into();
     g.save_page(&tasks, tasks.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
     let after_affected = todo_tasks();
     assert!(after_affected.groups.is_empty());
     let _ = fs::remove_dir_all(&dir);
@@ -10466,6 +10470,8 @@ fn every_query_request_executes_again_and_reads_the_current_sql_image() {
     let mut errand = g.load_named("Errand", PageKind::Page).unwrap().unwrap();
     errand.blocks[0].raw = "DONE buy milk".into();
     g.save_page(&errand, errand.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
 
     let tagged_after = tagged();
     let tasks_after = tasks();
@@ -10617,6 +10623,8 @@ fn overflowed_bounded_query_reexecutes_when_an_omitted_match_stops_matching() {
     let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
     notes.blocks[0].raw = "still unrelated".into();
     g.save_page(&notes, notes.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
     let after_unrelated = tasks();
     assert!(after_unrelated.exceeded);
     assert_eq!(after_unrelated.total, 2);
@@ -10631,6 +10639,8 @@ fn overflowed_bounded_query_reexecutes_when_an_omitted_match_stops_matching() {
     let mut page = g.load_named(omitted, PageKind::Page).unwrap().unwrap();
     page.blocks[0].raw = "DONE no longer matches".into();
     g.save_page(&page, page.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
 
     let after = tasks();
     assert!(!after.exceeded);
@@ -10650,6 +10660,8 @@ fn advanced_query_recomputes_opaque_nul_source_after_sql_revision_change() {
     let mut page = g.load_named("P", PageKind::Page).unwrap().unwrap();
     page.blocks[0].raw = "TODO ship".into();
     g.save_page(&page, page.rev.as_deref()).unwrap();
+    // This assertion deliberately observes the committed post-edit image.
+    wait_for_direct_query_projection(&g);
     let warm = when_ready(|| g.run_advanced_query_cached(query, None));
     // The independent oracle: a fresh walk of the same graph, from the free
     // function, with no memo and no projection of its own to agree with.
@@ -13213,7 +13225,7 @@ fn wait_for_direct_query_projection(graph: &Graph) {
     while !graph.direct_projection_ready_test() {
         assert!(
             started.elapsed() < Duration::from_secs(60),
-            "Direct query benchmark projection did not converge"
+            "Direct query test projection did not converge"
         );
         std::thread::sleep(Duration::from_millis(2));
     }

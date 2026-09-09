@@ -5050,7 +5050,7 @@ mod tests {
             // reason the boundary may be widened here — and only here — is gone.
             "Raw SQL crosses that boundary; **authority does not.**",
             "The restriction is the **engine's**, not a validator's.",
-            "This seam adds no refusal.",
+            "This seam adds no SQL-text refusal.",
         ] {
             assert!(
                 contract.contains(phrase),
