@@ -156,9 +156,45 @@ function fail(message) {
 }
 
 async function openSheet(browser) {
-  await browser.$(".qs-gear").waitForExist({ timeout: 15_000 });
-  await browser.$(".qs-gear").click();
+  await activate(browser, ".qs-gear", { describe: "the sheet gear" });
   await browser.$(".qs-sheet").waitForExist({ timeout: 10_000 });
+}
+
+/** Find a control and activate it in ONE round trip, retrying the whole
+ *  selection until a node is found.
+ *
+ *  This is the `scripts/lib/e2e-navigation.mjs` rule one control down: **never
+ *  hold a WebDriver element handle across a re-rendering list.** Everything in
+ *  the Display panel re-renders as a write settles, so `browser.$(sel)` then
+ *  `.click()` can deliver the click to a node that has already left the
+ *  document — nothing happens, and the journey fails ten seconds later on the
+ *  outcome instead of on the press. Finding and clicking inside one
+ *  `browser.execute` makes detachment unrepresentable: no JS turn separates
+ *  them. Two of ten unchanged-binary burn-in runs failed this way, in two
+ *  different controls, which is what says it is a class rather than a site.
+ *
+ *  `focus()` before `click()` because some of these controls are inputs the
+ *  journey then types into, and a scripted `click()` does not move focus. */
+async function activate(browser, selector, { text = null, describe } = {}) {
+  let seen = [];
+  try {
+    await browser.waitUntil(async () => {
+      const outcome = await browser.execute((where, wanted) => {
+        const nodes = [...document.querySelectorAll(where)];
+        const texts = nodes.map((el) => (el.textContent ?? "").trim());
+        const index = wanted === null ? (nodes.length ? 0 : -1) : texts.indexOf(wanted);
+        if (index < 0) return { clicked: false, texts };
+        nodes[index].focus?.();
+        nodes[index].click();
+        return { clicked: true, texts };
+      }, selector, text);
+      seen = outcome.texts;
+      return outcome.clicked;
+    }, { timeout: 15_000, interval: 250, timeoutMsg: "not found" });
+  } catch {
+    const what = describe ?? (text === null ? selector : `${selector} reading ${JSON.stringify(text)}`);
+    fail(`never activated ${what}; ${selector} offered ${JSON.stringify(seen)}`);
+  }
 }
 
 /** Press a Display trigger until its panel is up, finding and clicking it in ONE
@@ -198,26 +234,21 @@ async function closeDisplay(browser) {
 
 /** Press a button by its exact visible text, inside a container. */
 async function press(browser, selector, text) {
-  const elements = await browser.$$(selector);
-  for (const element of elements) {
-    if ((await element.getText()).trim() === text) { await element.click(); return; }
-  }
-  const seen = [];
-  for (const element of elements) seen.push((await element.getText()).trim());
-  fail(`no ${selector} reading ${JSON.stringify(text)}; saw ${JSON.stringify(seen)}`);
+  await activate(browser, selector, { text });
 }
 
 /** Open a field picker from its trigger, narrow it, and take the named field. */
 async function pickField(browser, triggerText, key) {
   await press(browser, ".qd-panel .qd-add, .qd-panel .qd-row-btn", triggerText);
   await browser.$(".qd-field-picker .qs-vocab-options").waitForExist({ timeout: 8_000 });
-  const option = await browser.$(`.qd-field-picker .qs-vocab-option[data-vocabulary-key="${key}"]`);
-  if (!(await option.isExisting())) {
-    const keys = await browser.execute(() =>
-      [...document.querySelectorAll(".qd-field-picker .qs-vocab-option")].map((el) => el.getAttribute("data-vocabulary-key")));
-    fail(`the ${JSON.stringify(triggerText)} picker does not offer ${key}; it offers ${JSON.stringify(keys)}`);
+  const offered = await browser.execute(() =>
+    [...document.querySelectorAll(".qd-field-picker .qs-vocab-option")].map((el) => el.getAttribute("data-vocabulary-key")));
+  if (!offered.includes(key)) {
+    fail(`the ${JSON.stringify(triggerText)} picker does not offer ${key}; it offers ${JSON.stringify(offered)}`);
   }
-  await option.click();
+  await activate(browser, `.qd-field-picker .qs-vocab-option[data-vocabulary-key="${key}"]`, {
+    describe: `the ${JSON.stringify(key)} option in the ${JSON.stringify(triggerText)} picker`,
+  });
   await browser.$(".qd-field-picker").waitForExist({ reverse: true, timeout: 5_000 });
 }
 
@@ -384,8 +415,7 @@ await withApp(0, async (browser) => {
   await waitForProperty(browser, "Display", "tine.columns", "owner");
 
   await openDisplay(browser);
-  const sample = await browser.$(".qd-panel .qd-sample");
-  await sample.click();
+  await activate(browser, ".qd-panel .qd-sample", { describe: "the Sample input" });
   await browser.keys("25".split(""));
   await browser.keys(["Enter"]);
   await waitForProperty(browser, "Display", "tine.sample", "25");
@@ -591,21 +621,25 @@ await withApp(0, async (browser) => {
   // Page membership scope: three exact values, and the one that is stated is
   // the one that is stored. `both` is not a display setting — it changes which
   // pages are MEMBERS — so it lives outside both namespaces.
-  const scopeSelect = await browser.$('[data-query-result-kind="page"] .query-page-match select');
   const scopeChoices = await browser.execute(() =>
     [...document.querySelectorAll('[data-query-result-kind="page"] .query-page-match option')]
       .map((option) => option.value));
   if (JSON.stringify(scopeChoices) !== JSON.stringify(["names", "content", "both"])) {
     fail(`page membership scope does not offer the three stored values: ${JSON.stringify(scopeChoices)}`);
   }
-  await scopeSelect.selectByAttribute("value", "both");
+  // The handle is taken and used with nothing in between. A `<select>` needs a
+  // real change event, so this one keeps WebDriver rather than scripting the
+  // value — but it must not sit across a round trip while the section rerenders.
+  await browser
+    .$('[data-query-result-kind="page"] .query-page-match select')
+    .selectByAttribute("value", "both");
   await waitForProperty(browser, "Scoped", "tine.page-match-scope", "both");
 
   // **Absent and present-but-empty are different states, and both are
   // reachable.** "Use inherited settings" REMOVES the namespace, so the section
   // shows what the query says again; membership scope and the other family are
   // untouched by it.
-  await browser.$('[data-query-result-kind="page"] .query-scoped-reset').click();
+  await activate(browser, '[data-query-result-kind="page"] .query-scoped-reset', { describe: "Use inherited settings" });
   await waitForProperties(
     browser,
     "Scoped",
@@ -617,7 +651,7 @@ await withApp(0, async (browser) => {
 
   // "Clear settings" writes an EMPTY draft: the marker is there with no members,
   // which says "show nothing extra" rather than "show what the query says".
-  await browser.$('[data-query-result-kind="page"] .query-scoped-clear').click();
+  await activate(browser, '[data-query-result-kind="page"] .query-scoped-clear', { describe: "Clear settings" });
   await waitForProperties(
     browser,
     "Scoped",
