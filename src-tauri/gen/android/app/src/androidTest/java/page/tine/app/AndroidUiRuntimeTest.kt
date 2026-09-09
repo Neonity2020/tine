@@ -2,6 +2,7 @@ package page.tine.app
 
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
@@ -411,6 +412,7 @@ class AndroidUiRuntimeTest {
   @Test
   fun systemBarStripAndIconsAgreeWithTinesOwnThemeNotTheDeviceNightSetting() {
     val scenario = ActivityScenario.launch(MainActivity::class.java)
+    val samples = JSONArray()
     for (dark in listOf(true, false, true)) {
       scenario.onActivity { activity ->
         SystemBarAppearance.apply(activity, dark)
@@ -449,8 +451,29 @@ class AndroidUiRuntimeTest {
             "icons on a ${if (dark) "dark" else "light"} strip",
           controller.isAppearanceLightStatusBars != dark,
         )
+
+        samples.put(
+          JSONObject()
+            .put("tineDark", dark)
+            .put("stripColor", String.format("#%08X", background.color))
+            .put("expectedStripColor", String.format("#%08X", expected))
+            .put("lightStatusBarIcons", controller.isAppearanceLightStatusBars)
+            .put("lightNavigationBarIcons", controller.isAppearanceLightNavigationBars)
+            .put("deviceNightMode", activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK)
+        )
       }
     }
+    // The lane requires every method to leave a receipt and an in-journey
+    // screenshot; a method that only passes its assertions is RED, because an
+    // absent receipt must stay visible rather than become a green aggregate.
+    // This one had no `emitReceipt` call at all, which nobody could see while
+    // the method was missing from the runner's list and so never ran.
+    emitReceipt(
+      "systemBarStripAndIconsAgreeWithTinesOwnThemeNotTheDeviceNightSetting",
+      JSONObject()
+        .put("journey", "467-system-bar-strip-and-icons")
+        .put("samples", samples),
+    )
     // Deliberately no ActivityScenario teardown here -- same rule as
     // `withFreshDemoGraph` below. Destroying Tauri's active WebView from the
     // instrumentation thread aborts HWUI on a destroyed mutex on the hosted
