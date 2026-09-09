@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import {
   startWebdriverApplication,
   stopWebdriverApplication,
@@ -15,6 +16,7 @@ import {
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { enableManagedStorage } from "./lib/e2e-managed-activation.mjs";
 
 await ensureDisplay();
 
@@ -23,9 +25,13 @@ const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32"
 const TD = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver") : "tauri-driver");
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4510);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4511);
-const TMP = path.join(os.tmpdir(), "tine-print-security-e2e");
+const managed = process.env.E2E_PRINT_MANAGED === "1";
+const backendName = managed ? "Managed" : "Direct";
+const TMP = path.join(os.tmpdir(), `tine-print-security-e2e-${backendName.toLowerCase()}`);
 const GRAPH = path.join(TMP, "graph");
 
+// One fixed directory per backend arm, cleared on entry: the two arms never share
+// a path, and the last run's driver log survives for post-mortem.
 fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(path.join(GRAPH, dir), { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
@@ -39,8 +45,14 @@ fs.writeFileSync(path.join(GRAPH, "pages", "Print proof.md"), [
   "  fn main() {}",
   "  ```",
   "- ![large](../assets/oversized.png)",
+  "- {{query (task TODO)}}",
+  "- {{tine-query @block and [[PrintMatches]]}}",
+  "- {{query (task TODO)}}",
+  "  tine.view:: table",
   "",
 ].join("\n"));
+fs.writeFileSync(path.join(GRAPH, "pages", "Private matches.md"),
+  "public:: false\n- TODO print-selected-private-root [[PrintMatches]]\n\t- print-required-child\n\t\t- print-required-grandchild\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), "- Open [[Print proof]]\n");
@@ -60,6 +72,13 @@ const env = {
 };
 const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
 const log = fs.openSync(path.join(TMP, "tauri-driver.log"), "w");
+// Managed activation drives a native confirmation through xdotool, which needs a
+// window manager that answers _NET_ACTIVE_WINDOW; bare Xvfb does not. Only the
+// Managed arm needs it, so this journey self-provisions one the way
+// e2e-query-export.mjs does rather than relying on a runner env var.
+const wm = managed ? spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
+  detached: true, stdio: ["ignore", log, log],
+}) : undefined;
 const driverArgs = webdriverServerArgs(
   DRIVER_PORT,
   NATIVE_PORT,
@@ -77,6 +96,7 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
+  if (managed) await enableManagedStorage(browser);
   // The contract starts at the named page's menu, not at today's journal.
   // Route through the visible application search control so a different valid
   // startup surface cannot fail the safety journey before it begins.
@@ -142,9 +162,17 @@ try {
     timeout: 15_000, timeoutMsg: "PDF export did not create its print frame",
   });
   const proof = await browser.execute(() => window.__tinePrintSecurityProof);
+  console.log(JSON.stringify({ backend: backendName, binary: APP,
+    binarySha256: createHash("sha256").update(fs.readFileSync(APP)).digest("hex"), ...proof }));
   const sandbox = new Set((proof.sandbox ?? "").split(/\s+/).filter(Boolean));
   if (sandbox.has("allow-scripts") || !sandbox.has("allow-same-origin") || !sandbox.has("allow-modals")) {
     throw new Error(`unsafe print sandbox: ${JSON.stringify(proof.sandbox)}`);
+  }
+  for (const expected of ["print-selected-private-root", "print-required-child", "print-required-grandchild", '<table class="sheet-table">']) {
+    if (!proof.srcdoc.includes(expected)) throw new Error(`${backendName} Print omitted ${expected}`);
+  }
+  if (proof.srcdoc.includes("Query results are unavailable for this render.") || proof.srcdoc.includes("non-public pages omitted")) {
+    throw new Error(`${backendName} Print lost its personal query scope or operation reader`);
   }
   if (/<script\b/i.test(proof.srcdoc) || /cdn\.jsdelivr\.net/i.test(proof.srcdoc)
     || !/script-src 'none'/.test(proof.srcdoc) || !/class="katex/.test(proof.srcdoc)
@@ -159,6 +187,7 @@ try {
     if (process.platform === "win32") td.kill("SIGKILL");
     else process.kill(-td.pid, "SIGKILL");
   } catch {}
+  try { if (wm?.pid) process.kill(-wm.pid, "SIGKILL"); } catch {}
   stopWebdriverApplication(webviewTarget);
   fs.closeSync(log);
 }

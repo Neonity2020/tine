@@ -287,6 +287,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Export to PDF answers a page's queries from the same index the rest of Tine
+  reads.** A `{{query …}}` or `{{tine-query …}}` inside a page you export is
+  answered from the current search index on both Direct Files and Managed
+  graphs, instead of walking the graph a second time just for the export. Two
+  differences you will notice. While the index is still being built — the first
+  open, or the moment after a save — preparation now waits and retries rather
+  than exporting a page with a gap where the results belong. And when a query
+  exceeds a Print limit, whether in matches, source length or nesting depth,
+  Tine tells you which limit it hit and prepares nothing: no print dialog opens
+  on a page whose results are incomplete, where before the PDF was produced with
+  a "narrow it before publishing" note printed in place of the results. Starting
+  a second export, or switching graphs mid-preparation, cancels the first
+  cleanly. Page-anchored queries remain unsupported in a printed page.
+
 - **A `{{query (property …)}}` on a Direct Files graph no longer re-reads every
   page to work out what its values mean.** Deciding whether `rank:: 007` is a
   number or a word is a whole-graph question, and Tine answered it by walking

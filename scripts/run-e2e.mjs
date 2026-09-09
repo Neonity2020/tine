@@ -178,6 +178,10 @@ const suites = {
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
+    // Print answers queries from the current main SQLite image on BOTH backends,
+    // so the contract's both-backend claim needs two selected arms, not one run
+    // by hand. Managed differs only in where the page body comes from.
+    ["print-security-managed", "scripts/e2e-print-security.mjs", { E2E_PRINT_MANAGED: "1" }],
     ["block-embed", "scripts/e2e-block-embed.mjs", {}],
     ["compat-home-current-page", "scripts/e2e-compat-home-current-page.mjs", {}],
     ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],

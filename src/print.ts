@@ -7,8 +7,11 @@
 // blocks (only the on-screen ones are in the DOM), so printing the live page would
 // drop most of a long page. The core-rendered document is complete and unstyled by
 // the app chrome, so the PDF is the page, nothing else.
-import { backend } from "./backend";
-import { pushToast } from "./ui";
+import { backend, OperationCancelledError } from "./backend";
+import { pushToast, graphMeta, graphTransitioning } from "./ui";
+import { graphBinding } from "./persistence";
+import { onGraphRebound } from "./modeHooks";
+import { runQueryWhenReady } from "./queryReadiness";
 import { failureShape } from "./failureShape";
 import type { PrintOpts } from "./types";
 
@@ -103,18 +106,33 @@ export async function preparePrintHtml(html: string): Promise<string> {
 }
 
 /** Export a page to PDF via the OS print dialog. Safe to call repeatedly. */
-export async function exportPagePdf(name: string, opts: PrintOpts = DEFAULT_PRINT_OPTS): Promise<void> {
-  let html: string;
-  try {
-    html = await preparePrintHtml(await backend().pagePrintHtml(name, opts));
-  } catch (e) {
-    // `no-page` (deleted mid-action) or any core error — never leave a dangling frame.
-    pushToast(`Couldn't prepare “${name}” for PDF`, "error");
-    console.error("pagePrintHtml failed", failureShape(e));
-    return;
-  }
+let activePrint: AbortController | null = null;
 
-  const iframe = document.createElement("iframe");
+export async function exportPagePdf(name: string, opts: PrintOpts = DEFAULT_PRINT_OPTS): Promise<void> {
+  activePrint?.abort();
+  const controller = new AbortController();
+  activePrint = controller;
+  const binding = graphBinding();
+  const root = graphMeta()?.root;
+  const current = () => activePrint === controller && !controller.signal.aborted
+    && graphBinding() === binding && graphMeta()?.root === root && !graphTransitioning();
+  const abort = () => controller.abort();
+  const unbind = onGraphRebound(abort);
+  window.addEventListener("pagehide", abort);
+  window.addEventListener("beforeunload", abort);
+  let iframe: HTMLIFrameElement | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pending = false;
+  try {
+    const prepared = await runQueryWhenReady(() => backend().pagePrintHtml(name, opts), {
+      signal: controller.signal, isCurrent: current,
+      onPending(error) {
+        if (error && !pending) { pending = true; pushToast("Preparing page for PDF…", "info"); }
+      },
+    });
+    const html = await preparePrintHtml(prepared);
+    if (!current()) return;
+    iframe = document.createElement("iframe");
   iframe.setAttribute("aria-hidden", "true");
   // Keep same-origin DOM access so the parent can wait for fonts and invoke the
   // native print dialog, but categorically disable child scripts. The core also
@@ -127,15 +145,16 @@ export async function exportPagePdf(name: string, opts: PrintOpts = DEFAULT_PRIN
     "position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden";
   iframe.srcdoc = html;
 
-  let done = false;
-  const cleanup = () => {
-    if (done) return;
-    done = true;
-    iframe.remove();
-  };
-
-  iframe.onload = async () => {
-    const win = iframe.contentWindow;
+    const frame = iframe;
+    await new Promise<void>((resolve) => {
+      const cleanup = () => {
+        frame.remove();
+        controller.signal.removeEventListener("abort", cleanup);
+        resolve();
+      };
+      controller.signal.addEventListener("abort", cleanup, { once: true });
+      frame.onload = async () => {
+    const win = frame.contentWindow;
     if (!win) {
       cleanup();
       return;
@@ -143,21 +162,35 @@ export async function exportPagePdf(name: string, opts: PrintOpts = DEFAULT_PRIN
     try {
       // Let the locally bundled styles/fonts settle so pagination measures the
       // final, already-typeset static layout.
-      const fonts = iframe.contentDocument?.fonts;
+      const fonts = frame.contentDocument?.fonts;
       if (fonts?.ready) await fonts.ready;
       await new Promise((r) => setTimeout(r, 400));
+      if (!current()) { cleanup(); return; }
       win.addEventListener("afterprint", cleanup, { once: true });
       win.focus();
       win.print();
       // Fallback: if the engine never fires afterprint (or the user cancels without
       // one), reclaim the frame after a minute.
-      setTimeout(cleanup, 60_000);
     } catch (e) {
       pushToast("Print failed", "error");
       console.error("iframe print failed", e);
       cleanup();
     }
-  };
-
-  document.body.appendChild(iframe);
+      };
+      if (!current()) { cleanup(); return; }
+      timer = setTimeout(cleanup, 60_000);
+      document.body.appendChild(frame);
+    });
+  } catch (error) {
+    if (error instanceof OperationCancelledError || !current()) return;
+    pushToast(error instanceof Error ? error.message : `Couldn't prepare “${name}” for PDF`, "error");
+    console.error("pagePrintHtml failed", failureShape(error));
+  } finally {
+    iframe?.remove();
+    if (timer) clearTimeout(timer);
+    unbind();
+    window.removeEventListener("pagehide", abort);
+    window.removeEventListener("beforeunload", abort);
+    if (activePrint === controller) activePrint = null;
+  }
 }

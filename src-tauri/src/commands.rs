@@ -1841,6 +1841,17 @@ pub(crate) async fn page_print_html(
     opts: tine_core::publish::PrintOpts,
     state: GraphContext<'_>,
 ) -> Result<String, CommandError> {
+    fn print_error(error: tine_core::publish::PrintPreparationError) -> CommandError {
+        match error {
+            tine_core::publish::PrintPreparationError::Io(error) => CommandError::from(error),
+            tine_core::publish::PrintPreparationError::Query(error) => CommandError::from(error),
+            tine_core::publish::PrintPreparationError::Budget(message) => CommandError::tagged(
+                "query-unavailable",
+                Some("print_query_budget_exceeded"),
+                Some(serde_json::json!({ "message": message })),
+            ),
+        }
+    }
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -1859,15 +1870,16 @@ pub(crate) async fn page_print_html(
                 )?
                 .ok_or_else(|| CommandError::prose("no-page"))?;
                 slot.with_filesystem_graph(|graph| {
-                    graph
-                        .page_print_html_page(&page, opts)
+                    handle
+                        .application_print_html(graph, &page, opts)
                         .map_err(CommandError::from)
+                        .and_then(|answer| answer.map_err(print_error))
                 })
             }
             None => slot
                 .legacy_graph()?
                 .page_print_html(&name, opts)
-                .map_err(CommandError::from)?
+                .map_err(print_error)?
                 .ok_or_else(|| CommandError::prose("no-page")),
         }
     })

@@ -1328,6 +1328,10 @@ mod tests {
         assert!(page.markdown.contains("hls__"));
         assert!(page.markdown.contains("normal tab in a companion pane"));
         assert!(page.markdown.contains("drag the PDF tab"));
+        assert!(page.markdown.contains("PDF preparation waits and retries"));
+        assert!(page
+            .markdown
+            .contains("opens no print dialog for an incomplete page"));
         assert!(page.markdown.contains("structural companion pane"));
         assert!(page
             .markdown

@@ -667,7 +667,7 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "Page-menu PDF export creates only a static, script-disabled print frame.",
+     "userOutcome": "On Direct and Managed, page-menu PDF export includes complete OG/TQL query descendants, private matches and query tables in a static, script-disabled print frame.",
      "blocking": true,
      "authority": "Tine print-export script isolation contract"
     }

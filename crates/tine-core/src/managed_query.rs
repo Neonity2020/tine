@@ -550,6 +550,20 @@ impl ManagedQueryShared {
         answer
     }
 
+    pub(crate) fn execute_print(
+        &self,
+        capture: &ManagedReadCapture,
+        graph: &crate::model::Graph,
+        page: &crate::model::PageDto,
+        opts: crate::publish::PrintOpts,
+    ) -> Result<Result<String, crate::publish::PrintPreparationError>, ManagedQueryOutcome> {
+        // The existing operation-reader adapter owns with_managed_read,
+        // registry capture, Stored identity, recency and final cancellation.
+        self.with_publication_query_reader(capture, |reader| {
+            graph.page_print_html_page(page, opts, reader)
+        })
+    }
+
     pub(crate) fn execute_export(
         &self,
         capture: &ManagedReadCapture,

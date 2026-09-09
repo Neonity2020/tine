@@ -919,3 +919,36 @@ publication migration.
 Tests: `publish::tests`,
 `managed_static_publication_pairs_ordinary_drain_with_current_main_queries`, and
 `publication_sources_are_compared_inside_the_owned_main_snapshot`.
+
+Print executes ordinary OG/TQL macros and query tables/boards through the shared
+current-main SQLite selection and subtree executor on both backends. One document
+owns one snapshot, registry, execution day, identity policy and cancellation
+lifetime, including nested and repeated occurrences. Direct reads the requested
+page body from its file; Managed loads the exact actor-owned page body and reads
+queries off actor through the existing Managed read admission. Those body and
+query authorities do not imply one source revision or a just-saved-edit guarantee.
+
+Each occurrence independently permits 20,000 shallow rows and 32 MiB of shallow
+construction, with a 64 KiB source limit and the existing 64-level OG/EDN nesting
+guard. Expansion depth remains four. Print has no query-count, subtree-node,
+subtree-byte or whole-HTML cap. One asset budget covers the body and query output:
+12 MiB per image and 32 MiB cumulative raw asset bytes, with inert omission markers.
+Copy's bounded subtree policy and omission counts are separate and unchanged.
+
+Required query rows and descendants are complete or the entire preparation fails.
+Selection overflow is rejected before subtree hydration as `query-unavailable`,
+reason `print_query_budget_exceeded`, with the message “Couldn't prepare this page
+for PDF: a query exceeds the Print limit. Narrow the query and try again.” Source
+and nesting refusals also give bounded, specific messages. Typed readiness is
+retried under the Print operation owner; terminal errors, cancellation, a newer
+Print request, or a graph rebound cannot insert an incomplete iframe or print it.
+
+Personal Print includes private matches. Page-anchored results, positional query
+grids and BEGIN_QUERY remain explicitly unsupported; cross-page links retain
+their existing degradation. Query subtree construction uses physical SQLite
+locators and stored payload, never parsed-graph hydration or public-ID rediscovery.
+Org sheet conversion uses the physical path, including uppercase `.ORG` files.
+
+Proof: `print_query_reader_regression_renders_matches_on_both_backends`, the
+`print_*` executor/route tests, `src/print.query.test.ts`, and the native page-menu
+journey in `scripts/e2e-print-security.mjs` for each backend.

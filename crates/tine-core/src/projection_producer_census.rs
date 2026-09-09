@@ -2124,6 +2124,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // disappear. Diffing the full 472-row and 468-row multisets shows these
     // four removals and nothing else, so no write boundary moved: retiring a
     // reader is exactly one fewer place that can open the projection.
+    // Q2 Print composes the existing snapshot and subtree primitives rather than
+    // opening anything: it adds no import, no direct call and no receiver, so all
+    // 468 tuples and this digest stand unchanged, physical writes included.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "7e4433e1162c496655e90f707de28a2abeae1110b5f45ed5acc871bd3e375421",

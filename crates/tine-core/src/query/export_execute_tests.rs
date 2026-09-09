@@ -8,6 +8,292 @@ use crate::query::results::{BackendOrder, RecencyPage, ResultIdentity, ResultRea
 use crate::query::sql::sql_gates_tests::{scratch, serialize, Corpus};
 use crate::query::{QueryDialect, QueryExportBatch, QueryExportSpec};
 
+#[cfg(test)]
+fn print_snapshot(
+    corpus: &Corpus,
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    source: &str,
+) -> Result<String, crate::publish::PrintPreparationError> {
+    let registry = corpus.graph.property_registry();
+    let identity = ResultIdentity::Stored;
+    let recency = |_page: RecencyPage<'_>| 0;
+    let page_recency = crate::query::rank::PageRecencyPrograms::new(
+        crate::query::rank::JournalRankInput::StoredDay,
+        |_| 0,
+        |_| 0,
+    );
+    let reader = crate::query::read_execute::SnapshotQueryReader::new(
+        snapshot,
+        crate::query::read_execute::SnapshotQueryInputs {
+            registry: &registry,
+            identity: &identity,
+            order: BackendOrder::Direct,
+            recency: &recency,
+            page_recency: &page_recency,
+            today: corpus.today(),
+        },
+    )?;
+    crate::publish::page_print_html_document(
+        &corpus.graph,
+        "Print",
+        &crate::doc::parse(source),
+        crate::publish::PrintOpts::default(),
+        &reader,
+    )
+}
+
+#[test]
+fn print_queries_share_one_snapshot_across_nested_and_repeated_macros() {
+    let _serial = serialize();
+    let root = scratch("q2-print-snapshot");
+    write_corpus(&root);
+    std::fs::write(
+        root.join("pages/Nested.md"),
+        "- TODO nested owner\n\t- {{tine-query prop('cost') = 2}}\n",
+    )
+    .unwrap();
+    let corpus = Corpus::open(root, true);
+    let path = copy_projection(&corpus, "print-snapshot");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    let writer_path = path.clone();
+    set_after_construction_hook(Box::new(move || {
+        let writer = rusqlite::Connection::open(writer_path).unwrap();
+        assert!(writer.execute("UPDATE block_text SET content = replace(content, 'alpha', 'omega') WHERE content LIKE '%alpha%'", []).unwrap() > 0);
+    }));
+    let html = print_snapshot(&corpus, &mut snapshot,
+        "- {{query (and (task TODO) (page Alpha))}}\n- {{query (and (task TODO) (page Alpha))}}\n- {{query (page Nested)}}\n")
+        .unwrap();
+    assert_eq!(html.matches("alpha grandchild").count(), 2);
+    assert!(!html.contains("omega grandchild"));
+    assert!(
+        html.contains("beta child"),
+        "nested property queries share the captured registry"
+    );
+    snapshot.finish();
+    let mut later = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    assert!(print_snapshot(
+        &corpus,
+        &mut later,
+        "- {{query (and (task TODO) (page Alpha))}}\n"
+    )
+    .unwrap()
+    .contains("omega grandchild"));
+}
+
+#[test]
+fn print_missing_payload_or_cancellation_returns_no_html() {
+    let _serial = serialize();
+    let root = scratch("q2-print-cancel");
+    write_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+    snapshot.cancellation().cancel();
+    let result = print_snapshot(&corpus, &mut snapshot, "- {{query (task TODO)}}\n");
+    assert!(result.is_err(), "cancelled Print must return no HTML");
+    let mut snapshot = corpus.snapshot();
+    let cancellation = snapshot.cancellation();
+    set_after_construction_hook(Box::new(move || cancellation.cancel()));
+    assert!(matches!(
+        print_snapshot(&corpus, &mut snapshot, "- {{query (task TODO)}}\n"),
+        Err(crate::publish::PrintPreparationError::Query(
+            crate::query::QueryExecutionError::Cancelled
+        ))
+    ));
+    let path = copy_projection(&corpus, "print-missing");
+    {
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.pragma_update(None, "foreign_keys", false).unwrap();
+        assert_eq!(
+            writer
+                .execute("DELETE FROM block_text WHERE content = 'alpha child'", [])
+                .unwrap(),
+            1
+        );
+    }
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    assert!(matches!(
+        print_snapshot(&corpus, &mut snapshot, "- {{query (task TODO)}}\n"),
+        Err(crate::publish::PrintPreparationError::Query(
+            crate::query::QueryExecutionError::Unavailable(_)
+        ))
+    ));
+}
+
+#[test]
+fn print_selection_budget_exceeded_refuses_complete_document() {
+    let _serial = serialize();
+    let root = scratch("q2-print-selection-limit");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let content = (0..20_000)
+        .map(|n| format!("- TODO row {n}\n"))
+        .collect::<String>()
+        + "- DONE boundary plus one\n";
+    std::fs::write(root.join("pages/Tasks.md"), content).unwrap();
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+    let boundary = print_snapshot(&corpus, &mut snapshot, "- {{query (task TODO)}}\n").unwrap();
+    assert!(boundary.contains("row 19999"));
+    crate::query::export_results::reset_export_subtree_census();
+    let result = print_snapshot(
+        &corpus,
+        &mut snapshot,
+        "- earlier body\n- {{query (or (task TODO) (task DONE))}}\n",
+    );
+    assert!(
+        result.is_err(),
+        "selection overflow must discard the complete document"
+    );
+    assert_eq!(result.unwrap_err().to_string(), "Couldn't prepare this page for PDF: a query exceeds the Print limit. Narrow the query and try again.");
+    assert_eq!(
+        crate::query::export_results::export_subtree_census(),
+        Default::default(),
+        "denied selection performs no subtree hydration"
+    );
+}
+
+#[test]
+fn print_does_not_inherit_copy_output_caps() {
+    let _serial = serialize();
+    let root = scratch("q2-print-output-caps");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let mut content = String::from("- TODO large root\n");
+    for n in 0..2_001 {
+        content.push_str(&format!("\t- descendant {n} {}\n", "x".repeat(4_200)));
+    }
+    for n in 0..51 {
+        content.push_str(&format!("- DONE root {n}\n"));
+    }
+    std::fs::write(root.join("pages/Tasks.md"), content).unwrap();
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+    let source = "- {{query (task DONE)}}\n".repeat(65) + "- {{query (task TODO)}}\n";
+    let html = print_snapshot(&corpus, &mut snapshot, &source).unwrap();
+    assert_eq!(html.matches("DONE</span>").count(), 65 * 51);
+    assert!(html.contains("descendant 2000"));
+    assert!(html.len() > 8 * 1024 * 1024);
+}
+
+#[test]
+fn print_preserves_source_nesting_expansion_and_asset_budgets() {
+    let _serial = serialize();
+    let root = scratch("q2-print-source-budget");
+    write_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+    let source = format!(
+        "- {{{{query {}}}}}\n",
+        "x".repeat(crate::query::QUERY_SOURCE_MAX_BYTES + 1)
+    );
+    assert!(
+        print_snapshot(&corpus, &mut snapshot, &source).is_err(),
+        "source overflow rejects Print"
+    );
+    let at_source = format!(
+        "- {{{{query {}(task TODO)}}}}\n",
+        " ".repeat(crate::query::QUERY_SOURCE_MAX_BYTES - "(task TODO)".len())
+    );
+    assert!(print_snapshot(&corpus, &mut snapshot, &at_source)
+        .unwrap()
+        .contains("alpha child"));
+    let nested = |depth: usize| {
+        format!(
+            "- {{{{query {}(task TODO){}}}}}\n",
+            "(and ".repeat(depth - 1),
+            ")".repeat(depth - 1)
+        )
+    };
+    assert!(print_snapshot(&corpus, &mut snapshot, &nested(64))
+        .unwrap()
+        .contains("alpha child"));
+    assert!(print_snapshot(&corpus, &mut snapshot, &nested(65)).is_err());
+}
+
+#[test]
+fn print_query_sheets_preserve_org_format_and_physical_identity() {
+    let _serial = serialize();
+    let root = scratch("q2-print-org");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    let id = "622601de-5df1-4eef-9c7d-2cf997ea0002";
+    std::fs::write(
+        root.join("pages/Beta.ORG"),
+        format!("* TODO beta root\n:PROPERTIES:\n:id: {id}\n:cost: 2\n:END:\n** beta child\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages/Decoy.md"),
+        format!("title:: Beta\n- DONE decoy root\n  id:: {id}\n\t- wrong physical child\n"),
+    )
+    .unwrap();
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+    let html = print_snapshot(
+        &corpus,
+        &mut snapshot,
+        "- {{query (and (task TODO) (page Beta))}}\n  tine.view:: table\n",
+    )
+    .unwrap();
+    assert!(html.contains("beta root") && html.contains("beta child"));
+    assert!(html.contains("<table class=\"sheet-table\">"));
+    assert!(!html.contains("wrong physical child"));
+    assert!(
+        !html.contains(":PROPERTIES:"),
+        "uppercase Org format must survive sheet conversion"
+    );
+    let board = print_snapshot(
+        &corpus,
+        &mut snapshot,
+        "- {{query (and (task TODO) (page Beta))}}\n  tine.view:: board\n",
+    )
+    .unwrap();
+    assert!(board.contains("beta root") && board.contains("beta child"));
+    assert!(!board.contains("wrong physical child"));
+}
+
+#[test]
+fn print_preserves_private_scope_and_unsupported_surfaces() {
+    let _serial = serialize();
+    let root = scratch("q2-print-private");
+    write_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+    let html = print_snapshot(
+        &corpus,
+        &mut snapshot,
+        "- {{query (task TODO)}}\n- {{tine-query @page and [[Alpha]]}}\n",
+    )
+    .unwrap();
+    assert!(
+        html.contains("alpha grandchild"),
+        "personal Print includes private query output"
+    );
+    assert!(!html.contains("non-public pages omitted"));
+    assert!(!html.contains("Query results are unavailable for this render."));
+}
+
+#[test]
+fn print_direct_queries_use_current_sqlite_subtrees() {
+    let _serial = serialize();
+    let root = scratch("q2-print-direct-sqlite");
+    write_corpus(&root);
+    std::fs::write(root.join("pages/Print.md"), "- {{query (task TODO)}}\n").unwrap();
+    let corpus = Corpus::open(root, true);
+    std::fs::write(corpus.root.join("pages/Focus A.md"), "- poisoned source\n").unwrap();
+    let parses = corpus.graph.page_build_parses_test();
+    let html = corpus
+        .graph
+        .page_print_html("Print", crate::publish::PrintOpts::default())
+        .unwrap()
+        .unwrap();
+    assert!(html.contains("alpha grandchild"));
+    assert!(!html.contains("poisoned source"));
+    assert_eq!(corpus.graph.page_build_parses_test(), parses);
+}
+
 #[derive(Clone, Copy)]
 struct Caps {
     queries: usize,

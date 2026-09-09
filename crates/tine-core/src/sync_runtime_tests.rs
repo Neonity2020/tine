@@ -11,6 +11,150 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[cfg(test)]
+mod print_query_reader_regression_renders_matches_on_both_backends {
+    use super::*;
+
+    fn run(managed: bool) {
+        let fixture = ActivationFixture::nested_unicode("q2-print-reader", 0xb200);
+        fs::write(
+            fixture.graph_root.join("notes/Matches.md"),
+            "- TODO q2-selected-root [[Q2Tag]]\n\t- q2-required-descendant\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.graph_root.join("notes/Print.md"),
+            "- {{query (task TODO)}}\n- {{tine-query @block and [[Q2Tag]]}}\n- {{query (task TODO)}}\n  tine.view:: table\n",
+        )
+        .unwrap();
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let html = if managed {
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let handle = activated.handle.expect("managed Print fixture activates");
+            drive_initial_feed_with_turn_budget(&handle, 128);
+            let page = match handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "notes/Print.md".into(),
+                    },
+                })
+                .unwrap()
+            {
+                SyncApplicationPageLoadOutcome::Loaded { page, .. } => page,
+                other => panic!("Print page did not load: {other:?}"),
+            };
+            handle
+                .application_print_html(&graph, &page, crate::publish::PrintOpts::default())
+                .unwrap()
+                .unwrap()
+        } else {
+            graph.warm_cache();
+            graph
+                .attach_direct_projection(fixture.root.join("print-direct.sqlite"))
+                .unwrap();
+            let started = std::time::Instant::now();
+            while !graph.direct_projection_ready_test() {
+                assert!(started.elapsed() < std::time::Duration::from_secs(30));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            graph
+                .page_print_html("Print", crate::publish::PrintOpts::default())
+                .unwrap()
+                .expect("Direct Print page exists")
+        };
+        let alert = "<div class=\"query query-unsupported\" role=\"alert\">Query results are unavailable for this render.</div>";
+        eprintln!(
+            "Q2 backend={} unavailable_alerts={} selected={} descendant={} table={}",
+            if managed { "Managed" } else { "Direct" },
+            html.matches(alert).count(),
+            html.contains("q2-selected-root"),
+            html.contains("q2-required-descendant"),
+            html.contains("<table class=\"sheet-table\">")
+        );
+        assert!(
+            html.contains("q2-selected-root")
+                && html.contains("q2-required-descendant")
+                && html.contains("<table class=\"sheet-table\">")
+                && !html.contains(alert),
+            "complete Print query content required; unavailable-reader alert present: {}",
+            html.contains(alert)
+        );
+    }
+
+    #[test]
+    fn direct() {
+        run(false);
+    }
+
+    #[test]
+    fn managed() {
+        run(true);
+    }
+}
+
+#[test]
+fn print_managed_uses_actor_body_and_sqlite_query_subtrees() {
+    let fixture = ActivationFixture::nested_unicode("q2-print-actor-body", 0xb240);
+    fs::write(
+        fixture.graph_root.join("notes/Matches.md"),
+        "- TODO stored root\n\t- stored descendant\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/Print.md"),
+        "- actor body\n- {{query (task TODO)}}\n",
+    )
+    .unwrap();
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+    let handle = activated.handle.unwrap();
+    drive_initial_feed_with_turn_budget(&handle, 128);
+    let page = match handle
+        .load_application_page(SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath {
+                path: "notes/Print.md".into(),
+            },
+        })
+        .unwrap()
+    {
+        SyncApplicationPageLoadOutcome::Loaded { page, .. } => page,
+        other => panic!("actor body did not load: {other:?}"),
+    };
+    fs::write(
+        fixture.graph_root.join("notes/Matches.md"),
+        "- poisoned source\n",
+    )
+    .unwrap();
+    let graph = Graph::open_derived_read_only(&fixture.graph_root);
+    let html = handle
+        .application_print_html(&graph, &page, crate::publish::PrintOpts::default())
+        .unwrap()
+        .unwrap();
+    assert!(html.contains("actor body") && html.contains("stored descendant"));
+    assert!(!html.contains("poisoned source"));
+}
+
+#[test]
+fn print_query_routes_have_no_parsed_graph_hydration() {
+    let document = c7b_fn_body(
+        "crates/tine-core/src/publish.rs",
+        "page_print_html_document",
+    );
+    assert!(
+        !document.contains("query_reader: None"),
+        "Print must acquire a reader"
+    );
+    for route in [
+        "run_static_query",
+        "render_query_sheet",
+        "render_query_outcome",
+    ] {
+        let body = c7b_fn_body("crates/tine-core/src/publish.rs", route);
+        assert!(!body.contains("graph.with_pages("));
+    }
+}
+
+#[cfg(test)]
 #[path = "live_write_benchmark_tests.rs"]
 mod live_write_benchmark;
 

@@ -5204,6 +5204,36 @@ impl SyncRuntimeHandle {
         }
     }
 
+    pub fn application_print_html(
+        &self,
+        graph: &Graph,
+        page: &PageDto,
+        opts: crate::publish::PrintOpts,
+    ) -> Result<
+        Result<String, crate::publish::PrintPreparationError>,
+        SyncApplicationPageRequestError,
+    > {
+        let shared = &self.inner.managed_query;
+        let mut recaptures = 0;
+        loop {
+            let capture =
+                self.application_request(|reply| ActorRequest::ApplicationCurrentQueryRead {
+                    requires_registry: true,
+                    reply,
+                })?;
+            match shared.execute_print(&capture, graph, page, opts) {
+                Ok(answer) => return Ok(answer),
+                Err(crate::managed_query::ManagedQueryOutcome::Stale)
+                    if recaptures < crate::managed_query::MAX_STALE_RECAPTURES =>
+                {
+                    recaptures += 1;
+                    shared.census.note_stale_recapture();
+                }
+                Err(outcome) => return Err(managed_execution_error(&shared.census, outcome)),
+            }
+        }
+    }
+
     fn application_captured_export(
         &self,
         specs: &[crate::query::QueryExportSpec],

@@ -136,6 +136,14 @@ type SlugMap = std::collections::HashMap<String, String>;
 /// boundary. The renderer parses every authored surface, while the backend
 /// adapter owns the coherent snapshot, registry and cancellation lifetime.
 pub(crate) trait PublicationQueryRead {
+    fn run_subtrees(
+        &self,
+        query: &crate::query::ir::Query,
+        view: &ViewSettings,
+        bounds: Bounds,
+        context: &ExecutionContext,
+    ) -> Result<crate::query::export_execute::SubtreeQueryResult, QueryExecutionError>;
+
     fn run(
         &self,
         query: &crate::query::ir::Query,
@@ -145,6 +153,55 @@ pub(crate) trait PublicationQueryRead {
     ) -> Result<QueryResult, QueryExecutionError>;
 
     fn ensure_current(&self) -> Result<(), QueryExecutionError>;
+}
+
+#[derive(Debug)]
+pub enum PrintPreparationError {
+    Io(io::Error),
+    Query(QueryExecutionError),
+    Budget(&'static str),
+}
+
+const PRINT_SELECTION_REFUSAL: &str = "Couldn't prepare this page for PDF: a query exceeds the Print limit. Narrow the query and try again.";
+const PRINT_SOURCE_REFUSAL: &str = "Couldn't prepare this page for PDF: a query source exceeds the 64 KiB Print limit. Shorten the query and try again.";
+const PRINT_NESTING_REFUSAL: &str = "Couldn't prepare this page for PDF: a query exceeds the Print nesting limit of 64. Simplify the query and try again.";
+
+impl std::fmt::Display for PrintPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::Query(e) => e.fmt(f),
+            Self::Budget(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PrintPreparationError {}
+impl From<io::Error> for PrintPreparationError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<QueryExecutionError> for PrintPreparationError {
+    fn from(error: QueryExecutionError) -> Self {
+        Self::Query(error)
+    }
+}
+
+impl PrintPreparationError {
+    pub fn backend_wire_string(&self) -> String {
+        match self {
+            Self::Query(error) => error.backend_wire_string(),
+            Self::Budget(message) => {
+                crate::sync_runtime::tagged_backend_error_with_reason_and_detail(
+                    "query-unavailable",
+                    "print_query_budget_exceeded",
+                    json!({ "message": message }),
+                )
+            }
+            Self::Io(error) => error.to_string(),
+        }
+    }
 }
 
 fn publication_query_io_error(error: QueryExecutionError) -> io::Error {
@@ -1221,6 +1278,7 @@ struct Ctx<'a> {
     /// Inline/print renderers have no such owner and fail query surfaces
     /// explicitly instead of manufacturing an empty result.
     query_reader: Option<&'a dyn PublicationQueryRead>,
+    print_error: Option<&'a RefCell<Option<PrintPreparationError>>>,
     /// Pass-1 parsed public page documents, keyed by Logseq page identity. Page
     /// embeds use this before falling back to disk for non-public/unseen pages.
     pages: Option<&'a HashMap<String, &'a doc::Document>>,
@@ -2851,11 +2909,7 @@ fn render_query_sheet(
             return;
         }
     };
-    let StaticQueryRows::Block(groups) = outcome.rows else {
-        out.push_str("<div class=\"query-unsupported\" role=\"alert\">Page queries cannot be presented as block sheets.</div>");
-        return;
-    };
-    with_hydrated_query_groups(graph, &groups, |hydrated| {
+    let mut render = |hydrated: &[HydratedQueryBlock<'_>]| {
         let rows = hydrated
             .iter()
             .map(|row| SheetRow {
@@ -2883,7 +2937,28 @@ fn render_query_sheet(
                 out.push_str("<div class=\"query-unsupported\">A grid is positional; it cannot present query results.</div>");
             }
         }
-    });
+    };
+    match outcome.rows {
+        StaticQueryRows::Block(groups) => with_hydrated_query_groups(graph, &groups, render),
+        StaticQueryRows::Subtrees(roots) => {
+            let documents = roots.iter().map(|root| {
+                crate::model::dto_blocks_to_doc_checked(
+                    std::slice::from_ref(&root.block),
+                    crate::model::Format::from_path(Path::new(&root.path)) == crate::model::Format::Org,
+                )
+            }).collect::<io::Result<Vec<_>>>();
+            match documents {
+                Ok(documents) => {
+                    let hydrated = roots.iter().zip(&documents).map(|(root, blocks)| HydratedQueryBlock {
+                        page: &root.page, block: &blocks[0],
+                    }).collect::<Vec<_>>();
+                    render(&hydrated);
+                }
+                Err(error) => record_print_error(ctx, PrintPreparationError::Io(error)),
+            }
+        }
+        StaticQueryRows::Page(_) => out.push_str("<div class=\"query-unsupported\" role=\"alert\">Page queries cannot be presented as block sheets.</div>"),
+    }
 }
 
 /// The whole-block `{{query …}}` detection used for query-backed sheets: the
@@ -3007,12 +3082,14 @@ fn run_static_query(
     const STATIC_QUERY_MAX_ROWS: usize = 20_000;
     const STATIC_QUERY_MAX_BYTES: usize = 32 * 1024 * 1024;
     if !crate::query::query_source_within_limit(src) {
+        record_print_error(ctx, PrintPreparationError::Budget(PRINT_SOURCE_REFUSAL));
         return Err(format!(
             "<div class=\"query query-too-large\">Query source exceeds the {} KiB publication limit.</div>",
             crate::query::QUERY_SOURCE_MAX_BYTES / 1024
         ));
     }
     if check_nesting && !crate::query::query_nesting_within_limit(src) {
+        record_print_error(ctx, PrintPreparationError::Budget(PRINT_NESTING_REFUSAL));
         return Err("<div class=\"query query-too-large\">Query nesting is too deep to publish safely.</div>".to_string());
     }
     // Publication parsing has no suggestion UI. As before, an empty registry
@@ -3032,22 +3109,29 @@ fn run_static_query(
     };
     // A published page is not the author's current editor page. Existing
     // advanced `?current-page` binding therefore remains absent.
-    let result = reader
-        .run(
-            &query,
-            &view,
-            Bounds {
-                max_rows: STATIC_QUERY_MAX_ROWS,
-                max_bytes: STATIC_QUERY_MAX_BYTES,
-            },
-            &ExecutionContext::none(),
+    if ctx.print_error.is_some() && query.anchor == crate::query::ir::Anchor::Page {
+        return Err("<div class=\"query query-unsupported\" role=\"alert\">Page query results are unavailable in Print.</div>".into());
+    }
+    let bounds = Bounds {
+        max_rows: STATIC_QUERY_MAX_ROWS,
+        max_bytes: STATIC_QUERY_MAX_BYTES,
+    };
+    let (result, subtrees) = if ctx.print_error.is_some() {
+        reader
+            .run_subtrees(&query, &view, bounds, &ExecutionContext::none())
+            .map(|answer| (answer.result, Some(answer.roots)))
+    } else {
+        reader
+            .run(&query, &view, bounds, &ExecutionContext::none())
+            .map(|result| (result, None))
+    }
+    .map_err(|error| {
+        record_print_error(ctx, PrintPreparationError::Query(error));
+        format!(
+            "<div class=\"query query-unsupported\" role=\"alert\">{}</div>",
+            esc(&error.to_string())
         )
-        .map_err(|error| {
-            format!(
-                "<div class=\"query query-unsupported\" role=\"alert\">{}</div>",
-                esc(&error.to_string())
-            )
-        })?;
+    })?;
     if !result.report.supported
         || result
             .diagnostics
@@ -3060,10 +3144,17 @@ fn run_static_query(
         );
     }
     if result.exceeded {
+        record_print_error(ctx, PrintPreparationError::Budget(PRINT_SELECTION_REFUSAL));
         return Err(format!(
             "<div class=\"query query-too-large\">Query has {} matches; narrow it before publishing.</div>",
             result.matched_total.unwrap_or(result.total)
         ));
+    }
+    if let Some(roots) = subtrees {
+        return Ok(StaticQueryOutcome {
+            pre_filter_total: roots.len(),
+            rows: StaticQueryRows::Subtrees(roots),
+        });
     }
     Ok(match result.rows {
         QueryRows::Block { groups } => {
@@ -3094,6 +3185,16 @@ fn run_static_query(
 enum StaticQueryRows {
     Block(Vec<RefGroup>),
     Page(Vec<PageRow>),
+    Subtrees(Vec<crate::query::export_results::HydratedRoot>),
+}
+
+fn record_print_error(ctx: &Ctx, error: PrintPreparationError) {
+    if let Some(slot) = ctx.print_error {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
 }
 
 struct StaticQueryOutcome {
@@ -3126,6 +3227,7 @@ fn render_query_outcome(
     depth: u8,
 ) -> String {
     let total = match &outcome.rows {
+        StaticQueryRows::Subtrees(roots) => roots.len(),
         StaticQueryRows::Block(groups) => groups.iter().map(|group| group.blocks.len()).sum(),
         StaticQueryRows::Page(pages) => pages.len(),
     };
@@ -3136,6 +3238,17 @@ fn render_query_outcome(
         total
     );
     match outcome.rows {
+        StaticQueryRows::Subtrees(roots) => {
+            if roots.is_empty() {
+                out.push_str("<div class=\"query-empty\">No matching blocks.</div>");
+            } else {
+                out.push_str("<ul class=\"query-results\">");
+                for root in roots {
+                    render_result_block(&root.block, &mut out, ctx, depth);
+                }
+                out.push_str("</ul>");
+            }
+        }
         StaticQueryRows::Block(groups) if groups.is_empty() => {
             out.push_str("<div class=\"query-empty\">No matching blocks.</div>");
         }
@@ -3858,18 +3971,21 @@ body.print ul.outline ul{border-left:none}
 /// page (in-page `((ref))` → an in-document anchor); a ref to a block on another
 /// page degrades to its label / muted text (there's no second file to link to),
 /// which is correct for a single-page export.
-pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result<Option<String>> {
+pub fn page_print_html(
+    graph: &Graph,
+    name: &str,
+    opts: PrintOpts,
+) -> Result<Option<String>, PrintPreparationError> {
     let Some(entry) = graph.list_pages().into_iter().find(|e| e.name == name) else {
         return Ok(None);
     };
     let content = fs::read_to_string(&entry.path)?;
     let parsed = doc::parse(&content);
-    Ok(Some(page_print_html_document(
-        graph,
-        &entry.name,
-        &parsed,
-        opts,
-    )))
+    graph
+        .with_print_query_reader(|reader| {
+            page_print_html_document(graph, &entry.name, &parsed, opts, reader)
+        })
+        .map(Some)
 }
 
 /// Render one already-authoritative page document. Managed storage uses this
@@ -3882,11 +3998,13 @@ pub(crate) fn page_print_html_document(
     name: &str,
     parsed: &doc::Document,
     opts: PrintOpts,
-) -> String {
+    reader: &dyn PublicationQueryRead,
+) -> Result<String, PrintPreparationError> {
     let slug = slug(name);
     let mut refs = RefIndex::new();
     collect_block_refs(&parsed.roots, &slug, &mut refs);
     let print_asset_budget = RefCell::new(PrintAssetBudget::standard());
+    let print_error = RefCell::new(None);
     let ctx = Ctx {
         refs: &refs,
         reverse_refs: None,
@@ -3894,7 +4012,8 @@ pub(crate) fn page_print_html_document(
         slugs: None,
         inline_assets: true,
         print_asset_budget: Some(&print_asset_budget),
-        query_reader: None,
+        query_reader: Some(reader),
+        print_error: Some(&print_error),
         pages: None,
         page_links: None,
     };
@@ -3924,7 +4043,12 @@ pub(crate) fn page_print_html_document(
     }
     body.push_str("</ul>");
     let heading = format!("<h1 class=\"page\">{}</h1>", esc(name));
-    print_shell(name, &format!("{heading}{body}"), opts)
+    let html = print_shell(name, &format!("{heading}{body}"), opts);
+    if let Some(error) = print_error.into_inner() {
+        return Err(error);
+    }
+    reader.ensure_current()?;
+    Ok(html)
 }
 
 /// Options for the single-page print/PDF export, chosen in the pre-export dialog.
@@ -4802,6 +4926,7 @@ fn publish_graph_documents_inner(
         inline_assets: false,
         print_asset_budget: None,
         query_reader: queries,
+        print_error: None,
         pages: Some(&page_docs),
         page_links: Some(&page_links),
     };
@@ -4900,6 +5025,7 @@ mod tests {
             inline_assets: false,
             print_asset_budget: None,
             query_reader: None,
+            print_error: None,
             pages: None,
             page_links: None,
         };
@@ -5047,6 +5173,7 @@ mod tests {
                 inline_assets: false,
                 print_asset_budget: None,
                 query_reader: None,
+                print_error: None,
                 pages: None,
                 page_links: None,
             },
@@ -5771,6 +5898,7 @@ mod tests {
             inline_assets: true,
             print_asset_budget: Some(&cumulative),
             query_reader: None,
+            print_error: None,
             pages: None,
             page_links: None,
         };
@@ -5804,6 +5932,20 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn print_test_graph(dir: &Path) -> Graph {
+        let graph = Graph::open(dir);
+        graph.warm_cache();
+        graph
+            .attach_direct_projection(dir.join("print-test.sqlite"))
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !graph.direct_projection_ready_test() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        graph
+    }
+
     #[test]
     fn page_print_html_is_self_contained_with_inlined_image() {
         let dir = std::env::temp_dir().join(format!("tine-print-{}", std::process::id()));
@@ -5828,7 +5970,7 @@ mod tests {
         )
         .unwrap();
 
-        let g = Graph::open(&dir);
+        let g = print_test_graph(&dir);
         let html = g
             .page_print_html("Report", PrintOpts::default())
             .unwrap()
@@ -5838,14 +5980,21 @@ mod tests {
             .unwrap()
             .expect("page DTO exists");
         assert_eq!(
-            g.page_print_html_page(&page, PrintOpts::default()).unwrap(),
+            g.with_print_query_reader(|reader| g.page_print_html_page(
+                &page,
+                PrintOpts::default(),
+                reader
+            ))
+            .unwrap(),
             html,
             "actor-owned DTO and Direct Files source must share one renderer"
         );
         let mut current = page;
         current.blocks[1].raw = "Actor-current text".into();
         let current_html = g
-            .page_print_html_page(&current, PrintOpts::default())
+            .with_print_query_reader(|reader| {
+                g.page_print_html_page(&current, PrintOpts::default(), reader)
+            })
             .unwrap();
         assert!(current_html.contains("Actor-current text"));
         assert!(
@@ -5915,7 +6064,8 @@ mod tests {
             "- Parent\n  collapsed:: true\n\t- hidden child text\n",
         )
         .unwrap();
-        let g2 = Graph::open(&dir);
+        drop(g);
+        let g2 = print_test_graph(&dir);
         let expanded = g2
             .page_print_html("Folded", PrintOpts::default())
             .unwrap()
@@ -6031,6 +6181,18 @@ mod tests {
     }
 
     impl PublicationQueryRead for CapturedWalkReader<'_> {
+        fn run_subtrees(
+            &self,
+            _: &crate::query::ir::Query,
+            _: &ViewSettings,
+            _: Bounds,
+            _: &ExecutionContext,
+        ) -> Result<crate::query::export_execute::SubtreeQueryResult, QueryExecutionError> {
+            Err(QueryExecutionError::Unavailable(
+                crate::query::QueryUnavailableReason::UnsupportedRelation,
+            ))
+        }
+
         fn run(
             &self,
             query: &crate::query::ir::Query,
@@ -6681,6 +6843,7 @@ mod tests {
             inline_assets: false,
             print_asset_budget: None,
             query_reader: Some(&reader),
+            print_error: None,
             pages: None,
             page_links: None,
         };
@@ -7519,7 +7682,7 @@ mod tests {
                estimate:: 4\n",
         )
         .unwrap();
-        let graph = Graph::open(&dir);
+        let graph = print_test_graph(&dir);
         let print = graph
             .page_print_html("PrintSheet", PrintOpts::default())
             .unwrap()

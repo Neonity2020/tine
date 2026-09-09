@@ -7,7 +7,9 @@ use crate::query::export_results::{
     apply_located_view, hydrate_located_export_queries, select_located_export_queries,
     ExportSubtreeInputs,
 };
-use crate::query::ir::{ExecutionContext, Query, ViewSettings};
+use crate::query::ir::{
+    Anchor, Bounds, ExecutionContext, Query, QueryResult, QueryRows, ViewSettings,
+};
 use crate::query::registry::Registry;
 use crate::query::results::{
     probe_fts_ready, read_located_results, BackendOrder, RecencyPage, ResultIdentity,
@@ -73,6 +75,131 @@ pub(crate) struct ExportExecutionInputs<'a> {
     pub(crate) max_roots: usize,
     pub(crate) max_nodes: usize,
     pub(crate) max_bytes: usize,
+}
+
+pub(crate) struct SubtreeSelectionInputs<'a> {
+    pub(crate) registry: &'a Registry,
+    pub(crate) identity: &'a ResultIdentity,
+    pub(crate) order: BackendOrder,
+    pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
+    pub(crate) today: crate::date::JournalDate,
+    pub(crate) fts_ready: bool,
+}
+
+pub(crate) struct SubtreeQueryResult {
+    pub(crate) result: QueryResult,
+    pub(crate) roots: Vec<crate::query::export_results::HydratedRoot>,
+}
+
+/// Execute caller-supplied IR with complete subtree output. This preserves the
+/// support report and checks selection overflow before any subtree read.
+pub(crate) fn execute_subtrees_from_ir(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    query: &Query,
+    view: &ViewSettings,
+    bounds: Bounds,
+    context: &ExecutionContext,
+    inputs: &SubtreeSelectionInputs<'_>,
+) -> Result<SubtreeQueryResult, crate::query::QueryExecutionError> {
+    if snapshot.cancellation().is_cancelled() {
+        return Err(crate::query::QueryExecutionError::Cancelled);
+    }
+    let resolved = resolve_for_execution(query, context, inputs.today);
+    let query = block_anchored_query(resolved.query());
+    let mut result = QueryResult {
+        rows: QueryRows::Block { groups: Vec::new() },
+        diagnostics: query.diagnostics.clone(),
+        report: resolved.report().clone(),
+        total: 0,
+        matched_total: None,
+        exceeded: false,
+    };
+    if !result.report.supported || query.is_invalid() || resolved.query().anchor == Anchor::Page {
+        return Ok(SubtreeQueryResult {
+            result,
+            roots: Vec::new(),
+        });
+    }
+    let selected = select_subtree_roots(snapshot, &query, view, bounds, inputs)?;
+    result.total = selected.total;
+    result.exceeded = selected.exceeded;
+    if selected.exceeded {
+        return Ok(SubtreeQueryResult {
+            result,
+            roots: Vec::new(),
+        });
+    }
+    let roots = selected
+        .groups
+        .into_iter()
+        .flat_map(|group| {
+            group.blocks.into_iter().map(move |(block, locator)| {
+                crate::query::export_results::LocatedExportRoot {
+                    page: group.page.clone(),
+                    kind: group.kind,
+                    block,
+                    locator,
+                }
+            })
+        })
+        .collect();
+    let selected = vec![crate::query::SelectedExportQueryOf {
+        key: String::new(),
+        roots,
+        total: selected.total,
+    }];
+    let mut hydrated = crate::query::export_results::hydrate_located_queries(
+        snapshot,
+        selected,
+        inputs.identity,
+        crate::query::export_results::SubtreeOutputPolicy::Complete,
+    )?;
+    #[cfg(test)]
+    after_construction_hook();
+    if snapshot.cancellation().is_cancelled() {
+        return Err(crate::query::QueryExecutionError::Cancelled);
+    }
+    Ok(SubtreeQueryResult {
+        result,
+        roots: hydrated.pop().expect("one subtree query").roots,
+    })
+}
+
+fn select_subtree_roots(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    query: &Query,
+    view: &ViewSettings,
+    bounds: Bounds,
+    inputs: &SubtreeSelectionInputs<'_>,
+) -> Result<ExportSelectionAnswer<(BlockDto, ResultLocator)>, ResultReadError> {
+    let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+    let statement = lower_query(
+        query,
+        &LoweringInputs {
+            today: inputs.today,
+            registry: inputs.registry,
+            cutoff: None,
+            compiled: &compiled,
+            fts_ready: inputs.fts_ready,
+            result_set_rule: RESULT_SET_RULE,
+        },
+    );
+    if statement.matches_nothing {
+        return Ok(empty_selection());
+    }
+    let pre = read_located_results(
+        snapshot,
+        &ResultReadInputs {
+            statement: &statement,
+            order: inputs.order,
+            identity: inputs.identity,
+            max_rows: bounds.max_rows,
+            max_bytes: bounds.max_bytes,
+            profile: ConstructionProfile::from_view(view),
+            recency: inputs.recency,
+        },
+    )?;
+    Ok(apply_located_view(pre, view))
 }
 
 impl PreparedExportBatch {
@@ -166,35 +293,23 @@ impl PreparedExportBatch {
             let Some(execution) = item.execution.as_ref() else {
                 return Ok(empty_selection());
             };
-            let compiled =
-                crate::query::eval::CompiledLeaves::for_query(&execution.query.evaluable_filter());
-            let statement = lower_query(
-                &execution.query,
-                &LoweringInputs {
-                    today: self.today,
-                    registry: inputs.registry,
-                    cutoff: None,
-                    compiled: &compiled,
-                    fts_ready,
-                    result_set_rule: RESULT_SET_RULE,
-                },
-            );
-            if statement.matches_nothing {
-                return Ok(empty_selection());
-            }
-            let pre = read_located_results(
+            select_subtree_roots(
                 snapshot,
-                &ResultReadInputs {
-                    statement: &statement,
-                    order: inputs.order,
-                    identity: inputs.identity,
+                &execution.query,
+                &execution.view,
+                Bounds {
                     max_rows: QUERY_EXPORT_CONSTRUCTION_ROWS,
                     max_bytes: QUERY_EXPORT_CONSTRUCTION_BYTES,
-                    profile: ConstructionProfile::from_view(&execution.view),
-                    recency: inputs.recency,
                 },
-            )?;
-            Ok(apply_located_view(pre, &execution.view))
+                &SubtreeSelectionInputs {
+                    registry: inputs.registry,
+                    identity: inputs.identity,
+                    order: inputs.order,
+                    recency: inputs.recency,
+                    today: self.today,
+                    fts_ready,
+                },
+            )
         })?;
         let results = hydrate_located_export_queries(
             snapshot,

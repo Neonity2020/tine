@@ -66,6 +66,7 @@ adapter call edges.
 | application_pages_at_name_key_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed exact-name index boundary. |
 | application_parser_indices_for_block_ids | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Maps Managed block IDs to parser positions. |
 | application_preview_block_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed bounded-subtree preview boundary. |
+| application_print_html | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side bounded capture/retry adapter: renders the actor-loaded page with shared query selection and complete subtrees on one current main SQLite snapshot off actor; typed failures and Print's independent budgets are preserved. |
 | application_projection_roots | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Owns the cached complete DocBlock view for a Managed page. |
 | application_property_facets_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-facet index plus overlay. |
 | application_query_page_recency | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Computes recency from Managed path and graph config. |

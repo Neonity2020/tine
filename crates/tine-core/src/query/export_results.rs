@@ -83,6 +83,26 @@ pub(crate) struct ExportSubtreeInputs<'a> {
     pub(crate) max_bytes: usize,
 }
 
+/// Consumer output policy. Complete output has no node or byte admission cap.
+pub(crate) enum SubtreeOutputPolicy {
+    Bounded { max_nodes: usize, max_bytes: usize },
+    Complete,
+}
+
+pub(crate) struct HydratedRoot {
+    pub(crate) page: String,
+    pub(crate) kind: PageKind,
+    pub(crate) path: String,
+    pub(crate) block: BlockDto,
+}
+
+pub(crate) struct HydratedQuery {
+    pub(crate) key: String,
+    pub(crate) total: usize,
+    pub(crate) roots: Vec<HydratedRoot>,
+    pub(crate) omitted_nodes: usize,
+}
+
 /// One selected export root: its shallow SELECTION DTO and its exact locator.
 ///
 /// The DTO is the row the view already produced, reused rather than re-read:
@@ -162,13 +182,63 @@ pub(crate) fn hydrate_located_export_queries(
     selected: Vec<LocatedExportQuery>,
     inputs: &ExportSubtreeInputs<'_>,
 ) -> Result<Vec<QueryExportResult>, ResultReadError> {
+    Ok(hydrate_located_queries(
+        snapshot,
+        selected,
+        inputs.identity,
+        SubtreeOutputPolicy::Bounded {
+            max_nodes: inputs.max_nodes,
+            max_bytes: inputs.max_bytes,
+        },
+    )?
+    .into_iter()
+    .map(|query| {
+        let shown = query.roots.len();
+        let mut groups: Vec<RefGroup> = Vec::new();
+        for root in query.roots {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.kind == root.kind && group.page == root.page)
+            {
+                group.blocks.push(root.block);
+            } else {
+                groups.push(RefGroup {
+                    page: root.page,
+                    kind: root.kind,
+                    blocks: vec![root.block],
+                    evidence: Vec::new(),
+                });
+            }
+        }
+        QueryExportResult {
+            key: query.key,
+            groups,
+            shown,
+            total: query.total,
+            omitted_nodes: query.omitted_nodes,
+        }
+    })
+    .collect())
+}
+
+pub(crate) fn hydrate_located_queries(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    selected: Vec<LocatedExportQuery>,
+    identity: &ResultIdentity,
+    policy: SubtreeOutputPolicy,
+) -> Result<Vec<HydratedQuery>, ResultReadError> {
     let paths = read_root_page_paths(snapshot, &selected)?;
     let preorders = read_root_preorders(snapshot, &selected)?;
 
     // The two global budgets, clamped exactly as the oracle clamps them, and
     // charged in input macro/root order across every macro.
-    let mut remaining_nodes = inputs.max_nodes.max(1);
-    let mut remaining_bytes = inputs.max_bytes.max(1);
+    let mut remaining = match policy {
+        SubtreeOutputPolicy::Bounded {
+            max_nodes,
+            max_bytes,
+        } => Some((max_nodes.max(1), max_bytes.max(1))),
+        SubtreeOutputPolicy::Complete => None,
+    };
 
     let mut emitted: Vec<EmittedNode> = Vec::new();
     let mut outcomes: Vec<QueryOutcome> = Vec::with_capacity(selected.len());
@@ -187,18 +257,12 @@ pub(crate) fn hydrate_located_export_queries(
             if !topologies.contains_key(&key) {
                 let preorder = preorders[&key];
                 let path = paths[&locator.page_id].clone();
-                let subtree =
-                    read_subtree_topology(snapshot, locator, preorder, &path, inputs.identity)?;
+                let subtree = read_subtree_topology(snapshot, locator, preorder, &path, identity)?;
                 topologies.insert(key, subtree);
             }
             let subtree = &topologies[&key];
             let root_estimate = block_dto_estimated_bytes(&root.block);
-            let admitted = admit_subtree(
-                subtree,
-                root_estimate,
-                &mut remaining_nodes,
-                &mut remaining_bytes,
-            );
+            let admitted = admit_subtree_policy(subtree, root_estimate, &mut remaining)?;
             // `1 + descendants` is the oracle's `subtree_node_count`, and the
             // count of what did NOT fit is taken against it whether or not the
             // root itself was emitted.
@@ -209,6 +273,9 @@ pub(crate) fn hydrate_located_export_queries(
                 None
             } else {
                 let base = emitted.len();
+                emitted
+                    .try_reserve(admitted.order.len())
+                    .map_err(allocation_error)?;
                 for (at, node) in admitted.order.iter().copied().enumerate() {
                     let parent = admitted.parents[at];
                     emitted.push(EmittedNode {
@@ -246,6 +313,7 @@ pub(crate) fn hydrate_located_export_queries(
             roots.push(RootOutcome {
                 page: root.page,
                 kind: root.kind,
+                path: paths[&locator.page_id].clone(),
                 root: root_at,
                 omitted_nodes,
             });
@@ -258,7 +326,11 @@ pub(crate) fn hydrate_located_export_queries(
     }
 
     read_output_payload(snapshot, &mut emitted)?;
-    Ok(assemble(outcomes, emitted))
+    assemble(outcomes, emitted)
+}
+
+fn allocation_error(error: std::collections::TryReserveError) -> ResultReadError {
+    ResultReadError::Corrupt(format!("subtree output allocation failed: {error}"))
 }
 
 // ===== pass 1: the roots' pages and preorders =====
@@ -720,17 +792,33 @@ struct Admission {
 /// pre-check would reject is a node the estimate rejects too. The estimate is
 /// the STORED one, identity-adjusted by the same owner the result read uses,
 /// and pass 3 re-checks it against the payload that is actually decoded.
+#[cfg(test)]
 fn admit_subtree(
     subtree: &Subtree,
     root_estimate: usize,
     remaining_nodes: &mut usize,
     remaining_bytes: &mut usize,
 ) -> Admission {
+    let mut remaining = Some((*remaining_nodes, *remaining_bytes));
+    let admitted = admit_subtree_policy(subtree, root_estimate, &mut remaining)
+        .expect("bounded test admission allocates");
+    (*remaining_nodes, *remaining_bytes) = remaining.expect("bounded admission");
+    admitted
+}
+
+fn admit_subtree_policy(
+    subtree: &Subtree,
+    root_estimate: usize,
+    remaining: &mut Option<(usize, usize)>,
+) -> Result<Admission, ResultReadError> {
     let estimate = |node: usize| match node {
         0 => root_estimate,
         other => subtree.nodes[other - 1].estimated_bytes,
     };
-    let take = |node: usize, remaining_nodes: &mut usize, remaining_bytes: &mut usize| {
+    let take = |node: usize, remaining: &mut Option<(usize, usize)>| {
+        let Some((remaining_nodes, remaining_bytes)) = remaining else {
+            return true;
+        };
         if *remaining_nodes == 0 {
             return false;
         }
@@ -744,13 +832,21 @@ fn admit_subtree(
     };
     let mut order: Vec<usize> = Vec::new();
     let mut parents: Vec<usize> = Vec::new();
-    if !take(0, remaining_nodes, remaining_bytes) {
-        return Admission { order, parents };
+    let capacity = remaining
+        .as_ref()
+        .map_or(subtree.nodes.len() + 1, |(nodes, _)| {
+            (*nodes).min(subtree.nodes.len() + 1)
+        });
+    order.try_reserve(capacity).map_err(allocation_error)?;
+    parents.try_reserve(capacity).map_err(allocation_error)?;
+    if !take(0, remaining) {
+        return Ok(Admission { order, parents });
     }
     order.push(0);
     parents.push(NO_PARENT);
     // `(node, next child, position in `order`)`.
     let mut stack: Vec<(usize, usize, usize)> = vec![(0, 0, 0)];
+    stack.try_reserve(capacity).map_err(allocation_error)?;
     while let Some(&(node, next, at)) = stack.last() {
         let children = &subtree.children[node];
         if next == children.len() {
@@ -759,7 +855,7 @@ fn admit_subtree(
         }
         stack.last_mut().expect("a non-empty admission stack").1 += 1;
         let child = children[next];
-        if !take(child, remaining_nodes, remaining_bytes) {
+        if !take(child, remaining) {
             // The oracle's `break`: this parent stops taking children, and its
             // own ancestors carry on.
             stack.pop();
@@ -769,7 +865,7 @@ fn admit_subtree(
         parents.push(at);
         stack.push((child, 0, order.len() - 1));
     }
-    Admission { order, parents }
+    Ok(Admission { order, parents })
 }
 
 // ===== pass 3: output payload, for admitted nodes only =====
@@ -890,6 +986,7 @@ struct WantedPayload {
 struct RootOutcome {
     page: String,
     kind: PageKind,
+    path: String,
     /// Where this occurrence's root node landed in `emitted`, when it fit.
     root: Option<usize>,
     omitted_nodes: usize,
@@ -907,55 +1004,60 @@ struct QueryOutcome {
 /// byte budgets are cumulative across macros. Within a macro, consecutive roots
 /// from the same displayed page share one group, exactly as
 /// `emit_selected_export_queries` merges them.
-fn assemble(outcomes: Vec<QueryOutcome>, mut emitted: Vec<EmittedNode>) -> Vec<QueryExportResult> {
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); emitted.len()];
+fn assemble(
+    outcomes: Vec<QueryOutcome>,
+    mut emitted: Vec<EmittedNode>,
+) -> Result<Vec<HydratedQuery>, ResultReadError> {
+    let mut children: Vec<Vec<usize>> = Vec::new();
+    children
+        .try_reserve(emitted.len())
+        .map_err(allocation_error)?;
+    children.resize_with(emitted.len(), Vec::new);
     for at in 0..emitted.len() {
         let parent = emitted[at].parent;
         if parent != NO_PARENT {
+            children[parent].try_reserve(1).map_err(allocation_error)?;
             children[parent].push(at);
         }
     }
     outcomes
         .into_iter()
         .map(|query| {
-            let mut groups: Vec<RefGroup> = Vec::new();
-            let mut shown = 0usize;
+            let mut roots = Vec::new();
+            roots
+                .try_reserve(query.roots.len())
+                .map_err(allocation_error)?;
             let mut omitted_nodes = 0usize;
             for root in query.roots {
                 omitted_nodes = omitted_nodes.saturating_add(root.omitted_nodes);
                 let Some(at) = root.root else {
                     continue;
                 };
-                let dto = build_dto(at, &mut emitted, &children);
-                shown += 1;
-                if let Some(group) = groups
-                    .iter_mut()
-                    .find(|group| group.kind == root.kind && group.page == root.page)
-                {
-                    group.blocks.push(dto);
-                } else {
-                    groups.push(RefGroup {
-                        page: root.page,
-                        kind: root.kind,
-                        blocks: vec![dto],
-                        evidence: Vec::new(),
-                    });
-                }
+                let dto = build_dto(at, &mut emitted, &children)?;
+                roots.push(HydratedRoot {
+                    page: root.page,
+                    kind: root.kind,
+                    path: root.path,
+                    block: dto,
+                });
             }
-            QueryExportResult {
+            Ok(HydratedQuery {
                 key: query.key,
-                groups,
-                shown,
+                roots,
                 total: query.total,
                 omitted_nodes,
-            }
+            })
         })
         .collect()
 }
 
 /// One admitted root's DTO tree, assembled on an explicit stack so a deep valid
 /// export cannot overflow the thread stack.
-fn build_dto(root: usize, emitted: &mut [EmittedNode], children: &[Vec<usize>]) -> BlockDto {
+fn build_dto(
+    root: usize,
+    emitted: &mut [EmittedNode],
+    children: &[Vec<usize>],
+) -> Result<BlockDto, ResultReadError> {
     fn take(emitted: &mut [EmittedNode], at: usize) -> BlockDto {
         emitted[at]
             .dto
@@ -973,13 +1075,17 @@ fn build_dto(root: usize, emitted: &mut [EmittedNode], children: &[Vec<usize>]) 
             stack.last_mut().expect("a non-empty assembly stack").1 += 1;
             let child = children[node][next];
             let dto = take(emitted, child);
+            stack.try_reserve(1).map_err(allocation_error)?;
             stack.push((child, 0, dto));
             continue;
         }
         let (_, _, dto) = stack.pop().expect("a non-empty assembly stack");
         match stack.last_mut() {
-            Some(parent) => parent.2.children.push(dto),
-            None => return dto,
+            Some(parent) => {
+                parent.2.children.try_reserve(1).map_err(allocation_error)?;
+                parent.2.children.push(dto);
+            }
+            None => return Ok(dto),
         }
     }
 }

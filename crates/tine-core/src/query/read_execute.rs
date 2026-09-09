@@ -38,6 +38,33 @@ pub(crate) struct SnapshotQueryReader<'a> {
 }
 
 impl<'a> SnapshotQueryReader<'a> {
+    pub(crate) fn run_subtrees(
+        &self,
+        query: &Query,
+        view: &ViewSettings,
+        bounds: Bounds,
+        context: &ExecutionContext,
+    ) -> Result<super::export_execute::SubtreeQueryResult, QueryExecutionError> {
+        self.ensure_current()?;
+        let result = super::export_execute::execute_subtrees_from_ir(
+            &mut self.snapshot.borrow_mut(),
+            query,
+            view,
+            bounds,
+            context,
+            &super::export_execute::SubtreeSelectionInputs {
+                registry: self.inputs.registry,
+                identity: self.inputs.identity,
+                order: self.inputs.order,
+                recency: self.inputs.recency,
+                today: self.inputs.today,
+                fts_ready: self.fts_ready,
+            },
+        )?;
+        self.ensure_current()?;
+        Ok(result)
+    }
+
     pub(crate) fn new(
         snapshot: &'a mut PhysicalProjectionQuerySnapshot,
         inputs: SnapshotQueryInputs<'a>,
@@ -150,6 +177,16 @@ impl<'a> SnapshotQueryReader<'a> {
 }
 
 impl crate::publish::PublicationQueryRead for SnapshotQueryReader<'_> {
+    fn run_subtrees(
+        &self,
+        query: &Query,
+        view: &ViewSettings,
+        bounds: Bounds,
+        context: &ExecutionContext,
+    ) -> Result<super::export_execute::SubtreeQueryResult, QueryExecutionError> {
+        SnapshotQueryReader::run_subtrees(self, query, view, bounds, context)
+    }
+
     fn run(
         &self,
         query: &Query,

@@ -17087,25 +17087,84 @@ impl Graph {
         &self,
         name: &str,
         opts: crate::publish::PrintOpts,
-    ) -> io::Result<Option<String>> {
+    ) -> Result<Option<String>, crate::publish::PrintPreparationError> {
         crate::publish::page_print_html(self, name, opts)
     }
 
     /// Render an actor-owned page DTO without consulting this Graph's parsed
     /// page cache. The Graph supplies only root/config/asset capabilities to the
     /// shared print renderer.
-    pub fn page_print_html_page(
+    pub(crate) fn page_print_html_page(
         &self,
         page: &PageDto,
         opts: crate::publish::PrintOpts,
-    ) -> io::Result<String> {
+        reader: &dyn crate::publish::PublicationQueryRead,
+    ) -> Result<String, crate::publish::PrintPreparationError> {
         let document = Document {
             pre_block: page.pre_block.clone(),
             roots: dto_blocks_to_doc_checked(&page.blocks, matches!(page.format, Format::Org))?,
         };
-        Ok(crate::publish::page_print_html_document(
-            self, &page.name, &document, opts,
-        ))
+        crate::publish::page_print_html_document(self, &page.name, &document, opts, reader)
+    }
+
+    pub(crate) fn with_print_query_reader<T>(
+        &self,
+        render: impl FnOnce(
+            &crate::query::read_execute::SnapshotQueryReader<'_>,
+        ) -> Result<T, crate::publish::PrintPreparationError>,
+    ) -> Result<T, crate::publish::PrintPreparationError> {
+        use crate::query::rank::{JournalRankInput, PageRecencyPrograms};
+        use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
+        use crate::query::results::{BackendOrder, RecencyPage, ResultIdentity};
+        let render = std::cell::RefCell::new(Some(render));
+        let today = crate::date::JournalDate::today();
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_read_job(
+                request,
+                crate::direct_projection::RegistrySensitivity::Required,
+                |job| {
+                    let registry = self.direct_lowering_registry(true, job)?;
+                    let identity = ResultIdentity::DirectStructural {
+                        session_pages: Arc::clone(&job.session_pages),
+                        all_session: false,
+                    };
+                    let recency = |page: RecencyPage<'_>| {
+                        crate::query::page_recency_secs_for(
+                            page.journal_day,
+                            &self.root.join(page.path),
+                        )
+                    };
+                    let root = self.root.clone();
+                    let page_recency = PageRecencyPrograms::new(
+                        JournalRankInput::StoredDay,
+                        |day| {
+                            crate::query::page_recency_secs_for(
+                                day.parse::<i64>().ok(),
+                                Path::new(""),
+                            )
+                        },
+                        move |path| crate::query::page_recency_secs_for(None, &root.join(path)),
+                    );
+                    let reader = SnapshotQueryReader::new(
+                        &mut job.snapshot,
+                        SnapshotQueryInputs {
+                            registry: &registry,
+                            identity: &identity,
+                            order: BackendOrder::Direct,
+                            recency: &recency,
+                            page_recency: &page_recency,
+                            today,
+                        },
+                    )?;
+                    Ok(render
+                        .borrow_mut()
+                        .take()
+                        .expect("Print renderer runs once")(
+                        &reader
+                    ))
+                },
+            )
+        })?
     }
 
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every
