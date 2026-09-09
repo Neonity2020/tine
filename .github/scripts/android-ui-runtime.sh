@@ -117,7 +117,8 @@ methods=(
   responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent \
   longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation \
   initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement \
-  generatedDirectFilesPdfRouteHonorsHardwareBackHistory
+  generatedDirectFilesPdfRouteHonorsHardwareBackHistory \
+  systemBarStripAndIconsAgreeWithTinesOwnThemeNotTheDeviceNightSetting
 )
 if [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "205" ]]; then
   methods=(responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent)

@@ -1044,6 +1044,28 @@ for (const nonVacuousBoundary of [
     `Android UI instrumentation is missing the non-vacuous ${nonVacuousBoundary} boundary`
   );
 }
+// Every @Test in the class must be SELECTED by the runner, or it is a proof
+// that never runs. `ef7a5fcd` added the GH #467 system-bar test and did not add
+// it to `methods=(...)`, so for four days it existed, was believed to guard the
+// fix, and was never executed once -- which is also why the forbidden
+// `ActivityScenario` teardown it contained never crashed anything. Test
+// existence is not coverage; selection is.
+const declaredAndroidUiMethods = [...androidUiRuntimeTest.matchAll(/@Test\s+fun\s+([A-Za-z0-9_]+)\s*\(/g)]
+  .map((match) => match[1]);
+assert.ok(declaredAndroidUiMethods.length > 0, "found no @Test methods in AndroidUiRuntimeTest.kt");
+const selectedAndroidUiMethods = new Set(
+  (androidUiRuntimeScript.match(/methods=\(([\s\S]*?)\)/)?.[1] ?? "")
+    .split(/\s+/)
+    .filter((token) => /^[A-Za-z0-9_]+$/.test(token))
+);
+for (const method of declaredAndroidUiMethods) {
+  assert.ok(
+    selectedAndroidUiMethods.has(method),
+    `AndroidUiRuntimeTest.${method} is never selected: add it to methods=(...) in `
+      + ".github/scripts/android-ui-runtime.sh, or delete the test"
+  );
+}
+
 assert.doesNotMatch(
   androidUiRuntimeTest,
   /scenario\.close\(\)/,
