@@ -1333,6 +1333,38 @@ describe("q3: scoped display settings on an inline query", () => {
     }
   });
 
+  it("q3_scoped_block_presentation_reaches_the_sheet_face", async () => {
+    // FAIL-BEFORE: the scoped presentation was inert for the two faces that are
+    // drawn by a sheet. `sheetFaceFor` asked the SINGULAR `tine.view` whether it
+    // was already a sheet face before it would honour a scoped `board`, so a
+    // note whose Blocks section said `tine.block-view:: board` fell through to
+    // the grouped renderer: the panel said Board and the section kept showing a
+    // list, with nothing on screen or in the file to explain the disagreement.
+    // The presentation is the scoped namespace's own authority (§15.1); what a
+    // sheet face needs from the block is a schema owner, not the other
+    // namespace's opinion.
+    loadFriendly('{{query (search "alpha")}}\ntine.view:: list\ntine.block-display:: 1\ntine.block-view:: board', {
+      form: '(search "alpha")',
+      filter: searchFilter("alpha"),
+      view: { view: "list" },
+      block_presentation: "board",
+      block_display: {},
+    });
+    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue(mixed());
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const blocks = root.querySelector<HTMLElement>('[data-query-result-kind="block"]')!;
+      expect(blocks.querySelector(".sheet-board")).not.toBeNull();
+      // The other family is untouched by it: nothing about the Pages section
+      // asked for a sheet, so it keeps the presentation it inherited.
+      const pages = root.querySelector<HTMLElement>('[data-query-result-kind="page"]')!;
+      expect(pages.querySelector(".sheet-board")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
   it("q3_absent_scope_inherits_and_present_empty_clears", async () => {
     // FAIL-BEFORE: nothing distinguished the two, because nothing read either.
     // `{}` is falsy-shaped in every way that matters, so a truthiness copy of

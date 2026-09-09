@@ -529,22 +529,33 @@ await withApp(0, async (browser) => {
   await waitForProperty(browser, "Scoped", "tine.block-display", "1");
   await waitForProperty(browser, "Scoped", "tine.page-view", "table");
   await closeDisplay(browser);
+  //
+  // The two families draw a board with DIFFERENT renderers, and that is the
+  // product, not an inconsistency: page cards navigate, so the Pages section
+  // uses the shared read-only renderers in `QueryPageResults`; block cards keep
+  // ordinary editing, so an inline query's Blocks section is the sheet board
+  // that owns that editing surface (§15.3). Asserting the Pages renderer's
+  // class on the Blocks section would demand that block results stop being
+  // editable.
   const bothFaces = await browser.execute(() => {
-    // The verdict is the two class names. The rest is here so a failure says
-    // WHICH of the two ways this can go wrong happened: a family that rendered
-    // the wrong face, or a family with no rows to render one for at all.
+    // The verdict is the two faces. The rest is here so a failure says WHICH of
+    // the two ways this can go wrong happened: a family that rendered the wrong
+    // face, or a family with no rows to render one for at all.
     const section = (kind) => document.querySelector(`[data-query-result-kind="${kind}"]`);
     const shown = (kind) => {
       const host = section(kind);
       if (!host) return "no such section";
+      if (host.querySelector(".sheet-board")) return "board";
+      if (host.querySelector(".sheet-table")) return "table";
       for (const face of ["board", "table", "list", "search"]) {
         if (host.querySelector(`.query-results-${face}`)) return face;
       }
+      if (host.querySelector(".query-group")) return "groups";
       return host.querySelector(".query-result-section-empty")?.textContent?.trim() ?? "nothing";
     };
     return {
       page: document.querySelector('[data-query-result-kind="page"] .query-results-table') ? "table" : null,
-      block: document.querySelector('[data-query-result-kind="block"] .query-results-board') ? "board" : null,
+      block: document.querySelector('[data-query-result-kind="block"] .sheet-board') ? "board" : null,
       shows: { page: shown("page"), block: shown("block") },
       counts: {
         page: section("page")?.querySelector(".query-result-section-count")?.textContent?.trim() ?? null,
@@ -621,14 +632,16 @@ await withApp(1, async (browser) => {
   await openPage(browser, "Scoped");
   await browser.$('[data-query-result-kind="block"]').waitForExist({ timeout: 20_000 });
   await browser.waitUntil(
-    async () => (await browser.$$('[data-query-result-kind="block"] .query-results-board')).length === 1,
+    // Same two renderers as above: the Blocks section's board is the editable
+    // sheet board, the Pages section's faces are the read-only ones.
+    async () => (await browser.$$('[data-query-result-kind="block"] .sheet-board')).length === 1,
     { timeout: 15_000, timeoutMsg: "the saved block board did not come back" },
   );
   const scopedAgain = await browser.execute(() => ({
     matchScope: document.querySelector('[data-query-result-kind="page"] .query-page-match select')?.value ?? null,
     pageList: !!document.querySelector('[data-query-result-kind="page"] .query-results-list'),
     pageTable: !!document.querySelector('[data-query-result-kind="page"] .query-results-table'),
-    blockBoard: !!document.querySelector('[data-query-result-kind="block"] .query-results-board'),
+    blockBoard: !!document.querySelector('[data-query-result-kind="block"] .sheet-board'),
     // An empty draft is still a draft, so the way back to inherited is live.
     pageInherit: document.querySelector('[data-query-result-kind="page"] .query-scoped-reset')?.disabled ?? null,
   }));

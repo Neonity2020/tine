@@ -1852,13 +1852,15 @@ export function QueryMacro(props: {
     </>
   );
   /** Whether a presentation can be drawn as the typed SHEET face. It needs a
-   *  block to own the schema and a sheet configuration to read it from; without
-   *  one, a table presentation falls back to the ordinary grouped renderers
-   *  rather than rendering nothing at all (I-10). */
+   *  block to own the schema, and that is ALL it needs: a scoped presentation
+   *  is its own authority (§15.1), so it must not also have to ask the singular
+   *  `tine.view` for permission. Requiring that made `tine.block-view:: board`
+   *  inert — the panel said Board, the section kept rendering grouped rows, and
+   *  neither the screen nor the file said why. A presentation that is not a
+   *  sheet face still falls through to the ordinary grouped renderers rather
+   *  than rendering nothing at all (I-10). */
   const sheetFaceFor = (presentation: QueryView) =>
-    (presentation === "table" || presentation === "board")
-    && !!props.blockId
-    && (sheet()?.view === "table" || sheet()?.view === "board");
+    (presentation === "table" || presentation === "board") && !!props.blockId;
   /** The Blocks family under a SHEET face (table/board), which owns its own
    *  editing surface. The presentation is passed in because a SCOPED block
    *  presentation is not the block's `tine.view` — the sheet config only knows
