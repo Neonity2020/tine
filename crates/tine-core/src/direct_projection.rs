@@ -1561,42 +1561,6 @@ impl DirectProjection {
         Some(names)
     }
 
-    pub(crate) fn fuzzy_candidate_paths(
-        &self,
-        cache_generation: u64,
-        normalized_needle: &str,
-    ) -> Option<std::collections::HashSet<String>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let mut paths = std::collections::HashSet::new();
-        drain_after(
-            |after, batch| {
-                read.fuzzy_subsequence_candidate_pages_after(normalized_needle, after, batch)
-            },
-            |row| row.page_id,
-            |row| {
-                paths.insert(row.path);
-                Ok(())
-            },
-            |_, _| None,
-        )
-        .ok()?;
-        let current = self.ready_at(cache_generation).then_some(paths);
-        #[cfg(test)]
-        if current.is_some() {
-            self.shared
-                .fuzzy_candidate_reads
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        current
-    }
-
     pub(crate) fn page_aliases_with_owners(
         &self,
         cache_generation: u64,
@@ -4772,19 +4736,20 @@ mod tests {
         std::fs::write(root.join("pages/two.md"), "- unrelated content\n").unwrap();
         let graph = Graph::open(&root);
         graph.warm_cache();
-        let oracle = crate::query::search(&graph, "cly", 20);
+        let oracle = crate::query::search_cancellable(&graph, "cly", 20, || false);
         graph
             .attach_direct_projection(root.join("private/projection.sqlite"))
             .unwrap();
         wait_ready(&graph);
 
-        let candidate_pages = graph
-            .direct_projection_fuzzy_candidate_pages("cly")
-            .unwrap();
-        assert_eq!(candidate_pages.len(), 1);
-        assert_eq!(candidate_pages[0].0.rel_path, "pages/one.md");
-        assert_eq!(signature(&graph.search("cly", 20)), signature(&oracle));
-        assert!(graph.direct_projection_fuzzy_candidate_reads_test() > 0);
+        let selected = graph.search("cly", 20).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].page, "one");
+        assert_eq!(
+            signature(&graph.search("cly", 20).unwrap()),
+            signature(&oracle)
+        );
+        assert_eq!(graph.direct_projection_fuzzy_candidate_reads_test(), 0);
         let names = graph
             .referenced_page_names()
             .into_iter()
@@ -4809,7 +4774,10 @@ mod tests {
         let fuzzy_reads = graph.direct_projection_fuzzy_candidate_reads_test();
         let name_reads = graph.direct_projection_referenced_name_reads_test();
         graph.direct_projection_mark_stale_test();
-        assert_eq!(signature(&graph.search("cly", 20)), signature(&oracle));
+        assert_eq!(
+            signature(&graph.search("cly", 20).unwrap()),
+            signature(&oracle)
+        );
         assert_eq!(
             graph
                 .referenced_page_names()
@@ -4839,7 +4807,7 @@ mod tests {
         page.blocks[0].raw = "Nothing matching [[Replacement Page]]".into();
         graph.save_page(&page, baseline.as_deref()).unwrap();
         wait_ready(&graph);
-        assert!(graph.search("cly", 20).is_empty());
+        assert!(graph.search("cly", 20).unwrap().is_empty());
         let names = graph
             .referenced_page_names()
             .into_iter()
@@ -4855,7 +4823,7 @@ mod tests {
         .unwrap();
         graph.sync_file_checked(&root.join("pages/one.md")).unwrap();
         wait_ready(&graph);
-        assert!(!graph.search("ecf", 20).is_empty());
+        assert!(!graph.search("ecf", 20).unwrap().is_empty());
         let names = graph
             .referenced_page_names()
             .into_iter()
@@ -5225,7 +5193,14 @@ mod tests {
         oracle_graph.warm_cache();
         let oracle = cases
             .iter()
-            .map(|(query, limit)| signature(&crate::query::search(&oracle_graph, query, *limit)))
+            .map(|(query, limit)| {
+                signature(&crate::query::search_cancellable(
+                    &oracle_graph,
+                    query,
+                    *limit,
+                    || false,
+                ))
+            })
             .collect::<Vec<_>>();
         let graph = Graph::open(&root);
         graph
@@ -5239,7 +5214,7 @@ mod tests {
         wait_ready(&graph);
         for ((query, limit), expected) in cases.into_iter().zip(oracle) {
             assert_eq!(
-                signature(&graph.search(query, limit)),
+                signature(&graph.search(query, limit).unwrap()),
                 expected,
                 "{query:?}"
             );
@@ -5255,12 +5230,17 @@ mod tests {
         graph.warm_cache();
         wait_ready(&graph);
         assert_eq!(
-            signature(&graph.search("needle", 20)),
-            signature(&crate::query::search(&graph, "needle", 20))
+            signature(&graph.search("needle", 20).unwrap()),
+            signature(&crate::query::search_cancellable(
+                &graph,
+                "needle",
+                20,
+                || false
+            ))
         );
         graph.delete_page("renamed search", PageKind::Page).unwrap();
         wait_ready(&graph);
-        assert!(graph.search("needle", 20).is_empty());
+        assert!(graph.search("needle", 20).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5269,8 +5249,8 @@ mod tests {
     /// created at all is not a reason to walk the graph: the public query route
     /// refuses with a typed `Unavailable(ProjectionUnavailable)`, which is the
     /// bounded signal the frontend surfaces instead of a spinner that never
-    /// ends. The primitives that are NOT part of the query route — search and
-    /// the reference-name inventory — keep their own semantics unchanged, which
+    /// ends. Search shares the typed refusal; the reference-name inventory
+    /// keeps its navigation semantics unchanged, which
     /// is what makes this a query-route claim and not a graph-wide one.
     #[test]
     fn unavailable_projection_refuses_the_public_query_and_keeps_other_semantics() {
@@ -5313,10 +5293,13 @@ mod tests {
             "the refusal must not traverse the graph"
         );
         assert_eq!(graph.direct_projection_indexed_reads_test(), 0);
-        assert_eq!(
-            signature(&graph.search("cly", 20)),
-            signature(&crate::query::search(&graph, "cly", 20))
-        );
+        assert!(!crate::query::search_cancellable(&graph, "cly", 20, || false).is_empty());
+        assert!(matches!(
+            graph.search("cly", 20),
+            Err(crate::query::QueryExecutionError::Unavailable(
+                crate::query::QueryUnavailableReason::ProjectionUnavailable
+            ))
+        ));
         let names = graph
             .referenced_page_names()
             .into_iter()
@@ -5798,10 +5781,11 @@ mod tests {
         let mut fuzzy_oracle = Duration::ZERO;
         for value in ["a", "todo", "http", "2026", "%", "_", "é"] {
             let indexed_started = Instant::now();
-            let indexed_search = graph.search(value, 5_000);
+            let indexed_search = graph.search(value, 5_000).unwrap();
             fuzzy_indexed += indexed_started.elapsed();
             let oracle_started = Instant::now();
-            let oracle_search = crate::query::search(&oracle_graph, value, 5_000);
+            let oracle_search =
+                crate::query::search_cancellable(&oracle_graph, value, 5_000, || false);
             fuzzy_oracle += oracle_started.elapsed();
             assert_eq!(
                 signature(&indexed_search),
@@ -5889,6 +5873,148 @@ mod tests {
     /// exists, and every startup consumer — the dispatched query, aliases,
     /// block-ref counts, the property registry, `list_pages` — answers from
     /// SQL with the cache still absent.
+    fn friendly_committed_fixture(tag: &str) -> Graph {
+        let root = scratch(tag);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Tasks.md"), "- needle\n").unwrap();
+        let database = scratch(&format!("{tag}-db")).join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        std::fs::remove_file(root.join("pages/Tasks.md")).unwrap();
+        graph
+    }
+
+    #[test]
+    fn public_friendly_reads_committed_blocks_without_source_documents() {
+        let _serial = serialize_projection_tests();
+        let graph = friendly_committed_fixture("friendly-current-main");
+        let answer = graph.run_graph_search("needle", 0, 10, false).unwrap();
+        assert_eq!(answer.hits.len(), 1, "read the committed SQLite block");
+        assert!(!graph.has_parsed_cache_test());
+    }
+
+    #[test]
+    fn public_block_search_reads_committed_blocks_without_source_documents() {
+        let _serial = serialize_projection_tests();
+        let graph = friendly_committed_fixture("literal-current-main");
+        let answer = graph.search("needle", 10).unwrap();
+        assert_eq!(answer.len(), 1, "read the committed SQLite group");
+        assert_eq!(answer[0].blocks.len(), 1);
+        assert!(!graph.has_parsed_cache_test());
+    }
+
+    #[test]
+    fn public_friendly_unavailable_is_typed_not_empty() {
+        use crate::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
+        let _serial = serialize_projection_tests();
+        let missing = Graph::open(scratch("friendly-no-projection"));
+        assert!(matches!(
+            missing.run_graph_search("needle", 0, 10, false),
+            Err(QueryExecutionError::Unavailable(
+                QueryUnavailableReason::ProjectionUnavailable
+            ))
+        ));
+        assert!(matches!(
+            missing.search("needle", 10),
+            Err(QueryExecutionError::Unavailable(
+                QueryUnavailableReason::ProjectionUnavailable
+            ))
+        ));
+        let graph = friendly_committed_fixture("friendly-busy");
+        let projection = graph.direct_projection_test().unwrap();
+        let QueryJobOpen::Job(first) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("first job")
+        };
+        let QueryJobOpen::Job(second) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("second job")
+        };
+        assert!(matches!(
+            graph.run_graph_search("needle", 0, 10, false),
+            Err(QueryExecutionError::NotReady(QueryReadinessReason::Busy))
+        ));
+        drop(first);
+        drop(second);
+        assert_eq!(graph.search("needle", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn friendly_latest_lane_cancels_rank_payload_and_ancestor_work() {
+        let _serial = serialize_projection_tests();
+        let graph = Arc::new(friendly_committed_fixture("friendly-rank-supersession"));
+        let newer = Arc::clone(&graph);
+        crate::query::friendly::set_before_friendly_rank_hook(Some(Box::new(move || {
+            assert_eq!(
+                newer.search_latest("shared", "needle", 10).unwrap().len(),
+                1
+            );
+        })));
+        let old = graph
+            .run_graph_search_latest("shared", "needle", 0, 10, false)
+            .unwrap();
+        assert!(old.cancelled);
+        assert!(old.hits.is_empty());
+        let newer = Arc::clone(&graph);
+        crate::query::friendly::set_before_friendly_rank_hook(Some(Box::new(move || {
+            assert_eq!(
+                newer
+                    .run_graph_search_latest("shared", "needle", 0, 10, false)
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+        })));
+        assert!(graph
+            .search_latest("shared", "needle", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            graph
+                .direct_projection_test()
+                .unwrap()
+                .active_query_jobs_test(),
+            0
+        );
+    }
+
+    #[test]
+    fn friendly_independent_lanes_and_edits_do_not_cancel() {
+        let _serial = serialize_projection_tests();
+        let graph = Arc::new(friendly_committed_fixture("friendly-independent-lanes"));
+        let other = Arc::clone(&graph);
+        crate::query::friendly::set_before_friendly_rank_hook(Some(Box::new(move || {
+            assert_eq!(
+                other.search_latest("picker", "needle", 10).unwrap().len(),
+                1
+            );
+        })));
+        let answer = graph
+            .run_graph_search_latest("switcher", "needle", 0, 10, false)
+            .unwrap();
+        assert!(!answer.cancelled);
+        assert_eq!(answer.hits.len(), 1);
+        assert_eq!(
+            graph
+                .direct_projection_test()
+                .unwrap()
+                .active_query_jobs_test(),
+            0
+        );
+    }
+
     #[test]
     fn public_export_reads_committed_subtrees_without_source_documents() {
         let _serial = serialize_projection_tests();

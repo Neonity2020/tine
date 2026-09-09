@@ -2579,7 +2579,7 @@ impl<'a> SqliteMaterializedRead<'a> {
 
     /// Page-level candidates for the legacy ordered-subsequence matcher --
     /// the managed twin of the read Direct Files narrows through in
-    /// `direct_projection::fuzzy_candidate_paths`, over the same
+    /// the shared storage navigation API, over the same
     /// `search_substring_fts` rows and the same
     /// `to_lowercase().nfc()` normalization both writers apply.
     pub fn fuzzy_subsequence_candidate_pages_after(

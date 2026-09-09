@@ -4555,13 +4555,18 @@ fn sort_key(b: &BlockDto, page: &str, field: &str) -> String {
 /// Literal fuzzy full-text autocomplete for the `((` block picker, grouped by
 /// page and capped at `limit` total blocks. Ctrl-K uses `run_graph_search*` and
 /// retains the shared search dialect through `QueryPlan::friendly*`.
-pub fn search(graph: &Graph, query: &str, limit: usize) -> Vec<RefGroup> {
-    search_cancellable(graph, query, limit, || false)
+pub fn search(
+    graph: &Graph,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<RefGroup>, QueryExecutionError> {
+    graph.search(query, limit)
 }
 
 /// Search with cooperative cancellation for interactive callers. The cheap
 /// callback is checked before each block projection, so a superseded rare-prefix
 /// scan does not finish walking a huge page in the background.
+#[cfg(test)]
 pub fn search_cancellable(
     graph: &Graph,
     query: &str,
@@ -5163,9 +5168,13 @@ fn finish_quick_switch_top(
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
 pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> {
-    let plan = crate::query_plan::QueryPlan::legacy_page_search(query, limit);
-    let execution = plan.execute(graph, || false);
-    crate::query_plan::page_hits_to_entries(execution.hits)
+    crate::query_plan::legacy_page_search_entries(
+        graph.list_pages(),
+        graph.page_aliases_with_owners(),
+        graph.referenced_page_names(),
+        query,
+        limit,
+    )
 }
 
 /// Resolve a `((uuid))` block reference to a shallow identity/result row.
@@ -7380,7 +7389,7 @@ mod tests {
     }
 
     fn search_block_texts(graph: &Graph, query: &str, limit: usize) -> Vec<String> {
-        search(graph, query, limit)
+        search_cancellable(graph, query, limit, || false)
             .into_iter()
             .flat_map(|group| group.blocks.into_iter().map(|block| block.raw))
             .collect()
@@ -7481,27 +7490,42 @@ mod tests {
             "- foo safe\n- foo x excluded\n- bar safe\n- unrelated\n",
         )]);
 
-        let or_hits = graph_search_block_texts(graph.run_graph_search("foo OR bar", 8, 8, false));
+        let or_hits = graph_search_block_texts(
+            crate::query_plan::QueryPlan::friendly("foo OR bar", 8, 8).execute_with_explain(
+                &graph,
+                || false,
+                false,
+            ),
+        );
         assert!(or_hits.iter().any(|text| text == "foo safe"));
         assert!(or_hits.iter().any(|text| text == "bar safe"));
         assert!(!or_hits.iter().any(|text| text == "unrelated"));
 
-        let excluded = graph_search_block_texts(graph.run_graph_search("foo -x", 8, 8, false));
+        let excluded = graph_search_block_texts(
+            crate::query_plan::QueryPlan::friendly("foo -x", 8, 8).execute_with_explain(
+                &graph,
+                || false,
+                false,
+            ),
+        );
         assert_eq!(excluded, ["foo safe"]);
-        assert!(graph.run_graph_search("-x", 8, 8, false).hits.is_empty());
+        assert!(crate::query_plan::QueryPlan::friendly("-x", 8, 8)
+            .execute_with_explain(&graph, || false, false)
+            .hits
+            .is_empty());
 
-        let scoped = graph_search_block_texts(graph.run_graph_search_latest_scoped(
-            "ctrlk-dsl-current-page",
-            "foo -x",
-            8,
-            8,
-            Some(crate::query_plan::QueryPageScope {
-                name: "Search".into(),
-                page_kind: PageKind::Page,
-                path: Some("pages/search.md".into()),
-            }),
-            false,
-        ));
+        let scoped = graph_search_block_texts(
+            crate::query_plan::QueryPlan::friendly_for_page(
+                "foo -x",
+                8,
+                crate::query_plan::QueryPageScope {
+                    name: "Search".into(),
+                    page_kind: PageKind::Page,
+                    path: Some("pages/search.md".into()),
+                },
+            )
+            .execute_with_explain(&graph, || false, false),
+        );
         assert_eq!(scoped, ["foo safe"]);
     }
 
@@ -7614,7 +7638,7 @@ mod tests {
 
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let ranked = search(&graph, "needle", 2)
+        let ranked = search_cancellable(&graph, "needle", 2, || false)
             .into_iter()
             .flat_map(|group| {
                 group
@@ -7652,7 +7676,7 @@ mod tests {
 
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let pages = search(&graph, "needle", 3)
+        let pages = search_cancellable(&graph, "needle", 3, || false)
             .into_iter()
             .flat_map(|group| std::iter::repeat_n(group.page, group.blocks.len()))
             .collect::<Vec<_>>();
@@ -7681,7 +7705,7 @@ mod tests {
             .collect();
         let graph = Graph::from_page_snapshot("", pages);
 
-        let pages = search(&graph, "needle", 3)
+        let pages = search_cancellable(&graph, "needle", 3, || false)
             .into_iter()
             .flat_map(|group| std::iter::repeat_n(group.page, group.blocks.len()))
             .collect::<Vec<_>>();
@@ -7705,7 +7729,7 @@ mod tests {
 
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let groups = search(&graph, "needle", 3);
+        let groups = search_cancellable(&graph, "needle", 3, || false);
         assert_eq!(
             groups
                 .iter()

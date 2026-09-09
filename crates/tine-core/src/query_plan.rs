@@ -278,6 +278,7 @@ pub struct QueryExecution {
 /// cached `Arc<Document>` Direct Files walks: retaining it here is what lets
 /// the shared evaluator hold `&DocBlock` winners and defer evidence/DTO
 /// construction until the heap is drained, exactly as the Direct path does.
+#[cfg(test)]
 pub(crate) struct ApplicationQueryPlanPage {
     pub(crate) entry: PageEntry,
     pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
@@ -481,10 +482,12 @@ impl QueryPlan {
 
     /// Execute all graph-backed branches.  Cancellation is checked between page
     /// candidates and before every block projection; no partial result escapes.
+    #[cfg(test)]
     pub fn execute(&self, graph: &Graph, cancelled: impl Fn() -> bool) -> QueryExecution {
         self.execute_with_explain(graph, cancelled, true)
     }
 
+    #[cfg(test)]
     pub fn execute_with_explain(
         &self,
         graph: &Graph,
@@ -535,6 +538,7 @@ impl QueryPlan {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_application_with_explain(
         &self,
         file_pages: Vec<PageEntry>,
@@ -1196,6 +1200,7 @@ pub(crate) fn admitted_block_evidence(
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct ScoredBlock<'a> {
     relevance: BlockRelevance,
     index: usize,
@@ -1204,6 +1209,7 @@ struct ScoredBlock<'a> {
     breadcrumb: Vec<String>,
 }
 
+#[cfg(test)]
 impl ScoredBlock<'_> {
     fn is_better_than(&self, other: &Self) -> bool {
         let quality = self.relevance.cmp_quality(&other.relevance);
@@ -1214,6 +1220,7 @@ impl ScoredBlock<'_> {
     }
 }
 
+#[cfg(test)]
 impl PartialEq for ScoredBlock<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.relevance.cmp_quality(&other.relevance) == Ordering::Equal
@@ -1221,12 +1228,15 @@ impl PartialEq for ScoredBlock<'_> {
                 == (other.page.rel_path.as_str(), other.index)
     }
 }
+#[cfg(test)]
 impl Eq for ScoredBlock<'_> {}
+#[cfg(test)]
 impl PartialOrd for ScoredBlock<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
+#[cfg(test)]
 impl Ord for ScoredBlock<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Max-heap root is the WORST retained candidate, ready for eviction.
@@ -1237,6 +1247,7 @@ impl Ord for ScoredBlock<'_> {
     }
 }
 
+#[cfg(test)]
 fn push_block<'a>(
     heap: &mut BinaryHeap<ScoredBlock<'a>>,
     limit: usize,
@@ -1654,6 +1665,7 @@ fn best_page_match(
     best.map(|(rank, text, alias)| (rank.base_score, rank.match_class, text, alias))
 }
 
+#[cfg(test)]
 fn execute_pages(
     plan: &QueryPlan,
     graph: &Graph,
@@ -1810,6 +1822,7 @@ pub(crate) fn legacy_page_search_entries(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn walk_blocks<'a>(
     blocks: &'a [DocBlock],
     ancestors: &mut Vec<&'a DocBlock>,
@@ -1846,6 +1859,7 @@ fn walk_blocks<'a>(
 /// Generic, not `dyn`: monomorphization keeps each caller's walk exactly the
 /// code it would have written by hand -- no per-block allocation, no indirect
 /// call inside the block walk.
+#[cfg(test)]
 fn execute_block_candidates<'a, I>(
     plan: &QueryPlan,
     pages: I,
@@ -1955,6 +1969,7 @@ where
     ))
 }
 
+#[cfg(test)]
 fn execute_blocks(
     plan: &QueryPlan,
     graph: &Graph,
@@ -1964,9 +1979,6 @@ fn execute_blocks(
     if branch.limit == 0 {
         return Some((Vec::new(), false));
     }
-    let candidate_pages = branch
-        .fuzzy_visible_content_needle()
-        .and_then(|needle| graph.direct_projection_fuzzy_candidate_pages(needle));
     let execute = |pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)]| {
         execute_block_candidates(
             plan,
@@ -1977,12 +1989,10 @@ fn execute_blocks(
             cancelled,
         )
     };
-    match candidate_pages.as_deref() {
-        Some(pages) => execute(pages),
-        None => graph.with_pages(execute),
-    }
+    graph.with_pages(execute)
 }
 
+#[cfg(test)]
 fn execute_application_blocks(
     plan: &QueryPlan,
     pages: &[ApplicationQueryPlanPage],
@@ -2261,15 +2271,21 @@ mod tests {
     fn graph_search_reports_per_category_truncation() {
         let (dir, graph) = fixture();
 
-        let page_truncated = graph.run_graph_search("opdf", 2, 1, false);
+        let page_truncated = crate::query_plan::QueryPlan::friendly("opdf", 2, 1)
+            .execute_with_explain(&graph, || false, false);
         assert!(page_truncated.has_more.pages);
         assert!(!page_truncated.has_more.blocks);
 
-        let block_truncated = graph.run_graph_search("foo", 10, 1, false);
+        let block_truncated = crate::query_plan::QueryPlan::friendly("foo", 10, 1)
+            .execute_with_explain(&graph, || false, false);
         assert!(!block_truncated.has_more.pages);
         assert!(block_truncated.has_more.blocks);
 
-        let complete = graph.run_graph_search("foo", 10, 10, false);
+        let complete = crate::query_plan::QueryPlan::friendly("foo", 10, 10).execute_with_explain(
+            &graph,
+            || false,
+            false,
+        );
         assert!(!complete.has_more.pages);
         assert!(!complete.has_more.blocks);
 
@@ -2499,8 +2515,8 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
 
-        let alias_hits = graph
-            .run_graph_search("bar", 10, 0, false)
+        let alias_hits = crate::query_plan::QueryPlan::friendly("bar", 10, 0)
+            .execute_with_explain(&graph, || false, false)
             .hits
             .into_iter()
             .filter_map(|hit| match hit {
@@ -2524,8 +2540,8 @@ mod tests {
             "a duplicate-named sibling must not inherit another file's alias"
         );
 
-        let unique_hits = graph
-            .run_graph_search("quux", 10, 0, false)
+        let unique_hits = crate::query_plan::QueryPlan::friendly("quux", 10, 0)
+            .execute_with_explain(&graph, || false, false)
             .hits
             .into_iter()
             .filter_map(|hit| match hit {
@@ -2591,19 +2607,20 @@ mod tests {
         graph.warm_cache();
 
         for query in ["book", "BOOK", "Book", "reading"] {
-            let page_hits: Vec<(String, String, Option<String>)> = graph
-                .run_graph_search(query, 100, 0, false)
-                .hits
-                .into_iter()
-                .filter_map(|hit| match hit {
-                    QueryHit::Page {
-                        page,
-                        matched_alias,
-                        ..
-                    } => Some((page.name, page.rel_path, matched_alias)),
-                    QueryHit::Block { .. } => None,
-                })
-                .collect();
+            let page_hits: Vec<(String, String, Option<String>)> =
+                crate::query_plan::QueryPlan::friendly(query, 100, 0)
+                    .execute_with_explain(&graph, || false, false)
+                    .hits
+                    .into_iter()
+                    .filter_map(|hit| match hit {
+                        QueryHit::Page {
+                            page,
+                            matched_alias,
+                            ..
+                        } => Some((page.name, page.rel_path, matched_alias)),
+                        QueryHit::Block { .. } => None,
+                    })
+                    .collect();
             // The exact invariant: an alias's folded text must never be a
             // path-less (referenced/virtual) page candidate. Unrelated
             // referenced pages (e.g. "Book Shelf") MAY appear — they are real.
@@ -2633,8 +2650,8 @@ mod tests {
                 );
             }
             // A genuinely unrelated referenced page is NOT affected.
-            let shelf: Vec<String> = graph
-                .run_graph_search("Book Shelf", 100, 0, false)
+            let shelf: Vec<String> = crate::query_plan::QueryPlan::friendly("Book Shelf", 100, 0)
+                .execute_with_explain(&graph, || false, false)
                 .hits
                 .into_iter()
                 .filter_map(|hit| match hit {
@@ -2756,7 +2773,8 @@ mod tests {
         });
         assert_eq!(virtual_hit.unwrap().rel_path, "");
 
-        let execution = graph.run_graph_search("foo -draft OR ready", 10, 10, true);
+        let execution = crate::query_plan::QueryPlan::friendly("foo -draft OR ready", 10, 10)
+            .execute_with_explain(&graph, || false, true);
         let blocks = execution
             .hits
             .iter()
@@ -2785,7 +2803,8 @@ mod tests {
         assert!(!explanation.contains("PageName"));
         assert!(!explanation.contains("VisibleContent"));
 
-        let no_explain = graph.run_graph_search("foo", 10, 10, false);
+        let no_explain = crate::query_plan::QueryPlan::friendly("foo", 10, 10)
+            .execute_with_explain(&graph, || false, false);
         assert!(no_explain.explanation.branches.is_empty());
         crate::test_support::remove_dir_all(dir);
     }
@@ -2857,7 +2876,8 @@ mod tests {
     #[test]
     fn regex_evidence_is_authoritative_and_bounded_to_projected_text() {
         let (dir, graph) = fixture();
-        let execution = graph.run_graph_search("/[A-Z]{3}/", 10, 10, true);
+        let execution = crate::query_plan::QueryPlan::friendly("/[A-Z]{3}/", 10, 10)
+            .execute_with_explain(&graph, || false, true);
         let (text, evidence) = execution
             .hits
             .iter()
@@ -2889,7 +2909,12 @@ mod tests {
             "/[A-Z]{3}/",
             "/(unclosed/",
         ] {
-            let full = block_fingerprint(crate::query::search(&graph, query, usize::MAX));
+            let full = block_fingerprint(crate::query::search_cancellable(
+                &graph,
+                query,
+                usize::MAX,
+                || false,
+            ));
             let mut full_membership = full.clone();
             full_membership.sort();
             let mut reference = reference_literal_search(&graph, query, usize::MAX);
@@ -2897,7 +2922,12 @@ mod tests {
             assert_eq!(full_membership, reference, "query={query:?}");
             for limit in [0, 1, 2, 20] {
                 assert_eq!(
-                    block_fingerprint(crate::query::search(&graph, query, limit)),
+                    block_fingerprint(crate::query::search_cancellable(
+                        &graph,
+                        query,
+                        limit,
+                        || false
+                    )),
                     full.iter().take(limit).cloned().collect::<Vec<_>>(),
                     "query={query:?} limit={limit}"
                 );

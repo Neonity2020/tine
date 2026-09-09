@@ -1690,6 +1690,32 @@ mod tests {
         );
     }
 
+    /// The Guide must document that search can be still catching up, because
+    /// that is the one moment a user sees an answer that is not simply "here is
+    /// what matched". A changelog entry is not user documentation, so this is
+    /// the assertion that fails if the page and the product drift apart.
+    #[test]
+    fn the_search_guide_page_documents_the_indexing_and_retry_states() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|p| p.title == "Reference/Pages, links, references, and search")
+            .expect("the search reference page is part of the Guide")
+            .markdown;
+        for phrase in [
+            "still being built",
+            "says it is searching",
+            "Retry",
+            "nothing matched",
+        ] {
+            assert!(
+                page.contains(phrase),
+                "the search Guide page no longer documents {phrase:?}; the switcher \
+                 shows a pending state and a retry affordance, and the Guide is where \
+                 a user learns that an empty list is not the same as an unavailable one"
+            );
+        }
+    }
+
     #[test]
     fn copied_guide_pages_are_owned_for_native_watcher_echoes() {
         let dir = scratch("tine-guide-watcher-receipts");

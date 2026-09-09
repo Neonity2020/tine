@@ -3254,7 +3254,11 @@ fn search_cache_isolates_one_page_projection_panic() {
     let sibling_path = sibling.rel_path.clone();
     let bad_path = bad.rel_path.clone();
 
-    let execution = g.run_graph_search(needle, 0, 8, false);
+    let execution = crate::query_plan::QueryPlan::friendly(needle, 0, 8).execute_with_explain(
+        &g,
+        || false,
+        false,
+    );
     assert!(
         execution.hits.iter().any(|hit| matches!(
             hit,
@@ -3269,8 +3273,8 @@ fn search_cache_isolates_one_page_projection_panic() {
     g.invalidate_cache();
     assert!(g.page_index_failures().is_empty());
     g.warm_cache();
-    assert!(g
-        .run_graph_search(needle, 0, 8, false)
+    assert!(crate::query_plan::QueryPlan::friendly(needle, 0, 8)
+        .execute_with_explain(&g, || false, false)
         .hits
         .iter()
         .any(|hit| matches!(
@@ -5256,7 +5260,7 @@ fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
     fs::write(&future, future_bytes).unwrap();
     fs::write(dir.join("journals/15-07-2030.md"), "- today sentinel\n").unwrap();
     fs::write(dir.join("journals/14-07-2030.md"), "- past sentinel\n").unwrap();
-    let g = Graph::open(&dir);
+    let g = ready_graph(&dir);
     let future_title = "Wednesday, 17-07-2030";
     assert_eq!(
         g.journals_desc().len(),
@@ -5300,12 +5304,13 @@ fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
     // deliberately separate from the filtered Journals feed.
     assert!(g
         .run_graph_search_latest("future-feed-test", future_title, 8, 8, false)
+        .unwrap()
         .hits
         .iter()
         .any(|hit| matches!(hit,
             crate::query_plan::QueryHit::Page { page, .. } if page.path == future
         )));
-    assert!(!g.search("future-search-sentinel", 8).is_empty());
+    assert!(!g.search("future-search-sentinel", 8).unwrap().is_empty());
     assert_eq!(g.path_for(future_title, PageKind::Journal), future);
     assert_eq!(
         g.page_source_file(future_title, PageKind::Journal, None)
@@ -5334,6 +5339,7 @@ fn future_journals_are_feed_only_excluded_but_keep_raw_identity() {
     );
     assert!(g
         .run_graph_search_latest("future-feed-test", future_title, 8, 8, false)
+        .unwrap()
         .hits
         .iter()
         .any(|hit| matches!(hit,
@@ -16495,7 +16501,7 @@ fn nested_page_is_listed_openable_by_name_and_searchable() {
         "- nestedsentinel body\n",
     )
     .unwrap();
-    let g = Graph::open(&dir);
+    let g = ready_graph(&dir);
     g.warm_cache();
 
     // Listed by basename, carrying its nested path.
@@ -16518,7 +16524,7 @@ fn nested_page_is_listed_openable_by_name_and_searchable() {
 
     // Indexed for full-text search (the cache folded it in via list_pages).
     assert!(
-        !g.search("nestedsentinel", 10).is_empty(),
+        !g.search("nestedsentinel", 10).unwrap().is_empty(),
         "nested page is searchable"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -16610,7 +16616,7 @@ fn warmed_duplicate_name_cache_keeps_physical_owners_distinct() {
     fs::write(&flat, "- flat original sentinel\n").unwrap();
     fs::write(&nested, "- nested original sentinel\n").unwrap();
 
-    let g = Graph::open(&dir);
+    let g = ready_graph(&dir);
     g.warm_cache();
     let logical_winner = g
         .find_entry("Exact Storage Twin", PageKind::Page)
@@ -16676,6 +16682,7 @@ fn warmed_duplicate_name_cache_keeps_physical_owners_distinct() {
     ] {
         assert!(
             g.run_graph_search(needle, 0, 8, false)
+                .unwrap()
                 .hits
                 .iter()
                 .any(|hit| matches!(

@@ -27042,7 +27042,7 @@ fn managed_query_search_manual_receipt(
     let regex_all = "(content-regex \".*\")";
     let graph_search_source = "query-density-page";
 
-    let direct = Graph::open(&fixture.graph_root);
+    let direct = open_ready_direct_oracle(fixture);
     let total_pages = direct.list_pages().len();
     assert!(total_pages > 0, "{label} fixture has no pages");
     let direct_indexed = direct_oracle_answer(crate::query::run_query_bounded(
@@ -27051,7 +27051,9 @@ fn managed_query_search_manual_receipt(
     let direct_regex_all = direct_oracle_answer(crate::query::run_query_bounded(
         &direct, regex_all, MAX_ROWS, MAX_BYTES,
     ));
-    let direct_graph_search = direct.run_graph_search(graph_search_source, 0, MAX_ROWS, false);
+    let direct_graph_search = direct
+        .run_graph_search(graph_search_source, 0, MAX_ROWS, false)
+        .unwrap();
     if let Some(expected_total_pages) = expected_total_pages {
         assert_eq!(
             total_pages, expected_total_pages,
@@ -27268,22 +27270,29 @@ fn managed_query_search_manual_receipt(
                 serde_json::to_value(expected).unwrap(),
                 "managed graph search diverged from parser-owned Direct Files semantics: {label} sample={sample}"
             );
+        // These four counters used to assert the OLD cost model: one inventory
+        // pass over every page, and one hydration per page, per graph search.
+        // Q1 routes managed graph search through the shared Friendly reader,
+        // which answers from the projection, so the correct receipt is now that
+        // NONE of that work happens. The parity assertion directly above is
+        // what keeps this honest: the answer is unchanged, and it is produced
+        // without inventorying or hydrating anything.
         assert_eq!(
-            counters.block_branches, 1,
-            "the graph-search receipt must exercise its block branch: {counters:?}"
+            counters.block_branches, 0,
+            "managed graph search must not run the retired block branch: {counters:?}"
         );
         assert_eq!(
-            counters.full_inventory_passes, 1,
-            "graph search must make exactly one inventory pass: {counters:?}"
+            counters.full_inventory_passes, 0,
+            "managed graph search must not walk the page inventory: {counters:?}"
         );
         assert_eq!(
-            counters.inventory_pages, total_pages,
-            "graph-search inventory did not cover each page exactly once: {counters:?}"
+            counters.inventory_pages, 0,
+            "managed graph search must visit no inventory row: {counters:?}"
         );
         assert_eq!(
-                counters.result_page_hydrations, total_pages,
-                "graph block search must hydrate every inventoried page as a query result exactly once: {counters:?}"
-            );
+            counters.result_page_hydrations, 0,
+            "managed graph search must hydrate no page: {counters:?}"
+        );
         graph_search_samples.push(elapsed);
         graph_search_counters.push(counters);
     }
@@ -27364,128 +27373,185 @@ fn managed_query_search_manual_receipt(
 }
 
 #[test]
-fn managed_graph_search_accounts_for_pending_overlay_metadata_separately() {
-    const TOTAL_PAGES: usize = 16;
-    const MAX_ROWS: usize = 20_000;
-    let fixture = ActivationFixture::scaled_query_candidate_density(
-        "managed-query-search-overlay-accounting",
-        0xa2f3,
-        TOTAL_PAGES,
-        4,
-    );
-    let overlay_path = Graph::open(&fixture.graph_root)
+fn managed_friendly_reads_main_while_pending_then_follows_drain() {
+    let fixture =
+        ActivationFixture::scaled_query_candidate_density("managed-friendly-main", 0xa2f3, 16, 4);
+    let handle = open_reopened_managed_actor(&fixture);
+    let capture = || {
+        let graph = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::GraphSearch {
+                source: "query-density-page".into(),
+                page_limit: 0,
+                block_limit: 20_000,
+                lane: Some("friendly-main".into()),
+                explain: false,
+                scope: None,
+            },
+        );
+        let blocks = c7b_navigation(
+            &handle,
+            SyncApplicationNavigationRequest::BlockSearch {
+                query: "query-density-page".into(),
+                limit: 20_000,
+                lane: Some("friendly-main".into()),
+            },
+        );
+        (graph, blocks)
+    };
+    let before = capture();
+    let SyncApplicationNavigationReply::GraphSearch(answer) = &before.0 else {
+        panic!("graph reply")
+    };
+    assert_eq!(answer.hits.len(), 16);
+    let path = Graph::open(&fixture.graph_root)
         .list_pages()
         .into_iter()
         .next()
-        .expect("overlay fixture must contain pages")
+        .unwrap()
         .rel_path;
-
-    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-    let activation_handle = activated.handle.expect("activation retains its actor");
-    drive_initial_feed(&activation_handle);
-    assert!(matches!(
-        activation_handle.clean_shutdown(),
-        Ok(SyncShutdownOutcome::Safe(_))
-    ));
-    drop(activation_handle);
-
-    let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-    assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
-    let handle = opened.handle.expect("managed reopen retains its actor");
-    let (mut page, revision) = load_application_exact(&handle, &overlay_path);
-    let original_raw = page.blocks[0].raw.clone();
-    let edited_raw = format!("{original_raw} active-overlay-edit");
-    page.blocks[0].raw = edited_raw.clone();
-    let save = handle
+    let (mut page, revision) = load_application_exact(&handle, &path);
+    let edited = format!("{} active-overlay-edit", page.blocks[0].raw);
+    page.blocks[0].raw = edited.clone();
+    let saved = handle
         .save_application_page(SyncApplicationPageSaveRequest {
             target: SyncApplicationPageSaveTarget::Existing {
                 path: page.path.clone(),
-                revision: revision.clone(),
+                revision,
             },
             page,
         })
         .unwrap();
-    let SyncApplicationPageSaveOutcome::Saved {
-        page: saved_page,
-        revision: saved_revision,
-        ..
-    } = save
-    else {
-        panic!("the overlay fixture edit was not accepted as a changed save: {save:?}")
+    let SyncApplicationPageSaveOutcome::Saved { page, .. } = saved else {
+        panic!("save")
     };
-    assert_eq!(saved_page.blocks[0].raw, edited_raw);
-    assert_ne!(
-        saved_revision, revision,
-        "the overlay fixture must advance the page revision"
-    );
-    assert_eq!(
-        handle.status().unwrap().managed_local_pending,
-        1,
-        "the query must run with a real, undrained local overlay"
-    );
-    let direct = Graph::open(&fixture.graph_root);
-    let mut expected = direct.run_graph_search("query-density-page", 0, MAX_ROWS, false);
-    assert_eq!(
-        expected
-            .hits
-            .iter()
-            .filter(|hit| matches!(hit, crate::query_plan::QueryHit::Block { .. }))
-            .count(),
-        TOTAL_PAGES,
-        "the changed direct-file fixture must retain one matching block per page"
-    );
-
+    assert_eq!(page.blocks[0].raw, edited);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
     handle
         .reset_managed_application_query_instrumentation()
         .unwrap();
-    let outcome = handle
-        .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
+    let pending = capture();
+    assert_eq!(
+        serde_json::to_value(&pending).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+    let counters = handle.managed_application_query_instrumentation().unwrap();
+    assert_eq!(counters.full_inventory_passes, 0);
+    assert_eq!(counters.inventory_pages, 0);
+    assert_eq!(counters.result_page_hydrations, 0);
+    assert_eq!(counters.metadata_page_hydrations, 0);
+    drain_managed_local(&handle);
+    let after = capture();
+    assert_ne!(
+        serde_json::to_value(&after.0).unwrap(),
+        serde_json::to_value(&before.0).unwrap()
+    );
+    assert_ne!(
+        serde_json::to_value(&after.1).unwrap(),
+        serde_json::to_value(&before.1).unwrap()
+    );
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
+fn managed_friendly_selection_releases_actor_operation() {
+    let fixture =
+        ActivationFixture::scaled_query_candidate_density("managed-friendly-actor", 0xa2f4, 4, 4);
+    let handle = open_reopened_managed_actor(&fixture);
+    let path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .next()
+        .unwrap()
+        .rel_path;
+    let edit_handle = handle.clone();
+    crate::query::friendly::set_before_friendly_rank_hook(Some(Box::new(move || {
+        let (mut page, revision) = load_application_exact(&edit_handle, &path);
+        page.blocks[0].raw.push_str(" edited-during-selection");
+        assert!(matches!(
+            edit_handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: page.path.clone(),
+                        revision
+                    },
+                    page,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+    })));
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let answer = c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::GraphSearch {
             source: "query-density-page".into(),
             page_limit: 0,
-            block_limit: MAX_ROWS,
-            lane: Some("overlay-accounting".into()),
+            block_limit: 100,
+            lane: None,
             explain: false,
             scope: None,
-        })
-        .unwrap();
-    let SyncApplicationNavigationOutcome::Loaded {
-        reply: SyncApplicationNavigationReply::GraphSearch(mut actual),
-    } = outcome
-    else {
-        panic!("managed graph search returned the wrong outcome: {outcome:?}")
+        },
+    );
+    let SyncApplicationNavigationReply::GraphSearch(answer) = answer else {
+        panic!("graph reply")
     };
-    canonicalize_graph_search_for_mode_differential(&mut actual);
-    canonicalize_graph_search_for_mode_differential(&mut expected);
+    assert_eq!(answer.hits.len(), 4);
+    assert!(answer.hits.iter().all(|hit| match hit {
+        crate::query_plan::QueryHit::Block { display_text, .. } =>
+            !display_text.contains("edited-during-selection"),
+        _ => false,
+    }));
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+    // No counter assertion on the run above, deliberately. The hook injects a
+    // real `save_application_page` INSIDE the query, and the save does its own
+    // page work, which lands in the same counters because they cannot be reset
+    // mid-query — so a zero there would be asserting something about the save,
+    // not about the search. What that run proves is what it is named for: the
+    // answer excludes the concurrent edit, and the actor operation was released
+    // rather than held across selection. The zero-work claim belongs to an
+    // uncontended run, so drop the hook and repeat the identical search.
+    crate::query::friendly::set_before_friendly_rank_hook(None);
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
+    let quiet = c7b_navigation(
+        &handle,
+        SyncApplicationNavigationRequest::GraphSearch {
+            source: "query-density-page".into(),
+            page_limit: 0,
+            block_limit: 100,
+            lane: None,
+            explain: false,
+            scope: None,
+        },
+    );
+    let SyncApplicationNavigationReply::GraphSearch(quiet) = quiet else {
+        panic!("graph reply")
+    };
+    assert_eq!(quiet.hits.len(), 4);
+    let quiet_counters = handle.managed_application_query_instrumentation().unwrap();
     assert_eq!(
-        serde_json::to_value(actual).unwrap(),
-        serde_json::to_value(expected).unwrap(),
-        "the active-overlay graph search must retain Direct Files semantics"
+        quiet_counters.full_inventory_passes, 0,
+        "{quiet_counters:?}"
+    );
+    assert_eq!(
+        quiet_counters.result_page_hydrations, 0,
+        "{quiet_counters:?}"
+    );
+    assert_eq!(
+        quiet_counters.metadata_page_hydrations, 0,
+        "an uncontended managed search must hydrate no page metadata: {quiet_counters:?}"
     );
 
-    let counters = handle.managed_application_query_instrumentation().unwrap();
-    assert_eq!(
-        counters.full_inventory_passes, 1,
-        "graph search must keep its one full inventory pass: {counters:?}"
-    );
-    assert_eq!(
-        counters.inventory_pages, TOTAL_PAGES,
-        "graph search must inventory each fixture page once: {counters:?}"
-    );
-    assert_eq!(
-        counters.block_branches, 1,
-        "the receipt must execute graph search's block branch: {counters:?}"
-    );
-    assert_eq!(
-            counters.result_page_hydrations, TOTAL_PAGES,
-            "every graph-search result page must be hydrated exactly once, independent of metadata work: {counters:?}"
-        );
-    assert!(
-            counters.metadata_page_hydrations > 0,
-            "the active overlay must make metadata/context hydration observable instead of hiding it in result work: {counters:?}"
-        );
-
-    drain_managed_local(&handle);
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
@@ -27766,6 +27832,35 @@ fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
 /// that the ordered-subsequence index can genuinely narrow to a single
 /// page, and enough repeated rows for a byte budget to cut both inside a
 /// page and between pages.
+/// Open the Direct oracle graph for a mode-parity test, with its disposable
+/// projection attached and warm.
+///
+/// Every Direct read here answers from the projection, so a bare `Graph::open`
+/// returns `Unavailable(ProjectionUnavailable)` and proves nothing about
+/// parity. There is one implementation of this wait on purpose: a second
+/// hand-rolled readiness loop is the twin D-14 forbids, and each copy would
+/// have to be corrected separately when the readiness signal changes.
+fn open_ready_direct_oracle_tagged(fixture: &ActivationFixture, tag: &str) -> Graph {
+    let direct = Graph::open(&fixture.graph_root);
+    direct
+        .attach_direct_projection(fixture.root.join(format!("direct-oracle-{tag}.sqlite")))
+        .unwrap();
+    direct.warm_cache();
+    let started = std::time::Instant::now();
+    while !direct.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the Direct oracle projection never became ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    direct
+}
+
+fn open_ready_direct_oracle(fixture: &ActivationFixture) -> Graph {
+    open_ready_direct_oracle_tagged(fixture, "default")
+}
+
 fn mode_differential_fixture(label: &str, seed: u128) -> ActivationFixture {
     let fixture = ActivationFixture::empty(label, seed);
     let directory = fixture.graph_root.join("notes/differential");
@@ -27986,14 +28081,16 @@ fn assert_managed_block_groups_match_direct(
 #[test]
 fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
     let fixture = mode_differential_fixture("mode-differential-evaluator", 0xa3f8);
-    let direct = Graph::open(&fixture.graph_root);
+    let direct = open_ready_direct_oracle(&fixture);
     let handle = open_reopened_managed_actor(&fixture);
 
     // 1. Plain-text whole-graph search: page branch plus block branch.
     assert_managed_graph_search_matches_direct(
         "plain text graph search",
         managed_graph_search(&handle, "differential needle", 5, 50),
-        direct.run_graph_search("differential needle", 5, 50, false),
+        direct
+            .run_graph_search("differential needle", 5, 50, false)
+            .unwrap(),
     );
 
     // 2. Literal fuzzy search -- the `((` block picker. `zqx` occurs on
@@ -28006,20 +28103,25 @@ fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
     assert_managed_block_groups_match_direct(
         "literal fuzzy block search",
         managed_block_search(&handle, "zqx sentinel", 10),
-        direct.search("zqx sentinel", 10),
+        direct.search("zqx sentinel", 10).unwrap(),
     );
     let counters = handle.managed_application_query_instrumentation().unwrap();
+    // The same reversal as in the manual receipt above. Narrowing through a
+    // managed candidate index and hydrating the surviving page was the old
+    // evaluator's cheapest possible shape; the shared reader does neither,
+    // because SQLite already holds the answer. The parity assertion directly
+    // above proves the result is the same one Direct produces.
     assert_eq!(
-        counters.fuzzy_narrowing_passes, 1,
-        "a literal fuzzy block search must consult the managed candidate index: {counters:?}"
+        counters.fuzzy_narrowing_passes, 0,
+        "a literal fuzzy block search must not narrow through the retired candidate index: {counters:?}"
     );
     assert_eq!(
-        counters.fuzzy_candidate_pages, 1,
-        "`zqx` occurs on one page, so narrowing must select one page: {counters:?}"
+        counters.fuzzy_candidate_pages, 0,
+        "no page is selected as a candidate any more: {counters:?}"
     );
     assert_eq!(
-        counters.result_page_hydrations, 1,
-        "a narrowed fuzzy search must hydrate only its candidate pages: {counters:?}"
+        counters.result_page_hydrations, 0,
+        "a fuzzy block search must hydrate no page: {counters:?}"
     );
 
     // A needle that is nowhere in the graph narrows to nothing, and both
@@ -28030,7 +28132,7 @@ fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
     assert_managed_block_groups_match_direct(
         "literal fuzzy block search with no candidates",
         managed_block_search(&handle, "zzqqxxjj", 10),
-        direct.search("zzqqxxjj", 10),
+        direct.search("zzqqxxjj", 10).unwrap(),
     );
     let counters = handle.managed_application_query_instrumentation().unwrap();
     assert_eq!(counters.fuzzy_candidate_pages, 0, "{counters:?}");
@@ -28043,7 +28145,9 @@ fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
         assert_managed_graph_search_matches_direct(
             &format!("limit-bounded graph search limit={limit}"),
             managed_graph_search(&handle, "differential needle", 0, limit),
-            direct.run_graph_search("differential needle", 0, limit, false),
+            direct
+                .run_graph_search("differential needle", 0, limit, false)
+                .unwrap(),
         );
     }
 
@@ -28168,12 +28272,29 @@ fn managed_query_evaluator_matches_direct_files_across_shapes_and_budgets() {
 /// number cannot be compared against a release ceiling and widening a
 /// ceiling to fit debug would retire it rather than move it.
 #[test]
-fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
-    // Block-DENSE on purpose. A one-block-per-page corpus measures the
-    // managed page LOAD, which this cache does not touch; the cost it
-    // removes is one lsdoc parse per block per query, so the fixture has to
-    // put enough blocks behind each page load for that to be the term that
-    // moves.
+fn managed_graph_search_converts_no_page_and_still_reflects_a_save() {
+    // Renamed from `managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones`.
+    // It used to prove that the managed evaluator's per-page conversion cache
+    // warmed across repeated graph searches and dropped exactly the saved page.
+    // Q1 answers managed graph search from the shared Friendly reader, so no
+    // page is converted at all and there is no cache leg left to warm. Asserting
+    // the old counts would fail; leaving them unasserted would let the test pass
+    // vacuously. So it now proves the retirement itself — zero conversion, cold,
+    // warm and after a save — and keeps the leg that always mattered most: an
+    // accepted save is visible to the very next search, at parity with Direct.
+    //
+    // Block-DENSE on purpose, as before: a one-block-per-page corpus would hide
+    // per-block work, which is exactly the cost this retirement removes.
+    //
+    // NOTE for the campaign's inherited-failure pass: the managed application
+    // projection cache still has ~10 production callers (backlinks, unlinked
+    // references, block referrers, advanced/simple query pages), but graph
+    // search was the only driver that reached it in this fixture — verified at
+    // the campaign base by re-driving this same test through unlinked
+    // references and through an advanced query, both of which leave every
+    // counter at zero even before Q1. So the cache's warm/invalidate behaviour
+    // is now uncovered. That is a real coverage gap, not something this packet
+    // should paper over here.
     const SYNTHETIC_PAGES: usize = 16;
     const BLOCKS_PER_PAGE: usize = 128;
     let fixture = ActivationFixture::scaled_with_blocks(
@@ -28182,7 +28303,7 @@ fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
         SYNTHETIC_PAGES,
         BLOCKS_PER_PAGE,
     );
-    let direct = Graph::open(&fixture.graph_root);
+    let direct = open_ready_direct_oracle_tagged(&fixture, "cold");
     let pages = direct.list_pages().len();
     assert!(pages > SYNTHETIC_PAGES, "fixture did not activate at scale");
     let handle = open_reopened_managed_actor(&fixture);
@@ -28205,42 +28326,39 @@ fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
 
     let (cold_elapsed, cold, cold_counters) = run();
     assert_eq!(
-        cold_counters.projection_cache_misses, pages,
-        "the first managed evaluation must convert every page exactly once: {cold_counters:?}"
+        cold_counters.projection_cache_misses, 0,
+        "managed graph search must convert no page at all: {cold_counters:?}"
     );
     assert_eq!(cold_counters.projection_cache_hits, 0, "{cold_counters:?}");
     assert_eq!(
-        cold_counters.hydration_cache_misses, pages,
-        "the first evaluation must parse and join each page once: {cold_counters:?}"
+        cold_counters.hydration_cache_misses, 0,
+        "managed graph search must parse and join no page: {cold_counters:?}"
     );
     assert_eq!(cold_counters.hydration_cache_hits, 0, "{cold_counters:?}");
     assert_managed_graph_search_matches_direct(
         "cold managed graph search",
         cold,
-        direct.run_graph_search(source, 0, 20_000, false),
+        direct.run_graph_search(source, 0, 20_000, false).unwrap(),
     );
 
     let (warm_elapsed, warm, warm_counters) = run();
     assert_eq!(
-            warm_counters.projection_cache_hits, pages,
-            "a repeated evaluation over unchanged pages must reuse every converted tree: {warm_counters:?}"
-        );
+        warm_counters.projection_cache_hits, 0,
+        "a repeat has no converted tree to reuse, because none was made: {warm_counters:?}"
+    );
     assert_eq!(
         warm_counters.projection_cache_misses, 0,
-        "a repeated evaluation must not re-parse a single unchanged page: {warm_counters:?}"
+        "a repeated evaluation must still convert nothing: {warm_counters:?}"
     );
-    assert_eq!(
-        warm_counters.hydration_cache_hits, pages,
-        "a repeated evaluation must reuse every exact page hydration: {warm_counters:?}"
-    );
+    assert_eq!(warm_counters.hydration_cache_hits, 0, "{warm_counters:?}");
     assert_eq!(warm_counters.hydration_cache_misses, 0, "{warm_counters:?}");
     assert_managed_graph_search_matches_direct(
         "warm managed graph search",
         warm,
-        direct.run_graph_search(source, 0, 20_000, false),
+        direct.run_graph_search(source, 0, 20_000, false).unwrap(),
     );
     eprintln!(
-            "managed_projection_cache cold_ms={:.3} warm_ms={:.3} pages={pages} blocks_per_synthetic_page={BLOCKS_PER_PAGE}",
+            "managed_graph_search_no_conversion cold_ms={:.3} warm_ms={:.3} pages={pages} blocks_per_synthetic_page={BLOCKS_PER_PAGE}",
             cold_elapsed.as_secs_f64() * 1_000.0,
             warm_elapsed.as_secs_f64() * 1_000.0,
         );
@@ -28273,27 +28391,21 @@ fn managed_projection_cache_reuses_unchanged_pages_and_drops_changed_ones() {
 
     let (_, _, after_save) = run();
     assert_eq!(
-        after_save.projection_cache_misses, 1,
-        "exactly the saved page must be reconverted: {after_save:?}"
+        after_save.projection_cache_misses, 0,
+        "a save gives managed graph search nothing to reconvert: {after_save:?}"
     );
-    assert_eq!(
-        after_save.projection_cache_hits,
-        pages - 1,
-        "every page the save did not touch must still be reused: {after_save:?}"
-    );
+    assert_eq!(after_save.projection_cache_hits, 0, "{after_save:?}");
     assert_eq!(after_save.hydration_cache_misses, 0, "{after_save:?}");
-    assert_eq!(
-            after_save.hydration_cache_hits,
-            pages - 1,
-            "unchanged pages must retain their parsed application DTOs while the just-saved page is served from its pending foreground projection: {after_save:?}"
-        );
+    assert_eq!(after_save.hydration_cache_hits, 0, "{after_save:?}");
 
-    let reopened_direct = Graph::open(&fixture.graph_root);
+    let reopened_direct = open_ready_direct_oracle_tagged(&fixture, "after-save");
     let (_, after_save_execution, _) = run();
     assert_managed_graph_search_matches_direct(
         "managed graph search after an accepted save",
         after_save_execution,
-        reopened_direct.run_graph_search(source, 0, 20_000, false),
+        reopened_direct
+            .run_graph_search(source, 0, 20_000, false)
+            .unwrap(),
     );
 
     assert!(matches!(

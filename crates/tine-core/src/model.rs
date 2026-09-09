@@ -7228,42 +7228,6 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
     }
 
-    pub(crate) fn direct_projection_fuzzy_candidate_pages(
-        &self,
-        normalized_needle: &str,
-    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let paths = projection.fuzzy_candidate_paths(generation, normalized_needle)?;
-        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone);
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-            return None;
-        }
-        let Some(snapshot) = snapshot else {
-            // R6: no parsed cache — hydrate exactly the candidates from disk.
-            return self
-                .parse_pages_on_demand(generation, paths.into_iter().map(PathBuf::from).collect());
-        };
-        let cache_index = self.cache_index.read().unwrap();
-        let cache_index = cache_index.as_ref()?;
-        let mut pages = Vec::with_capacity(paths.len());
-        for relative in paths {
-            let path = self.root.join(&relative);
-            let slot = cache_index.by_path.get(&path).copied()?;
-            let page = snapshot.get(slot)?;
-            if page.0.path != path || page.0.rel_path != relative {
-                return None;
-            }
-            pages.push(page.clone());
-        }
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
-    }
-
     /// Load exactly the named pages from the parsed cache, in the order asked
     /// (source-path order, which is what the reference accumulators charge
     /// their budget in). A dispatched query never comes here (R3): its answer is
@@ -17878,8 +17842,17 @@ impl Graph {
     }
 
     /// Full-text search across all blocks.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<RefGroup> {
-        crate::query::search(self, query, limit)
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RefGroup>, crate::query::QueryExecutionError> {
+        self.read_friendly_plan(
+            &crate::query_plan::QueryPlan::block_search_literal(query, limit),
+            false,
+            None,
+        )
+        .map(|answer| crate::query_plan::block_hits_to_groups(answer.hits))
     }
 
     /// Execute the typed, combined graph-search plan (page names + block text).
@@ -17891,7 +17864,7 @@ impl Graph {
         page_limit: usize,
         block_limit: usize,
         explain: bool,
-    ) -> crate::query_plan::QueryExecution {
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         self.run_graph_search_scoped(source, page_limit, block_limit, None, explain)
     }
 
@@ -17902,20 +17875,25 @@ impl Graph {
         block_limit: usize,
         scope: Option<crate::query_plan::QueryPageScope>,
         explain: bool,
-    ) -> crate::query_plan::QueryExecution {
-        match scope {
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        let plan = match scope {
             Some(scope) => {
                 crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
             }
             None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
-        }
-        .execute_with_explain(self, || false, explain)
+        };
+        self.read_friendly_plan(&plan, explain, None)
     }
 
     /// Interactive search lane: a newer request in the same lane cooperatively
-    /// cancels the older whole-graph scan. Separate lanes keep the Ctrl-K
+    /// cancels the older snapshot read. Separate lanes keep the Ctrl-K
     /// switcher and in-editor block picker from canceling one another.
-    pub fn search_latest(&self, lane: &str, query: &str, limit: usize) -> Vec<RefGroup> {
+    pub fn search_latest(
+        &self,
+        lane: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RefGroup>, crate::query::QueryExecutionError> {
         use std::sync::atomic::Ordering;
         let epoch = {
             let mut lanes = self.search_lanes.lock().unwrap();
@@ -17925,9 +17903,14 @@ impl Graph {
                 .clone()
         };
         let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        crate::query::search_cancellable(self, query, limit, || {
-            epoch.load(Ordering::Acquire) != mine
-        })
+        let cancelled: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || epoch.load(Ordering::Acquire) != mine);
+        self.read_friendly_plan(
+            &crate::query_plan::QueryPlan::block_search_literal(query, limit),
+            false,
+            Some(cancelled),
+        )
+        .map(|answer| crate::query_plan::block_hits_to_groups(answer.hits))
     }
 
     /// Latest-wins combined graph search.  It shares the same lane epochs as the
@@ -17940,7 +17923,7 @@ impl Graph {
         page_limit: usize,
         block_limit: usize,
         explain: bool,
-    ) -> crate::query_plan::QueryExecution {
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         self.run_graph_search_latest_scoped(lane, source, page_limit, block_limit, None, explain)
     }
 
@@ -17952,7 +17935,7 @@ impl Graph {
         block_limit: usize,
         scope: Option<crate::query_plan::QueryPageScope>,
         explain: bool,
-    ) -> crate::query_plan::QueryExecution {
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         use std::sync::atomic::Ordering;
         let epoch = {
             let mut lanes = self.search_lanes.lock().unwrap();
@@ -17962,18 +17945,69 @@ impl Graph {
                 .clone()
         };
         let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        match scope {
+        let plan = match scope {
             Some(scope) => {
                 crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
             }
             None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
+        };
+        self.read_friendly_plan(
+            &plan,
+            explain,
+            Some(Arc::new(move || epoch.load(Ordering::Acquire) != mine)),
+        )
+    }
+
+    fn read_friendly_plan(
+        &self,
+        plan: &crate::query_plan::QueryPlan,
+        explain: bool,
+        lane: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        use crate::query::friendly::{
+            friendly_without_read, read_friendly_results, FriendlyReadInputs,
+        };
+        if let Some(answer) = friendly_without_read(plan, explain, &lane) {
+            return Ok(answer);
         }
-        .execute_with_explain(self, || epoch.load(Ordering::Acquire) != mine, explain)
+        let answer = self.dispatch_direct_query(|request| {
+            self.direct_projection_read_job(
+                request,
+                crate::direct_projection::RegistrySensitivity::Insensitive,
+                |job| {
+                    let identity = crate::query::results::ResultIdentity::DirectStructural {
+                        session_pages: Arc::clone(&job.session_pages),
+                        all_session: false,
+                    };
+                    read_friendly_results(
+                        &mut job.snapshot,
+                        &FriendlyReadInputs {
+                            plan,
+                            graph_root: &self.root,
+                            identity: &identity,
+                            explain,
+                            lane: lane.clone(),
+                        },
+                    )
+                    .map_err(Into::into)
+                },
+            )
+        });
+        if lane.as_ref().is_some_and(|cancelled| cancelled()) {
+            return Ok(friendly_without_read(plan, explain, &lane).unwrap());
+        }
+        answer
     }
 
     /// Fuzzy page-name matches for the quick switcher.
     pub fn quick_switch(&self, query: &str, limit: usize) -> Vec<PageEntry> {
-        crate::query::quick_switch(self, query, limit)
+        crate::query_plan::legacy_page_search_entries(
+            self.list_pages(),
+            self.page_aliases_with_owners(),
+            self.referenced_page_names(),
+            query,
+            limit,
+        )
     }
 
     /// All `template:: <name>` templates across the graph, with the blocks to

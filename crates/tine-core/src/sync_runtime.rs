@@ -4743,11 +4743,46 @@ impl SyncRuntimeHandle {
         request: SyncApplicationNavigationRequest,
     ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
         validate_application_navigation_request(&request)?;
+        let lane = match &request {
+            SyncApplicationNavigationRequest::GraphSearch { lane, .. }
+            | SyncApplicationNavigationRequest::BlockSearch { lane, .. } => lane.as_deref(),
+            _ => None,
+        };
+        // Capture once, before any serialized actor turn or bounded recapture.
+        let cancellation = lane.map(|lane| {
+            begin_application_search_cancellation(&self.inner.application_search_lanes, lane)
+        });
         // R4: a simple query is two phases — a short actor turn, then (when the
         // actor captured an accepted-frontier read) execution on THIS thread
         // with `operation` released. Every other navigation request is one
         // actor turn.
         let request = match request {
+            SyncApplicationNavigationRequest::GraphSearch {
+                source,
+                page_limit,
+                block_limit,
+                explain,
+                scope,
+                ..
+            } => {
+                let plan = match scope {
+                    Some(scope) => {
+                        crate::query_plan::QueryPlan::friendly_for_page(&source, block_limit, scope)
+                    }
+                    None => {
+                        crate::query_plan::QueryPlan::friendly(&source, page_limit, block_limit)
+                    }
+                };
+                return self.application_captured_friendly(&plan, explain, false, cancellation);
+            }
+            SyncApplicationNavigationRequest::BlockSearch { query, limit, .. } => {
+                return self.application_captured_friendly(
+                    &crate::query_plan::QueryPlan::block_search_literal(&query, limit),
+                    false,
+                    true,
+                    cancellation,
+                );
+            }
             SyncApplicationNavigationRequest::SimpleQuery {
                 query,
                 max_rows,
@@ -4838,17 +4873,6 @@ impl SyncRuntimeHandle {
             }
             request => request,
         };
-        let lane = match &request {
-            SyncApplicationNavigationRequest::GraphSearch { lane, .. }
-            | SyncApplicationNavigationRequest::BlockSearch { lane, .. } => lane.as_deref(),
-            _ => None,
-        };
-        // Advance the epoch before waiting for the serialized actor turn. A
-        // newer search can therefore cancel an older scan that currently owns
-        // `operation`, rather than waiting uselessly for it to finish first.
-        let cancellation = lane.map(|lane| {
-            begin_application_search_cancellation(&self.inner.application_search_lanes, lane)
-        });
         self.application_request(|reply| ActorRequest::ApplicationNavigation {
             request,
             cancellation,
@@ -5124,6 +5148,58 @@ impl SyncRuntimeHandle {
                 ManagedMetadataOutcome::NotAnswered(outcome) => {
                     return Err(managed_execution_error(&shared.census, outcome))
                 }
+            }
+        }
+    }
+
+    fn application_captured_friendly(
+        &self,
+        plan: &crate::query_plan::QueryPlan,
+        explain: bool,
+        blocks: bool,
+        cancellation: Option<ApplicationSearchCancellation>,
+    ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
+        use crate::query::friendly::friendly_without_read;
+        let lane: Option<Arc<dyn Fn() -> bool + Send + Sync>> = cancellation.map(|token| {
+            Arc::new(move || token.cancelled()) as Arc<dyn Fn() -> bool + Send + Sync>
+        });
+        let loaded =
+            |answer: crate::query_plan::QueryExecution| SyncApplicationNavigationOutcome::Loaded {
+                reply: if blocks {
+                    SyncApplicationNavigationReply::BlockSearch(
+                        crate::query_plan::block_hits_to_groups(answer.hits),
+                    )
+                } else {
+                    SyncApplicationNavigationReply::GraphSearch(answer)
+                },
+            };
+        let shared = &self.inner.managed_query;
+        let mut recaptures = 0;
+        loop {
+            if let Some(answer) = friendly_without_read(plan, explain, &lane) {
+                return Ok(loaded(answer));
+            }
+            let capture =
+                self.application_request(|reply| ActorRequest::ApplicationCurrentQueryRead {
+                    requires_registry: false,
+                    reply,
+                });
+            if let Some(answer) = friendly_without_read(plan, explain, &lane) {
+                return Ok(loaded(answer));
+            }
+            let answer = shared.execute_friendly(&capture?, plan, explain, lane.clone());
+            if let Some(answer) = friendly_without_read(plan, explain, &lane) {
+                return Ok(loaded(answer));
+            }
+            match answer {
+                Ok(answer) => return Ok(loaded(answer)),
+                Err(crate::managed_query::ManagedQueryOutcome::Stale)
+                    if recaptures < crate::managed_query::MAX_STALE_RECAPTURES =>
+                {
+                    recaptures += 1;
+                    shared.census.note_stale_recapture();
+                }
+                Err(outcome) => return Err(managed_execution_error(&shared.census, outcome)),
             }
         }
     }
@@ -14981,6 +15057,8 @@ impl RuntimeActor {
             // through the merged registry builder and could serve a stale or
             // empty table after a failed build.
             SyncApplicationNavigationRequest::SimpleQuery { .. }
+            | SyncApplicationNavigationRequest::GraphSearch { .. }
+            | SyncApplicationNavigationRequest::BlockSearch { .. }
             | SyncApplicationNavigationRequest::QueryRun { .. }
             | SyncApplicationNavigationRequest::QueryExplainEmpty { .. }
             | SyncApplicationNavigationRequest::AdvancedQuery { .. }
@@ -14993,35 +15071,6 @@ impl RuntimeActor {
             SyncApplicationNavigationRequest::OrphanAssets => {
                 SyncApplicationNavigationReply::OrphanAssets(
                     self.application_orphan_assets_ready()?,
-                )
-            }
-            SyncApplicationNavigationRequest::GraphSearch {
-                source,
-                page_limit,
-                block_limit,
-                lane: _,
-                explain,
-                scope,
-            } => SyncApplicationNavigationReply::GraphSearch(self.application_graph_search_ready(
-                &source,
-                page_limit,
-                block_limit,
-                scope,
-                explain,
-                cancellation,
-            )?),
-            SyncApplicationNavigationRequest::BlockSearch {
-                query,
-                limit,
-                lane: _,
-            } => {
-                let execution = self.application_query_plan_ready(
-                    crate::query_plan::QueryPlan::block_search_literal(&query, limit),
-                    false,
-                    cancellation,
-                )?;
-                SyncApplicationNavigationReply::BlockSearch(
-                    crate::query_plan::block_hits_to_groups(execution.hits),
                 )
             }
         };
@@ -16955,150 +17004,6 @@ impl RuntimeActor {
             crate::model::collect_application_page_asset_refs(&source.page, &mut referenced);
         }
         Ok(self.graph.orphan_assets_with_references(&referenced))
-    }
-
-    fn application_graph_search_ready(
-        &self,
-        source: &str,
-        page_limit: usize,
-        block_limit: usize,
-        scope: Option<crate::query_plan::QueryPageScope>,
-        explain: bool,
-        cancellation: Option<&ApplicationSearchCancellation>,
-    ) -> Result<crate::query_plan::QueryExecution, SyncApplicationPageRequestError> {
-        let plan = match scope {
-            Some(scope) => {
-                crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
-            }
-            None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
-        };
-        self.application_query_plan_ready(plan, explain, cancellation)
-    }
-
-    fn application_query_plan_ready(
-        &self,
-        plan: crate::query_plan::QueryPlan,
-        explain: bool,
-        cancellation: Option<&ApplicationSearchCancellation>,
-    ) -> Result<crate::query_plan::QueryExecution, SyncApplicationPageRequestError> {
-        let cancelled = || cancellation.is_some_and(ApplicationSearchCancellation::cancelled);
-        // ONE pending overlay for this request, built lazily: the cancellation
-        // return below skips the alias and referenced-name consumers.
-        let mut overlay_memo: Option<ApplicationNavigationOverlay> = None;
-        let entries = self
-            .application_navigation_pages_ready(self.navigation_overlay_scoped(&mut overlay_memo)?)?
-            .into_iter()
-            .map(|(entry, _)| entry)
-            .collect::<Vec<_>>();
-        #[cfg(test)]
-        self.note_managed_application_query_inventory_pass(entries.len());
-        if cancelled() {
-            return Ok(plan.execute_application_with_explain(
-                entries,
-                &[],
-                Vec::new(),
-                Vec::new(),
-                cancelled,
-                explain,
-            ));
-        }
-        let overlay = self.navigation_overlay_scoped(&mut overlay_memo)?;
-        let aliases = self.application_navigation_aliases_ready(overlay)?;
-        let referenced = self.application_navigation_reference_names_ready(overlay)?;
-        let needs_blocks = plan
-            .branches
-            .iter()
-            .any(|branch| branch.target == crate::query_plan::QueryTarget::Blocks);
-        #[cfg(test)]
-        if needs_blocks {
-            self.note_managed_application_query_block_branch();
-        }
-        let mut pages = Vec::new();
-        if needs_blocks {
-            // Direct Files narrows a literal fuzzy block predicate through its
-            // stored ordered-subsequence index before it walks anything. The
-            // managed frontier keeps the SAME index in its materialized
-            // projection, so ask it the same question here -- at the caller,
-            // because the caller is what owns the materialized read and knows
-            // whether the accepted frontier is the whole story. The index only
-            // chooses pages; the parser-owned matcher still decides and ranks
-            // every block, so a narrowed run returns identical results.
-            let narrowed = plan
-                .fuzzy_block_needle()
-                .and_then(|needle| self.application_fuzzy_candidate_paths_ready(needle));
-            for entry in &entries {
-                if cancelled() {
-                    break;
-                }
-                if narrowed
-                    .as_ref()
-                    .is_some_and(|paths| !paths.contains(entry.rel_path.as_str()))
-                {
-                    continue;
-                }
-                let current = match self.load_application_exact_ready(&entry.rel_path)? {
-                    ApplicationExactLoad::Loaded(current) => current,
-                    ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
-                            "application_query_plan_page_load",
-                        ))
-                    }
-                };
-                pages.push(crate::query_plan::ApplicationQueryPlanPage {
-                    roots: self.application_projection_roots(&entry.rel_path, &current.page),
-                    entry: entry.clone(),
-                });
-            }
-        }
-        Ok(plan.execute_application_with_explain(
-            entries, &pages, aliases, referenced, cancelled, explain,
-        ))
-    }
-
-    /// Managed pages that could contain `needle` as an ordered subsequence,
-    /// read from the same materialized index Direct Files narrows through
-    /// (`SqliteGraphProjectionRead::fuzzy_subsequence_candidate_pages_after`,
-    /// which the managed read view already exposes and already populates -- the
-    /// managed unlinked-reference path reads the same `search_substring_fts`
-    /// rows).
-    ///
-    /// `None` means "do not narrow", never "no results". It is returned
-    /// whenever the materialized frontier is not the whole story -- an actor
-    /// holding a pending local suffix has page content the index has not seen,
-    /// and narrowing on a stale index would silently DROP a matching page --
-    /// and whenever the index read itself refuses, because narrowing is an
-    /// optimization and must never turn into a failed request.
-    fn application_fuzzy_candidate_paths_ready(&self, needle: &str) -> Option<HashSet<String>> {
-        if needle.is_empty() {
-            return None;
-        }
-        if self
-            .managed_local
-            .as_ref()
-            .is_some_and(|managed| !managed.latest_projection_frames.is_empty())
-        {
-            return None;
-        }
-        let read = self.application_materialized_read_ready().ok()?;
-        const BATCH: usize = 1024;
-        let mut cursor = None;
-        let mut paths = HashSet::new();
-        loop {
-            let rows = read
-                .fuzzy_subsequence_candidate_pages_after(needle, cursor, BATCH)
-                .ok()?;
-            let len = rows.len();
-            for row in rows {
-                cursor = Some(row.page_id);
-                paths.insert(row.path.as_str().to_owned());
-            }
-            if len < BATCH {
-                break;
-            }
-        }
-        #[cfg(test)]
-        self.note_managed_application_query_fuzzy_narrowing(paths.len());
-        Some(paths)
     }
 
     fn application_backlink_filter_context_ready(

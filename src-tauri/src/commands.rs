@@ -2031,7 +2031,7 @@ pub(crate) async fn run_graph_search(
                     "managed navigation returned the wrong reply",
                 )),
             },
-            None => Ok(match lane.as_deref() {
+            None => (match lane.as_deref() {
                 Some(lane) => slot.legacy_graph()?.run_graph_search_latest_scoped(
                     lane,
                     &source,
@@ -2047,7 +2047,8 @@ pub(crate) async fn run_graph_search(
                     scope,
                     explain,
                 ),
-            }),
+            })
+            .map_err(CommandError::from),
         }
     })
     .await
@@ -2785,10 +2786,11 @@ pub(crate) async fn search(
                     "managed navigation returned the wrong reply",
                 )),
             },
-            None => Ok(match lane.as_deref() {
+            None => (match lane.as_deref() {
                 Some(lane) => slot.legacy_graph()?.search_latest(lane, &query, limit),
                 None => slot.legacy_graph()?.search(&query, limit),
-            }),
+            })
+            .map_err(CommandError::from),
         }
     })
     .await

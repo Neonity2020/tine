@@ -6,6 +6,9 @@
 
 use tine_core::Graph;
 
+#[path = "support/ready_query.rs"]
+mod ready_query;
+
 #[test]
 fn gh221_malformed_html_fragment_indexes_without_panic() {
     let dir = std::env::temp_dir().join(format!("gh221-{}", std::process::id()));
@@ -15,6 +18,7 @@ fn gh221_malformed_html_fragment_indexes_without_panic() {
     std::fs::write(dir.join("pages/test-page.md"), b"- <div </div><").unwrap();
 
     let g = Graph::open(&dir);
+    ready_query::attach_projection(&g, &dir);
     let entries = g.list_pages();
     let entry = entries
         .iter()
@@ -22,7 +26,7 @@ fn gh221_malformed_html_fragment_indexes_without_panic() {
         .expect("page listed")
         .clone();
     let dto = g.load_page(&entry).expect("load ok");
-    let exec = g.run_graph_search("div", 100, 100, false);
+    let exec = ready_query::when_ready(|| g.run_graph_search("div", 100, 100, false));
     let failures = g.page_index_failures();
 
     let _ = std::fs::remove_dir_all(&dir);

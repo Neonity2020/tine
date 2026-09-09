@@ -2114,9 +2114,19 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // removed; no snapshot opener is added (`open_direct`/`open_managed` keep
     // their counts), and the write-boundary token list above is unchanged, so
     // the physical write surface is byte-for-byte the pinned one.
+    // Q1's shared Friendly reader REMOVES four tuples (472 -> 468) and adds
+    // none. All four belonged to the retired `DirectProjection::fuzzy_candidate_paths`
+    // wrapper, which opened its own reader: one
+    // `PhysicalGraphProjectionDatabase::open_read_only(` import plus its
+    // `reader.lock`, `reader.is_none` and `reader.as_ref` receivers, one
+    // occurrence each. The surviving `page_aliases_with_owners` keeps its own
+    // copies of those three receivers, which is why they thin rather than
+    // disappear. Diffing the full 472-row and 468-row multisets shows these
+    // four removals and nothing else, so no write boundary moved: retiring a
+    // reader is exactly one fewer place that can open the projection.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a65f320888e42c5418ded93fb20c2c0b670669abb03366e60b1b8e1fadf89608",
+        "7e4433e1162c496655e90f707de28a2abeae1110b5f45ed5acc871bd3e375421",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

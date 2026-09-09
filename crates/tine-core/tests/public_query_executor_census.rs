@@ -44,6 +44,67 @@ use std::path::Path;
 /// is already counted.
 const SOURCE_CONSTRUCTORS: &[&str] = &["GraphQueryPages(", "ApplicationQueryPages {"];
 
+#[test]
+fn public_quick_switch_routes_bypass_query_quick_switch() {
+    let root = repo_root();
+    let model = compiled_source(&root.join("crates/tine-core/src/model.rs"));
+    let body = model
+        .split("pub fn quick_switch(")
+        .nth(1)
+        .unwrap()
+        .split("\n    }")
+        .next()
+        .unwrap();
+    assert!(body.contains("query_plan::legacy_page_search_entries("));
+    assert!(!body.contains("query::quick_switch("));
+    assert!(!body.contains(".execute("));
+    let commands = compiled_source(&root.join("src-tauri/src/commands.rs"));
+    let body = commands
+        .split("async fn quick_switch(")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(body.contains(".quick_switch("));
+    assert!(!body.contains("query::quick_switch("));
+    let managed = compiled_source(&root.join("crates/tine-core/src/sync_runtime.rs"));
+    // The QuickSwitch request pattern is matched TWICE in this file: once by the
+    // request-size validator, which only reads `query` and `limit`, and once by
+    // the evaluation arm that actually answers it. Taking the first occurrence
+    // reads the validator and proves nothing about routing, so select the arm by
+    // the reply it builds and require exactly one such arm.
+    let arms = managed
+        .split("SyncApplicationNavigationRequest::QuickSwitch {")
+        .skip(1)
+        .map(|arm| {
+            arm.split("SyncApplicationNavigationRequest::ResolveBlocks")
+                .next()
+                .unwrap()
+        })
+        .filter(|arm| arm.contains("SyncApplicationNavigationReply::QuickSwitch"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        arms.len(),
+        1,
+        "I-12: exactly one managed arm may answer QuickSwitch"
+    );
+    let body = arms[0];
+    assert!(body.contains("query_plan::legacy_page_search_entries("));
+    assert!(!body.contains("query::quick_switch("));
+    assert!(!body.contains(".execute("));
+    let query = compiled_source(&root.join("crates/tine-core/src/query.rs"));
+    let body = query
+        .split("pub fn quick_switch(")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(body.contains("query_plan::legacy_page_search_entries("));
+    assert!(!body.contains(".execute("));
+}
+
 /// Every production walk, by `(file, enclosing function)`, and the packet that
 /// deletes it.
 ///

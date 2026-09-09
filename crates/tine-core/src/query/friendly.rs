@@ -32,6 +32,42 @@ pub(crate) struct FriendlyReadInputs<'a> {
     pub(crate) graph_root: &'a Path,
     pub(crate) identity: &'a ResultIdentity,
     pub(crate) explain: bool,
+    pub(crate) lane: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+/// Diagnostic and branchless plans need no database. Supersession still wins.
+pub(crate) fn friendly_without_read(
+    plan: &QueryPlan,
+    explain: bool,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Option<QueryExecution> {
+    let cancelled = lane.as_ref().is_some_and(|lane| lane());
+    if !cancelled && plan.diagnostics.is_empty() && !plan.branches.is_empty() {
+        return None;
+    }
+    Some(QueryExecution {
+        hits: Vec::new(),
+        diagnostics: plan.diagnostics.clone(),
+        explanation: if explain {
+            plan.explanation()
+        } else {
+            QueryExplanation {
+                branches: Vec::new(),
+            }
+        },
+        has_more: QueryHasMore::default(),
+        cancelled,
+    })
+}
+
+fn check_lane(
+    snapshot: &PhysicalProjectionQuerySnapshot,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<(), ResultReadError> {
+    if lane.as_ref().is_some_and(|lane| lane()) {
+        snapshot.cancellation().cancel();
+    }
+    cancelled(snapshot)
 }
 
 #[cfg(test)]
@@ -114,6 +150,7 @@ pub(crate) fn read_friendly_results(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     inputs: &FriendlyReadInputs<'_>,
 ) -> Result<QueryExecution, ResultReadError> {
+    check_lane(snapshot, &inputs.lane)?;
     let explanation = if inputs.explain {
         inputs.plan.explanation()
     } else {
@@ -180,8 +217,19 @@ pub(crate) fn read_friendly_results(
         }
     }
     let cancellation = snapshot.cancellation();
+    let rank = programs.function(cancellation.clone());
+    let lane = inputs.lane.clone();
     snapshot
-        .set_query_rank_function(programs.function(cancellation))
+        .set_query_rank_function(move |id, text| {
+            if lane.as_ref().is_some_and(|lane| lane()) {
+                cancellation.cancel();
+            }
+            let answer = rank(id, text);
+            if lane.as_ref().is_some_and(|lane| lane()) {
+                cancellation.cancel();
+            }
+            answer
+        })
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
 
     let mut hits = Vec::new();
@@ -194,7 +242,7 @@ pub(crate) fn read_friendly_results(
             (QueryTarget::Blocks, BoundBranch::Blocks { .. }) => true,
             _ => false,
         }) {
-            cancelled(snapshot)?;
+            check_lane(snapshot, &inputs.lane)?;
             match bound {
                 BoundBranch::Pages {
                     branch,
@@ -208,20 +256,27 @@ pub(crate) fn read_friendly_results(
                         branch,
                         *owner_rank,
                         *global_rank,
+                        &inputs.lane,
                     )?;
                     hits.append(&mut section);
                     has_more.pages |= more;
                 }
                 BoundBranch::Blocks { branch, rank } => {
-                    let (mut section, more) =
-                        read_blocks(snapshot, inputs.identity, &plan, branch, *rank)?;
+                    let (mut section, more) = read_blocks(
+                        snapshot,
+                        inputs.identity,
+                        &plan,
+                        branch,
+                        *rank,
+                        &inputs.lane,
+                    )?;
                     hits.append(&mut section);
                     has_more.blocks |= more;
                 }
             }
         }
     }
-    cancelled(snapshot)?;
+    check_lane(snapshot, &inputs.lane)?;
     Ok(QueryExecution {
         hits,
         diagnostics: inputs.plan.diagnostics.clone(),
@@ -273,6 +328,7 @@ fn read_pages(
     branch: &QueryBranch,
     owner_rank: u64,
     global_rank: u64,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
     if branch.limit == 0 {
         return Ok((Vec::new(), false));
@@ -353,6 +409,7 @@ fn read_pages(
     let mut seen_physical = HashSet::new();
     let mut hits = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
+        check_lane(snapshot, lane)?;
         if let Some(page_id) = descriptor.page_id {
             if !seen_physical.insert(page_id) {
                 return Err(ResultReadError::Corrupt(
@@ -472,6 +529,7 @@ fn read_blocks(
     plan: &QueryPlan,
     branch: &QueryBranch,
     rank_program: u64,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
     if branch.limit == 0 {
         return Ok((Vec::new(), false));
@@ -532,6 +590,7 @@ fn read_blocks(
     descriptors.truncate(branch.limit);
     let mut seen = HashSet::new();
     for descriptor in &descriptors {
+        check_lane(snapshot, lane)?;
         if !seen.insert(descriptor.block_id) {
             return Err(ResultReadError::Corrupt(
                 "one physical block appears twice in Friendly results".into(),
@@ -547,8 +606,10 @@ fn read_blocks(
         }
     }
 
-    let breadcrumbs = read_breadcrumbs(snapshot, &descriptors)?;
+    let breadcrumbs = read_breadcrumbs(snapshot, &descriptors, lane)?;
     let mut payload: Vec<Option<BlockDto>> = vec![None; descriptors.len()];
+    check_lane(snapshot, lane)?;
+    let cancellation = snapshot.cancellation();
     read_admitted_payload(
         snapshot,
         &descriptors,
@@ -561,14 +622,21 @@ fn read_blocks(
             tag_count: descriptor.tag_count,
             property_count: descriptor.property_count,
         },
-        |at, dto| payload[at] = Some(dto),
+        |at, dto| {
+            if lane.as_ref().is_some_and(|lane| lane()) {
+                cancellation.cancel();
+            }
+            payload[at] = Some(dto);
+        },
     )?;
+    check_lane(snapshot, lane)?;
     let mut hits = Vec::with_capacity(descriptors.len());
     for ((descriptor, mut block), breadcrumb) in descriptors
         .into_iter()
         .zip(payload.into_iter())
         .zip(breadcrumbs)
     {
+        check_lane(snapshot, lane)?;
         let mut block = block.take().ok_or_else(|| {
             ResultReadError::Corrupt("an admitted Friendly block has no payload".into())
         })?;
@@ -682,6 +750,7 @@ struct Ancestor {
 fn read_breadcrumbs(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     descriptors: &[BlockDescriptor],
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<Vec<Vec<String>>, ResultReadError> {
     let mut active = descriptors
         .iter()
@@ -690,14 +759,14 @@ fn read_breadcrumbs(
     let mut visited = vec![HashSet::new(); descriptors.len()];
     let mut crumbs = vec![Vec::new(); descriptors.len()];
     while active.iter().any(Option::is_some) {
-        cancelled(snapshot)?;
+        check_lane(snapshot, lane)?;
         let requested = active.iter().flatten().copied().collect::<HashSet<_>>();
         let mut ancestors = HashMap::with_capacity(requested.len());
         let requested_ids = requested.iter().copied().collect::<Vec<_>>();
         for batch in requested_ids.chunks(PAYLOAD_BATCH) {
             #[cfg(test)]
             run_one_shot_hook(&BEFORE_ANCESTOR_BATCH);
-            cancelled(snapshot)?;
+            check_lane(snapshot, lane)?;
             let params = batch
                 .iter()
                 .map(|id| PhysicalQueryValue::Blob(id.to_vec()))

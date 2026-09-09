@@ -1,6 +1,8 @@
 import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { autocompleteFacets, backend } from "../backend";
+import { runQueryWhenReady } from "../queryReadiness";
+import { graphBinding } from "../persistence";
 import { clearClipboardSlot, normalize, peekClipboardSlot, writeClipboardText } from "../clipboard";
 import {
   detectTrigger,
@@ -1431,6 +1433,21 @@ export function Editor(props: { id: string }): JSX.Element {
 
   const [ac, setAc] = createSignal<Trigger | null>(null);
   const [acItems, setAcItems] = createSignal<AcItem[]>([]);
+  const [blockSearchPending, setBlockSearchPending] = createSignal<string | null>(null);
+  const [blockSearchError, setBlockSearchError] = createSignal<string | null>(null);
+  let blockSearchRequest = 0;
+  let blockSearchController: AbortController | undefined;
+  const cancelBlockSearch = () => {
+    ++blockSearchRequest;
+    blockSearchController?.abort();
+    setBlockSearchPending(null);
+    setBlockSearchError(null);
+  };
+  createEffect(() => {
+    graphBinding();
+    cancelBlockSearch();
+    onCleanup(() => { ++blockSearchRequest; blockSearchController?.abort(); });
+  });
   const [acIndex, setAcIndex] = createSignal(0);
   // GH #412/#413: inside a COMPLETE whole-block code wrapper the editor shows
   // only the payload between the wrapper lines (fences stay out of the editing
@@ -1474,7 +1491,7 @@ export function Editor(props: { id: string }): JSX.Element {
     }
   };
   createEffect(() => {
-    if (ac() && acItems().length > 0) updateAcRect(); // re-anchor on open / each keystroke
+    if (ac() && (acItems().length > 0 || blockSearchPending() || blockSearchError())) updateAcRect(); // re-anchor on open / each keystroke
   });
   // Flip the popup above the line when there isn't room below (near the viewport
   // bottom), so it stays fully visible — matches OG's caret-aware placement.
@@ -1499,6 +1516,7 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   const closeAc = () => {
+    cancelBlockSearch();
     setAc(null);
     setAcItems([]);
     setAcIndex(0);
@@ -1534,7 +1552,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // Page/block/tag/command/code completion is a real transient above its editor
   // and, on mobile, above the drawer. One Escape peels only this popup.
   createEffect(() => {
-    if (!ac() || !acItems().length) return;
+    if (!ac() || (!acItems().length && !blockSearchPending() && !blockSearchError())) return;
     const unregister = registerTransientLayer({
       id: autocompleteLayerId,
       root: () => acListRef ?? null,
@@ -1545,6 +1563,7 @@ export function Editor(props: { id: string }): JSX.Element {
   });
 
   const updateAutocomplete = async () => {
+    cancelBlockSearch();
     const t = detectEditorTrigger();
     if (!t) {
       closeAc();
@@ -1654,9 +1673,25 @@ export function Editor(props: { id: string }): JSX.Element {
       // `((` → full-text search for a block to reference, grouped by page. An
       // empty query (bare `((`) returns nothing — the popup stays hidden until
       // the user types. Selecting inserts the target's durable external ID (see selectAc).
-      const groups = await backend().search(t.query, 20, "block-picker");
-      const cur = ac();
-      if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
+      const mine = blockSearchRequest;
+      const binding = graphBinding();
+      const controller = new AbortController();
+      blockSearchController = controller;
+      const isCurrent = () => mine === blockSearchRequest && !controller.signal.aborted && graphBinding() === binding && ac() === t;
+      setAcItems([]);
+      setBlockSearchPending("Searching…");
+      let groups;
+      try {
+        groups = await runQueryWhenReady(() => backend().search(t.query, 20, "block-picker"), {
+          signal: controller.signal,
+          isCurrent,
+          onPending: (error) => setBlockSearchPending(error ? "Indexing — waiting for search to be ready…" : null),
+        });
+      } catch (error) {
+        if (isCurrent()) setBlockSearchError(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (!isCurrent()) return;
       const items: AcItem[] = [];
       for (const g of groups) {
         for (const b of g.blocks) {
@@ -3994,12 +4029,14 @@ export function Editor(props: { id: string }): JSX.Element {
           </Show>
         </div>
       </Show>
-      <Show when={ac() && acItems().length > 0 && acRect()}>
+      <Show when={ac() && (acItems().length > 0 || blockSearchPending() || blockSearchError()) && acRect()}>
         {/* Portaled to <body> + position:fixed so the right sidebar's overflow
             (or any clipping ancestor) can't cut the dropdown off.
             data-lenis-prevent: with smooth scrolling on, scroll it natively. */}
         <Portal>
           <div class="autocomplete" ref={acListRef} data-lenis-prevent style={acStyle()}>
+            <Show when={blockSearchPending()}><div role="status">{blockSearchPending()}</div></Show>
+            <Show when={blockSearchError()}><div role="alert">{blockSearchError()} <button onMouseDown={(event) => event.preventDefault()} onClick={() => void updateAutocomplete()}>Retry search</button></div></Show>
             <For each={acItems()}>
               {(item, i) => (
                 <div

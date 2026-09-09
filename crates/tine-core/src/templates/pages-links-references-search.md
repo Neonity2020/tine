@@ -33,6 +33,7 @@ icon:: 🔗
   - The five **Search syntax** forms, listed in the switcher footer: `foo bar` (both terms), `foo OR bar` (either), `foo -draft` (exclude), `"exact phrase"`, and `/[A-Z]{3}/` (case-sensitive regular expression).
   - Title matches rank exact, then prefix, then substring, then fuzzy. After you deliberately open the same result more than once for a query, it may break ties among equally strong matches; that history stays on this device and in this graph, and Settings → **Editor** → **Learn Ctrl+K choices** disables or resets it.
   - Composed and decomposed Unicode spellings of the same text share matches (so both forms of an accented name are found); accent folding is deliberately not added, so `cafe` does not match `café`.
+  - Search reads the same index the rest of Tine queries, so it does not re-read your pages for every keystroke. While that index is still being built — just after opening a graph, or in the moment after a save — the switcher says it is searching instead of showing an empty list, and if it cannot answer at all it says so and offers **Retry**. An empty result therefore means nothing matched, and only that. The `((` block picker behaves the same way.
   - The in-app Guide itself stays out of search, page lists, and backlinks.
 - ## Search tabs and saved searches
   - **Open search tab** in the switcher footer turns the current search into a graph-scoped search tab with its own search box. The tab survives restarts and writes nothing to your graph until you name it.

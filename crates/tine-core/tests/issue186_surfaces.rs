@@ -6,7 +6,10 @@
 
 use std::fs;
 use tine_core::model::Graph;
-use tine_core::query_plan::{QueryHit, QueryPlan};
+use tine_core::query_plan::QueryHit;
+
+#[path = "support/ready_query.rs"]
+mod ready_query;
 
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -63,14 +66,14 @@ fn page_and_block_surfaces_share_candidates_within_designed_limits() {
         .unwrap();
     }
     let graph = Graph::open(&dir);
-    graph.warm_cache();
+    ready_query::attach_projection(&graph, &dir);
 
     let qs = graph.quick_switch("医保", 100);
     let qs_names: Vec<&str> = qs.iter().map(|p| p.name.as_str()).collect();
     eprintln!("QUICK_SWITCH count={}", qs_names.len());
     eprintln!("QS first 12: {:?}", &qs_names[..qs_names.len().min(12)]);
 
-    let friendly = graph.run_graph_search("医保", 100, 100, false);
+    let friendly = graph.run_graph_search("医保", 100, 100, false).unwrap();
     let page_hits: Vec<&str> = friendly
         .hits
         .iter()
@@ -95,11 +98,13 @@ fn page_and_block_surfaces_share_candidates_within_designed_limits() {
         &page_hits[..page_hits.len().min(12)]
     );
 
-    let literal_blocks = QueryPlan::block_search_literal("医保", 20).execute(&graph, || false);
+    let literal_blocks = ready_query::when_ready(|| graph.search("医保", 20));
     eprintln!(
-        "LITERAL-BLOCK-PICKER hits={} has_more={:?}",
-        literal_blocks.hits.len(),
-        literal_blocks.has_more
+        "LITERAL-BLOCK-PICKER hits={}",
+        literal_blocks
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum::<usize>()
     );
 
     // The core contract under test: every 医保-PREFIX page is a top-class match
@@ -121,7 +126,10 @@ fn page_and_block_surfaces_share_candidates_within_designed_limits() {
     // returns every eligible match when it fits its top-20 window).
     assert_eq!(block_hits, 12, "Ctrl+K must find the 12 content blocks");
     assert_eq!(
-        literal_blocks.hits.len(),
+        literal_blocks
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum::<usize>(),
         12,
         "the (( picker returns every eligible match within its window"
     );
@@ -169,7 +177,7 @@ fn literal_autocomplete_is_stable_across_character_swaps_and_dsl_tokens() {
     })
     .unwrap();
     let graph = Graph::open(&dir);
-    graph.warm_cache();
+    ready_query::attach_projection(&graph, &dir);
 
     for (query, want) in [
         ("O", "ORb-target-page"),
@@ -193,12 +201,12 @@ fn literal_autocomplete_is_stable_across_character_swaps_and_dsl_tokens() {
     let or_entries = graph.quick_switch("OR", 100);
     let or_names: Vec<&str> = or_entries.iter().map(|p| p.name.as_str()).collect();
     assert!(or_names.contains(&"ORb-target-page") && or_names.contains(&"OR 专题"));
-    let or_blocks = QueryPlan::block_search_literal("OR", 20).execute(&graph, || false);
+    let or_blocks = ready_query::when_ready(|| graph.search("OR", 20));
     assert!(
         or_blocks
-            .hits
             .iter()
-            .any(|h| matches!(h, QueryHit::Block { display_text, .. } if display_text.contains("ORb target"))),
+            .flat_map(|group| &group.blocks)
+            .any(|block| block.raw.contains("ORb target")),
         "(( picker treats 'OR' literally"
     );
 

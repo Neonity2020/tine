@@ -999,8 +999,16 @@ fn search_cache_reflects_saves_and_deletes() {
     std::fs::write(root.join("pages").join("Seed.md"), "- a seed block\n").unwrap();
 
     let g = Graph::open(&root);
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
     // Warms the cache on first search.
-    assert_eq!(g.search("zonkwort", 10).len(), 0, "token absent initially");
+    assert_eq!(
+        g.search("zonkwort", 10).unwrap().len(),
+        0,
+        "token absent initially"
+    );
 
     // Saving a page with the token must be visible to a subsequent search
     // without any disk re-scan (cache upsert).
@@ -1010,7 +1018,10 @@ fn search_cache_reflects_saves_and_deletes() {
         title: "Fresh".into(),
         pre_block: None,
         blocks: vec![BlockDto {
-            id: "x".into(),
+            // A real UUID, not a placeholder: the projection refuses a block
+            // with no assigned runtime UUID, so `id: "x"` made the save fail to
+            // index and left every later read permanently NotReady.
+            id: "6f1c0a2e-6f3a-4b1e-9a11-2c3d4e5f6a7b".into(),
             raw: "contains zonkwort here".into(),
             ..Default::default()
         }],
@@ -1022,14 +1033,19 @@ fn search_cache_reflects_saves_and_deletes() {
         guide: false,
     };
     g.save_page(&page, None).unwrap();
-    let hits = g.search("zonkwort", 10);
+    // A save makes the projection stale for a moment; the typed readiness error
+    // is the public signal to wait on, exactly as the app does. Retrying it
+    // preserves what this test asserts and hides nothing: `when_ready` fails the
+    // fixture immediately on any error that is not `NotReady`.
+    ready_query::when_search_hits(&g, "zonkwort", 1);
+    let hits = g.search("zonkwort", 10).unwrap();
     assert_eq!(hits.len(), 1, "saved page should be searchable");
     assert_eq!(hits[0].page, "Fresh");
 
     // Deleting the page removes it from the cache too.
     g.delete_page("Fresh", PageKind::Page).unwrap();
     assert_eq!(
-        g.search("zonkwort", 10).len(),
+        ready_query::when_search_hits(&g, "zonkwort", 0),
         0,
         "deleted page should drop out"
     );
@@ -1102,6 +1118,10 @@ fn search_ignores_hidden_property_metadata() {
     std::fs::create_dir_all(root.join("journals")).unwrap();
     std::fs::create_dir_all(root.join("pages")).unwrap();
     let g = Graph::open(&root);
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
 
     // A block whose only occurrence of "qzxmeta" is in a property line (like an
     // id:: uuid or hl-color::) must NOT match — the user can't see it.
@@ -1111,7 +1131,8 @@ fn search_ignores_hidden_property_metadata() {
         title: "Meta".into(),
         pre_block: None,
         blocks: vec![BlockDto {
-            id: "x".into(),
+            // A real UUID, for the same reason as above.
+            id: "b2d4f6a8-1c3e-4a5b-8d7f-9e0a1b2c3d4e".into(),
             raw: "a perfectly ordinary block\nsome-prop:: qzxmeta".into(),
             ..Default::default()
         }],
@@ -1123,16 +1144,19 @@ fn search_ignores_hidden_property_metadata() {
         guide: false,
     };
     g.save_page(&page, None).unwrap();
+    // The save leaves the projection briefly stale; wait on the typed readiness
+    // signal rather than unwrapping it. Order matters: gate on the positive
+    // assertion FIRST, so the negative one below cannot pass merely because the
+    // index had not caught up yet.
     assert_eq!(
-        g.search("qzxmeta", 10).len(),
-        0,
-        "token only in a property line should not be a search hit"
-    );
-    // But the visible body is still searchable.
-    assert_eq!(
-        g.search("ordinary", 10).len(),
+        ready_query::when_search_hits(&g, "ordinary", 1),
         1,
         "visible body still matches"
+    );
+    assert_eq!(
+        g.search("qzxmeta", 10).unwrap().len(),
+        0,
+        "token only in a property line should not be a search hit"
     );
 
     std::fs::remove_dir_all(&root).ok();
@@ -1307,8 +1331,12 @@ fn save_refuses_to_clobber_external_change() {
     std::fs::write(&path, "- one").unwrap();
 
     let g = Graph::open(&root);
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
     // Build the cache (Tine now "knows" N = "- one"), then load it for editing.
-    g.search("one", 10);
+    g.search("one", 10).unwrap();
     let mut dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
     as_editor(&g, &mut dto);
 
@@ -1340,7 +1368,11 @@ fn save_conflicts_when_file_deleted_externally() {
     let path = root.join("pages").join("N.md");
     std::fs::write(&path, "- one").unwrap();
     let g = Graph::open(&root);
-    g.search("one", 10); // warm cache
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
+    g.search("one", 10).unwrap(); // warm cache
     let dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
 
     // The file is deleted on disk (Syncthing / Logseq) after we loaded it.
@@ -1439,7 +1471,11 @@ fn sync_file_detects_external_change_and_suppresses_self() {
     std::fs::write(&path, "- before").unwrap();
 
     let g = Graph::open(&root);
-    g.search("before", 10); // build the cache (S = "- before")
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
+    g.search("before", 10).unwrap(); // build the cache (S = "- before")
 
     // No external change yet → sync reports nothing.
     assert!(g.sync_file(&path).is_none());
@@ -1449,12 +1485,17 @@ fn sync_file_detects_external_change_and_suppresses_self() {
     let changed = g.sync_file(&path).expect("external change detected");
     assert_eq!(changed.name, "S");
     assert_eq!(changed.kind, PageKind::Page);
+    // A read is answered only at the current generation, so after a mutation the
+    // public route reports `NotReady` until the projection catches up. Gate on
+    // that typed signal instead of racing it. The positive assertion goes first
+    // deliberately: it is the one that proves the new content arrived, so the
+    // negative assertions below cannot pass merely because nothing had landed.
     assert_eq!(
-        g.search("after", 10).len(),
+        ready_query::when_search_hits(&g, "after", 1),
         1,
         "cache updated to new content"
     );
-    assert_eq!(g.search("before", 10).len(), 0);
+    assert_eq!(g.search("before", 10).unwrap().len(), 0);
 
     // Re-syncing the same content is a no-op (self-write suppression).
     assert!(g.sync_file(&path).is_none());
@@ -1462,7 +1503,7 @@ fn sync_file_detects_external_change_and_suppresses_self() {
     // Deletion is reported and drops it from the cache.
     std::fs::remove_file(&path).unwrap();
     assert!(g.forget_file(&path).is_some());
-    assert_eq!(g.search("after", 10).len(), 0);
+    assert_eq!(ready_query::when_search_hits(&g, "after", 0), 0);
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1478,7 +1519,11 @@ fn noop_save_does_not_bump_cache_generation() {
     let root = std::env::temp_dir().join(format!("tine-noopgen-{}", std::process::id()));
     std::fs::create_dir_all(root.join("pages")).unwrap();
     let g = Graph::open(&root);
-    g.search("x", 10); // build the cache
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
+    g.search("x", 10).unwrap(); // build the cache
     let mk = |raw: &str| PageDto {
         name: "N".into(),
         kind: PageKind::Page,
@@ -1529,7 +1574,11 @@ fn self_write_marker_does_not_outlive_its_save() {
     let root = std::env::temp_dir().join(format!("tine-marker-life-{}", std::process::id()));
     std::fs::create_dir_all(root.join("pages")).unwrap();
     let g = Graph::open(&root);
-    g.search("x", 10);
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
+    g.search("x", 10).unwrap();
     let page = PageDto {
         name: "C".into(),
         kind: PageKind::Page,
@@ -1573,7 +1622,11 @@ fn disk_rev_fast_path_is_fresh_and_detects_external_change() {
     let root = std::env::temp_dir().join(format!("tine-diskrev-{}", std::process::id()));
     std::fs::create_dir_all(root.join("pages")).unwrap();
     let g = Graph::open(&root);
-    g.search("x", 10); // build the cache
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
+    g.search("x", 10).unwrap(); // build the cache
     let page = PageDto {
         name: "R".into(),
         kind: PageKind::Page,
@@ -1630,7 +1683,11 @@ fn self_write_is_not_reported_as_external_change() {
     let root = std::env::temp_dir().join(format!("tine-selfwrite-{}", std::process::id()));
     std::fs::create_dir_all(root.join("pages")).unwrap();
     let g = Graph::open(&root);
-    g.search("x", 10); // build the cache
+    // `search` answers from the projection now, so a bare graph has nothing to
+    // read. Provision one exactly as the other query fixtures here do; its own
+    // `warm_cache` is the cache-building this test already relied on.
+    ready_query::attach_projection(&g, &root);
+    g.search("x", 10).unwrap(); // build the cache
 
     let path = root.join("pages").join("W.md");
     let page = PageDto {

@@ -510,6 +510,46 @@ impl ManagedQueryShared {
         execute_managed_query(capture, &self.jobs, &self.census, self.job_wait())
     }
 
+    pub(crate) fn execute_friendly(
+        &self,
+        capture: &ManagedReadCapture,
+        plan: &crate::query_plan::QueryPlan,
+        explain: bool,
+        lane: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<crate::query_plan::QueryExecution, ManagedQueryOutcome> {
+        let answer = with_managed_read(
+            capture.job_epoch,
+            &capture.read_input(),
+            &self.jobs,
+            self.job_wait(),
+            |mut opened| {
+                crate::query::friendly::read_friendly_results(
+                    &mut opened.snapshot,
+                    &crate::query::friendly::FriendlyReadInputs {
+                        plan,
+                        graph_root: &capture.graph_root,
+                        identity: &ResultIdentity::Stored,
+                        explain,
+                        lane,
+                    },
+                )
+                .map_err(|error| match error {
+                    ResultReadError::Cancelled => ManagedQueryOutcome::Cancelled,
+                    ResultReadError::Sql(_) => {
+                        ManagedQueryOutcome::Failed("managed Friendly statement")
+                    }
+                    ResultReadError::Corrupt(_) => {
+                        ManagedQueryOutcome::Failed("managed Friendly result rows")
+                    }
+                })
+            },
+        );
+        if answer.is_ok() {
+            self.census.note_statement_read();
+        }
+        answer
+    }
+
     pub(crate) fn execute_export(
         &self,
         capture: &ManagedReadCapture,

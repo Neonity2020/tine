@@ -107,13 +107,6 @@ const NON_OWNED_DRAINS: &[DrainOwner] = &[
     },
     DrainOwner {
         file: "crates/tine-core/src/sync_runtime.rs",
-        enclosing_symbol: "application_fuzzy_candidate_paths_ready",
-        read_family: "fuzzy_subsequence_candidate_pages_after",
-        question: "managed fuzzy candidates",
-        retirement_owner: "W4-C7b",
-    },
-    DrainOwner {
-        file: "crates/tine-core/src/sync_runtime.rs",
         enclosing_symbol: "application_navigation_pages_ready",
         read_family: "navigation_pages_after",
         question: "managed navigation pages",
@@ -177,7 +170,6 @@ fn hand_written_cursor_drains_are_pinned() {
     for symbol in [
         "property_facets",
         "referenced_page_names",
-        "fuzzy_candidate_paths",
         "page_aliases_with_owners",
         "real_page_names",
         "reference_candidate_paths",
@@ -201,10 +193,14 @@ fn hand_written_cursor_drains_are_pinned() {
     // candidate route — along with the query walk it handed its candidates to.
     // Its `task_candidate_locators_after` drain went with it, and so did its
     // row in the per-symbol list above. No surviving consumer changed.
+    // 12 → 11: Q1 deleted `fuzzy_candidate_paths` — the Direct Friendly
+    // candidate route — along with parsed-page ranking. Its
+    // `fuzzy_subsequence_candidate_pages_after` drain went with it, and so did
+    // its row above. No surviving consumer changed.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        12,
-        "I-12: the twelve owned Direct cursor consumers must each delegate to drain_after"
+        11,
+        "I-12: the eleven owned Direct cursor consumers must each delegate to drain_after"
     );
 
     for allowed in NON_OWNED_DRAINS {

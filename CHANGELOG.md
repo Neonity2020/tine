@@ -146,6 +146,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Tine also tells you how many blocks disagree with it, which is usually a
   typo you wanted to find.
 
+- **Search and the page switcher tell you when they are still catching up.**
+  Whole-graph search, the Ctrl-K page switcher and the `((` block picker now read
+  their answers from the same index the rest of Tine queries, instead of
+  re-reading and re-parsing your pages for every keystroke. On a large graph that
+  is the difference between a search that stalls and one that returns. Two things
+  change on screen. While the index is still being built — right after opening a
+  graph, or in the moment after a save — the switcher says it is searching rather
+  than showing an empty list, and if it genuinely cannot answer it says so and
+  offers to retry, instead of silently reporting that nothing matched. An empty
+  result now means "nothing matches", and only that.
+
 ### Fixed
 
 - **A query and a board no longer disagree about what `group by state` means.**

@@ -1,4 +1,5 @@
-import { For, Show, createSignal, createResource, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
+import { runQueryWhenReady } from "../queryReadiness";
 import { backend } from "../backend";
 import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
@@ -95,26 +96,50 @@ export function QuickSwitcher(): JSX.Element {
   onCleanup(() => clearTimeout(qTimer));
   // Fetch OG's complete ranked pools once per query. Presentation paging below
   // changes only the rendered slice and therefore does not trigger another scan.
-  const [graphResults] = createResource(
-    () => (commandsOnly() ? null : {
+  const [graphResults, setGraphResults] = createSignal<Awaited<ReturnType<ReturnType<typeof backend>["runGraphSearch"]>>>();
+  const [searchPending, setSearchPending] = createSignal<string | null>(null);
+  const [searchError, setSearchError] = createSignal<string | null>(null);
+  const [searchRetry, setSearchRetry] = createSignal(0);
+  let searchRequest = 0;
+  createEffect(() => {
+    searchRetry();
+    const open = switcherOpen();
+    const raw = query();
+    const commands = commandsOnly();
+    const s = {
       q: debouncedQuery(),
       pages: currentPageOnly() ? 0 : PAGE_POOL,
       blocks: BLOCK_POOL,
       scope: currentPageScope(),
       graphRoot: graphMeta()?.root ?? "",
       graphBinding: graphBinding(),
-    }),
-    (s) => s && s.q.trim()
-      ? backend().runGraphSearch(
+    };
+    const mine = ++searchRequest;
+    const controller = new AbortController();
+    onCleanup(() => controller.abort());
+    setGraphResults(undefined);
+    setSearchError(null);
+    setSearchPending(null);
+    if (!open || commands || !raw.trim()) return;
+    setSearchPending("Searching…");
+    if (raw !== s.q) return;
+    const isCurrent = () => mine === searchRequest && !controller.signal.aborted;
+    void runQueryWhenReady(() => backend().runGraphSearch(
           s.q,
           s.pages,
           s.blocks,
           s.scope ? "quick-switch:current-page" : "quick-switch",
           false,
           s.scope ?? undefined,
-        )
-      : Promise.resolve({ hits: [], diagnostics: [], explanation: { branches: [] }, has_more: { pages: false, blocks: false }, cancelled: false })
-  );
+        ), {
+      signal: controller.signal,
+      isCurrent,
+      onPending: (error) => setSearchPending(error ? "Indexing — waiting for search to be ready…" : null),
+    }).then((answer) => { if (isCurrent()) setGraphResults(answer); })
+      .catch((error: unknown) => {
+        if (isCurrent()) setSearchError(error instanceof Error ? error.message : String(error));
+      });
+  });
 
   const currentPageName = () => {
     const scope = currentPageScope();
@@ -621,7 +646,9 @@ export function QuickSwitcher(): JSX.Element {
                 {graphResults()!.diagnostics.map((diagnostic) => diagnostic.message).join(" · ")}
               </div>
             </Show>
-            <Show when={query().trim() && flat().length === 0 && !(graphResults()?.diagnostics.length ?? 0)}>
+            <Show when={searchPending()}><div class="switcher-empty" role="status">{searchPending()}</div></Show>
+            <Show when={searchError()}><div class="switcher-empty switcher-error" role="alert">{searchError()} <button onClick={() => setSearchRetry((n) => n + 1)}>Retry search</button></div></Show>
+            <Show when={query().trim() && !searchPending() && !searchError() && flat().length === 0 && !(graphResults()?.diagnostics.length ?? 0)}>
               <div class="switcher-empty">No matched results</div>
             </Show>
           </div>

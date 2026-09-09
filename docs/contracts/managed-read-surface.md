@@ -26,6 +26,7 @@ adapter call edges.
 | application_block_reference_counts_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Merges Managed reference-count index and overlay. |
 | application_block_referrers_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Merges Managed referrer index and hydrated pages. |
 | application_captured_export | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side bounded capture/retry adapter. Shared PreparedExportBatch performs selection and subtree construction on one current main SQLite snapshot outside the actor; no pending merge or save progression. |
+| application_captured_friendly | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side GraphSearch/BlockSearch driver: shared Friendly reader on captured current main SQLite, off actor, with bounded stale recapture and typed failures. |
 | application_captured_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed driver for every captured public query command: one current main SQLite snapshot with `operation` released; bounded stale recapture, typed readiness, cancellation and failure, no traversal. |
 | application_captured_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Actor half of `query_run`/`query_explain_empty`/advanced datalog: §4.4 binding, actual main-frontier stamp, and optional immutable shared-registry capture. |
 | application_captured_registry | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side PUBLIC `query_registry` driver over the same one-main-snapshot acquisition a result query uses; bounded stale recapture and typed cancellation/read failure. |
@@ -35,8 +36,6 @@ adapter call edges.
 | application_editor_blocks_new | `crates/tine-core/src/sync_runtime.rs` | adapter | application_editor_blocks | New-save generated-key policy delegates to the shared builder. |
 | application_equivalent_page_names_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | equivalent_page_names | Supplies Managed name-index candidates to the shared equivalence rule. |
 | application_from_clean_foreground_commit | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Converts a Managed foreground commit result. |
-| application_fuzzy_candidate_paths_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed fuzzy-name index boundary. |
-| application_graph_search_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed search index and pending-overlay merge. |
 | application_hydration_cache_budget_for_available | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed hydration-cache resource boundary. |
 | application_hydration_retained_bytes | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed hydration-cache accounting boundary. |
 | application_inventory_of_kind_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed kind-filtered inventory index. |
@@ -70,7 +69,6 @@ adapter call edges.
 | application_projection_roots | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Owns the cached complete DocBlock view for a Managed page. |
 | application_property_facets_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed property-facet index plus overlay. |
 | application_query_page_recency | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Computes recency from Managed path and graph config. |
-| application_query_plan_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed query-plan/index preparation boundary. |
 | application_request | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed application request boundary. |
 | application_resolve_blocks_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Materializes resolved Managed UUID groups. |
 | application_simple_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed simple-query driver: off-actor execution over one current main SQLite snapshot, with bounded stale recapture and typed errors. |

@@ -48,6 +48,7 @@ fn read(
             graph_root: &corpus.root,
             identity,
             explain: true,
+            lane: None,
         },
     );
     snapshot.finish();
@@ -246,6 +247,7 @@ fn cancellation_between_payload_batches_returns_no_partial_execution() {
             graph_root: &corpus.root,
             identity: &ResultIdentity::Stored,
             explain: true,
+            lane: None,
         },
     );
     set_before_payload_batch_hook(None);
@@ -271,6 +273,7 @@ fn cancellation_inside_rank_and_before_ancestor_work_returns_no_partial_executio
             graph_root: &corpus.root,
             identity: &ResultIdentity::Stored,
             explain: true,
+            lane: None,
         },
     );
     set_before_friendly_rank_hook(None);
@@ -288,6 +291,7 @@ fn cancellation_inside_rank_and_before_ancestor_work_returns_no_partial_executio
             graph_root: &corpus.root,
             identity: &ResultIdentity::Stored,
             explain: true,
+            lane: None,
         },
     );
     set_before_ancestor_batch_hook(None);
@@ -354,6 +358,7 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
                 graph_root: &corpus.root,
                 identity: &ResultIdentity::Stored,
                 explain: true,
+                lane: None,
             },
         );
         assert!(matches!(answer, Err(ResultReadError::Corrupt(_))));

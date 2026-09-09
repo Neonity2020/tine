@@ -82,6 +82,34 @@ pub fn when_ready<T>(mut attempt: impl FnMut() -> Result<T, QueryExecutionError>
     }
 }
 
+/// `Graph::search` after a mutation, waiting for the answer to reflect it.
+///
+/// `when_ready` alone is not enough here. It retries the typed `NotReady`
+/// signal, but a read taken just after a save can also come back `Ok` at the
+/// generation BEFORE the save, so a fixture that asserts the new content
+/// straight away is racing the projection under load rather than observing it.
+/// This waits for the expected hit count, and fails with the count it actually
+/// saw so a real regression still reads as one.
+///
+/// Use it only for a transition a mutation is supposed to cause. An assertion
+/// that a token must NEVER match is not a transition: waiting for it would just
+/// wait for the first sample and prove nothing, so make those reads plain, and
+/// order them AFTER a transition this helper has already observed.
+pub fn when_search_hits(graph: &Graph, needle: &str, expected: usize) -> usize {
+    let started = Instant::now();
+    loop {
+        let hits = when_ready(|| graph.search(needle, 10)).len();
+        if hits == expected {
+            return hits;
+        }
+        assert!(
+            started.elapsed() < READY_TIMEOUT,
+            "search for {needle:?} never reached {expected} hits (last saw {hits})"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// `Graph::run_query` through the readiness gate.
 pub fn run_query(graph: &Graph, source: &str) -> Arc<Vec<RefGroup>> {
     when_ready(|| graph.run_query(source))
