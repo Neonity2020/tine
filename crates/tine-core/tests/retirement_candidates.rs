@@ -10,8 +10,10 @@
 //! The convention's first deliberate use was the `simple_query_candidate_paths`
 //! hatch in `direct_projection.rs`, and it worked exactly as intended: RET2
 //! deleted the Direct query walk, the hatch's stated CONDITION was met, and the
-//! hatch, its marker and this row all went with it. The surviving exemplar is
-//! the pre-SQL candidate planner in `query.rs`. Copy its shape: WHAT may be
+//! hatch, its marker and this row all went with it. The pre-SQL candidate
+//! planner in `query.rs` retired the same way once the SQL route took over its
+//! work. The surviving exemplar is the in-memory query walk, also in
+//! `query.rs`. Copy its shape: WHAT may be
 //! deleted, the CONDITION that makes it deletable, and WHAT CURRENTLY BLOCKS
 //! deletion — the last being the part a future sweep actually needs, because a
 //! marker that only says "delete me eventually" tells the sweep nothing about
@@ -31,16 +33,10 @@ const MARKER: &str = "// RETIREMENT-CANDIDATE:";
 
 /// The exact `(file, first line of the marker)` set. Adding or removing a row
 /// is the deliberate act this guard exists to force.
-const PINNED: &[(&str, &str)] = &[
-    (
-        "crates/tine-core/src/query.rs",
-        "// RETIREMENT-CANDIDATE: the pre-SQL candidate planner for the walk.",
-    ),
-    (
-        "crates/tine-core/src/query.rs",
-        "// RETIREMENT-CANDIDATE: the in-memory query walk.",
-    ),
-];
+const PINNED: &[(&str, &str)] = &[(
+    "crates/tine-core/src/query.rs",
+    "// RETIREMENT-CANDIDATE: the in-memory query walk.",
+)];
 
 fn markers() -> BTreeSet<(String, String)> {
     let root = repo_root();
@@ -83,7 +79,7 @@ fn retirement_candidate_markers_are_pinned() {
          Adding a marker and deleting one are both deliberate acts, so both \
          update this list. If you deleted the code, delete its row. If you \
          added a marker, add its row and copy the exemplar's shape: \
-         `crates/tine-core/src/query.rs`, on the pre-SQL candidate planner.\n\
+         `crates/tine-core/src/query.rs`, on the in-memory query walk.\n\
          \n\
          I-12: this census uses the one production-source scanner \
          (`tests/support/production_source.rs`); do not add a second walker."

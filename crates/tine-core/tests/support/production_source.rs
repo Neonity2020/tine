@@ -12,7 +12,10 @@
 //!   * `crates/*/src` and `src-tauri/src`;
 //!   * NOT `src/bin/**` — standalone CLI binaries own their own terminal
 //!     output and are not part of the application;
-//!   * NOT a `*_tests.rs` file that a sibling pulls in under `#[cfg(test)]`;
+//!   * NOT a file that is reachable only through `#[cfg(test)]` module
+//!     declarations, wherever in the repository they are written and however
+//!     many hops away — a `*_tests.rs` file that itself declares further
+//!     modules passes its test-only-ness on to them;
 //!   * NOT a trailing `#[cfg(test)] mod tests { .. }`, nor any other
 //!     `#[cfg(test)]` or `#[cfg(all(test, ..))]` region — those are blanked in
 //!     place, so line numbers stay true to the file on disk. `#[cfg(not(test))]`
@@ -56,32 +59,173 @@ pub fn collect_rs_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-pub fn test_only_include(path: &Path) -> bool {
-    let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
+/// Where a `mod` declaration in `declarer` pulls its source from, and whether
+/// the declaration itself is gated to `cfg(test)`.
+struct ModuleDeclaration {
+    target: PathBuf,
+    cfg_test: bool,
+}
+
+/// Normalise away `.` and `..` without touching the filesystem: `#[path]` is
+/// resolved against a directory that always exists, and a symlinked source tree
+/// is not a shape this repository has.
+fn normalize(path: PathBuf) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_os_string()),
+        }
+    }
+    parts.iter().collect()
+}
+
+/// Every `mod` declaration a file makes, resolved to the file it compiles.
+///
+/// Two resolution rules, and they are NOT the same directory — getting this
+/// wrong is what let five test-only `eprintln!` sites into the print census:
+///   * `#[path = "REL"]` is relative to the directory holding the DECLARING
+///     file, so `src/query.rs` reaching `#[path = "query/oracle_gate1_tests.rs"]`
+///     lands on `src/query/oracle_gate1_tests.rs`;
+///   * a plain `mod name;` is relative to the declaring file's own module
+///     directory — the parent for a `lib.rs`/`main.rs`/`mod.rs` root, otherwise
+///     the sibling directory named after the file.
+///
+/// A visibility on the declaration (`pub(crate) mod gates_tests;`, so a sibling
+/// test module can reuse the harness) says nothing about gating: the
+/// `#[cfg(test)]` above it is what decides. Missing that once counted R3's 25
+/// gate `eprintln!` sites as production print sites.
+fn module_declarations(declarer: &Path, source: &str) -> Vec<ModuleDeclaration> {
+    static DECLARATION: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let declaration = DECLARATION.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?P<cfg>#\[cfg\((?:test\)|all\(\s*test\b)[^\n]*\]\s*)?(?:#\[path\s*=\s*"(?P<path>[^"]+)"\]\s*)?(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>\w+)\s*;"#,
+        )
+        .unwrap()
+    });
+    let Some(directory) = declarer.parent() else {
+        return Vec::new();
     };
-    // Compilation follows the module declaration, even when an oracle keeps
-    // its original filename after its production consumers have retired.
-    let stem = file.trim_end_matches(".rs");
-    let escaped_file = regex::escape(file);
-    let escaped_stem = regex::escape(stem);
-    // A visibility on the declaration (`pub(crate) mod gates_tests;`, so a
-    // sibling test module can reuse the harness) does not make the include any
-    // less test-only: the `#[cfg(test)]` above it is what decides. Without
-    // this the R3 `pub(crate) mod sql_gates_tests;` counted 25 gate `eprintln!`
-    // sites as production print sites.
-    let include = Regex::new(&format!(
-        r#"(?m)^#\[cfg\(test\)\]\s*\n(?:#\[path\s*=\s*"{escaped_file}"\]\s*\n(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+;|(?:pub(?:\([^)]*\))?\s+)?mod\s+{escaped_stem};)"#
-    ))
-    .unwrap();
-    fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
-        let sibling = entry.unwrap().path();
-        sibling != path
-            && sibling
-                .extension()
+    let stem = declarer.file_stem().and_then(|stem| stem.to_str());
+    let module_directory = match stem {
+        Some("lib") | Some("main") | Some("mod") | None => directory.to_path_buf(),
+        Some(stem) => directory.join(stem),
+    };
+    declaration
+        .captures_iter(source)
+        .map(|found| {
+            let cfg_test = found.name("cfg").is_some();
+            let target = match found.name("path") {
+                Some(relative) => directory.join(relative.as_str()),
+                None => {
+                    let name = &found["name"];
+                    let flat = module_directory.join(format!("{name}.rs"));
+                    if flat.is_file() {
+                        flat
+                    } else {
+                        module_directory.join(name).join("mod.rs")
+                    }
+                }
+            };
+            ModuleDeclaration {
+                target: normalize(target),
+                cfg_test,
+            }
+        })
+        .collect()
+}
+
+/// Files that `candidates` can only reach through `#[cfg(test)]`.
+///
+/// Test-only-ness is TRANSITIVE, so this is a least fixed point rather than a
+/// per-file question: seed with the directly gated includes, then keep
+/// absorbing whatever only a test-only file declares, until nothing new
+/// arrives. A production declarer keeps a file out of the set even when a test
+/// module also pulls it in.
+fn test_only_within(candidates: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    let mut declarers_of: std::collections::HashMap<PathBuf, Vec<(PathBuf, bool)>> =
+        std::collections::HashMap::new();
+    for file in candidates {
+        let Ok(source) = fs::read_to_string(file) else {
+            continue;
+        };
+        for declaration in module_declarations(file, &source) {
+            declarers_of
+                .entry(declaration.target)
+                .or_default()
+                .push((file.clone(), declaration.cfg_test));
+        }
+    }
+    let mut test_only: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    loop {
+        let mut grew = false;
+        for (target, declarers) in &declarers_of {
+            if test_only.contains(target) {
+                continue;
+            }
+            if declarers
+                .iter()
+                .all(|(declarer, cfg_test)| *cfg_test || test_only.contains(declarer))
+            {
+                test_only.insert(target.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    test_only
+}
+
+/// Every `.rs` file directly inside `directory`.
+fn rs_files_beside(directory: Option<&Path>) -> Vec<PathBuf> {
+    let Some(directory) = directory else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            path.extension()
                 .is_some_and(|extension| extension == "rs")
-            && include.is_match(&fs::read_to_string(sibling).unwrap())
-    })
+                .then_some(path)
+        })
+        .collect()
+}
+
+/// Whether a shipped binary never compiles this file because every route to it
+/// passes through `#[cfg(test)]`.
+///
+/// The search must be REPOSITORY-WIDE, because neither the declaration nor its
+/// gating is visible from the included file or from its own directory.
+/// `src/query.rs` declares its two oracle modules from the directory ABOVE
+/// them, and `sync_runtime_tests.rs` declares `mod rebaselining_layout;` with
+/// no `#[cfg(test)]` of its own — it does not need one, being itself reached
+/// only under `cfg(test)`. A per-file sibling scan misses both shapes and
+/// reports their `eprintln!` calls as production print sites, which is exactly
+/// what it did.
+pub fn test_only_include(path: &Path) -> bool {
+    static REPOSITORY: std::sync::OnceLock<std::collections::HashSet<PathBuf>> =
+        std::sync::OnceLock::new();
+    let path = normalize(path.to_path_buf());
+    if path.starts_with(repo_root()) {
+        return REPOSITORY
+            .get_or_init(|| test_only_within(&production_source_files()))
+            .contains(&path);
+    }
+    // A file outside the scanned source roots: the scanner's own unit tests
+    // fabricate one in a temp directory. Its only possible declarers are the
+    // files beside it and one directory up, which is where both `mod` forms
+    // can name it from.
+    let mut candidates = rs_files_beside(path.parent());
+    candidates.extend(rs_files_beside(path.parent().and_then(Path::parent)));
+    test_only_within(&candidates).contains(&path)
 }
 
 pub fn compiled_source(path: &Path) -> String {
