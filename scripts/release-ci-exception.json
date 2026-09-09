@@ -2,7 +2,6 @@
   "schemaVersion": 1,
   "releaseVersion": "0.6.982",
   "linuxAdditionalKnownRedTestNames": [
-    "sync_runtime::tests::managed_graph_search_accounts_for_pending_overlay_metadata_separately",
     "sync_runtime::tests::over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor"
   ],
   "retiredManagedV1AllowedProblems": [

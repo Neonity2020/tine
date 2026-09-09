@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   LINUX_CORE_RELEASE_FILTERSET,
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
@@ -328,5 +331,61 @@ assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_live_gr
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_direct_publication_event_waits_for_inflight_writer_receipt\)/);
 assert.doesNotMatch(WINDOWS_CORE_SMOKE_FILTERSET, /all\(\)|fast_commit/);
 assert.equal(LINUX_TINE_CORE_SHARD_COUNT, 4);
+
+// A ledger that excludes a test BY NAME must name a test that exists. The
+// release-selection contract already proves this, but only in hosted CI and only
+// after a full compile, so a rename can ride master for a whole campaign first.
+// Not hypothetical: Q1 of the query campaign renamed
+// managed_graph_search_accounts_for_pending_overlay_metadata_separately and left
+// the release ledger naming the dead test. The filterset term test(=<dead name>)
+// then excludes nothing, the observed exclusion set stops matching the contract,
+// and EVERY master push fails on a message about an exclusion contract rather
+// than about the rename that caused it. This scan is the cheap local copy of
+// that proof: it runs with no cargo build at all.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const coreSourceRoot = path.join(repoRoot, "crates/tine-core/src");
+const coreSourceText = fs
+  .readdirSync(coreSourceRoot, { recursive: true })
+  .filter((entry) => typeof entry === "string" && entry.endsWith(".rs"))
+  .map((entry) => fs.readFileSync(path.join(coreSourceRoot, entry), "utf8"))
+  .join("\n");
+const declaredCoreTestFns = new Set(
+  [...coreSourceText.matchAll(/\bfn\s+([A-Za-z0-9_]+)\s*\(/g)].map((match) => match[1])
+);
+for (const [ledger, names] of [
+  ["KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES in tine-core-nextest-contract.mjs", KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES],
+  ["linuxAdditionalKnownRedTestNames in release-ci-exception.json", ONE_RELEASE_CI_EXCEPTION.linuxAdditionalKnownRedTestNames],
+]) {
+  const rotted = names.filter((name) => !declaredCoreTestFns.has(name.split("::").pop()));
+  assert.deepEqual(
+    rotted,
+    [],
+    `${ledger} names ${rotted.length} test(s) that crates/tine-core/src no longer declares: `
+      + `${rotted.join(", ")}. An exclusion by name excludes nothing once the name is dead, which `
+      + "breaks the Linux release exclusion contract on every master push. Update the ledger in "
+      + "the same commit as the rename, and when a test has recovered drop its name outright "
+      + "rather than carrying a green name forward as known-red."
+  );
+}
+// The Windows waiver subtracts from the required set, so its invariant is
+// containment, not existence: you can only waive something that is required.
+// (The four names it waives are oplog tests that moved to the tine-storage
+// crate; WINDOWS_CORE_EXACT_TEST_NAMES still lists them and the waiver is what
+// keeps the Windows gate green. That is real rot in the Windows release
+// contract, tracked separately -- it is not what this scan is for.)
+const ordinaryWindowsRequired = new Set([
+  ...WINDOWS_CORE_EXACT_TEST_NAMES,
+  ...WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
+  ...WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
+]);
+const unrequiredWaivers = ONE_RELEASE_CI_EXCEPTION.windowsMissingRequiredTestNames.filter(
+  (name) => !ordinaryWindowsRequired.has(name)
+);
+assert.deepEqual(
+  unrequiredWaivers,
+  [],
+  `windowsMissingRequiredTestNames waives ${unrequiredWaivers.join(", ")}, which the Windows `
+    + "required set does not contain, so the waiver subtracts nothing and hides its own staleness."
+);
 
 console.log("tine-core nextest contract fixture tests passed.");
