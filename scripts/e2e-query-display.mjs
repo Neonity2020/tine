@@ -529,10 +529,29 @@ await withApp(0, async (browser) => {
   await waitForProperty(browser, "Scoped", "tine.block-display", "1");
   await waitForProperty(browser, "Scoped", "tine.page-view", "table");
   await closeDisplay(browser);
-  const bothFaces = await browser.execute(() => ({
-    page: document.querySelector('[data-query-result-kind="page"] .query-results-table') ? "table" : null,
-    block: document.querySelector('[data-query-result-kind="block"] .query-results-board') ? "board" : null,
-  }));
+  const bothFaces = await browser.execute(() => {
+    // The verdict is the two class names. The rest is here so a failure says
+    // WHICH of the two ways this can go wrong happened: a family that rendered
+    // the wrong face, or a family with no rows to render one for at all.
+    const section = (kind) => document.querySelector(`[data-query-result-kind="${kind}"]`);
+    const shown = (kind) => {
+      const host = section(kind);
+      if (!host) return "no such section";
+      for (const face of ["board", "table", "list", "search"]) {
+        if (host.querySelector(`.query-results-${face}`)) return face;
+      }
+      return host.querySelector(".query-result-section-empty")?.textContent?.trim() ?? "nothing";
+    };
+    return {
+      page: document.querySelector('[data-query-result-kind="page"] .query-results-table') ? "table" : null,
+      block: document.querySelector('[data-query-result-kind="block"] .query-results-board') ? "board" : null,
+      shows: { page: shown("page"), block: shown("block") },
+      counts: {
+        page: section("page")?.querySelector(".query-result-section-count")?.textContent?.trim() ?? null,
+        block: section("block")?.querySelector(".query-result-section-count")?.textContent?.trim() ?? null,
+      },
+    };
+  });
   if (bothFaces.page !== "table" || bothFaces.block !== "board") {
     fail(`the two families do not render their own presentations: ${JSON.stringify(bothFaces)}`);
   }
