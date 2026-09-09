@@ -12,6 +12,8 @@ use crate::doc::property_key_norm;
 use crate::query::registry::{is_internal_key, Registry};
 use crate::query::{QueryExecutionError, QueryUnavailableReason};
 
+pub(crate) type SharedRegistryCache = Arc<std::sync::Mutex<CommittedRegistryCache>>;
+
 struct Published {
     revision: u64,
     registry: Arc<Registry>,
@@ -202,12 +204,6 @@ impl RegistryCapture {
         snapshot: &mut PhysicalProjectionQuerySnapshot,
         config: &ParseConfig,
     ) -> Result<Arc<Registry>, QueryExecutionError> {
-        if snapshot.cancellation().is_cancelled() {
-            return Err(QueryExecutionError::Cancelled);
-        }
-        if config.digest() != self.config {
-            return Err(invalid());
-        }
         let revision = snapshot.query_revision().map_err(|error| {
             if snapshot.cancellation().is_cancelled() {
                 QueryExecutionError::Cancelled
@@ -220,6 +216,24 @@ impl RegistryCapture {
                 QueryExecutionError::Unavailable(QueryUnavailableReason::ReadFailed)
             }
         })?;
+        self.build_at_validated_revision(snapshot, config, revision)
+    }
+
+    /// Managed callers pass the acceptance sequence already validated by
+    /// `open_managed` inside this exact snapshot. It is distinct from the
+    /// disposable physical query revision Direct reads above.
+    pub(crate) fn build_at_validated_revision(
+        &self,
+        snapshot: &mut PhysicalProjectionQuerySnapshot,
+        config: &ParseConfig,
+        revision: u64,
+    ) -> Result<Arc<Registry>, QueryExecutionError> {
+        if snapshot.cancellation().is_cancelled() {
+            return Err(QueryExecutionError::Cancelled);
+        }
+        if config.digest() != self.config {
+            return Err(invalid());
+        }
         if revision != self.revision {
             return Err(invalid());
         }

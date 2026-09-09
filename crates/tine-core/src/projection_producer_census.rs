@@ -984,14 +984,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             2,
         ),
         ("crates/tine-core/src/graph_name_folding.rs", "fs.write", 2),
-        // R5b: the pending-overlay projection is disposable — deleted (with its
-        // `-wal`/`-shm` sidecars, one `remove_file` site in a loop) on every
-        // runtime open before it is recreated, and again on close.
-        (
-            "crates/tine-core/src/managed_overlay.rs",
-            "fs.remove_file",
-            1,
-        ),
         (
             "crates/tine-core/src/managed_storage_journey.rs",
             "file.create",
@@ -1982,49 +1974,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `PhysicalQueryValue::Integer(` (the FTS readiness probe's row). No other
     // file gained or lost a `tine_storage` reference; no `storage-receiver:`
     // entry moved. All read-side.
-    // Re-pinned 2026-09-06 (query engine R5b, the pending-overlay projection).
-    // Derived by diffing the dump at `b93f6758` (342 entries) against the
-    // working head (352): added (10), ALL in the new `managed_overlay.rs` and
-    // nothing removed or changed anywhere else — its `use` line
-    // (`MaterializationError`, `PhysicalGraphProjectionChange`,
-    // `PhysicalGraphProjectionDatabase`, `PhysicalProjectionQuerySnapshot`),
-    // three `MaterializationError::Incomplete(` (the open validator's
-    // "revision moved" answers), ONE `PhysicalGraphProjectionDatabase::open_writable(`
-    // with the receiver calls `initialize_schema`, `validate_schema` and
-    // `apply` — the overlay worker's WRITE crossing, into a file that is
-    // app-private, disposable, holds no authority and is recreated on every
-    // open (contract §1.2 row, "The pending local suffix has one mirror off the
-    // actor") — ONE `PhysicalProjectionQuerySnapshot::open_direct(` (the
-    // overlay read, validated by revision) and ONE
-    // `sqlite::materialized_page_input(` (the per-page lowering input the
-    // accepted apply already uses). The write-crossing table above is
-    // byte-identical because none of those tokens is a journal, immutable,
-    // durable-directory or package boundary; the projection write goes through
-    // the same `PhysicalGraphProjectionDatabase` type the accepted apply uses.
-    // Re-pinned 2026-09-06 (query engine R5a, the two-source pending read).
-    // Derived by diffing the dump at `2ad7911d` (352 entries) against the
-    // working head (355): added (3), all in `managed_query.rs` and nothing
-    // removed or changed anywhere else — a second
-    // `PhysicalProjectionQuerySnapshot::open_managed(` (the coherence-proof
-    // open of the accepted snapshot AFTER the overlay snapshot, so a
-    // successful open proves no path left the pending set since capture),
-    // ONE `PhysicalQueryValue::Text(` and ONE `PhysicalQueryValue::Blob(`
-    // (decoding the overlay-mask `page_id` lookup and the descriptor row's
-    // path/preorder columns). All read-side; the write-crossing table above is
-    // byte-identical.
-    // Re-pinned 2026-09-06 (query engine R5c, the patched pending property
-    // registry). Derived by diffing the dump at `70dfa709` (355 entries)
-    // against the working head (363): added (8), ALL in the new
-    // `managed_registry_patch.rs` and nothing removed or changed anywhere
-    // else — its `use` line (`PhysicalProjectionQuerySnapshot`,
-    // `PhysicalQueryValue`), three `PhysicalQueryValue::Text(` (the by-key,
-    // declaration and path binds), three `PhysicalQueryValue::Blob(` (the
-    // page-id binds) and ONE `PhysicalQueryValue::Integer(` (the
-    // `owner_type`/`ordinal` decode). The module opens nothing in production:
-    // the executor hands it the two snapshots it already owns; its
-    // `open_direct` calls are `#[cfg(test)]` and outside `production_rust()`.
-    // Removing exactly those 8 entries from the head dump reproduces the R5a
-    // digest above, so the other 355 are byte-identical.
+    // S1 Managed-main retirement (2026-09-08): the disposable pending query
+    // projection and its registry-patch reader are removed. This deletes their
+    // writable database open, disposable-file cleanup, second query snapshot,
+    // mask-value decoding, and patch-only SQL binds. Managed live reads now
+    // retain one read-only PhysicalProjectionQuerySnapshot::open_managed site;
+    // committed registry construction reuses that validated snapshot through
+    // query::registry_cache. The authoritative editor/navigation pending
+    // journal and its application overlay remain outside this retired surface.
     // Re-pinned 2026-09-07 (query engine R6, warm validation from bytes).
     // Derived by diffing the dump at `2ad7911d` (352) against the working
     // head (369) and subtracting the R5a/R5c deltas above (11): R6 adds 7
@@ -2129,9 +2086,17 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // existing process-local coverage owner and its opaque target, not a SQLite
     // writer or authority. The physical-write inventory remains byte-identical
     // at 23 rows / 32 occurrences.
+    // Re-pinned 2026-09-09 for current-main query reads. Reconstructed the
+    // old 6a02be51 digest exactly: remove Direct progress/target bookkeeping,
+    // move the Managed FTS decode into shared results, and add one read-only
+    // accepted-apply metadata snapshot in oplog/sqlite. Against that recorded
+    // pre-main inventory (458 rows), this retirement removes 22 tuples and
+    // adds one narrowed Managed import (437 rows): pending query database
+    // open/apply/validation, its registry patch binds, the second snapshot and
+    // mask decoding disappear. No authority write boundary is added.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "e5f11f34e7d537c8e1f4067a5c41d41aeaa96cafe2bd9046b63e6f620ebbaf3e",
+        "c2cd28274ce4450f04f7f48030226808d433cca4e2ce41f3124ef3248b1df76e",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -2221,14 +2186,9 @@ fn g_i_managed_query_jobs_drain_before_projection_file_close() {
             "I-21: RuntimeActor::drop must drain every off-actor query job before its \
              SqliteFrontier closes the projection file (see the guard's doc comment)",
         );
-    let actor_overlay_close = actor_drop.find("self.close_pending_overlay()").expect(
-        "I-21: RuntimeActor::drop must close the pending overlay (R5b), whose file the \
-         two-source pending read (R5a) holds open exactly like the projection file",
-    );
     assert!(
-        actor_drain < actor_overlay_close,
-        "I-21: the overlay closes (worker join + file delete) only AFTER every off-actor \
-         query job is drained; a reader may hold the overlay file open"
+        actor_drain < actor_drop.len(),
+        "I-21: RuntimeActor::drop drains before its fields close the main projection"
     );
     let handle_drop = block("impl Drop for HandleInner {");
     let close = handle_drop
@@ -2259,13 +2219,9 @@ fn g_i_managed_query_jobs_drain_before_projection_file_close() {
                 "I-21: `self.clean.take()` closes the projection file; drain the query-job \
                  owner immediately before it (exemplar: the shared-join install)",
             );
-        let overlay_close = preceding.find("self.close_pending_overlay()").expect(
-            "I-21: `self.clean.take()` replaces the file the pending overlay sits next to; \
-             close the overlay before it, after the drain (exemplar: the shared-join install)",
-        );
         assert!(
-            drain < overlay_close,
-            "I-21: drain the query jobs BEFORE closing the overlay they may be reading"
+            drain < preceding.len(),
+            "I-21: drain the query jobs before replacing the main projection"
         );
     }
     assert_eq!(

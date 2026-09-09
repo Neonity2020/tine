@@ -309,7 +309,6 @@ Managed storage selection, and no byte is written into the user's graph.
 | `archive/operations.<generation>/sweeps/<uuid>.<20-digit-version>` | lease-owning absence-sweep coalescer and disposition actions | managed open, publication barrier, Re-apply, Keep-deletion, and Restore | append-only chain of canonical immutable full-state objects; highest valid linked version is current | authoritative disposition history; retain-all by default; a torn highest tail falls back to the preceding valid object |
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
-| `<configured projection>.pending-overlay.sqlite` (+ `-wal`/`-shm`) | pending-overlay worker thread of the clean runtime | off-actor Managed simple queries whose stamp names a pending suffix | current `tine-storage` physical projection schema, rows of the pending pages only, no frontier or authority | disposable: created empty on every runtime open, deleted on close; a damaged file makes the query walk |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
 | application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
@@ -861,229 +860,17 @@ IR enters the captured SQL route. Candidate types and lowering remain test-only
 for the independent oracle. Production metadata cursor reads and oracle lowering
 share the unchanged `query_cursor::drain_after` advancement and batch-retry owner.
 
-**A Managed simple query over the accepted frontier runs off the actor.** A
-simple query whose evidence is wholly the accepted frontier — no pending local
-suffix — is answered in two phases: one short actor turn that checks readiness
-and captures inputs which the handle executes on
-the calling thread after the actor's operation lock is released. The capture
-carries everything the read needs and nothing the actor owns: the projection
-path, the parsed query and view, the parse config and journal format, the
-registry snapshot, execution day, and the stamp — acceptance sequence,
-frontier digest and config digest — the answer is valid for. The executor opens
-its own owned snapshot under the runtime's
-query-job owner, the same owner every off-actor read of that file is admitted
-by, so the drain that precedes closing the file reaches it. The answer is
-base-ordered and the requested view is applied within this operation; it is
-not retained for later requests. Every other outcome has one named disposition:
-a `Stale` snapshot re-captures at most twice, then reports
-`NotReady(PendingEdits)`; `Busy` reports `NotReady(Busy)`; `Cancelled` stays
-cancelled and is not counted as a fallback; a `Failed` read is an error
-(`Unavailable(ReadFailed)`). These routes never traverse the parsed graph.
-The independent traversal oracle is test-only. A pending local suffix is part
-of the stamp (the overlay revision below), and the turn captures a page-local
-query with it exactly as it captures an accepted-only one. IR block/page queries,
-Explain AND the public advanced (datalog) query use this same captured execution
-and error classification: EVERY public Managed query command is now one driver,
-one SQL compiler and one shallow payload constructor, and none of them has an
-actor arm that selects rows. The advanced route reaches that driver through
-`query::resolve_advanced_source` — the one owner of an advanced source's size
-and nesting limits, its parse, its `?current-page` and execution-day binding and
-its `ran`/`ignored` clause report — and its answer is the `@block` answer plus
-that report, reattached after row construction for this source spelling. A refused advanced source (a
-source limit, or a clause set nothing lowers) keeps its existing SEMANTIC
-answer — the report, zero rows, `supported = false` — and never becomes an
-execution error, a fallback or a scan reporting success over nothing. An absent
-pending overlay is `Unavailable(ProjectionUnavailable)`, never endless readiness.
-The projection file is closed in exactly three places — the runtime
-actor dropping, a handle closing, and the shared-join install replacing the
-clean runtime — and each drains the job owner first; the accepted batch apply
-is not one of them, because it writes a checkpoint sidecar, never a WAL
-checkpoint, and readers and the writer coexist under WAL.
+**Managed live queries read one current main snapshot.** For simple, IR block/page, Explain and supported advanced queries, one short actor turn captures immutable inputs: the actual database frontier root and canonical digest, parse config, query/view, execution day, lifecycle epoch, and an optional committed-registry capture. The current root is the complete SQLite image already available; it is not the latest required editor or synchronization target. The calling thread acquires job capacity before it opens one main SQLite snapshot. `open_managed` validates the captured acceptance sequence and frontier digest inside that read transaction, which serves all selection and payload statements. A concurrent commit before opening may require bounded recapture; a later commit does not invalidate the coherent read.
 
-**That read is one snapshot, and it never opens a page.** The executor takes
-its job slot BEFORE any transaction, then opens the projection with
-`open_managed`, which validates the capture's acceptance sequence and frontier
-root digest INSIDE the read transaction that serves every later statement — so
-an accepted batch can never land between the check and the rows, and a
-projection that has moved on answers `Stale` rather than a mixture. Everything
-after that is four kinds of read on that one snapshot: the full-text
-readiness probe, one descriptor statement that carries each admitted block's
-page name, kind, journal day, path, stored result identity and estimated size,
-the payload batches charged for the rows the budget admitted, and — only for a
-non-journal page the answer already admitted — that page file's modification
-time. No page document is loaded, no source text is parsed. Selection may
-inspect substantial database data, including all visible text for an unselective
-regex; only output payload construction is bounded by admitted results. The
-answer's cross-page order is the projection's own `pages.path` under SQLite's
-binary collation, its per-block identity is the stored one, and a journal
-page's recency is read from its display NAME exactly as the walk reads it, so
-the two routes are one behaviour. Cancellation is checked by the snapshot, not
-by the reader: a drain cancels the open snapshot, the statement in flight
-stops, and the transaction ends before the slot is released, so an owner that
-reports no active job has no reader left on the file. A snapshot that cannot be
-opened, a statement the seam refuses and a projection that contradicts itself
-are all `Failed` — a read the seam or the descriptor can see is damaged never
-answers as if it succeeded. What no read can see: a missing `block_text` or
-`pages` row under a shape whose match set joins that table simply drops the
-block from the match set, on this route and on Direct alike, because the
-shared lowering has no row-count cross-check (R4a finding F1, open).
+All registry construction and query execution run outside the actor and cache lock. Property-free queries skip registry acquisition. Property queries reuse the existing inferred/declared type logic and committed registry owner, building or patching affected keys against the same validated snapshot. The normal accepted-apply producer invalidates affected property/declaration keys; ordinary text-only changes do not require a whole-registry rebuild. A metadata read failure is an error, not an empty registry. Public `query_registry` uses this same capture and snapshot path. Registry wire generation describes changes to effective metadata; it is not an acknowledgment of a particular edit.
 
-**The pending local suffix has one mirror off the actor: the overlay
-projection.** Beside the accepted projection the clean runtime keeps
-`<accepted projection>.pending-overlay.sqlite`, a second database of the same
-`tine-storage` physical schema holding the lowered rows of exactly the pages
-whose latest projection frame is still pending — the same set the actor's
-frame map holds, no more. It is disposable in the strongest sense: it is
-deleted and recreated empty on every runtime open, deleted again on close,
-carries no frontier, no stamp and no authority, and is never read to decide
-anything the accepted file or the journal decides.
-Reconstruction consumes the existing pending materialization directly, without
-parsing application pages or constructing editor DTOs. Before replacing an
-overlay, its instance is retired to new captures, then query jobs are drained,
-then its writer is joined and its files removed.
-The actor never writes it: every change to the pending set — a frame published, a page's post-save
-content, a deletion, a drain retiring the frame — is pushed as one revisioned
-update to a single overlay worker thread, which lowers the newest state per
-path through the same per-page lowering the accepted apply uses and publishes
-the revision it has flushed. A path whose content the actor could not supply
-is `incomplete`, and a lowering or write failure marks the whole overlay
-`failed`. Incomplete work reports temporary readiness; a damaged overlay
-reports a bounded failure and never an answer. The revision the
-actor read when it stamped a query is the stamp's `overlay_revision`; the
-capture is validated against that pending state. The stamp also includes `overlay_instance`: recreating the file
-can reuse revision numbers, but never a capture or patched registry from the
-old instance. A query is a read: it pushes nothing and advances no revision.
-Coherence with the accepted file follows from acceptance itself — a pending
-path leaves the set only when its batch is accepted, which advances the
-acceptance sequence the capture's `open_managed` validates inside its read
-transaction, so a snapshot that opens `Current` was captured before any
-pending page it masks could have moved.
+The reader loads no page document and parses no source text. Selection may inspect substantial database data, including all visible text for an unselective regex. Ordered narrow descriptors charge the existing construction budget; raw output payload is fetched in batches only for admitted rows. Managed page order remains `pages.path` under SQLite BINARY collation, with stored within-page preorder and exposed identity. Existing journal-name recency and admitted result-page filesystem metadata lookup remain separate from source-text reads. Required-row decoding or coverage damage is a failed read. A predicate whose match itself depends on an absent joined row can still omit that match without the result constructor observing the missing row; this existing limitation is not repaired by removing pending composition.
 
-The patched registry cache is keyed by the overlay instance and flushed revision
-actually opened, together with accepted/config/base-registry identity. An older
-capture may legally open a later overlay; its requested revision cannot identify
-that later registry. A deterministic test queues two equal captures, changes a
-numeric declaration to text between their executions, and checks that each
-answer uses the type in its own opened snapshot.
+The authoritative pending editor and navigation state remains in its ordinary journal and editor machinery. It is not a live-query source and has no query-only database, mask, merge, repair worker or patched pending registry. Before ordinary drain, a query may show the older current main image. Drain or external acceptance advances that image, and database-change notifications schedule another UI refresh. Query result blocks still edit immediately through the normal editor path; membership grace is UI scheduling, not a storage freshness guarantee.
 
-Managed captures include the query owner's admission epoch from their actor
-turn. A projection lifecycle drain cancels those captures even when their
-workers have not started waiting for capacity. Newly captured work can enter
-the new epoch; ordinary edits do not change it. The regression
-`ret2_a_capture_waiting_to_enter_execution_is_cancelled_by_replacement_drain`
-checks cancellation before snapshot opening and a fresh SQL answer afterward.
+Lifecycle cancellation reaches both queued captures and open read handles. Capacity is acquired before transactions; the transaction ends before the job slot is released. Closure and projection replacement cancel and drain the existing job owner before closing the projection. Ordinary accepted writes coexist with readers under WAL and do not cancel them. A stale acquisition recaptures at most twice, then reports typed readiness; busy admission reports busy readiness; cancellation remains cancellation; failed reads report unavailability. No outcome switches to traversal. The independent traversal oracle remains test-only for these migrated surfaces. Advanced source parsing, binding, limits and refused-source reports keep their existing shared owner and semantics.
 
-The job owner can split cancellation from waiting: `begin_drain` marks the
-current admission generation cancelled and returns a `QueryDrainFence`;
-`wait_for_drain` waits only for slots admitted before that fence, including
-slots without registered SQLite handles. New admissions remain live and cannot
-extend that fence's wait. Existing `cancel_all_and_drain` callers additionally
-retain their full-idle barrier. The barrier test
-`a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions` pins this
-distinction.
-
-`PendingOverlayRepair` owns the old instance and any uninstalled replacement
-while preparation runs under a capacity guard. Registration transfers teardown
-responsibility before that guard can be released. Retirement prevents later
-registration; cleanup after the drain closes retained instances. A failed
-creation remains terminal until lifecycle cleanup. The owner tests cover
-transfer, stale tokens, retirement before registration and actual creation
-failure.
-
-The actor repair protocol captures a fence and immutable preparation inputs in
-a short begin turn. The handle waits and creates/registers the candidate off
-the actor, releasing its capacity guard before requesting installation. The
-actor announces the latest pending path set and reconstructs one authoritative
-page between requests or during idle work, using the existing materialization
-producer. Retirement covers both the current overlay and an uninstalled repair
-candidate before job drainage; cleanup follows drainage. Tests exercise a real
-missing file, an edit while an old query slot is held, and shutdown before
-candidate installation. Simple and captured public query routes trigger this
-protocol once per request when opening a pending projection fails, identifying
-the exact failed instance. Execution releases its snapshots and capacity before
-repair begins. Accepted-file failures and cancellation do not trigger pending
-repair. Queries then recapture; unfinished reconstruction reports typed
-readiness, while another failed read reports unavailability. A failed attempt
-never supplies an answer. Tests remove the real file beneath simple, IR, Explain and advanced
-routes and compare their repaired SQL answers with the undamaged answers.
-An actual creation failure remains terminal for later requests even after the
-filesystem obstruction is removed; lifecycle cleanup is required before a new
-attempt. Acceptance between begin and install cannot resurrect accepted rows
-in the pending database: installation derives its paths from current authority.
-
-Overlay teardown serializes worker join and file removal once per instance.
-Repeated close calls on a retained old instance cannot remove a replacement at
-the same disposable path. This is checked by
-`closing_a_retired_instance_again_cannot_remove_its_replacement`.
-
-**A captured pending query is answered off the actor from BOTH databases.**
-The executor opens the overlay first, at the flushed revision the capture
-required or later, and only then opens the accepted file and validates the
-capture's stamp inside that read transaction — that open ORDER is the whole
-coherence proof, because a path can only leave the pending set by being
-accepted, which advances the sequence the validation checks. It then lowers ONE
-compiled query twice: once against the overlay unmasked, once against the
-accepted file with every page of the overlay's pending set masked out (§5.9's
-`NOT IN`), so the two sources are disjoint by construction and no page can be
-answered for twice. The two descriptor streams are merged in the walk's own
-base order — `pages.path` under SQLite's binary collation, then preorder —
-under ONE construction budget, and payloads are read per source only for the
-rows that budget admitted. **The answer is the walk's answer**: same rows, same
-order, same `total`, same `exceeded`, same public ids; no page document is
-loaded and nothing is parsed, on either side. An unflushed or incomplete overlay
-with a live worker opens `Pending` and reports temporary readiness. A failed or
-stopped worker and an unreadable file open `Failed`, never endless readiness.
-A stale stamp re-captures within the same bound as an accepted query. A damaged
-row inside a validated snapshot is `Failed`, and a page the mask failed to
-remove — reachable from both sources —
-is `Failed` too rather than answered twice. A future relation that leaves one
-page (`PageLocality`) reports `Unavailable(UnsupportedRelation)` until SQL split
-execution supports it. All currently supported relations are page-local. A
-property leaf uses the registry patched off the actor.
-
-**The property registry is patched, never rebuilt, for a pending query.**
-Query capture propagates an accepted-registry read failure before execution;
-it never substitutes a cached or empty registry for failed metadata acquisition.
-The actor caches ONE registry: the accepted table, keyed by acceptance
-sequence, frontier digest and parse config; a pending suffix does not evict it
-and does not advance its generation. A captured query with a property leaf
-carries that table and the executor patches, off the actor and under its two
-snapshots, exactly the keys the pending pages can have changed: the keys of the
-masked pages' rows, the keys of the overlay's rows, and every key whose
-declaration page (a page named like the key, carrying `tine.type::`) is
-pending. Each affected key's row is rebuilt by the one producer over the key's
-complete row set. An ordinary text edit affects no key and reads no accepted
-property row. The walk's merged table while pending is built per read and never
-published; when a pending build is refused, readers fall back to the accepted
-table (a coherent older answer), never to a merged table from another pending
-revision. Since RET2-Managed-Metadata those readers are query export and the
-test-only walk oracles only — the public registry request below does not fall
-back at all.
-
-**The PUBLIC registry snapshot (§7.1 `query_registry`) is that same captured
-read, and it never falls back.** It takes one short actor turn — readiness, the
-query stamp, the accepted table's own fallible cached acquisition, and the
-pending overlay's instance and required revision — and is then answered off the
-actor through the SAME snapshot/mask/registry acquisition a result query uses:
-capacity before any transaction, the overlay opened first, the accepted file
-second with the stamp validated inside its read transaction, the mask derived
-from the OPENED pending state, and the effective table patched under both. It
-loads no page document and rebuilds no merged table on the actor. Every
-non-answering disposition is the result routes' typed
-`query::QueryExecutionError` — readiness for `Busy` and for exhausted stale
-re-captures, `Cancelled` for a drain or close, `Unavailable(ReadFailed)` for a
-read that was attempted and did not answer — and none of them is published,
-memoized, or served as metadata. A failed pending projection takes the same
-bounded exact-instance repair after every snapshot and slot handle releases;
-failed creation stays terminal. The wire generation remains the ACCEPTED
-table's: a pending suffix never advances it, and only acceptance does, under the
-existing G7 rules. Two reads that opened the same overlay instance and revision
-share one patched table, whether they are metadata reads or result queries;
-two that opened different revisions never do.
-Lifecycle cancellation is checked again after constructing the registry wire
-snapshot and releasing its read transactions, before releasing job capacity or
-counting a successful metadata read. A drain during construction therefore
-returns `Cancelled`, just as it does for result construction.
+Copy/export and Friendly query routing are separate remaining campaign consumers until their SQL migration is accepted; this live-read contract does not claim they have already migrated.
 
 ## 2. Enrollment and synchronization state machine
 

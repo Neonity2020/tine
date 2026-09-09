@@ -16,6 +16,7 @@ import {
 } from "./e2e-capabilities.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { openPageByName } from "./lib/e2e-navigation.mjs";
+import { enableManagedStorage } from "./lib/e2e-managed-activation.mjs";
 
 await ensureDisplay();
 
@@ -189,37 +190,6 @@ async function acceptNativeConfirmation(label, before) {
   await waitFor(() => !windowIds("^Tine$").includes(dialog), 30_000, `${label} confirmation did not close`);
 }
 
-async function enableManagedStorage() {
-  const trigger = await browser.$('button[title^="Settings"]');
-  await trigger.waitForDisplayed({ timeout: 30_000 });
-  await trigger.click();
-  await browser.$(".settings-modal").waitForDisplayed({ timeout: 30_000 });
-  const tab = await waitFor(
-    () => visibleButtonContaining("Backups & recovery"),
-    30_000,
-    "Backups & recovery settings tab was absent",
-  );
-  await tab.click();
-  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
-  await experimental.waitForDisplayed({ timeout: 30_000 });
-  if ((await experimental.getAttribute("aria-expanded")) !== "true") await experimental.click();
-  const action = await waitFor(
-    () => visibleButtonContaining("Enable Tine-managed storage..."),
-    30_000,
-    "managed activation action was absent",
-  );
-  const before = new Set(windowIds("^Tine$"));
-  await action.click();
-  await acceptNativeConfirmation("managed activation", before);
-  await browser.waitUntil(async () => (await bodyText()).includes("Tine-managed storage active"), {
-    timeout: 300_000,
-    interval: 250,
-    timeoutMsg: "managed activation did not reach active",
-  });
-  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
-  await close.click();
-  await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
-}
 
 async function forceManagedFeedReload() {
   const title = await browser.$(".journal-today .journal-title");
@@ -305,7 +275,7 @@ try {
   await browser.$(".journal-day, .ls-block").waitForExist({ timeout: 60_000 });
 
   phase = "managed-activation";
-  await enableManagedStorage();
+  await enableManagedStorage(browser);
   await forceManagedFeedReload();
 
   phase = "initial-managed-window";

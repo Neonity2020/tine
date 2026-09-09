@@ -3502,6 +3502,9 @@ pub struct SqliteFrontier {
     /// under (§5.8 M21). It is the config the database's own stamp records, so
     /// a per-event apply can never mix atoms from two configs.
     parse_config: ParseConfig,
+    // Shared inference state belongs to this disposable database incarnation.
+    // No owner or metadata maintenance is needed before a property read.
+    query_registry: std::sync::OnceLock<crate::query::registry_cache::SharedRegistryCache>,
     _lease: Arc<HeldApplierLocks>,
 }
 
@@ -3790,6 +3793,7 @@ impl SqliteFrontier {
                     required_frontier_digest: expected_digest,
                     checkpoint_each_apply: true,
                     parse_config: parse_config,
+                    query_registry: std::sync::OnceLock::new(),
                     _lease: locks,
                 },
                 recovery: ProjectionRecovery::OpenedExisting,
@@ -3882,6 +3886,7 @@ impl SqliteFrontier {
                     )?,
                     checkpoint_each_apply: true,
                     parse_config: source.parse_config.clone(),
+                    query_registry: std::sync::OnceLock::new(),
                     _lease: lease,
                 },
                 recovery: ProjectionRecovery::OpenedExisting,
@@ -4002,6 +4007,7 @@ impl SqliteFrontier {
                                 )?,
                                 checkpoint_each_apply: true,
                                 parse_config: source.parse_config.clone(),
+                                query_registry: std::sync::OnceLock::new(),
                                 _lease: lease,
                             },
                             recovery: ProjectionRecovery::RebuiltPreservingEvidence {
@@ -4033,6 +4039,7 @@ impl SqliteFrontier {
                             )?,
                             checkpoint_each_apply: true,
                             parse_config: source.parse_config.clone(),
+                            query_registry: std::sync::OnceLock::new(),
                             _lease: lease,
                         },
                         recovery: {
@@ -4205,6 +4212,7 @@ impl SqliteFrontier {
                 )?,
                 checkpoint_each_apply: true,
                 parse_config: source.parse_config.clone(),
+                query_registry: std::sync::OnceLock::new(),
                 _lease: lease,
             },
             rebuild,
@@ -4233,8 +4241,52 @@ impl SqliteFrontier {
             )?,
             checkpoint_each_apply: false,
             parse_config: parse_config,
+            query_registry: std::sync::OnceLock::new(),
             _lease: lease,
         })
+    }
+
+    /// Capture only immutable inference inputs on the producer turn. The
+    /// shared SQL registry builder and publication run after the actor releases.
+    pub(crate) fn query_registry_capture(
+        &self,
+        sequence: u64,
+        config: &ParseConfig,
+    ) -> Result<
+        (
+            crate::query::registry_cache::SharedRegistryCache,
+            crate::query::registry_cache::RegistryCapture,
+        ),
+        crate::query::QueryExecutionError,
+    > {
+        let owner = Arc::clone(self.query_registry.get_or_init(|| {
+            Arc::new(std::sync::Mutex::new(
+                crate::query::registry_cache::CommittedRegistryCache::new(
+                    sequence,
+                    &self.parse_config,
+                ),
+            ))
+        }));
+        let capture = owner.lock().unwrap().capture(sequence, config)?;
+        Ok((owner, capture))
+    }
+
+    /// Metadata for changed pages only, read from the committed image using
+    /// the same decoder as live registry reads. A missing/damaged disposable
+    /// metadata read invalidates inference; it cannot reject an authority save.
+    fn query_registry_page_metadata(
+        &self,
+        root: &AcceptedFrontierRoot,
+        pages: &BTreeSet<[u8; 16]>,
+    ) -> Option<crate::query::registry_sql::PageRegistryMetadata> {
+        let digest = canonical_frontier_root_digest(root).ok()?;
+        let mut snapshot = tine_storage::sqlite::PhysicalProjectionQuerySnapshot::open_managed(
+            &self.path,
+            root.acceptance_sequence(),
+            digest,
+        )
+        .ok()?;
+        crate::query::registry_sql::read_page_registry_metadata(&mut snapshot, pages).ok()
     }
 
     pub fn path(&self) -> &Path {
@@ -4417,9 +4469,9 @@ impl SqliteFrontier {
         &self.required_frontier_root
     }
 
-    /// The frontier digest every accepted row in this file was applied under —
-    /// with `required_frontier_root().acceptance_sequence()`, the stamp an
-    /// off-actor query snapshot validates against (`managed_query`).
+    /// Digest of the required frontier, which can be ahead of physical apply.
+    /// Current live queries use the actual `frontier_root()` and its digest;
+    /// this target remains for the ordinary materialization/readiness pipeline.
     pub(crate) const fn required_frontier_digest(&self) -> ContentDigest {
         self.required_frontier_digest
     }
@@ -4755,6 +4807,26 @@ impl SqliteFrontier {
                 started.elapsed().as_secs_f64() * 1_000.0,
             );
         }
+        // Capture bounded metadata only if a query has initialized inference.
+        // These local maps are released after this apply; no page registry is
+        // retained beside SQLite. Duplicates returned before reaching here.
+        let registry_owner = self.query_registry.get().cloned();
+        let registry_pages = registry_owner.as_ref().map(|_| {
+            materialization
+                .replacements()
+                .iter()
+                .map(|page| page.page_id.as_uuid().into_bytes())
+                .chain(
+                    materialization
+                        .deletions()
+                        .iter()
+                        .map(|id| id.as_uuid().into_bytes()),
+                )
+                .collect::<BTreeSet<_>>()
+        });
+        let registry_before = registry_pages.as_ref().and_then(|pages| {
+            self.query_registry_page_metadata(event.prior_frontier_root(), pages)
+        });
         let physical_started = trace.then(std::time::Instant::now);
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
@@ -4766,6 +4838,32 @@ impl SqliteFrontier {
                 "PHASE TIME SQLite.apply.physical_transaction {:.3}ms",
                 started.elapsed().as_secs_f64() * 1_000.0,
             );
+        }
+        if disposition == ApplyDisposition::Applied {
+            if let Some(owner) = registry_owner {
+                let current_root = event.post_frontier_root();
+                let after = registry_pages
+                    .as_ref()
+                    .and_then(|pages| self.query_registry_page_metadata(current_root, pages));
+                let sequence = current_root.acceptance_sequence();
+                let mut owner = owner.lock().unwrap();
+                match (registry_before, after) {
+                    (Some(before), Some(after)) => {
+                        let changes = crate::query::registry_sql::registry_changes(&before, &after);
+                        if owner
+                            .committed(
+                                sequence,
+                                changes.normalized_keys,
+                                changes.declaration_page_names,
+                            )
+                            .is_err()
+                        {
+                            owner.reset(sequence, &self.parse_config);
+                        }
+                    }
+                    _ => owner.reset(sequence, &self.parse_config),
+                }
+            }
         }
         Ok((disposition, materialization_stats, apply_stats))
     }

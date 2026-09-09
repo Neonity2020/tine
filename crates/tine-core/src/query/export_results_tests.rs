@@ -25,12 +25,12 @@ use crate::model::{BlockDto, Graph, PageKind, RefGroup};
 use crate::query::export_results::{
     apply_located_view, export_subtree_census, hydrate_located_export_queries,
     reset_export_subtree_census, select_located_export_queries, set_before_completeness_batch_hook,
-    ExportSubtreeInputs, ExportSubtreeSource, LocatedExportRoot,
+    ExportSubtreeInputs, LocatedExportRoot,
 };
 use crate::query::results::{
-    read_located_results_merged, reset_result_read_census, result_read_census,
+    read_located_results, reset_result_read_census, result_read_census,
     set_before_export_payload_batch_hook, BackendOrder, RecencyPage, ResultIdentity, ResultLocator,
-    ResultReadError, ResultReadShared, ResultSource,
+    ResultReadError, ResultReadInputs,
 };
 use crate::query::sql::sql_gates_tests::{scratch, serialize, Corpus};
 use crate::query::{
@@ -148,30 +148,6 @@ fn write_dialect_corpus(root: &Path) {
 
 // ===== the adapter under test =====
 
-/// Every page id in one corpus's projection, read through the seam the gates
-/// already use for fixture lookups.
-fn all_page_ids(corpus: &Corpus) -> Vec<[u8; 16]> {
-    let reader = rusqlite::Connection::open_with_flags(
-        corpus.projection_path(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("the projection opens read-only");
-    let mut statement = reader
-        .prepare("SELECT page_id FROM pages ORDER BY page_id")
-        .expect("the page index is readable");
-    let ids = statement
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .expect("the page index is readable")
-        .map(|id| {
-            id.expect("a page id row")
-                .as_slice()
-                .try_into()
-                .expect("a 16-byte page id")
-        })
-        .collect();
-    ids
-}
-
 /// The recency producer, bound to one corpus root — R3's own axis, reached
 /// through the `(journal day, page path)` signature the result read offers.
 fn recency_for(root: &Path) -> impl Fn(RecencyPage<'_>) -> i64 + '_ {
@@ -232,7 +208,8 @@ fn export_over(
             let dialect = spec.simple_dialect();
             let (_query, view) = crate::query::parse_query_text(&spec.query, dialect, today);
             let (_block_query, statement) = corpus.lower_block_anchored(&spec.query, dialect);
-            let shared = ResultReadShared {
+            let inputs = ResultReadInputs {
+                statement: &statement,
                 order: BackendOrder::Direct,
                 identity,
                 max_rows: QUERY_EXPORT_CONSTRUCTION_ROWS,
@@ -240,18 +217,12 @@ fn export_over(
                 profile: ConstructionProfile::from_view(&view),
                 recency: &recency,
             };
-            let pre = read_located_results_merged(
-                &mut [ResultSource {
-                    snapshot: &mut *snapshot,
-                    statement: &statement,
-                }],
-                &shared,
-            )?;
+            let pre = read_located_results(&mut *snapshot, &inputs)?;
             Ok(apply_located_view(pre, &view))
         })?
     };
     let results = hydrate_located_export_queries(
-        &mut [ExportSubtreeSource { snapshot }],
+        snapshot,
         selected,
         &ExportSubtreeInputs {
             identity,
@@ -908,6 +879,9 @@ fn the_export_core_source_names_no_graph_document_or_filesystem() {
         "std::fs",
         "File::",
         "parse_query",
+        "ExportSubtreeSource",
+        "locator.source",
+        "sources:",
     ] {
         assert!(
             !code.contains(forbidden),
@@ -915,6 +889,7 @@ fn the_export_core_source_names_no_graph_document_or_filesystem() {
              projection alone, over snapshots its caller owns"
         );
     }
+    assert!(code.contains("snapshot: &mut PhysicalProjectionQuerySnapshot"));
 }
 
 // ===== physical identity =====
@@ -1085,7 +1060,6 @@ fn located_selection_keeps_two_identically_named_roots_apart() {
         ..BlockDto::default()
     };
     let locator = |page: u8, id: u8| ResultLocator {
-        source: 0,
         page_id: [page; 16],
         block_id: [id; 16],
     };
@@ -1157,113 +1131,6 @@ fn a_nested_root_verifies_the_parent_that_ends_its_subtree() {
         "the row after the subtree has a parent, and it was verified"
     );
     let differences = batch_differences("nested boundary", &walk, &read);
-    assert!(differences.is_empty(), "{}", differences.join("\n"));
-}
-
-// ===== two sources =====
-
-/// The Managed pending route's shape: two owned snapshots whose pages are
-/// DISJOINT, one statement lowered per source, and roots selected from both.
-///
-/// Each root's subtree must be read on the snapshot its own locator names. The
-/// answer is compared against the single-source walk export, which sees the same
-/// graph — so a root hydrated against the wrong source shows up as a wrong
-/// subtree, not merely as a wrong count.
-#[test]
-fn split_source_roots_hydrate_against_their_own_snapshot() {
-    let _serial = serialize();
-    let root = scratch("ret3-export-split-source");
-    write_export_corpus(&root);
-    let corpus = Corpus::open(root, true);
-    let specs = vec![spec("todo", "(task TODO)")];
-    let caps = Caps::default();
-    let walk = walk_export(&corpus.graph, &specs, caps);
-
-    // "Pending" owns Alpha; "accepted" is masked against it. Disjoint by
-    // construction, exactly as R5a's overlay masking makes them.
-    let pending_pages = [corpus.page_id("Alpha")];
-    let today = corpus.today();
-    let graph_root = corpus.root.clone();
-    let recency = recency_for(&graph_root);
-    let identity = ResultIdentity::Stored;
-
-    // The overlay's statement masks every page the overlay does NOT own.
-    let accepted_mask: Vec<[u8; 16]> = all_page_ids(&corpus)
-        .into_iter()
-        .filter(|id| !pending_pages.contains(id))
-        .collect();
-    let mut overlay = corpus.snapshot();
-    let mut accepted = corpus.snapshot();
-    let read = {
-        let overlay = &mut overlay;
-        let accepted = &mut accepted;
-        let (limit, selected) =
-            select_located_export_queries(&specs, caps.queries, caps.roots, |spec| {
-                let dialect = spec.simple_dialect();
-                let (_query, view) = crate::query::parse_query_text(&spec.query, dialect, today);
-                // The overlay sees ONLY its own pages; the accepted source has them
-                // masked out. Two statements, one IR.
-                let (_q, overlay_statement) =
-                    corpus.lower_block_anchored_masked(&spec.query, dialect, &accepted_mask);
-                let (_q, accepted_statement) =
-                    corpus.lower_block_anchored_masked(&spec.query, dialect, &pending_pages);
-                let shared = ResultReadShared {
-                    order: BackendOrder::Direct,
-                    identity: &identity,
-                    max_rows: QUERY_EXPORT_CONSTRUCTION_ROWS,
-                    max_bytes: QUERY_EXPORT_CONSTRUCTION_BYTES,
-                    profile: ConstructionProfile::from_view(&view),
-                    recency: &recency,
-                };
-                let pre = read_located_results_merged(
-                    &mut [
-                        ResultSource {
-                            snapshot: &mut *overlay,
-                            statement: &overlay_statement,
-                        },
-                        ResultSource {
-                            snapshot: &mut *accepted,
-                            statement: &accepted_statement,
-                        },
-                    ],
-                    &shared,
-                )?;
-                Ok::<_, ResultReadError>(apply_located_view(pre, &view))
-            })
-            .expect("the split selection answers");
-        assert_eq!(limit, caps.queries);
-        assert!(
-            selected[0]
-                .roots
-                .iter()
-                .any(|root| root.locator.source == 0)
-                && selected[0]
-                    .roots
-                    .iter()
-                    .any(|root| root.locator.source == 1),
-            "the selection really did come from both sources"
-        );
-        let results = hydrate_located_export_queries(
-            &mut [
-                ExportSubtreeSource { snapshot: overlay },
-                ExportSubtreeSource { snapshot: accepted },
-            ],
-            selected,
-            &ExportSubtreeInputs {
-                identity: &identity,
-                max_nodes: caps.nodes,
-                max_bytes: caps.bytes,
-            },
-        )
-        .expect("the split export answers");
-        QueryExportBatch {
-            results,
-            omitted_queries: 0,
-        }
-    };
-    overlay.finish();
-    accepted.finish();
-    let differences = batch_differences("split source", &walk, &read);
     assert!(differences.is_empty(), "{}", differences.join("\n"));
 }
 

@@ -463,10 +463,8 @@ struct ApplicationJournalFeedIndexKey {
 ///
 /// The frontier pair covers the accepted rows exactly as it does for the
 /// journal day index; the config digest covers the atomizer's rules, which are
-/// not in the frontier stamp. R5c: a pending local suffix is deliberately NOT
-/// part of it. The suffix is not accepted evidence and cannot change what the
-/// accepted table says; the pending route patches that table off the actor
-/// (`managed_registry_patch`) rather than evicting it once per keystroke.
+/// not in the frontier stamp. A pending local suffix is deliberately not part
+/// of it because the remaining actor registry serves export and test oracles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ApplicationPropertyRegistryKey {
     acceptance_sequence: u64,
@@ -3743,7 +3741,7 @@ fn managed_execution_error(
         ManagedQueryOutcome::Cancelled => {
             SyncApplicationPageRequestError::QueryExecution(QueryExecutionError::Cancelled)
         }
-        ManagedQueryOutcome::Failed(_) | ManagedQueryOutcome::PendingFailed { .. } => {
+        ManagedQueryOutcome::Failed(_) => {
             census.note_failed_read();
             query_unavailable(QueryUnavailableReason::ReadFailed)
         }
@@ -3852,11 +3850,13 @@ struct PreparedSimpleQuery {
     view: crate::query::ir::ViewSettings,
     today: crate::date::JournalDate,
     profile: crate::query::ConstructionProfile,
+    #[cfg(test)]
     props: bool,
     config: crate::config::ParseConfig,
-    registry: std::sync::Arc<crate::query::registry::Registry>,
-    /// `None` while a pending local suffix is undrained.
-    stamp: Option<crate::managed_query::ManagedQueryStamp>,
+    registry: Option<crate::managed_query::ManagedRegistryCapture>,
+    stamp: crate::managed_query::ManagedQueryStamp,
+    #[cfg(test)]
+    walk_registry: std::sync::Arc<crate::query::registry::Registry>,
 }
 
 /// Apply a request's view to its operation-scoped pre-view answer.
@@ -4838,55 +4838,6 @@ impl SyncRuntimeHandle {
         })
     }
 
-    /// Reconstruct a failed pending projection without holding the actor or a
-    /// read transaction. Query dispatch calls this only after its failed read
-    /// has released every snapshot and capacity slot.
-    fn repair_pending_projection(
-        &self,
-        instance: u64,
-    ) -> Result<(), SyncApplicationPageRequestError> {
-        let Some(start) = self.application_request(|reply| {
-            ActorRequest::BeginPendingProjectionRepair { instance, reply }
-        })?
-        else {
-            return Ok(());
-        };
-        self.complete_pending_projection_repair(start)
-    }
-
-    fn complete_pending_projection_repair(
-        &self,
-        start: PendingRepairStart,
-    ) -> Result<(), SyncApplicationPageRequestError> {
-        let shared = &self.inner.managed_query;
-        shared.jobs.wait_for_drain(start.fence);
-        let slot = match shared.jobs.acquire() {
-            crate::query_jobs::Admission::Slot(slot) => slot,
-            crate::query_jobs::Admission::Cancelled => {
-                shared.pending_repair.fail(start.token);
-                return Err(pending_repair_error(
-                    crate::managed_overlay::PendingRepairStatus::Retired,
-                ));
-            }
-            crate::query_jobs::Admission::Busy => {
-                shared.pending_repair.fail(start.token);
-                return Err(pending_repair_error(
-                    crate::managed_overlay::PendingRepairStatus::Failed,
-                ));
-            }
-        };
-        let prepared =
-            shared
-                .pending_repair
-                .prepare_candidate(start.token, &start.path, start.config, &slot);
-        drop(slot);
-        prepared.map_err(pending_repair_error)?;
-        self.application_request(|reply| ActorRequest::FinishPendingProjectionRepair {
-            token: start.token,
-            reply,
-        })
-    }
-
     /// The Managed simple-query route (R4, SPEC §5.9).
     ///
     /// Phase one is an actor turn that holds `operation` exactly as every
@@ -4920,7 +4871,6 @@ impl SyncRuntimeHandle {
         use crate::managed_query::ManagedQueryOutcome;
         let shared = &self.inner.managed_query;
         let mut recaptures = 0;
-        let mut repaired_pending = false;
         loop {
             let turn =
                 self.application_request(|reply| ActorRequest::ApplicationSimpleQueryTurn {
@@ -4969,13 +4919,6 @@ impl SyncRuntimeHandle {
                     shared.census.note_stale_recapture();
                     continue;
                 }
-                ManagedQueryOutcome::PendingFailed { instance, .. } if !repaired_pending => {
-                    shared.census.note_failed_read();
-                    repaired_pending = true;
-                    drop(capture);
-                    self.repair_pending_projection(instance)?;
-                    continue;
-                }
                 outcome => return Err(managed_execution_error(&shared.census, outcome)),
             }
         }
@@ -5019,7 +4962,6 @@ impl SyncRuntimeHandle {
             }
         };
         let mut recaptures = 0;
-        let mut repaired_pending = false;
         loop {
             let turn =
                 self.application_request(|reply| ActorRequest::ApplicationCapturedQueryTurn {
@@ -5105,13 +5047,6 @@ impl SyncRuntimeHandle {
                     shared.census.note_stale_recapture();
                     continue;
                 }
-                ManagedQueryOutcome::PendingFailed { instance, .. } if !repaired_pending => {
-                    shared.census.note_failed_read();
-                    repaired_pending = true;
-                    drop(capture);
-                    self.repair_pending_projection(instance)?;
-                    continue;
-                }
                 outcome => return Err(managed_execution_error(&shared.census, outcome)),
             }
         }
@@ -5119,11 +5054,10 @@ impl SyncRuntimeHandle {
 
     /// **The PUBLIC property-registry route** (RET2): SPEC §7.1's
     /// `query_registry`, over the same two phases and the same shared
-    /// snapshot/mask/registry acquisition every captured Managed query uses.
+    /// one-main-snapshot registry acquisition every captured Managed query uses.
     ///
-    /// Phase one is a short actor turn that captures the accepted path, stamp,
-    /// config and ACCEPTED registry table plus the pending overlay instance and
-    /// required revision; phase two runs
+    /// Phase one is a short actor turn that captures the main path, actual
+    /// frontier stamp, config, and immutable registry-cache input; phase two runs
     /// [`crate::managed_metadata::execute_managed_metadata`] on the CALLING
     /// thread with `operation` released. The actor cannot answer without
     /// opening a snapshot.
@@ -5133,10 +5067,8 @@ impl SyncRuntimeHandle {
     /// before the first build — as if it were the answer, so a damaged
     /// projection silently changed what every `prop(…)` filter meant. Now
     /// `Stale`, `Busy`, `Cancelled` and `Failed` are classified by exactly the
-    /// same [`managed_execution_error`] the result routes use, a failed pending
-    /// projection takes exactly the same bounded exact-instance repair after
-    /// the capture (and therefore every snapshot and slot handle) is released,
-    /// and nothing about a failure is published.
+    /// same [`managed_execution_error`] the result routes use, and nothing
+    /// about a failure is published.
     fn application_captured_registry(
         &self,
     ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
@@ -5144,7 +5076,6 @@ impl SyncRuntimeHandle {
         use crate::managed_query::ManagedQueryOutcome;
         let shared = &self.inner.managed_query;
         let mut recaptures = 0;
-        let mut repaired_pending = false;
         loop {
             let turn = self.application_request(|reply| {
                 ActorRequest::ApplicationCapturedRegistryTurn { reply }
@@ -5169,19 +5100,6 @@ impl SyncRuntimeHandle {
                 {
                     recaptures += 1;
                     shared.census.note_stale_recapture();
-                    continue;
-                }
-                ManagedMetadataOutcome::NotAnswered(ManagedQueryOutcome::PendingFailed {
-                    instance,
-                    ..
-                }) if !repaired_pending => {
-                    shared.census.note_failed_read();
-                    repaired_pending = true;
-                    // The capture owns the overlay handle the repair replaces;
-                    // it goes before the actor round trip, exactly as it does
-                    // on the result routes.
-                    drop(capture);
-                    self.repair_pending_projection(instance)?;
                     continue;
                 }
                 ManagedMetadataOutcome::NotAnswered(outcome) => {
@@ -5966,47 +5884,6 @@ impl SyncRuntimeHandle {
 
     /// Test-only: the pending overlay's file and its published state once
     /// every update pushed so far has been flushed (bounded wait).
-    #[cfg(test)]
-    fn pending_overlay_state(
-        &self,
-    ) -> Result<Option<(PathBuf, crate::managed_overlay::OverlayState)>, SyncRuntimeRequestError>
-    {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::PendingOverlayState {
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    /// Test-only (RET2): stop and delete the pending overlay while a local
-    /// suffix is still undrained. That is the ONE state in which the actor
-    /// turn has no stamp — a pending set with nothing to read it from — and
-    /// the only way to reach it deterministically from outside the actor.
-    #[cfg(test)]
-    fn close_pending_overlay(&self) -> Result<(), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ClosePendingOverlay {
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn rebuild_pending_overlay_for_test(&self) -> Result<(), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply, receiver) = mpsc::channel();
-        self.send(ActorRequest::RebuildPendingOverlay { reply })?;
-        receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
     #[cfg(test)]
     fn install_managed_local_append_fault(
         &self,
@@ -11269,24 +11146,6 @@ enum ActorRequest {
         reply: mpsc::Sender<crate::oplog::hot_engine::validation_tests::ObservableEngineState>,
     },
     #[cfg(test)]
-    PendingOverlayState {
-        reply: mpsc::Sender<Option<(PathBuf, crate::managed_overlay::OverlayState)>>,
-    },
-    /// RET2 gate hook: close and delete the pending overlay in place, leaving
-    /// the pending set undrained and unreadable.
-    #[cfg(test)]
-    ClosePendingOverlay { reply: mpsc::Sender<()> },
-    #[cfg(test)]
-    RebuildPendingOverlay { reply: mpsc::Sender<()> },
-    BeginPendingProjectionRepair {
-        instance: u64,
-        reply: mpsc::Sender<Result<Option<PendingRepairStart>, SyncApplicationPageRequestError>>,
-    },
-    FinishPendingProjectionRepair {
-        token: crate::managed_overlay::PendingRepairToken,
-        reply: mpsc::Sender<Result<(), SyncApplicationPageRequestError>>,
-    },
-    #[cfg(test)]
     ApplicationPropertyRegistryProbe {
         reply: mpsc::Sender<ApplicationPropertyRegistryProbe>,
     },
@@ -11317,34 +11176,6 @@ enum ActorRequest {
     },
 }
 
-struct PendingRepairStart {
-    token: crate::managed_overlay::PendingRepairToken,
-    fence: crate::query_jobs::QueryDrainFence,
-    path: PathBuf,
-    config: crate::config::ParseConfig,
-}
-
-fn pending_repair_error(
-    status: crate::managed_overlay::PendingRepairStatus,
-) -> SyncApplicationPageRequestError {
-    use crate::managed_overlay::PendingRepairStatus;
-    match status {
-        PendingRepairStatus::Working => SyncApplicationPageRequestError::QueryExecution(
-            crate::query::QueryExecutionError::NotReady(
-                crate::query::QueryReadinessReason::Recovering,
-            ),
-        ),
-        PendingRepairStatus::Failed => {
-            query_unavailable(crate::query::QueryUnavailableReason::ReadFailed)
-        }
-        PendingRepairStatus::Idle | PendingRepairStatus::Retired => {
-            SyncApplicationPageRequestError::QueryExecution(
-                crate::query::QueryExecutionError::Cancelled,
-            )
-        }
-    }
-}
-
 fn actor_thread_from_clean_resources(
     request: SyncRuntimeOpenRequest,
     identities: SyncLocalActivationIdentities,
@@ -11362,10 +11193,7 @@ fn actor_thread_from_clean_resources(
         recovery,
         managed_query,
     ) {
-        Ok(mut actor) => {
-            actor.install_pending_overlay();
-            actor
-        }
+        Ok(actor) => actor,
         Err(error) => {
             let _ = started.send(ActorStartupEvent(Err(error)));
             return;
@@ -11393,11 +11221,6 @@ fn run_actor_loop(
             .chain(actor.sweep_deadline_remaining())
             .chain(
                 actor
-                    .pending_overlay_rebuild_has_work()
-                    .then_some(Duration::from_millis(10)),
-            )
-            .chain(
-                actor
                     .search_index_build_has_work()
                     .then_some(Duration::from_millis(10)),
             )
@@ -11405,7 +11228,6 @@ fn run_actor_loop(
         let request = match receiver.recv_timeout(timeout) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                actor.advance_pending_overlay_rebuild();
                 if actor
                     .managed_local
                     .as_ref()
@@ -11818,35 +11640,6 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
-            ActorRequest::PendingOverlayState { reply } => {
-                let _ = reply.send(actor.pending_overlay_state());
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::ClosePendingOverlay { reply } => {
-                actor.retire_pending_overlay();
-                actor.managed_query.jobs.cancel_all_and_drain();
-                actor.close_pending_overlay();
-                let _ = reply.send(());
-                false
-            }
-            ActorRequest::BeginPendingProjectionRepair { instance, reply } => {
-                let _ = reply.send(actor.begin_pending_projection_repair(instance));
-                false
-            }
-            ActorRequest::FinishPendingProjectionRepair { token, reply } => {
-                let _ = reply.send(actor.finish_pending_projection_repair(token));
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::RebuildPendingOverlay { reply } => {
-                actor.retire_pending_overlay();
-                actor.managed_query.jobs.cancel_all_and_drain();
-                actor.install_pending_overlay();
-                let _ = reply.send(());
-                false
-            }
-            #[cfg(test)]
             ActorRequest::ApplicationPropertyRegistryProbe { reply } => {
                 let _ = reply.send(ApplicationPropertyRegistryProbe {
                     accepted: actor
@@ -11914,9 +11707,6 @@ fn run_actor_loop(
             actor.terminal = Some(error);
         }
         actor.publish_absence_sweep_changes();
-        if !should_stop {
-            actor.advance_pending_overlay_rebuild();
-        }
         *shared_status.write().unwrap() = actor.snapshot();
         if should_stop {
             break;
@@ -12109,13 +11899,6 @@ struct ManagedLocalRuntimeState {
     frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     pending_index: ManagedLocalPendingIndex,
     latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
-    /// The pending-page overlay projection (R5b, `managed_overlay.rs`): every
-    /// change to `latest_projection_frames` is mirrored into it, so a query
-    /// can answer the pending suffix from the database instead of a walk.
-    /// `None` only when the overlay could not be created; pending queries
-    /// then walk exactly as before R5.
-    pending_overlay: Option<Arc<crate::managed_overlay::PendingOverlay>>,
-    pending_overlay_rebuild: VecDeque<String>,
     checkpoint: ManagedLocalDrainCheckpoint,
     checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
@@ -12311,71 +12094,18 @@ impl ManagedLocalRuntimeState {
             .or_else(|| (!self.frames.is_empty()).then(|| "authenticate".into()))
     }
 
-    /// A path entered (or re-entered) the pending set. The overlay is told in
-    /// the same call, so the two can never disagree about membership; its
-    /// content follows from the same actor turn (`note_pending_page_content`
-    /// / `note_pending_page_missing`), or the overlay stays incomplete for
-    /// that path and pending queries walk until it arrives.
     fn note_latest_projection_frame(
         &mut self,
         path: ManagedPath,
         frame: LocalJournalFrame<ManagedLocalJournalPayloadKind>,
     ) {
-        let key = path.as_str().to_owned();
-        if let Some(overlay) = self.pending_overlay.as_ref() {
-            overlay.announce(&key);
-        }
-        self.latest_projection_frames.insert(key, frame);
-    }
-
-    /// The pending state of `path` is this page.
-    ///
-    /// The overlay's membership key is the projection intent's path
-    /// (`note_latest_projection_frame`); the content arrives under the
-    /// application page's path, a different structure. If the two ever
-    /// diverged the overlay would hold a page the accepted-side mask does not
-    /// cover and the two-source read (R5a) would answer
-    /// `Corrupt("page in two sources")` — an error, not a wrong answer, but a
-    /// confusing one. So content for a path that was never announced marks the
-    /// overlay failed instead: pending queries report a counted failure,
-    /// and in tests the divergence panics.
-    fn note_pending_page_content(&self, path: &ManagedPath, page: Arc<MaterializedPage>) {
-        if !self.latest_projection_frames.contains_key(path.as_str()) {
-            debug_assert!(
-                false,
-                "pending content for {:?} arrived under a path the pending set does not \
-                 hold; the frame's intent path and the application page path diverged",
-                path.as_str()
-            );
-            self.note_pending_overlay_failed("pending content path not announced");
-            return;
-        }
-        if let Some(overlay) = self.pending_overlay.as_ref() {
-            overlay.content(path.as_str(), page);
-        }
-    }
-
-    /// The pending state of `path` is "no page".
-    fn note_pending_page_missing(&self, path: &ManagedPath) {
-        if let Some(overlay) = self.pending_overlay.as_ref() {
-            overlay.tombstone(path.as_str());
-        }
-    }
-
-    /// The pending state of `path` cannot be represented: the overlay is not
-    /// to be trusted until the next open, and pending queries walk.
-    fn note_pending_overlay_failed(&self, reason: &'static str) {
-        if let Some(overlay) = self.pending_overlay.as_ref() {
-            overlay.mark_failed(reason);
-        }
+        self.latest_projection_frames
+            .insert(path.as_str().to_owned(), frame);
     }
 
     /// `path`'s batch was accepted and drained: it left the pending set.
     fn retire_latest_projection_frame(&mut self, path: &ManagedPath) {
         self.latest_projection_frames.remove(path.as_str());
-        if let Some(overlay) = self.pending_overlay.as_ref() {
-            overlay.remove(path.as_str());
-        }
     }
 
     fn compact_clean_foreground_journal_if_needed(&mut self) -> Result<bool, String> {
@@ -12992,10 +12722,6 @@ fn open_clean_foreground_journal(
         frames: recovered_frames.into(),
         pending_index,
         latest_projection_frames,
-        // Installed by the actor once it owns the projection file
-        // (`install_pending_overlay`): the overlay sits next to that file.
-        pending_overlay: None,
-        pending_overlay_rebuild: VecDeque::new(),
         checkpoint,
         checkpoint_batch_id,
         continuation: None,
@@ -13860,192 +13586,7 @@ fn managed_registry_page_key(page_id: PageId) -> String {
     format!("page:{}", page_id.as_uuid())
 }
 
-impl RuntimeActor {
-    /// (Re)create the pending-page overlay projection next to the active
-    /// projection file and rebuild it from the authoritative pending set
-    /// (`latest_projection_frames`), page by page through the shared pending
-    /// materialization producer, without parser/editor views. Never reuses a file from an earlier process. A
-    /// creation failure leaves no overlay installed: pending queries report
-    /// projection unavailability rather than traversing or retrying forever.
-    fn install_pending_overlay(&mut self) {
-        self.close_pending_overlay();
-        let Ok(database) = self.active_database() else {
-            return;
-        };
-        let accepted_path = database.path().to_path_buf();
-        let config = self.graph.config.parse_config();
-        let Ok(overlay) = crate::managed_overlay::PendingOverlay::open(
-            &accepted_path,
-            config,
-            crate::managed_overlay::next_instance(),
-        ) else {
-            return;
-        };
-        let paths = match self.managed_local.as_mut() {
-            Some(managed) => {
-                managed.pending_overlay = Some(Arc::clone(&overlay));
-                managed
-                    .latest_projection_frames
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            }
-            None => {
-                overlay.close();
-                return;
-            }
-        };
-        for path in paths {
-            overlay.announce(&path);
-            let Ok(parsed) = ManagedPath::parse(path.clone()) else {
-                overlay.mark_failed("pending overlay rebuild path");
-                continue;
-            };
-            match self.with_pending_materialized_page(&parsed, |page| {
-                Ok(page.map(|(page, _source)| Arc::new(page)))
-            }) {
-                Ok(Some(Some(page))) => overlay.content(&path, page),
-                Ok(Some(None)) => overlay.tombstone(&path),
-                Ok(None) => overlay.remove(&path),
-                Err(_) => {
-                    overlay.mark_failed("pending overlay rebuild page");
-                }
-            }
-        }
-    }
-
-    fn begin_pending_projection_repair(
-        &mut self,
-        instance: u64,
-    ) -> Result<Option<PendingRepairStart>, SyncApplicationPageRequestError> {
-        let state = self.managed_query.pending_repair.status();
-        if state != crate::managed_overlay::PendingRepairStatus::Idle {
-            return Err(pending_repair_error(state));
-        }
-        let old = match self
-            .managed_local
-            .as_ref()
-            .and_then(|managed| managed.pending_overlay.as_ref())
-        {
-            Some(overlay) if overlay.instance() == instance => Arc::clone(overlay),
-            _ => return Ok(None),
-        };
-        let path = self
-            .active_database()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
-            .path()
-            .to_path_buf();
-        let config = self.graph.config.parse_config();
-        let token = self
-            .managed_query
-            .pending_repair
-            .begin(old)
-            .ok_or_else(|| pending_repair_error(self.managed_query.pending_repair.status()))?;
-        if let Some(managed) = self.managed_local.as_mut() {
-            managed.pending_overlay.take();
-            managed.pending_overlay_rebuild.clear();
-        }
-        let fence = self.managed_query.jobs.begin_drain();
-        Ok(Some(PendingRepairStart {
-            token,
-            fence,
-            path,
-            config,
-        }))
-    }
-
-    fn finish_pending_projection_repair(
-        &mut self,
-        token: crate::managed_overlay::PendingRepairToken,
-    ) -> Result<(), SyncApplicationPageRequestError> {
-        let Some(managed) = self.managed_local.as_mut() else {
-            return Err(pending_repair_error(
-                crate::managed_overlay::PendingRepairStatus::Retired,
-            ));
-        };
-        let candidate = self
-            .managed_query
-            .pending_repair
-            .finish(token)
-            .ok_or_else(|| pending_repair_error(self.managed_query.pending_repair.status()))?;
-        managed.pending_overlay_rebuild =
-            managed.latest_projection_frames.keys().cloned().collect();
-        for path in &managed.pending_overlay_rebuild {
-            candidate.announce(path);
-        }
-        managed.pending_overlay = Some(candidate);
-        Ok(())
-    }
-
-    fn pending_overlay_rebuild_has_work(&self) -> bool {
-        self.managed_local
-            .as_ref()
-            .is_some_and(|managed| !managed.pending_overlay_rebuild.is_empty())
-    }
-
-    /// One authoritative page per actor turn, also progressed during idle time.
-    /// A disconnected original query caller cannot strand reconstruction.
-    fn advance_pending_overlay_rebuild(&mut self) {
-        let work = self.managed_local.as_mut().and_then(|managed| {
-            let overlay = managed.pending_overlay.as_ref()?.clone();
-            let path = managed.pending_overlay_rebuild.pop_front()?;
-            Some((overlay, path))
-        });
-        let Some((overlay, path)) = work else { return };
-        let rebuilt = ManagedPath::parse(path.clone()).ok().and_then(|parsed| {
-            self.with_pending_materialized_page(&parsed, |page| {
-                Ok(page.map(|(page, _)| Arc::new(page)))
-            })
-            .ok()
-        });
-        match rebuilt {
-            Some(Some(Some(page))) => overlay.content(&path, page),
-            Some(Some(None)) => overlay.tombstone(&path),
-            Some(None) => overlay.remove(&path),
-            None => {
-                overlay.mark_failed("pending overlay repair page");
-                if let Some(managed) = self.managed_local.as_mut() {
-                    managed.pending_overlay_rebuild.clear();
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn pending_overlay_state(&self) -> Option<(PathBuf, crate::managed_overlay::OverlayState)> {
-        let overlay = self.managed_local.as_ref()?.pending_overlay.as_ref()?;
-        let state = overlay.wait_flushed(overlay.latest_revision(), Duration::from_secs(10));
-        Some((overlay.path().to_path_buf(), state))
-    }
-
-    /// Stop captures of this instance before draining jobs which already own it.
-    fn retire_pending_overlay(&self) {
-        self.managed_query.pending_repair.retire();
-        if let Some(overlay) = self
-            .managed_local
-            .as_ref()
-            .and_then(|managed| managed.pending_overlay.as_ref())
-        {
-            overlay.retire();
-        }
-    }
-
-    /// Stop and delete the pending overlay. Every off-actor query job has been
-    /// drained by the caller (I-21); the overlay's own close joins its worker.
-    fn close_pending_overlay(&mut self) {
-        self.managed_query.pending_repair.cleanup();
-        if let Some(managed) = self.managed_local.as_mut() {
-            managed.pending_overlay_rebuild.clear();
-        }
-        if let Some(overlay) = self
-            .managed_local
-            .as_mut()
-            .and_then(|managed| managed.pending_overlay.take())
-        {
-            overlay.close();
-        }
-    }
-}
+impl RuntimeActor {}
 
 impl Drop for RuntimeActor {
     fn drop(&mut self) {
@@ -14053,9 +13594,7 @@ impl Drop for RuntimeActor {
         // truncates its WAL) when this actor drops; every off-actor query job
         // must be gone first. Idempotent, so the handle's `close` and this
         // drain compose in either order.
-        self.retire_pending_overlay();
         self.managed_query.jobs.cancel_all_and_drain();
-        self.close_pending_overlay();
     }
 }
 
@@ -16437,15 +15976,9 @@ impl RuntimeActor {
     /// materialized owner rows of the accepted frontier, with NO mask and NO
     /// pending overlay.
     ///
-    /// **R5c: this is the only table this actor caches and publishes**, keyed
-    /// by `(acceptance sequence, frontier state digest, parse config digest)`.
-    /// A pending local suffix no longer evicts it and no longer advances its
-    /// generation: the suffix is not accepted evidence, so it cannot change
-    /// what this table says. A captured pending query carries this table and
-    /// the executor PATCHES it off the actor, over exactly the keys the
-    /// pending pages can have changed
-    /// (`managed_registry_patch::patched_pending_registry`), instead of making
-    /// every keystroke rebuild the graph's whole registry here (I-13).
+    /// This actor-side cache remains for export and the independent test
+    /// oracles. Live result and metadata queries capture the database-owned
+    /// committed registry cache instead.
     ///
     /// Deliberately NOT named `application_*`: R5c adds no read-surface entry
     /// point. `application_property_registry_ready` still owns the question and
@@ -16485,15 +16018,8 @@ impl RuntimeActor {
     /// exactly as the rows are, so a new pending page has an entry and a
     /// replaced path does not keep its accepted format.
     ///
-    /// **R5c:** the merged table is built PER READ and never published. It is
-    /// returned at the accepted base's generation, because the pending state a
-    /// reader is looking at is identified by the query stamp's
-    /// `overlay_revision`, not by G7's generation, which belongs to the
-    /// accepted table. This build is the residue R5c leaves behind: the ordinary
-    /// pending route no longer reaches it, only the recovery walk and the
-    /// non-simple-query readers do, and removing it needs an
-    /// ordinal-preserving by-key/by-page property read `tine-storage` v0.16.0
-    /// does not expose.
+    /// The merged table is built per actor-side read and never published. Live
+    /// query execution does not call this function.
     fn application_property_registry_ready(
         &self,
     ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
@@ -16806,55 +16332,22 @@ impl RuntimeActor {
                 exceeded: false,
             }));
         }
-        // The CAPTURE path prepares a property query under the ACCEPTED table,
-        // because that is the base the off-actor executor patches. RET2 leaves
-        // this as the ONLY preparation a production turn makes; the merged
-        // table is now re-taken by the `#[cfg(test)]` oracle alone.
+        // Production captures only immutable main-image inputs; the merged
+        // editor-state table is re-taken by the test oracle alone.
         let prepared =
             self.application_simple_query_prepared_ir(parsed, view, today, max_rows, max_bytes)?;
-        // No stamp: a pending local suffix exists and NO overlay could be
-        // created for it, so there is nothing to read the pending pages from.
-        // RET2: that is a bounded unavailability, not endless pending and not
-        // an actor walk — the projection genuinely cannot serve this query
-        // until the overlay exists.
-        let Some(stamp) = prepared.stamp.clone() else {
-            return Err(query_unavailable(
-                crate::query::QueryUnavailableReason::ProjectionUnavailable,
-            ));
-        };
-        // R5b/R5c: with a pending suffix, only a query every relation of which
-        // stays inside one page can be split between the accepted file and the
-        // overlay (`PageLocality`, exhaustive over the IR). A property leaf is
-        // no longer an exclusion: R5c patches the registry off the actor, so a
-        // `props` query is captured like any other and the executor lowers both
-        // sources under the patched table.
-        //
-        // RET2: every attribute the IR can carry today is `Local`, so this is a
-        // FUTURE-relation guard, not a live route. A cross-page relation added
-        // later must be answered by the index or refused here — it must never
-        // evaluate the parsed graph on the actor.
-        if stamp.overlay_revision.is_some()
-            && prepared.query.page_locality() != crate::query::ir::PageLocality::Local
-        {
-            return Err(query_unavailable(
-                crate::query::QueryUnavailableReason::UnsupportedRelation,
-            ));
-        }
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let overlay = self.pending_overlay_capture(&stamp)?;
         Ok(SimpleQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
                 job_epoch: self.managed_query.jobs.capture_epoch(),
                 path: database.path().to_path_buf(),
-                overlay,
                 graph_root: self.graph.root.clone(),
-                stamp,
+                stamp: prepared.stamp,
                 config: prepared.config,
                 journal_format: self.graph.journal_format.clone(),
                 registry: prepared.registry,
-                props: prepared.props,
                 query: prepared.query,
                 view: prepared.view,
                 today: prepared.today,
@@ -16873,72 +16366,31 @@ impl RuntimeActor {
         )))
     }
 
-    /// The per-request inputs both halves of a Managed simple query share:
-    /// ONE parse of the source at ONE execution day, the config and registry
-    /// the answer is computed under, and the stamp — `None`
-    /// while a pending local suffix makes the accepted frontier not the whole
-    /// story, in which case nothing is captured.
-    /// The accepted-frontier evidence an off-actor capture is stamped with, or
-    /// `None` while a pending local suffix is undrained.
+    /// Capture evidence from the actual coherent main database image. The hot
+    /// engine's required target may legitimately be ahead of this root.
     fn managed_simple_query_stamp(
         &self,
         config: &crate::config::ParseConfig,
-    ) -> Result<Option<crate::managed_query::ManagedQueryStamp>, SyncApplicationPageRequestError>
-    {
-        match self.managed_query.pending_repair.status() {
-            crate::managed_overlay::PendingRepairStatus::Working => {
-                return Err(SyncApplicationPageRequestError::QueryExecution(
-                    crate::query::QueryExecutionError::NotReady(
-                        crate::query::QueryReadinessReason::Recovering,
-                    ),
-                ))
-            }
-            crate::managed_overlay::PendingRepairStatus::Failed => {
-                return Err(query_unavailable(
-                    crate::query::QueryUnavailableReason::ReadFailed,
-                ))
-            }
-            crate::managed_overlay::PendingRepairStatus::Retired => {
-                return Err(SyncApplicationPageRequestError::QueryExecution(
-                    crate::query::QueryExecutionError::Cancelled,
-                ))
-            }
-            crate::managed_overlay::PendingRepairStatus::Idle => {}
-        }
-        // R5b: a pending suffix is part of the stamp, not a reason to have
-        // none — its overlay revision. Without an overlay (creation failed)
-        // the pending state has no stamp and the query reports unavailability.
-        let (overlay_instance, overlay_revision) = match self.managed_local.as_ref() {
-            Some(managed) if !managed.latest_projection_frames.is_empty() => {
-                match managed.pending_overlay.as_ref() {
-                    Some(overlay) => (Some(overlay.instance()), Some(overlay.latest_revision())),
-                    None => return Ok(None),
-                }
-            }
-            _ => (None, None),
-        };
-        let read = self.application_materialized_read_ready()?;
-        let acceptance_sequence = read.acceptance_sequence();
-        drop(read);
+    ) -> Result<crate::managed_query::ManagedQueryStamp, SyncApplicationPageRequestError> {
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        Ok(Some(crate::managed_query::ManagedQueryStamp {
-            acceptance_sequence,
-            frontier_digest: database.required_frontier_digest(),
+        let root = database
+            .frontier_root()
+            .map_err(|_| query_unavailable(crate::query::QueryUnavailableReason::ReadFailed))?;
+        let frontier_digest = crate::oplog::sqlite::canonical_frontier_root_digest(&root)
+            .map_err(|_| query_unavailable(crate::query::QueryUnavailableReason::ReadFailed))?;
+        Ok(crate::managed_query::ManagedQueryStamp {
+            acceptance_sequence: root.acceptance_sequence(),
+            frontier_digest,
             config_digest: config.digest(),
-            overlay_revision,
-            overlay_instance,
-        }))
+        })
     }
 
     /// The per-request inputs one Managed simple-query turn captures under.
     ///
-    /// RET2: there is exactly ONE registry choice left here — the ACCEPTED
-    /// table, which is the base the off-actor executor patches. The MERGED
-    /// table the actor-side walk had to coerce against is now needed only by
-    /// the `#[cfg(test)]` oracle, which re-takes it through
-    /// [`Self::prepared_for_walk`].
+    /// Property-free queries skip registry capture. Property queries capture
+    /// the database-owned committed cache input at the stamped main revision.
     #[cfg(test)]
     fn application_simple_query_prepared(
         &self,
@@ -16962,39 +16414,39 @@ impl RuntimeActor {
         let profile = crate::query::ConstructionProfile::from_view(&view);
         let config = self.graph.config.parse_config();
         let props = parsed.filter.has_props_leaf();
-        // The stamp comes FIRST: it is one materialized-read open, and the
-        // registry choice below is keyed by the intent it is prepared for, so
-        // computing it after the registry would only invite a second open.
         let stamp = self.managed_simple_query_stamp(&config)?;
-        // A query without a `props` leaf never consults an effective type, so
-        // building the registry would be cost with no meaning.
         let registry = if props {
-            self.accepted_property_registry()?
+            let database = self
+                .active_database()
+                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+            let (owner, capture) = database
+                .query_registry_capture(stamp.acceptance_sequence, &config)
+                .map_err(SyncApplicationPageRequestError::QueryExecution)?;
+            Some(crate::managed_query::ManagedRegistryCapture { owner, capture })
         } else {
-            std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
+            None
         };
         Ok(PreparedSimpleQuery {
             query: parsed,
             view,
             today,
             profile,
+            #[cfg(test)]
             props,
-            config,
+            config: config.clone(),
             registry,
             stamp,
+            #[cfg(test)]
+            walk_registry: std::sync::Arc::new(crate::query::registry::Registry::empty(&config)),
         })
     }
 
-    /// Re-take the registry MERGED for a preparation the capture path made
-    /// (R5c). The walk coerces against the merged table; with nothing pending
-    /// the two are the same table and this is a cache hit.
-    ///
-    /// RET2: production no longer walks, so the only caller left is the walk
-    /// ORACLE the parity gates compare against.
+    /// Re-take the merged editor-state registry for the independent walk
+    /// oracle. Production does not call this path.
     #[cfg(test)]
     fn prepared_for_walk(&self, mut prepared: PreparedSimpleQuery) -> PreparedSimpleQuery {
         if prepared.props {
-            prepared.registry = self.application_property_registry();
+            prepared.walk_registry = self.application_property_registry();
         }
         prepared
     }
@@ -17113,7 +16565,7 @@ impl RuntimeActor {
             &crate::query::ApplicationQueryPages {
                 pages: &pages,
                 config: prepared.config,
-                registry: prepared.registry,
+                registry: prepared.walk_registry,
             },
             &prepared.query,
             prepared.today,
@@ -17391,54 +16843,26 @@ impl RuntimeActor {
             || matches!(&request, ManagedQueryRequest::Counts(probes)
                 if probes.iter().any(|probe| probe.filter.has_props_leaf()));
         let stamp = self.managed_simple_query_stamp(&config)?;
-        // The CAPTURE path prepares under the ACCEPTED table, because that is
-        // the base the off-actor executor patches.
-        let registry = if props {
-            self.accepted_property_registry()?
-        } else {
-            std::sync::Arc::new(crate::query::registry::Registry::empty(&config))
-        };
-        // No stamp: a pending local suffix with no overlay to read it from.
-        // RET2 classifies it exactly as the simple-query turn does — bounded
-        // unavailability, never an actor walk.
-        let Some(stamp) = stamp else {
-            return Err(query_unavailable(
-                crate::query::QueryUnavailableReason::ProjectionUnavailable,
-            ));
-        };
-        // R5b/R5c: with a pending suffix, only a query every relation of which
-        // stays inside one page can be split between the accepted file and the
-        // overlay. An explanation is split only when EVERY probe is.
-        //
-        // RET2: a future-relation guard, exactly as in the simple-query turn.
-        // Every attribute the IR carries today is `Local`.
-        let local = selection.page_locality() == crate::query::ir::PageLocality::Local
-            && match &request {
-                ManagedQueryRequest::Counts(probes) => probes
-                    .iter()
-                    .all(|probe| probe.page_locality() == crate::query::ir::PageLocality::Local),
-                _ => true,
-            };
-        if stamp.overlay_revision.is_some() && !local {
-            return Err(query_unavailable(
-                crate::query::QueryUnavailableReason::UnsupportedRelation,
-            ));
-        }
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let overlay = self.pending_overlay_capture(&stamp)?;
+        let registry = if props {
+            let (owner, capture) = database
+                .query_registry_capture(stamp.acceptance_sequence, &config)
+                .map_err(SyncApplicationPageRequestError::QueryExecution)?;
+            Some(crate::managed_query::ManagedRegistryCapture { owner, capture })
+        } else {
+            None
+        };
         Ok(IrQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
                 job_epoch: self.managed_query.jobs.capture_epoch(),
                 path: database.path().to_path_buf(),
-                overlay,
                 graph_root: self.graph.root.clone(),
                 stamp,
                 config,
                 journal_format: self.graph.journal_format.clone(),
                 registry,
-                props,
                 query: selection,
                 view: view.clone(),
                 today,
@@ -17451,50 +16875,13 @@ impl RuntimeActor {
         )))
     }
 
-    /// The pending half of ANY capture this actor takes: the overlay the
-    /// off-actor read must open and the exact revision it must carry.
-    ///
-    /// One spelling for all three captured routes. `None` is "the accepted
-    /// frontier is the whole story"; a stamp that names a pending revision with
-    /// no overlay to read it from is the actor being unavailable for this read,
-    /// never a read that silently drops the suffix.
-    fn pending_overlay_capture(
-        &self,
-        stamp: &crate::managed_query::ManagedQueryStamp,
-    ) -> Result<Option<crate::managed_query::PendingOverlayCapture>, SyncApplicationPageRequestError>
-    {
-        let Some(required_revision) = stamp.overlay_revision else {
-            return Ok(None);
-        };
-        let overlay = self
-            .managed_local
-            .as_ref()
-            .and_then(|managed| managed.pending_overlay.clone())
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        Ok(Some(crate::managed_query::PendingOverlayCapture {
-            required_revision,
-            overlay,
-        }))
-    }
-
     /// Phase one of the PUBLIC property-registry route (RET2, SPEC §7.1
     /// `query_registry`): see `SyncRuntimeHandle::application_captured_registry`
     /// for the whole route.
     ///
-    /// A SHORT turn, and deliberately the same short turn the query routes
-    /// take: the readiness check, the query stamp (so a metadata read and a
-    /// result query taken at the same moment describe the same accepted
-    /// frontier, the same config and the same pending revision), the ACCEPTED
-    /// table through its existing cached fallible acquisition, and the pending
-    /// overlay handle. It performs NO whole-registry scan of its own beyond the
-    /// accepted cache's existing cold build, and it reconstructs no pending
-    /// page: the pending suffix is patched in off the actor, under the
-    /// snapshots the executor opens.
-    ///
-    /// `accepted_property_registry` is the fallible acquisition, not
-    /// `application_property_registry`: a failed metadata read must be an
-    /// error, because serving the last published table would answer today's
-    /// question with a table for another frontier.
+    /// A short turn with the same main-frontier stamp and immutable registry
+    /// capture as a property result query. Registry SQL runs off actor on the
+    /// validated snapshot.
     fn application_captured_registry_turn(
         &mut self,
     ) -> Result<RegistryTurn, SyncApplicationPageRequestError> {
@@ -17502,31 +16889,20 @@ impl RuntimeActor {
             return Ok(RegistryTurn::Deferred(state));
         }
         let config = self.graph.config.parse_config();
-        // The stamp comes FIRST, exactly as it does in the query turns, so the
-        // pending-repair status and the materialized read are consulted once
-        // and in the same order.
         let stamp = self.managed_simple_query_stamp(&config)?;
-        let registry = self.accepted_property_registry()?;
-        // No stamp: a pending local suffix exists and NO overlay could be
-        // created for it. Bounded unavailability, exactly as for a query —
-        // never the accepted table served as if the suffix did not exist.
-        let Some(stamp) = stamp else {
-            return Err(query_unavailable(
-                crate::query::QueryUnavailableReason::ProjectionUnavailable,
-            ));
-        };
         let database = self
             .active_database()
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let overlay = self.pending_overlay_capture(&stamp)?;
+        let (owner, capture) = database
+            .query_registry_capture(stamp.acceptance_sequence, &config)
+            .map_err(SyncApplicationPageRequestError::QueryExecution)?;
         Ok(RegistryTurn::Captured(Box::new(
             crate::managed_metadata::ManagedMetadataCapture {
                 job_epoch: self.managed_query.jobs.capture_epoch(),
                 path: database.path().to_path_buf(),
-                overlay,
                 stamp,
                 config,
-                registry,
+                registry: crate::managed_query::ManagedRegistryCapture { owner, capture },
             },
         )))
     }
@@ -20842,17 +20218,6 @@ impl RuntimeActor {
         })?;
         for projection in record.projections() {
             managed.note_latest_projection_frame(projection.intent().path().clone(), frame.clone());
-            if projection.intent().target().bytes().is_none() {
-                managed.note_pending_page_missing(projection.intent().path());
-                continue;
-            }
-            match committed.post_pages().get(&projection.intent().page_id()) {
-                Some(post_page) => managed.note_pending_page_content(
-                    projection.intent().path(),
-                    Arc::new(post_page.clone()),
-                ),
-                None => managed.note_pending_overlay_failed("application unit post page"),
-            }
         }
         managed.frames.push_back(frame);
         Ok(SyncApplicationUnitOutcome::Applied)
@@ -22610,10 +21975,6 @@ impl RuntimeActor {
         )?;
         let application = join_application_page(parsed, editor)
             .map_err(|_| SyncEditorRequestError::ActorRefusedAt("new_page_response_join"))?;
-        managed.note_pending_page_content(
-            &application.editor.page.path,
-            Arc::new(application.editor.page.clone()),
-        );
         let page = application.editor.dto.clone();
         self.prepared_application_reply = Some((batch_id.to_string(), application));
         Ok(SyncEditorSaveOutcome::Durable {
@@ -22687,13 +22048,6 @@ impl RuntimeActor {
         match outcome {
             TrustedLocalCommitOutcome::Committed(committed) => {
                 let application = self.application_from_clean_foreground_commit(&committed)?;
-                self.managed_local
-                    .as_ref()
-                    .expect("clean foreground journal remains installed")
-                    .note_pending_page_content(
-                        &application.editor.page.path,
-                        Arc::new(application.editor.page.clone()),
-                    );
                 let page = application.editor.dto.clone();
                 self.prepared_application_reply = Some((batch_id.to_string(), application));
                 Ok(SyncEditorSaveOutcome::Durable {
@@ -22851,12 +22205,6 @@ impl RuntimeActor {
         };
         let source = application(source_page_id)?;
         let destination = application(destination_page_id)?;
-        for current in [&source, &destination] {
-            managed.note_pending_page_content(
-                &current.editor.page.path,
-                Arc::new(current.editor.page.clone()),
-            );
-        }
         Ok(SyncApplicationMoveSubtreesOutcome::Committed {
             episode_id: episode_id.to_string(),
             batch_id: batch_id.to_string(),
@@ -22916,16 +22264,7 @@ impl RuntimeActor {
             }
             PendingManagedLocalCommit::Response(committed) => {
                 return match self.application_from_clean_foreground_commit(&committed) {
-                    Ok(application) => {
-                        self.managed_local
-                            .as_ref()
-                            .expect("clean foreground journal remains installed")
-                            .note_pending_page_content(
-                                &application.editor.page.path,
-                                Arc::new(application.editor.page.clone()),
-                            );
-                        Ok(true)
-                    }
+                    Ok(_) => Ok(true),
                     Err(_) => {
                         self.managed_local
                             .as_mut()
@@ -22939,14 +22278,7 @@ impl RuntimeActor {
         match outcome {
             TrustedLocalCommitOutcome::Committed(committed) => {
                 match self.application_from_clean_foreground_commit(&committed) {
-                    Ok(application) => {
-                        self.managed_local
-                            .as_ref()
-                            .expect("clean foreground journal remains installed")
-                            .note_pending_page_content(
-                                &application.editor.page.path,
-                                Arc::new(application.editor.page.clone()),
-                            );
+                    Ok(_) => {
                         self.managed_local
                             .as_mut()
                             .expect("clean foreground journal remains installed")
@@ -25241,11 +24573,8 @@ impl RuntimeActor {
         // a fresh generation. The old generation stays untouched until the
         // marker replacement commits; open reclaims whichever generation the
         // marker does not name. Every off-actor query job over the old file
-        // is cancelled and drained first (R4), and the pending overlay that
-        // sits next to the old file goes with it (R5b).
-        self.retire_pending_overlay();
+        // is cancelled and drained first.
         self.managed_query.jobs.cancel_all_and_drain();
-        self.close_pending_overlay();
         self.clean.take();
         let installation = (|| {
             fs::rename(&baseline_directory, &replacement_directories.baseline)
@@ -25334,7 +24663,6 @@ impl RuntimeActor {
         // until a scan reconciles it (GH #351 audit finding 1).
         self.clean = Some(CleanRuntimeActorCore::new(runtime, sweeps, true));
         self.managed_local = Some(managed_local);
-        self.install_pending_overlay();
         self.projection_turns = Some(projection_turns);
         for batch_id in recovered_provider_batches {
             self.queue_clean_provider_publication(batch_id);

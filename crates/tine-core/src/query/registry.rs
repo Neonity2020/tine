@@ -220,11 +220,10 @@ impl Registry {
 /// classifier, the atomizer, the histogram, the top values, the mismatch count
 /// and the declaration binding stay the one producer's (§6.2, D-4).
 ///
-/// The result carries `base.generation()` and `base.config_digest()`
-/// unchanged: a patched table is a VIEW of the accepted table under a pending
-/// suffix, not a new published generation. The pending state is keyed by the
-/// query stamp's `overlay_revision`; G7's generation belongs to the ACCEPTED
-/// table and only [`crate::sync_runtime`]'s publish step advances it.
+/// The result keeps the base generation and config digest while being built.
+/// The existing committed registry owner publishes it with the semantic
+/// generation of its effective rows; rebuilding unchanged metadata does not
+/// advance that generation. This helper owns inference, not publication.
 pub fn patch_registry(
     base: &Registry,
     patches: impl IntoIterator<Item = (String, Option<RegistryRow>)>,

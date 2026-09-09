@@ -1,5 +1,5 @@
 //! RET3: **database-owned export subtree construction**, over the caller's own
-//! snapshots.
+//! snapshot.
 //!
 //! Copy / Export answers a query macro with the SUBTREE under each selected
 //! result, not just the matched row. Today that is done by re-scanning parsed
@@ -12,7 +12,7 @@
 //!   same public id (an `id::` property copied between pages) and two physical
 //!   pages may share a display name. The source re-scan resolves such a pair by
 //!   whichever page it happened to reach first. Here, selection attaches a
-//!   [`ResultLocator`] — source, physical page id, physical block id — at
+//!   [`ResultLocator`] — physical page id and physical block id — at
 //!   admission, while the collector still owns those facts, and hydration reads
 //!   exactly that block on exactly that snapshot.
 //! * **A subtree is not a page.** Loading a whole document to answer "the four
@@ -23,8 +23,8 @@
 //!
 //! **What this module does not do.** It opens no connection, acquires no job,
 //! actor or graph lock, reads no source document, and performs no recovery or
-//! retry. It receives the SAME `&mut` snapshots the selection ran on, plus the
-//! identity policy the caller captured beside them. Capacity, snapshot
+//! retry. It receives the SAME `&mut` snapshot the selection ran on, plus the
+//! identity policy the caller captured beside it. Capacity, snapshot
 //! acquisition, the public Direct/Managed command adapters, the final
 //! cancellation check and releasing the transactions all stay with the caller.
 //! [`ResultReadError`] is the shared failure vocabulary.
@@ -73,17 +73,7 @@ pub(crate) const TOPOLOGY_BATCH: usize = 128;
 /// these vectors are hot, index-dense and entirely local to this module.
 const NO_PARENT: usize = usize::MAX;
 
-/// One export source: the SAME owned read snapshot the SELECTION ran on.
-///
-/// `source` in a [`ResultLocator`] indexes this slice; it is not itself a proof
-/// of snapshot identity. The manager-owned job adapter must retain these exact
-/// handles across selection and hydration. Substituting a later handle could
-/// otherwise mix the selected root DTO with another revision's descendants.
-pub(crate) struct ExportSubtreeSource<'a> {
-    pub(crate) snapshot: &'a mut PhysicalProjectionQuerySnapshot,
-}
-
-/// Everything the bounded construction needs besides the snapshots.
+/// Everything the bounded construction needs besides the snapshot.
 pub(crate) struct ExportSubtreeInputs<'a> {
     /// The identity policy CAPTURED by the caller beside its snapshots — the
     /// same value the selection resolved its public ids with, so a descendant
@@ -154,7 +144,7 @@ pub(crate) fn select_located_export_queries<E>(
 
 /// **Hydrate the selected roots' subtrees from the projection alone.**
 ///
-/// The whole construction, in four passes over the SAME snapshots:
+/// The whole construction, in four passes over the SAME snapshot:
 ///
 /// 1. the roots' pages and preorders, batched — this is where a root whose
 ///    locator does not own its page is rejected;
@@ -168,12 +158,12 @@ pub(crate) fn select_located_export_queries<E>(
 /// including the ones discovered after the output budget closed — which is why
 /// pass 2 reads a root's whole topology even when nothing more can fit.
 pub(crate) fn hydrate_located_export_queries(
-    sources: &mut [ExportSubtreeSource<'_>],
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
     selected: Vec<LocatedExportQuery>,
     inputs: &ExportSubtreeInputs<'_>,
 ) -> Result<Vec<QueryExportResult>, ResultReadError> {
-    let paths = read_root_page_paths(sources, &selected)?;
-    let preorders = read_root_preorders(sources, &selected)?;
+    let paths = read_root_page_paths(snapshot, &selected)?;
+    let preorders = read_root_preorders(snapshot, &selected)?;
 
     // The two global budgets, clamped exactly as the oracle clamps them, and
     // charged in input macro/root order across every macro.
@@ -187,23 +177,18 @@ pub(crate) fn hydrate_located_export_queries(
     // Re-reading their identical topology would be pure waste, so it is cached
     // — a cache that cannot move an admission or an omission count, because it
     // returns the same rows the second read would have.
-    let mut topologies: HashMap<(usize, [u8; 16]), Subtree> = HashMap::new();
+    let mut topologies: HashMap<[u8; 16], Subtree> = HashMap::new();
 
     for query in selected {
         let mut roots = Vec::with_capacity(query.roots.len());
         for root in query.roots {
             let locator = root.locator;
-            let key = (locator.source, locator.block_id);
+            let key = locator.block_id;
             if !topologies.contains_key(&key) {
                 let preorder = preorders[&key];
-                let path = paths[&(locator.source, locator.page_id)].clone();
-                let subtree = read_subtree_topology(
-                    &mut *sources[locator.source].snapshot,
-                    locator,
-                    preorder,
-                    &path,
-                    inputs.identity,
-                )?;
+                let path = paths[&locator.page_id].clone();
+                let subtree =
+                    read_subtree_topology(snapshot, locator, preorder, &path, inputs.identity)?;
                 topologies.insert(key, subtree);
             }
             let subtree = &topologies[&key];
@@ -227,7 +212,6 @@ pub(crate) fn hydrate_located_export_queries(
                 for (at, node) in admitted.order.iter().copied().enumerate() {
                     let parent = admitted.parents[at];
                     emitted.push(EmittedNode {
-                        source: locator.source,
                         page_id: locator.page_id,
                         block_id: match node {
                             0 => locator.block_id,
@@ -273,80 +257,69 @@ pub(crate) fn hydrate_located_export_queries(
         });
     }
 
-    read_output_payload(sources, &mut emitted)?;
+    read_output_payload(snapshot, &mut emitted)?;
     Ok(assemble(outcomes, emitted))
 }
 
 // ===== pass 1: the roots' pages and preorders =====
 
-/// Every root's page PATH, per source, batched.
+/// Every root's page path, batched on the operation's snapshot.
 ///
 /// The path is what a fresh Direct Files session's structural identity policy
 /// resolves a descendant's public id from (`doc_runtime_id_for_order`), and a
-/// page that has no row on the source its locator names is a projection that
-/// contradicts itself.
+/// page that has no row is a projection that contradicts itself.
 fn read_root_page_paths(
-    sources: &mut [ExportSubtreeSource<'_>],
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
     selected: &[LocatedExportQuery],
-) -> Result<HashMap<(usize, [u8; 16]), String>, ResultReadError> {
-    let mut wanted: Vec<HashSet<[u8; 16]>> = (0..sources.len()).map(|_| HashSet::new()).collect();
+) -> Result<HashMap<[u8; 16], String>, ResultReadError> {
+    let mut wanted = HashSet::new();
     for query in selected {
         for root in &query.roots {
-            let Some(source) = wanted.get_mut(root.locator.source) else {
-                return Err(ResultReadError::Corrupt(
-                    "an export root names a source this batch does not own".to_string(),
-                ));
-            };
-            source.insert(root.locator.page_id);
+            wanted.insert(root.locator.page_id);
         }
     }
     let mut paths = HashMap::new();
-    for (at, ids) in wanted.into_iter().enumerate() {
-        // Sorted, so the batching (and therefore the statement count a gate
-        // asserts) is a property of the input and not of a hash seed.
-        let mut ids: Vec<[u8; 16]> = ids.into_iter().collect();
-        ids.sort_unstable();
-        for batch in ids.chunks(TOPOLOGY_BATCH) {
-            let snapshot = &mut *sources[at].snapshot;
-            if snapshot.cancellation().is_cancelled() {
-                return Err(ResultReadError::Cancelled);
-            }
-            let sql = format!(
-                "SELECT page_id, path FROM pages WHERE page_id IN ({})",
-                placeholders(batch.len())
-            );
-            let params = batch
-                .iter()
-                .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
-                .collect::<Vec<_>>();
-            #[cfg(test)]
-            note(|census| census.page_statements += 1);
-            let rows = snapshot
-                .run_projection_query(&sql, &params)
-                .map_err(|error| sql_or_cancelled(snapshot, error))?;
-            for row in &rows {
-                let decoded = (|| {
-                    Ok::<_, String>((
-                        blob16(row, 0, "pages.page_id")?,
-                        text(row, 1, "pages.path")?,
-                    ))
-                })()
-                .map_err(ResultReadError::Corrupt)?;
-                paths.insert((at, decoded.0), decoded.1);
-            }
-            for id in batch {
-                if !paths.contains_key(&(at, *id)) {
-                    return Err(ResultReadError::Corrupt(
-                        "an export root's page has no page row".to_string(),
-                    ));
-                }
+    let mut ids: Vec<[u8; 16]> = wanted.into_iter().collect();
+    ids.sort_unstable();
+    for batch in ids.chunks(TOPOLOGY_BATCH) {
+        if snapshot.cancellation().is_cancelled() {
+            return Err(ResultReadError::Cancelled);
+        }
+        let sql = format!(
+            "SELECT page_id, path FROM pages WHERE page_id IN ({})",
+            placeholders(batch.len())
+        );
+        let params = batch
+            .iter()
+            .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        note(|census| census.page_statements += 1);
+        let rows = snapshot
+            .run_projection_query(&sql, &params)
+            .map_err(|error| sql_or_cancelled(snapshot, error))?;
+        for row in &rows {
+            let decoded = (|| {
+                Ok::<_, String>((
+                    blob16(row, 0, "pages.page_id")?,
+                    text(row, 1, "pages.path")?,
+                ))
+            })()
+            .map_err(ResultReadError::Corrupt)?;
+            paths.insert(decoded.0, decoded.1);
+        }
+        for id in batch {
+            if !paths.contains_key(id) {
+                return Err(ResultReadError::Corrupt(
+                    "an export root's page has no page row".to_string(),
+                ));
             }
         }
     }
     Ok(paths)
 }
 
-/// Every root's PREORDER, per source, batched — and the ownership check that
+/// Every root's preorder, batched — and the ownership check that
 /// makes duplicate public ids and equal display names harmless.
 ///
 /// `query_block_results.page_id` must be the page the locator names. That is
@@ -354,72 +327,63 @@ fn read_root_page_paths(
 /// row is found by its physical block id, and the page it claims has to be the
 /// one the selection admitted it under.
 fn read_root_preorders(
-    sources: &mut [ExportSubtreeSource<'_>],
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
     selected: &[LocatedExportQuery],
-) -> Result<HashMap<(usize, [u8; 16]), i64>, ResultReadError> {
-    let mut wanted: Vec<HashMap<[u8; 16], [u8; 16]>> =
-        (0..sources.len()).map(|_| HashMap::new()).collect();
+) -> Result<HashMap<[u8; 16], i64>, ResultReadError> {
+    let mut wanted = HashMap::new();
     for query in selected {
         for root in &query.roots {
-            let Some(source) = wanted.get_mut(root.locator.source) else {
-                return Err(ResultReadError::Corrupt(
-                    "an export root names a source this batch does not own".to_string(),
-                ));
-            };
-            source.insert(root.locator.block_id, root.locator.page_id);
+            wanted.insert(root.locator.block_id, root.locator.page_id);
         }
     }
     let mut preorders = HashMap::new();
-    for (at, ids) in wanted.into_iter().enumerate() {
-        let mut ordered: Vec<([u8; 16], [u8; 16])> = ids.into_iter().collect();
-        ordered.sort_unstable();
-        for batch in ordered.chunks(TOPOLOGY_BATCH) {
-            let snapshot = &mut *sources[at].snapshot;
-            if snapshot.cancellation().is_cancelled() {
-                return Err(ResultReadError::Cancelled);
+    let mut ordered: Vec<([u8; 16], [u8; 16])> = wanted.into_iter().collect();
+    ordered.sort_unstable();
+    for batch in ordered.chunks(TOPOLOGY_BATCH) {
+        if snapshot.cancellation().is_cancelled() {
+            return Err(ResultReadError::Cancelled);
+        }
+        let sql = format!(
+            "SELECT block_id, page_id, preorder FROM query_block_results \
+             WHERE block_id IN ({})",
+            placeholders(batch.len())
+        );
+        let params = batch
+            .iter()
+            .map(|(id, _)| PhysicalQueryValue::Blob(id.to_vec()))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        note(|census| census.root_statements += 1);
+        let rows = snapshot
+            .run_projection_query(&sql, &params)
+            .map_err(|error| sql_or_cancelled(snapshot, error))?;
+        let owned: HashMap<[u8; 16], [u8; 16]> = batch.iter().copied().collect();
+        for row in &rows {
+            let decoded = (|| {
+                Ok::<_, String>((
+                    blob16(row, 0, "query_block_results.block_id")?,
+                    blob16(row, 1, "query_block_results.page_id")?,
+                    integer(row, 2, "query_block_results.preorder")?,
+                ))
+            })()
+            .map_err(ResultReadError::Corrupt)?;
+            if owned.get(&decoded.0) != Some(&decoded.1) {
+                return Err(ResultReadError::Corrupt(
+                    "an export root's block is owned by a different page".to_string(),
+                ));
             }
-            let sql = format!(
-                "SELECT block_id, page_id, preorder FROM query_block_results \
-                 WHERE block_id IN ({})",
-                placeholders(batch.len())
-            );
-            let params = batch
-                .iter()
-                .map(|(id, _)| PhysicalQueryValue::Blob(id.to_vec()))
-                .collect::<Vec<_>>();
-            #[cfg(test)]
-            note(|census| census.root_statements += 1);
-            let rows = snapshot
-                .run_projection_query(&sql, &params)
-                .map_err(|error| sql_or_cancelled(snapshot, error))?;
-            let owned: HashMap<[u8; 16], [u8; 16]> = batch.iter().copied().collect();
-            for row in &rows {
-                let decoded = (|| {
-                    Ok::<_, String>((
-                        blob16(row, 0, "query_block_results.block_id")?,
-                        blob16(row, 1, "query_block_results.page_id")?,
-                        integer(row, 2, "query_block_results.preorder")?,
-                    ))
-                })()
-                .map_err(ResultReadError::Corrupt)?;
-                if owned.get(&decoded.0) != Some(&decoded.1) {
-                    return Err(ResultReadError::Corrupt(
-                        "an export root's block is owned by a different page".to_string(),
-                    ));
-                }
-                if decoded.2 < 0 {
-                    return Err(ResultReadError::Corrupt(
-                        "query_block_results.preorder is negative".to_string(),
-                    ));
-                }
-                preorders.insert((at, decoded.0), decoded.2);
+            if decoded.2 < 0 {
+                return Err(ResultReadError::Corrupt(
+                    "query_block_results.preorder is negative".to_string(),
+                ));
             }
-            for (id, _) in batch {
-                if !preorders.contains_key(&(at, *id)) {
-                    return Err(ResultReadError::Corrupt(
-                        "an export root has no result row".to_string(),
-                    ));
-                }
+            preorders.insert(decoded.0, decoded.2);
+        }
+        for (id, _) in batch {
+            if !preorders.contains_key(id) {
+                return Err(ResultReadError::Corrupt(
+                    "an export root has no result row".to_string(),
+                ));
             }
         }
     }
@@ -812,7 +776,6 @@ fn admit_subtree(
 
 /// One node the budget admitted, and where its DTO comes from.
 struct EmittedNode {
-    source: usize,
     page_id: [u8; 16],
     block_id: [u8; 16],
     payload: NodePayload,
@@ -838,27 +801,27 @@ struct WantedFacts {
     property_count: usize,
 }
 
-/// Read the OUTPUT payload of the admitted DESCENDANTS, per source, through the
-/// shared payload reader.
+/// Read the output payload of the admitted descendants through the shared
+/// payload reader on the operation's snapshot.
 ///
 /// Distinct block ids only: two occurrences of one repeated root emit the same
 /// rows twice by design, but reading their identical payload twice would be
 /// waste, and de-duplicating a READ cannot move an admission or an omission
 /// count. Nothing here reads payload for a node the budget rejected.
 fn read_output_payload(
-    sources: &mut [ExportSubtreeSource<'_>],
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
     emitted: &mut [EmittedNode],
 ) -> Result<(), ResultReadError> {
-    let mut wanted: Vec<Vec<WantedPayload>> = (0..sources.len()).map(|_| Vec::new()).collect();
-    let mut seen: HashSet<(usize, [u8; 16])> = HashSet::new();
+    let mut wanted = Vec::new();
+    let mut seen = HashSet::new();
     for node in emitted.iter() {
         let NodePayload::Wanted(facts) = &node.payload else {
             continue;
         };
-        if !seen.insert((node.source, node.block_id)) {
+        if !seen.insert(node.block_id) {
             continue;
         }
-        wanted[node.source].push(WantedPayload {
+        wanted.push(WantedPayload {
             block_id: node.block_id,
             page_id: node.page_id,
             result_id: facts.result_id.clone(),
@@ -867,15 +830,11 @@ fn read_output_payload(
             property_count: facts.property_count,
         });
     }
-    let mut built: HashMap<(usize, [u8; 16]), BlockDto> = HashMap::new();
-    for (at, rows) in wanted.iter().enumerate() {
-        if rows.is_empty() {
-            continue;
-        }
-        let snapshot = &mut *sources[at].snapshot;
+    let mut built = HashMap::new();
+    if !wanted.is_empty() {
         read_admitted_payload(
             snapshot,
-            rows,
+            &wanted,
             PayloadChannel::ExportOutput,
             |row: &WantedPayload| PayloadFacts {
                 block_id: row.block_id,
@@ -886,7 +845,7 @@ fn read_output_payload(
                 property_count: row.property_count,
             },
             |index, dto| {
-                built.insert((at, rows[index].block_id), dto);
+                built.insert(wanted[index].block_id, dto);
             },
         )?;
     }
@@ -901,7 +860,7 @@ fn read_output_payload(
                 dto
             }
             NodePayload::Wanted(_) => built
-                .get(&(node.source, node.block_id))
+                .get(&node.block_id)
                 .ok_or_else(|| {
                     ResultReadError::Corrupt(
                         "an admitted descendant has no payload row".to_string(),
