@@ -973,6 +973,10 @@ fn publishes_only_public_pages() {
     std::fs::write(root.join("pages").join("Secret.md"), "- private notes\n").unwrap();
 
     let g = Graph::open(&root);
+    // Publication answers query occurrences from the main projection now, so a
+    // bare graph has nothing to read. Provision one exactly as the publishing
+    // examples do.
+    ready_query::attach_projection(&g, &root);
     let (dir, n) = g.publish_html().unwrap();
     assert_eq!(n, 1, "only the public page is published");
     let p = std::fs::read_to_string(format!("{dir}/shared.html")).unwrap();

@@ -20665,6 +20665,12 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncApplicationPublishOutcome::Deferred { state });
         }
+        // This explicit publication command already promises captured current
+        // documents. Settle their normal foreground publication before pairing
+        // them with main SQL; ordinary query capture never calls this drain.
+        if let Some(state) = self.drain_clean_foreground_for_command() {
+            return Ok(SyncApplicationPublishOutcome::Deferred { state });
+        }
         let inventory = self.application_inventory_ready()?;
         let mut pages = Vec::with_capacity(inventory.len());
         for entry in inventory {
@@ -20679,7 +20685,14 @@ impl RuntimeActor {
             })?;
             pages.push((entry, document));
         }
-        let (path, pages) = crate::publish::publish_graph_documents(&self.graph, pages)
+        let capture = self.capture_current_query_read(true)?;
+        let output = self
+            .managed_query
+            .with_publication_query_reader(&capture, |reader| {
+                crate::publish::publish_graph_documents_with_queries(&self.graph, pages, reader)
+            });
+        let (path, pages) = output
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_query_snapshot"))?
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_output"))?;
         Ok(SyncApplicationPublishOutcome::Published { path, pages })
     }
@@ -22603,12 +22616,9 @@ impl RuntimeActor {
         }
     }
 
-    fn execute_clean_editor_transaction(
-        &mut self,
-        transaction: OperationTransaction,
-        page_id: PageId,
-        affected_page_ids: Vec<String>,
-    ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+    /// Existing bounded foreground drain, shared by explicit commands that
+    /// require accepted documents before their own operation starts.
+    fn drain_clean_foreground_for_command(&mut self) -> Option<SyncEditorDeferred> {
         for _ in 0..MAX_CLEAN_DRAIN_TURNS {
             if self
                 .managed_local
@@ -22631,12 +22641,24 @@ impl RuntimeActor {
             .as_ref()
             .is_some_and(|managed| managed.pending_count() != 0)
         {
+            return Some(SyncEditorDeferred::BlockedRecovery {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::SqliteDrain,
+                retained_publication: false,
+            });
+        }
+        None
+    }
+
+    fn execute_clean_editor_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+        page_id: PageId,
+        affected_page_ids: Vec<String>,
+    ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        if let Some(state) = self.drain_clean_foreground_for_command() {
             return Ok(SyncEditorSaveOutcome::Deferred {
-                state: SyncEditorDeferred::BlockedRecovery {
-                    batch_id: None,
-                    phase: SyncLocalMutationPhase::SqliteDrain,
-                    retained_publication: false,
-                },
+                state,
                 affected_page_ids,
             });
         }

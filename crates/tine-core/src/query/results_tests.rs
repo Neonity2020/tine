@@ -407,6 +407,93 @@ fn parity_over(corpus: &Corpus, identity: &ResultIdentity) -> (Vec<String>, usiz
 
 // ===== the ordered full-DTO parity gate =====
 
+#[test]
+fn operation_snapshot_driver_reuses_readers_without_retaining_answers() {
+    use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
+    let _serial = serialize();
+    let root = scratch("publication-snapshot-driver");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let registry = corpus.graph.property_registry();
+    let identity = ResultIdentity::Stored;
+    let recency = recency_for(&corpus.root);
+    let page_recency = page_recency_for(&corpus.root);
+    let mut snapshot = corpus.snapshot();
+    let cancellation = snapshot.cancellation();
+    let reader = SnapshotQueryReader::new(
+        &mut snapshot,
+        SnapshotQueryInputs {
+            registry: &registry,
+            identity: &identity,
+            order: BackendOrder::Direct,
+            recency: &recency,
+            page_recency: &page_recency,
+            today: corpus.today(),
+        },
+    )
+    .unwrap();
+    for (source, dialect) in every_shape() {
+        let (query, view) = crate::query::parse_query_text(source, dialect, corpus.today());
+        for bounds in [
+            Bounds {
+                max_rows: 20_000,
+                max_bytes: 32 << 20,
+            },
+            Bounds {
+                max_rows: 1,
+                max_bytes: 256,
+            },
+        ] {
+            let expected = crate::query::run_query_result_over(
+                &GraphQueryPages(&corpus.graph),
+                &query,
+                &view,
+                corpus.today(),
+                bounds,
+            );
+            let actual = reader
+                .run(&query, &view, bounds, &ExecutionContext::none())
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{source}"
+            );
+        }
+    }
+    let (query, view) =
+        crate::query::parse_query_text("(task TODO)", QueryDialect::Og, corpus.today());
+    let bounds = Bounds {
+        max_rows: 20_000,
+        max_bytes: 32 << 20,
+    };
+    reset_result_read_census();
+    let first = reader
+        .run(&query, &view, bounds, &ExecutionContext::none())
+        .unwrap();
+    let first_read_rows = result_read_census().descriptor_rows;
+    assert!(first_read_rows > 0);
+    let second = reader
+        .run(&query, &view, bounds, &ExecutionContext::none())
+        .unwrap();
+    assert_eq!(
+        result_read_census().descriptor_rows,
+        first_read_rows * 2,
+        "each use runs SQL"
+    );
+    assert_eq!(
+        serde_json::to_value(first).unwrap(),
+        serde_json::to_value(second).unwrap()
+    );
+    cancellation.cancel();
+    assert!(matches!(
+        reader.run(&query, &view, bounds, &ExecutionContext::none()),
+        Err(crate::query::QueryExecutionError::Cancelled)
+    ));
+    drop(reader);
+    snapshot.finish();
+}
+
 /// The acceptance bar: the constructor's COMPLETE public result equals the
 /// walk's, for every shape §5 names, under every bound §4 names, with the
 /// stored identity.

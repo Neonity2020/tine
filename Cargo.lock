@@ -5773,6 +5773,7 @@ dependencies = [
  "smallvec",
  "sqlparser",
  "syn 2.0.117",
+ "tempfile",
  "tine-storage",
  "unicode-normalization",
  "unicode-segmentation",

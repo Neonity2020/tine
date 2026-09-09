@@ -174,6 +174,12 @@ impl QueryPlan {
             .find(|branch| branch.target == QueryTarget::Blocks)
             .and_then(QueryBranch::fuzzy_visible_content_needle)
     }
+
+    /// Captured current-page scope for projection-backed Friendly execution.
+    /// A physical path, when present, remains authoritative over display name.
+    pub(crate) fn page_scope(&self) -> Option<&QueryPageScope> {
+        self.page_scope.as_ref()
+    }
 }
 
 /// One routed page used to scope a block-search plan. A supplied relative path
@@ -1520,6 +1526,9 @@ pub(crate) struct PageTextRank {
 /// Width of [`PageTextRank::global_order_key`]: signed match-class rank followed
 /// by signed length-adjusted score, both in the existing comparator's order.
 const PAGE_RANK_KEY_LEN: usize = 4 + 4;
+/// Width of [`PageTextRank::owner_order_key`]: exact-override bit, match class,
+/// then the unadjusted score used while choosing one text for an owner.
+const PAGE_OWNER_RANK_KEY_LEN: usize = 1 + 4 + 4;
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl PageTextRank {
@@ -1545,6 +1554,18 @@ impl PageTextRank {
                 && (self.match_class.rank() > other.match_class.rank()
                     || (self.match_class == other.match_class
                         && self.base_score > other.base_score)))
+    }
+
+    /// Lossless owner-local page-text key. Ascending byte order is best first,
+    /// including the private exact override that is deliberately absent from
+    /// the global page comparator. Candidate source order remains the final tie
+    /// breaker, preserving name-first and first-alias behavior.
+    pub(crate) fn owner_order_key(&self) -> [u8; PAGE_OWNER_RANK_KEY_LEN] {
+        let mut key = [0u8; PAGE_OWNER_RANK_KEY_LEN];
+        key[0] = u8::from(!self.exact_override);
+        key[1..5].copy_from_slice(&descending_i32_key(self.match_class.rank()));
+        key[5..9].copy_from_slice(&descending_i32_key(self.base_score));
+        key
     }
 
     /// Existing final score for a physical page/reference name. This uses the
@@ -3124,6 +3145,42 @@ mod tests {
             (first_alias_wins.1, first_alias_wins.2),
             ("foo first", Some("foo first"))
         );
+    }
+
+    #[test]
+    fn page_owner_rank_blob_matches_the_existing_strict_comparator() {
+        let classes = [
+            ObjectiveMatchClass::Exact,
+            ObjectiveMatchClass::Prefix,
+            ObjectiveMatchClass::Substring,
+            ObjectiveMatchClass::Fuzzy,
+            ObjectiveMatchClass::BodyEvidence,
+        ];
+        let ranks = [false, true].into_iter().flat_map(|exact_override| {
+            classes.into_iter().flat_map(move |match_class| {
+                [i32::MIN, -1, 0, 1, i32::MAX]
+                    .into_iter()
+                    .map(move |base_score| PageTextRank {
+                        base_score,
+                        match_class,
+                        exact_override,
+                    })
+            })
+        });
+        let ranks = ranks.collect::<Vec<_>>();
+        for left in &ranks {
+            for right in &ranks {
+                assert_eq!(
+                    left.owner_order_key() < right.owner_order_key(),
+                    left.is_better_owner_choice_than(right)
+                );
+                assert_eq!(
+                    left.owner_order_key() == right.owner_order_key(),
+                    !left.is_better_owner_choice_than(right)
+                        && !right.is_better_owner_choice_than(left)
+                );
+            }
+        }
     }
 
     #[test]

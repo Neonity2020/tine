@@ -904,3 +904,18 @@ editors. This covers an early coherent read followed by a later commit, includin
 a database replacement whose physical SQLite revision happens to repeat.
 The counter is never a query target, result key or saved-edit acknowledgment.
 Managed uses its existing completed local/provider drain notifications.
+
+
+Static whole-site queries use the same current-main SQL reader for OG, advanced,
+TQL, BEGIN_QUERY and query-backed sheets. Every authored occurrence executes on
+that publication's snapshot; no backend answer cache or publication query index
+is built. Page queries render links through exact captured public page paths,
+with private matches omitted after selection and counted as omissions. The
+whole-site command preserves its fresh captured-document/privacy boundary;
+ordinary live-query reads still accept a coherent older main image. Print-query
+routing and the remaining Friendly public adapters are not covered by this
+publication migration.
+
+Tests: `publish::tests`,
+`managed_static_publication_pairs_ordinary_drain_with_current_main_queries`, and
+`publication_sources_are_compared_inside_the_owned_main_snapshot`.

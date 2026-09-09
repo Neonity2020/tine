@@ -475,14 +475,17 @@ fn bench_switcher(root: &Path) -> io::Result<f64> {
 }
 
 fn bench_warm_query(root: &Path) -> io::Result<f64> {
+    let projection_dir = tempfile::tempdir()?;
     let graph = Graph::open(root);
+    graph.attach_direct_projection(projection_dir.path().join("direct.sqlite"))?;
+    graph.warm_cache();
     let page_count = graph.with_pages(|pages| pages.len());
     black_box(page_count);
     let mut durations = Vec::with_capacity(WARM_QUERY_RUNS);
     for i in 0..WARM_QUERY_RUNS {
         let query = primary_query_variant(i);
         let started = Instant::now();
-        let groups = graph.run_query(&query);
+        let groups = graph.run_query(&query).map_err(io::Error::other)?;
         durations.push(started.elapsed());
         assert_nonzero(result_count(groups.as_ref()), &query);
         black_box(groups.len());
@@ -493,8 +496,13 @@ fn bench_warm_query(root: &Path) -> io::Result<f64> {
 fn bench_publish(root: &Path) -> io::Result<(f64, usize)> {
     let mut durations = Vec::with_capacity(PUBLISH_RUNS);
     let mut publish_pages = 0usize;
+    // Graph initialization is outside the publication timing. Each reopen uses
+    // the same ordinary disposable projection, including its warm validation.
+    let projection_dir = tempfile::tempdir()?;
     for _ in 0..PUBLISH_RUNS {
         let graph = Graph::open(root);
+        graph.attach_direct_projection(projection_dir.path().join("direct.sqlite"))?;
+        graph.warm_cache();
         let page_count = graph.with_pages(|pages| pages.len());
         black_box(page_count);
         let started = Instant::now();

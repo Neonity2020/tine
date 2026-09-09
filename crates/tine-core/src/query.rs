@@ -42,6 +42,7 @@ pub(crate) mod sql;
 // wires Direct Files' production switch to it and R4 wires Managed Storage, so
 // outside `cfg(test)` the module says "not called yet" once, here.
 pub(crate) mod rank;
+pub(crate) mod read_execute;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod results;
 // RET3's database-owned export subtree construction: located selection over the
@@ -53,6 +54,8 @@ pub(crate) mod results;
 pub(crate) mod export_execute;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod export_results;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod friendly;
 pub(crate) mod tql;
 pub mod view;
 

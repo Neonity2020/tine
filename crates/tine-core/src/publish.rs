@@ -4,7 +4,9 @@
 
 use crate::doc::{self, DocBlock};
 use crate::model::{BlockDto, Graph, PageKind, RefGroup};
+use crate::query::ir::{Bounds, ExecutionContext, PageRow, QueryResult, QueryRows, ViewSettings};
 use crate::query::macro_text::is_query_macro_name;
+use crate::query::QueryExecutionError;
 use crate::refs::block_id;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -130,52 +132,29 @@ pub fn slug(name: &str) -> String {
 /// search-index entry — so a link can never diverge from the file it points at.
 type SlugMap = std::collections::HashMap<String, String>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum QueryCacheKey {
-    Simple(String),
-    Advanced(String),
+/// One operation-owned current-main reader supplied by the publication
+/// boundary. The renderer parses every authored surface, while the backend
+/// adapter owns the coherent snapshot, registry and cancellation lifetime.
+pub(crate) trait PublicationQueryRead {
+    fn run(
+        &self,
+        query: &crate::query::ir::Query,
+        view: &ViewSettings,
+        bounds: Bounds,
+        context: &ExecutionContext,
+    ) -> Result<QueryResult, QueryExecutionError>;
+
+    fn ensure_current(&self) -> Result<(), QueryExecutionError>;
 }
 
-impl QueryCacheKey {
-    fn source_len(&self) -> usize {
-        match self {
-            Self::Simple(source) | Self::Advanced(source) => source.len(),
-        }
-    }
+fn publication_query_io_error(error: QueryExecutionError) -> io::Error {
+    let kind = match error {
+        QueryExecutionError::NotReady(_) => io::ErrorKind::WouldBlock,
+        QueryExecutionError::Unavailable(_) => io::ErrorKind::Other,
+        QueryExecutionError::Cancelled => io::ErrorKind::Interrupted,
+    };
+    io::Error::new(kind, error)
 }
-
-const QUERY_CACHE_MAX_ENTRIES: usize = 64;
-const QUERY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Default)]
-struct QueryCache {
-    entries: HashMap<QueryCacheKey, crate::query::BoundedGroups>,
-    bytes: usize,
-}
-
-impl QueryCache {
-    fn get(&self, key: &QueryCacheKey) -> Option<crate::query::BoundedGroups> {
-        self.entries.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: QueryCacheKey, groups: crate::query::BoundedGroups) {
-        if self.entries.contains_key(&key) || self.entries.len() >= QUERY_CACHE_MAX_ENTRIES {
-            return;
-        }
-        let bytes = key
-            .source_len()
-            .saturating_add(crate::model::ref_groups_estimated_bytes(&groups.groups))
-            .saturating_add(256);
-        if bytes > QUERY_CACHE_MAX_BYTES || self.bytes.saturating_add(bytes) > QUERY_CACHE_MAX_BYTES
-        {
-            return;
-        }
-        self.bytes += bytes;
-        self.entries.insert(key, groups);
-    }
-}
-
-type SharedQueryCache = RefCell<QueryCache>;
 
 #[cfg(test)]
 mod publish_test_counts {
@@ -185,7 +164,6 @@ mod publish_test_counts {
 
     thread_local! {
         static ACTIVE: Cell<bool> = const { Cell::new(false) };
-        static QUERY_RUNS: Cell<usize> = const { Cell::new(0) };
         static PAGE_DOC_LOADS: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -193,7 +171,6 @@ mod publish_test_counts {
 
     pub(super) fn count_for(_root: &Path) -> Guard {
         ACTIVE.set(true);
-        QUERY_RUNS.set(0);
         PAGE_DOC_LOADS.set(0);
         Guard
     }
@@ -204,20 +181,10 @@ mod publish_test_counts {
         }
     }
 
-    pub(super) fn bump_query_run(_graph: &Graph) {
-        if ACTIVE.get() {
-            QUERY_RUNS.set(QUERY_RUNS.get() + 1);
-        }
-    }
-
     pub(super) fn bump_page_doc_load(_graph: &Graph) {
         if ACTIVE.get() {
             PAGE_DOC_LOADS.set(PAGE_DOC_LOADS.get() + 1);
         }
-    }
-
-    pub(super) fn query_runs() -> usize {
-        QUERY_RUNS.get()
     }
 
     pub(super) fn page_doc_loads() -> usize {
@@ -1231,7 +1198,7 @@ fn ref_target_text(raw: &str) -> String {
 
 /// Render context threaded through `render_block`/`decorate`: the block-ref index
 /// (always) and the graph (present in a real export, absent in inline-decorator unit
-/// tests — when absent, macros drop instead of expanding).
+/// tests — when absent, data macros drop while query macros refuse explicitly).
 struct Ctx<'a> {
     refs: &'a RefIndex,
     reverse_refs: Option<&'a ReverseRefIndex>,
@@ -1250,13 +1217,22 @@ struct Ctx<'a> {
     /// exactly when `inline_assets` is true; all images therefore consume one
     /// cumulative byte ceiling before base64/IPC/DOM amplification.
     print_asset_budget: Option<&'a RefCell<PrintAssetBudget>>,
-    /// Export-local `{{query}}` memo. Whole-graph publish sets this so repeated
-    /// macros do one graph scan per distinct source; print export/tests leave it
-    /// `None` and keep the old direct call path.
-    query_cache: Option<&'a SharedQueryCache>,
+    /// The publication boundary's one operation-owned current-main reader.
+    /// Inline/print renderers have no such owner and fail query surfaces
+    /// explicitly instead of manufacturing an empty result.
+    query_reader: Option<&'a dyn PublicationQueryRead>,
     /// Pass-1 parsed public page documents, keyed by Logseq page identity. Page
     /// embeds use this before falling back to disk for non-public/unseen pages.
     pages: Option<&'a HashMap<String, &'a doc::Document>>,
+    /// Exact captured physical-path capabilities for `@page` rows. A page row
+    /// must agree on path, title and kind before it may become a public link.
+    page_links: Option<&'a HashMap<String, PublicationPageLink>>,
+}
+
+struct PublicationPageLink {
+    name: String,
+    kind: PageKind,
+    slug: String,
 }
 
 /// lsdoc render options for a Markdown block body (the canonical skeleton the export decorates).
@@ -2863,22 +2839,23 @@ fn render_query_sheet(
     emit: &SheetEmit,
     out: &mut String,
 ) {
-    // §7.9: a sheet whose row source is `{{tine-query …}}` is a sheet. The TQL
-    // path has its own executor, so route the whole rendering through it rather
-    // than handing TQL text to the OG string parser, which would read it as one
-    // unknown head and publish an empty board.
-    if macro_name.eq_ignore_ascii_case("tine-query") {
-        out.push_str(&render_tql_query(graph, query, ctx, 0));
-        return;
-    }
-    let outcome = match run_static_query_groups(graph, query, ctx) {
+    let (input, check_nesting) = if macro_name.eq_ignore_ascii_case("tine-query") {
+        (crate::query::QueryInput::MacroTql, false)
+    } else {
+        (crate::query::QueryInput::MacroQuery, true)
+    };
+    let outcome = match run_static_query(query, input, check_nesting, ctx) {
         Ok(outcome) => outcome,
         Err(html) => {
             out.push_str(&html);
             return;
         }
     };
-    with_hydrated_query_groups(graph, &outcome.groups, |hydrated| {
+    let StaticQueryRows::Block(groups) = outcome.rows else {
+        out.push_str("<div class=\"query-unsupported\" role=\"alert\">Page queries cannot be presented as block sheets.</div>");
+        return;
+    };
+    with_hydrated_query_groups(graph, &groups, |hydrated| {
         let rows = hydrated
             .iter()
             .map(|row| SheetRow {
@@ -2940,7 +2917,7 @@ fn whole_query_macro(rendered: &str) -> Option<String> {
 /// block source rather than from lsdoc's comma-split `data-args`.
 fn expand_query_macro(name: &str, argument: &str, ctx: &Ctx, depth: u8) -> String {
     let Some(graph) = ctx.graph else {
-        return String::new();
+        return "<div class=\"query query-unsupported\" role=\"alert\">Query results are unavailable for this render.</div>".to_string();
     };
     if depth >= 4 {
         return format!("<span class=\"macro-raw\">{{{{{} …}}}}</span>", esc(name));
@@ -2949,11 +2926,9 @@ fn expand_query_macro(name: &str, argument: &str, ctx: &Ctx, depth: u8) -> Strin
 }
 
 /// Expand one `{{macro …}}`. Bounded by `depth` (a page can embed a block that embeds
-/// a page …; a circular embed would otherwise loop). With no graph in context, macros drop.
+/// a page …; a circular embed would otherwise loop). With no graph in context,
+/// query macros refuse explicitly and other data macros drop.
 fn expand_macro(name: &str, args: &[String], ctx: &Ctx, depth: u8) -> String {
-    let Some(graph) = ctx.graph else {
-        return String::new();
-    };
     if depth >= 4 {
         return format!("<span class=\"macro-raw\">{{{{{} …}}}}</span>", esc(name));
     }
@@ -2962,8 +2937,14 @@ fn expand_macro(name: &str, args: &[String], ctx: &Ctx, depth: u8) -> String {
     // A macro name this tree writes but cannot export would publish the author's
     // query as literal text (Y1) — which is exactly what this arm used to do.
     if is_query_macro_name(name) {
-        return render_query_named(graph, name, arg0, ctx, depth + 1);
+        return match ctx.graph {
+            Some(graph) => render_query_named(graph, name, arg0, ctx, depth + 1),
+            None => "<div class=\"query query-unsupported\" role=\"alert\">Query results are unavailable for this render.</div>".to_string(),
+        };
     }
+    let Some(graph) = ctx.graph else {
+        return String::new();
+    };
     match name {
         "embed" => render_embed(graph, arg0, ctx, depth + 1),
         "video" => render_video(arg0),
@@ -2986,8 +2967,8 @@ fn render_query(graph: &Graph, src: &str, ctx: &Ctx, depth: u8) -> String {
 ///
 /// `{{query …}}` keeps the legacy OG/advanced string path, unchanged. A
 /// `{{tine-query …}}` argument is TQL, which that path cannot read at all, so it
-/// goes through the shared parser and the one IR walk — the same engine the app
-/// runs. Publishing a macro name this tree can write but not export is the
+/// goes through the shared parser and supplied reader. Publishing a macro name
+/// this tree can write but not export is the
 /// failure Y1 names, and it is why this arm exists.
 fn render_query_named(graph: &Graph, name: &str, argument: &str, ctx: &Ctx, depth: u8) -> String {
     if !macro_name_is_tql(name) {
@@ -2996,142 +2977,31 @@ fn render_query_named(graph: &Graph, name: &str, argument: &str, ctx: &Ctx, dept
     render_tql_query(graph, argument, ctx, depth)
 }
 
-/// The `{{tine-query …}}` spelling — the ONE publication surface that answers
-/// from the snapshot's query database rather than from the parsed capture.
-///
-/// Shared with [`publication_runs_indexed_queries`] so the decision to build an
-/// index and the decision to use one can never disagree about which macro name
-/// needs it.
+/// Whether one authored query macro uses the TQL grammar. Both spellings route
+/// through the same supplied reader after their grammar-specific parse.
 fn macro_name_is_tql(name: &str) -> bool {
     name.eq_ignore_ascii_case("tine-query")
 }
 
-/// True when this publication authored at least one `{{tine-query …}}` macro.
-///
-/// `{{query …}}`, `#+BEGIN_QUERY` and the query-backed sheet views read the
-/// parsed capture, so a publication without a TQL macro must not pay for an
-/// index it will never read. The authored source decides, read through
-/// [`crate::query::macro_text::query_macro_extents`] — the one owner that
-/// already tells a real macro from a `{{` in prose, a nested options map or a
-/// `[[page]]` ref — never a pattern match over source bytes.
-///
-/// Only the AUTHORIZED pages are scanned: publication renders exactly those,
-/// and every embed it resolves is filtered through the same public capability.
-fn publication_runs_indexed_queries(public: &[(&str, PageKind, Arc<doc::Document>)]) -> bool {
-    fn blocks_run_indexed_queries(blocks: &[DocBlock]) -> bool {
-        blocks.iter().any(|block| {
-            crate::query::macro_text::query_macro_extents(&block.raw)
-                .iter()
-                .any(|extent| macro_name_is_tql(&extent.name))
-                || blocks_run_indexed_queries(&block.children)
-        })
-    }
-    public
-        .iter()
-        .any(|(_, _, document)| blocks_run_indexed_queries(&document.roots))
-}
-
 /// The `{{tine-query …}}` static-export path: parse the COMPLETE raw argument
-/// with the one Rust splitter, run the IR, then hand the groups to the same
-/// renderer, public-page filter and title chrome the OG path uses.
+/// with the one Rust splitter, then hand the IR to the publication boundary's
+/// current-main reader.
 fn render_tql_query(graph: &Graph, argument: &str, ctx: &Ctx, depth: u8) -> String {
-    if !crate::query::query_source_within_limit(argument) {
-        return format!(
-            "<div class=\"query query-too-large\">Query source exceeds the {} KiB publication limit.</div>",
-            crate::query::QUERY_SOURCE_MAX_BYTES / 1024
-        );
-    }
-    // A static export has no property registry to suggest against; an empty one
-    // costs only `UnknownIdent` SUGGESTIONS, never a different parse (§6.4).
-    let registry =
-        crate::query::registry::Registry::from_snapshot(&crate::query::ir::RegistrySnapshot {
-            rows: Vec::new(),
-            generation: 0,
-        });
-    let (query, view) = crate::query::parse_query_input(
-        argument,
-        crate::query::QueryInput::MacroTql,
-        crate::date::JournalDate::today(),
-        &registry,
-    );
-    // An enabled diagnostic means the query is not understood; it returns no
-    // rows by contract (§3.5), so say that rather than publishing an empty list
-    // that reads as "nothing matched".
-    if query.is_invalid() {
-        return "<div class=\"query query-unsupported\" role=\"alert\">Unsupported query.</div>"
-            .to_string();
-    }
-    const STATIC_QUERY_MAX_ROWS: usize = 20_000;
-    const STATIC_QUERY_MAX_BYTES: usize = 32 * 1024 * 1024;
-    #[cfg(test)]
-    publish_test_counts::bump_query_run(graph);
-    let result = crate::query::run_query_result_ir(
-        graph,
-        &query,
-        &view,
-        crate::query::ir::Bounds {
-            max_rows: STATIC_QUERY_MAX_ROWS,
-            max_bytes: STATIC_QUERY_MAX_BYTES,
-        },
-        // A published page is not "the current page" of the author's session;
-        // `?current-page` simply has no binding here (§4.4), exactly as the
-        // print export already behaves.
-        &crate::query::ir::ExecutionContext::none(),
-    );
-    // RET2: the TQL macro's execution is the SAME database route the app takes,
-    // so it can now report a typed availability failure instead of walking the
-    // parsed graph behind the export's back. A static page says so in the same
-    // bounded shape as its other two refusals rather than publishing an empty
-    // result that reads as "nothing matched".
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            return format!(
-                "<div class=\"query query-unsupported\" role=\"alert\">{}</div>",
-                esc(&error.to_string()),
-            )
-        }
+    let outcome = match run_static_query(argument, crate::query::QueryInput::MacroTql, false, ctx) {
+        Ok(outcome) => outcome,
+        Err(html) => return html,
     };
-    if result.exceeded {
-        return format!(
-            "<div class=\"query query-too-large\">Query has {} matches; narrow it before publishing.</div>",
-            result.total
-        );
-    }
-    let groups = match result.rows {
-        crate::query::ir::QueryRows::Block { groups } => groups,
-        // A `@page`-anchored query answers page rows, which the static export's
-        // block-result renderer has no shape for. P1 owns that surface; until
-        // then say so instead of rendering a silently empty result.
-        crate::query::ir::QueryRows::Page { .. } => {
-            return "<div class=\"query query-unsupported\" role=\"alert\">Page-anchored queries are not published yet.</div>".to_string()
-        }
-    };
-    let pre_filter_total: usize = groups.iter().map(|group| group.blocks.len()).sum();
-    let groups: Vec<RefGroup> = groups
-        .into_iter()
-        .filter(|group| publish_page_allowed(ctx, &group.page))
-        .collect();
-    render_query_outcome(
-        graph,
-        StaticQueryOutcome {
-            groups,
-            pre_filter_total,
-        },
-        None,
-        ctx,
-        depth,
-    )
+    render_query_outcome(graph, outcome, None, ctx, depth)
 }
 
 /// The ONE static-export query executor, shared by the `{{query …}}` macro
-/// renderer and the query-backed sheet views (`tine.view:: board/table` on a
-/// query block). Enforces the same source/nesting bounds, export-local memo,
-/// row ceiling, and public-page capability filter; `Err` is the user-facing
-/// failure HTML.
-fn run_static_query_groups(
-    graph: &Graph,
+/// renderer, TQL, `BEGIN_QUERY`, and query-backed sheet views. It parses each
+/// use independently and routes every valid IR through the supplied coherent
+/// reader. `Err` is the user-facing failure HTML.
+fn run_static_query(
     src: &str,
+    input: crate::query::QueryInput,
+    check_nesting: bool,
     ctx: &Ctx,
 ) -> Result<StaticQueryOutcome, String> {
     const STATIC_QUERY_MAX_ROWS: usize = 20_000;
@@ -3142,91 +3012,92 @@ fn run_static_query_groups(
             crate::query::QUERY_SOURCE_MAX_BYTES / 1024
         ));
     }
-    if !crate::query::query_nesting_within_limit(src) {
+    if check_nesting && !crate::query::query_nesting_within_limit(src) {
         return Err("<div class=\"query query-too-large\">Query nesting is too deep to publish safely.</div>".to_string());
     }
-    let is_advanced = crate::query::is_advanced(src);
-    let bounded = if let Some(cache) = ctx.query_cache {
-        let key = if is_advanced {
-            QueryCacheKey::Advanced(src.to_string())
-        } else {
-            QueryCacheKey::Simple(src.to_string())
-        };
-        let cached = cache.borrow().get(&key);
-        if let Some(groups) = cached {
-            groups
-        } else {
-            #[cfg(test)]
-            publish_test_counts::bump_query_run(graph);
-            let groups = if is_advanced {
-                let (result, exceeded, total) = crate::query::run_advanced_query_bounded(
-                    graph,
-                    src,
-                    None,
-                    STATIC_QUERY_MAX_ROWS,
-                    STATIC_QUERY_MAX_BYTES,
-                );
-                crate::query::BoundedGroups {
-                    groups: result.groups,
-                    total,
-                    exceeded,
-                }
-            } else {
-                crate::query::run_query_bounded(
-                    graph,
-                    src,
-                    STATIC_QUERY_MAX_ROWS,
-                    STATIC_QUERY_MAX_BYTES,
-                )
-            };
-            cache.borrow_mut().insert(key, groups.clone());
-            groups
-        }
-    } else if is_advanced {
-        #[cfg(test)]
-        publish_test_counts::bump_query_run(graph);
-        let (result, exceeded, total) = crate::query::run_advanced_query_bounded(
-            graph,
-            src,
-            None,
-            STATIC_QUERY_MAX_ROWS,
-            STATIC_QUERY_MAX_BYTES,
-        );
-        crate::query::BoundedGroups {
-            groups: result.groups,
-            total,
-            exceeded,
-        }
-    } else {
-        #[cfg(test)]
-        publish_test_counts::bump_query_run(graph);
-        crate::query::run_query_bounded(graph, src, STATIC_QUERY_MAX_ROWS, STATIC_QUERY_MAX_BYTES)
+    // Publication parsing has no suggestion UI. As before, an empty registry
+    // affects only suggestions; the supplied reader owns lowering against its
+    // captured property registry.
+    let registry =
+        crate::query::registry::Registry::from_snapshot(&crate::query::ir::RegistrySnapshot {
+            rows: Vec::new(),
+            generation: 0,
+        });
+    let (query, view) =
+        crate::query::parse_query_input(src, input, crate::date::JournalDate::today(), &registry);
+    // Advanced source is intentionally unresolved at parse time. The shared
+    // reader resolves it before deciding which diagnostics are actionable.
+    let Some(reader) = ctx.query_reader else {
+        return Err("<div class=\"query query-unsupported\" role=\"alert\">Query results are unavailable for this render.</div>".to_string());
     };
-    if bounded.exceeded {
+    // A published page is not the author's current editor page. Existing
+    // advanced `?current-page` binding therefore remains absent.
+    let result = reader
+        .run(
+            &query,
+            &view,
+            Bounds {
+                max_rows: STATIC_QUERY_MAX_ROWS,
+                max_bytes: STATIC_QUERY_MAX_BYTES,
+            },
+            &ExecutionContext::none(),
+        )
+        .map_err(|error| {
+            format!(
+                "<div class=\"query query-unsupported\" role=\"alert\">{}</div>",
+                esc(&error.to_string())
+            )
+        })?;
+    if !result.report.supported
+        || result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| !diagnostic.disabled)
+    {
+        return Err(
+            "<div class=\"query query-unsupported\" role=\"alert\">Unsupported query.</div>"
+                .to_string(),
+        );
+    }
+    if result.exceeded {
         return Err(format!(
             "<div class=\"query query-too-large\">Query has {} matches; narrow it before publishing.</div>",
-            bounded.total
+            result.matched_total.unwrap_or(result.total)
         ));
     }
-    // A site export is a projection of the public page set, not an alternate
-    // frontend over the live graph. Query execution still reuses the ordinary
-    // engine, but results from pages outside the pass-1 public capability must
-    // never cross into generated HTML. Print export has no page capability and
-    // deliberately retains its existing whole-graph behavior.
-    let pre_filter_total: usize = bounded.groups.iter().map(|group| group.blocks.len()).sum();
-    let groups: Vec<RefGroup> = bounded
-        .groups
-        .into_iter()
-        .filter(|group| publish_page_allowed(ctx, &group.page))
-        .collect();
-    Ok(StaticQueryOutcome {
-        groups,
-        pre_filter_total,
+    Ok(match result.rows {
+        QueryRows::Block { groups } => {
+            let pre_filter_total = groups.iter().map(|group| group.blocks.len()).sum();
+            let groups = groups
+                .into_iter()
+                .filter(|group| publish_page_allowed(ctx, &group.page))
+                .collect();
+            StaticQueryOutcome {
+                rows: StaticQueryRows::Block(groups),
+                pre_filter_total,
+            }
+        }
+        QueryRows::Page { pages } => {
+            let pre_filter_total = pages.len();
+            let pages = pages
+                .into_iter()
+                .filter(|page| publication_page_link(ctx, page).is_some())
+                .collect();
+            StaticQueryOutcome {
+                rows: StaticQueryRows::Page(pages),
+                pre_filter_total,
+            }
+        }
     })
 }
 
+enum StaticQueryRows {
+    Block(Vec<RefGroup>),
+    Page(Vec<PageRow>),
+}
+
 struct StaticQueryOutcome {
-    groups: Vec<RefGroup>,
+    rows: StaticQueryRows,
     pre_filter_total: usize,
 }
 
@@ -3237,7 +3108,7 @@ fn render_query_with_title(
     ctx: &Ctx,
     depth: u8,
 ) -> String {
-    let outcome = match run_static_query_groups(graph, src, ctx) {
+    let outcome = match run_static_query(src, crate::query::QueryInput::MacroQuery, true, ctx) {
         Ok(outcome) => outcome,
         Err(html) => return html,
     };
@@ -3254,20 +3125,47 @@ fn render_query_outcome(
     ctx: &Ctx,
     depth: u8,
 ) -> String {
-    let groups = outcome.groups;
-    let total: usize = groups.iter().map(|g| g.blocks.len()).sum();
+    let total = match &outcome.rows {
+        StaticQueryRows::Block(groups) => groups.iter().map(|group| group.blocks.len()).sum(),
+        StaticQueryRows::Page(pages) => pages.len(),
+    };
     let omitted = outcome.pre_filter_total.saturating_sub(total);
     let mut out = format!(
         "<div class=\"query\"><div class=\"query-head\">{} <span class=\"query-count\">{}</span></div>",
         esc(title.unwrap_or("Query")),
         total
     );
-    if total == 0 {
-        out.push_str("<div class=\"query-empty\">No matching blocks.</div>");
-    } else {
-        out.push_str("<ul class=\"query-results\">");
-        render_query_groups(graph, &groups, &mut out, ctx, depth);
-        out.push_str("</ul>");
+    match outcome.rows {
+        StaticQueryRows::Block(groups) if groups.is_empty() => {
+            out.push_str("<div class=\"query-empty\">No matching blocks.</div>");
+        }
+        StaticQueryRows::Block(groups) => {
+            out.push_str("<ul class=\"query-results\">");
+            render_query_groups(graph, &groups, &mut out, ctx, depth);
+            out.push_str("</ul>");
+        }
+        StaticQueryRows::Page(pages) if pages.is_empty() => {
+            out.push_str("<div class=\"query-empty\">No matching pages.</div>");
+        }
+        StaticQueryRows::Page(pages) => {
+            out.push_str("<ul class=\"query-results query-page-results\">");
+            for page in pages {
+                let Some(link) = publication_page_link(ctx, &page) else {
+                    continue;
+                };
+                out.push_str(&format!(
+                    "<li><a class=\"ref query-page-result\" href=\"{}.html\">{}</a>{}</li>",
+                    esc_attr(&link.slug),
+                    esc(&link.name),
+                    if link.kind == PageKind::Journal {
+                        "<span class=\"k\">journal</span>"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            out.push_str("</ul>");
+        }
     }
     if omitted > 0 {
         out.push_str(&format!(
@@ -3278,6 +3176,12 @@ fn render_query_outcome(
     }
     out.push_str("</div>");
     out
+}
+
+fn publication_page_link<'a>(ctx: &'a Ctx<'_>, page: &PageRow) -> Option<&'a PublicationPageLink> {
+    ctx.page_links?
+        .get(&page.path)
+        .filter(|link| link.name == page.name && link.kind == page.kind)
 }
 
 /// Inline an `{{embed ((uuid))}}` or `{{embed [[Page]]}}`.
@@ -3540,8 +3444,8 @@ fn render_block_ordered(
     // the app's `bodyBlocks`. No second hand-rolled inline parser (the old `render_inline`).
     let blocks = body_blocks(&b.raw);
     // BEGIN_QUERY is a static-site feature. The print context deliberately has
-    // no public-page capability (`pages: None`) and retains its prior rendering
-    // and whole-graph query behavior.
+    // no public-page capability (`pages: None`) and therefore does not inspect
+    // or execute the container.
     let begin_query = ctx.pages.and_then(|_| inspect_begin_query(&b.raw, &blocks));
 
     // Every block gets a stable anchor so a search hit can deep-link straight to it: its
@@ -3990,8 +3894,9 @@ pub(crate) fn page_print_html_document(
         slugs: None,
         inline_assets: true,
         print_asset_budget: Some(&print_asset_budget),
-        query_cache: None,
+        query_reader: None,
         pages: None,
+        page_links: None,
     };
     // `page_html` builds the heading + outline and wraps it in `shell`; we want the
     // same body but the print shell, so mirror its body build here.
@@ -4382,25 +4287,13 @@ struct PublishStage {
     identity: FileIdentity,
 }
 
-/// How long a publication waits for its own snapshot query index.
-///
-/// Indexing is proportional to the captured graph, not to a user gesture, so
-/// the bound is generous; it exists only so a worker that never converges
-/// fails the publication instead of hanging it.
-const SNAPSHOT_QUERY_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// How long the publication waits for the snapshot's writer worker to return
-/// before removing the tree its database lives in.
-const SNAPSHOT_QUERY_INDEX_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// The temporary tree ONE publication snapshot exclusively created, removed
 /// when it drops.
 ///
 /// It is a field rather than a `Drop` on the snapshot itself because
 /// `Drop::drop` runs BEFORE a struct's fields drop: removing the tree from
-/// there would unlink the snapshot's own query database out from under the
-/// graph still holding it. As the LAST field it is removed last, which is the
-/// ordering the contents require.
+/// there would remove the resolver root while the captured graph still holds
+/// it. As the LAST field it is removed last.
 struct PublicationSnapshotRoot(PathBuf);
 
 impl Drop for PublicationSnapshotRoot {
@@ -4409,39 +4302,12 @@ impl Drop for PublicationSnapshotRoot {
     }
 }
 
-/// The publication snapshot's own disposable query index, closed and drained
-/// when it drops.
-///
-/// Its rows describe the COMPLETE fresh capture, including pages the public
-/// capability will not publish — that is what lets the renderer count honestly
-/// what it omitted — so the database is private state for the length of one
-/// publication and its bytes never leave the owner-private root above.
-struct PublicationSnapshotQueryIndex(Arc<crate::direct_projection::DirectProjection>);
-
-impl Drop for PublicationSnapshotQueryIndex {
-    fn drop(&mut self) {
-        // The graph field dropped first and released its own handle, so this is
-        // the last one: closing here drains every reader AND waits for the
-        // writer worker, so the tree can be removed with nothing open in it.
-        // If this bounded wait expires, the worker's retained root owner keeps
-        // the directory alive until actual connection/lease teardown. Timeout
-        // never authorizes deleting files under an active writer.
-        let _ = self
-            .0
-            .close_and_wait_for_worker(SNAPSHOT_QUERY_INDEX_CLOSE_TIMEOUT);
-    }
-}
-
-/// One publication's immutable document capture, and the disposable machinery
-/// that answers queries over exactly that capture.
-///
-/// **Field order is the teardown contract.** Rust drops fields in declaration
-/// order: the graph releases its projection handle, the index then closes and
-/// drains the worker, and only then is the temporary tree removed.
+/// One publication's immutable document capture. The captured graph remains
+/// the resolver for embeds, namespaces and query-result hydration; query
+/// selection belongs to the caller-supplied current-main reader.
 struct PublicationGraphSnapshot {
     graph: Graph,
-    index: Option<PublicationSnapshotQueryIndex>,
-    root: Arc<PublicationSnapshotRoot>,
+    root: PublicationSnapshotRoot,
 }
 
 #[cfg(windows)]
@@ -4490,8 +4356,7 @@ impl PublicationGraphSnapshot {
                 Ok(()) => {
                     return Ok(Self {
                         graph: Graph::from_page_snapshot(&root, pages),
-                        index: None,
-                        root: Arc::new(PublicationSnapshotRoot(root)),
+                        root: PublicationSnapshotRoot(root),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -4502,25 +4367,6 @@ impl PublicationGraphSnapshot {
             io::ErrorKind::AlreadyExists,
             "could not reserve an immutable publication snapshot root",
         ))
-    }
-
-    /// Give this snapshot its own query index, over its own documents, inside
-    /// its own temporary root.
-    ///
-    /// Called only once, and only after every setting the parse and the render
-    /// read is final, because the index is built from the graph's effective
-    /// configuration at attach time.
-    ///
-    /// The drain owner is installed the instant the projection exists, so a
-    /// failed WAIT still closes the worker before the root is removed.
-    fn index_queries(&mut self) -> io::Result<()> {
-        debug_assert!(self.index.is_none(), "one query index per publication");
-        let database = self.root.0.join("query-index.sqlite");
-        let projection = self.graph.attach_snapshot_query_projection(database)?;
-        projection.retain_worker_resource(self.root.clone());
-        self.index = Some(PublicationSnapshotQueryIndex(projection));
-        self.graph
-            .await_snapshot_query_projection(SNAPSHOT_QUERY_INDEX_TIMEOUT)
     }
 }
 
@@ -4767,30 +4613,45 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let mut pages = Vec::new();
-    for entry in graph.list_pages() {
-        let content = fs::read_to_string(&entry.path)?;
-        let mut document = if entry
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("org"))
-        {
-            crate::org::parse_org(&content)
-        } else {
-            doc::parse(&content)
-        };
+    let mut sources = Vec::new();
+    for listed in graph.list_pages() {
+        let content = fs::read_to_string(&listed.path)?;
+        let (entry, mut document, revision) =
+            crate::model::parse_exact_page(graph, &listed, &content)?;
         crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+        sources.push((entry.clone(), revision));
         pages.push((entry, document));
     }
-    publish_graph_documents(graph, pages)
+    graph.with_publication_query_reader(&sources, |reader| {
+        publish_graph_documents_with_queries(graph, pages, reader)
+    })
 }
 
 /// Publish one already-authoritative graph snapshot. Managed storage obtains
 /// these documents in a single actor turn; Direct Files parses its fresh files
 /// immediately before entering the same renderer.
-pub(crate) fn publish_graph_documents(
+#[cfg(test)]
+fn publish_graph_documents(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
+) -> io::Result<(String, usize)> {
+    publish_graph_documents_inner(graph, pages, None)
+}
+
+/// Render one already-authoritative document capture while every query surface
+/// reads the supplied coherent current-main snapshot.
+pub(crate) fn publish_graph_documents_with_queries(
+    graph: &Graph,
+    pages: Vec<(crate::model::PageEntry, doc::Document)>,
+    queries: &dyn PublicationQueryRead,
+) -> io::Result<(String, usize)> {
+    publish_graph_documents_inner(graph, pages, Some(queries))
+}
+
+fn publish_graph_documents_inner(
+    graph: &Graph,
+    pages: Vec<(crate::model::PageEntry, doc::Document)>,
+    queries: Option<&dyn PublicationQueryRead>,
 ) -> io::Result<(String, usize)> {
     let out = graph.root.join("publish");
     graph.ensure_write_target(&out)?;
@@ -4826,13 +4687,14 @@ pub(crate) fn publish_graph_documents(
     let mut entries = snapshot_pages.iter().collect::<Vec<_>>();
     entries.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
 
-    // Pass 1: parse every page into one immutable query snapshot, while keeping
-    // only authorized pages in the publication projection. `entries` is already
+    // Pass 1: retain the immutable captured documents, while keeping only
+    // authorized pages in the publication projection. `entries` is already
     // sorted by name, so `public` (and hence the slug assignment below) is
-    // deterministic across runs. Queries need the complete fresh snapshot so
-    // the renderer can honestly count matches omitted by the public capability;
-    // result hydration still comes exclusively from `public` below.
+    // deterministic across runs. Query selection sees the complete capture
+    // through the supplied reader; result hydration still comes exclusively
+    // from `public` below.
     let mut public: Vec<(&str, PageKind, Arc<doc::Document>)> = Vec::new();
+    let mut public_paths = Vec::new();
     for (e, parsed) in entries {
         let is_public = all_public || page_is_public(parsed.pre_block.as_deref());
         if !is_public {
@@ -4850,38 +4712,22 @@ pub(crate) fn publish_graph_documents(
             continue;
         }
         public.push((e.name.as_str(), e.kind, Arc::clone(parsed)));
+        public_paths.push((e.rel_path.clone(), e.name.clone(), e.kind));
     }
 
-    // Every downstream resolver gets the same exact document revision as the
-    // visibility pass. The snapshot graph has a fully preinstalled cache/page
-    // list, so a query cannot fall through to the live graph or a stale
-    // pre-export cache. The render context's public-page map remains the sole
-    // capability for hydrating any query/embed/namespace result into HTML.
-    let snapshot = PublicationGraphSnapshot::new(snapshot_pages.clone())?;
+    // Every downstream document resolver gets the same exact revision as the
+    // visibility pass. This captured graph serves embeds, namespaces and
+    // admitted-result hydration only; it is not a query selection source. The
+    // public-page maps remain the sole HTML hydration/link capabilities.
+    let mut snapshot = PublicationGraphSnapshot::new(snapshot_pages.clone())?;
     // The render pass reads user presentation settings from the render-time
     // graph's config (sheet board workflow order, user's hidden block
     // properties). The snapshot graph starts from a bare temp root, so copy
     // exactly those presentation settings — never scope-affecting settings
     // like `:hidden` or `:publishing/all-pages-public?`, which the publish
     // projection resolves from the source graph above.
-    let mut snapshot = snapshot;
     snapshot.graph.config.preferred_workflow = graph.config.preferred_workflow;
     snapshot.graph.config.block_hidden_properties = graph.config.block_hidden_properties.clone();
-    // `{{tine-query …}}` answers through the query database, and the snapshot
-    // graph deliberately has no access to the live graph's: publishing must
-    // read its OWN fresh capture, including pages the public capability will
-    // not publish. So give the snapshot its own disposable index, over exactly
-    // these documents, inside the root it exclusively created — after the
-    // presentation settings above, because the index is built from this
-    // graph's effective configuration.
-    //
-    // A failure here is a publishing IO failure. The staged output has not
-    // replaced the last good publication yet, and a site whose queries all
-    // render "the query index is unavailable" is worse than the site that is
-    // already there.
-    if publication_runs_indexed_queries(&public) {
-        snapshot.index_queries()?;
-    }
 
     // ONE source of truth: a unique, nonempty name→slug map for the exported set.
     // Every filename, cross-page link, block-ref target, and search-index entry is
@@ -4906,6 +4752,13 @@ pub(crate) fn publish_graph_documents(
         .as_ref()
         .map(|slug| format!("{slug}.html"))
         .unwrap_or_else(|| "index.html".to_string());
+    let page_links = public_paths
+        .into_iter()
+        .map(|(path, name, kind)| {
+            let slug = slug_of(&name);
+            (path, PublicationPageLink { name, kind, slug })
+        })
+        .collect::<HashMap<_, _>>();
 
     // Build the block-ref index from the public pages, keyed to their final slugs
     // (a `((ref))` only resolves to a block that's actually exported).
@@ -4930,8 +4783,6 @@ pub(crate) fn publish_graph_documents(
             &mut reverse_refs,
         );
     }
-    let query_cache: SharedQueryCache = RefCell::new(QueryCache::default());
-
     // Pass 2: render each public page (collecting the per-block search index along
     // the way), accumulate the sidebar page index (`__tinePages`) and the static
     // no-JS all-pages list shown in the index page's <main>.
@@ -4950,8 +4801,9 @@ pub(crate) fn publish_graph_documents(
         slugs: Some(&slugs),
         inline_assets: false,
         print_asset_budget: None,
-        query_cache: Some(&query_cache),
+        query_reader: queries,
         pages: Some(&page_docs),
+        page_links: Some(&page_links),
     };
     for (name, kind, parsed) in &public {
         let slug = slug_of(name);
@@ -5013,6 +4865,11 @@ pub(crate) fn publish_graph_documents(
     write_publish_stage_file(&stage, "pages.html", pages_html.as_bytes())?;
     let entry_html = welcome_html.unwrap_or(pages_html);
     write_publish_stage_file(&stage, "index.html", entry_html.as_bytes())?;
+    if let Some(queries) = queries {
+        queries
+            .ensure_current()
+            .map_err(publication_query_io_error)?;
+    }
     commit_publish_stage(graph, stage, &out)?;
     Ok((out.display().to_string(), count))
 }
@@ -5034,7 +4891,7 @@ mod tests {
     /// Render a block body the way `render_block` does: one lsdoc parse → canonical
     /// skeleton (`render_html`) → export decoration. The unit the decorator tests drive.
     fn render_body(raw: &str, refs: &RefIndex) -> String {
-        // Graph-less context: the inline decorator under test; macros drop (no graph).
+        // Graph-less context: ordinary data macros drop; queries fail explicitly.
         let ctx = Ctx {
             refs,
             reverse_refs: None,
@@ -5042,8 +4899,9 @@ mod tests {
             slugs: None,
             inline_assets: false,
             print_asset_budget: None,
-            query_cache: None,
+            query_reader: None,
             pages: None,
+            page_links: None,
         };
         decorate(&lsdoc::render_html(&body_blocks(raw), &md_opts()), &ctx, 0)
     }
@@ -5188,8 +5046,9 @@ mod tests {
                 slugs: None,
                 inline_assets: false,
                 print_asset_budget: None,
-                query_cache: None,
+                query_reader: None,
                 pages: None,
+                page_links: None,
             },
             0,
         );
@@ -5273,6 +5132,7 @@ mod tests {
         fs::write(dir.join("pages").join("Secret.md"), "- private stuff\n").unwrap();
 
         let g = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&g);
         let (outdir, count) = publish_graph(&g).unwrap();
         assert_eq!(count, 2, "only the two public pages");
         let out = std::path::Path::new(&outdir);
@@ -5357,7 +5217,7 @@ mod tests {
         fs::write(dir.join("pages/Visible.md"), "public:: true\n- visible\n").unwrap();
 
         let graph = Graph::open(&dir);
-        let (outdir, count) = publish_graph(&graph).unwrap();
+        let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
         let out = Path::new(&outdir);
         assert_eq!(count, 1);
         assert!(!out.join("twin.html").exists());
@@ -5406,6 +5266,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         let (outdir, count) = publish_graph(&graph).unwrap();
         assert_eq!(count, 2);
         let dashboard =
@@ -5425,6 +5286,38 @@ mod tests {
             "private macro targets should fail closed: {dashboard}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_query_selection_has_only_the_supplied_main_reader() {
+        let production = include_str!("publish.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        for retired in [
+            "attach_snapshot_query_projection",
+            "index_queries(",
+            "run_query_bounded(",
+            "run_advanced_query_bounded(",
+            "run_query_result_ir(",
+            "query_cache",
+            "query-index.sqlite",
+        ] {
+            assert!(
+                !production.contains(retired),
+                "retired publication path: {retired}"
+            );
+        }
+        assert!(production.contains("with_publication_query_reader"));
+        let compact = production.split_whitespace().collect::<String>();
+        let checked = compact.find("queries.ensure_current()").unwrap();
+        let commit = compact
+            .find("commit_publish_stage(graph,stage,&out)")
+            .unwrap();
+        assert!(
+            checked < commit,
+            "cancellation must be checked before output commit"
+        );
     }
 
     #[test]
@@ -5490,7 +5383,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        graph.warm_cache();
+        let _projection = prepare_publication_graph(&graph);
 
         // Simulate a sync/editor outside Tine changing both visibility and body
         // after the live graph cache was populated. Publication must not combine
@@ -5501,6 +5394,16 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            publish_graph(&graph).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        graph
+            .sync_file_checked(&dir.join("pages/Source.md"))
+            .unwrap();
+        graph
+            .wait_for_direct_projection_for_test(std::time::Duration::from_secs(30))
+            .unwrap();
         let (outdir, count) = publish_graph(&graph).unwrap();
         assert_eq!(count, 2);
         let out = Path::new(&outdir);
@@ -5563,6 +5466,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         let (outdir, count) = publish_graph(&graph).unwrap();
         assert_eq!(count, 2);
         let out = std::path::Path::new(&outdir);
@@ -5570,6 +5474,7 @@ mod tests {
 
         fs::write(dir.join("pages/Secret.md"), "- stale private token\n").unwrap();
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         let (outdir, count) = publish_graph(&graph).unwrap();
         assert_eq!(count, 1);
         let out = std::path::Path::new(&outdir);
@@ -5641,6 +5546,7 @@ mod tests {
         PUBLISH_STAGE_WRITE_SWAP.with(|slot| *slot.borrow_mut() = Some(outside.clone()));
 
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         assert!(publish_graph(&graph).is_err());
         assert_eq!(
             fs::read_to_string(outside.join("style.css")).unwrap(),
@@ -5678,6 +5584,7 @@ mod tests {
         PUBLISH_RECOVERY_SWAP.with(|slot| *slot.borrow_mut() = Some(outside.clone()));
 
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         let (out, count) = publish_graph(&graph).unwrap();
         assert_eq!(count, 1);
         assert!(Path::new(&out).join("public.html").exists());
@@ -5719,6 +5626,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         let (outdir, count) = publish_graph(&graph).unwrap();
         assert_eq!(count, 2);
         let out = std::path::Path::new(&outdir);
@@ -5772,6 +5680,7 @@ mod tests {
         fs::write(dir.join("pages").join("日本語.md"), "- charlie body\n").unwrap();
 
         let g = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&g);
         let (outdir, count) = publish_graph(&g).unwrap();
         assert_eq!(count, 3, "all three public pages exported");
         let out = std::path::Path::new(&outdir);
@@ -5861,8 +5770,9 @@ mod tests {
             slugs: None,
             inline_assets: true,
             print_asset_budget: Some(&cumulative),
-            query_cache: None,
+            query_reader: None,
             pages: None,
+            page_links: None,
         };
 
         assert!(inline_asset_uri(&cumulative_ctx, "../assets/one.png").is_some());
@@ -6062,7 +5972,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let (outdir, _) = publish_graph(&graph).unwrap();
+        let (outdir, _) = publish_graph_with_main_reader(&graph).unwrap();
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
 
@@ -6110,21 +6020,72 @@ mod tests {
             .collect()
     }
 
-    /// **RET2 correction, the publication half.** The TQL macro answers from a
-    /// database, and the only database it may answer from is the one built over
-    /// the publication's OWN capture.
+    /// Test-only independent walk oracle. Production publication adapters use
+    /// the shared SQL reader; local renderer fixtures need only prove that the
+    /// parsed IR is forwarded and its returned identities hydrate from the
+    /// exact captured documents.
+    struct CapturedWalkReader<'a> {
+        graph: &'a Graph,
+        runs: std::cell::Cell<usize>,
+        freshness_checks: std::cell::Cell<usize>,
+    }
+
+    impl PublicationQueryRead for CapturedWalkReader<'_> {
+        fn run(
+            &self,
+            query: &crate::query::ir::Query,
+            view: &ViewSettings,
+            bounds: Bounds,
+            context: &ExecutionContext,
+        ) -> Result<QueryResult, QueryExecutionError> {
+            self.runs.set(self.runs.get() + 1);
+            let resolved = crate::query::resolve_for_execution(
+                query,
+                context,
+                crate::date::JournalDate::today(),
+            );
+            Ok(crate::query::run_resolved_query_result_over(
+                &crate::query::GraphQueryPages(self.graph),
+                &resolved,
+                view,
+                bounds,
+            ))
+        }
+
+        fn ensure_current(&self) -> Result<(), QueryExecutionError> {
+            self.freshness_checks.set(self.freshness_checks.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn prepare_publication_graph(graph: &Graph) -> tempfile::TempDir {
+        let projection = tempfile::tempdir().unwrap();
+        graph
+            .attach_direct_projection(projection.path().join("direct.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        graph
+            .wait_for_direct_projection_for_test(std::time::Duration::from_secs(30))
+            .unwrap();
+        projection
+    }
+
+    fn publish_graph_with_main_reader(graph: &Graph) -> io::Result<(String, usize)> {
+        let _projection = prepare_publication_graph(graph);
+        publish_graph(graph)
+    }
+
+    /// The renderer routes TQL through its supplied reader and filters only
+    /// after that reader has answered over the complete capture.
     ///
     /// The two claims are inseparable, so they are one fixture:
     ///
-    /// * the rows come from SQL — the full-graph evaluator is never entered,
-    ///   which is what makes this a query-ROUTE claim and not merely "some
-    ///   HTML appeared";
-    /// * the index covers the COMPLETE capture, including the private page, so
+    /// * the reader sees the COMPLETE capture, including the private page, so
     ///   the public-page capability can subtract honestly. A publication that
     ///   indexed only public pages would render the same visible row with a
     ///   silently wrong "omitted" count — a privacy claim stated as a number.
     #[test]
-    fn publish_answers_a_tql_macro_from_sql_and_counts_the_private_matches_it_omitted() {
+    fn publish_answers_a_tql_macro_through_its_reader_and_counts_private_matches() {
         let dir =
             std::env::temp_dir().join(format!("tine-publish-tql-omission-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -6148,8 +6109,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        crate::query::reset_full_graph_query_evaluations();
-        let (outdir, count) = publish_graph(&graph).unwrap();
+        let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
         assert_eq!(count, 2, "only the two public pages are published");
         let out = Path::new(&outdir);
         let dashboard = fs::read_to_string(out.join("dashboard.html")).unwrap();
@@ -6169,31 +6129,64 @@ mod tests {
         );
         assert!(
             dashboard.contains("1 result on non-public pages omitted."),
-            "the private match must be COUNTED, which requires indexing it: {dashboard}"
+            "the private match must be counted before publication filtering: {dashboard}"
         );
         assert!(
             !dashboard.contains("query-unsupported"),
             "the publication refused its own query: {dashboard}"
         );
-        assert_eq!(
-            crate::query::full_graph_query_evaluations(),
-            0,
-            "the TQL publication route must answer from SQL, never by walking"
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_page_query_emits_real_public_links_and_counts_private_omissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-page-query-links-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "public:: true\n- {{tine-query @page}}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Public Target.md"),
+            "public:: true\n- public target\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages/Secret Target.md"), "- private target\n").unwrap();
+
+        let graph = Graph::open(&dir);
+        let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
+        assert_eq!(count, 2);
+        let dashboard = fs::read_to_string(Path::new(&outdir).join("dashboard.html")).unwrap();
+        assert!(
+            dashboard.contains(
+                "class=\"ref query-page-result\" href=\"public-target.html\">Public Target</a>"
+            ),
+            "the physical public page row must become its real page link: {dashboard}"
+        );
+        assert!(
+            !dashboard.contains("Secret Target") && !dashboard.contains("secret-target.html"),
+            "a private page row crossed the captured capability: {dashboard}"
+        );
+        assert!(
+            dashboard.contains("1 result on non-public pages omitted."),
+            "the full reader answer must be counted before capability filtering: {dashboard}"
         );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The index is built from the CAPTURE, not from the live graph.
-    ///
-    /// The live graph is warmed with the old body first, so a snapshot that
-    /// reached the live graph's parsed cache — or its projection — would answer
-    /// with the stale token. Publication reparses the files itself, and the
-    /// index it builds must describe exactly that reparse. The sibling
-    /// `publish_uses_one_fresh_snapshot_after_external_visibility_rewrite`
-    /// makes the same claim for the walking `{{query …}}` route.
+    /// TQL and OG publication share the same main-image correspondence rule.
+    /// A changed source is refused until its ordinary watcher delta commits;
+    /// publication never rebuilds a database from the captured documents.
     #[test]
-    fn publish_indexes_the_captured_documents_not_the_live_graph_cache() {
+    fn publish_tql_refuses_stale_main_until_normal_source_update() {
         let dir = std::env::temp_dir().join(format!(
             "tine-publish-tql-immutable-capture-{}",
             std::process::id()
@@ -6220,6 +6213,7 @@ mod tests {
 
         let graph = Graph::open(&dir);
         graph.warm_cache();
+        let _projection = prepare_publication_graph(&graph);
         // An external editor rewrites the source after the live cache was built.
         fs::write(
             dir.join("pages/Tasks.md"),
@@ -6227,31 +6221,35 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            publish_graph(&graph).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        graph
+            .sync_file_checked(&dir.join("pages/Tasks.md"))
+            .unwrap();
+        graph
+            .wait_for_direct_projection_for_test(std::time::Duration::from_secs(30))
+            .unwrap();
         let (outdir, _) = publish_graph(&graph).unwrap();
         let dashboard = fs::read_to_string(Path::new(&outdir).join("dashboard.html")).unwrap();
         assert!(
             dashboard.contains("tql-current-token"),
-            "the index must describe the fresh capture: {dashboard}"
+            "the reader must describe the fresh capture: {dashboard}"
         );
         assert!(
             !dashboard.contains("tql-stale-token"),
-            "a stale live-graph revision reached the publication index: {dashboard}"
+            "a stale live-graph revision reached the published result: {dashboard}"
         );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The snapshot database is private for its whole life, and its life ends
-    /// with the publication.
-    ///
-    /// It holds rows for pages the publication will NOT publish — that is what
-    /// makes the omitted count honest — so the bytes are private state. The
-    /// permission is taken at creation, before anything is written into the
-    /// tree, and the tree survives exactly as long as the graph and index that
-    /// live in it: `Drop` order, not a manual sequence a later edit can
-    /// reorder.
+    /// The captured-document resolver remains owner-private and operation
+    /// scoped, but it never creates query storage. Selection belongs wholly to
+    /// the supplied main reader.
     #[test]
-    fn publication_snapshot_query_index_is_owner_private_and_dies_with_its_root() {
+    fn publication_snapshot_has_no_query_index_and_dies_with_its_root() {
         let dir = std::env::temp_dir().join(format!(
             "tine-publish-snapshot-index-lifetime-{}",
             std::process::id()
@@ -6267,7 +6265,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let mut snapshot = PublicationGraphSnapshot::new(capture_snapshot_pages(&graph)).unwrap();
+        let snapshot = PublicationGraphSnapshot::new(capture_snapshot_pages(&graph)).unwrap();
         let root = snapshot.root.0.clone();
 
         #[cfg(unix)]
@@ -6280,19 +6278,12 @@ mod tests {
             );
         }
 
-        snapshot.index_queries().unwrap();
-        let database = root.join("query-index.sqlite");
         assert!(
-            database.exists(),
-            "the snapshot index lives under the snapshot's own root, never the graph"
-        );
-        assert!(
-            snapshot.index.is_some(),
-            "the drain owner is installed with the projection"
+            !root.join("query-index.sqlite").exists(),
+            "publication must not own transient query storage"
         );
 
-        // Dropping closes the graph, then closes and drains the projection,
-        // then removes the tree. Nothing is left behind for the next run.
+        // Dropping closes the captured resolver and removes its empty root.
         drop(snapshot);
         assert!(
             !root.exists(),
@@ -6303,30 +6294,36 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Only an authored `{{tine-query …}}` buys an index.
-    ///
-    /// The other publication query surfaces read the parsed capture, so a
-    /// publication without a TQL macro must not pay for a database it will
-    /// never read — and the decision is the macro owner's, so a `{{` in prose
-    /// or an OG macro cannot buy one by accident.
     #[test]
-    fn publication_indexes_only_when_a_tql_macro_was_authored() {
-        let page = |source: &str| ("Page", PageKind::Page, Arc::new(doc::parse(source)));
+    fn legacy_document_renderer_reports_a_missing_query_reader_explicitly() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-no-query-reader-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:publishing/all-pages-public? true}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages/Dashboard.md"), "- {{query (task TODO)}}\n").unwrap();
+        let graph = Graph::open(&dir);
+        let pages = capture_snapshot_pages(&graph)
+            .into_iter()
+            .map(|(entry, document)| (entry, document.as_ref().clone()))
+            .collect();
 
-        assert!(!publication_runs_indexed_queries(&[page(
-            "- {{query (task TODO)}}\n- prose with {{tine-query-ish braces\n"
-        )]));
-        assert!(!publication_runs_indexed_queries(&[page(
-            "- #+BEGIN_QUERY\n  {:title \"T\"}\n  #+END_QUERY\n"
-        )]));
-        assert!(publication_runs_indexed_queries(&[page(
-            "- parent\n\t- {{tine-query @block and [[Alpha]]}}\n"
-        )]));
-        // The options map's inner `}` must not end the extent early, which is
-        // exactly what a `{{tine-query.*?}}` scan gets wrong.
-        assert!(publication_runs_indexed_queries(&[page(
-            "- {{TINE-QUERY @block {:title \"T\"}}}\n"
-        )]));
+        let (outdir, _) = publish_graph_documents(&graph, pages).unwrap();
+        let dashboard = fs::read_to_string(Path::new(&outdir).join("dashboard.html")).unwrap();
+        assert!(
+            dashboard.contains("Query results are unavailable for this render."),
+            "a missing reader must not look like an empty successful query: {dashboard}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// §4.3.1: the query transport is the RAW SOURCE SLICE, not lsdoc's
@@ -6364,7 +6361,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let (outdir, _) = publish_graph(&graph).unwrap();
+        let (outdir, _) = publish_graph_with_main_reader(&graph).unwrap();
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
 
@@ -6410,7 +6407,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let (outdir, _) = publish_graph(&graph).unwrap();
+        let (outdir, _) = publish_graph_with_main_reader(&graph).unwrap();
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
 
@@ -6453,7 +6450,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let (outdir, count) = publish_graph(&graph).unwrap();
+        let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
         assert_eq!(count, 1);
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
@@ -6487,6 +6484,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
         let (outdir, _) = publish_graph(&graph).unwrap();
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
@@ -6533,7 +6531,7 @@ mod tests {
         .unwrap();
 
         let g = Graph::open(&dir);
-        let (outdir, _) = publish_graph(&g).unwrap();
+        let (outdir, _) = publish_graph_with_main_reader(&g).unwrap();
         let main = fs::read_to_string(std::path::Path::new(&outdir).join("main.html")).unwrap();
 
         // task facets: checkbox + marker badge, priority, planning date
@@ -6593,9 +6591,9 @@ mod tests {
     }
 
     #[test]
-    fn publish_memoizes_repeated_query_macros() {
+    fn publish_runs_repeated_query_macros_once_per_authored_use() {
         let dir =
-            std::env::temp_dir().join(format!("tine-publish-query-memo-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tine-publish-query-repeat-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
@@ -6607,7 +6605,7 @@ mod tests {
         .unwrap();
         fs::write(
             dir.join("pages").join("Tasks.md"),
-            "- TODO repeated query memo target\n",
+            "- TODO repeated query target\n",
         )
         .unwrap();
         fs::write(
@@ -6620,14 +6618,30 @@ mod tests {
         )
         .unwrap();
 
-        let g = Graph::open(&dir);
-        let _guard = publish_test_counts::count_for(&dir);
-        let (outdir, _) = publish_graph(&g).unwrap();
+        let graph = Graph::open(&dir);
+        let captured = capture_snapshot_pages(&graph);
+        let pages = captured
+            .iter()
+            .map(|(entry, document)| (entry.clone(), document.as_ref().clone()))
+            .collect();
+        let mut snapshot = PublicationGraphSnapshot::new(captured).unwrap();
+        snapshot.graph.config = graph.config.clone();
+        let reader = CapturedWalkReader {
+            graph: &snapshot.graph,
+            runs: std::cell::Cell::new(0),
+            freshness_checks: std::cell::Cell::new(0),
+        };
+        let (outdir, _) = publish_graph_documents_with_queries(&graph, pages, &reader).unwrap();
 
         assert_eq!(
-            publish_test_counts::query_runs(),
+            reader.runs.get(),
+            5,
+            "each macro occurrence must execute through the supplied reader"
+        );
+        assert_eq!(
+            reader.freshness_checks.get(),
             1,
-            "same query source should be evaluated once per export"
+            "the operation is revalidated once before stage publication"
         );
         let dash =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
@@ -6641,7 +6655,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_rejects_query_sources_before_keying_and_bounds_valid_memos() {
+    fn publication_rejects_oversized_sources_before_calling_the_reader() {
         let dir = std::env::temp_dir().join(format!(
             "tine-publish-query-source-bound-{}",
             std::process::id()
@@ -6654,7 +6668,11 @@ mod tests {
         let graph = Graph::open(&dir);
         graph.warm_cache();
         let refs = RefIndex::new();
-        let cache: SharedQueryCache = RefCell::new(QueryCache::default());
+        let reader = CapturedWalkReader {
+            graph: &graph,
+            runs: std::cell::Cell::new(0),
+            freshness_checks: std::cell::Cell::new(0),
+        };
         let ctx = Ctx {
             refs: &refs,
             reverse_refs: None,
@@ -6662,23 +6680,18 @@ mod tests {
             slugs: None,
             inline_assets: false,
             print_asset_budget: None,
-            query_cache: Some(&cache),
+            query_reader: Some(&reader),
             pages: None,
+            page_links: None,
         };
 
         let oversized = "x".repeat(crate::query::QUERY_SOURCE_MAX_BYTES + 1);
         assert!(render_query(&graph, &oversized, &ctx, 0).contains("publication limit"));
         let nested = format!("{}(task TODO){}", "(and ".repeat(1_000), ")".repeat(1_000));
         assert!(render_query(&graph, &nested, &ctx, 0).contains("nesting is too deep"));
-        assert!(cache.borrow().entries.is_empty());
-
-        for index in 0..(QUERY_CACHE_MAX_ENTRIES + 20) {
-            let source = format!("(and (task TODO) (content \"memo-{index}\"))");
-            let _ = render_query(&graph, &source, &ctx, 0);
-        }
-        let cache = cache.borrow();
-        assert_eq!(cache.entries.len(), QUERY_CACHE_MAX_ENTRIES);
-        assert!(cache.bytes <= QUERY_CACHE_MAX_BYTES);
+        assert_eq!(reader.runs.get(), 0, "refused source reached the reader");
+        let _ = render_query(&graph, "(task TODO)", &ctx, 0);
+        assert_eq!(reader.runs.get(), 1, "a valid source executes normally");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6707,7 +6720,7 @@ mod tests {
         .unwrap();
 
         let graph = Graph::open(&dir);
-        let (outdir, _) = publish_graph(&graph).unwrap();
+        let (outdir, _) = publish_graph_with_main_reader(&graph).unwrap();
         let dashboard =
             fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
 
@@ -6761,6 +6774,7 @@ mod tests {
 
         let g = Graph::open(&dir);
         let _guard = publish_test_counts::count_for(&dir);
+        let _projection = prepare_publication_graph(&g);
         let (outdir, _) = publish_graph(&g).unwrap();
 
         assert_eq!(
@@ -6798,7 +6812,7 @@ mod tests {
             fs::write(dir.join("pages").join(file), body).unwrap();
         }
         let graph = Graph::open(&dir);
-        let (outdir, count) = publish_graph(&graph).unwrap();
+        let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
         assert_eq!(count, pages.len(), "every fixture page publishes");
         (dir, outdir)
     }
@@ -7576,6 +7590,7 @@ mod tests {
         .unwrap();
 
         let g = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&g);
         let (outdir, count) = publish_graph(&g).unwrap();
         println!("SAMPLE_EXPORT_DIR={outdir} pages={count}");
 

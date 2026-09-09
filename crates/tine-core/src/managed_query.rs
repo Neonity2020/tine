@@ -561,6 +561,57 @@ impl ManagedQueryShared {
         answer
     }
 
+    /// The existing explicit whole-site publisher owns its captured documents.
+    /// Its query occurrences share this one main read image, without retaining
+    /// answers or constructing a second projection from those documents.
+    pub(crate) fn with_publication_query_reader<T>(
+        &self,
+        capture: &ManagedReadCapture,
+        publish: impl FnOnce(&crate::query::read_execute::SnapshotQueryReader<'_>) -> T,
+    ) -> Result<T, ManagedQueryOutcome> {
+        with_managed_read(
+            capture.job_epoch,
+            &capture.read_input(),
+            &self.jobs,
+            self.job_wait(),
+            |mut opened| {
+                let recency = |page: RecencyPage<'_>| {
+                    capture.journal_format.page_recency_secs(
+                        page.kind == PageKind::Journal,
+                        page.name,
+                        &capture.graph_root.join(page.path),
+                    )
+                };
+                let journal_format = capture.journal_format.clone();
+                let file_journal_format = capture.journal_format.clone();
+                let file_root = capture.graph_root.clone();
+                let page_recency = PageRecencyPrograms::new(
+                    JournalRankInput::DisplayName,
+                    move |name| journal_format.page_recency_secs(true, name, Path::new("")),
+                    move |path| {
+                        file_journal_format.page_recency_secs(false, "", &file_root.join(path))
+                    },
+                );
+                let reader = crate::query::read_execute::SnapshotQueryReader::new(
+                    &mut opened.snapshot,
+                    crate::query::read_execute::SnapshotQueryInputs {
+                        registry: &opened.registry,
+                        identity: &ResultIdentity::Stored,
+                        order: BackendOrder::Managed,
+                        recency: &recency,
+                        page_recency: &page_recency,
+                        today: JournalDate::today(),
+                    },
+                )
+                .map_err(|error| match error {
+                    crate::query::QueryExecutionError::Cancelled => ManagedQueryOutcome::Cancelled,
+                    _ => ManagedQueryOutcome::Failed("publication query reader"),
+                })?;
+                Ok(publish(&reader))
+            },
+        )
+    }
+
     pub(crate) fn execute_metadata(
         &self,
         capture: &crate::managed_metadata::ManagedMetadataCapture,

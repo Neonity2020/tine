@@ -12,7 +12,7 @@ const BLOCKS_PER_FILE: usize = 50;
 const COLD_RUNS: usize = 3;
 const CACHE_BUILD_RUNS: usize = 3;
 const WARM_SCAN_RUNS: usize = 5;
-const MEMO_HIT_RUNS: usize = 9;
+const REPEAT_QUERY_RUNS: usize = 9;
 const EDIT_CYCLES: usize = 12;
 
 const PRIMARY_QUERY: &str = "(task TODO)";
@@ -36,7 +36,7 @@ fn main() -> io::Result<()> {
     println!("compound_query={COMPOUND_QUERY}");
     println!("note=bare TODO is not accepted by the current simple query parser; (task TODO) is the accepted task predicate");
     println!(
-        "runs=cold:{COLD_RUNS} cache_build:{CACHE_BUILD_RUNS} warm_scan:{WARM_SCAN_RUNS} memo:{MEMO_HIT_RUNS} edit_cycles:{EDIT_CYCLES}"
+        "runs=cold:{COLD_RUNS} cache_build:{CACHE_BUILD_RUNS} warm_scan:{WARM_SCAN_RUNS} repeat_query:{REPEAT_QUERY_RUNS} edit_cycles:{EDIT_CYCLES}"
     );
     println!();
 
@@ -55,12 +55,12 @@ fn main() -> io::Result<()> {
         );
         let row = bench_scale(scale, &root, generated)?;
         println!(
-            "result scale={} cold_total_ms={:.3} cache_build_ms={:.3} warm_scan_ms={:.3} memo_hit_us={:.3} save_page_ms={:.3}/{:.3} edit_rescan_ms={:.3}/{:.3} compound_rescan_ms={:.3}/{:.3} primary_results={} compound_results={}",
+            "result scale={} cold_total_ms={:.3} cache_build_ms={:.3} warm_scan_ms={:.3} repeat_query_us={:.3} save_page_ms={:.3}/{:.3} edit_rescan_ms={:.3}/{:.3} compound_rescan_ms={:.3}/{:.3} primary_results={} compound_results={}",
             row.scale,
             row.cold_total_ms,
             row.cache_build_ms,
             row.warm_scan_ms,
-            row.memo_hit_us,
+            row.repeat_query_us,
             row.save_page_ms.median,
             row.save_page_ms.p95,
             row.primary_rescan_ms.median,
@@ -329,7 +329,7 @@ struct BenchRow {
     cold_total_ms: f64,
     cache_build_ms: f64,
     warm_scan_ms: f64,
-    memo_hit_us: f64,
+    repeat_query_us: f64,
     save_page_ms: DistributionMs,
     primary_rescan_ms: DistributionMs,
     compound_rescan_ms: DistributionMs,
@@ -342,9 +342,9 @@ fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Resu
     for _ in 0..COLD_RUNS {
         let graph = Graph::open(root);
         let started = Instant::now();
-        let groups = graph.run_query(PRIMARY_QUERY);
+        let groups = graph.run_query(PRIMARY_QUERY).map_err(io::Error::other)?;
         cold_total.push(started.elapsed());
-        let primary_results = result_count(groups.as_ref());
+        let primary_results = result_count(&groups);
         assert_nonzero(primary_results, PRIMARY_QUERY);
         black_box(primary_results);
     }
@@ -365,20 +365,27 @@ fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Resu
     for i in 0..WARM_SCAN_RUNS {
         let query = primary_query_variant(i);
         let started = Instant::now();
-        let groups = warm_graph.run_query(&query);
+        let groups = warm_graph.run_query(&query).map_err(io::Error::other)?;
         warm_scan.push(started.elapsed());
-        assert_nonzero(result_count(groups.as_ref()), &query);
+        assert_nonzero(result_count(&groups), &query);
         black_box(groups.len());
     }
 
-    let memo_graph = Graph::open(root);
-    let seeded = memo_graph.run_query(PRIMARY_QUERY);
-    assert_nonzero(result_count(seeded.as_ref()), PRIMARY_QUERY);
-    let mut memo_hits = Vec::with_capacity(MEMO_HIT_RUNS);
-    for _ in 0..MEMO_HIT_RUNS {
+    // No answer memo exists any more: a repeated identical query re-executes
+    // against the current image. This arm measures that repeat cost, which is
+    // why it is no longer called a memo hit.
+    let repeat_graph = Graph::open(root);
+    let seeded = repeat_graph
+        .run_query(PRIMARY_QUERY)
+        .map_err(io::Error::other)?;
+    assert_nonzero(result_count(&seeded), PRIMARY_QUERY);
+    let mut repeat_queries = Vec::with_capacity(REPEAT_QUERY_RUNS);
+    for _ in 0..REPEAT_QUERY_RUNS {
         let started = Instant::now();
-        let groups = memo_graph.run_query(PRIMARY_QUERY);
-        memo_hits.push(started.elapsed());
+        let groups = repeat_graph
+            .run_query(PRIMARY_QUERY)
+            .map_err(io::Error::other)?;
+        repeat_queries.push(started.elapsed());
         black_box(groups.len());
     }
 
@@ -393,7 +400,7 @@ fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Resu
         cold_total_ms: ms(median(&cold_total)),
         cache_build_ms: ms(median(&cache_build)),
         warm_scan_ms: ms(median(&warm_scan)),
-        memo_hit_us: us(median(&memo_hits)),
+        repeat_query_us: us(median(&repeat_queries)),
         save_page_ms: dist_ms(&primary_edit.save_durations),
         primary_rescan_ms: dist_ms(&primary_edit.query_durations),
         compound_rescan_ms: dist_ms(&compound_edit.query_durations),
@@ -418,12 +425,12 @@ struct EditCycleResult {
 
 fn run_edit_cycles(root: &Path, query: &str) -> io::Result<EditCycleResult> {
     let graph = Graph::open(root);
-    let initial = graph.run_query(query);
-    assert_nonzero(result_count(initial.as_ref()), query);
+    let initial = graph.run_query(query).map_err(io::Error::other)?;
+    assert_nonzero(result_count(&initial), query);
 
     let mut save_durations = Vec::with_capacity(EDIT_CYCLES);
     let mut query_durations = Vec::with_capacity(EDIT_CYCLES);
-    let mut last_result_count = result_count(initial.as_ref());
+    let mut last_result_count = result_count(&initial);
 
     for _ in 0..EDIT_CYCLES {
         let mut page = graph
@@ -443,9 +450,9 @@ fn run_edit_cycles(root: &Path, query: &str) -> io::Result<EditCycleResult> {
         black_box(new_rev.len());
 
         let started = Instant::now();
-        let groups = graph.run_query(query);
+        let groups = graph.run_query(query).map_err(io::Error::other)?;
         query_durations.push(started.elapsed());
-        last_result_count = result_count(groups.as_ref());
+        last_result_count = result_count(&groups);
         assert_nonzero(last_result_count, query);
         black_box(last_result_count);
     }
@@ -527,7 +534,7 @@ fn us(duration: Duration) -> f64 {
 }
 
 fn print_table(rows: &[BenchRow]) {
-    println!("| scale | files | pages | journals | cold total ms | cache-build ms | warm scan ms | memo-hit us | save_page med/p95 ms | edit re-scan med/p95 ms | compound re-scan med/p95 ms | results primary/compound |");
+    println!("| scale | files | pages | journals | cold total ms | cache-build ms | warm scan ms | repeat query us | save_page med/p95 ms | edit re-scan med/p95 ms | compound re-scan med/p95 ms | results primary/compound |");
     println!(
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     );
@@ -541,7 +548,7 @@ fn print_table(rows: &[BenchRow]) {
             row.cold_total_ms,
             row.cache_build_ms,
             row.warm_scan_ms,
-            row.memo_hit_us,
+            row.repeat_query_us,
             row.save_page_ms.median,
             row.save_page_ms.p95,
             row.primary_rescan_ms.median,

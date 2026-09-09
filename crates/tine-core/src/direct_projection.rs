@@ -577,6 +577,73 @@ pub(crate) struct DirectQueryJob {
 }
 
 impl DirectQueryJob {
+    /// Check the existing static publisher's fresh source capture against this
+    /// pinned projection image. Ordinary query reads do not call this method.
+    /// These fingerprints are disposable metadata, not a second source authority.
+    pub(crate) fn publication_sources_match(
+        &mut self,
+        sources: &[(PageEntry, String)],
+        capture_config: &ParseConfig,
+    ) -> Result<bool, crate::query::results::ResultReadError> {
+        use crate::query::results::{sql_or_cancelled, ResultReadError};
+        let config_digest = capture_config.digest();
+        let mut expected = sources
+            .iter()
+            .map(|(entry, revision)| {
+                (
+                    page_id(&entry.rel_path),
+                    projection_source_revision(revision, config_digest),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        if expected.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ResultReadError::Corrupt(
+                "duplicate physical page in publication capture".into(),
+            ));
+        }
+        let mut at = 0;
+        let mut matches = true;
+        let mut malformed = false;
+        let read = self.snapshot.visit_projection_query(
+            "SELECT p.page_id, s.revision FROM pages p \
+             LEFT JOIN direct_source_revisions s ON s.page_id = p.page_id \
+             ORDER BY p.page_id",
+            &[],
+            |row| {
+                let [PhysicalQueryValue::Blob(id), PhysicalQueryValue::Text(revision)] = row else {
+                    malformed = true;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                };
+                if id.len() != 16 {
+                    malformed = true;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                if !expected
+                    .get(at)
+                    .is_some_and(|(wanted_id, wanted_revision)| {
+                        wanted_id.as_slice() == id.as_slice() && wanted_revision == revision
+                    })
+                {
+                    matches = false;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                at += 1;
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        );
+        read.map_err(|error| sql_or_cancelled(&self.snapshot, error))?;
+        if self.snapshot.cancellation().is_cancelled() {
+            return Err(ResultReadError::Cancelled);
+        }
+        if malformed {
+            return Err(ResultReadError::Corrupt(
+                "publication source fingerprint is absent or malformed".into(),
+            ));
+        }
+        Ok(matches && at == expected.len())
+    }
+
     /// Registry input and selection share this owned transaction. This scans
     /// metadata, not result payload; inference remains build_registry's job.
     pub(crate) fn read_registry(
@@ -3028,6 +3095,18 @@ mod tests {
 
     static PROJECTION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serialize the projection tests without letting one failure hide the
+    /// rest. This mutex guards no invariant — it only stops two tests driving
+    /// the same global projection worker at once — so a panicking test must not
+    /// poison it. It used to be taken with `.unwrap()`, and a single failing
+    /// test then turned 39 unrelated tests into `PoisonError` noise, which is
+    /// exactly the shape that makes a suite unreadable by name.
+    fn serialize_projection_tests() -> std::sync::MutexGuard<'static, ()> {
+        PROJECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("tine-direct-projection-{tag}-{}", Uuid::new_v4()))
     }
@@ -3153,7 +3232,7 @@ mod tests {
 
     #[test]
     fn public_query_replacement_returns_readiness_for_a_new_request() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("public-target-replacement-retry");
         let graph = Graph::open(&root);
         graph
@@ -3182,7 +3261,7 @@ mod tests {
 
     #[test]
     fn current_snapshot_capture_runs_before_later_queued_save() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("target-capture-before-later-save");
         let graph = Graph::open(&root);
         graph
@@ -3302,7 +3381,7 @@ mod tests {
 
     #[test]
     fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("target-acquired-image");
         let graph = Graph::open(&root);
         graph
@@ -3365,7 +3444,7 @@ mod tests {
 
     #[test]
     fn current_snapshot_requires_initialization_but_not_source_freshness() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("current-initialization");
         let graph = Graph::open(&root);
         graph
@@ -3391,7 +3470,7 @@ mod tests {
 
     #[test]
     fn same_config_inventory_preserves_jobs_but_changed_config_cancels_them() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("target-config-lifecycle");
         let graph = Graph::open(&root);
         graph
@@ -3479,7 +3558,7 @@ mod tests {
 
     #[test]
     fn current_snapshot_write_failure_recovers_from_authoritative_source() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("target-write-failure");
         let database = root.join("private/projection.sqlite");
         let graph = Graph::open(&root);
@@ -3522,7 +3601,7 @@ mod tests {
 
     #[test]
     fn direct_projection_matches_parser_tasks_and_tracks_replace_delete() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("task-parity");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::create_dir_all(root.join("journals")).unwrap();
@@ -3615,7 +3694,7 @@ mod tests {
 
     #[test]
     fn b4_page_ref_and_property_facets_record_indexed_reads() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("b4-indexed-reads");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -3796,7 +3875,7 @@ mod tests {
 
     #[test]
     fn a_damaged_query_table_is_rebuilt_without_a_source_edit() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("damaged-query-table");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/source.md"), "- TODO links [[Target]]\n").unwrap();
@@ -3844,7 +3923,7 @@ mod tests {
     /// is `Failed`, and neither consumes a slot.
     #[test]
     fn a_rebuild_drains_a_live_query_job_before_touching_the_file() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("rebuild-drains-job");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/source.md"), "- TODO links [[Target]]\n").unwrap();
@@ -3946,7 +4025,7 @@ mod tests {
     /// and must be answered structurally.
     #[test]
     fn lowering_measurement_excludes_other_graphs() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("measurement-owner");
         let other = scratch("measurement-other");
         reset_lowerings(&root);
@@ -3967,7 +4046,7 @@ mod tests {
 
     #[test]
     fn session_pages_name_exactly_the_pages_this_process_lowered() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("session-pages");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
@@ -4045,7 +4124,7 @@ mod tests {
     /// frontend acts on: one is silent, the other is shown.
     #[test]
     fn a_cancelled_query_job_refuses_without_repairing_or_walking() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("cancelled-query-job");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -4105,7 +4184,7 @@ mod tests {
     /// still projecting. A subsequent read observes the completed projection.
     #[test]
     fn a_projection_behind_edits_serves_coherent_sql_then_refreshes() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("behind-parsed-cache");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/tasks.md"), "- TODO ship it\n").unwrap();
@@ -4174,7 +4253,7 @@ mod tests {
     /// ever being traversed.
     #[test]
     fn a_failed_statement_read_repairs_and_retries_the_same_statement() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("failed-read-recovers");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -4271,7 +4350,7 @@ mod tests {
     /// is loaded as a `Document` (I-13, I-15).
     #[test]
     fn the_dispatched_result_reproduces_the_walks_order_and_loads_only_result_pages() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("dispatch-order");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::create_dir_all(root.join("journals")).unwrap();
@@ -4394,7 +4473,7 @@ mod tests {
     /// it (P1-e).
     #[test]
     fn an_unselective_shape_answers_through_the_statement_without_a_candidate_superset() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("b4-candidate-cutoff");
         std::fs::create_dir_all(root.join("journals")).unwrap();
         // 50 real journal dates, comfortably past the 32-page small-graph
@@ -4531,7 +4610,7 @@ mod tests {
             }
         }
 
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let source = PathBuf::from(
             std::env::var("TINE_B4_QUERY_CORPUS").expect("TINE_B4_QUERY_CORPUS is required"),
         );
@@ -4682,7 +4761,7 @@ mod tests {
 
     #[test]
     fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("search-reference-parity");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -4791,7 +4870,7 @@ mod tests {
 
     #[test]
     fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("reference-family-parity");
         let target_id = "11111111-2222-4333-8444-555555555555";
         std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -4917,7 +4996,7 @@ mod tests {
     /// same semantics and avoids the reported multi-second fallback.
     #[test]
     fn a_timed_out_close_retains_resources_until_the_writer_really_exits() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("worker-resource-lifetime");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/source.md"), "- before\n").unwrap();
@@ -4973,7 +5052,7 @@ mod tests {
 
     #[test]
     fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("reference-delta-handoff");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
@@ -5037,7 +5116,7 @@ mod tests {
 
     #[test]
     fn reference_wait_is_zero_cost_when_no_projection_work_exists() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("reference-no-work-wait");
         let projection = DirectProjection::start(root.join("projection.sqlite")).unwrap();
         let started = Instant::now();
@@ -5052,7 +5131,7 @@ mod tests {
 
     #[test]
     fn direct_projection_preserves_external_uuid_ambiguity_for_parser_resolution() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("external-uuid-ambiguity");
         let target_id = "11111111-2222-4333-8444-555555555555";
         std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -5115,7 +5194,7 @@ mod tests {
 
     #[test]
     fn direct_projection_fuzzy_candidates_preserve_parser_corpus_semantics() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("search-corpus-parity");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -5195,7 +5274,7 @@ mod tests {
     /// is what makes this a query-route claim and not a graph-wide one.
     #[test]
     fn unavailable_projection_refuses_the_public_query_and_keeps_other_semantics() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("fallback");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -5252,7 +5331,7 @@ mod tests {
 
     #[test]
     fn concurrent_graph_instance_cannot_replace_ready_projection_facts() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("single-writer");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/tasks.md"), "- TODO one\n").unwrap();
@@ -5347,7 +5426,7 @@ mod tests {
 
     #[test]
     fn clean_reopen_reuses_sqlite_and_external_edit_relowers_only_one_page() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("reopen-revisions");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
@@ -5447,7 +5526,7 @@ mod tests {
     /// no longer asks and which no later reopen will notice (J7, D-1).
     #[test]
     fn each_queued_page_lowers_under_the_config_it_was_queued_with() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("per-item-parse-config");
         std::fs::create_dir_all(&root).unwrap();
         let mut database = open_projection_database(&root.join("projection.sqlite")).unwrap();
@@ -5682,7 +5761,7 @@ mod tests {
     #[test]
     #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
     fn real_corpus_projection_converges_and_matches_task_query() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = PathBuf::from(
             std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
                 .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
@@ -5812,7 +5891,7 @@ mod tests {
     /// SQL with the cache still absent.
     #[test]
     fn public_export_reads_committed_subtrees_without_source_documents() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("export-current-main");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(
@@ -5861,7 +5940,7 @@ mod tests {
 
     #[test]
     fn public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("public-ir-warm");
         let database = scratch("public-ir-warm-db").join("projection.sqlite");
         {
@@ -5909,7 +5988,7 @@ mod tests {
 
     #[test]
     fn warm_reopen_parses_nothing_and_answers_from_sql() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("warm-reopen");
         let database = scratch("warm-reopen-db").join("projection.sqlite");
         {
@@ -5981,7 +6060,7 @@ mod tests {
 
     #[test]
     fn query_registry_snapshot_preserves_old_reads_without_publishing_over_new_edits() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("registry-snapshot");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         let source = root.join("pages/Source.md");
@@ -6038,7 +6117,7 @@ mod tests {
 
     #[test]
     fn query_registry_live_text_edits_reuse_cache_and_property_edits_patch_it() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("registry-live-delta");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/Source.md"), "score:: 1\n- TODO task\n").unwrap();
@@ -6113,7 +6192,7 @@ mod tests {
     #[test]
     fn query_registry_snapshot_rejects_orphaned_property_owners() {
         use crate::query::{QueryExecutionError, QueryUnavailableReason};
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("registry-orphan");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 2\n").unwrap();
@@ -6148,7 +6227,7 @@ mod tests {
 
     #[test]
     fn task_query_does_not_refresh_property_registry() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("task-no-registry");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 2\n").unwrap();
@@ -6173,7 +6252,7 @@ mod tests {
 
     #[test]
     fn task_query_skips_registry_capture_after_many_dirty_property_keys() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("task-no-registry-capture");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/Source.md"), "seed:: 1\n- TODO task\n").unwrap();
@@ -6251,7 +6330,7 @@ mod tests {
 
     #[test]
     fn non_property_query_does_not_borrow_editor_registry_generation() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("task-no-editor-registry-generation");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 1\n").unwrap();
@@ -6288,7 +6367,7 @@ mod tests {
     /// `WARM_STREAM_HIGH_WATER` documents wait in the queue.
     #[test]
     fn cold_open_streams_without_retaining_the_graph() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = scratch("cold-stream");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         let pages = 3 * WARM_STREAM_HIGH_WATER + 7;
@@ -6335,8 +6414,175 @@ mod tests {
     }
 
     #[test]
+    fn publication_reader_uses_capture_ids_without_changing_live_editor_ids() {
+        let _serial = serialize_projection_tests();
+        let root = scratch("publication-capture-ids");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        let path = root.join("pages/Source.md");
+        std::fs::write(&path, "- TODO keep me\n").unwrap();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let entry = graph.list_pages().into_iter().next().unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let old_id = page.blocks[0].id.clone();
+        let baseline = page.rev.clone();
+        let mut inserted = page.blocks[0].clone();
+        inserted.id = uuid::Uuid::new_v4().to_string();
+        inserted.raw = "Inserted heading".into();
+        inserted.marker = None;
+        page.blocks.insert(0, inserted);
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        assert_eq!(graph.load_page(&entry).unwrap().blocks[1].id, old_id);
+        let had_cache = graph.has_parsed_cache_test();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut captured = crate::doc::parse(&content);
+        crate::model::assign_doc_runtime_ids(&mut captured.roots, &entry.rel_path);
+        let captured_id = captured.roots[1].uuid.clone();
+        assert_ne!(
+            captured_id, old_id,
+            "the structural edit makes identity policies distinguishable"
+        );
+        let sources = vec![(entry.clone(), crate::model::content_rev(&content))];
+        let (query, view) = crate::query::parse_query_text(
+            "(task TODO)",
+            crate::query::QueryDialect::Og,
+            crate::date::JournalDate::today(),
+        );
+        let result = graph
+            .with_publication_query_reader(&sources, |reader| {
+                reader
+                    .run(
+                        &query,
+                        &view,
+                        crate::query::ir::Bounds {
+                            max_rows: 100,
+                            max_bytes: 1_000_000,
+                        },
+                        &crate::query::ir::ExecutionContext::none(),
+                    )
+                    .map_err(std::io::Error::other)
+            })
+            .unwrap();
+        let crate::query::ir::QueryRows::Block { groups } = result.rows else {
+            panic!("block publication result")
+        };
+        assert_eq!(groups[0].blocks[0].id, captured_id);
+        assert_eq!(graph.load_page(&entry).unwrap().blocks[1].id, old_id);
+        assert_eq!(graph.has_parsed_cache_test(), had_cache);
+
+        let mut mismatched = sources;
+        mismatched[0].1 = crate::model::content_rev("different captured bytes");
+        let called = std::cell::Cell::new(false);
+        let refused = graph
+            .with_publication_query_reader(&mismatched, |_| {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            !called.get(),
+            "source mismatch cannot enter the publication writer"
+        );
+    }
+
+    #[test]
+    fn publication_sources_are_compared_inside_the_owned_main_snapshot() {
+        let _serial = serialize_projection_tests();
+        let root = r6_graph("publication-source-snapshot");
+        let database = scratch("publication-source-snapshot-db").join("projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let sources = graph
+            .list_pages()
+            .into_iter()
+            .map(|entry| {
+                let revision =
+                    crate::model::content_rev(&std::fs::read_to_string(&entry.path).unwrap());
+                (entry, revision)
+            })
+            .collect::<Vec<_>>();
+        let config = graph.config.parse_config();
+        let projection = graph.direct_projection_test().unwrap();
+        let QueryJobOpen::Job(mut old) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("old publication image");
+        };
+        assert!(old.publication_sources_match(&sources, &config).unwrap());
+        let mut other_config = config.clone();
+        other_config
+            .separated_by_commas
+            .push("publication-fixture".into());
+        assert!(!old
+            .publication_sources_match(&sources, &other_config)
+            .unwrap());
+        assert!(!old
+            .publication_sources_match(&sources[1..], &config)
+            .unwrap());
+        let mut extra = sources.clone();
+        extra[0].0.rel_path = "pages/not-captured.md".into();
+        assert!(!old.publication_sources_match(&extra, &config).unwrap());
+
+        let path = root.join("pages/two.md");
+        let updated = "- TODO changed after publication capture\n";
+        std::fs::write(&path, updated).unwrap();
+        assert!(graph.sync_file(&path).is_some());
+        wait_ready(&graph);
+        let mut fresh = sources.clone();
+        fresh
+            .iter_mut()
+            .find(|(entry, _)| entry.path == path)
+            .unwrap()
+            .1 = crate::model::content_rev(updated);
+        assert!(
+            old.publication_sources_match(&sources, &config).unwrap(),
+            "a later commit cannot mix the captured image"
+        );
+        assert!(!old.publication_sources_match(&fresh, &config).unwrap());
+        let QueryJobOpen::Job(mut current) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("current publication image");
+        };
+        assert!(current.publication_sources_match(&fresh, &config).unwrap());
+        assert!(!current
+            .publication_sources_match(&sources, &config)
+            .unwrap());
+        current.snapshot.cancellation().cancel();
+        assert!(matches!(
+            current.publication_sources_match(&fresh, &config),
+            Err(crate::query::results::ResultReadError::Cancelled)
+        ));
+        drop(current);
+        drop(old);
+
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .execute("DELETE FROM direct_source_revisions", [])
+            .unwrap();
+        drop(writer);
+        let QueryJobOpen::Job(mut damaged) =
+            projection.open_current_query_job(RegistrySensitivity::Insensitive)
+        else {
+            panic!("damaged source-metadata image");
+        };
+        assert!(matches!(
+            damaged.publication_sources_match(&fresh, &config),
+            Err(crate::query::results::ResultReadError::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn external_watcher_edit_after_warm_reopen_enqueues_a_page_delta() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("external-watcher-no-cache");
         let database = scratch("external-watcher-no-cache-db").join("projection.sqlite");
         {
@@ -6408,7 +6654,7 @@ mod tests {
     /// parsed and relowered; the parsed cache is never built.
     #[test]
     fn an_external_edit_between_sessions_relowers_one_page_without_a_cache() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("external-edit-stream");
         let database = scratch("external-edit-stream-db").join("projection.sqlite");
         {
@@ -6451,7 +6697,7 @@ mod tests {
     /// recreated and its rebuild streams like a cold open — no parsed cache.
     #[test]
     fn a_damaged_projection_streams_its_rebuild() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("damaged-stream");
         let database = scratch("damaged-stream-db").join("projection.sqlite");
         {
@@ -6497,7 +6743,7 @@ mod tests {
 
     #[test]
     fn edited_page_reload_and_sql_keep_the_same_session_ids() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("edited-session-reload");
         let database = scratch("edited-session-reload-db").join("projection.sqlite");
         let graph = Graph::open(&root);
@@ -6581,7 +6827,7 @@ mod tests {
 
     #[test]
     fn failed_projection_recovery_does_not_build_a_parsed_graph() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("streamed-damage-recovery");
         let database = scratch("streamed-damage-recovery-db").join("projection.sqlite");
         let graph = Graph::open(&root);
@@ -6623,7 +6869,7 @@ mod tests {
 
     #[test]
     fn failed_projection_writer_can_recover_from_source_inventory() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("failed-writer-stream-recovery");
         let database = scratch("failed-writer-stream-recovery-db").join("projection.sqlite");
         let graph = Graph::open(&root);
@@ -6672,7 +6918,7 @@ mod tests {
     /// The compact session owner survives without retaining parsed documents.
     #[test]
     fn session_identity_survives_parsed_page_eviction() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("identity-eviction");
         let database = scratch("identity-eviction-db").join("projection.sqlite");
         let graph = Graph::open(&root);
@@ -6851,7 +7097,7 @@ mod tests {
 
     #[test]
     fn query_job_capture_waits_for_post_commit_identity_publication() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("producer-identity-boundary");
         let database = root.join("private/projection.sqlite");
         let graph = Graph::open(&root);
@@ -6873,7 +7119,10 @@ mod tests {
         let entry = graph.list_pages().into_iter().next().unwrap();
         let id = page_id(&entry.rel_path);
         assert!(!projection.session_pages_test().contains(&id));
-        let mut page = graph.load_page(&entry).unwrap();
+        // Build the edit fixture without enqueueing load_page's ordinary
+        // watcher delta on the producer whose first identity transition this
+        // test pauses. The source bytes and deterministic starting IDs agree.
+        let mut page = Graph::open(&root).load_page(&entry).unwrap();
         let baseline = page.rev.clone();
         page.blocks[0].raw = "TODO producer identity sentinel".into();
         let (paused, observed) = std::sync::mpsc::channel();
@@ -6956,7 +7205,7 @@ mod tests {
 
     #[test]
     fn query_job_snapshot_is_captured_on_the_projection_worker() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("producer-capture");
         let graph = Graph::open(&root);
         graph
@@ -7015,7 +7264,7 @@ mod tests {
     /// projection's candidates from disk and build no whole-graph cache.
     #[test]
     fn reference_hydration_without_a_cache_parses_only_candidates() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("hydration");
         let database = scratch("hydration-db").join("projection.sqlite");
         {
@@ -7053,7 +7302,7 @@ mod tests {
     /// included.
     #[test]
     fn list_pages_is_served_from_the_projection_when_ready() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = r6_graph("list-pages");
         let database = scratch("list-pages-db").join("projection.sqlite");
         {
@@ -7090,7 +7339,7 @@ mod tests {
     #[test]
     #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
     fn real_corpus_clean_reopen_reuses_projected_pages() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = PathBuf::from(
             std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
                 .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
@@ -7144,7 +7393,7 @@ mod tests {
     #[test]
     #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
     fn real_corpus_reference_family_matches_parser_oracle() {
-        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let _serial = serialize_projection_tests();
         let root = PathBuf::from(
             std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
                 .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),

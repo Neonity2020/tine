@@ -2104,9 +2104,19 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // and cancellation import, bound sort/property/limit values, admitted page
     // IDs, and the existing raw page estimator in reader and walk oracle.
     // The full multiset reconstructs both digests; no write boundary changes.
+    // S3 static publication and the shared Friendly reader add 21 tuples
+    // (451 -> 472), reviewed one by one: 12 `PhysicalQueryValue` decodings and
+    // the read-only `PhysicalProjectionQuerySnapshot` import in the new
+    // `query/friendly.rs`, one more `PhysicalProjectionQuerySnapshot` import in
+    // the new `query/read_execute.rs` (the publication `SnapshotQueryReader`),
+    // five `MaterializationError::InvalidQuery` constructions in `query/rank.rs`,
+    // and two more value decodings in `direct_projection.rs`. Nothing is
+    // removed; no snapshot opener is added (`open_direct`/`open_managed` keep
+    // their counts), and the write-boundary token list above is unchanged, so
+    // the physical write surface is byte-for-byte the pinned one.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "8e47c443a7295506a1d981e80ffcc24f23ff5253628cf8a6d72a9ae4acca6384",
+        "a65f320888e42c5418ded93fb20c2c0b670669abb03366e60b1b8e1fadf89608",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -87,6 +87,51 @@ impl QueryRankPrograms {
         self.bind(|text| Ok(Some(text.to_lowercase().into_bytes())))
     }
 
+    /// Bind a two-text rank program through the storage seam's fixed one-text
+    /// callback. SQL frames the pair as `<left UTF-8 byte length>:<left><right>`;
+    /// the length prefix makes every user string, including colons and NULs,
+    /// unambiguous without a second callback registry.
+    pub(crate) fn bind_pair(
+        &mut self,
+        program: impl Fn(&str, &str) -> Result<Option<Vec<u8>>, MaterializationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> u64 {
+        self.bind(move |framed| {
+            let bytes = framed.as_bytes();
+            let Some(colon) = bytes.iter().position(|byte| *byte == b':') else {
+                return Err(MaterializationError::InvalidQuery(
+                    "query rank pair has no length separator".into(),
+                ));
+            };
+            let length = std::str::from_utf8(&bytes[..colon])
+                .ok()
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    MaterializationError::InvalidQuery(
+                        "query rank pair has an invalid length".into(),
+                    )
+                })?;
+            let start = colon + 1;
+            let end = start
+                .checked_add(length)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| {
+                    MaterializationError::InvalidQuery(
+                        "query rank pair length exceeds its payload".into(),
+                    )
+                })?;
+            let left = std::str::from_utf8(&bytes[start..end]).map_err(|_| {
+                MaterializationError::InvalidQuery("query rank pair left text is invalid".into())
+            })?;
+            let right = std::str::from_utf8(&bytes[end..]).map_err(|_| {
+                MaterializationError::InvalidQuery("query rank pair right text is invalid".into())
+            })?;
+            program(left, right)
+        })
+    }
+
     /// The single callback installed for this statement's whole program table.
     pub(crate) fn function(
         &self,

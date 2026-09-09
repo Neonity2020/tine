@@ -6086,73 +6086,10 @@ impl Graph {
             .map(|projection| projection.observe_commits(wake))
     }
 
-    /// Attach this graph's OWN disposable query projection over the document
-    /// snapshot it was constructed with.
-    ///
-    /// For a graph built by [`Graph::from_page_snapshot`] — a caller-owned,
-    /// immutable capture in a root the caller exclusively created. The parsed
-    /// cache is already preinstalled, so [`Graph::attach_direct_projection`]
-    /// enqueues exactly those documents, identities and inventory order, with
-    /// this graph's own effective parse configuration; nothing rereads the
-    /// source tree and nothing reaches the live graph's projection.
-    ///
-    /// This is NOT `warm_cache`/`recover`: neither would have a source tree to
-    /// read under a snapshot root, and both would be a second opinion about a
-    /// snapshot the caller already owns.
-    ///
-    /// The returned handle is the one the caller closes and drains before
-    /// removing the directory the database lives in, so it is returned from the
-    /// ATTACH — before any wait can fail — and never from the wait.
-    pub(crate) fn attach_snapshot_query_projection(
-        &self,
-        path: PathBuf,
-    ) -> io::Result<Arc<crate::direct_projection::DirectProjection>> {
-        // The projection keys stored work by SOURCE REVISION, and a snapshot
-        // root holds no source bytes to read one from. Publish the digest of
-        // each EXACT captured document instead — the revision of what this
-        // graph actually serves, never of what the live tree holds now. Done
-        // here rather than in `from_page_snapshot` so a snapshot that never
-        // indexes never pays for the serialization.
-        {
-            let cache = self.cache.read().unwrap();
-            let Some(pages) = cache.as_ref() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "snapshot query projection needs a preinstalled document snapshot",
-                ));
-            };
-            // Lock order is cache → disk_revs (see `disk_revs`), and both are
-            // published together so no reader sees one without the other.
-            *self.disk_revs.write().unwrap() = pages
-                .iter()
-                .map(|(entry, document)| {
-                    (entry.path.clone(), content_rev(&doc::serialize(document)))
-                })
-                .collect();
-        }
-        self.attach_direct_projection(path)?;
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "snapshot query projection could not be attached",
-                )
-            })
-    }
-
-    /// Block until this snapshot graph's attached projection has indexed the
-    /// preinstalled snapshot, or `timeout` elapses.
-    ///
-    /// Every non-ready outcome is a bounded `io::Error`, because a snapshot
-    /// graph takes no writes: there is no later generation to wait for, and no
-    /// repair anyone else will schedule. A caller that cannot index cannot
-    /// answer, and a publication that cannot answer must fail before it
-    /// replaces anything.
-    pub(crate) fn await_snapshot_query_projection(
+    /// Test barrier for ordinary producer progression. Production queries read
+    /// the current coherent image and never wait for a saved-edit generation.
+    #[cfg(test)]
+    pub(crate) fn wait_for_direct_projection_for_test(
         &self,
         timeout: std::time::Duration,
     ) -> io::Result<()> {
@@ -6177,7 +6114,7 @@ impl Graph {
                 ProjectionProgress::Working(_) => {}
                 ProjectionProgress::Stale => {
                     return Err(io::Error::other(
-                        "snapshot query projection stopped short of its own snapshot",
+                        "test projection stopped before the producer generation",
                     ))
                 }
                 ProjectionProgress::Stopped => {
@@ -6802,6 +6739,77 @@ impl Graph {
                     .map_err(Into::into)
             })
         })
+    }
+
+    /// Bind the static publisher's captured source documents to one main image.
+    /// A byte/config mismatch is local to this explicit publication command;
+    /// ordinary live reads never wait for this correspondence.
+    pub(crate) fn with_publication_query_reader<T>(
+        &self,
+        sources: &[(PageEntry, String)],
+        publish: impl FnOnce(&crate::query::read_execute::SnapshotQueryReader<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        use crate::query::rank::{JournalRankInput, PageRecencyPrograms};
+        use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
+        use crate::query::results::{BackendOrder, RecencyPage, ResultIdentity};
+        // The dispatcher can repair a failed acquisition before publication
+        // starts. Once the callback starts, its IO outcome is final; the writer
+        // is never re-entered as a query retry.
+        let publish = std::cell::RefCell::new(Some(publish));
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_read_job(
+                request,
+                crate::direct_projection::RegistrySensitivity::Required,
+                |job| {
+                    if !job.publication_sources_match(sources, &self.config.parse_config())? {
+                        return Ok(Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "The graph is still updating. Try publishing again shortly.",
+                        )));
+                    }
+                    let registry = self.direct_lowering_registry(true, job)?;
+                    let identity = ResultIdentity::DirectStructural {
+                        session_pages: Arc::new(HashSet::new()),
+                        all_session: false,
+                    };
+                    let recency = |page: RecencyPage<'_>| {
+                        crate::query::page_recency_secs_for(
+                            page.journal_day,
+                            &self.root.join(page.path),
+                        )
+                    };
+                    let root = self.root.clone();
+                    let page_recency = PageRecencyPrograms::new(
+                        JournalRankInput::StoredDay,
+                        |day| {
+                            crate::query::page_recency_secs_for(
+                                day.parse::<i64>().ok(),
+                                Path::new(""),
+                            )
+                        },
+                        move |path| crate::query::page_recency_secs_for(None, &root.join(path)),
+                    );
+                    let reader = SnapshotQueryReader::new(
+                        &mut job.snapshot,
+                        SnapshotQueryInputs {
+                            registry: &registry,
+                            identity: &identity,
+                            order: BackendOrder::Direct,
+                            recency: &recency,
+                            page_recency: &page_recency,
+                            today: crate::date::JournalDate::today(),
+                        },
+                    )?;
+                    Ok(publish
+                        .borrow_mut()
+                        .take()
+                        .expect("publication callback runs once")(
+                        &reader
+                    ))
+                },
+            )
+        })
+        .map_err(io::Error::other)?
     }
 
     /// **SPEC §7.1 `query_run`'s Direct Files execution** (RET1).
@@ -24264,7 +24272,7 @@ fn parse_external_document(
     }
 }
 
-fn parse_exact_page(
+pub(crate) fn parse_exact_page(
     graph: &Graph,
     entry: &PageEntry,
     content: &str,

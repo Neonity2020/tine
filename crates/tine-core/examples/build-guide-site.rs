@@ -52,6 +52,11 @@ fn main() {
 
     let mut graph = Graph::open(&tmp);
     graph.config.all_pages_public = true;
+    let projection_dir = tempfile::tempdir().expect("create derived-state directory");
+    graph
+        .attach_direct_projection(projection_dir.path().join("direct.sqlite"))
+        .expect("open main projection");
+    graph.warm_cache();
     let (publish_dir, count) = publish_graph(&graph).expect("publish demo graph");
     let publish_dir = PathBuf::from(publish_dir);
 

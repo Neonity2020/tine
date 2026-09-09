@@ -35450,6 +35450,70 @@ fn managed_registry_provider_acceptance_updates_metadata_and_typed_query() {
 }
 
 #[test]
+fn managed_static_publication_pairs_ordinary_drain_with_current_main_queries() {
+    let fixture = ActivationFixture::empty("managed-static-main", 0x4a47);
+    fs::create_dir_all(fixture.graph_root.join("notes")).unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/Dashboard.md"),
+        "public:: true\n- {{query (task TODO)}}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.graph_root.join("notes/Tasks.md"),
+        "public:: true\n- TODO original publication task\n",
+    )
+    .unwrap();
+    let handle = r4a_reopen(&fixture);
+    let path = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.name == "Tasks")
+        .unwrap()
+        .rel_path;
+    let (mut page, revision) = load_application_exact(&handle, &path);
+    page.blocks.push(application_move_test_root(
+        "TODO fresh publication witness",
+        0,
+    ));
+    let saved = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page,
+        })
+        .unwrap();
+    assert!(matches!(
+        saved,
+        SyncApplicationPageSaveOutcome::Saved { .. }
+    ));
+    assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+    let published = handle.publish_application_html().unwrap();
+    let SyncApplicationPublishOutcome::Published { path, pages } = published else {
+        panic!("publication did not complete: {published:?}");
+    };
+    assert_eq!(pages, 2);
+    assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+    let dashboard = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "html"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .find(|html| html.contains("<title>Dashboard"))
+        .expect("public dashboard output");
+    assert!(
+        dashboard.contains("fresh publication witness"),
+        "{dashboard}"
+    );
+    assert!(dashboard.contains("original publication task"));
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
+}
+
+#[test]
 fn managed_live_reads_hold_main_while_editor_state_is_pending_then_follow_drain() {
     let fixture = ret2_advanced_fixture("managed-main-only-pending", 0x4a46);
     let handle = r4a_reopen(&fixture);

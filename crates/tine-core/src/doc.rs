@@ -369,7 +369,14 @@ pub(crate) const CRUMB_MAX_CHARS: usize = 60;
 /// `DocBlock`. Three copies of a truncation rule is three places for the rule
 /// to drift.
 pub(crate) fn crumb_line(block: &DocBlock) -> String {
-    let line = block.visible_text().lines().next().unwrap_or("").trim();
+    crumb_line_text(block.visible_text())
+}
+
+/// The breadcrumb transform over an already projected exact visible string.
+/// Database-backed readers use this rather than synthesizing a `DocBlock` or
+/// reparsing source solely to apply the shared first-line/elision rule.
+pub(crate) fn crumb_line_text(visible: &str) -> String {
+    let line = visible.lines().next().unwrap_or("").trim();
     if line.chars().count() > CRUMB_MAX_CHARS {
         format!(
             "{}…",
