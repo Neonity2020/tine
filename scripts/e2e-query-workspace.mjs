@@ -121,11 +121,45 @@ async function presentationButton(browser, label) {
   throw new Error(`missing ${label} presentation button`);
 }
 
-async function inlineQueryViewButton(browser, label) {
+/** Put an inline query on a named presentation, through whichever control that
+ *  host actually offers.
+ *
+ *  A query with a builder states its view in the Display panel; only the hosts
+ *  with no builder — an authored advanced query, a friendly search, a block
+ *  whose reading has not landed — keep the header switcher
+ *  (`Macro.tsx`: `props.blockId && !inlineDisplay()`). Two controls writing one
+ *  fact is how they came apart, so there is exactly one at a time, and a
+ *  journey that knows only the older one fails on a UI that is working
+ *  correctly. `QueryMacro.test.tsx::clickView` makes the same choice.
+ *
+ *  The panel is left CLOSED: it is portalled over the results this journey then
+ *  reads. */
+async function setInlineQueryView(browser, label) {
   for (const button of await browser.$$(".query-view-switcher button")) {
-    if ((await button.getText()).trim() === label) return button;
+    if ((await button.getText()).trim() === label) { await button.click(); return; }
   }
-  throw new Error(`missing inline-query ${label} view button`);
+  if (!(await browser.$(".qd-trigger").isExisting())) {
+    await browser.$(".qs-gear").waitForExist({ timeout: 15_000 });
+    await browser.$(".qs-gear").click();
+    await browser.$(".qs-sheet").waitForExist({ timeout: 10_000 });
+  }
+  const trigger = await browser.$(".qd-trigger");
+  await trigger.waitForExist({ timeout: 10_000 });
+  if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
+  await browser.$(".qd-panel").waitForExist({ timeout: 10_000 });
+  const buttons = await browser.$$(".qd-panel .qd-view");
+  const seen = [];
+  for (const button of buttons) {
+    const text = (await button.getText()).trim();
+    seen.push(text);
+    if (text === label) {
+      await button.click();
+      await browser.keys("Escape");
+      await browser.$(".qd-panel").waitForExist({ reverse: true, timeout: 5_000 });
+      return;
+    }
+  }
+  throw new Error(`neither control offers the inline-query ${label} view; the Display panel offers ${JSON.stringify(seen)}`);
 }
 
 async function assertInPageFind(browser, query, activeSelector, slowTyping = false) {
@@ -226,8 +260,7 @@ await withApp(0, async (browser) => {
     timeout: 10_000, timeoutMsg: "unlinked-reference content did not finish rendering",
   });
   await assertInPageFind(browser, "names Query parity near the start", ".unlinked-references .reference-blocks.inpage-find-active-block");
-  const inlineSearchButton = await inlineQueryViewButton(browser, "Search");
-  await inlineSearchButton.click();
+  await setInlineQueryView(browser, "Search");
   await browser.waitUntil(async () => (await browser.$$(".query-search-results .query-search-hit")).length === 9, {
     timeout: 10_000, timeoutMsg: "Search presentation dropped ordinary DSL query results",
   });
