@@ -26,8 +26,8 @@ use crate::query::ir::{Query, ViewSettings};
 use crate::query::rank::{JournalRankInput, PageRecencyPrograms};
 use crate::query::registry::Registry;
 use crate::query::results::{
-    read_page_results, read_results, BackendOrder, PageReadInputs, RecencyPage, ResultIdentity,
-    ResultReadError, ResultReadInputs,
+    read_page_results, BackendOrder, PageReadInputs, RecencyPage, ResultIdentity, ResultReadError,
+    ResultReadInputs,
 };
 use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
@@ -144,6 +144,7 @@ impl ManagedQueryAnswer {
 
 #[derive(Debug)]
 pub(crate) enum ManagedQueryOutcome {
+    StatisticsResourceLimit,
     Answered(ManagedQueryAnswer),
     Stale,
     Busy,
@@ -351,33 +352,35 @@ fn execute_main_source(
                 anchor: crate::query::ir::Anchor,
                 statement: &crate::query::sql::SqlQuery|
      -> Result<ManagedQueryAnswer, ResultReadError> {
-        if statement.matches_nothing {
-            return Ok(empty_answer(anchor));
-        }
+        let view = crate::query::view::statistics_execution_view(&capture.query, &capture.view);
         match anchor {
             crate::query::ir::Anchor::Page => Ok(ManagedQueryAnswer::Pages(read_page_results(
                 snapshot,
                 &PageReadInputs {
                     statement,
                     order: BackendOrder::Managed,
-                    view: &capture.view,
+                    view: &view,
                     max_rows: capture.max_rows,
                     max_bytes: capture.max_bytes,
                     recency: &page_recency,
                 },
             )?)),
-            crate::query::ir::Anchor::Block => Ok(ManagedQueryAnswer::Blocks(read_results(
-                snapshot,
-                &ResultReadInputs {
-                    statement,
-                    order: BackendOrder::Managed,
-                    identity: &ResultIdentity::Stored,
-                    max_rows: capture.max_rows,
-                    max_bytes: capture.max_bytes,
-                    profile: capture.profile,
-                    recency: &recency,
-                },
-            )?)),
+            crate::query::ir::Anchor::Block => Ok(ManagedQueryAnswer::Blocks(
+                crate::query::results::read_ordered_results(
+                    snapshot,
+                    &ResultReadInputs {
+                        statement,
+                        order: BackendOrder::Managed,
+                        identity: &ResultIdentity::Stored,
+                        max_rows: capture.max_rows,
+                        max_bytes: capture.max_bytes,
+                        profile: capture.profile,
+                        recency: &recency,
+                    },
+                    &view,
+                    &page_recency,
+                )?,
+            )),
         }
     };
     let answer = match &capture.request {
@@ -410,6 +413,9 @@ fn execute_main_source(
             ManagedQueryOutcome::Answered(answer)
         }
         Err(ResultReadError::Cancelled) => ManagedQueryOutcome::Cancelled,
+        Err(ResultReadError::StatisticsResourceLimit) => {
+            ManagedQueryOutcome::StatisticsResourceLimit
+        }
         Err(ResultReadError::Sql(_)) => ManagedQueryOutcome::Failed("managed projection statement"),
         Err(ResultReadError::Corrupt(_)) => {
             ManagedQueryOutcome::Failed("managed projection result rows")
@@ -422,15 +428,6 @@ fn anchored_for(query: &Query, request: &ManagedQueryRequest) -> Query {
         (ManagedQueryRequest::Pages, _)
         | (ManagedQueryRequest::Counts(_), crate::query::ir::Anchor::Page) => query.clone(),
         _ => crate::query::block_anchored_query(query),
-    }
-}
-
-fn empty_answer(anchor: crate::query::ir::Anchor) -> ManagedQueryAnswer {
-    match anchor {
-        crate::query::ir::Anchor::Page => {
-            ManagedQueryAnswer::Pages(crate::query::results::PageAnswer::default())
-        }
-        crate::query::ir::Anchor::Block => ManagedQueryAnswer::Blocks(PreViewGroups::default()),
     }
 }
 
@@ -535,6 +532,9 @@ impl ManagedQueryShared {
                 )
                 .map_err(|error| match error {
                     ResultReadError::Cancelled => ManagedQueryOutcome::Cancelled,
+                    ResultReadError::StatisticsResourceLimit => {
+                        ManagedQueryOutcome::StatisticsResourceLimit
+                    }
                     ResultReadError::Sql(_) => {
                         ManagedQueryOutcome::Failed("managed Friendly statement")
                     }
@@ -600,6 +600,9 @@ impl ManagedQueryShared {
                     )
                     .map_err(|error| match error {
                         ResultReadError::Cancelled => ManagedQueryOutcome::Cancelled,
+                        ResultReadError::StatisticsResourceLimit => {
+                            ManagedQueryOutcome::StatisticsResourceLimit
+                        }
                         ResultReadError::Sql(_) => {
                             ManagedQueryOutcome::Failed("managed export statement")
                         }

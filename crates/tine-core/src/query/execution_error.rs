@@ -29,6 +29,7 @@ pub enum QueryUnavailableReason {
     ReadFailed,
     InvalidSnapshot,
     UnsupportedRelation,
+    StatisticsResourceLimit,
 }
 
 impl QueryUnavailableReason {
@@ -38,11 +39,13 @@ impl QueryUnavailableReason {
             Self::ReadFailed => "read_failed",
             Self::InvalidSnapshot => "invalid_snapshot",
             Self::UnsupportedRelation => "unsupported_relation",
+            Self::StatisticsResourceLimit => "statistics_resource_limit",
         }
     }
 
     pub fn message(self) -> &'static str {
         match self {
+            Self::StatisticsResourceLimit => "Exact query statistics exceed the available memory limit. Narrow the query or remove grouping or aggregates.",
             Self::ProjectionUnavailable => "The query index is unavailable.",
             Self::ReadFailed => "The query index could not be read.",
             Self::InvalidSnapshot => "The query index returned inconsistent results.",
@@ -119,6 +122,7 @@ mod tests {
             QueryUnavailableReason::ReadFailed,
             QueryUnavailableReason::InvalidSnapshot,
             QueryUnavailableReason::UnsupportedRelation,
+            QueryUnavailableReason::StatisticsResourceLimit,
         ] {
             let wire: serde_json::Value = serde_json::from_str(
                 &QueryExecutionError::Unavailable(reason).backend_wire_string(),

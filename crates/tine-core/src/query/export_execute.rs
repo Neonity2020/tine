@@ -107,6 +107,7 @@ pub(crate) fn execute_subtrees_from_ir(
     let resolved = resolve_for_execution(query, context, inputs.today);
     let query = block_anchored_query(resolved.query());
     let mut result = QueryResult {
+        statistics: None,
         rows: QueryRows::Block { groups: Vec::new() },
         diagnostics: query.diagnostics.clone(),
         report: resolved.report().clone(),

@@ -11,6 +11,8 @@ import {
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
+import type { QueryResult, QueryStatistics, ViewSettings } from "../editor/queryIr";
+import { querySummary } from "../editor/queryAggregate";
 import { QUERY_MACRO_NAMES } from "../editor/queryMacroName";
 import {
   friendlySearchToDsl,
@@ -90,7 +92,7 @@ const SUPERSEDED_MESSAGE =
   "This workspace changed while it was being saved, so nothing was written. Try saving again.";
 
 export interface QueryWorkspaceDependencies extends MaterializeQueryDependencies {
-  runQuery(source: string): Promise<RefGroup[]>;
+  runQuery(source: string, view?: ViewSettings): Promise<RefGroup[] | QueryResult>;
   runAdvancedQuery(source: string): Promise<AdvancedQueryResult>;
 }
 
@@ -245,7 +247,10 @@ function defaultDependencies(): QueryWorkspaceDependencies {
     savePage: (page, baseRev, force) => api.savePage(page, baseRev, force),
     runGraphSearch: (source, pageLimit, blockLimit, lane, explain) =>
       api.runGraphSearch(source, pageLimit, blockLimit, lane, explain),
-    runQuery: (source) => api.runQuery(source),
+    runQuery: async (source, view) => {
+      const parsed = await api.parseQuery(source, "og");
+      return api.queryRun(parsed.query, { ...parsed.view, ...view });
+    },
     runAdvancedQuery: (source) => api.runAdvancedQuery(source),
   };
 }
@@ -750,8 +755,9 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
       source: source().trim(),
       sourceKind: sourceKind(),
       explain: explain(),
+      presentation: presentation(),
     }),
-    async (request): Promise<QueryExecution> => {
+    async (request): Promise<QueryExecution & { statistics?: QueryStatistics }> => {
       if (!request.source) {
         return { hits: [], diagnostics: [], explanation: { branches: [] }, cancelled: false };
       }
@@ -768,11 +774,24 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         const result = await deps().runAdvancedQuery(request.source);
         return groupsToExecution(result.groups, request.explain, diagnosticsFromAdvanced(result));
       }
-      return groupsToExecution(await deps().runQuery(request.source), request.explain);
+      const result = await deps().runQuery(request.source, { view: request.presentation });
+      if (Array.isArray(result)) return groupsToExecution(result, request.explain);
+      const execution = result.anchor === "block"
+        ? groupsToExecution(result.groups, request.explain)
+        : {
+          hits: result.pages.map((page): QueryHit => ({ entity: "page", page: {
+            name: page.name, kind: page.kind, path: page.path, date_key: page.journal_day ?? null,
+          }, display_text: page.name, evidence: [], score: 0 })),
+          diagnostics: [], explanation: { branches: [] }, cancelled: false,
+        };
+      return { ...execution, statistics: result.statistics };
     }
   );
 
-  const execution = () => executionResource.error ? undefined : executionResource();
+  const execution = createMemo<(QueryExecution & { statistics?: QueryStatistics }) | undefined>(
+    (previous) => executionResource.error ? previous : executionResource(),
+  );
+  const statisticsSummary = createMemo(() => querySummary({ statistics: execution()?.statistics }));
   const hits = () => execution()?.hits ?? [];
   const boardGroups = createMemo(() => {
     const grouped = new Map<string, QueryHit[]>();
@@ -995,6 +1014,22 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
           {hits().length} result{hits().length === 1 ? "" : "s"}
         </Show>
       </section>
+
+      <Show when={statisticsSummary()}>{(summary) => (
+        <section class="query-workspace-summary" aria-label="Query statistics">
+          <For each={summary().columns}>{(column, at) => (
+            <span>{column.label}: {summary().overall[at()]?.text} </span>
+          )}</For>
+          <Show when={summary().groups}>{(groups) => (
+            <table aria-label="Grouped query statistics">
+              <thead><tr><th>{summary().groupLabel}</th><For each={summary().columns}>{(column) => <th>{column.label}</th>}</For></tr></thead>
+              <tbody><For each={groups()}>{(group) => <tr><th>{group.label}</th><For each={group.cells}>{(cell) => <td>{cell.text}</td>}</For></tr>}</For></tbody>
+            </table>
+          )}</Show>
+          <Show when={summary().multiMembership}><p>A row with multiple tags contributes to each tag group.</p></Show>
+          <Show when={summary().notice}><p>{summary().notice}</p></Show>
+        </section>
+      )}</Show>
 
       <Show when={(execution()?.diagnostics.length ?? 0) > 0}>
         <ul class="query-workspace-diagnostics" aria-label="Query diagnostics">

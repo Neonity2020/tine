@@ -342,6 +342,8 @@ export function viewAfterViewSwitch(
  *  filter save runs. Without it a query table wrote the sheet's properties and
  *  a query save wrote the query's, and the two disagreed about the same note. */
 export interface QueryDisplayControl {
+  statistics?: import("./queryIr").QueryStatistics;
+  statisticsView?: ViewSettings;
   /** The view the block currently resolves to — the engine's merged answer. */
   view: ViewSettings;
   /** Route a display change through the query's one save path. */

@@ -1,15 +1,4 @@
-// The one summary a {{query}} result renders, for every inline view.
-//
-// `(aggregate …)` / `(group-by …)` ride in the DSL and are parse-but-ignored by
-// the Rust engine, which returns the full block set; the math is computed here
-// in the frontend from the returned rows. Kept DOM-free and unit-testable.
-//
-// This file used to expose `foldAggregate` + `groupRows`, a single-aggregate
-// fold over a `{page, props}` shadow row. Both are gone: a view carries an
-// ORDERED LIST of aggregates, and folding only `aggregates[0]` silently dropped
-// every other column its author asked for, while the shadow row's own property
-// lookup could disagree with the board rendered directly beneath it. One
-// summary over the caller's real rows replaces both.
+// Query summaries format backend statistics from the same snapshot as the rows.
 
 /** The three functions a QUERY aggregate can name (contract §4). The sheet's
  *  own seventeen-name footer vocabulary is a different, wider set, and is
@@ -37,6 +26,7 @@ export interface QuerySummaryGroup {
 }
 
 export interface QuerySummary {
+  notice?: string | null;
   /** One column per REQUESTED aggregate, in the requested order — repeats and a
    *  bare whole-result count included, because the view carries a LIST. */
   columns: { label: string; entry: QueryAggregateEntry }[];
@@ -56,75 +46,33 @@ export function queryAggregateLabel([field, fn]: QueryAggregateEntry): string {
   return field ? `${verb} of ${field}` : verb;
 }
 
-/** **The one summary a query result renders.**
- *
- *  Grouping and value reading are the CALLER's, deliberately. The rows are the
- *  same result DTOs the Board renders, and their group keys come from the one
- *  shared reader (`sheet/fields.ts::groupKeysForBlock`) rather than a second
- *  property lookup that could disagree with the face beside it.
- *
- *  The numbers are unchanged: count, numeric sum, numeric average parsed with
- *  `parseFloat` (so "3 hrs" contributes 3), rounded to three decimals, with
- *  non-contributing rows counted as `skipped`. Nothing new is invented here.
- *
- *  Returns `null` when there is nothing to summarize. */
-export function querySummary<R>(input: {
-  rows: readonly R[];
-  aggregates: readonly QueryAggregateEntry[];
-  /** `null` means "not grouped". Otherwise the groups this row belongs to; an
-   *  empty list reads as the single `null` group, as the Board does. */
-  groupKeys: ((row: R) => readonly (string | null)[]) | null;
+/** Format the snapshot's complete statistics. Rows and live editor facets never
+ * participate in this adapter. An absent answer is not a numeric zero. */
+export function querySummary(input: {
+  statistics?: import("./queryIr").QueryStatistics | null;
   groupLabel?: string | null;
-  multiMembership?: boolean;
-  /** The row's value for an aggregate's field, as text. */
-  value: (row: R, field: string) => string | null | undefined;
 }): QuerySummary | null {
-  const aggregates = [...input.aggregates];
-  const keysOf = input.groupKeys;
-  if (!aggregates.length && !keysOf) return null;
-  const fold = (set: readonly R[], [field, fn]: QueryAggregateEntry): QuerySummaryCell => {
-    if (fn === "count") return { text: `${set.length}`, skipped: 0 };
-    let sum = 0;
-    let n = 0;
-    let skipped = 0;
-    for (const row of set) {
-      const parsed = parseFloat((input.value(row, field) ?? "").trim());
-      if (Number.isFinite(parsed)) {
-        sum += parsed;
-        n++;
-      } else skipped++;
-    }
-    const val = fn === "sum" ? sum : n ? sum / n : 0;
-    // Round to 3 decimals to avoid float noise; integers print without a dot.
-    return { text: `${Math.round(val * 1000) / 1000}`, skipped };
+  const statistics = input.statistics;
+  if (!statistics) return null;
+  const format = (cell: import("./queryIr").QueryStatisticsCell): QuerySummaryCell => {
+    if (cell.kind === "marker") return {
+      text: `Unavailable (${cell.reason.replaceAll("_", " ")})`, skipped: cell.skipped,
+    };
+    // Avoid overflowing a finite large number while rounding for display.
+    const scaled = cell.value * 1000;
+    const value = Number.isFinite(scaled) ? Math.round(scaled) / 1000 : cell.value;
+    return { text: `${value}`, skipped: cell.skipped };
   };
-  const columns = aggregates.map((entry) => ({ label: queryAggregateLabel(entry), entry }));
-  const overall = aggregates.map((entry) => fold(input.rows, entry));
-  if (!keysOf) {
-    return { columns, overall, groups: null, groupLabel: null, multiMembership: false };
-  }
-  // First-seen key first, which is the order the Board's own columns appear in.
-  const buckets = new Map<string, { key: string | null; rows: R[] }>();
-  for (const row of input.rows) {
-    const keys = keysOf(row);
-    for (const key of keys.length ? keys : [null]) {
-      // Prefixed so a group literally named like the none-marker cannot collide.
-      const id = key === null ? "!none" : `k${key}`;
-      const bucket = buckets.get(id);
-      if (bucket) bucket.rows.push(row);
-      else buckets.set(id, { key, rows: [row] });
-    }
-  }
   return {
-    columns,
-    overall,
-    groups: [...buckets.values()].map((bucket) => ({
-      key: bucket.key,
-      label: bucket.key ?? "(none)",
-      count: bucket.rows.length,
-      cells: aggregates.map((entry) => fold(bucket.rows, entry)),
-    })),
-    groupLabel: input.groupLabel ?? null,
-    multiMembership: input.multiMembership ?? false,
+    columns: statistics.aggregates.map((entry) => ({ label: queryAggregateLabel(entry), entry })),
+    overall: statistics.overall.map(format),
+    groups: statistics.groups?.map((group) => ({
+      key: group.key, label: group.key ?? "(none)", count: group.count, cells: group.cells.map(format),
+    })) ?? null,
+    groupLabel: input.groupLabel ?? statistics.group_by,
+    multiMembership: statistics.group_by === "tags",
+    notice: statistics.grouping_status === "unsupported_formula"
+      ? "Exact statistics by formula are not supported yet. Overall statistics are shown."
+      : null,
   };
 }

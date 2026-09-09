@@ -577,6 +577,14 @@ pub(crate) fn descriptor_statement(
     statement: &SqlQuery,
     order: crate::query::results::BackendOrder,
 ) -> Result<SqlQuery, MaterializationError> {
+    Ok(descriptor_view_statement(statement, order, None)?.query)
+}
+
+pub(crate) fn descriptor_view_statement(
+    statement: &SqlQuery,
+    order: crate::query::results::BackendOrder,
+    ordered: Option<(&crate::query::ir::ViewSettings, &PageRecencyPrograms)>,
+) -> Result<RankedPageStatement, MaterializationError> {
     let block_anchor = format!("{BLOCK_ANCHOR_SELECT} {BLOCK_ANCHOR_FROM}");
     let match_set = format!("{MATCH_SET_SELECT} {MATCH_SET_FROM}");
     let (answer, answered, ids) = if let Some(at) = find_once(&statement.sql, &block_anchor)? {
@@ -602,28 +610,172 @@ pub(crate) fn descriptor_statement(
         crate::query::results::BackendOrder::Direct => "o.position",
         crate::query::results::BackendOrder::Managed => "p.path",
     };
-    Ok(SqlQuery {
-        sql: format!(
-            "{with} r(block_id, page_id) AS ({body}) \
+    let mut params = statement.params.clone();
+    let mut ranks = QueryRankPrograms::default();
+    let mut terms = Vec::new();
+    let mut extra = String::new();
+    let mut recency_expression = None;
+    if let Some((view, recency)) = ordered {
+        let mut lower = None;
+        for (field, direction) in &view.sort {
+            let expression = match field.as_str().to_ascii_lowercase().as_str() {
+                "page" => {
+                    let lower = bound_lowercase(&mut lower, &mut ranks, &mut params);
+                    format!("tine_query_rank({lower}, p.name)")
+                }
+                "priority" => {
+                    "COALESCE((SELECT priority FROM block_planning WHERE block_id=r.block_id), 'Z')"
+                        .into()
+                }
+                "scheduled" | "deadline" => {
+                    let column = field.as_str().to_ascii_lowercase();
+                    format!("COALESCE((SELECT {column} FROM block_planning WHERE block_id=r.block_id), '~')")
+                }
+                "modified" | "updated" | "updated-at" | "date" => {
+                    recency_expression.get_or_insert_with(|| {
+                        recency_order_expression("p", recency, &mut ranks, &mut params)
+                    });
+                    "p.qe_recency".into()
+                }
+                _ => {
+                    let lower = bound_lowercase(&mut lower, &mut ranks, &mut params);
+                    let key = bind_page_param(
+                        &mut params,
+                        PhysicalQueryValue::Text(property_key_norm(field.as_str())),
+                    );
+                    format!("tine_query_rank({lower}, COALESCE((SELECT value FROM properties WHERE owner_type=1 AND owner_id=r.block_id AND page_id=r.page_id AND normalized_name={key} ORDER BY ordinal, name LIMIT 1), (SELECT CASE WHEN instr(query_visible, char(10))=0 THEN query_visible ELSE substr(query_visible, 1, instr(query_visible, char(10))-1) END FROM block_text WHERE block_id=r.block_id)))")
+                }
+            };
+            terms.push(directed_order(expression, *direction));
+        }
+        terms.extend([
+            "p.name COLLATE BINARY ASC".into(),
+            "CASE p.text_kind WHEN 1 THEN 0 ELSE 1 END ASC".into(),
+        ]);
+        extra = format!(
+            ", COUNT(*) OVER (){}",
+            statistics_columns(view, false, &mut params)
+        );
+    }
+    terms.push(format!("{base} ASC"));
+    terms.push("q.preorder ASC".into());
+    let page_cte = recency_expression.map(|expression| format!(", qe_order_pages AS MATERIALIZED (SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path, {expression} AS qe_recency FROM pages p WHERE p.page_id IN (SELECT page_id FROM r))"));
+    let page_source = if page_cte.is_some() {
+        "qe_order_pages"
+    } else {
+        "pages"
+    };
+    let page_cte = page_cte.unwrap_or_default();
+    Ok(RankedPageStatement {
+        query: SqlQuery {
+            sql: format!(
+                "{with} r(block_id, page_id) AS ({body}){page_cte} \
              SELECT r.block_id, r.page_id, p.name, p.text_kind, p.journal_day, p.path, \
              q.page_id, q.preorder, q.result_id, q.estimated_bytes, q.tag_count, \
-             q.property_count, b.order_key, o.position \
+             q.property_count, b.order_key, o.position{extra} \
              FROM r \
              LEFT JOIN query_block_results q ON q.block_id = r.block_id \
              LEFT JOIN blocks b ON b.block_id = r.block_id \
-             LEFT JOIN pages p ON p.page_id = r.page_id \
+             LEFT JOIN {page_source} p ON p.page_id = r.page_id \
              LEFT JOIN query_page_order o ON o.page_id = r.page_id \
-             ORDER BY {base}, q.preorder"
-        ),
-        params: statement.params.clone(),
-        // The wrapper adds ordering and metadata to an already-classified
-        // statement; it neither creates nor removes a bound, and it lowers no
-        // content leaf of its own.
-        positively_bounded: statement.positively_bounded,
-        matches_nothing: statement.matches_nothing,
-        content_plans: statement.content_plans.clone(),
-        regexes: statement.regexes.clone(),
+             ORDER BY {}",
+                terms.join(", ")
+            ),
+            params,
+            // The wrapper adds ordering and metadata to an already-classified
+            // statement; it neither creates nor removes a bound, and it lowers no
+            // content leaf of its own.
+            positively_bounded: statement.positively_bounded,
+            matches_nothing: statement.matches_nothing,
+            content_plans: statement.content_plans.clone(),
+            regexes: statement.regexes.clone(),
+        },
+        ranks,
     })
+}
+
+fn directed_order(expression: String, direction: crate::query::ir::SortDir) -> String {
+    format!(
+        "{expression} {}",
+        match direction {
+            crate::query::ir::SortDir::Asc => "ASC",
+            crate::query::ir::SortDir::Desc => "DESC",
+        }
+    )
+}
+
+fn bound_lowercase(
+    bound: &mut Option<String>,
+    ranks: &mut QueryRankPrograms,
+    params: &mut Vec<PhysicalQueryValue>,
+) -> String {
+    bound
+        .get_or_insert_with(|| {
+            let id = ranks.bind_unicode_lowercase();
+            bind_page_param(params, PhysicalQueryValue::Integer(id as i64))
+        })
+        .clone()
+}
+
+fn recency_order_expression(
+    alias: &str,
+    recency: &PageRecencyPrograms,
+    ranks: &mut QueryRankPrograms,
+    params: &mut Vec<PhysicalQueryValue>,
+) -> String {
+    let bound = recency.bind(ranks);
+    let journal = bind_page_param(params, PhysicalQueryValue::Integer(bound.journal_id as i64));
+    let file = bind_page_param(params, PhysicalQueryValue::Integer(bound.file_id as i64));
+    match bound.journal_input {
+        JournalRankInput::StoredDay => format!("CASE WHEN {alias}.text_kind = 1 AND {alias}.journal_day IS NOT NULL THEN tine_query_rank({journal}, CAST({alias}.journal_day AS TEXT)) ELSE tine_query_rank({file}, {alias}.path) END"),
+        JournalRankInput::DisplayName => format!("CASE WHEN {alias}.text_kind = 1 THEN tine_query_rank({journal}, {alias}.name) ELSE tine_query_rank({file}, {alias}.path) END"),
+    }
+}
+
+/// Narrow authored values, never atom expansion or DTO payload. Each scalar
+/// subquery is owner-local; tags are one ordered membership vector per row.
+fn statistics_columns(
+    view: &crate::query::ir::ViewSettings,
+    page: bool,
+    params: &mut Vec<PhysicalQueryValue>,
+) -> String {
+    use crate::query::ir::AggFn;
+    let view = crate::query::view::effective_statistics_view(view);
+    if view.aggregates.is_empty() {
+        return String::new();
+    }
+    let owner = if page { 0 } else { 1 };
+    let id = if page { "r.page_id" } else { "r.block_id" };
+    let property = |key: &str, params: &mut Vec<PhysicalQueryValue>| {
+        let key = bind_page_param(params, PhysicalQueryValue::Text(key.into()));
+        format!("(SELECT value FROM properties WHERE owner_type={owner} AND owner_id={id} AND page_id=r.page_id AND name={key} ORDER BY ordinal LIMIT 1)")
+    };
+    let mut columns: Vec<String> = view
+        .aggregates
+        .iter()
+        .map(|(field, op)| {
+            if *op == AggFn::Count {
+                "NULL".into()
+            } else {
+                property(field.as_str(), params)
+            }
+        })
+        .collect();
+    let group = view.group_by.as_ref().map(|field| field.as_str());
+    let keys = match group {
+        None => "json_array()".into(),
+        Some(field) if field.starts_with("formula:") => "json_array()".into(),
+        Some("tags") => format!("COALESCE((SELECT json_group_array(tag) FROM (SELECT tag FROM tags WHERE owner_type={owner} AND owner_id={id} AND page_id=r.page_id ORDER BY ordinal)), json_array())"),
+        Some("page" | "name") => format!("json_array({}.name)", if page { "r" } else { "p" }),
+        Some("path") if page => "json_array(r.path)".into(),
+        Some("kind") if page => "json_array(CASE r.text_kind WHEN 1 THEN 'journal' ELSE 'page' END)".into(),
+        Some("day" | "journal-day" | "journal_day") if page => "json_array(CAST(r.journal_day AS TEXT))".into(),
+        Some("state") if !page => "json_array((SELECT marker FROM tasks WHERE block_id=r.block_id))".into(),
+        Some(field @ ("priority" | "scheduled" | "deadline")) if !page => format!("json_array((SELECT {field} FROM block_planning WHERE block_id=r.block_id))"),
+        Some(field) => format!("json_array({})", property(field.strip_prefix("prop:").unwrap_or(field), params)),
+    };
+    columns.push(keys);
+    format!(", {}", columns.join(", "))
 }
 
 /// The PAGE statement for one lowered `@page` query: the same selected pages,
@@ -675,7 +827,6 @@ pub(crate) fn page_statement(
     let mut lowercase = None;
     let mut property_keys = HashMap::<String, String>::new();
     let mut order_terms = Vec::new();
-    let mut bound_recency = None;
     for (field, direction) in &view.sort {
         let normalized = field.as_str().to_ascii_lowercase();
         let expression = match normalized.as_str() {
@@ -694,33 +845,7 @@ pub(crate) fn page_statement(
                 "COALESCE(r.journal_day, -9223372036854775808)".into()
             }
             "modified" | "updated" | "updated-at" | "date" => {
-                let bound = *bound_recency.get_or_insert_with(|| recency.bind(&mut ranks));
-                let journal_id = bind_page_param(
-                    &mut params,
-                    PhysicalQueryValue::Integer(bound.journal_id as i64),
-                );
-                let file_id = bind_page_param(
-                    &mut params,
-                    PhysicalQueryValue::Integer(bound.file_id as i64),
-                );
-                match bound.journal_input {
-                    // Direct Files' established producer takes `Option<day>`:
-                    // an undated journal follows the same file-mtime branch as
-                    // an ordinary page.
-                    JournalRankInput::StoredDay => format!(
-                        "CASE WHEN r.text_kind = {TEXT_KIND_JOURNAL} \
-                                   AND r.journal_day IS NOT NULL \
-                         THEN tine_query_rank({journal_id}, CAST(r.journal_day AS TEXT)) \
-                         ELSE tine_query_rank({file_id}, r.path) END"
-                    ),
-                    // Managed's established producer parses the display name
-                    // and deliberately ranks an unparseable journal at MIN.
-                    JournalRankInput::DisplayName => format!(
-                        "CASE WHEN r.text_kind = {TEXT_KIND_JOURNAL} \
-                         THEN tine_query_rank({journal_id}, r.name) \
-                         ELSE tine_query_rank({file_id}, r.path) END"
-                    ),
-                }
+                recency_order_expression("r", recency, &mut ranks, &mut params)
             }
             _ => {
                 let lowercase = lowercase.get_or_insert_with(|| {
@@ -764,12 +889,18 @@ pub(crate) fn page_statement(
             format!(" LIMIT {parameter}")
         })
         .unwrap_or_default();
+    let statistics = statistics_columns(view, true, &mut params);
+    let statistics = if statistics.is_empty() {
+        statistics
+    } else {
+        format!(", COUNT(*) OVER (PARTITION BY r.page_id){statistics}")
+    };
     Ok(RankedPageStatement {
         query: SqlQuery {
             sql: format!(
                 "{with} r(page_id, name, text_kind, journal_day, path) AS ({body}) \
                  SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, o.position, \
-                        q.estimated_bytes, q.property_count, COUNT(*) OVER () \
+                        q.estimated_bytes, q.property_count, COUNT(*) OVER (){statistics} \
                  FROM r \
                  LEFT JOIN query_page_order o ON o.page_id = r.page_id \
                  LEFT JOIN query_page_results q ON q.page_id = r.page_id \

@@ -11,7 +11,7 @@ import { LiveRefGroup } from "./LiveRefGroup";
 import { CrossingNotice } from "./CrossingNotice";
 import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
 import { SearchResultRow } from "./SearchResultRow";
-import { querySummary, type QueryAggregateEntry, type QuerySummary } from "../editor/queryAggregate";
+import { querySummary, type QuerySummary } from "../editor/queryAggregate";
 import { quoteEdnString, unquoteEdnString } from "../editor/edn";
 import { queryMacroExtents, QUERY_MACRO_NAMES } from "../editor/queryMacro";
 import {
@@ -45,13 +45,11 @@ import {
   boardGroupByOptions,
   fieldIdsForRecords,
   fieldLabel,
-  groupKeysForBlock,
   isFieldId,
   type FieldId,
   type QueryGroupingControl,
 } from "../sheet/fields";
 import {
-  readFormulaRowField,
   type FormulaEvalRow,
 } from "../sheet/formulaEval";
 import { formulasOf } from "../sheet/formulaFields";
@@ -820,6 +818,8 @@ export function QueryMacro(props: {
   // raw text by clicking it, with the ran/ignored note above saying what took.
   const currentPage = () => props.currentPage ?? (props.blockId ? doc.byId[props.blockId]?.page : undefined);
   interface QueryOperationResult {
+    statistics?: import("../editor/queryIr").QueryStatistics;
+    statisticsView?: ViewSettings;
     groups: RefGroup[];
     advInfo: { ran: string[]; ignored: string[]; supported: boolean } | null;
     // `@page`-anchored rows (K16) are pages rather than degenerate empty groups.
@@ -979,6 +979,8 @@ export function QueryMacro(props: {
           groups: [],
           advInfo: isAdvanced() ? reportInfo(result.report) : null,
           pageRows: result.pages,
+          statistics: result.statistics,
+          statisticsView: reading.view,
           matchedTotal: result.matched_total ?? result.total,
           searchExecution: null,
           diagnostics: result.diagnostics ?? [],
@@ -986,6 +988,8 @@ export function QueryMacro(props: {
       }
       return {
         groups: result.groups,
+        statistics: isAdvanced() ? undefined : result.statistics,
+        statisticsView: reading.view,
         advInfo: isAdvanced() ? reportInfo(result.report) : null,
         pageRows: null,
         matchedTotal: null,
@@ -1023,7 +1027,11 @@ export function QueryMacro(props: {
   // inherits deferred metadata from this hold.
   let pendingFocusedOperation: DisplayedQueryOperation | undefined;
   createEffect(() => {
-    const candidate = groupResource.error ? undefined : groupResource();
+    if (groupResource.error) {
+      pendingFocusedOperation = undefined;
+      return; // Keep the previous coherent rows/statistics pair with error status.
+    }
+    const candidate = groupResource();
     if (!candidate) {
       pendingFocusedOperation = undefined;
       setDisplayedOperation(undefined);
@@ -1228,14 +1236,6 @@ export function QueryMacro(props: {
     const resolved = grouping();
     return resolved.kind === "field" && isFieldId(resolved.field) ? resolved.field : null;
   });
-  // Aggregate keys name literal properties. Unlike grouping, this grammar has
-  // no FieldId prefix: a property named "prop:cost" must keep those exact bytes.
-  const aggregateValue = (row: FormulaEvalRow, name: string): string =>
-    name ? readFormulaRowField(row, `prop:${name}`)?.text ?? "" : "";
-  const aggregateEntries = createMemo<QueryAggregateEntry[]>(() => {
-    if (isAdvanced()) return [];
-    return (view().aggregates ?? []).map(([field, fn]): QueryAggregateEntry => [field ?? "", fn]);
-  });
   /** The grouping vocabulary a QUERY board offers: the sheet builtins, the
    *  properties its OWN result rows carry (a children board reads the owner's
    *  children, which a query has none of), the source page, and the block's
@@ -1252,6 +1252,8 @@ export function QueryMacro(props: {
    *  the query table's header sorts, its column order and its aggregate footer,
    *  and the board's grouping. */
   const queryDisplayControl = createMemo<QueryDisplayControl>(() => ({
+    statistics: displayedOperation()?.statistics,
+    statisticsView: displayedOperation()?.statisticsView,
     view: displayView(),
     apply: (next) => void applyDisplay(next),
     // The block's OWN bytes, not the engine's reading: what the query reader
@@ -1275,23 +1277,9 @@ export function QueryMacro(props: {
   }));
   const summary = createMemo<QuerySummary | null>(() => {
     if (isAdvanced()) return null;
-    const field = groupingField();
-    const entries = aggregateEntries();
-    // A grouping with no aggregate has always shown the per-group COUNT; that
-    // stays a caller's default rather than a rule hidden inside the summary.
-    const requested: QueryAggregateEntry[] =
-      entries.length || !field ? entries : [["", "count"]];
-    const formulas = queryFormulas();
-    const now = new Date();
-    return querySummary<FormulaEvalRow>({
-      rows: queryRecords(),
-      aggregates: requested,
-      groupKeys: field ? (row) => groupKeysForBlock(row, field, { formulas, now }) : null,
-      groupLabel: field ? fieldLabel(field) : null,
-      // Tags place one row in every tag's group, as the Board already does.
-      multiMembership: field === "tags",
-      value: aggregateValue,
-    });
+    const statistics = displayedOperation()?.statistics;
+    const field = statistics?.group_by;
+    return querySummary({ statistics, groupLabel: field && isFieldId(field) ? fieldLabel(field) : field });
   });
 
   const sorted = createMemo(() => {
@@ -1517,6 +1505,9 @@ export function QueryMacro(props: {
                         showing only its first entry dropped every other column
                         its author asked for. Rendered above the current presentation,
                         which stays grouped by page. */}
+                    <Show when={summary()?.notice}>
+                      <p class="query-summary-note">{summary()?.notice}</p>
+                    </Show>
                     <Show when={summary()}>
                       {(s) => (
                         <Show

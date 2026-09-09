@@ -45,6 +45,7 @@ pub(crate) mod rank;
 pub(crate) mod read_execute;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod results;
+pub(crate) mod statistics;
 // RET3's database-owned export subtree construction: located selection over the
 // shared result collector, and bounded subtree hydration over the SAME caller
 // owned snapshots. Like `sql` and `results` it is what the public Direct and
@@ -130,6 +131,8 @@ pub fn query_nesting_within_limit(source: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct BoundedGroups {
+    pub statistics: Option<ir::QueryStatistics>,
+    pub matched_total: Option<usize>,
     pub groups: Vec<RefGroup>,
     pub total: usize,
     pub exceeded: bool,
@@ -379,6 +382,8 @@ impl BoundedReferenceGroups {
         groups.retain(|entry| !entry.group.blocks.is_empty());
         groups.sort_by(|a, b| reference_group_display_order(a, b));
         BoundedGroups {
+            matched_total: None,
+            statistics: None,
             groups: groups.into_iter().map(|entry| entry.group).collect(),
             total: self.budget.total,
             exceeded: self.budget.exceeded,
@@ -759,6 +764,8 @@ fn collect_bounded_candidates(
         groups.into_iter().map(|(_, g)| g).collect()
     });
     BoundedGroups {
+        matched_total: None,
+        statistics: None,
         groups,
         total: budget.total,
         exceeded: budget.exceeded,
@@ -1587,6 +1594,8 @@ pub fn block_referrers_bounded(
     let u = uuid.trim();
     if u.is_empty() {
         return BoundedGroups {
+            matched_total: None,
+            statistics: None,
             groups: Vec::new(),
             total: 0,
             exceeded: false,
@@ -1737,6 +1746,14 @@ pub fn run_query_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
+    #[cfg(test)]
+    return run_query_bounded_over(
+        &BaseOrderedOracleSource(&GraphQueryPages(graph)),
+        query_src,
+        max_rows,
+        max_bytes,
+    );
+    #[cfg(not(test))]
     run_query_bounded_over(&GraphQueryPages(graph), query_src, max_rows, max_bytes)
 }
 
@@ -2481,6 +2498,7 @@ pub(crate) fn run_query_result_over(
         supported: true,
     };
     let mut result = ir::QueryResult {
+        statistics: None,
         rows: ir::QueryRows::Page { pages: Vec::new() },
         diagnostics: query.diagnostics.clone(),
         report,
@@ -2489,6 +2507,16 @@ pub(crate) fn run_query_result_over(
         exceeded: false,
     };
     if query.anchor == Anchor::Block {
+        #[cfg(test)]
+        let bounded = run_ordered_result_oracle(
+            source,
+            query,
+            view,
+            today,
+            bounds.max_rows,
+            bounds.max_bytes,
+        );
+        #[cfg(not(test))]
         let bounded = run_pred_bounded_over(
             source,
             query,
@@ -2501,6 +2529,8 @@ pub(crate) fn run_query_result_over(
             groups: bounded.groups,
         };
         result.total = bounded.total;
+        result.statistics = bounded.statistics;
+        result.matched_total = bounded.matched_total;
         result.exceeded = bounded.exceeded;
         return result;
     }
@@ -2693,6 +2723,9 @@ pub(crate) fn run_resolved_query_result_over(
 /// displayed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PreViewGroups {
+    pub(crate) ordered: bool,
+    pub(crate) statistics: Option<ir::QueryStatistics>,
+    pub(crate) matched_total: Option<usize>,
     pub(crate) groups: Vec<RefGroup>,
     pub(crate) recency_by_page: std::collections::HashMap<String, i64>,
     pub(crate) total: usize,
@@ -2746,10 +2779,110 @@ fn run_pred_bounded_over(
     apply_view(pre, view)
 }
 
+/// Test-only page-order adapter. Replays borrowed pages in semantic base order
+/// before constructing DTOs, so the independent oracle still counts only
+/// admitted DTO construction. Production ordering belongs entirely to SQL.
+#[cfg(test)]
+struct BaseOrderedOracleSource<'a>(&'a dyn QueryPageSource);
+
+#[cfg(test)]
+impl QueryPageSource for BaseOrderedOracleSource<'_> {
+    fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
+        let mut order = Vec::new();
+        self.0.for_each_page(&mut |page| {
+            order.push((page.name.to_owned(), page.kind, order.len()));
+            std::ops::ControlFlow::Continue(())
+        });
+        order.sort_by(|a, b| compare_result_pages(&a.0, a.1, &b.0, b.1));
+        for (_, _, wanted) in order {
+            let mut at = 0;
+            let mut stop = false;
+            self.0.for_each_page(&mut |page| {
+                let current = at;
+                at += 1;
+                if current != wanted {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                stop = visit(page).is_break();
+                std::ops::ControlFlow::Break(())
+            });
+            if stop {
+                break;
+            }
+        }
+    }
+    fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
+        self.0.with_hydration_pages(run);
+    }
+    fn parse_config(&self) -> crate::config::ParseConfig {
+        self.0.parse_config()
+    }
+    fn registry(&self) -> std::sync::Arc<registry::Registry> {
+        self.0.registry()
+    }
+    fn compare_mode(&self) -> atom::CompareMode {
+        self.0.compare_mode()
+    }
+    fn note_predicate_evaluation(&self) {
+        self.0.note_predicate_evaluation();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn run_ordered_result_oracle(
+    source: &dyn QueryPageSource,
+    query: &Query,
+    view: &ViewSettings,
+    today: JournalDate,
+    max_rows: usize,
+    max_bytes: usize,
+) -> BoundedGroups {
+    // Independent ordering/admission oracle; never a production candidate sort.
+    let pre = collect_pred_bounded_over(
+        source,
+        query,
+        today,
+        usize::MAX,
+        usize::MAX,
+        ConstructionProfile {
+            sample_admission_cap: None,
+            want_recency: QueryOpts::from_view(view).uses_recency(),
+        },
+    );
+    let matched_total = pre.total;
+    let ordered = apply_view(pre, view);
+    let mut budget = ConstructionBudget::new(max_rows, max_bytes);
+    let mut groups = Vec::new();
+    for mut group in ordered.groups {
+        group.blocks.retain(|block| {
+            budget.admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(block))
+        });
+        if !group.blocks.is_empty() {
+            groups.push(group);
+        }
+    }
+    BoundedGroups {
+        groups,
+        total: budget.total,
+        exceeded: budget.exceeded,
+        matched_total: (!query.is_invalid()).then_some(matched_total),
+        statistics: None,
+    }
+}
+
 /// §5.9: the view applied to an already-constructed pre-view
 /// result. Base order, then `sort-by`, then `sample` — `finish_query_groups`
 /// unchanged, reached from both the walk and the dispatched statement.
 pub(crate) fn apply_view(pre: PreViewGroups, view: &ViewSettings) -> BoundedGroups {
+    if pre.ordered {
+        return BoundedGroups {
+            groups: pre.groups,
+            total: pre.total,
+            exceeded: pre.exceeded,
+            statistics: pre.statistics,
+            matched_total: pre.matched_total,
+        };
+    }
     let opts = QueryOpts::from_view(view);
     let mut budget = ConstructionBudget::new(usize::MAX, usize::MAX);
     budget.total = pre.total;
@@ -2852,6 +2985,9 @@ pub(crate) fn collect_pred_bounded_over(
     });
 
     PreViewGroups {
+        matched_total: None,
+        ordered: false,
+        statistics: None,
         groups,
         recency_by_page,
         total: budget.total,
@@ -2911,6 +3047,8 @@ fn finish_query_groups(
     budget: ConstructionBudget,
 ) -> BoundedGroups {
     BoundedGroups {
+        matched_total: None,
+        statistics: None,
         groups: finish_result_view_groups(
             groups.into_iter().map(ResultViewGroup::from).collect(),
             &recency_by_page,
@@ -3798,6 +3936,15 @@ pub fn run_advanced_query_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> (AdvancedResult, bool, usize) {
+    #[cfg(test)]
+    return run_advanced_query_bounded_over(
+        &BaseOrderedOracleSource(&GraphQueryPages(graph)),
+        query_src,
+        current_page,
+        max_rows,
+        max_bytes,
+    );
+    #[cfg(not(test))]
     run_advanced_query_bounded_over(
         &GraphQueryPages(graph),
         query_src,
@@ -5723,6 +5870,8 @@ fn export_query_subtrees_over(
                 QUERY_EXPORT_CONSTRUCTION_BYTES,
             );
             BoundedGroups {
+                matched_total: None,
+                statistics: None,
                 groups: result.groups,
                 total,
                 exceeded,
@@ -7211,6 +7360,9 @@ mod tests {
         };
         let output = apply_view(
             PreViewGroups {
+                matched_total: None,
+                ordered: false,
+                statistics: None,
                 groups,
                 recency_by_page: HashMap::new(),
                 total: 3,

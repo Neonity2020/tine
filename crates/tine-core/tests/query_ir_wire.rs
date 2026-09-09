@@ -337,6 +337,7 @@ fn the_query_result_wire_format_is_tagged_by_anchor() {
     golden_encoding(
         "query_result_block",
         &QueryResult {
+            statistics: Some(statistics_wire_example()),
             rows: QueryRows::Block {
                 groups: vec![RefGroup {
                     page: "Home".to_string(),
@@ -363,6 +364,7 @@ fn the_query_result_wire_format_is_tagged_by_anchor() {
     golden_encoding(
         "query_result_page",
         &QueryResult {
+            statistics: Some(statistics_wire_example()),
             rows: QueryRows::Page {
                 pages: vec![
                     PageRow {
@@ -398,6 +400,73 @@ fn the_query_result_wire_format_is_tagged_by_anchor() {
             exceeded: true,
         },
     );
+}
+
+fn statistics_wire_example() -> tine_core::query::ir::QueryStatistics {
+    use tine_core::query::ir::{
+        QueryStatistics, QueryStatisticsCell as Cell, QueryStatisticsGroup,
+        QueryStatisticsGroupingStatus as Status, QueryStatisticsMarker as Marker,
+    };
+    let cells = vec![
+        Cell::Number {
+            value: 3.125,
+            skipped: 1,
+        },
+        Cell::Number {
+            value: 0.0,
+            skipped: 0,
+        },
+        Cell::Marker {
+            reason: Marker::NonFinite,
+            skipped: 0,
+        },
+        Cell::Marker {
+            reason: Marker::DivisionByZero,
+            skipped: 0,
+        },
+        Cell::Marker {
+            reason: Marker::EmptyGroup,
+            skipped: 0,
+        },
+        Cell::Marker {
+            reason: Marker::NonNumeric,
+            skipped: 2,
+        },
+    ];
+    QueryStatistics {
+        count: 2,
+        aggregates: vec![(Field::new("cost"), AggFn::Sum); 6],
+        group_by: Some(Field::new("prop:group")),
+        overall: cells.clone(),
+        groups: Some(vec![QueryStatisticsGroup {
+            key: None,
+            count: 2,
+            cells,
+        }]),
+        grouping_status: Status::Exact,
+    }
+}
+
+#[test]
+fn statistics_wire_rejects_non_finite_numbers_and_marker_values() {
+    use tine_core::query::ir::QueryStatisticsCell;
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(serde_json::to_string(&QueryStatisticsCell::Number { value, skipped: 0 }).is_err());
+    }
+    for value in [
+        serde_json::json!({"kind":"number","value":null,"skipped":0}),
+        serde_json::json!({"kind":"number","value":"3.125","skipped":0}),
+        serde_json::json!({"kind":"marker","reason":"non_finite","value":null,"skipped":0}),
+    ] {
+        assert!(serde_json::from_value::<QueryStatisticsCell>(value).is_err());
+    }
+    let absent = serde_json::json!({"anchor":"block","groups":[],"report":{"supported":true},"total":0,"exceeded":false});
+    let result: QueryResult = serde_json::from_value(absent).unwrap();
+    assert!(result.statistics.is_none());
+    assert!(serde_json::to_value(result)
+        .unwrap()
+        .get("statistics")
+        .is_none());
 }
 
 #[test]

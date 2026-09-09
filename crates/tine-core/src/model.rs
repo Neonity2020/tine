@@ -883,6 +883,8 @@ pub struct BacklinkFilterContext {
 /// without a deep clone while preserving the construction ceiling's outcome.
 #[derive(Debug, Clone)]
 pub struct BoundedRefGroups {
+    pub statistics: Option<crate::query::ir::QueryStatistics>,
+    pub matched_total: Option<usize>,
     pub groups: Arc<Vec<RefGroup>>,
     pub total: usize,
     pub exceeded: bool,
@@ -4050,13 +4052,14 @@ enum DirectAttempt<T> {
     /// the reason travels so a contradiction (`InvalidSnapshot`) and a refused
     /// statement (`ReadFailed`) stay distinguishable at the public boundary.
     FailedRead(crate::query::QueryUnavailableReason),
-    /// Nothing was attempted and no repair can change that: no projection is
+    /// Projection repair cannot answer this request: no projection is
     /// attached at all (`ProjectionUnavailable`), or the compiler could not
     /// lower this shape (`UnsupportedRelation`). The second is a
     /// FUTURE-relation arm and not a live route — `query::sql::lower_query` is
     /// total today — but it is the arm a non-total lowering must take, because
     /// the alternative shapes (a fabricated empty answer, or a switch back to
-    /// the evaluator) are both forbidden.
+    /// the evaluator) are both forbidden. Statistics resource exhaustion also
+    /// takes this arm: an oversized fold does not mean the index is broken.
     Unavailable(crate::query::QueryUnavailableReason),
     /// The projection cancelled the job — a rebuild drained it, or the graph
     /// closed. Nothing is wrong with the projection, so it is NEVER repaired
@@ -4082,6 +4085,9 @@ fn direct_attempt_from_read<T>(
         Ok(answer) => DirectAttempt::Answered(answer),
         Err(Error::Cancelled) => DirectAttempt::Cancelled,
         Err(Error::NotReady(_)) => DirectAttempt::NotReady,
+        Err(Error::Unavailable(
+            reason @ crate::query::QueryUnavailableReason::StatisticsResourceLimit,
+        )) => DirectAttempt::Unavailable(reason),
         Err(Error::Unavailable(reason)) => DirectAttempt::FailedRead(reason),
     }
 }
@@ -6400,10 +6406,11 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
         profile: crate::query::ConstructionProfile,
+        view: Option<&crate::query::ir::ViewSettings>,
     ) -> Result<crate::query::PreViewGroups, crate::query::QueryExecutionError> {
         self.dispatch_direct_query(|request| {
             self.direct_projection_statement_pre_view(
-                request, query, today, max_rows, max_bytes, profile,
+                request, query, today, max_rows, max_bytes, profile, view,
             )
         })
     }
@@ -6568,6 +6575,7 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
         profile: crate::query::ConstructionProfile,
+        view: Option<&crate::query::ir::ViewSettings>,
     ) -> DirectAttempt<crate::query::PreViewGroups> {
         use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
         if query.is_invalid() {
@@ -6648,7 +6656,7 @@ impl Graph {
         // (§3.5), or a leaf that can never hold — has an answer already. Reading
         // the projection to be told `0 rows` is the same answer at the price of
         // a round trip (I-15).
-        if statement.matches_nothing {
+        if statement.matches_nothing && view.is_none() {
             return DirectAttempt::Answered(crate::query::PreViewGroups::default());
         }
         // R3: the answer is constructed from ONE owned read snapshot of the
@@ -6678,11 +6686,37 @@ impl Graph {
             profile,
             recency: &recency,
         };
-        let mut pre = match crate::query::results::read_results(&mut job.snapshot, &inputs) {
+        let read = match view {
+            // The page-recency programs are the SQL ordering axis's, so they
+            // are built only on the branch that orders in SQL.
+            Some(view) => {
+                let root = self.root.clone();
+                let page_recency = crate::query::rank::PageRecencyPrograms::new(
+                    crate::query::rank::JournalRankInput::StoredDay,
+                    |day| {
+                        crate::query::page_recency_secs_for(
+                            day.parse().ok(),
+                            std::path::Path::new(""),
+                        )
+                    },
+                    move |path| crate::query::page_recency_secs_for(None, &root.join(path)),
+                );
+                crate::query::results::read_ordered_results(
+                    &mut job.snapshot,
+                    &inputs,
+                    view,
+                    &page_recency,
+                )
+            }
+            None => crate::query::results::read_results(&mut job.snapshot, &inputs),
+        };
+        let mut pre = match read {
             Ok(pre) => pre,
             Err(error) => return direct_attempt_from_read(Err(error.into())),
         };
-        crate::query::base_order_groups(&mut pre.groups);
+        if !pre.ordered {
+            crate::query::base_order_groups(&mut pre.groups);
+        }
         if job.snapshot.cancellation().is_cancelled() {
             return DirectAttempt::Cancelled;
         }
@@ -6833,7 +6867,10 @@ impl Graph {
         bounds: crate::query::ir::Bounds,
     ) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
         let query = resolved.query();
+        let execution_view = crate::query::view::statistics_execution_view(query, view);
+        let view = &execution_view;
         let mut result = crate::query::ir::QueryResult {
+            statistics: None,
             rows: crate::query::ir::QueryRows::Page { pages: Vec::new() },
             diagnostics: query.diagnostics.clone(),
             report: crate::query::ir::QueryReport {
@@ -6848,6 +6885,7 @@ impl Graph {
         if query.anchor == crate::query::ir::Anchor::Page {
             let answer = self.direct_page_rows(query, view, resolved.today(), bounds)?;
             result.total = answer.total;
+            result.statistics = answer.statistics;
             result.matched_total = Some(answer.matched_total);
             result.exceeded = answer.exceeded;
             result.rows = crate::query::ir::QueryRows::Page {
@@ -6866,6 +6904,8 @@ impl Graph {
             bounds.max_bytes,
         )?;
         result.total = bounded.total;
+        result.statistics = bounded.statistics;
+        result.matched_total = bounded.matched_total;
         result.exceeded = bounded.exceeded;
         result.rows = crate::query::ir::QueryRows::Block {
             groups: Arc::try_unwrap(bounded.groups)
@@ -7032,11 +7072,7 @@ impl Graph {
                     result_set_rule: RESULT_SET_RULE,
                 },
             );
-            // A filter that folded to false — an invalid query's zero results
-            // (§3.5), or a leaf that can never hold — has its answer already.
-            if statement.matches_nothing {
-                return Ok(crate::query::results::PageAnswer::default());
-            }
+            // Valid empty selections still fold requested empty statistics.
             let root = self.root.clone();
             let page_recency = crate::query::rank::PageRecencyPrograms::new(
                 crate::query::rank::JournalRankInput::StoredDay,
@@ -16792,6 +16828,8 @@ impl Graph {
         self.derived_memo_entry(key, || {
             let computed = compute();
             DerivedEntry::plain(BoundedRefGroups {
+                matched_total: None,
+                statistics: None,
                 groups: Arc::new(computed.groups),
                 total: computed.total,
                 exceeded: computed.exceeded,
@@ -16810,10 +16848,21 @@ impl Graph {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
+        let execution_view = crate::query::view::statistics_execution_view(query, view);
+        let view = &execution_view;
         let profile = crate::query::ConstructionProfile::from_view(view);
-        let pre = self.direct_simple_query_pre_view(query, today, max_rows, max_bytes, profile)?;
+        let pre = self.direct_simple_query_pre_view(
+            query,
+            today,
+            max_rows,
+            max_bytes,
+            profile,
+            Some(view),
+        )?;
         let bounded = crate::query::apply_view(pre, view);
         Ok(BoundedRefGroups {
+            statistics: bounded.statistics,
+            matched_total: bounded.matched_total,
             groups: Arc::new(bounded.groups),
             total: bounded.total,
             exceeded: bounded.exceeded,
@@ -16886,6 +16935,8 @@ impl Graph {
             let groups = compute();
             let total = groups.iter().map(|group| group.blocks.len()).sum();
             crate::query::BoundedGroups {
+                matched_total: None,
+                statistics: None,
                 groups,
                 total,
                 exceeded: false,
@@ -16943,7 +16994,8 @@ impl Graph {
             };
         let query = crate::query::block_anchored_query(&query);
         let profile = crate::query::ConstructionProfile::default();
-        let pre = self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile)?;
+        let pre =
+            self.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile, None)?;
         Ok((
             crate::query::AdvancedResult {
                 groups: pre.groups,
@@ -17021,6 +17073,8 @@ impl Graph {
             // A refused INPUT (§3.5) is a semantic answer, not an availability
             // failure: it is the same empty result at every readiness state.
             return Ok(BoundedRefGroups {
+                matched_total: None,
+                statistics: None,
                 groups: Arc::new(Vec::new()),
                 total: 0,
                 exceeded: false,

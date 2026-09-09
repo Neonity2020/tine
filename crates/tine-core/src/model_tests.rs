@@ -10191,6 +10191,7 @@ fn advanced_query_pre_view_rows(
             max_rows,
             max_bytes,
             crate::query::ConstructionProfile::default(),
+            None,
         )
     })
     .groups
@@ -10206,8 +10207,10 @@ fn simple_query_pre_view_rows_at(
     let (query, view) = crate::query::parse_query_source(query_src, today);
     let query = crate::query::block_anchored_query(&query);
     let profile = crate::query::ConstructionProfile::from_view(&view);
-    when_ready(|| graph.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile))
-        .groups
+    when_ready(|| {
+        graph.direct_simple_query_pre_view(&query, today, max_rows, max_bytes, profile, None)
+    })
+    .groups
 }
 
 #[test]

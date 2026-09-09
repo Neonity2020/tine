@@ -23,7 +23,7 @@ import { initParser } from "../render/parse";
 import { blockProperty, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import { setToasts, toasts } from "../ui";
 import type { BlockDto, RefGroup } from "../types";
-import type { ViewSettings } from "../editor/queryIr";
+import type { QueryStatistics, ViewSettings } from "../editor/queryIr";
 import type { QueryDisplayControl } from "../editor/queryViewProperties";
 import { queryColumnName, type FieldId, type QueryGroupingControl } from "../sheet/fields";
 
@@ -76,10 +76,16 @@ function load(raw: string): void {
 
 /** A host that records what the surface asked it to save, exactly as `Macro`
  *  would receive it. */
-function displayHarness(initial: ViewSettings) {
+function displayHarness(initial: ViewSettings, statistics?: QueryStatistics) {
   const [view, setView] = createSignal<ViewSettings>(initial);
   const applied: ViewSettings[] = [];
   const control: QueryDisplayControl = {
+    // The footer states the ANSWER's numbers (contract §6); it no longer folds
+    // the rendered rows. So a fixture that asserts a footer VALUE states the
+    // statistics the backend returned, beside the view it answered. A fixture
+    // that asserts only the menu, the writer or the cell's existence does not.
+    statistics,
+    statisticsView: statistics ? initial : undefined,
     get view() {
       return view();
     },
@@ -247,7 +253,11 @@ describe("the query table's aggregate footer", () => {
     // FAIL-BEFORE: the cell wrote through `setColumnAggregate`, whose vocabulary
     // has fourteen names the query reader does not understand and no `avg`.
     load("{{query (task TODO)}}\ntine.view:: table");
-    const h = displayHarness({ view: "table", aggregates: [["cost", "sum"]] });
+    const h = displayHarness({ view: "table", aggregates: [["cost", "sum"]] }, {
+      count: 2, aggregates: [["cost", "sum"]], group_by: null,
+      overall: [{ kind: "number", value: 14, skipped: 0 }],
+      groups: null, grouping_status: "none",
+    });
     const { root, dispose } = mount(() => (
       <>
         <SheetTable ownerId="query" rowSource="query" groups={resultGroups()} queryDisplay={h.control} />
@@ -309,7 +319,11 @@ describe("the query table's aggregate footer", () => {
     // saying `state=count`, about an ordinary property named `state`, rendered
     // no footer cell at all and could not be edited or removed from the table.
     load("{{query (task TODO)}}\ntine.view:: table");
-    const h = displayHarness({ view: "table", aggregates: [["state", "count"]] });
+    const h = displayHarness({ view: "table", aggregates: [["state", "count"]] }, {
+      count: 2, aggregates: [["state", "count"]], group_by: null,
+      overall: [{ kind: "number", value: 2, skipped: 0 }],
+      groups: null, grouping_status: "none",
+    });
     const groups: RefGroup[] = [{
       page: "Tracker",
       kind: "page",

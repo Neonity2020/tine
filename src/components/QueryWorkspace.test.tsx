@@ -3,6 +3,7 @@ import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import type { PaneRouter, QueryRoute } from "../router";
 import type { PageDto, QueryExecution } from "../types";
+import type { QueryResult } from "../editor/queryIr";
 import {
   clearTransientLayersForTest,
   dismissTopTransient,
@@ -418,6 +419,49 @@ function text(root: HTMLElement, selector: string): string {
 }
 
 describe("QueryWorkspace", () => {
+  it("q4_query_summary_and_footer_use_returned_statistics_rejects_stale_workspace_completion", async () => {
+    const route: QueryRoute = { kind: "query", id: "statistics-race", sourceKind: "dsl", source: "old", presentation: "list" };
+    const deps = workspaceDeps();
+    const answers = new Map<string, (result: QueryResult) => void>();
+    vi.mocked(deps.runQuery).mockImplementation((source) => new Promise((resolve) => answers.set(source, resolve)));
+    const result = (name: string, value: number): QueryResult => ({
+      anchor: "page", pages: [{ name, path: `pages/${name}.md`, kind: "page", properties: [] }],
+      diagnostics: [], report: { ran: [], ignored: [], supported: true }, total: 1, exceeded: false,
+      statistics: { count: 1, aggregates: [["cost", "sum"]], group_by: "formula:cost",
+        overall: [{ kind: "number", value, skipped: 0 }], groups: null, grouping_status: "unsupported_formula" },
+    });
+    const root = document.createElement("div"); document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await vi.waitFor(() => expect(answers.has("old")).toBe(true));
+      typeInto(root.querySelector<HTMLInputElement>(".query-workspace-source")!, "new");
+      await vi.waitFor(() => expect(answers.has("new")).toBe(true));
+      answers.get("new")!(result("Current page", 2468));
+      await vi.waitFor(() => expect(text(root, "section[aria-label='Query statistics']")).toContain("2468"));
+      answers.get("old")!(result("Obsolete page", 9999));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(root.textContent).not.toContain("9999");
+      expect(root.textContent).not.toContain("Obsolete page");
+      expect(root.textContent).toContain("Exact statistics by formula are not supported yet. Overall statistics are shown.");
+      expect(root.querySelector("[aria-label='Grouped query statistics']")).toBeNull();
+    } finally { dispose(); }
+  });
+
+  it("q4_statistics_resource_limit_is_visible_not_zero", async () => {
+    const route: QueryRoute = { kind: "query", id: "statistics-limit", sourceKind: "dsl", source: "(task TODO)", presentation: "list" };
+    const deps = workspaceDeps();
+    const message = "Exact query statistics exceed the available memory limit. Narrow the query or remove grouping or aggregates.";
+    vi.mocked(deps.runQuery).mockRejectedValue(new QueryUnavailableError("statistics_resource_limit", message));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={routerMock(route)} deps={deps} />, root);
+    try {
+      await vi.waitFor(() => expect(text(root, ".query-workspace-status")).toContain(message));
+      expect(root.querySelector(".query-workspace-empty, section[aria-label='Query statistics']")).toBeNull();
+      expect(deps.runQuery).toHaveBeenCalledTimes(1);
+    } finally { dispose(); }
+  });
+
   it("retries pending DSL queries automatically and surfaces permanent errors", async () => {
     const route: QueryRoute = { kind: "query", id: "readiness", sourceKind: "dsl", source: "(task TODO)", presentation: "list" };
     const deps = workspaceDeps();

@@ -434,7 +434,7 @@ export function SheetTable(props: {
   const queryAggregateFn = (field: FieldId): QueryAggFn | null => {
     const key = queryAggregateFieldName(field);
     if (key === null) return null;
-    return (props.queryDisplay?.view.aggregates ?? []).find(([k]) => k === key)?.[1] ?? null;
+    return (props.queryDisplay?.statisticsView?.aggregates ?? props.queryDisplay?.view.aggregates ?? []).find(([k]) => k === key)?.[1] ?? null;
   };
   const setQueryAggregate = (field: FieldId, fn: QueryAggFn | null) => {
     const control = props.queryDisplay;
@@ -456,13 +456,9 @@ export function SheetTable(props: {
   const queryAggregateText = (field: FieldId, fn: QueryAggFn): string => {
     const key = queryAggregateFieldName(field);
     if (key === null) return "";
-    const summary = querySummary<RowRecord>({
-      rows: sortedRows(),
-      aggregates: [[key, fn]],
-      groupKeys: null,
-      value: (row) => rowFieldValue(row, field)?.text ?? "",
-    });
-    return summary?.overall[0]?.text ?? "";
+    const statistics = props.queryDisplay?.statistics;
+    const at = statistics?.aggregates.findIndex(([field, op]) => field === key && op === fn) ?? -1;
+    return querySummary({ statistics })?.overall[at]?.text ?? "";
   };
   const hasAggregates = createMemo(() =>
     props.queryDisplay

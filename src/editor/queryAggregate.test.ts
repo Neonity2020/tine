@@ -1,5 +1,57 @@
 import { describe, it, expect } from "vitest";
-import { querySummary, queryAggregateLabel, type QueryAggregateEntry } from "./queryAggregate";
+import { querySummary as formatStatistics, queryAggregateLabel, type QueryAggregateEntry } from "./queryAggregate";
+import type { QueryStatisticsCell } from "./queryIr";
+import semantics from "../../crates/tine-core/tests/fixtures/query-statistics/semantics.json";
+
+it("formats the shared backend arithmetic fixtures without changing their values", () => {
+  for (const fixture of semantics) {
+    const summary = formatStatistics({ statistics: {
+      count: fixture.values.length, aggregates: [["", "count"], ["cost", "sum"], ["cost", "avg"]],
+      group_by: null, overall: fixture.cells as QueryStatisticsCell[], groups: null, grouping_status: "none",
+    } });
+    expect(summary!.overall.map((cell) => cell.text), fixture.name).toEqual(fixture.display);
+    const oracle = querySummary({ rows: fixture.values, aggregates: [["", "count"], ["cost", "sum"], ["cost", "avg"]],
+      groupKeys: null, value: (value) => value });
+    expect(oracle!.overall.map((cell) => cell.text), fixture.name).toEqual(fixture.display);
+  }
+});
+
+// Independent compatibility oracle. Production summaries accept only the
+// returned statistics; these authored fixtures retain the shipped JS arithmetic.
+function querySummary<R>(input: {
+  rows: readonly R[]; aggregates: readonly QueryAggregateEntry[];
+  groupKeys: ((row: R) => readonly (string | null)[]) | null;
+  groupLabel?: string | null; multiMembership?: boolean;
+  value: (row: R, field: string) => string | null | undefined;
+}) {
+  if (!input.aggregates.length && !input.groupKeys) return formatStatistics({});
+  const aggregates: QueryAggregateEntry[] = input.aggregates.length ? [...input.aggregates] : [["", "count"]];
+  const fold = (rows: readonly R[], [field, op]: QueryAggregateEntry): QueryStatisticsCell => {
+    if (op === "count") return { kind: "number", value: rows.length, skipped: 0 };
+    let sum = 0, contributors = 0;
+    for (const row of rows) {
+      const value = parseFloat((input.value(row, field) ?? "").trim());
+      if (Number.isFinite(value)) { sum += value; contributors++; }
+    }
+    const skipped = rows.length - contributors;
+    if (!rows.length) return { kind: "marker", reason: "empty_group", skipped };
+    if (!contributors) return { kind: "marker", reason: "non_numeric", skipped };
+    const value = op === "sum" ? sum : sum / contributors;
+    return Number.isFinite(value) ? { kind: "number", value, skipped } : { kind: "marker", reason: "non_finite", skipped };
+  };
+  const groups = new Map<string | null, R[]>();
+  if (input.groupKeys) for (const row of input.rows) {
+    const keys = input.groupKeys(row);
+    for (const key of keys.length ? keys : [null]) groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  return formatStatistics({ groupLabel: input.groupLabel, statistics: {
+    count: input.rows.length, aggregates: aggregates.map(([key, op]) => [key, op]),
+    group_by: input.groupKeys ? input.multiMembership ? "tags" : "prop:group" : null,
+    overall: aggregates.map((entry) => fold(input.rows, entry)),
+    groups: input.groupKeys ? [...groups].map(([key, rows]) => ({ key, count: rows.length, cells: aggregates.map((entry) => fold(rows, entry)) })) : null,
+    grouping_status: input.groupKeys ? "exact" : "none",
+  } });
+}
 
 interface Row {
   page: string;
@@ -47,9 +99,9 @@ describe("the aggregate arithmetic", () => {
     expect(summarize(rows, [["hours", "avg"]])!.overall).toEqual([{ text: "2.75", skipped: 2 }]);
   });
 
-  it("avg of an all-non-numeric set is 0 with everything skipped (no NaN)", () => {
+  it("avg of an all-non-numeric set is explicitly unavailable", () => {
     const r: Row[] = [{ page: "X", props: { hours: "x" } }];
-    expect(summarize(r, [["hours", "avg"]])!.overall).toEqual([{ text: "0", skipped: 1 }]);
+    expect(summarize(r, [["hours", "avg"]])!.overall).toEqual([{ text: "Unavailable (non numeric)", skipped: 1 }]);
   });
 
   it("parseFloat is lenient: a trailing unit still contributes its leading number", () => {
@@ -126,7 +178,7 @@ describe("every requested aggregate", () => {
     const s = summarize(rows, many, "status")!;
     expect(s.groups!.map((g) => g.cells.map((c) => c.text))).toEqual([
       ["2", "5.5", "2.75", "5.5"],
-      ["2", "0", "0", "0"],
+      ["2", "Unavailable (non numeric)", "Unavailable (non numeric)", "Unavailable (non numeric)"],
     ]);
   });
 
@@ -183,7 +235,7 @@ describe("nothing to summarize", () => {
 
   it("is still a breakdown when a grouping asks for no aggregate", () => {
     const s = summarize(rows, [], "status")!;
-    expect(s.columns).toEqual([]);
+    expect(s.columns).toEqual([{ label: "Count", entry: ["", "count"] }]);
     expect(s.groups!.map((g) => [g.key, g.count])).toEqual([
       ["open", 2],
       ["done", 2],

@@ -2127,9 +2127,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // Q2 Print composes the existing snapshot and subtree primitives rather than
     // opening anything: it adds no import, no direct call and no receiver, so all
     // 468 tuples and this digest stand unchanged, physical writes included.
+    // Q4 complete ordering/statistics adds three read-only bound-value tuples
+    // (468 -> 471), all in query/sql.rs: one PhysicalQueryValue::Integer and
+    // two PhysicalQueryValue::Text occurrences. Shared recency construction
+    // and requested raw-property/group keys account for the net additions.
+    // Full base/post multisets reconstruct both digests with no removals;
+    // snapshot openers and the physical-write token inventory above stand.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "7e4433e1162c496655e90f707de28a2abeae1110b5f45ed5acc871bd3e375421",
+        "cd2b662b6830e1821b78be8573ca8bbef8244ba91050be40f1650d5072624de1",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -2677,6 +2677,10 @@ pub enum SyncApplicationNavigationRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncApplicationBoundedRefGroups {
+    #[serde(skip)]
+    pub statistics: Option<crate::query::ir::QueryStatistics>,
+    #[serde(skip)]
+    pub matched_total: Option<usize>,
     pub groups: Vec<RefGroup>,
     pub total: usize,
     pub exceeded: bool,
@@ -3734,6 +3738,9 @@ fn managed_execution_error(
     use crate::managed_query::ManagedQueryOutcome;
     use crate::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
     match outcome {
+        ManagedQueryOutcome::StatisticsResourceLimit => {
+            query_unavailable(QueryUnavailableReason::StatisticsResourceLimit)
+        }
         ManagedQueryOutcome::Stale => SyncApplicationPageRequestError::QueryExecution(
             QueryExecutionError::NotReady(QueryReadinessReason::PendingEdits),
         ),
@@ -3794,13 +3801,22 @@ fn managed_ir_block_result(
     bounded: SyncApplicationBoundedRefGroups,
 ) -> crate::query::ir::QueryResult {
     crate::query::ir::QueryResult {
+        statistics: if report.supported && !selection.is_invalid() {
+            bounded.statistics
+        } else {
+            None
+        },
         rows: crate::query::ir::QueryRows::Block {
             groups: bounded.groups,
         },
         diagnostics: selection.diagnostics.clone(),
         report: report.clone(),
         total: bounded.total,
-        matched_total: None,
+        matched_total: if report.supported && !selection.is_invalid() {
+            bounded.matched_total
+        } else {
+            None
+        },
         exceeded: bounded.exceeded,
     }
 }
@@ -3869,6 +3885,8 @@ fn finish_managed_pre_view(
 ) -> SyncApplicationBoundedRefGroups {
     let bounded = crate::query::apply_view(pre, view);
     SyncApplicationBoundedRefGroups {
+        statistics: bounded.statistics,
+        matched_total: bounded.matched_total,
         groups: bounded.groups,
         total: bounded.total,
         exceeded: bounded.exceeded,
@@ -4947,7 +4965,9 @@ impl SyncRuntimeHandle {
                     let Some(mut pre) = answer.into_blocks() else {
                         return Err(managed_answer_shape_error(&shared.census));
                     };
-                    crate::query::base_order_groups(&mut pre.groups);
+                    if !pre.ordered {
+                        crate::query::base_order_groups(&mut pre.groups);
+                    }
                     return Ok(SyncApplicationNavigationOutcome::Loaded {
                         reply: SyncApplicationNavigationReply::SimpleQuery(
                             finish_managed_pre_view(pre, &capture.view),
@@ -5033,7 +5053,9 @@ impl SyncRuntimeHandle {
                             let Some(mut pre) = answer.into_blocks() else {
                                 return Err(managed_answer_shape_error(&shared.census));
                             };
-                            crate::query::base_order_groups(&mut pre.groups);
+                            if !pre.ordered {
+                                crate::query::base_order_groups(&mut pre.groups);
+                            }
                             SyncApplicationNavigationReply::QueryRun(managed_ir_block_result(
                                 &capture.query,
                                 &capture.report,
@@ -5046,6 +5068,7 @@ impl SyncRuntimeHandle {
                             };
                             SyncApplicationNavigationReply::QueryRun(
                                 crate::query::ir::QueryResult {
+                                    statistics: pages.statistics,
                                     rows: crate::query::ir::QueryRows::Page { pages: pages.pages },
                                     diagnostics: capture.query.diagnostics.clone(),
                                     report: capture.report.clone(),
@@ -13312,6 +13335,8 @@ fn bound_application_reference_sources(
         exceeded = true;
     }
     SyncApplicationBoundedRefGroups {
+        matched_total: None,
+        statistics: None,
         groups: bounded.groups,
         total,
         exceeded,
@@ -15416,6 +15441,8 @@ impl RuntimeActor {
         let target = uuid.trim();
         let Ok(target_uuid) = Uuid::parse_str(target) else {
             return Ok(SyncApplicationBoundedRefGroups {
+                matched_total: None,
+                statistics: None,
                 groups: Vec::new(),
                 total: 0,
                 exceeded: false,
@@ -15564,6 +15591,8 @@ impl RuntimeActor {
         }
         let bounded = accumulator.finish();
         Ok(SyncApplicationBoundedRefGroups {
+            matched_total: None,
+            statistics: None,
             groups: bounded.groups,
             total: bounded.total,
             exceeded: bounded.exceeded,
@@ -16461,6 +16490,8 @@ impl RuntimeActor {
         let (parsed, view) = crate::query::parse_query_source(query, today);
         if parsed.is_invalid() {
             return Ok(SimpleQueryTurn::Answered(SyncApplicationBoundedRefGroups {
+                matched_total: None,
+                statistics: None,
                 groups: Vec::new(),
                 total: 0,
                 exceeded: false,
@@ -16597,6 +16628,8 @@ impl RuntimeActor {
         let plan = crate::query::simple_query_candidate_plan(query);
         if matches!(plan, Plan::Empty) {
             return Ok(SyncApplicationBoundedRefGroups {
+                matched_total: None,
+                statistics: None,
                 groups: Vec::new(),
                 total: 0,
                 exceeded: false,
@@ -16684,20 +16717,25 @@ impl RuntimeActor {
             .collect::<Vec<_>>();
         // The independent evaluator returns a base-ordered PRE-VIEW answer;
         // `sort-by` and `sample` are applied per request below.
-        let mut pre = crate::query::collect_pred_bounded_over(
+        let bounded = crate::query::run_ordered_result_oracle(
             &crate::query::ApplicationQueryPages {
                 pages: &pages,
                 config: prepared.config,
                 registry: prepared.walk_registry,
             },
             &prepared.query,
+            &prepared.view,
             prepared.today,
             max_rows,
             max_bytes,
-            prepared.profile,
         );
-        crate::query::base_order_groups(&mut pre.groups);
-        Ok(finish_managed_pre_view(pre, &prepared.view))
+        Ok(SyncApplicationBoundedRefGroups {
+            groups: bounded.groups,
+            total: bounded.total,
+            exceeded: bounded.exceeded,
+            matched_total: bounded.matched_total,
+            statistics: bounded.statistics,
+        })
     }
 
     fn application_all_query_pages_ready(

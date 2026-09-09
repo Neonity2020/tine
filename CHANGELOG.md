@@ -287,6 +287,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Queries order all matches before sampling and display limits.** Without an
+  explicit sort, a sample is taken from the complete default page/document
+  order, so an existing sampled query may show different rows than it did
+  before. Query statistics describe that complete sample even when a display
+  limit hides rows.
+
 - **Export to PDF answers a page's queries from the same index the rest of Tine
   reads.** A `{{query …}}` or `{{tine-query …}}` inside a page you export is
   answered from the current search index on both Direct Files and Managed

@@ -94,12 +94,15 @@ impl<'a> SnapshotQueryReader<'a> {
     ) -> Result<QueryResult, QueryExecutionError> {
         self.ensure_current()?;
         let resolved = resolve_for_execution(query, context, self.inputs.today);
+        let execution_view = super::view::statistics_execution_view(resolved.query(), view);
+        let view = &execution_view;
         let query = if resolved.query().anchor == Anchor::Page {
             resolved.query().clone()
         } else {
             block_anchored_query(resolved.query())
         };
         let mut result = QueryResult {
+            statistics: None,
             rows: match query.anchor {
                 Anchor::Page => QueryRows::Page { pages: Vec::new() },
                 Anchor::Block => QueryRows::Block { groups: Vec::new() },
@@ -125,9 +128,6 @@ impl<'a> SnapshotQueryReader<'a> {
                 result_set_rule: RESULT_SET_RULE,
             },
         );
-        if statement.matches_nothing {
-            return Ok(result);
-        }
         let mut snapshot = self.snapshot.borrow_mut();
         match query.anchor {
             Anchor::Page => {
@@ -143,6 +143,7 @@ impl<'a> SnapshotQueryReader<'a> {
                     },
                 )?;
                 result.total = answer.total;
+                result.statistics = answer.statistics;
                 result.matched_total = Some(answer.matched_total);
                 result.exceeded = answer.exceeded;
                 result.rows = QueryRows::Page {
@@ -150,7 +151,7 @@ impl<'a> SnapshotQueryReader<'a> {
                 };
             }
             Anchor::Block => {
-                let pre = read_results(
+                let pre = super::results::read_ordered_results(
                     &mut snapshot,
                     &ResultReadInputs {
                         statement: &statement,
@@ -161,9 +162,13 @@ impl<'a> SnapshotQueryReader<'a> {
                         profile: ConstructionProfile::from_view(view),
                         recency: self.inputs.recency,
                     },
+                    view,
+                    self.inputs.page_recency,
                 )?;
                 let answer = apply_view(pre, view);
                 result.total = answer.total;
+                result.statistics = answer.statistics;
+                result.matched_total = answer.matched_total;
                 result.exceeded = answer.exceeded;
                 result.rows = QueryRows::Block {
                     groups: answer.groups,

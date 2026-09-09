@@ -6195,6 +6195,7 @@ mod query_command_surface_tests {
     #[test]
     fn query_run_refuses_an_over_budget_result_rather_than_truncating_it() {
         let result = tine_core::query::ir::QueryResult {
+            statistics: None,
             rows: tine_core::query::ir::QueryRows::Block { groups: Vec::new() },
             diagnostics: Vec::new(),
             report: tine_core::query::ir::QueryReport {
@@ -6211,6 +6212,7 @@ mod query_command_surface_tests {
         assert!(wire.contains("99999"), "{wire}");
 
         let page_result = tine_core::query::ir::QueryResult {
+            statistics: None,
             rows: tine_core::query::ir::QueryRows::Page { pages: Vec::new() },
             diagnostics: Vec::new(),
             report: tine_core::query::ir::QueryReport {
@@ -6233,6 +6235,7 @@ mod query_command_surface_tests {
     #[test]
     fn query_run_passes_a_result_within_budget_through_unchanged() {
         let result = tine_core::query::ir::QueryResult {
+            statistics: None,
             rows: tine_core::query::ir::QueryRows::Page { pages: Vec::new() },
             diagnostics: Vec::new(),
             report: tine_core::query::ir::QueryReport {

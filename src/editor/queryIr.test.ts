@@ -269,3 +269,18 @@ describe("the TypeScript mirror of the Rust query IR", () => {
     )).toBe(true);
   });
 });
+it("validates finite statistics cells and every marker in the shared wire fixtures", async () => {
+  const { isQueryStatistics } = await import("./queryIr");
+  for (const result of [resultBlock, resultPage]) {
+    expect(isQueryStatistics(result.statistics)).toBe(true);
+    expect(isQueryStatistics(JSON.parse(JSON.stringify(result.statistics)))).toBe(true);
+    for (const value of [null, "3.125", Infinity, NaN]) {
+      const bad = structuredClone(result.statistics!);
+      Object.assign(bad.overall[0], { value });
+      expect(isQueryStatistics(bad)).toBe(false);
+    }
+    const bad = structuredClone(result.statistics!);
+    Object.assign(bad.overall[2], { value: null });
+    expect(isQueryStatistics(bad)).toBe(false);
+  }
+});

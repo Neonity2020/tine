@@ -19,7 +19,7 @@ import { backend } from "../backend";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import { resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import type { BlockDto, RefGroup } from "../types";
-import type { ParsedQuery, ViewSettings } from "../editor/queryIr";
+import type { ParsedQuery, ViewSettings, QueryResult, QueryStatisticsCell } from "../editor/queryIr";
 import { blockRunResult } from "../queryReadingsTestkit";
 
 beforeAll(async () => {
@@ -108,7 +108,33 @@ function load(raw: string, view: ViewSettings): void {
     },
     view,
   } as unknown as ParsedQuery));
-  vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult(groups()));
+  vi.spyOn(backend(), "queryRun").mockResolvedValue(statisticsResult(groups(), view));
+}
+
+// Fixture producer: the component receives already-computed facts. The final
+// Q4 regression deliberately supplies facts inconsistent with visible rows.
+function statisticsResult(groups: RefGroup[], view: ViewSettings): QueryResult {
+  const rows = groups.flatMap((group) => group.blocks.map((block) => ({ page: group.page, block })));
+  const field = view.group_by === "" ? null : view.group_by ?? (view.view === "board" ? "state" : null);
+  const aggregates = view.aggregates?.length ? view.aggregates : field ? [["", "count"] as [string, "count"]] : [];
+  const fold = (rows: { page: string; block: BlockDto }[]): QueryStatisticsCell[] => aggregates.map(([key, op]) => {
+    if (op === "count") return { kind: "number", value: rows.length, skipped: 0 };
+    const values = rows.map(({ block }) => parseFloat(block.properties?.find(([name]) => name === key)?.[1] ?? "")).filter(Number.isFinite);
+    const skipped = rows.length - values.length;
+    if (!values.length) return { kind: "marker", reason: rows.length ? "non_numeric" : "empty_group", skipped };
+    const sum = values.reduce((sum, n) => sum + n, 0);
+    return { kind: "number", value: op === "sum" ? sum : sum / values.length, skipped };
+  });
+  const buckets = new Map<string | null, typeof rows>();
+  for (const row of rows) {
+    const keys = field === "tags" ? row.block.tags ?? [] : [field === "page" ? row.page : field === "state" ? row.block.marker ?? null : row.block.properties?.find(([key]) => key === field?.slice(5))?.[1] ?? null];
+    for (const key of keys.length ? keys : [null]) buckets.set(key, [...(buckets.get(key) ?? []), row]);
+  }
+  return { ...blockRunResult(groups), statistics: aggregates.length ? {
+    count: rows.length, aggregates, group_by: field, overall: fold(rows),
+    groups: field ? [...buckets].map(([key, rows]) => ({ key, count: rows.length, cells: fold(rows) })) : null,
+    grouping_status: field ? "exact" : "none",
+  } : undefined };
 }
 
 async function mountQuery(): Promise<{ root: HTMLElement; dispose: () => void }> {
@@ -130,7 +156,36 @@ async function mountQuery(): Promise<{ root: HTMLElement; dispose: () => void }>
 const cells = (root: HTMLElement, selector: string) =>
   [...root.querySelectorAll(selector)].map((element) => element.textContent?.trim());
 
+it("q4_query_summary_and_footer_use_returned_statistics", async () => {
+  load("{{query (todo TODO)}}\ntine.view:: table", { view: "table", aggregates: [["cost", "sum"]] });
+  vi.mocked(backend().queryRun).mockResolvedValue({
+    ...blockRunResult(groups()),
+    statistics: {
+      count: 100, aggregates: [["cost", "sum"]], group_by: null,
+      overall: [{ kind: "number", value: 12345, skipped: 0 }],
+      groups: null, grouping_status: "none",
+    },
+  } as ReturnType<typeof blockRunResult>);
+  const { root, dispose } = await mountQuery();
+  try {
+    expect(cells(root, ".query-summary .qs-value")).toContain("12345");
+    await vi.waitFor(() => expect(cells(root, ".sheet-aggregate-value")).toContain("12345"));
+  } finally { dispose(); }
+});
+
 describe("the overall summary", () => {
+  it("q4_statistics_resource_limit_is_visible_not_zero", async () => {
+    load("{{query (todo TODO)}}", { aggregates: [["cost", "sum"]] });
+    const message = "Exact query statistics exceed the available memory limit. Narrow the query or remove grouping or aggregates.";
+    vi.mocked(backend().queryRun).mockRejectedValue(new Error(message));
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.textContent).toContain(message));
+      expect(root.querySelector(".query-summary .qs-value")).toBeNull();
+      expect(backend().queryRun).toHaveBeenCalledTimes(1);
+    } finally { dispose(); }
+  });
+
   it("renders EVERY requested aggregate, in order, repeats included", async () => {
     // FAIL-BEFORE: only `aggregates[0]` was folded, so this rendered "4".
     load("{{query (todo TODO)}}", {
@@ -154,11 +209,11 @@ describe("the overall summary", () => {
     load("{{query (todo TODO)}}", {
       aggregates: [["prop:cost", "sum"], ["formula:cost", "sum"], ["cost", "sum"]],
     });
-    vi.mocked(backend().queryRun).mockResolvedValue(blockRunResult([{
+    vi.mocked(backend().queryRun).mockResolvedValue(statisticsResult([{
       page: "Alpha", kind: "page", blocks: [
         resultBlock("literal", "A result", [["prop:cost", "7"], ["formula:cost", "11"], ["cost", "2"]]),
       ],
-    }]));
+    }], { aggregates: [["prop:cost", "sum"], ["formula:cost", "sum"], ["cost", "sum"]] }));
     const { root, dispose } = await mountQuery();
     try {
       expect(cells(root, ".query-summary .qs-value")).toEqual(["7", "11", "2"]);
@@ -232,7 +287,7 @@ describe("the grouped breakdown", () => {
       expect(cells(root, ".query-summary-table thead th")).toEqual(["State", "Count", "Sum of cost"]);
       expect(cells(root, ".query-summary-table tbody td")).toEqual([
         "TODO", "2", "14",
-        "DONE", "2", "0 (2 skipped)",
+        "DONE", "2", "Unavailable (non numeric) (2 skipped)",
       ]);
     } finally {
       dispose();

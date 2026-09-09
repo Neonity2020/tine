@@ -692,6 +692,604 @@ fn write_page_result_corpus(root: &Path, pages: usize) {
     }
 }
 
+fn q4_run(corpus: &Corpus, view: &ViewSettings, cap: usize) -> serde_json::Value {
+    let (query, _) = crate::query::parse_query_text("@block", QueryDialect::Tql, corpus.today());
+    wire(
+        &crate::query::run_query_result_ir(
+            &corpus.graph,
+            &query,
+            view,
+            Bounds {
+                max_rows: cap,
+                max_bytes: usize::MAX,
+            },
+            &ExecutionContext::none(),
+        )
+        .expect("ready query"),
+    )
+}
+
+#[test]
+fn q4_blocks_sort_all_before_row_cap_and_sample() {
+    let _serial = serialize();
+    let root = scratch("q4-sort-before-cap");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/Order.md"),
+        "- z\n  rank:: z\n  cost:: 30\n- y\n  rank:: y\n  cost:: 20\n- a\n  rank:: a\n  cost:: 10\n").unwrap();
+    let corpus = Corpus::open(root, true);
+    let view = ViewSettings {
+        sort: vec![(Field::new("rank"), SortDir::Asc)],
+        sample: Some(1),
+        ..ViewSettings::default()
+    };
+    let answer = q4_run(&corpus, &view, 2);
+    assert_eq!(answer["groups"][0]["blocks"][0]["properties"][0][1], "a");
+    assert_eq!(answer["total"], 1);
+    assert_eq!(answer["matched_total"], 3);
+    assert_eq!(answer["exceeded"], false);
+}
+
+#[test]
+fn q4_unsorted_sample_uses_complete_base_order() {
+    let _serial = serialize();
+    let root = scratch("q4-base-before-sample");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/00.md"), "title:: Zulu\n\n- z\n").unwrap();
+    std::fs::write(root.join("pages/01.md"), "title:: Alpha\n\n- a\n").unwrap();
+    let corpus = Corpus::open(root, true);
+    let view = ViewSettings {
+        sample: Some(1),
+        ..ViewSettings::default()
+    };
+    let (_, statement) = corpus.lower_block_anchored("@block", QueryDialect::Tql);
+    let mut snapshot = corpus.snapshot();
+    super::read_ordered_results(
+        &mut snapshot,
+        &ResultReadInputs {
+            statement: &statement,
+            order: BackendOrder::Direct,
+            identity: &ResultIdentity::Stored,
+            max_rows: 2,
+            max_bytes: usize::MAX,
+            profile: ConstructionProfile::default(),
+            recency: &recency_for(&corpus.root),
+        },
+        &view,
+        &page_recency_for(&corpus.root),
+    )
+    .expect("ordered descriptors and payload");
+    snapshot.finish();
+    let answer = q4_run(&corpus, &view, 2);
+    assert_eq!(answer["groups"][0]["page"], "Alpha");
+    assert_eq!(answer["total"], 1);
+    assert_eq!(answer["exceeded"], false);
+}
+
+fn q4_statistics_fixture(label: &str, body: &str) -> Corpus {
+    let root = scratch(label);
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/Stats.md"), body).unwrap();
+    Corpus::open(root, true)
+}
+
+fn q4_statistics_view() -> ViewSettings {
+    use crate::query::ir::AggFn;
+    ViewSettings {
+        aggregates: vec![
+            (Field::new(""), AggFn::Count),
+            (Field::new("cost"), AggFn::Sum),
+        ],
+        group_by: Some(Field::new("prop:group")),
+        ..ViewSettings::default()
+    }
+}
+
+#[test]
+fn q4_statistics_cap1_of3_includes_tail_numeric_group() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture("q4-cap-tail", "- one\n  cost:: 1\n  group:: first\n- two\n  cost:: 2\n  group:: second\n- three\n  cost:: 30\n  group:: tail\n");
+    let answer = q4_run(&corpus, &q4_statistics_view(), 1);
+    assert_eq!(answer["groups"][0]["blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["statistics"]["count"], 3);
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 33.0);
+    assert_eq!(answer["statistics"]["groups"][2]["key"], "tail");
+}
+
+#[test]
+fn q4_tail_only_tag_group_does_not_multiply_overall() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-tag-tail",
+        "- one #first\n  cost:: 1\n- two #second #tail\n  cost:: 2\n",
+    );
+    let mut view = q4_statistics_view();
+    view.group_by = Some(Field::new("tags"));
+    let answer = q4_run(&corpus, &view, 1);
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 3.0);
+    assert_eq!(answer["statistics"]["groups"].as_array().unwrap().len(), 3);
+    assert_eq!(answer["statistics"]["count"], 2);
+}
+
+#[test]
+fn q4_repeated_ordered_count_sum_avg_sum() {
+    use crate::query::ir::AggFn;
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-repeat",
+        "- one\n  cost:: 2\n  cost:: 100\n- two\n  cost:: 3 hrs\n- three\n",
+    );
+    let view = ViewSettings {
+        aggregates: [AggFn::Count, AggFn::Sum, AggFn::Avg, AggFn::Sum]
+            .into_iter()
+            .map(|op| (Field::new("cost"), op))
+            .collect(),
+        ..ViewSettings::default()
+    };
+    let answer = q4_run(&corpus, &view, 1);
+    assert_eq!(
+        answer["statistics"]["overall"],
+        serde_json::json!([
+            {"kind":"number","value":3.0,"skipped":0},
+            {"kind":"number","value":5.0,"skipped":1},
+            {"kind":"number","value":2.5,"skipped":1},
+            {"kind":"number","value":5.0,"skipped":1}
+        ])
+    );
+}
+
+#[test]
+fn q4_sorted_sample2_of4_precedes_bridge_caps() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-sample-two",
+        "- z\n  cost:: 9\n- y\n  cost:: 8\n- b\n  cost:: 2\n- a\n  cost:: 1\n",
+    );
+    let mut view = q4_statistics_view();
+    view.sort = vec![(Field::new("cost"), SortDir::Asc)];
+    view.sample = Some(2);
+    let answer = q4_run(&corpus, &view, 1);
+    assert_eq!(answer["statistics"]["count"], 2);
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 3.0);
+    assert_eq!(answer["total"], 2);
+    assert_eq!(answer["matched_total"], 4);
+}
+
+#[test]
+fn q4_formula_grouping_reports_unsupported_preserves_visual_groups() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture("q4-formula", "- one\n  formula-cost:: 3 hrs\n");
+    // The projection stores raw authored keys. Exercise a literal colon key
+    // without asking the Markdown property grammar to create that wire case.
+    let writer = rusqlite::Connection::open(corpus.projection_path()).unwrap();
+    writer.execute("UPDATE properties SET name='formula:cost', normalized_name='formula:cost' WHERE name='formula-cost'", []).unwrap();
+    let mut view = q4_statistics_view();
+    view.group_by = Some(Field::new("formula:cost"));
+    view.aggregates[1].0 = Field::new("formula:cost");
+    let answer = q4_run(&corpus, &view, 1);
+    assert_eq!(
+        answer["statistics"]["grouping_status"],
+        "unsupported_formula"
+    );
+    assert_eq!(answer["statistics"]["groups"], serde_json::Value::Null);
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 3.0);
+    assert_eq!(answer["groups"][0]["blocks"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn q4_legacy_numeric_raw_property_semantics() {
+    use crate::query::ir::AggFn;
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture("q4-raw", "- one\n  cost:: 3 hrs\n  Cost:: 999\n- two\n  cost:: 2026-09-09\n- three\n  cost:: 2e2tail\n- four\n  cost:: 1e+\n- five\n  cost:: Infinity\n");
+    let view = ViewSettings {
+        aggregates: vec![(Field::new("cost"), AggFn::Sum)],
+        ..ViewSettings::default()
+    };
+    let answer = q4_run(&corpus, &view, 1);
+    assert_eq!(
+        answer["statistics"]["overall"],
+        serde_json::json!([
+            {"kind":"number", "value":2230.0,"skipped":1}
+        ])
+    );
+}
+
+#[test]
+fn q4_ordered_float_rounding_and_overflow_match_js() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-float",
+        "- one\n  cost:: 1e308\n- two\n  cost:: 1e308\n- three\n  cost:: -1e308\n",
+    );
+    let answer = q4_run(&corpus, &q4_statistics_view(), 1);
+    assert_eq!(
+        answer["statistics"]["overall"][1],
+        serde_json::json!({"kind":"marker", "reason":"non_finite", "skipped":0})
+    );
+}
+
+#[test]
+fn q4_statistics_empty_group_only_and_scoped_pages() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture("q4-empty", "- one\n");
+    let mut view = q4_statistics_view();
+    view.sample = Some(0);
+    let answer = q4_run(&corpus, &view, 1);
+    assert_eq!(answer["statistics"]["count"], 0);
+    assert_eq!(answer["statistics"]["overall"][0]["value"], 0.0);
+    assert_eq!(answer["statistics"]["overall"][1]["reason"], "empty_group");
+    assert_eq!(answer["statistics"]["groups"], serde_json::json!([]));
+    view.aggregates.clear();
+    view.sample = None;
+    let grouped = q4_run(&corpus, &view, 1);
+    assert_eq!(
+        grouped["statistics"]["aggregates"],
+        serde_json::json!([["", "count"]])
+    );
+    view.group_by = Some(Field::new(""));
+    view.view = Some(crate::query::ir::ViewKind::Board);
+    assert!(q4_run(&corpus, &view, 1).get("statistics").is_none());
+    let page_view = ViewSettings {
+        sample: Some(1),
+        ..q4_statistics_view()
+    };
+    for (source, count) in [("@page", 1), ("@page and name = 'absent'", 0)] {
+        let (query, _) = crate::query::parse_query_text(source, QueryDialect::Tql, corpus.today());
+        let pages = crate::query::run_query_result_ir(
+            &corpus.graph,
+            &query,
+            &page_view,
+            Bounds::unbounded(),
+            &ExecutionContext::none(),
+        )
+        .unwrap();
+        assert_eq!(pages.statistics.unwrap().count, count, "{source}");
+    }
+    assert_eq!(
+        answer["statistics"]["count"], 0,
+        "the separate page sample cannot change block statistics"
+    );
+}
+
+#[test]
+fn q4_physical_duplicate_name_page_aggregation() {
+    let _serial = serialize();
+    let root = scratch("q4-page-identities");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("pages/a.md"),
+        "title:: Same\ncost:: 2\n\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages/b.org"),
+        "#+TITLE: Same\n:PROPERTIES:\n:cost: 3\n:END:\n\n* body\n",
+    )
+    .unwrap();
+    let corpus = Corpus::open(root, true);
+    let (query, _) = crate::query::parse_query_text(
+        "@page and journal = false",
+        QueryDialect::Tql,
+        corpus.today(),
+    );
+    let answer = wire(
+        &crate::query::run_query_result_ir(
+            &corpus.graph,
+            &query,
+            &q4_statistics_view(),
+            Bounds {
+                max_rows: 1,
+                max_bytes: usize::MAX,
+            },
+            &ExecutionContext::none(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(answer["pages"].as_array().unwrap().len(), 1);
+    assert_eq!(answer["statistics"]["count"], 2);
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 5.0);
+}
+
+#[test]
+fn q4_statistics_read_census_keeps_rejected_payload_unread() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-census",
+        "- one\n  cost:: 1\n- two\n  cost:: 2\n- three\n  cost:: 3\n",
+    );
+    reset_result_read_census();
+    let answer = q4_run(&corpus, &q4_statistics_view(), 1);
+    assert_eq!(answer["statistics"]["count"], 3);
+    assert_eq!(result_read_census().payload_block_rows, 1);
+    assert_eq!(result_read_census().statistics_rows, 3);
+    assert_eq!(result_read_census().statistics_values, 6);
+    for order in [BackendOrder::Direct, BackendOrder::Managed] {
+        let mut snapshot = corpus.snapshot();
+        reset_result_read_census();
+        let result = q4_snapshot_order(
+            &corpus,
+            &mut snapshot,
+            Bounds {
+                max_rows: 1,
+                max_bytes: usize::MAX,
+            },
+            order,
+        )
+        .unwrap();
+        assert_eq!(wire(&result)["statistics"], answer["statistics"]);
+        let census = result_read_census();
+        assert_eq!(
+            (
+                census.statistics_rows,
+                census.statistics_values,
+                census.payload_block_rows,
+                census.payload_statements
+            ),
+            (3, 6, 1, 3)
+        );
+        assert_eq!(census.page_payload_statements, 0);
+    }
+}
+
+#[test]
+fn q4_statistics_wire_numbers_and_markers() {
+    let value = serde_json::json!({
+        "anchor":"block", "groups":[], "total":0, "exceeded":false,
+        "report":{"supported":true},
+        "statistics":{"count":0,"aggregates":[["cost","sum"]],"group_by":null,
+            "overall":[{"kind":"number","value":3.125,"skipped":1}],
+            "groups":null,"grouping_status":"none"}
+    });
+    let decoded: crate::query::ir::QueryResult = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(wire(&decoded)["statistics"], value["statistics"]);
+    for bad in [serde_json::Value::Null, serde_json::json!("3.125")] {
+        let mut invalid = value.clone();
+        invalid["statistics"]["overall"][0]["value"] = bad;
+        assert!(serde_json::from_value::<crate::query::ir::QueryResult>(invalid).is_err());
+    }
+}
+
+fn q4_snapshot_run(
+    corpus: &Corpus,
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    bounds: Bounds,
+) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
+    q4_snapshot_order(corpus, snapshot, bounds, BackendOrder::Direct)
+}
+
+fn q4_snapshot_order(
+    corpus: &Corpus,
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    bounds: Bounds,
+    order: BackendOrder,
+) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
+    q4_snapshot_query(corpus, snapshot, bounds, order, "@block")
+}
+
+fn q4_snapshot_query(
+    corpus: &Corpus,
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    bounds: Bounds,
+    order: BackendOrder,
+    source: &str,
+) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
+    use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
+    let registry = corpus.graph.property_registry();
+    let recency = recency_for(&corpus.root);
+    let page_recency = page_recency_for(&corpus.root);
+    let reader = SnapshotQueryReader::new(
+        snapshot,
+        SnapshotQueryInputs {
+            registry: &registry,
+            identity: &ResultIdentity::Stored,
+            order,
+            recency: &recency,
+            page_recency: &page_recency,
+            today: corpus.today(),
+        },
+    )?;
+    let (query, _) = crate::query::parse_query_text(source, QueryDialect::Tql, corpus.today());
+    reader.run(
+        &query,
+        &q4_statistics_view(),
+        bounds,
+        &ExecutionContext::none(),
+    )
+}
+
+#[test]
+fn q4_statistics_byte_cap_preserves_complete_facts() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-bytes",
+        &format!(
+            "- {}\n  cost:: 3\n- small\n  cost:: 4\n",
+            "large ".repeat(2000)
+        ),
+    );
+    let mut snapshot = corpus.snapshot();
+    let answer = wire(
+        &q4_snapshot_run(
+            &corpus,
+            &mut snapshot,
+            Bounds {
+                max_rows: 10,
+                max_bytes: 4096,
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(answer["groups"], serde_json::json!([]));
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 7.0);
+    snapshot.finish();
+    let mut snapshot = corpus.snapshot();
+    let complete = q4_snapshot_run(&corpus, &mut snapshot, Bounds::unbounded()).unwrap();
+    snapshot.finish();
+    let crate::query::ir::QueryRows::Block { groups } = &complete.rows else {
+        panic!("block result");
+    };
+    let exact = budget_cost(&groups[0].page, &groups[0].blocks[0]);
+    for (bytes, displayed) in [(exact, 1), (exact - 1, 0)] {
+        let mut snapshot = corpus.snapshot();
+        let answer = q4_snapshot_run(
+            &corpus,
+            &mut snapshot,
+            Bounds {
+                max_rows: 10,
+                max_bytes: bytes,
+            },
+        )
+        .unwrap();
+        let crate::query::ir::QueryRows::Block { groups } = &answer.rows else {
+            panic!("block result");
+        };
+        assert_eq!(
+            groups.iter().map(|group| group.blocks.len()).sum::<usize>(),
+            displayed
+        );
+        assert_eq!(answer.statistics, complete.statistics);
+        assert!(answer.exceeded);
+    }
+    let mut snapshot = corpus.snapshot();
+    let failure = q4_snapshot_run(
+        &corpus,
+        &mut snapshot,
+        Bounds {
+            max_rows: 10,
+            max_bytes: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(failure
+        .backend_wire_string()
+        .contains("statistics_resource_limit"));
+}
+
+#[test]
+fn q4_statistics_failure_and_cancellation_return_no_partial_answer() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture("q4-errors", "- one\n  cost:: 1\n");
+    let mut snapshot = corpus.snapshot();
+    let failure = q4_snapshot_run(
+        &corpus,
+        &mut snapshot,
+        Bounds {
+            max_rows: 1,
+            max_bytes: 0,
+        },
+    );
+    assert!(
+        failure.is_err(),
+        "requested statistics cannot fit a zero-byte budget"
+    );
+    snapshot.finish();
+    let mut snapshot = corpus.snapshot();
+    snapshot.cancellation().cancel();
+    assert!(matches!(
+        q4_snapshot_run(&corpus, &mut snapshot, Bounds::unbounded()),
+        Err(crate::query::QueryExecutionError::Cancelled)
+    ));
+    snapshot.finish();
+    for (label, sql) in [
+        ("sql", "DROP TABLE properties"),
+        ("corruption", "DELETE FROM query_block_results"),
+    ] {
+        let path = copy_projection(&corpus, &format!("q4-failure-{label}"));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        let error = q4_snapshot_run(&corpus, &mut snapshot, Bounds::unbounded()).unwrap_err();
+        assert!(
+            matches!(error, crate::query::QueryExecutionError::Unavailable(_)),
+            "{label}: {error}"
+        );
+    }
+}
+
+#[test]
+fn q4_statistics_resource_limit_is_visible_not_zero() {
+    let _serial = serialize();
+    let body = (0..40)
+        .map(|i| format!("- row {i}\n  cost:: 1\n  group:: key{i}\n"))
+        .collect::<String>();
+    let corpus = q4_statistics_fixture("q4-resource", &body);
+    let mut snapshot = corpus.snapshot();
+    reset_result_read_census();
+    let error = q4_snapshot_run(
+        &corpus,
+        &mut snapshot,
+        Bounds {
+            max_rows: 1,
+            max_bytes: 2048,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        result_read_census().statistics_rows > 1,
+        "the group budget, not initial overhead, must be exhausted"
+    );
+    assert_eq!(
+        result_read_census().payload_block_rows,
+        0,
+        "a failed fold publishes no partial payload"
+    );
+    assert_eq!(error.to_string(), "Exact query statistics exceed the available memory limit. Narrow the query or remove grouping or aggregates.");
+    assert!(error
+        .backend_wire_string()
+        .contains("statistics_resource_limit"));
+}
+
+#[test]
+fn q4_commit_between_rows_and_statistics_uses_one_snapshot() {
+    let _serial = serialize();
+    let corpus = q4_statistics_fixture(
+        "q4-coherent",
+        "- TODO one #old\n  cost:: 1\n  group:: old\n- DONE two #new\n  cost:: 9\n  group:: new\n",
+    );
+    let path = copy_projection(&corpus, "q4-coherent");
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    let hook_path = path.clone();
+    set_before_payload_batch_hook(Some(Box::new(move |_| {
+        let writer = rusqlite::Connection::open(&hook_path).unwrap();
+        writer.execute_batch("BEGIN; UPDATE properties SET value = '9' WHERE name = 'cost'; UPDATE properties SET value = 'alt' WHERE name = 'group' AND value = 'old'; UPDATE tags SET tag = 'alt' WHERE tag = 'old'; UPDATE tasks SET marker = 'TODO' WHERE marker = 'DONE'; COMMIT;").unwrap();
+    })));
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    let result = q4_snapshot_query(
+        &corpus,
+        &mut snapshot,
+        Bounds::unbounded(),
+        BackendOrder::Direct,
+        "@block and task = 'TODO'",
+    );
+    set_before_payload_batch_hook(None);
+    let answer = wire(&result.unwrap());
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 1.0);
+    assert_eq!(answer["statistics"]["count"], 1);
+    assert_eq!(answer["statistics"]["groups"][0]["key"], "old");
+    assert_eq!(
+        answer["groups"][0]["blocks"][0]["tags"],
+        serde_json::json!(["old"])
+    );
+    assert_eq!(answer["groups"][0]["blocks"][0]["properties"][0][1], "1");
+    snapshot.finish();
+    let mut next = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    let answer = wire(
+        &q4_snapshot_query(
+            &corpus,
+            &mut next,
+            Bounds::unbounded(),
+            BackendOrder::Direct,
+            "@block and task = 'TODO'",
+        )
+        .unwrap(),
+    );
+    assert_eq!(answer["statistics"]["overall"][1]["value"], 18.0);
+    assert_eq!(answer["statistics"]["count"], 2);
+    assert_eq!(answer["statistics"]["groups"][0]["key"], "alt");
+}
+
 #[test]
 fn page_results_sort_the_complete_set_before_limit_and_keep_exact_counts() {
     let _serial = serialize();
@@ -722,6 +1320,18 @@ fn page_results_sort_the_complete_set_before_limit_and_keep_exact_counts() {
         ("rank".into(), "a-winner".into())
     );
     assert!(actual.exceeded);
+
+    let statistics_view = ViewSettings {
+        aggregates: vec![(Field::new(""), crate::query::ir::AggFn::Count)],
+        ..view.clone()
+    };
+    let with_statistics = database_page_answer(&corpus, source, &statistics_view, 2, usize::MAX)
+        .expect("statistics preserve the approved page admission counters");
+    assert_eq!(with_statistics.matched_total, 45);
+    assert_eq!(with_statistics.total, 2);
+    assert_eq!(with_statistics.pages.len(), 1);
+    assert!(with_statistics.exceeded);
+    assert_eq!(with_statistics.statistics.unwrap().count, 1);
 
     let mut snapshot = corpus.snapshot();
     let position = snapshot

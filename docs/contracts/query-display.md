@@ -398,52 +398,93 @@ segments the panel reports as retained`), `src/sheet/fields.test.ts`
 
 ## 6. One summary for every grouped or aggregated face
 
-The complete summary is rendered above each inline presentation, including Table,
-Board, and builder-backed Search. Table footers are additional column controls;
-they do not replace or truncate that ordered summary. Board defaults are resolved
-with the existing view-default helper for both controls and summary grouping,
-without writing properties on open.
+The backend owns exact ordinary-field statistics in optional `QueryResult.statistics`.
+Rows and statistics come from one current main-SQLite snapshot on both backends.
+Statistics describe the complete semantically ordered sample, before payload
+admission. The frontend formats these returned facts; visible, revealed or live
+editor rows never supply an exact query-wide fold. Children-backed sheets retain
+their existing aggregates.
 
-Query aggregate keys are literal property names, including names starting with
-`prop:` or `formula:`. These prefixes have no special meaning in this grammar.
-`QuerySummary.test.tsx` pins distinct values for both prefixed names and the bare name.
+### Ordering and sampling before display limits
 
-`queryAggregate.ts::querySummary` is the only fold. It takes the rows, the
-ordered aggregate list, an optional group-key function and a value reader, and
-returns one cell per requested aggregate — for the whole result and for each
-group. It replaced `foldAggregate` and `groupRows`, whose callers shipped two
-defects:
+Blocks establish the complete base order: binary page display name,
+journal-before-page kind, existing construction order for equal page keys, and
+document preorder. Explicit stable multisort follows the requested directions,
+with ascending full base ordinal as the final tie. Descending does not reverse
+equal-key document order. The semantic sample is taken next, then the bridge
+admits a bounded payload prefix. Without an explicit sort, sampling selects the
+complete base-order prefix; construction-prefix sampling followed by
+alphabetization is forbidden.
 
-- they folded `aggregates[0]` and dropped the rest, so a note asking for
-  `count; cost=sum` rendered one number, whichever the property happened to
-  spell first;
-- the list face and the board face grouped through different code, and could
-  disagree about which group a row was in.
+For construction order `z,y,a`, ascending property sort, sample 1 and row cap 2,
+the selected and displayed winner is `a`, and its statistics count is 1.
+The old construction-prefix answer `y` is not an allowed result.
 
-The **writers** are a separate matter. `queryBuilder.ts::currentSort` /
-`currentAgg` still read `sort[0]` / `aggregates[0]` and `withSort` / `withAgg`
-still write a one-element list; they are the `+ sort` and `+ summarize` pills,
-which remain the only display controls on the faces the panel is not offered on
-(§7). Those faces are out of scope here and are listed as open below. The
-rendering defect is fixed everywhere; the one-entry WRITE survives exactly where
-those pills do.
+Block `total` counts the semantic sample, including denied rows; `matched_total`
+is the complete pre-sample match count. Block `exceeded` means denial within
+that sample. Page counters retain their approved meanings: `matched_total` is
+pre-sample, `total` is admitted-before-sample, and `exceeded` retains its existing
+behavior. Thus 45 page matches with row cap 2 and sample 1 have `total=2`, one
+displayed page and `exceeded=true`, while statistics describe one sampled page.
+Neither legacy `total` nor visible-row count is a universal statistics count.
 
-Grouping keys come from `sheet/fields.ts::groupKeysForBlock` over the same DTO
-rows the Board renders, and formula columns through `readFormulaRowField`, so
-the list summary, the board columns and the table footer cannot drift apart.
-`tags` places a row in every tag's group, exactly as the board does; the summary
-reports that (`multiMembership`) rather than pretending the group counts
-partition the result. A row with no value for the grouping field falls into
-`(none)`, which stays distinct from a group whose value is literally `(none)`.
+The desktop bridge retains its existing over-budget refusal. A core answer with
+`exceeded=true` is not silently passed through that refusal; successful returned
+statistics still describe the complete sample when frontend reveal limits hide
+rows. No second statistics request or increased consumer budget bypasses it.
 
-The arithmetic is what shipped, unchanged: `count` counts rows; `sum` and `avg`
-`parseFloat` each value and skip what is not numeric, with `avg` dividing by the
-numeric contributors rather than by the row count; results round to three
-decimals; and the number of skipped rows is carried rather than folded away.
-Repeated aggregate entries render repeatedly, in the requested order, because
-that is what the property spells.
+### Statistics, grouping and formatting
 
-Tests: `src/editor/queryAggregate.test.ts`, `src/components/QuerySummary.test.tsx`.
+Aggregates preserve their order and duplicates. Keys are literal case-sensitive
+authored property names, including `state`, `page`, `prop:cost` and
+`formula:cost`. Count always counts rows, including a named-property count.
+Sum and average read only the first exact-spelling raw property by authored
+ordinal, use JavaScript `parseFloat` numeric-prefix semantics, skip missing and
+non-finite inputs, and add contributors sequentially in sample order. Average
+divides by contributors. Skipped counts are explicit.
+
+Cells are tagged finite JSON numbers or markers with reasons:
+`non_finite`, `division_by_zero`, `empty_group`, `non_numeric`. A number is
+unrounded on the wire; markers have no value. Neither null, numeric strings nor
+NaN/Infinity labels are numeric cells. The frontend renders markers as
+**Unavailable** with their reason. Finite values retain three-decimal JS rounding
+and display behavior without overflowing a large finite value while rounding.
+A valid empty selection has count zero, empty-group sum/average markers, and an
+empty group list when grouping is requested. Absence of statistics is not zero.
+
+The shared effective view resolves an unset Board grouping to task state without
+writing a default on open. Explicitly cleared grouping remains ungrouped.
+Grouping alone requests count. Groups follow first full ordinal and then the
+row's membership order. Missing null, literal `(none)`, and empty string remain
+distinct. Tags contribute once overall and once per membership; the summary
+retains the multi-membership notice.
+
+Formula query-wide grouping is deferred. It returns exact ordinary-field overall
+cells, `groups=null`, and `grouping_status=unsupported_formula`, with:
+**Exact statistics by formula are not supported yet. Overall statistics are shown.**
+Saved and visual formula grouping remain intact; a literal aggregate property
+named `formula:cost` remains supported. Advanced-query summaries remain disabled.
+
+The overall summary and query-table footer consume the same returned statistics.
+Footer lookup uses aggregate-list position, and duplicate entries remain in the
+complete summary. Page rows retain physical path identity, so equal display names
+do not collapse before aggregation. Scoped page and block answers remain separate.
+
+Statistics have a separate retained-key/cell budget at the consumer's existing
+byte ceiling. Exceeding it refuses the complete answer with the canonical typed
+`statistics_resource_limit` reason, never partial groups or fabricated zero:
+**Exact query statistics exceed the available memory limit. Narrow the query or remove grouping or aggregates.**
+It is not a readiness retry or a reason to repair the projection. Existing
+refresh ownership retains coherent rows and statistics together and rejects
+obsolete completions.
+
+Tests: `crates/tine-core/src/query/statistics_tests.rs`,
+`crates/tine-core/src/query/results_tests.rs` (the `q4_` regressions),
+`crates/tine-core/tests/query_ir_wire.rs` with
+`tests/fixtures/query-statistics/semantics.json`, `src/editor/queryAggregate.test.ts`,
+`src/editor/queryIr.test.ts`, `src/components/QuerySummary.test.tsx`,
+`src/components/QueryWorkspace.test.tsx` and
+`src/components/QueryDisplayConsumers.test.tsx`.
 
 ## 7. The inline Display panel
 

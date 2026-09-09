@@ -13,12 +13,10 @@
 //!   ([`crate::query::sql::descriptor_statement`]) to add ordering and the
 //!   result metadata; it never re-lowers, never re-applies §5.3's result-set
 //!   rule (the statement already did), and never edits the predicate.
-//! * ORDERING is the order the walk CHARGES its budget in — Direct Files by
-//!   `query_page_order.position`, Managed Storage by `pages.path` BINARY — then
-//!   `query_block_results.preorder` within a page. DISPLAY order
-//!   (`base_order_groups`, `sort-by`, `sample`) is NOT applied here: this
-//!   returns the same PRE-VIEW shape the retired document hydration returned,
-//!   and [`crate::query::apply_view`] finishes it exactly as before.
+//! * Main-result ORDERING and semantic sampling precede admission in SQL.
+//!   Statistics fold that complete sample in the same snapshot; only admitted
+//!   descriptors enter payload hydration. Located export and probe consumers
+//!   retain their existing construction-order entry point and bounds.
 //! * The BUDGET is [`ConstructionBudget`] itself, walked with the same four
 //!   rules `collect_sql_matched_blocks` uses, in the same order. `total` and
 //!   `exceeded` are the budget's, not a second policy.
@@ -72,12 +70,8 @@ pub(crate) const PAYLOAD_BATCH: usize = 128;
 /// the page's own facets share these two tables under owner type 0.
 const OWNER_BLOCK: i64 = 1;
 
-/// The cross-page base order a backend charges its budget in.
-///
-/// Not a display order and not a preference: it is the order in which the
-/// WALK's page source enumerates pages, because that is what decides which rows
-/// survive a truncated budget. Direct Files' inventory order is materialized in
-/// `query_page_order`; Managed Storage's is `pages.path` compared as bytes.
+/// The backend construction order, also the final tie within equal display
+/// page keys. Direct uses `query_page_order`; Managed uses binary `pages.path`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackendOrder {
     Direct,
@@ -210,6 +204,7 @@ pub(crate) struct RecencyPage<'a> {
 /// either answers completely, fails, or was cancelled.
 #[derive(Debug)]
 pub(crate) enum ResultReadError {
+    StatisticsResourceLimit,
     /// The seam refused the statement or the read.
     Sql(MaterializationError),
     /// The projection contradicts itself. The caller fails the read and
@@ -239,6 +234,9 @@ pub(crate) fn probe_fts_ready(
 impl std::fmt::Display for ResultReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResultReadError::StatisticsResourceLimit => {
+                f.write_str(crate::query::QueryUnavailableReason::StatisticsResourceLimit.message())
+            }
             ResultReadError::Sql(error) => write!(f, "projection read failed: {error}"),
             ResultReadError::Corrupt(what) => write!(f, "projection is inconsistent: {what}"),
             ResultReadError::Cancelled => write!(f, "query cancelled"),
@@ -254,6 +252,9 @@ impl From<ResultReadError> for crate::query::QueryExecutionError {
     fn from(error: ResultReadError) -> Self {
         use crate::query::QueryUnavailableReason as Reason;
         match error {
+            ResultReadError::StatisticsResourceLimit => {
+                Self::Unavailable(Reason::StatisticsResourceLimit)
+            }
             ResultReadError::Cancelled => Self::Cancelled,
             ResultReadError::Sql(_) => Self::Unavailable(Reason::ReadFailed),
             ResultReadError::Corrupt(_) => Self::Unavailable(Reason::InvalidSnapshot),
@@ -272,7 +273,25 @@ pub(crate) fn read_results(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     inputs: &ResultReadInputs<'_>,
 ) -> Result<PreViewGroups, ResultReadError> {
-    let carried = read_results_carried::<PlainResults>(snapshot, inputs)?;
+    plain_groups(read_results_carried::<PlainResults>(
+        snapshot, inputs, None,
+    )?)
+}
+
+pub(crate) fn read_ordered_results(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    inputs: &ResultReadInputs<'_>,
+    view: &crate::query::ir::ViewSettings,
+    recency: &PageRecencyPrograms,
+) -> Result<PreViewGroups, ResultReadError> {
+    plain_groups(read_results_carried::<PlainResults>(
+        snapshot,
+        inputs,
+        Some((view, recency)),
+    )?)
+}
+
+fn plain_groups(carried: CarriedGroups<PlainResults>) -> Result<PreViewGroups, ResultReadError> {
     Ok(PreViewGroups {
         // A field move per GROUP, never a conversion per block: the ordinary
         // carrier's block vector IS `Vec<BlockDto>` already.
@@ -280,6 +299,9 @@ pub(crate) fn read_results(
         recency_by_page: carried.recency_by_page,
         total: carried.total,
         exceeded: carried.exceeded,
+        ordered: carried.ordered,
+        matched_total: carried.matched_total,
+        statistics: carried.statistics,
     })
 }
 
@@ -294,7 +316,7 @@ pub(crate) fn read_located_results(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     inputs: &ResultReadInputs<'_>,
 ) -> Result<LocatedPreViewGroups, ResultReadError> {
-    let carried = read_results_carried::<LocatedResults>(snapshot, inputs)?;
+    let carried = read_results_carried::<LocatedResults>(snapshot, inputs, None)?;
     Ok(LocatedPreViewGroups {
         groups: carried.groups,
         recency_by_page: carried.recency_by_page,
@@ -308,18 +330,53 @@ pub(crate) fn read_located_results(
 fn read_results_carried<C: ResultCarrier>(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     inputs: &ResultReadInputs<'_>,
+    ordered: Option<(&crate::query::ir::ViewSettings, &PageRecencyPrograms)>,
 ) -> Result<CarriedGroups<C>, ResultReadError> {
     install_regexes(snapshot, inputs.statement)?;
     let mut pages = PageGroups::<C>::default();
+    pages.adjacent = ordered.is_some();
+    pages.coalesce_names = ordered.is_some_and(|(view, _)| !view.sort.is_empty());
     let mut budget = ConstructionBudget::new(inputs.max_rows, inputs.max_bytes);
-    let admitted = read_descriptors(snapshot, inputs, &mut pages, &mut budget)?;
+    let mut statistics = match ordered {
+        Some((view, _)) => super::statistics::StatisticsFold::new(view, inputs.max_bytes)?,
+        None => None,
+    };
+    let mut matched_total = ordered.map(|_| 0);
+    let ordered_inputs = ResultReadInputs {
+        profile: ConstructionProfile::default(),
+        ..*inputs
+    };
+    let inputs = if ordered.is_some() {
+        &ordered_inputs
+    } else {
+        inputs
+    };
+    let admitted = read_descriptors(
+        snapshot,
+        inputs,
+        &mut pages,
+        &mut budget,
+        ordered,
+        &mut statistics,
+        &mut matched_total,
+    )?;
     read_payload(snapshot, &mut pages, &admitted)?;
-    Ok(pages.finish(inputs, budget))
+    if snapshot.cancellation().is_cancelled() {
+        return Err(ResultReadError::Cancelled);
+    }
+    let mut answer = pages.finish(inputs, budget);
+    answer.ordered = ordered.is_some();
+    answer.matched_total = matched_total;
+    answer.statistics = statistics.map(super::statistics::StatisticsFold::finish);
+    Ok(answer)
 }
 
 /// [`PreViewGroups`] before the carrier is known — what
 /// [`read_results_carried`] answers.
 struct CarriedGroups<C: ResultCarrier> {
+    ordered: bool,
+    matched_total: Option<usize>,
+    statistics: Option<crate::query::ir::QueryStatistics>,
     groups: Vec<ResultViewGroup<C::Block>>,
     recency_by_page: HashMap<String, i64>,
     total: usize,
@@ -332,6 +389,7 @@ struct CarriedGroups<C: ResultCarrier> {
 /// the complete count computed by SQLite before its result limit.
 #[derive(Debug, Default)]
 pub(crate) struct PageAnswer {
+    pub(crate) statistics: Option<crate::query::ir::QueryStatistics>,
     pub(crate) pages: Vec<crate::query::ir::PageRow>,
     pub(crate) total: usize,
     pub(crate) matched_total: usize,
@@ -361,35 +419,56 @@ pub(crate) fn read_page_results(
     if snapshot.cancellation().is_cancelled() {
         return Err(ResultReadError::Cancelled);
     }
+    let mut statistics = super::statistics::StatisticsFold::new(inputs.view, inputs.max_bytes)?;
     let statement = page_statement(
         inputs.statement,
         inputs.order,
         inputs.view,
-        inputs.max_rows,
+        if statistics.is_some() {
+            usize::MAX
+        } else {
+            inputs.max_rows
+        },
         inputs.recency,
     )
     .map_err(ResultReadError::Sql)?;
     let cancellation = snapshot.cancellation();
     snapshot
-        .set_query_rank_function(statement.ranks.function(cancellation))
+        .set_query_rank_function(statement.ranks.function(cancellation.clone()))
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     let mut descriptors = Vec::new();
     let mut budget = ConstructionBudget::new(inputs.max_rows, inputs.max_bytes);
     let mut seen = HashSet::new();
     let mut matched_total = None;
     let mut damage: Option<String> = None;
+    let mut failure = None;
+    let mut ordinal = 0usize;
     let visit =
         snapshot.visit_projection_query(&statement.query.sql, &statement.query.params, |row| {
+            if cancellation.is_cancelled() {
+                failure = Some(ResultReadError::Cancelled);
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
             #[cfg(test)]
             note(|census| census.page_rows += 1);
-            let decoded = match decode_page_row(row, inputs.order) {
+            let descriptor = if statistics.is_some() {
+                row.get(..9).unwrap_or(row)
+            } else {
+                row
+            };
+            let decoded = match decode_page_row(descriptor, inputs.order) {
                 Ok(decoded) => decoded,
                 Err(what) => {
                     damage = Some(what);
                     return Ok(std::ops::ControlFlow::Break(()));
                 }
             };
-            if !seen.insert(decoded.page_id) {
+            let unique = if statistics.is_some() {
+                matches!(count(row, 9, "physical page multiplicity"), Ok(1))
+            } else {
+                seen.insert(decoded.page_id)
+            };
+            if !unique {
                 damage = Some("one physical page appears twice in a page result".to_string());
                 return Ok(std::ops::ControlFlow::Break(()));
             }
@@ -401,10 +480,33 @@ pub(crate) fn read_page_results(
                     return Ok(std::ops::ControlFlow::Break(()));
                 }
             }
-            if budget.closed() || !budget.admit_page_estimated(decoded.estimated_bytes) {
+            if !inputs
+                .view
+                .sample
+                .is_some_and(|sample| ordinal >= sample as usize)
+            {
+                if let Some(fold) = &mut statistics {
+                    if let Err(error) = fold_statistics_row(fold, row, 10) {
+                        failure = Some(error);
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                }
+            }
+            ordinal += 1;
+            if !budget.closed() && budget.admit_page_estimated(decoded.estimated_bytes) {
+                descriptors.push(decoded);
+            } else if statistics.is_none() {
                 return Ok(std::ops::ControlFlow::Break(()));
             }
-            descriptors.push(decoded);
+            if statistics.is_some()
+                && budget.closed()
+                && inputs
+                    .view
+                    .sample
+                    .is_some_and(|sample| ordinal >= sample as usize)
+            {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
             Ok(std::ops::ControlFlow::Continue(()))
         });
     if let Err(error) = visit {
@@ -413,13 +515,20 @@ pub(crate) fn read_page_results(
     if let Some(what) = damage {
         return Err(ResultReadError::Corrupt(what));
     }
+    if let Some(error) = failure {
+        return Err(error);
+    }
     let matched_total = matched_total.unwrap_or(0);
     let mut pages = hydrate_page_rows(snapshot, &descriptors)?;
     let total = pages.len();
     if let Some(sample) = inputs.view.sample {
         pages.truncate(sample as usize);
     }
+    if snapshot.cancellation().is_cancelled() {
+        return Err(ResultReadError::Cancelled);
+    }
     Ok(PageAnswer {
+        statistics: statistics.map(super::statistics::StatisticsFold::finish),
         pages,
         total,
         matched_total,
@@ -676,6 +785,8 @@ struct PageGroup<C: ResultCarrier> {
 /// `base_order_groups`/`finish_query_groups` merges them for display later, the
 /// same way and in the same place as today.
 struct PageGroups<C: ResultCarrier> {
+    adjacent: bool,
+    coalesce_names: bool,
     order: Vec<PageGroup<C>>,
     by_page: HashMap<[u8; 16], usize>,
 }
@@ -685,6 +796,8 @@ struct PageGroups<C: ResultCarrier> {
 impl<C: ResultCarrier> Default for PageGroups<C> {
     fn default() -> Self {
         Self {
+            adjacent: false,
+            coalesce_names: false,
             order: Vec::new(),
             by_page: HashMap::new(),
         }
@@ -702,7 +815,19 @@ impl<C: ResultCarrier> PageGroups<C> {
         journal_day: Option<i64>,
         path: &str,
     ) -> usize {
-        if let Some(at) = self.by_page.get(&page_id) {
+        if self.coalesce_names
+            && self
+                .order
+                .last()
+                .is_some_and(|last| last.group.page == name && last.group.kind == kind)
+        {
+            return self.order.len() - 1;
+        }
+        if let Some(at) = self
+            .by_page
+            .get(&page_id)
+            .filter(|at| !self.adjacent || **at + 1 == self.order.len())
+        {
             return *at;
         }
         let at = self.order.len();
@@ -745,6 +870,9 @@ impl<C: ResultCarrier> PageGroups<C> {
             groups.push(page.group);
         }
         CarriedGroups {
+            ordered: false,
+            matched_total: None,
+            statistics: None,
             groups,
             recency_by_page,
             total: budget.total,
@@ -793,24 +921,62 @@ fn read_descriptors<C: ResultCarrier>(
     inputs: &ResultReadInputs<'_>,
     pages: &mut PageGroups<C>,
     budget: &mut ConstructionBudget,
+    ordered: Option<(&crate::query::ir::ViewSettings, &PageRecencyPrograms)>,
+    statistics: &mut Option<super::statistics::StatisticsFold>,
+    matched_total: &mut Option<usize>,
 ) -> Result<Vec<Descriptor>, ResultReadError> {
     if snapshot.cancellation().is_cancelled() {
         return Err(ResultReadError::Cancelled);
     }
-    let statement =
-        descriptor_statement(inputs.statement, inputs.order).map_err(ResultReadError::Sql)?;
+    let statement = super::sql::descriptor_view_statement(inputs.statement, inputs.order, ordered)
+        .map_err(ResultReadError::Sql)?;
+    snapshot
+        .set_query_rank_function(statement.ranks.function(snapshot.cancellation()))
+        .map_err(|error| sql_or_cancelled(snapshot, error))?;
+    let statement = statement.query;
     let mut admitted = Vec::new();
     let mut damage: Option<String> = None;
+    let mut failure = None;
+    let mut ordinal = 0usize;
+    let cancellation = snapshot.cancellation();
     let visit = snapshot.visit_projection_query(&statement.sql, &statement.params, |row| {
+        if cancellation.is_cancelled() {
+            failure = Some(ResultReadError::Cancelled);
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
         #[cfg(test)]
         note(|census| census.descriptor_rows += 1);
-        let (page, decoded) = match decode_descriptor(row, inputs) {
+        if let Some((view, _)) = ordered {
+            match count(row, 14, "complete block count") {
+                Ok(total) => *matched_total = Some(total),
+                Err(what) => {
+                    damage = Some(what);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            if view.sample.is_some_and(|sample| ordinal >= sample as usize) {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        }
+        ordinal += 1;
+        let descriptor = if ordered.is_some() {
+            row.get(..14).unwrap_or(row)
+        } else {
+            row
+        };
+        let (page, decoded) = match decode_descriptor(descriptor, inputs) {
             Ok(decoded) => decoded,
             Err(what) => {
                 damage = Some(what);
                 return Ok(std::ops::ControlFlow::Break(()));
             }
         };
+        if let Some(fold) = statistics {
+            if let Err(error) = fold_statistics_row(fold, row, 15) {
+                failure = Some(error);
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        }
         Ok(admit_decoded(
             &page,
             decoded,
@@ -826,7 +992,35 @@ fn read_descriptors<C: ResultCarrier>(
     if let Some(what) = damage {
         return Err(ResultReadError::Corrupt(what));
     }
+    if let Some(error) = failure {
+        return Err(error);
+    }
     Ok(admitted)
+}
+
+fn fold_statistics_row(
+    fold: &mut super::statistics::StatisticsFold,
+    row: &[PhysicalQueryValue],
+    offset: usize,
+) -> Result<(), ResultReadError> {
+    let width = fold.view().aggregates.len();
+    let values = (0..width)
+        .map(|at| opt_text(row, offset + at, "statistics raw value"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ResultReadError::Corrupt)?;
+    let encoded =
+        text(row, offset + width, "statistics memberships").map_err(ResultReadError::Corrupt)?;
+    let mut keys: Vec<Option<String>> = serde_json::from_str(&encoded)
+        .map_err(|_| ResultReadError::Corrupt("invalid statistics memberships".into()))?;
+    if keys.is_empty() {
+        keys.push(None);
+    }
+    #[cfg(test)]
+    note(|census| {
+        census.statistics_rows += 1;
+        census.statistics_values += width;
+    });
+    fold.add(&values, keys)
 }
 
 /// What one descriptor row says about its page, dropped immediately after the
@@ -1460,6 +1654,8 @@ fn spell(value: Option<&PhysicalQueryValue>) -> &'static str {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResultReadCensus {
+    pub(crate) statistics_rows: usize,
+    pub(crate) statistics_values: usize,
     pub(crate) descriptor_rows: usize,
     pub(crate) payload_statements: usize,
     pub(crate) payload_block_rows: usize,
@@ -1524,6 +1720,8 @@ fn payload_property_rows(census: &mut ResultReadCensus, channel: PayloadChannel)
 thread_local! {
     static CENSUS: std::cell::Cell<ResultReadCensus> =
         const { std::cell::Cell::new(ResultReadCensus {
+            statistics_rows: 0,
+            statistics_values: 0,
             descriptor_rows: 0,
             payload_statements: 0,
             payload_block_rows: 0,

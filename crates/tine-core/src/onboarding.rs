@@ -1089,6 +1089,19 @@ mod tests {
         // revisit → Query text (TQL)*").
         assert!(page.markdown.contains("- ## Query text (TQL)"));
         assert!(page.markdown.contains("**Save query text**"));
+        assert!(page
+            .markdown
+            .contains("complete default page/document order"));
+        assert!(page
+            .markdown
+            .contains("Statistics describe the complete sample"));
+        assert!(page.markdown.contains("**Unavailable** with a reason"));
+        assert!(page
+            .markdown
+            .contains("Exact query statistics exceed the available memory limit."));
+        assert!(page
+            .markdown
+            .contains("Exact statistics by formula are not supported yet."));
         // The one picker: a key's count and observed type are what the list
         // shows, and a typed key is offered honestly in BOTH scopes a block
         // query can write it in — the pair of field kinds the two-stage chooser

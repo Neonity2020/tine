@@ -626,7 +626,15 @@ pub(crate) fn explain_empty(
         .probes
         .iter()
         .map(|probe| {
-            crate::query::run_query_result_over(source, probe, view, resolved.today(), bounds).total
+            let answer =
+                crate::query::run_query_result_over(source, probe, view, resolved.today(), bounds);
+            // Explain retains its count-only purpose: a sorted display sample
+            // does not constrain these pre-view probes.
+            if probe.anchor == super::ir::Anchor::Block && !view.sort.is_empty() {
+                answer.matched_total.unwrap_or(answer.total)
+            } else {
+                answer.total
+            }
         })
         .collect::<Vec<_>>();
     // The oracle counts every probe of the plan it was handed, in order, so the
@@ -1069,4 +1077,38 @@ mod tests {
             })
         );
     }
+}
+/// Resolve the implicit Board grouping for execution without authoring a saved
+/// default. Q3 consumes this same effective-view seam after scoped resolution.
+pub fn effective_statistics_view(view: &super::ir::ViewSettings) -> super::ir::ViewSettings {
+    use super::ir::{AggFn, Field, ViewKind};
+    let mut effective = view.clone();
+    if effective.group_by.is_none() && effective.view == Some(ViewKind::Board) {
+        effective.group_by = Some(Field::new("state"));
+    }
+    if effective
+        .group_by
+        .as_ref()
+        .is_some_and(|field| field.as_str().is_empty())
+    {
+        effective.group_by = None;
+    }
+    if effective.aggregates.is_empty() && effective.group_by.is_some() {
+        effective.aggregates.push((Field::new(""), AggFn::Count));
+    }
+    effective
+}
+
+/// Advanced result transforms do not request query-wide statistics. Keep their
+/// ordering/sample settings while explicitly clearing even implicit grouping.
+pub(crate) fn statistics_execution_view(
+    query: &super::ir::Query,
+    view: &super::ir::ViewSettings,
+) -> super::ir::ViewSettings {
+    let mut effective = view.clone();
+    if matches!(query.source, super::ir::Source::Advanced { .. }) {
+        effective.aggregates.clear();
+        effective.group_by = Some(super::ir::Field::new(""));
+    }
+    effective
 }

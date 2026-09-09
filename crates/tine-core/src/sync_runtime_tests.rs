@@ -27143,6 +27143,8 @@ fn managed_query_gate_samples() -> usize {
 /// published, so this is a shape adapter and nothing more.
 fn direct_oracle_answer(bounded: crate::query::BoundedGroups) -> crate::model::BoundedRefGroups {
     crate::model::BoundedRefGroups {
+        matched_total: None,
+        statistics: None,
         groups: std::sync::Arc::new(bounded.groups),
         total: bounded.total,
         exceeded: bounded.exceeded,
@@ -34545,6 +34547,7 @@ fn ret2_an_answer_of_the_wrong_shape_is_an_invalid_snapshot() {
     let wrong = || {
         Outcome::Answered(ManagedQueryAnswer::Pages(
             crate::query::results::PageAnswer {
+                statistics: None,
                 pages: Vec::new(),
                 total: 0,
                 matched_total: 0,

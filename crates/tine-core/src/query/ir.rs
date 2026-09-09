@@ -1057,6 +1057,66 @@ pub enum QueryRows {
     Page { pages: Vec<PageRow> },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryStatisticsMarker {
+    NonFinite,
+    DivisionByZero,
+    EmptyGroup,
+    NonNumeric,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueryStatisticsCell {
+    Number {
+        #[serde(serialize_with = "serialize_finite_statistic")]
+        value: f64,
+        skipped: usize,
+    },
+    Marker {
+        reason: QueryStatisticsMarker,
+        skipped: usize,
+    },
+}
+
+fn serialize_finite_statistic<S: serde::Serializer>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if !value.is_finite() {
+        return Err(serde::ser::Error::custom(
+            "statistics numbers must be finite",
+        ));
+    }
+    serializer.serialize_f64(*value)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryStatisticsGroupingStatus {
+    None,
+    Exact,
+    UnsupportedFormula,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryStatisticsGroup {
+    pub key: Option<String>,
+    pub count: usize,
+    pub cells: Vec<QueryStatisticsCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryStatistics {
+    pub count: usize,
+    pub aggregates: Vec<(Field, AggFn)>,
+    pub group_by: Option<Field>,
+    pub overall: Vec<QueryStatisticsCell>,
+    pub groups: Option<Vec<QueryStatisticsGroup>>,
+    pub grouping_status: QueryStatisticsGroupingStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     #[serde(flatten)]
@@ -1068,6 +1128,8 @@ pub struct QueryResult {
     /// Exact complete stored match count when the producer proved one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<QueryStatistics>,
     pub exceeded: bool,
 }
 

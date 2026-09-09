@@ -272,7 +272,40 @@ export interface QueryReport {
 }
 
 /** The anchor-specific result rows (§7.1, K16), flattened onto the result. */
+export type QueryStatisticsMarker = "non_finite" | "division_by_zero" | "empty_group" | "non_numeric";
+export type QueryStatisticsCell =
+  | { kind: "number"; value: number; skipped: number }
+  | { kind: "marker"; reason: QueryStatisticsMarker; skipped: number };
+export type QueryStatisticsGroup = { key: string | null; count: number; cells: QueryStatisticsCell[] };
+export type QueryStatistics = {
+  count: number; aggregates: [Field, AggFn][]; group_by: Field | null;
+  overall: QueryStatisticsCell[]; groups: QueryStatisticsGroup[] | null;
+  grouping_status: "none" | "exact" | "unsupported_formula";
+};
+
+export function isQueryStatistics(value: unknown): value is QueryStatistics {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  const count = (n: unknown) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+  const cell = (c: unknown): boolean => {
+    if (!c || typeof c !== "object") return false;
+    const x = c as Record<string, unknown>;
+    if (!count(x.skipped)) return false;
+    if (x.kind === "number") return Object.keys(x).length === 3 && typeof x.value === "number" && Number.isFinite(x.value);
+    return x.kind === "marker" && Object.keys(x).length === 3 &&
+      ["non_finite", "division_by_zero", "empty_group", "non_numeric"].includes(x.reason as string);
+  };
+  if (!count(v.count) || !Array.isArray(v.aggregates) || !v.aggregates.every((a) =>
+    Array.isArray(a) && a.length === 2 && typeof a[0] === "string" && ["count", "sum", "avg"].includes(a[1]))) return false;
+  const cells = (a: unknown) => Array.isArray(a) && a.length === (v.aggregates as unknown[]).length && a.every(cell);
+  if (!(v.group_by === null || typeof v.group_by === "string") || !cells(v.overall)) return false;
+  if (v.grouping_status === "none" || v.grouping_status === "unsupported_formula") return v.groups === null;
+  return v.grouping_status === "exact" && Array.isArray(v.groups) && v.groups.every((g) =>
+    g && typeof g === "object" && (g.key === null || typeof g.key === "string") && count(g.count) && cells(g.cells));
+}
+
 export type QueryResult = {
+  statistics?: QueryStatistics;
   diagnostics?: Diagnostic[];
   report: QueryReport;
   total: number;
