@@ -768,7 +768,8 @@
    "nonRequirements": [
     "Pixel geometry of the panel on a wide screen, animation, or the order of rows within one ordered list beyond what the user set."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-09 (Claude): HARNESS DEBT, and the journey is worth keeping \u2014 its first execution found a real product defect (a scoped `tine.block-view:: board` could not reach the sheet face; fixed in 761e7f8c). It is quarantined because it is not yet a dependable gate: measured 8 passes in 10 unchanged-binary runs at dbe8e2af, with two failures of ONE class. Both are a WebDriver handle taken by `browser.$()` and clicked after the panel re-rendered underneath it, so the click reaches a detached node and nothing happens: run 1 of the first burn-in on the section trigger (`.qd-panel still not existing`), run 5 of the second on `.qd-panel .qd-sample` (`tine.sample` never became \"25\"). `pressDisplayTrigger` already fixed that class for the two panel OPENERS; the remaining interactions inside an open panel \u2014 `.qd-sample`, `.qd-view`, the field pickers \u2014 still hold handles across a write-triggered remount, which this journey's own comment predicts (\"a write can remount the sheet under it\"). The repair is the same one-shot find-and-activate pattern `scripts/lib/e2e-navigation.mjs` encodes, applied to every `.qd-panel`-scoped interaction rather than one more site at a time; it was NOT done in this batch because the file had already reached the third-commit churn alarm. Keep running it for artifacts; restore blocking after an unchanged-binary burn-in with no failures of this class."
   },
   "scripts/e2e-query-workspace.mjs": {
    "contracts": [
