@@ -6334,6 +6334,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 
+    #[test]
+    fn external_watcher_edit_after_warm_reopen_enqueues_a_page_delta() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = r6_graph("external-watcher-no-cache");
+        let database = scratch("external-watcher-no-cache-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database).unwrap();
+        assert!(graph.warm_cache_cancellable(|| false));
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        reset_lowerings(&root);
+
+        let path = root.join("pages/two.md");
+        std::fs::write(&path, "- TODO external watcher changed\n").unwrap();
+        assert!(
+            graph.sync_file(&path).is_some(),
+            "the watcher admits external bytes even without a parsed cache"
+        );
+        wait_ready(&graph);
+        let answer = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .expect("ordinary delta progression updates the current main query");
+        assert!(answer
+            .groups
+            .iter()
+            .flat_map(|g| &g.blocks)
+            .any(|block| block.raw.contains("external watcher changed")));
+        assert_eq!(lowerings(), 1, "only the externally edited page is lowered");
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "the watcher does not warm the graph"
+        );
+        assert!(
+            graph.sync_file(&path).is_none(),
+            "unchanged bytes remain a no-op"
+        );
+        assert_eq!(lowerings(), 1);
+        let added = root.join("pages/External-new.md");
+        std::fs::write(&added, "- TODO external watcher created\n").unwrap();
+        assert!(graph.sync_file(&added).is_some());
+        wait_ready(&graph);
+        let answer = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .unwrap();
+        assert!(answer
+            .groups
+            .iter()
+            .flat_map(|g| &g.blocks)
+            .any(|block| block.raw.contains("external watcher created")));
+        assert_eq!(lowerings(), 2);
+        std::fs::remove_file(&added).unwrap();
+        graph.forget_file(&added);
+        wait_ready(&graph);
+        let answer = graph
+            .run_query_bounded("(task TODO)", 100, 1_000_000)
+            .unwrap();
+        assert!(!answer
+            .groups
+            .iter()
+            .flat_map(|g| &g.blocks)
+            .any(|block| block.raw.contains("external watcher created")));
+        assert!(!graph.has_parsed_cache_test());
+    }
+
     /// **R6 §1, one external edit between sessions.** Exactly that page is
     /// parsed and relowered; the parsed cache is never built.
     #[test]

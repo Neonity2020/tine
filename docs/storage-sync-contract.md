@@ -847,6 +847,10 @@ ownership, ordinal, count and estimate validation. Both row and byte limits
 apply. `total` counts admitted pages before sampling; optional `matched_total`
 reports the complete SQL match count, independent of limits and sampling.
 Page navigation uses the physical path even when display names coincide.
+External watcher reconciliation uses the ordinary page-delta producer even
+when the full parsed cache is absent. Repeated delivery of an already admitted
+revision/config uses the existing session identity record to avoid another
+delta; no query answer or saved-edit target is retained for this purpose.
 Recency selection may read file metadata and is measured separately from
 output payload. Cancellation during selection or hydration returns no partial
 page answer. This does not yet supply complete SQL grouped statistics.

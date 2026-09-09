@@ -16139,8 +16139,8 @@ impl Graph {
         drop(guard);
     }
 
-    /// Update one page in the cache after we write it (no full rebuild). A no-op
-    /// if the cache hasn't been built yet. `disk_rev` is `content_rev` of the
+    /// Publish one page delta after a write or external reconciliation, without
+    /// building an absent parsed cache. `disk_rev` is `content_rev` of the
     /// exact on-disk bytes `doc` was produced from (the freshness key — see
     /// `disk_revs`).
     fn cache_upsert(&self, entry: PageEntry, doc: Document, disk_rev: String) {
@@ -21521,7 +21521,7 @@ impl Graph {
         // A missing/mismatched entry falls through to the exact comparison, so this
         // can only ever save work, never serve stale content.
         {
-            let _cache_guard = self.cache.read().unwrap();
+            let cache_guard = self.cache.read().unwrap();
             if self
                 .disk_revs
                 .read()
@@ -21531,44 +21531,52 @@ impl Graph {
             {
                 return Ok(None);
             }
+            // With no parsed cache, the existing session identity owner still
+            // records the exact revision/config admitted by cache_upsert.
+            // Repeated watcher delivery must not enqueue the same delta again.
+            // The cache lock pairs this read with that producer's publication.
+            if cache_guard.is_none()
+                && self
+                    .session_page_ids
+                    .read()
+                    .unwrap()
+                    .get(path)
+                    .is_some_and(|ids| {
+                        ids.revision == disk_rev
+                            && ids.config == self.config.parse_config().digest()
+                    })
+            {
+                return Ok(None);
+            }
         }
         {
             let guard = self.cache.read().unwrap();
-            let Some(cache) = guard.as_ref() else {
-                // Cache not built yet: nothing to reconcile in the parse cache, but
-                // the page SET may have changed (this could be a newly-created
-                // file). Drop the page-list memo so list_pages — and the eventual
-                // warm build that reads it — re-scan the dir and include it.
-                // This path does NOT bump cache_gen, so the gen-keyed find_entry
-                // index would otherwise stay stale here (miss the new/removed file)
-                // until some other op bumps the gen — drop it alongside the list memo.
-                drop(guard);
-                *self.page_list_cache.write().unwrap() = None;
-                *self.find_entry_cache.write().unwrap() = None;
-                *self.cache_index.write().unwrap() = None;
-                return Ok(None);
-            };
-            if let Some(i) = self.cached_page_index_for_path(cache, path) {
-                let cached = &cache[i].1;
-                // Compare CONTENT, not the in-memory uuids: cached blocks carry
-                // generated uuids (assigned at cache build / upsert), while a
-                // fresh `parse` leaves them empty for non-ref-target blocks, so a
-                // direct `cached == newdoc` would never match and would flag every
-                // one of Tine's own writes as an external change. Normalize the
-                // cached doc through the same serialize→parse round-trip the file
-                // went through (both sides then have empty uuids) and compare.
-                let cached_norm = match Format::from_path(path) {
-                    Format::Md => {
-                        let opts = doc::SerializeOpts::detect(Some(content));
-                        doc::parse(&doc::serialize_with(cached, &opts))
+            // A warm SQL session deliberately has no parsed cache. The
+            // ordinary upsert below must still publish its external page delta;
+            // only this optional comparison needs a cached document.
+            if let Some(cache) = guard.as_ref() {
+                if let Some(i) = self.cached_page_index_for_path(cache, path) {
+                    let cached = &cache[i].1;
+                    // Compare CONTENT, not the in-memory uuids: cached blocks carry
+                    // generated uuids (assigned at cache build / upsert), while a
+                    // fresh `parse` leaves them empty for non-ref-target blocks, so a
+                    // direct `cached == newdoc` would never match and would flag every
+                    // one of Tine's own writes as an external change. Normalize the
+                    // cached doc through the same serialize→parse round-trip the file
+                    // went through (both sides then have empty uuids) and compare.
+                    let cached_norm = match Format::from_path(path) {
+                        Format::Md => {
+                            let opts = doc::SerializeOpts::detect(Some(content));
+                            doc::parse(&doc::serialize_with(cached, &opts))
+                        }
+                        Format::Org => crate::org::parse_org(&crate::org::serialize_org_detect(
+                            cached,
+                            Some(content),
+                        )),
+                    };
+                    if cached_norm == newdoc {
+                        return Ok(None); // unchanged / our own write
                     }
-                    Format::Org => crate::org::parse_org(&crate::org::serialize_org_detect(
-                        cached,
-                        Some(content),
-                    )),
-                };
-                if cached_norm == newdoc {
-                    return Ok(None); // unchanged / our own write
                 }
             }
         }

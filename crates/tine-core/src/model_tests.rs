@@ -3959,16 +3959,15 @@ fn find_entry_cache_rebuilds_after_file_rescue_generation_bump() {
 #[test]
 fn find_entry_cache_invalidated_by_cold_sync_file() {
     // Regression: the gen-keyed find_entry index must not go stale on
-    // sync_file's cold-cache branch (the parsed-doc cache not yet built), which
-    // drops the page-list memo WITHOUT bumping cache_gen. Before the fix,
-    // find_entry kept serving the pre-create index here (missing the new file)
-    // until some other op happened to bump the generation.
+    // sync_file with the parsed-doc cache absent. The ordinary page upsert now
+    // advances the generation and enqueues the projection delta in this case;
+    // find_entry must not keep serving the pre-create index.
     let dir = scratch("find-entry-cache-cold-sync");
     fs::write(dir.join("pages").join("Existing.md"), "- body\n").unwrap();
     let g = Graph::open(&dir);
 
     // Do NOT warm the doc cache: find_entry builds only its own index, so
-    // self.cache stays cold and sync_file below takes the else-branch.
+    // self.cache stays cold throughout reconciliation.
     assert!(g.find_entry("New", PageKind::Page).is_none());
 
     // A brand-new external file appears (as Logseq/Syncthing would create it),
