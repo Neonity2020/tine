@@ -411,50 +411,52 @@ class AndroidUiRuntimeTest {
   @Test
   fun systemBarStripAndIconsAgreeWithTinesOwnThemeNotTheDeviceNightSetting() {
     val scenario = ActivityScenario.launch(MainActivity::class.java)
-    try {
-      for (dark in listOf(true, false, true)) {
-        scenario.onActivity { activity ->
-          SystemBarAppearance.apply(activity, dark)
+    for (dark in listOf(true, false, true)) {
+      scenario.onActivity { activity ->
+        SystemBarAppearance.apply(activity, dark)
 
-          val expected = ContextCompat.getColor(
-            activity,
-            if (dark) R.color.tine_system_bar_dark else R.color.tine_system_bar_light,
-          )
-          val background = activity.window.decorView.background
-          assertTrue(
-            "the window background behind the system bars must be a flat colour, was $background",
-            background is ColorDrawable,
-          )
-          assertEquals(
-            "strip colour for dark=$dark",
-            expected,
-            (background as ColorDrawable).color,
-          )
+        val expected = ContextCompat.getColor(
+          activity,
+          if (dark) R.color.tine_system_bar_dark else R.color.tine_system_bar_light,
+        )
+        val background = activity.window.decorView.background
+        assertTrue(
+          "the window background behind the system bars must be a flat colour, was $background",
+          background is ColorDrawable,
+        )
+        assertEquals(
+          "strip colour for dark=$dark",
+          expected,
+          (background as ColorDrawable).color,
+        )
 
-          val controller =
-            WindowCompat.getInsetsController(activity.window, activity.window.decorView)
-          assertEquals(
-            "status-bar icons for dark=$dark",
-            !dark,
-            controller.isAppearanceLightStatusBars,
-          )
-          assertEquals(
-            "navigation-bar icons for dark=$dark",
-            !dark,
-            controller.isAppearanceLightNavigationBars,
-          )
-          // The failure this test exists for: white-on-white. Light icons are
-          // only legible on a light strip, and vice versa.
-          assertTrue(
-            "dark=$dark put ${if (controller.isAppearanceLightStatusBars) "dark" else "light"} " +
-              "icons on a ${if (dark) "dark" else "light"} strip",
-            controller.isAppearanceLightStatusBars != dark,
-          )
-        }
+        val controller =
+          WindowCompat.getInsetsController(activity.window, activity.window.decorView)
+        assertEquals(
+          "status-bar icons for dark=$dark",
+          !dark,
+          controller.isAppearanceLightStatusBars,
+        )
+        assertEquals(
+          "navigation-bar icons for dark=$dark",
+          !dark,
+          controller.isAppearanceLightNavigationBars,
+        )
+        // The failure this test exists for: white-on-white. Light icons are
+        // only legible on a light strip, and vice versa.
+        assertTrue(
+          "dark=$dark put ${if (controller.isAppearanceLightStatusBars) "dark" else "light"} " +
+            "icons on a ${if (dark) "dark" else "light"} strip",
+          controller.isAppearanceLightStatusBars != dark,
+        )
       }
-    } finally {
-      scenario.close()
     }
+    // Deliberately no ActivityScenario teardown here -- same rule as
+    // `withFreshDemoGraph` below. Destroying Tauri's active WebView from the
+    // instrumentation thread aborts HWUI on a destroyed mutex on the hosted
+    // API-35 x86_64 image, and the shell runner already force-stops the package
+    // between methods. `test-release-pipeline.mjs` pins the rule by scanning
+    // this file for the literal call, so do not name it even in a comment.
   }
 
   private fun withFreshDemoGraph(
