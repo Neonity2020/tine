@@ -31284,21 +31284,54 @@ fn c7b_repository_source(relative: &str) -> String {
 /// the function that contains it, and a nested `fn` cannot be mistaken for the
 /// outer one.
 fn c7b_fn_body(relative: &str, name: &str) -> String {
+    c7b_body_of(relative, None, name)
+}
+
+/// The same, for a method name that several `impl` blocks legitimately share.
+///
+/// `SyncRuntimeHandle::application_navigation` (the public entry) and
+/// `RuntimeActor::application_navigation` (the serialized turn that answers it)
+/// are two different functions with one name, which is correct — the caller-side
+/// name IS the actor-side name. An unqualified lookup cannot tell them apart and
+/// fails with "must define exactly one", which reads as a duplication defect
+/// rather than as a guard that needs to say which side it means.
+fn c7b_impl_fn_body(relative: &str, self_ty: &str, name: &str) -> String {
+    c7b_body_of(relative, Some(self_ty), name)
+}
+
+fn c7b_body_of(relative: &str, self_ty: Option<&str>, name: &str) -> String {
     use syn::visit::{self, Visit};
 
     struct Finder<'a> {
         name: &'a str,
+        self_ty: Option<&'a str>,
+        inside: Option<String>,
         spans: Vec<(usize, usize)>,
     }
     impl<'a> Finder<'a> {
         fn record(&mut self, ident: &syn::Ident, block: &syn::Block) {
-            if ident == self.name {
-                let span = block.brace_token.span.join();
-                self.spans.push((span.start().line, span.end().line));
+            if ident != self.name {
+                return;
             }
+            if let Some(wanted) = self.self_ty {
+                if self.inside.as_deref() != Some(wanted) {
+                    return;
+                }
+            }
+            let span = block.brace_token.span.join();
+            self.spans.push((span.start().line, span.end().line));
         }
     }
     impl<'ast, 'a> Visit<'ast> for Finder<'a> {
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let outer = self.inside.take();
+            self.inside = match item.self_ty.as_ref() {
+                syn::Type::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
+                _ => None,
+            };
+            visit::visit_item_impl(self, item);
+            self.inside = outer;
+        }
         fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
             self.record(&item.sig.ident, &item.block);
             visit::visit_item_fn(self, item);
@@ -31313,13 +31346,20 @@ fn c7b_fn_body(relative: &str, name: &str) -> String {
     let file = syn::parse_file(&source).expect("production source parses");
     let mut finder = Finder {
         name,
+        self_ty,
+        inside: None,
         spans: Vec::new(),
     };
     finder.visit_file(&file);
+    let qualified = match self_ty {
+        Some(self_ty) => format!("{self_ty}::{name}"),
+        None => name.to_string(),
+    };
     assert_eq!(
         finder.spans.len(),
         1,
-        "{relative} must define exactly one `{name}`; found {}",
+        "{relative} must define exactly one `{qualified}`; found {}. If two impls share the \
+         name legitimately, qualify the lookup with `c7b_impl_fn_body` instead of collapsing them.",
         finder.spans.len()
     );
     let (start, end) = finder.spans[0];
@@ -31417,7 +31457,17 @@ fn c7b_query_walk_boundaries_are_shared_and_live_sql_does_not_restore_a_walk() {
         "execute_main_source",
     );
     assert!(managed.contains("lower_query("));
-    assert!(managed.contains("read_results("));
+    // The shared SQL result reader, one call per anchor. `read_results` was
+    // split into these two by Q4 (`6661bd07`) and this pin kept naming the old
+    // one, so it went red while the boundary it guards was never breached — a
+    // name pin outlives the name unless it is moved with it.
+    for reader in ["read_page_results(", "read_ordered_results("] {
+        assert!(
+            managed.contains(reader),
+            "Managed live SQL execution must read its rows through the shared \
+             `query::results` reader; `{reader}` is missing"
+        );
+    }
     for forbidden in [
         "QueryPageSource",
         "run_pred_bounded_over(",
@@ -31459,7 +31509,11 @@ fn c7b_query_walk_boundaries_are_shared_and_live_sql_does_not_restore_a_walk() {
             );
         }
     }
-    let public = c7b_fn_body(C7B_SYNC_RUNTIME_RS, "application_navigation");
+    let public = c7b_impl_fn_body(
+        C7B_SYNC_RUNTIME_RS,
+        "SyncRuntimeHandle",
+        "application_navigation",
+    );
     assert!(
         public.contains("application_captured_export("),
         "Managed export must leave the navigation actor before SQL"

@@ -779,17 +779,32 @@ fn resolve_blocks_uses_hinted_page_lookup_without_per_hint_linear_scans() {
     );
 }
 
+/// Advanced queries keep NO answer memo, and must not grow one back.
+///
+/// `3ad93741` removed backend answer retention: an advanced query re-executes
+/// against the current image every time, which is what lets an accepted save be
+/// visible to the very next query with no invalidation protocol to get wrong.
+///
+/// This replaces `run_advanced_query_uses_generation_keyed_memo_cache`, which
+/// asserted the OPPOSITE and had been red ever since the retirement landed. A
+/// guard pinning a retired architecture says nothing about the one that
+/// replaced it, and its failure reads as debt rather than as staleness.
+///
+/// `derived_memo` survives deliberately and is not what this pins: backlinks
+/// and unlinked references are a different question with a different answer.
+/// The runtime half of this claim is `sheets_phase0_bench`'s `repeat_vs_warm`
+/// column, which should sit near 1.00.
 #[test]
-fn run_advanced_query_uses_generation_keyed_memo_cache() {
+fn advanced_queries_keep_no_answer_memo() {
     let src = include_str!("../src/model.rs");
-    assert!(
-        src.contains("fn advanced_memo_bounded("),
-        "advanced queries should have a dedicated memo cache"
-    );
-    assert!(
-        !src.contains("Not memoized (invoked on demand)"),
-        "stale non-memoized advanced-query comment should be gone"
-    );
+    for retired in ["fn advanced_memo_bounded(", "fn clear_query_memos_test("] {
+        assert!(
+            !src.contains(retired),
+            "`{retired}` is back in model.rs. Advanced queries re-execute against the current \
+             image and retain no answer (3ad93741). Reinstating an answer cache is a design \
+             decision that owes an invalidation contract, not a helper."
+        );
+    }
 }
 
 #[test]
