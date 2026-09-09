@@ -81,6 +81,10 @@ const windowsManagedScenario = fs.readFileSync(
   path.join(process.cwd(), "scripts/e2e-windows-managed-storage.mjs"),
   "utf8"
 );
+const navigationContract = fs.readFileSync(
+  path.join(process.cwd(), "scripts/lib/e2e-navigation.mjs"),
+  "utf8"
+);
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const iosConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), "src-tauri/tauri.ios.conf.json"), "utf8"));
@@ -208,10 +212,24 @@ assert.match(
   /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
   "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
 );
+// `affe9be1` moved page navigation into ONE implementation, so this property no
+// longer lives in the journey: the scenario calls `openPageByName` and the row
+// selection is in `scripts/lib/e2e-navigation.mjs`. Pin it where it actually is,
+// and pin that the scenario still routes through it -- pinning only the helper
+// would pass while a journey grew its own switcher code again, which is the
+// exact regression the shared contract exists to prevent. The `kind` check the
+// journey used to carry is deliberately not required: excluding `block-result`
+// rows and demanding an exact name match is the same user-visible outcome, and
+// the shared contract states it that way.
+assert.match(
+  navigationContract,
+  /!candidate\.classList\.contains\("block-result"\)[\s\S]*?\.switcher-name[\s\S]*?=== target/,
+  "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
+);
 assert.match(
   windowsManagedScenario,
-  /\.switcher-row:not\(\.block-result\)[\s\S]*?kind === "page" \|\| kind === "journal"[\s\S]*?name === title/,
-  "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
+  /import \{[^}]*openPageByName[^}]*\} from "\.\/lib\/e2e-navigation\.mjs"/,
+  "the Windows managed scenario must navigate through the shared page-navigation contract"
 );
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
