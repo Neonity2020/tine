@@ -218,8 +218,18 @@ describe("the TypeScript mirror of the Rust query IR", () => {
     expect(resultPage.anchor).toBe("page");
     // The point of the discriminant: a page result carries `pages`, never
     // `groups`, so a consumer cannot read block rows off a page-anchored answer.
-    if (resultPage.anchor === "page") expect(Array.isArray(resultPage.pages)).toBe(true);
-    if (resultBlock.anchor === "block") expect(Array.isArray(resultBlock.groups)).toBe(true);
+    if (resultPage.anchor === "page") {
+      expect(Array.isArray(resultPage.pages)).toBe(true);
+      expect(resultPage.pages[0]).toMatchObject({
+        path: "pages/home.md",
+        properties: [["status", "active"]],
+      });
+      expect(resultPage.matched_total).toBe(7);
+    }
+    if (resultBlock.anchor === "block") {
+      expect(Array.isArray(resultBlock.groups)).toBe(true);
+      expect(resultBlock.matched_total).toBeUndefined();
+    }
   });
 
   it("mirrors the enum lists against the fixtures' own spellings", () => {

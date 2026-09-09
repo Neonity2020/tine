@@ -34291,6 +34291,7 @@ fn ret2_an_answer_of_the_wrong_shape_is_an_invalid_snapshot() {
             crate::query::results::PageAnswer {
                 pages: Vec::new(),
                 total: 0,
+                matched_total: 0,
                 exceeded: false,
             },
         ))

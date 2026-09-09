@@ -105,6 +105,7 @@ use crate::doc::property_key_norm;
 use crate::query::atom::atom_key;
 use crate::query::eval::{format_number, CompiledLeaves};
 use crate::query::ir::{Anchor, Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Query, Rel, Value};
+use crate::query::rank::{JournalRankInput, PageRecencyPrograms, QueryRankPrograms};
 use crate::query::registry::Registry;
 use crate::refs;
 use crate::search_query::{canonical_fold, AndGroup, Matcher, Term};
@@ -626,13 +627,14 @@ pub(crate) fn descriptor_statement(
 }
 
 /// The PAGE statement for one lowered `@page` query: the same selected pages,
-/// plus the two order keys the shared page read charges its `max_rows` in.
+/// plus the ordering, complete count and raw-cost metadata the shared reader
+/// needs before it hydrates admitted page properties.
 ///
 /// **A wrapper, not a second compiler**, exactly as [`descriptor_statement`] is:
 /// `statement` is [`lower_query`]'s output verbatim, its selected-page relation
 /// becomes one more CTE (`r`) beside whatever `WITH` list the statement already
-/// carries, and nothing is bound here. A block-anchored statement is rejected —
-/// its rows are the descriptor read's.
+/// carries. Sort programs and property keys are bound values. A block-anchored
+/// statement is rejected because its rows belong to the block descriptor read.
 ///
 /// **The join is LEFT on purpose (D-3).** Direct Files' page order IS
 /// `query_page_order.position`; a missing row must FAIL the read rather than
@@ -640,10 +642,18 @@ pub(crate) fn descriptor_statement(
 /// supplies no `query_page_order` and orders by `pages.path` under SQLite's
 /// BINARY collation, which is `String::cmp` on the UTF-8 bytes and is exactly
 /// the `rel_path` sort `application_navigation_pages_ready` ends with.
+pub(crate) struct RankedPageStatement {
+    pub(crate) query: SqlQuery,
+    pub(crate) ranks: QueryRankPrograms,
+}
+
 pub(crate) fn page_statement(
     statement: &SqlQuery,
     order: crate::query::results::BackendOrder,
-) -> Result<SqlQuery, MaterializationError> {
+    view: &crate::query::ir::ViewSettings,
+    max_rows: usize,
+    recency: &PageRecencyPrograms,
+) -> Result<RankedPageStatement, MaterializationError> {
     let page_anchor = format!("{PAGE_ANCHOR_SELECT} {PAGE_ANCHOR_FROM}");
     let Some(at) = find_once(&statement.sql, &page_anchor)? else {
         return Err(MaterializationError::InvalidQuery(
@@ -660,20 +670,125 @@ pub(crate) fn page_statement(
         crate::query::results::BackendOrder::Direct => "o.position",
         crate::query::results::BackendOrder::Managed => "r.path",
     };
-    Ok(SqlQuery {
-        sql: format!(
-            "{with} r(page_id, name, text_kind, journal_day, path) AS ({body}) \
-             SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, o.position \
-             FROM r \
-             LEFT JOIN query_page_order o ON o.page_id = r.page_id \
-             ORDER BY {base}"
-        ),
-        params: statement.params.clone(),
-        positively_bounded: statement.positively_bounded,
-        matches_nothing: statement.matches_nothing,
-        content_plans: statement.content_plans.clone(),
-        regexes: statement.regexes.clone(),
+    let mut params = statement.params.clone();
+    let mut ranks = QueryRankPrograms::default();
+    let mut lowercase = None;
+    let mut property_keys = HashMap::<String, String>::new();
+    let mut order_terms = Vec::new();
+    let mut bound_recency = None;
+    for (field, direction) in &view.sort {
+        let normalized = field.as_str().to_ascii_lowercase();
+        let expression = match normalized.as_str() {
+            "name" | "page" => {
+                let lowercase = lowercase.get_or_insert_with(|| {
+                    let id = ranks.bind_unicode_lowercase();
+                    bind_page_param(&mut params, PhysicalQueryValue::Integer(id as i64))
+                });
+                format!("tine_query_rank({lowercase}, r.name)")
+            }
+            // The current text decorations are `journal` and `page`, in that
+            // lexical order. Physical encoding is Page=0, Journal=1, so a raw
+            // numeric sort would silently reverse the established meaning.
+            "kind" => "CASE r.text_kind WHEN 1 THEN 0 WHEN 0 THEN 1 ELSE 2 END".into(),
+            "day" | "journal-day" | "journal_day" => {
+                "COALESCE(r.journal_day, -9223372036854775808)".into()
+            }
+            "modified" | "updated" | "updated-at" | "date" => {
+                let bound = *bound_recency.get_or_insert_with(|| recency.bind(&mut ranks));
+                let journal_id = bind_page_param(
+                    &mut params,
+                    PhysicalQueryValue::Integer(bound.journal_id as i64),
+                );
+                let file_id = bind_page_param(
+                    &mut params,
+                    PhysicalQueryValue::Integer(bound.file_id as i64),
+                );
+                match bound.journal_input {
+                    // Direct Files' established producer takes `Option<day>`:
+                    // an undated journal follows the same file-mtime branch as
+                    // an ordinary page.
+                    JournalRankInput::StoredDay => format!(
+                        "CASE WHEN r.text_kind = {TEXT_KIND_JOURNAL} \
+                                   AND r.journal_day IS NOT NULL \
+                         THEN tine_query_rank({journal_id}, CAST(r.journal_day AS TEXT)) \
+                         ELSE tine_query_rank({file_id}, r.path) END"
+                    ),
+                    // Managed's established producer parses the display name
+                    // and deliberately ranks an unparseable journal at MIN.
+                    JournalRankInput::DisplayName => format!(
+                        "CASE WHEN r.text_kind = {TEXT_KIND_JOURNAL} \
+                         THEN tine_query_rank({journal_id}, r.name) \
+                         ELSE tine_query_rank({file_id}, r.path) END"
+                    ),
+                }
+            }
+            _ => {
+                let lowercase = lowercase.get_or_insert_with(|| {
+                    let id = ranks.bind_unicode_lowercase();
+                    bind_page_param(&mut params, PhysicalQueryValue::Integer(id as i64))
+                });
+                let key = property_key_norm(field.as_str());
+                let key_param = property_keys
+                    .entry(key.clone())
+                    .or_insert_with(|| bind_page_param(&mut params, PhysicalQueryValue::Text(key)))
+                    .clone();
+                format!(
+                    "tine_query_rank({lowercase}, COALESCE(\
+                       (SELECT property.value FROM properties property \
+                        WHERE property.owner_type = {OWNER_PAGE} \
+                          AND property.owner_id = r.page_id \
+                          AND property.page_id = r.page_id \
+                          AND property.normalized_name = {key_param} \
+                        ORDER BY property.ordinal, property.name LIMIT 1), \
+                       r.name))"
+                )
+            }
+        };
+        let direction = match direction {
+            crate::query::ir::SortDir::Asc => "ASC",
+            crate::query::ir::SortDir::Desc => "DESC",
+        };
+        order_terms.push(format!("{expression} {direction}"));
+    }
+    if order_terms.is_empty() {
+        order_terms.push(base.into());
+    } else {
+        order_terms.push("r.path COLLATE BINARY ASC".into());
+        order_terms.push("r.page_id ASC".into());
+    }
+    let limit = max_rows
+        .checked_add(1)
+        .and_then(|rows| i64::try_from(rows).ok())
+        .map(|rows| {
+            let parameter = bind_page_param(&mut params, PhysicalQueryValue::Integer(rows));
+            format!(" LIMIT {parameter}")
+        })
+        .unwrap_or_default();
+    Ok(RankedPageStatement {
+        query: SqlQuery {
+            sql: format!(
+                "{with} r(page_id, name, text_kind, journal_day, path) AS ({body}) \
+                 SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, o.position, \
+                        q.estimated_bytes, q.property_count, COUNT(*) OVER () \
+                 FROM r \
+                 LEFT JOIN query_page_order o ON o.page_id = r.page_id \
+                 LEFT JOIN query_page_results q ON q.page_id = r.page_id \
+                 ORDER BY {}{limit}",
+                order_terms.join(", ")
+            ),
+            params,
+            positively_bounded: statement.positively_bounded,
+            matches_nothing: statement.matches_nothing,
+            content_plans: statement.content_plans.clone(),
+            regexes: statement.regexes.clone(),
+        },
+        ranks,
     })
+}
+
+fn bind_page_param(params: &mut Vec<PhysicalQueryValue>, value: PhysicalQueryValue) -> String {
+    params.push(value);
+    format!("?{}", params.len())
 }
 
 /// The offset of `needle` in `haystack`, requiring it to occur exactly once.

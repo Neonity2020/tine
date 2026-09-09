@@ -6834,11 +6834,13 @@ impl Graph {
                 supported: true,
             },
             total: 0,
+            matched_total: (query.anchor == crate::query::ir::Anchor::Page).then_some(0),
             exceeded: false,
         };
         if query.anchor == crate::query::ir::Anchor::Page {
-            let answer = self.direct_page_rows(query, resolved.today(), bounds)?;
+            let answer = self.direct_page_rows(query, view, resolved.today(), bounds)?;
             result.total = answer.total;
+            result.matched_total = Some(answer.matched_total);
             result.exceeded = answer.exceeded;
             result.rows = crate::query::ir::QueryRows::Page {
                 pages: answer.pages,
@@ -6911,11 +6913,12 @@ impl Graph {
     fn direct_page_rows(
         &self,
         query: &crate::query::ir::Query,
+        view: &crate::query::ir::ViewSettings,
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
     ) -> Result<crate::query::results::PageAnswer, crate::query::QueryExecutionError> {
         self.dispatch_direct_query(|request| {
-            self.direct_projection_statement_page_rows(request, query, today, bounds)
+            self.direct_projection_statement_page_rows(request, query, view, today, bounds)
         })
     }
 
@@ -6992,6 +6995,7 @@ impl Graph {
         &self,
         request: &DirectQueryRequest,
         query: &crate::query::ir::Query,
+        view: &crate::query::ir::ViewSettings,
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
     ) -> DirectAttempt<crate::query::results::PageAnswer> {
@@ -7012,8 +7016,8 @@ impl Graph {
                 &LoweringInputs {
                     today,
                     registry: &registry,
-                    // NOT `max_rows`: the page loop's `exceeded` is decided by the
-                    // row AFTER the cap, so a `LIMIT` would hide it.
+                    // Selection stays complete; the page wrapper owns its
+                    // post-order limit and `COUNT(*) OVER()` exact count.
                     cutoff: None,
                     compiled: &compiled,
                     fts_ready,
@@ -7025,11 +7029,27 @@ impl Graph {
             if statement.matches_nothing {
                 return Ok(crate::query::results::PageAnswer::default());
             }
+            let root = self.root.clone();
+            let page_recency = crate::query::rank::PageRecencyPrograms::new(
+                crate::query::rank::JournalRankInput::StoredDay,
+                |day| {
+                    crate::query::page_recency_secs_for(
+                        day.parse::<i64>().ok(),
+                        std::path::Path::new(""),
+                    )
+                },
+                move |path| crate::query::page_recency_secs_for(None, &root.join(path)),
+            );
             crate::query::results::read_page_results(
                 &mut job.snapshot,
-                &statement,
-                crate::query::results::BackendOrder::Direct,
-                bounds.max_rows,
+                &crate::query::results::PageReadInputs {
+                    statement: &statement,
+                    order: crate::query::results::BackendOrder::Direct,
+                    view,
+                    max_rows: bounds.max_rows,
+                    max_bytes: bounds.max_bytes,
+                    recency: &page_recency,
+                },
             )
             .map_err(Into::into)
         })
@@ -7097,6 +7117,18 @@ impl Graph {
             let recency = |page: crate::query::results::RecencyPage<'_>| {
                 crate::query::page_recency_secs_for(page.journal_day, &self.root.join(page.path))
             };
+            let root = self.root.clone();
+            let page_recency = crate::query::rank::PageRecencyPrograms::new(
+                crate::query::rank::JournalRankInput::StoredDay,
+                |day| {
+                    crate::query::page_recency_secs_for(
+                        day.parse::<i64>().ok(),
+                        std::path::Path::new(""),
+                    )
+                },
+                move |path| crate::query::page_recency_secs_for(None, &root.join(path)),
+            );
+            let page_count_view = crate::query::ir::ViewSettings::default();
             let mut counts = Vec::with_capacity(lowered.len());
             for statement in &lowered {
                 if statement.matches_nothing {
@@ -7106,12 +7138,17 @@ impl Graph {
                 counts.push(if page_anchored {
                     crate::query::results::read_page_results(
                         &mut job.snapshot,
-                        statement,
-                        crate::query::results::BackendOrder::Direct,
-                        bounds.max_rows,
+                        &crate::query::results::PageReadInputs {
+                            statement,
+                            order: crate::query::results::BackendOrder::Direct,
+                            view: &page_count_view,
+                            max_rows: 0,
+                            max_bytes: 0,
+                            recency: &page_recency,
+                        },
                     )
                     .map_err(crate::query::QueryExecutionError::from)?
-                    .total
+                    .matched_total
                 } else {
                     crate::query::results::read_results(
                         &mut job.snapshot,

@@ -356,6 +356,7 @@ fn the_query_result_wire_format_is_tagged_by_anchor() {
                 supported: true,
             },
             total: 1,
+            matched_total: None,
             exceeded: false,
         },
     );
@@ -365,14 +366,18 @@ fn the_query_result_wire_format_is_tagged_by_anchor() {
             rows: QueryRows::Page {
                 pages: vec![
                     PageRow {
+                        path: "pages/home.md".to_string(),
                         name: "Home".to_string(),
                         kind: PageKind::Page,
                         journal_day: None,
+                        properties: vec![("status".to_string(), "active".to_string())],
                     },
                     PageRow {
+                        path: "journals/2026_07_29.md".to_string(),
                         name: "Jul 29th, 2026".to_string(),
                         kind: PageKind::Journal,
                         journal_day: Some(20260729),
+                        properties: vec![],
                     },
                 ],
             },
@@ -389,6 +394,7 @@ fn the_query_result_wire_format_is_tagged_by_anchor() {
                 supported: true,
             },
             total: 2,
+            matched_total: Some(7),
             exceeded: true,
         },
     );

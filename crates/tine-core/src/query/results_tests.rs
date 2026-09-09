@@ -27,11 +27,13 @@ use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 use crate::date::JournalDate;
 
 use crate::model::{block_dto_estimated_bytes, BlockDto, PageKind};
-use crate::query::ir::{Bounds, ExecutionContext};
+use crate::query::ir::{Anchor, Bounds, ExecutionContext, Field, SortDir};
 use crate::query::ir::{Query, ViewSettings};
+use crate::query::rank::{JournalRankInput, PageRecencyPrograms, QueryRankPrograms};
 use crate::query::results::{
-    read_results, reset_result_read_census, result_read_census, set_before_payload_batch_hook,
-    BackendOrder, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
+    read_page_results, read_results, reset_result_read_census, result_read_census,
+    set_before_page_payload_batch_hook, set_before_payload_batch_hook, BackendOrder,
+    PageReadInputs, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
 };
 use crate::query::sql::sql_gates_tests::{
     scratch, serialize, write_fast_corpus, Corpus, CONTENT_PLAN_SHAPES, IDENTITY_SHAPES,
@@ -39,8 +41,8 @@ use crate::query::sql::sql_gates_tests::{
 };
 use crate::query::sql::{descriptor_statement, ContentPlan};
 use crate::query::{
-    collect_pred_bounded_over, page_recency_secs_for, ConstructionProfile, GraphQueryPages,
-    PreViewGroups, QueryDialect, QueryInput, QueryPageSource,
+    collect_page_rows_over, collect_pred_bounded_over, page_recency_secs_for, ConstructionProfile,
+    GraphQueryPages, PreViewGroups, QueryDialect, QueryInput, QueryPageSource,
 };
 
 /// Every shape the parity gates run, from §5's own three tables. `PLAN_SHAPES`
@@ -126,6 +128,75 @@ fn byte_boundaries(reference: &PreViewGroups) -> Vec<usize> {
 /// rather than with the walk.
 fn recency_for(root: &Path) -> impl Fn(RecencyPage<'_>) -> i64 + '_ {
     move |page| page_recency_secs_for(page.journal_day, &root.join(page.path))
+}
+
+fn page_recency_for(root: &Path) -> PageRecencyPrograms {
+    let file_root = root.to_path_buf();
+    PageRecencyPrograms::new(
+        JournalRankInput::StoredDay,
+        |day| page_recency_secs_for(day.parse::<i64>().ok(), Path::new("")),
+        move |path| page_recency_secs_for(None, &file_root.join(path)),
+    )
+}
+
+fn database_page_answer(
+    corpus: &Corpus,
+    source: &str,
+    view: &ViewSettings,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<crate::query::results::PageAnswer, ResultReadError> {
+    let (anchor, statement) = corpus.lower(source, QueryDialect::Tql, corpus.fts_ready());
+    assert_eq!(
+        anchor,
+        Anchor::Page,
+        "the fixture query stays page-anchored"
+    );
+    let recency = page_recency_for(&corpus.root);
+    let mut snapshot = corpus.snapshot();
+    let answer = read_page_results(
+        &mut snapshot,
+        &PageReadInputs {
+            statement: &statement,
+            order: BackendOrder::Direct,
+            view,
+            max_rows,
+            max_bytes,
+            recency: &recency,
+        },
+    );
+    snapshot.finish();
+    answer
+}
+
+fn oracle_page_answer(
+    corpus: &Corpus,
+    source: &str,
+    view: &ViewSettings,
+    max_rows: usize,
+    max_bytes: usize,
+) -> crate::query::results::PageAnswer {
+    let (query, _) = crate::query::parse_query_text(source, QueryDialect::Tql, corpus.today());
+    collect_page_rows_over(
+        &GraphQueryPages(&corpus.graph),
+        &query,
+        view,
+        corpus.today(),
+        Bounds {
+            max_rows,
+            max_bytes,
+        },
+    )
+}
+
+fn assert_page_answers_equal(
+    expected: &crate::query::results::PageAnswer,
+    actual: &crate::query::results::PageAnswer,
+) {
+    assert_eq!(actual.pages, expected.pages);
+    assert_eq!(actual.total, expected.total);
+    assert_eq!(actual.matched_total, expected.matched_total);
+    assert_eq!(actual.exceeded, expected.exceeded);
 }
 
 /// The walk's answer for one shape under one set of bounds.
@@ -518,6 +589,524 @@ fn write_ordering_corpus(root: &Path) {
     }
 }
 
+fn write_page_result_corpus(root: &Path, pages: usize) {
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    for at in 0..pages {
+        let rank = if at + 1 == pages {
+            "a-winner".to_string()
+        } else {
+            format!("z-{at:03}")
+        };
+        std::fs::write(
+            root.join("pages").join(format!("Page{at:03}.md")),
+            format!("rank:: {rank}\ngroup:: {}\n\n- body\n", at % 3),
+        )
+        .expect("page fixture");
+    }
+}
+
+#[test]
+fn page_results_sort_the_complete_set_before_limit_and_keep_exact_counts() {
+    let _serial = serialize();
+    let root = scratch("s3-page-complete-sort");
+    write_page_result_corpus(&root, 45);
+    let corpus = Corpus::open(root, true);
+    let source = "@page and journal = false";
+    let view = ViewSettings {
+        sort: vec![(Field::new("rank"), SortDir::Asc)],
+        sample: Some(1),
+        ..ViewSettings::default()
+    };
+
+    let expected = oracle_page_answer(&corpus, source, &view, 2, usize::MAX);
+    let actual = database_page_answer(&corpus, source, &view, 2, usize::MAX)
+        .expect("the shared page reader answers");
+    assert_page_answers_equal(&expected, &actual);
+    assert_eq!(actual.matched_total, 45);
+    assert_eq!(actual.total, 2, "sample does not rewrite admitted total");
+    assert_eq!(
+        actual.pages.len(),
+        1,
+        "sample is applied after construction"
+    );
+    assert_eq!(actual.pages[0].path, "pages/Page044.md");
+    assert_eq!(
+        actual.pages[0].properties[0],
+        ("rank".into(), "a-winner".into())
+    );
+    assert!(actual.exceeded);
+
+    let mut snapshot = corpus.snapshot();
+    let position = snapshot
+        .run_projection_query(
+            "SELECT o.position FROM query_page_order o JOIN pages p ON p.page_id = o.page_id \
+             WHERE p.path = ?1",
+            &[PhysicalQueryValue::Text("pages/Page044.md".into())],
+        )
+        .expect("the stored inventory position is readable");
+    snapshot.finish();
+    assert!(
+        matches!(
+            position.first().and_then(|row| row.first()),
+            Some(PhysicalQueryValue::Integer(at)) if *at >= 41
+        ),
+        "the winning row must originate beyond the retired 41-row prefix"
+    );
+}
+
+#[test]
+fn page_result_limits_use_raw_estimates_and_never_hide_the_complete_count() {
+    let _serial = serialize();
+    let root = scratch("s3-page-bounds");
+    write_page_result_corpus(&root, 3);
+    let corpus = Corpus::open(root, true);
+    let source = "@page and journal = false";
+    let view = ViewSettings {
+        sort: vec![(Field::new("rank"), SortDir::Asc)],
+        ..ViewSettings::default()
+    };
+    let unbounded = oracle_page_answer(&corpus, source, &view, usize::MAX, usize::MAX);
+    let first = &unbounded.pages[0];
+    let first_cost = tine_storage::sqlite::query_page_result_estimated_bytes(
+        &first.name,
+        &first.path,
+        first
+            .properties
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    assert!(first_cost > 0);
+
+    for (rows, bytes) in [
+        (0, usize::MAX),
+        (usize::MAX, 0),
+        (1, usize::MAX),
+        (usize::MAX, first_cost),
+        (usize::MAX, first_cost - 1),
+    ] {
+        let expected = oracle_page_answer(&corpus, source, &view, rows, bytes);
+        let actual = database_page_answer(&corpus, source, &view, rows, bytes)
+            .expect("the bounded shared page reader answers");
+        assert_page_answers_equal(&expected, &actual);
+        assert_eq!(actual.matched_total, 3);
+    }
+    reset_result_read_census();
+    let empty = database_page_answer(
+        &corpus,
+        "@page and name = 'No Such Page'",
+        &view,
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("an empty page query answers");
+    assert_eq!(
+        (empty.pages.len(), empty.total, empty.matched_total),
+        (0, 0, 0)
+    );
+    assert!(!empty.exceeded);
+    assert_eq!(result_read_census().page_payload_statements, 0);
+}
+
+#[test]
+fn page_property_sort_matches_the_independent_oracle_for_saved_semantics() {
+    let _serial = serialize();
+    let root = scratch("s3-page-sort-semantics");
+    std::fs::create_dir_all(root.join("pages/nested")).expect("pages");
+    for (path, body) in [
+        ("NumTen.md", "rank:: 10\ngroup:: b\n\n- body\n"),
+        ("NumTwo.md", "rank:: 2\ngroup:: b\n\n- body\n"),
+        ("Twin.md", "rank:: İ\ngroup:: a\n\n- body\n"),
+        ("nested/Twin.md", "rank:: i\u{307}\ngroup:: a\n\n- body\n"),
+        ("Missing.md", "group:: a\n\n- body\n"),
+        ("OrdFirst.md", "rank:: zzz\nrank:: a\ngroup:: c\n\n- body\n"),
+        ("OrdSecond.md", "rank:: zz\ngroup:: c\n\n- body\n"),
+    ] {
+        std::fs::write(root.join("pages").join(path), body).expect("page fixture");
+    }
+    let corpus = Corpus::open(root, true);
+    let source = "@page and journal = false";
+    for view in [
+        ViewSettings {
+            sort: vec![(Field::new("rank"), SortDir::Asc)],
+            ..ViewSettings::default()
+        },
+        ViewSettings {
+            sort: vec![
+                (Field::new("group"), SortDir::Desc),
+                (Field::new("rank"), SortDir::Asc),
+            ],
+            ..ViewSettings::default()
+        },
+        ViewSettings {
+            sort: vec![(Field::new("name"), SortDir::Desc)],
+            ..ViewSettings::default()
+        },
+    ] {
+        let expected = oracle_page_answer(&corpus, source, &view, usize::MAX, usize::MAX);
+        let actual = database_page_answer(&corpus, source, &view, usize::MAX, usize::MAX)
+            .expect("the sorted page read answers");
+        assert_page_answers_equal(&expected, &actual);
+    }
+
+    let lexical = database_page_answer(
+        &corpus,
+        "@page and name like 'Num%'",
+        &ViewSettings {
+            sort: vec![(Field::new("rank"), SortDir::Asc)],
+            ..ViewSettings::default()
+        },
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("the lexical property sort answers");
+    assert_eq!(
+        lexical
+            .pages
+            .iter()
+            .map(|page| page.name.as_str())
+            .collect::<Vec<_>>(),
+        ["NumTen", "NumTwo"],
+        "numeric-looking authored properties remain lexical"
+    );
+    let twins = lexical.matched_total;
+    assert_eq!(twins, 2);
+    let first_ordinal = database_page_answer(
+        &corpus,
+        "@page and name like 'Ord%'",
+        &ViewSettings {
+            sort: vec![(Field::new("rank"), SortDir::Asc)],
+            ..ViewSettings::default()
+        },
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("the repeated-property sort answers");
+    assert_eq!(
+        first_ordinal
+            .pages
+            .iter()
+            .map(|page| page.name.as_str())
+            .collect::<Vec<_>>(),
+        ["OrdSecond", "OrdFirst"],
+        "the first authored property ordinal owns the saved sort scalar"
+    );
+    let all = database_page_answer(
+        &corpus,
+        source,
+        &ViewSettings::default(),
+        usize::MAX,
+        usize::MAX,
+    )
+    .expect("the default page read answers");
+    assert_eq!(
+        all.pages.iter().filter(|page| page.name == "Twin").count(),
+        2
+    );
+    assert!(all.pages.iter().any(|page| page.path == "pages/Twin.md"));
+    assert!(all
+        .pages
+        .iter()
+        .any(|page| page.path == "pages/nested/Twin.md"));
+}
+
+#[test]
+fn direct_page_recency_uses_file_mtime_for_undated_journals_and_ordinary_pages() {
+    let _serial = serialize();
+    let root = scratch("s3-page-undated-journal-recency");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let ordinary = root.join("pages/A-ordinary.md");
+    let undated = root.join("pages/Z-undated.md");
+    std::fs::write(&ordinary, "- ordinary\n").expect("ordinary page");
+    std::fs::write(&undated, "- undated journal\n").expect("undated journal");
+    let set_mtime = |path: &Path, seconds| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the fixture file opens");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+        )
+        .expect("the fixture mtime is settable");
+    };
+    set_mtime(&ordinary, 100);
+    set_mtime(&undated, 200);
+    let corpus = Corpus::open(root, true);
+
+    // Accepted inventory can retain an explicit Journal classification for a
+    // path whose filename supplies no day. The Direct physical producer stores
+    // that exact `(Journal, NULL journal_day)` shape.
+    let inventory = corpus
+        .graph
+        .projected_inventory_entry(
+            &crate::oplog::ManagedPath::parse("pages/Z-undated.md").unwrap(),
+            "Z-undated",
+            crate::oplog::ManagedTextKind::Journal,
+        )
+        .expect("the existing inventory decoder accepts an explicit journal kind");
+    assert_eq!(inventory.kind, PageKind::Journal);
+    assert_eq!(inventory.date_key, None);
+    let mut document = crate::doc::parse("- undated journal\n");
+    crate::model::assign_doc_runtime_ids(&mut document.roots, &inventory.rel_path);
+    let physical = crate::direct_projection::physical_page_for_test(
+        &inventory,
+        &document,
+        &crate::config::ParseConfig::default(),
+    )
+    .expect("the Direct producer accepts the inventory row");
+    assert_eq!(physical.text_kind, 1);
+    assert_eq!(physical.journal_day, None);
+
+    let database = copy_projection(&corpus, "undated-journal-recency");
+    {
+        let writer = rusqlite::Connection::open(&database).expect("the copy opens writable");
+        writer
+            .execute(
+                "UPDATE pages SET text_kind = 1, journal_day = NULL WHERE path = ?1",
+                rusqlite::params!["pages/Z-undated.md"],
+            )
+            .expect("the accepted undated-journal shape is installed");
+    }
+    let (anchor, statement) = corpus.lower(
+        "@page and name like '%'",
+        QueryDialect::Tql,
+        corpus.fts_ready(),
+    );
+    assert_eq!(anchor, Anchor::Page);
+    let view = ViewSettings {
+        sort: vec![(Field::new("modified"), SortDir::Asc)],
+        ..ViewSettings::default()
+    };
+    let recency = page_recency_for(&corpus.root);
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&database, || Ok(()))
+        .expect("the accepted projection copy opens");
+    let answer = read_page_results(
+        &mut snapshot,
+        &PageReadInputs {
+            statement: &statement,
+            order: BackendOrder::Direct,
+            view: &view,
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+            recency: &recency,
+        },
+    )
+    .expect("the Direct recency statement answers an undated journal");
+    snapshot.finish();
+
+    let mut expected = [
+        (
+            page_recency_secs_for(None, &ordinary),
+            "pages/A-ordinary.md",
+        ),
+        (page_recency_secs_for(None, &undated), "pages/Z-undated.md"),
+    ];
+    expected.sort_by(|left, right| left.cmp(right));
+    assert_eq!(expected[0].0, 100);
+    assert_eq!(expected[1].0, 200);
+    assert_eq!(
+        answer
+            .pages
+            .iter()
+            .map(|page| page.path.as_str())
+            .collect::<Vec<_>>(),
+        expected.iter().map(|(_, path)| *path).collect::<Vec<_>>()
+    );
+    let undated = answer
+        .pages
+        .iter()
+        .find(|page| page.path == "pages/Z-undated.md")
+        .expect("the undated journal is returned");
+    assert_eq!(undated.kind, PageKind::Journal);
+    assert_eq!(undated.journal_day, None);
+
+    let journal_format = crate::date::JournalFormat::new(None, None);
+    let managed_root = corpus.root.clone();
+    let managed_recency = PageRecencyPrograms::new(
+        JournalRankInput::DisplayName,
+        move |name| journal_format.page_recency_secs(true, name, Path::new("")),
+        move |path| page_recency_secs_for(None, &managed_root.join(path)),
+    );
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&database, || Ok(()))
+        .expect("the accepted projection copy opens again");
+    let managed = read_page_results(
+        &mut snapshot,
+        &PageReadInputs {
+            statement: &statement,
+            order: BackendOrder::Managed,
+            view: &view,
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+            recency: &managed_recency,
+        },
+    )
+    .expect("Managed display-name recency keeps its existing answer");
+    snapshot.finish();
+    assert_eq!(
+        managed
+            .pages
+            .iter()
+            .map(|page| page.path.as_str())
+            .collect::<Vec<_>>(),
+        ["pages/Z-undated.md", "pages/A-ordinary.md"],
+        "an unparseable Managed journal stays at MIN rather than using mtime"
+    );
+    let _ = std::fs::remove_file(database);
+}
+
+#[test]
+fn page_property_payload_batches_only_admitted_ids() {
+    let _serial = serialize();
+    let root = scratch("s3-page-payload-batches");
+    write_page_result_corpus(&root, PAYLOAD_BATCH + 1);
+    let corpus = Corpus::open(root, true);
+    let source = "@page and journal = false";
+    for (limit, statements) in [(PAYLOAD_BATCH, 1), (PAYLOAD_BATCH + 1, 2)] {
+        reset_result_read_census();
+        let answer =
+            database_page_answer(&corpus, source, &ViewSettings::default(), limit, usize::MAX)
+                .expect("the batched page read answers");
+        let census = result_read_census();
+        assert_eq!(answer.total, limit);
+        assert_eq!(answer.matched_total, PAYLOAD_BATCH + 1);
+        assert_eq!(census.page_payload_statements, statements);
+        assert_eq!(census.page_payload_property_rows, 2 * limit);
+    }
+}
+
+#[test]
+fn page_rank_programs_replace_as_one_redacted_statement_table() {
+    let _serial = serialize();
+    let root = scratch("s3-page-rank-programs");
+    write_page_result_corpus(&root, 1);
+    let corpus = Corpus::open(root, true);
+    let mut snapshot = corpus.snapshot();
+
+    let secret = "authored secret text".to_string();
+    let mut first = QueryRankPrograms::default();
+    let first_id = first.bind({
+        let secret = secret.clone();
+        move |text| Ok(Some(format!("{secret}:{text}").into_bytes()))
+    });
+    assert_eq!(first_id, 1);
+    assert!(!format!("{first:?}").contains(&secret));
+    let first_function = first.function(snapshot.cancellation());
+    let unknown = first_function(2, &secret).expect_err("an unknown program id must fail");
+    assert!(!format!("{unknown:?}").contains(&secret));
+    snapshot
+        .set_query_rank_function(first_function)
+        .expect("the first statement rank table installs");
+
+    let mut second = QueryRankPrograms::default();
+    second.bind(|text| Ok(Some(format!("second:{text}").into_bytes())));
+    snapshot
+        .set_query_rank_function(second.function(snapshot.cancellation()))
+        .expect("the next statement replaces the rank table");
+    let rows = snapshot
+        .run_projection_query(
+            "SELECT tine_query_rank(?1, ?2)",
+            &[
+                PhysicalQueryValue::Integer(1),
+                PhysicalQueryValue::Text("value".into()),
+            ],
+        )
+        .expect("the replacement rank table answers");
+    snapshot.finish();
+    assert_eq!(
+        rows,
+        vec![vec![PhysicalQueryValue::Blob(b"second:value".to_vec())]]
+    );
+}
+
+#[test]
+fn cancelling_page_selection_or_a_later_payload_batch_returns_no_partial_answer() {
+    let _serial = serialize();
+    let root = scratch("s3-page-cancellation");
+    write_page_result_corpus(&root, PAYLOAD_BATCH + 1);
+    let corpus = Corpus::open(root, true);
+    let (anchor, statement) = corpus.lower(
+        "@page and journal = false",
+        QueryDialect::Tql,
+        corpus.fts_ready(),
+    );
+    assert_eq!(anchor, Anchor::Page);
+    let view = ViewSettings {
+        sort: vec![(Field::new("modified"), SortDir::Asc)],
+        ..ViewSettings::default()
+    };
+
+    let mut selecting = corpus.snapshot();
+    let cancel_during_rank = selecting.cancellation();
+    let (rank_started, wait_for_rank) = std::sync::mpsc::channel::<()>();
+    let (rank_cancelled, wait_for_cancel) = std::sync::mpsc::channel::<()>();
+    let wait_for_cancel = std::sync::Mutex::new(wait_for_cancel);
+    let owner = std::thread::spawn(move || {
+        wait_for_rank.recv().expect("the rank callback starts");
+        cancel_during_rank.cancel();
+        rank_cancelled
+            .send(())
+            .expect("the rank callback is waiting");
+    });
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let recency = PageRecencyPrograms::new(
+        JournalRankInput::StoredDay,
+        |_| 0,
+        move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                rank_started.send(()).expect("the owner is listening");
+                wait_for_cancel
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("the owner cancels");
+            }
+            0
+        },
+    );
+    reset_result_read_census();
+    let answer = read_page_results(
+        &mut selecting,
+        &PageReadInputs {
+            statement: &statement,
+            order: BackendOrder::Direct,
+            view: &view,
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+            recency: &recency,
+        },
+    );
+    assert!(matches!(answer, Err(ResultReadError::Cancelled)));
+    let census = result_read_census();
+    assert!(census.page_recency_lookups > 0);
+    assert_eq!(census.page_payload_statements, 0);
+    drop(recency);
+    owner.join().expect("the cancellation owner finishes");
+    selecting.finish();
+
+    let mut between = corpus.snapshot();
+    let cancel_between = between.cancellation();
+    set_before_page_payload_batch_hook(Some(Box::new(move |batch| {
+        if batch == 1 {
+            cancel_between.cancel();
+        }
+    })));
+    let recency = page_recency_for(&corpus.root);
+    let answer = read_page_results(
+        &mut between,
+        &PageReadInputs {
+            statement: &statement,
+            order: BackendOrder::Direct,
+            view: &ViewSettings::default(),
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+            recency: &recency,
+        },
+    );
+    set_before_page_payload_batch_hook(None);
+    assert!(matches!(answer, Err(ResultReadError::Cancelled)));
+    between.finish();
+}
+
 /// `BackendOrder::Managed` orders by `pages.path` under SQLite's default
 /// BINARY collation, which must be `String::cmp` on the UTF-8 bytes — no
 /// collation, no folding, no locale.
@@ -821,6 +1410,97 @@ fn read_damaged(
     snapshot.finish();
     let _ = std::fs::remove_file(&path);
     answer
+}
+
+fn read_damaged_page(
+    corpus: &Corpus,
+    tag: &str,
+    damage: &str,
+    bind: &[&dyn rusqlite::ToSql],
+) -> Result<crate::query::results::PageAnswer, ResultReadError> {
+    let path = copy_projection(corpus, tag);
+    {
+        let writer = rusqlite::Connection::open(&path).expect("the copy opens writable");
+        writer
+            .pragma_update(None, "foreign_keys", false)
+            .expect("foreign key enforcement is settable");
+        let changed = writer.execute(damage, bind).expect("the damage applies");
+        assert!(
+            changed > 0,
+            "the damage statement changed nothing: {damage}"
+        );
+    }
+    let (anchor, statement) = corpus.lower(
+        "@page and journal = false",
+        QueryDialect::Tql,
+        corpus.fts_ready(),
+    );
+    assert_eq!(anchor, Anchor::Page);
+    let recency = page_recency_for(&corpus.root);
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
+        .expect("the damaged copy still opens");
+    let answer = read_page_results(
+        &mut snapshot,
+        &PageReadInputs {
+            statement: &statement,
+            order: BackendOrder::Direct,
+            view: &ViewSettings::default(),
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+            recency: &recency,
+        },
+    );
+    snapshot.finish();
+    let _ = std::fs::remove_file(&path);
+    answer
+}
+
+#[test]
+fn inconsistent_page_result_metadata_fails_instead_of_shrinking_the_answer() {
+    let _serial = serialize();
+    let root = scratch("s3-page-damage");
+    write_page_result_corpus(&root, 3);
+    let corpus = Corpus::open(root, true);
+    let page = "pages/Page000.md";
+    let damages = [
+        (
+            "missing-result",
+            "DELETE FROM query_page_results WHERE page_id = \
+             (SELECT page_id FROM pages WHERE path = ?1)",
+        ),
+        (
+            "missing-order",
+            "DELETE FROM query_page_order WHERE page_id = \
+             (SELECT page_id FROM pages WHERE path = ?1)",
+        ),
+        (
+            "count",
+            "UPDATE query_page_results SET property_count = property_count + 1 WHERE page_id = \
+             (SELECT page_id FROM pages WHERE path = ?1)",
+        ),
+        (
+            "ordinal",
+            "UPDATE properties SET ordinal = ordinal + 5 WHERE owner_type = 0 AND ordinal = 0 \
+             AND owner_id = (SELECT page_id FROM pages WHERE path = ?1)",
+        ),
+        (
+            "owner",
+            "UPDATE properties SET page_id = zeroblob(16) WHERE owner_type = 0 AND ordinal = 0 \
+             AND owner_id = (SELECT page_id FROM pages WHERE path = ?1)",
+        ),
+        (
+            "estimate",
+            "UPDATE query_page_results SET estimated_bytes = estimated_bytes + 1 WHERE page_id = \
+             (SELECT page_id FROM pages WHERE path = ?1)",
+        ),
+    ];
+    for (tag, damage) in damages {
+        let answer = read_damaged_page(&corpus, tag, damage, rusqlite::params![page]);
+        assert!(
+            matches!(answer, Err(ResultReadError::Corrupt(_))),
+            "{tag}: inconsistent page metadata must report Corrupt, got {answer:?}"
+        );
+    }
 }
 
 /// Every REQUIRED row of one admitted result, deleted one at a time, with

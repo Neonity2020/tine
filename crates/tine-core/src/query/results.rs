@@ -51,6 +51,7 @@ use crate::model::{
     block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, BlockDto,
     PageKind, RefGroup, ShallowBlockFacets,
 };
+use crate::query::rank::PageRecencyPrograms;
 use crate::query::sql::{descriptor_statement, page_statement, SqlQuery};
 use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups, ResultViewGroup};
 
@@ -327,91 +328,116 @@ struct CarriedGroups<C: ResultCarrier> {
 
 /// One `@page` answer, in the SAME shape the retired page walk returned.
 ///
-/// `total` is the number of rows ADMITTED, not the number seen: the walk's page
-/// loop stops at `max_rows` and reports `pages.len()`, which is a different
-/// rule from the block budget's and is preserved here rather than unified.
+/// `total` is the number of rows admitted before sampling; `matched_total` is
+/// the complete count computed by SQLite before its result limit.
 #[derive(Debug, Default)]
 pub(crate) struct PageAnswer {
     pub(crate) pages: Vec<crate::query::ir::PageRow>,
     pub(crate) total: usize,
+    pub(crate) matched_total: usize,
     pub(crate) exceeded: bool,
+}
+
+pub(crate) struct PageReadInputs<'a> {
+    pub(crate) statement: &'a SqlQuery,
+    pub(crate) order: BackendOrder,
+    pub(crate) view: &'a crate::query::ir::ViewSettings,
+    pub(crate) max_rows: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) recency: &'a PageRecencyPrograms,
 }
 
 /// Construct one `@page` query's ordered public rows from the projection alone.
 ///
-/// No `PageDto`, no `Document`, no parsed cache: the page index — name, kind and
-/// journal day — is what an `@page` answer is made of (K16), and the compiler
-/// already selected exactly the matching pages. The caller owns capacity, the
-/// snapshot and its lifecycle, exactly as it does for [`read_results`].
+/// No `PageDto`, no `Document`, no parsed cache: the projection's page-result
+/// metadata and authored property rows are the complete `@page` payload. The
+/// caller owns capacity, the snapshot and its lifecycle, exactly as it does for
+/// [`read_results`].
 pub(crate) fn read_page_results(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
-    statement: &SqlQuery,
-    order: BackendOrder,
-    max_rows: usize,
+    inputs: &PageReadInputs<'_>,
 ) -> Result<PageAnswer, ResultReadError> {
-    install_regexes(snapshot, statement)?;
+    install_regexes(snapshot, inputs.statement)?;
     if snapshot.cancellation().is_cancelled() {
         return Err(ResultReadError::Cancelled);
     }
-    let statement = page_statement(statement, order).map_err(ResultReadError::Sql)?;
-    let mut answer = PageAnswer::default();
+    let statement = page_statement(
+        inputs.statement,
+        inputs.order,
+        inputs.view,
+        inputs.max_rows,
+        inputs.recency,
+    )
+    .map_err(ResultReadError::Sql)?;
+    let cancellation = snapshot.cancellation();
+    snapshot
+        .set_query_rank_function(statement.ranks.function(cancellation))
+        .map_err(|error| sql_or_cancelled(snapshot, error))?;
+    let mut descriptors = Vec::new();
+    let mut budget = ConstructionBudget::new(inputs.max_rows, inputs.max_bytes);
     let mut seen = HashSet::new();
+    let mut matched_total = None;
     let mut damage: Option<String> = None;
-    let visit = snapshot.visit_projection_query(&statement.sql, &statement.params, |row| {
-        #[cfg(test)]
-        note(|census| census.page_rows += 1);
-        let decoded = match decode_page_row(row, order) {
-            Ok(decoded) => decoded,
-            Err(what) => {
-                damage = Some(what);
+    let visit =
+        snapshot.visit_projection_query(&statement.query.sql, &statement.query.params, |row| {
+            #[cfg(test)]
+            note(|census| census.page_rows += 1);
+            let decoded = match decode_page_row(row, inputs.order) {
+                Ok(decoded) => decoded,
+                Err(what) => {
+                    damage = Some(what);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            };
+            if !seen.insert(decoded.page_id) {
+                damage = Some("one physical page appears twice in a page result".to_string());
                 return Ok(std::ops::ControlFlow::Break(()));
             }
-        };
-        if !seen.insert(decoded.page_id) {
-            damage = Some("one physical page appears twice in a page result".to_string());
-            return Ok(std::ops::ControlFlow::Break(()));
-        }
-        if !admit_page(&decoded, &mut answer, max_rows) {
-            return Ok(std::ops::ControlFlow::Break(()));
-        }
-        Ok(std::ops::ControlFlow::Continue(()))
-    });
+            match matched_total {
+                None => matched_total = Some(decoded.matched_total),
+                Some(total) if total == decoded.matched_total => {}
+                Some(_) => {
+                    damage = Some("page rows disagree on their complete match count".to_string());
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            if budget.closed() || !budget.admit_page_estimated(decoded.estimated_bytes) {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            descriptors.push(decoded);
+            Ok(std::ops::ControlFlow::Continue(()))
+        });
     if let Err(error) = visit {
         return Err(sql_or_cancelled(snapshot, error));
     }
     if let Some(what) = damage {
         return Err(ResultReadError::Corrupt(what));
     }
-    Ok(answer)
-}
-
-/// The walk's page-loop admission, transcribed: the cap is checked BEFORE the
-/// push, so exactly `max_rows` matches fill the answer without setting
-/// `exceeded`, and the `max_rows + 1`-th match sets it and stops. `false` means
-/// "stop" — either the cap closed or, at `max_rows == 0`, it was closed from
-/// the first row. `max_bytes` is deliberately not charged: the page walk never
-/// charged it.
-fn admit_page(row: &PageRowRead, answer: &mut PageAnswer, max_rows: usize) -> bool {
-    if answer.pages.len() >= max_rows {
-        answer.exceeded = true;
-        return false;
+    let matched_total = matched_total.unwrap_or(0);
+    let mut pages = hydrate_page_rows(snapshot, &descriptors)?;
+    let total = pages.len();
+    if let Some(sample) = inputs.view.sample {
+        pages.truncate(sample as usize);
     }
-    answer.pages.push(crate::query::ir::PageRow {
-        name: row.name.clone(),
-        kind: row.kind,
-        journal_day: row.journal_day,
-    });
-    answer.total = answer.pages.len();
-    true
+    Ok(PageAnswer {
+        pages,
+        total,
+        matched_total,
+        exceeded: budget.exceeded || matched_total > total,
+    })
 }
 
-/// One decoded `@page` row: the public answer's three fields plus the physical
-/// and ordering fields validated for the selected backend.
-struct PageRowRead {
-    page_id: [u8; 16],
-    name: String,
-    kind: PageKind,
-    journal_day: Option<i64>,
+/// One decoded `@page` descriptor, including the physical and census fields
+/// validated before its public payload is hydrated.
+pub(crate) struct PageResultDescriptor {
+    pub(crate) page_id: [u8; 16],
+    pub(crate) name: String,
+    pub(crate) kind: PageKind,
+    pub(crate) journal_day: Option<i64>,
+    pub(crate) path: String,
+    pub(crate) estimated_bytes: usize,
+    pub(crate) property_count: usize,
+    pub(crate) matched_total: usize,
 }
 
 /// Column offsets of the page row, in the order [`page_statement`] selects them.
@@ -422,13 +448,19 @@ mod page_column {
     pub(super) const JOURNAL_DAY: usize = 3;
     pub(super) const PATH: usize = 4;
     pub(super) const POSITION: usize = 5;
-    pub(super) const COLUMNS: usize = 6;
+    pub(super) const ESTIMATED_BYTES: usize = 6;
+    pub(super) const PROPERTY_COUNT: usize = 7;
+    pub(super) const MATCHED_TOTAL: usize = 8;
+    pub(super) const COLUMNS: usize = 9;
 }
 
 /// One page row: validate its identity, its kind and its order key. A row that
 /// does not decode is damage and fails the read; it is never a page silently
 /// missing from the answer (D-3).
-fn decode_page_row(row: &[PhysicalQueryValue], order: BackendOrder) -> Result<PageRowRead, String> {
+fn decode_page_row(
+    row: &[PhysicalQueryValue],
+    order: BackendOrder,
+) -> Result<PageResultDescriptor, String> {
     use page_column as column;
     if row.len() != column::COLUMNS {
         return Err(format!(
@@ -444,18 +476,136 @@ fn decode_page_row(row: &[PhysicalQueryValue], order: BackendOrder) -> Result<Pa
         return Err(format!("pages.text_kind {text_kind} is not a page kind"));
     };
     let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
-    text(row, column::PATH, "pages.path")?;
+    let path = text(row, column::PATH, "pages.path")?;
     let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
     // Direct Files' page order IS this column (see `decode_descriptor`).
     if order == BackendOrder::Direct && position.is_none() {
         return Err("query_page_order has no position for a matched page".to_string());
     }
-    Ok(PageRowRead {
+    Ok(PageResultDescriptor {
         page_id,
         name,
         kind,
         journal_day,
+        path,
+        estimated_bytes: count(
+            row,
+            column::ESTIMATED_BYTES,
+            "query_page_results.estimated_bytes",
+        )?,
+        property_count: count(
+            row,
+            column::PROPERTY_COUNT,
+            "query_page_results.property_count",
+        )?,
+        matched_total: count(row, column::MATCHED_TOTAL, "page matched count")?,
     })
+}
+
+/// Hydrate only admitted page properties, in bounded owner batches, and
+/// validate the producer's stored count and estimate before exposing a row.
+pub(crate) fn hydrate_page_rows(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    descriptors: &[PageResultDescriptor],
+) -> Result<Vec<crate::query::ir::PageRow>, ResultReadError> {
+    let mut pages = Vec::with_capacity(descriptors.len());
+    for (batch_index, batch) in descriptors.chunks(PAYLOAD_BATCH).enumerate() {
+        #[cfg(test)]
+        run_before_page_payload_batch_hook(batch_index);
+        #[cfg(not(test))]
+        let _ = batch_index;
+        if snapshot.cancellation().is_cancelled() {
+            return Err(ResultReadError::Cancelled);
+        }
+        let ids = batch
+            .iter()
+            .map(|row| PhysicalQueryValue::Blob(row.page_id.to_vec()))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT owner_id, page_id, name, value, ordinal FROM properties \
+             WHERE owner_type = 0 AND owner_id IN ({}) \
+             ORDER BY owner_id, ordinal, name",
+            placeholders(ids.len())
+        );
+        #[cfg(test)]
+        note(|census| census.page_payload_statements += 1);
+        let rows = snapshot
+            .run_projection_query(&sql, &ids)
+            .map_err(|error| sql_or_cancelled(snapshot, error))?;
+        let admitted = batch.iter().map(|row| row.page_id).collect::<HashSet<_>>();
+        let mut properties: HashMap<[u8; 16], Vec<(usize, String, String)>> = HashMap::new();
+        for row in &rows {
+            #[cfg(test)]
+            note(|census| census.page_payload_property_rows += 1);
+            let owner = blob16(row, 0, "properties.owner_id").map_err(ResultReadError::Corrupt)?;
+            if !admitted.contains(&owner) {
+                return Err(ResultReadError::Corrupt(
+                    "a page property belongs to no admitted page".into(),
+                ));
+            }
+            let page_id = blob16(row, 1, "properties.page_id").map_err(ResultReadError::Corrupt)?;
+            if page_id != owner {
+                return Err(ResultReadError::Corrupt(
+                    "an admitted page property names a different page".into(),
+                ));
+            }
+            let ordinal = count(row, 4, "properties.ordinal").map_err(ResultReadError::Corrupt)?;
+            properties.entry(owner).or_default().push((
+                ordinal,
+                text(row, 2, "properties.name").map_err(ResultReadError::Corrupt)?,
+                text(row, 3, "properties.value").map_err(ResultReadError::Corrupt)?,
+            ));
+        }
+        for descriptor in batch {
+            let rows = properties.remove(&descriptor.page_id).unwrap_or_default();
+            if rows.len() != descriptor.property_count {
+                return Err(ResultReadError::Corrupt(
+                    "stored page property_count disagrees with the property rows".into(),
+                ));
+            }
+            if rows
+                .iter()
+                .enumerate()
+                .any(|(expected, row)| row.0 != expected)
+            {
+                return Err(ResultReadError::Corrupt(
+                    "page property ordinals are not contiguous".into(),
+                ));
+            }
+            let properties = rows
+                .into_iter()
+                .map(|(_, name, value)| (name, value))
+                .collect::<Vec<_>>();
+            let estimated = tine_storage::sqlite::query_page_result_estimated_bytes(
+                &descriptor.name,
+                &descriptor.path,
+                properties
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            );
+            if estimated != descriptor.estimated_bytes {
+                return Err(ResultReadError::Corrupt(
+                    "the emitted page result does not match its stored estimate".into(),
+                ));
+            }
+            pages.push(crate::query::ir::PageRow {
+                path: descriptor.path.clone(),
+                name: descriptor.name.clone(),
+                kind: descriptor.kind,
+                journal_day: descriptor.journal_day,
+                properties,
+            });
+        }
+        if !properties.is_empty() {
+            return Err(ResultReadError::Corrupt(
+                "a page property belongs to no admitted page".into(),
+            ));
+        }
+    }
+    if snapshot.cancellation().is_cancelled() {
+        return Err(ResultReadError::Cancelled);
+    }
+    Ok(pages)
 }
 
 /// §4.3.2's compiled-regex table for THIS statement, installed unconditionally.
@@ -1315,11 +1465,13 @@ pub(crate) struct ResultReadCensus {
     pub(crate) payload_block_rows: usize,
     pub(crate) payload_tag_rows: usize,
     pub(crate) payload_property_rows: usize,
-    /// `@page` rows the page statement returned (RET1). Beside the descriptor
-    /// count, never instead of it: a page answer reads no descriptor and no
-    /// payload at all, so a gate that asserts "one page row, zero payload
-    /// statements" is asserting the whole cost of the answer.
+    /// `@page` descriptors the page statement returned. Page-property payload
+    /// reads have their own counters so a gate can prove rejected owners were
+    /// never hydrated.
     pub(crate) page_rows: usize,
+    pub(crate) page_payload_statements: usize,
+    pub(crate) page_payload_property_rows: usize,
+    pub(crate) page_recency_lookups: usize,
     /// The SAME four counters for RET3's export OUTPUT payload — the admitted
     /// descendants of a subtree. Separate fields, not a second census, because
     /// the claim "no payload was read for a rejected descendant" is only
@@ -1378,6 +1530,9 @@ thread_local! {
             payload_tag_rows: 0,
             payload_property_rows: 0,
             page_rows: 0,
+            page_payload_statements: 0,
+            page_payload_property_rows: 0,
+            page_recency_lookups: 0,
             export_payload_statements: 0,
             export_payload_block_rows: 0,
             export_payload_tag_rows: 0,
@@ -1392,6 +1547,11 @@ fn note(update: impl FnOnce(&mut ResultReadCensus)) {
         update(&mut current);
         census.set(current);
     });
+}
+
+#[cfg(test)]
+pub(crate) fn note_page_recency_lookup() {
+    note(|census| census.page_recency_lookups += 1);
 }
 
 #[cfg(test)]
@@ -1414,6 +1574,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_EXPORT_PAYLOAD_BATCH: std::cell::RefCell<Option<Box<dyn Fn(usize)>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_PAGE_PAYLOAD_BATCH: std::cell::RefCell<Option<Box<dyn Fn(usize)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1427,6 +1589,25 @@ pub(crate) fn set_before_payload_batch_hook(hook: Option<Box<dyn Fn(usize)>>) {
 #[cfg(test)]
 pub(crate) fn set_before_export_payload_batch_hook(hook: Option<Box<dyn Fn(usize)>>) {
     BEFORE_EXPORT_PAYLOAD_BATCH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_page_payload_batch_hook(hook: Option<Box<dyn Fn(usize)>>) {
+    BEFORE_PAGE_PAYLOAD_BATCH.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_before_page_payload_batch_hook(batch: usize) {
+    let present = BEFORE_PAGE_PAYLOAD_BATCH.with(|slot| slot.borrow().is_some());
+    if present {
+        BEFORE_PAGE_PAYLOAD_BATCH.with(|slot| {
+            let taken = slot.borrow_mut().take();
+            if let Some(hook) = taken {
+                hook(batch);
+                *slot.borrow_mut() = Some(hook);
+            }
+        });
+    }
 }
 
 #[cfg(test)]

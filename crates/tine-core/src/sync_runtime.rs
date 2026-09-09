@@ -3800,6 +3800,7 @@ fn managed_ir_block_result(
         diagnostics: selection.diagnostics.clone(),
         report: report.clone(),
         total: bounded.total,
+        matched_total: None,
         exceeded: bounded.exceeded,
     }
 }
@@ -5025,6 +5026,7 @@ impl SyncRuntimeHandle {
                                     diagnostics: capture.query.diagnostics.clone(),
                                     report: capture.report.clone(),
                                     total: pages.total,
+                                    matched_total: Some(pages.matched_total),
                                     exceeded: pages.exceeded,
                                 },
                             )

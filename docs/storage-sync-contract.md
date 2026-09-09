@@ -833,7 +833,25 @@ block answers carry `query_page_order.position` and
 `query_block_results.preorder` and end with `ORDER BY` on those columns; the
 page wrapper carries the same page position. Missing Direct order metadata
 fails the read, because silently moving a page would change which rows survive
-a bounded budget. The FTS-readiness signal the content predicates' bounds
+a bounded budget.
+
+Page results carry physical graph-relative `path`, name, kind, optional journal
+day and authored ordered properties. Their shared descriptor wrapper applies
+the complete saved sort and `COUNT(*) OVER()` before its row limit. Unicode
+text sorting reuses Rust lowercase through operation-owned rank callbacks;
+numeric-looking property values remain lexical. Explicit sort ties use physical
+path, while unsorted reads retain Direct inventory or Managed path order.
+`query_page_results` supplies raw construction estimates and property counts;
+only admitted owners receive property payload reads, in batches of 128, with
+ownership, ordinal, count and estimate validation. Both row and byte limits
+apply. `total` counts admitted pages before sampling; optional `matched_total`
+reports the complete SQL match count, independent of limits and sampling.
+Page navigation uses the physical path even when display names coincide.
+Recency selection may read file metadata and is measured separately from
+output payload. Cancellation during selection or hydration returns no partial
+page answer. This does not yet supply complete SQL grouped statistics.
+
+The FTS-readiness signal the content predicates' bounds
 depend on is probed through the same seam and remembered once per generation,
 never once per query — and only a READY observation is remembered, because
 readiness is monotonic within one projection file while a rebuild publishes a

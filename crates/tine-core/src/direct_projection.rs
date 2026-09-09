@@ -5648,6 +5648,10 @@ mod tests {
             "Recovery source-inventory work is counted separately.",
             "Its descriptor wrapper does: Direct\nblock answers carry `query_page_order.position` and\n`query_block_results.preorder` and end with `ORDER BY` on those columns",
             "Missing Direct order metadata\nfails the read",
+            "Page results carry physical graph-relative `path`",
+            "the complete saved sort and `COUNT(*) OVER()` before its row limit",
+            "only admitted owners receive property payload reads, in batches of 128",
+            "`matched_total`\nreports the complete SQL match count, independent of limits and sampling",
             "remembered once per generation,\nnever once per query",
             // Typed non-answers and the one-repair obligation.
             "Capacity pressure is\n`NotReady(Busy)`.",

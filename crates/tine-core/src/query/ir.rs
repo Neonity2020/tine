@@ -1027,10 +1027,15 @@ impl Query {
 /// One `@page` result row. Needs no document load (K16).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageRow {
+    /// Physical graph-relative owner path. Display names are not unique.
+    pub path: String,
     pub name: String,
     pub kind: crate::model::PageKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_day: Option<i64>,
+    /// Authored page properties, in source order and original spelling.
+    #[serde(default)]
+    pub properties: Vec<(String, String)>,
 }
 
 /// The advanced-query report, preserved verbatim from `AdvancedResult` (M5):
@@ -1060,6 +1065,9 @@ pub struct QueryResult {
     pub diagnostics: Vec<Diagnostic>,
     pub report: QueryReport,
     pub total: usize,
+    /// Exact complete stored match count when the producer proved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_total: Option<usize>,
     pub exceeded: bool,
 }
 

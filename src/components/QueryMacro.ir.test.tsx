@@ -26,8 +26,9 @@ import { setDataRev } from "../ui";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 import { blockProperty, doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import type { RefGroup } from "../types";
-import type { ExplainEmptyResult, ParsedQuery, Query, ViewSettings } from "../editor/queryIr";
+import type { ExplainEmptyResult, ParsedQuery, Query, QueryResult, ViewSettings } from "../editor/queryIr";
 import { blockRunResult } from "../queryReadingsTestkit";
+import { resetTabsToJournals, route } from "../router";
 
 beforeAll(async () => {
   await initParser();
@@ -37,6 +38,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   resetSharedQueryResultsForTests();
   resetStore();
+  resetTabsToJournals();
   localStorage.clear();
   document.body.innerHTML = "";
 });
@@ -87,6 +89,40 @@ function load(raw: string, { readOnly = false }: { readOnly?: boolean } = {}): v
 const TQL_MACRO = "{{tine-query -- task TODO}}";
 
 describe("B1: a TQL block executes through query_run", () => {
+  it("uses the exact page count and physical path returned by the shared page reader", async () => {
+    load("{{tine-query @page and journal = false}}");
+    const answer: QueryResult = {
+      anchor: "page",
+      pages: [{
+        path: "pages/nested/Twin.md",
+        name: "Twin",
+        kind: "page",
+        properties: [["rank", "first"]],
+      }],
+      diagnostics: [],
+      report: { ran: ["journal"], ignored: [], supported: true },
+      total: 1,
+      matched_total: 43,
+      exceeded: true,
+    };
+    vi.spyOn(backend(), "queryRun").mockResolvedValue(answer);
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.querySelector(".query-page-row")?.textContent).toContain("Twin"));
+      expect(root.querySelector(".query-count")?.textContent).toBe("43");
+      (root.querySelector(".query-page-row") as HTMLButtonElement).click();
+      expect(route()).toMatchObject({
+        kind: "page",
+        name: "Twin",
+        pageKind: "page",
+        path: "pages/nested/Twin.md",
+      });
+    } finally {
+      dispose();
+    }
+  });
+
   it("automatically retries indexing without reporting an empty query", async () => {
     load(TQL_MACRO);
     let finish!: (value: ReturnType<typeof blockRunResult>) => void;

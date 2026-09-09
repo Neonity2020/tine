@@ -256,9 +256,11 @@ export function isInvalid(query: Query): boolean {
 
 /** One `@page` result row. Needs no document load (K16). */
 export interface PageRow {
+  path: string;
   name: string;
   kind: PageKind;
   journal_day?: number;
+  properties: [string, string][];
 }
 
 /** The advanced-query report (M5): OG/TQL sources report an empty `ignored` and
@@ -274,6 +276,8 @@ export type QueryResult = {
   diagnostics?: Diagnostic[];
   report: QueryReport;
   total: number;
+  /** Exact complete count when the backend proved one for this row kind. */
+  matched_total?: number;
   exceeded: boolean;
 } & (
   | { anchor: "block"; groups: RefGroup[] }

@@ -2239,11 +2239,12 @@ fn query_result_or_error(
     result: tine_core::query::ir::QueryResult,
 ) -> Result<tine_core::query::ir::QueryResult, CommandError> {
     if result.exceeded {
+        let complete = result.matched_total.unwrap_or(result.total);
         return Err(CommandError::coded(
             "result-too-large",
             format!(
                 "{} matching rows; narrow the query or add a sample (construction limits: {RESULT_BRIDGE_MAX_ROWS} rows / {RESULT_BRIDGE_MAX_BYTES} bytes)",
-                result.total
+                complete
             ),
         ));
     }
@@ -6187,12 +6188,32 @@ mod query_command_surface_tests {
                 ..Default::default()
             },
             total: 99_999,
+            matched_total: None,
             exceeded: true,
         };
         let error = query_result_or_error(result).expect_err("an exceeded result is a refusal");
         let wire = serde_json::to_string(&error).expect("the rejection serializes");
         assert!(wire.contains("result-too-large"), "{wire}");
         assert!(wire.contains("99999"), "{wire}");
+
+        let page_result = tine_core::query::ir::QueryResult {
+            rows: tine_core::query::ir::QueryRows::Page { pages: Vec::new() },
+            diagnostics: Vec::new(),
+            report: tine_core::query::ir::QueryReport {
+                supported: true,
+                ..Default::default()
+            },
+            total: 2,
+            matched_total: Some(43),
+            exceeded: true,
+        };
+        let error = query_result_or_error(page_result)
+            .expect_err("an exceeded page result is also a refusal");
+        let wire = serde_json::to_string(&error).expect("the rejection serializes");
+        assert!(
+            wire.contains("43"),
+            "the refusal uses the exact page count: {wire}"
+        );
     }
 
     #[test]
@@ -6205,6 +6226,7 @@ mod query_command_surface_tests {
                 ..Default::default()
             },
             total: 3,
+            matched_total: Some(3),
             exceeded: false,
         };
         let passed = query_result_or_error(result).expect("within budget");

@@ -2,13 +2,22 @@
   "anchor": "page",
   "pages": [
     {
+      "path": "pages/home.md",
       "name": "Home",
-      "kind": "page"
+      "kind": "page",
+      "properties": [
+        [
+          "status",
+          "active"
+        ]
+      ]
     },
     {
+      "path": "journals/2026_07_29.md",
       "name": "Jul 29th, 2026",
       "kind": "journal",
-      "journal_day": 20260729
+      "journal_day": 20260729,
+      "properties": []
     }
   ],
   "diagnostics": [
@@ -29,5 +38,6 @@
     "supported": true
   },
   "total": 2,
+  "matched_total": 7,
   "exceeded": true
 }

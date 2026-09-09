@@ -41,6 +41,7 @@ pub(crate) mod sql;
 // dispatch will call rather than something a release build reaches yet: R3b
 // wires Direct Files' production switch to it and R4 wires Managed Storage, so
 // outside `cfg(test)` the module says "not called yet" once, here.
+pub(crate) mod rank;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod results;
 // RET3's database-owned export subtree construction: located selection over the
@@ -173,6 +174,25 @@ impl ConstructionBudget {
         }
         self.rows += 1;
         self.bytes += bytes;
+        true
+    }
+
+    /// Admit one shallow page row at its producer-owned raw estimate.
+    ///
+    /// Page estimates already include name, path, properties and their fixed
+    /// row allowance, so adding the block result's page/group overhead would
+    /// count the same bytes twice. Page `total` remains admitted rows.
+    pub(crate) fn admit_page_estimated(&mut self, estimated_bytes: usize) -> bool {
+        if self.exceeded
+            || self.rows >= self.max_rows
+            || self.bytes.saturating_add(estimated_bytes) > self.max_bytes
+        {
+            self.exceeded = true;
+            return false;
+        }
+        self.rows += 1;
+        self.bytes += estimated_bytes;
+        self.total = self.rows;
         true
     }
 
@@ -2161,6 +2181,7 @@ fn run_query_bounded_over_dialect(
 /// reason, and `recency` is a callback because Direct Files answers it with a
 /// filesystem `stat` that must not run for a page the query never matched.
 pub(crate) struct QueryPageView<'a> {
+    pub(crate) path: &'a str,
     pub(crate) name: &'a str,
     pub(crate) kind: PageKind,
     pub(crate) pre_block: Option<&'a str>,
@@ -2275,6 +2296,7 @@ impl QueryPageSource for GraphQueryPages<'_> {
             for (entry, doc) in pages {
                 let recency = || page_recency_secs(entry);
                 let flow = visit(QueryPageView {
+                    path: &entry.rel_path,
                     name: &entry.name,
                     kind: entry.kind,
                     pre_block: doc.pre_block.as_deref(),
@@ -2333,6 +2355,7 @@ impl QueryPageSource for ApplicationQueryPages<'_> {
             let page = &source.page;
             let recency = || source.recency;
             let flow = visit(QueryPageView {
+                path: &page.path,
                 name: &page.name,
                 kind: page.kind,
                 pre_block: page.pre_block.as_deref(),
@@ -2459,6 +2482,7 @@ pub(crate) fn run_query_result_over(
         diagnostics: query.diagnostics.clone(),
         report,
         total: 0,
+        matched_total: (query.anchor == Anchor::Page).then_some(0),
         exceeded: false,
     };
     if query.anchor == Anchor::Block {
@@ -2477,8 +2501,9 @@ pub(crate) fn run_query_result_over(
         result.exceeded = bounded.exceeded;
         return result;
     }
-    let answer = collect_page_rows_over(source, query, today, bounds);
+    let answer = collect_page_rows_over(source, query, view, today, bounds);
     result.total = answer.total;
+    result.matched_total = Some(answer.matched_total);
     result.exceeded = answer.exceeded;
     result.rows = ir::QueryRows::Page {
         pages: answer.pages,
@@ -2487,16 +2512,16 @@ pub(crate) fn run_query_result_over(
 }
 
 /// The `@page` half of [`run_query_result_over`], as its own producer: the
-/// matched page rows in the SOURCE's enumeration order, under `max_rows`.
+/// matched page rows in the saved SQL-sort semantics, under both bounds.
 ///
 /// It is the WALK's page loop and the ORACLE the database page read is compared
-/// against (`results::read_page_results` is the production producer). `total` is
-/// the number of rows ADMITTED and `max_bytes` is never charged — both are the
-/// page loop's own long-standing rules and neither is unified with the block
-/// budget's here.
+/// against (`results::read_page_results` is the production producer). It walks
+/// the complete match set before ordering and charges the shared raw page
+/// estimate, independently of the SQL reader it checks.
 pub(crate) fn collect_page_rows_over(
     source: &dyn QueryPageSource,
     query: &Query,
+    view: &ViewSettings,
     today: JournalDate,
     bounds: ir::Bounds,
 ) -> results::PageAnswer {
@@ -2506,10 +2531,17 @@ pub(crate) fn collect_page_rows_over(
     if query.is_invalid() {
         return answer;
     }
+    let wants_recency = view.sort.iter().any(|(field, _)| {
+        matches!(
+            field.as_str().to_ascii_lowercase().as_str(),
+            "modified" | "updated" | "updated-at" | "date"
+        )
+    });
     let filter = query.evaluable_filter();
     let compiled = eval::CompiledLeaves::for_query(&filter);
     let parse_config = source.parse_config();
     let registry = source.registry();
+    let mut matches = Vec::new();
     source.for_each_page(&mut |page| {
         let (page_props, _tags) = page_facets(page.pre_block);
         if !eval::page_row_matches(
@@ -2527,19 +2559,89 @@ pub(crate) fn collect_page_rows_over(
         ) {
             return std::ops::ControlFlow::Continue(());
         }
-        if answer.pages.len() >= bounds.max_rows {
-            answer.exceeded = true;
-            return std::ops::ControlFlow::Break(());
-        }
-        answer.pages.push(ir::PageRow {
-            name: page.name.to_string(),
-            kind: page.kind,
-            journal_day: page.journal,
-        });
+        let recency = if wants_recency { (page.recency)() } else { 0 };
+        matches.push((
+            ir::PageRow {
+                path: page.path.to_string(),
+                name: page.name.to_string(),
+                kind: page.kind,
+                journal_day: page.journal,
+                properties: page_props,
+            },
+            recency,
+        ));
         std::ops::ControlFlow::Continue(())
     });
+    answer.matched_total = matches.len();
+    if !view.sort.is_empty() {
+        let directions = view
+            .sort
+            .iter()
+            .map(|(_, direction)| *direction == SortDir::Asc)
+            .collect::<Vec<_>>();
+        let mut decorated = matches
+            .into_iter()
+            .enumerate()
+            .map(|(base, (page, recency))| {
+                let keys = view
+                    .sort
+                    .iter()
+                    .map(|(field, _)| page_sort_decor(&page, recency, field.as_str()))
+                    .collect::<Vec<_>>();
+                (keys, page.path.clone(), base, page)
+            })
+            .collect::<Vec<_>>();
+        decorated.sort_by(|left, right| {
+            compare_sort_decorations(&left.0, &right.0, &directions)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        matches = decorated
+            .into_iter()
+            .map(|(_, _, _, page)| (page, 0))
+            .collect();
+    }
+    let mut budget = ConstructionBudget::new(bounds.max_rows, bounds.max_bytes);
+    for (page, _) in matches {
+        let estimated = tine_storage::sqlite::query_page_result_estimated_bytes(
+            &page.name,
+            &page.path,
+            page.properties
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        if !budget.admit_page_estimated(estimated) {
+            break;
+        }
+        answer.pages.push(page);
+    }
     answer.total = answer.pages.len();
+    answer.exceeded = budget.exceeded || answer.matched_total > answer.total;
+    if let Some(sample) = view.sample {
+        answer.pages.truncate(sample as usize);
+    }
     answer
+}
+
+fn page_sort_decor(page: &ir::PageRow, recency: i64, field: &str) -> SortDecor {
+    match field.to_ascii_lowercase().as_str() {
+        "name" | "page" => SortDecor::Text(page.name.to_lowercase()),
+        "kind" => SortDecor::Text(match page.kind {
+            PageKind::Journal => "journal".into(),
+            PageKind::Page => "page".into(),
+        }),
+        "day" | "journal-day" | "journal_day" => {
+            SortDecor::Num(page.journal_day.unwrap_or(i64::MIN))
+        }
+        "modified" | "updated" | "updated-at" | "date" => SortDecor::Num(recency),
+        _ => SortDecor::Text(lexical_property_sort_text(
+            page.properties
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            field,
+            || page.name.clone(),
+        )),
+    }
 }
 
 /// The public page-or-block entry over a Direct Files graph. The dialect is the

@@ -824,6 +824,8 @@ export function QueryMacro(props: {
     advInfo: { ran: string[]; ignored: string[]; supported: boolean } | null;
     // `@page`-anchored rows (K16) are pages rather than degenerate empty groups.
     pageRows: PageRow[] | null;
+    // Exact complete count for page rows; null for block/search answers.
+    matchedTotal: number | null;
     // Search hits carry evidence used only by the Search presentation.
     searchExecution: QueryExecution | null;
     // An INVALID query returns zero rows plus the engine's own diagnostics.
@@ -921,7 +923,7 @@ export function QueryMacro(props: {
           signal,
         );
         if (queryRequestKey() !== requestKey) {
-          return { groups: [], advInfo: null, pageRows: null, searchExecution: null, diagnostics: [] };
+          return { groups: [], advInfo: null, pageRows: null, matchedTotal: null, searchExecution: null, diagnostics: [] };
         }
         // The Search presentation renders these hits directly rather than the
         // RefGroups below, so the host block has to come out here too — the same
@@ -944,6 +946,7 @@ export function QueryMacro(props: {
           groups: [...grouped.values()],
           advInfo: null,
           pageRows: null,
+          matchedTotal: null,
           searchExecution: visibleExecution,
           diagnostics: [],
         };
@@ -957,7 +960,7 @@ export function QueryMacro(props: {
       // on a separate command.
       const reading = runnable();
       if (!reading) {
-        return { groups: [], advInfo: null, pageRows: null, searchExecution: null, diagnostics: [] };
+        return { groups: [], advInfo: null, pageRows: null, matchedTotal: null, searchExecution: null, diagnostics: [] };
       }
       const page = executionPage();
       const result = await sharedQueryResult(
@@ -969,13 +972,14 @@ export function QueryMacro(props: {
       // I-20: the user has edited since this run started; its answer is about a
       // query that is no longer on screen.
       if (queryRequestKey() !== requestKey) {
-        return { groups: [], advInfo: null, pageRows: null, searchExecution: null, diagnostics: [] };
+        return { groups: [], advInfo: null, pageRows: null, matchedTotal: null, searchExecution: null, diagnostics: [] };
       }
       if (result.anchor === "page") {
         return {
           groups: [],
           advInfo: isAdvanced() ? reportInfo(result.report) : null,
           pageRows: result.pages,
+          matchedTotal: result.matched_total ?? result.total,
           searchExecution: null,
           diagnostics: result.diagnostics ?? [],
         };
@@ -984,6 +988,7 @@ export function QueryMacro(props: {
         groups: result.groups,
         advInfo: isAdvanced() ? reportInfo(result.report) : null,
         pageRows: null,
+        matchedTotal: null,
         searchExecution: null,
         diagnostics: result.diagnostics ?? [],
       };
@@ -1049,6 +1054,7 @@ export function QueryMacro(props: {
   const groups = () => displayedOperation()?.groups;
   const advInfo = () => displayedOperation()?.advInfo ?? null;
   const pageRows = () => displayedOperation()?.pageRows ?? null;
+  const matchedTotal = () => displayedOperation()?.matchedTotal ?? null;
   const searchExecution = () => displayedOperation()?.searchExecution ?? null;
   const diagnostics = () => displayedOperation()?.diagnostics ?? [];
   const emptyResultsMessage = () => groupsPending()?.message
@@ -1080,7 +1086,7 @@ export function QueryMacro(props: {
   });
   const total = () => currentView() === "search"
     ? searchPresentationHits().length
-    : (pageRows()?.length ?? groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
+    : (pageRows() ? (matchedTotal() ?? pageRows()!.length) : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
   // **Why empty? (Q14, N19; B1).** `query_explain_empty` was decoded and never
   // rendered, so a query that matched nothing said only "No results" — which is
   // the one moment a user most needs to know WHICH conjunct emptied it. Asked
@@ -1664,7 +1670,7 @@ export function QueryMacro(props: {
                     </Show>
                     <Show when={currentView() !== "search"}>
                     {/* `@page`-anchored results are pages, not blocks (K16): they
-                        carry `{name, kind, journal_day?}` and need no document
+                        carry their physical owner and need no document
                         load, so they render as page links rather than as empty
                         block groups. */}
                     <Show when={pageRows()}>
@@ -1679,7 +1685,7 @@ export function QueryMacro(props: {
                                 onMouseDown={internalLinkMouseDown}
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  const target = { name: row.name, pageKind: row.kind };
+                                  const target = { name: row.name, pageKind: row.kind, path: row.path };
                                   const dest = internalLinkDest(e);
                                   if (dest === "sidebar") openPageInSidebar(target);
                                   else if (dest === "background") openPageTargetInNewTab(target);
@@ -1687,7 +1693,7 @@ export function QueryMacro(props: {
                                   else openPageTarget(target);
                                 }}
                                 onAuxClick={(e) => internalLinkAuxClick(e, () =>
-                                  openPageTargetInNewTab({ name: row.name, pageKind: row.kind })
+                                  openPageTargetInNewTab({ name: row.name, pageKind: row.kind, path: row.path })
                                 )}
                               >
                                 <span class="switcher-kind">{row.kind}</span>

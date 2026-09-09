@@ -23,10 +23,11 @@ use crate::date::{JournalDate, JournalFormat};
 use crate::model::PageKind;
 use crate::oplog::ContentDigest;
 use crate::query::ir::{Query, ViewSettings};
+use crate::query::rank::{JournalRankInput, PageRecencyPrograms};
 use crate::query::registry::Registry;
 use crate::query::results::{
-    read_page_results, read_results, BackendOrder, RecencyPage, ResultIdentity, ResultReadError,
-    ResultReadInputs,
+    read_page_results, read_results, BackendOrder, PageReadInputs, RecencyPage, ResultIdentity,
+    ResultReadError, ResultReadInputs,
 };
 use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
@@ -338,6 +339,14 @@ fn execute_main_source(
             &capture.graph_root.join(page.path),
         )
     };
+    let journal_format = capture.journal_format.clone();
+    let file_journal_format = capture.journal_format.clone();
+    let file_root = capture.graph_root.clone();
+    let page_recency = PageRecencyPrograms::new(
+        JournalRankInput::DisplayName,
+        move |name| journal_format.page_recency_secs(true, name, Path::new("")),
+        move |path| file_journal_format.page_recency_secs(false, "", &file_root.join(path)),
+    );
     let read = |snapshot: &mut PhysicalProjectionQuerySnapshot,
                 anchor: crate::query::ir::Anchor,
                 statement: &crate::query::sql::SqlQuery|
@@ -348,9 +357,14 @@ fn execute_main_source(
         match anchor {
             crate::query::ir::Anchor::Page => Ok(ManagedQueryAnswer::Pages(read_page_results(
                 snapshot,
-                statement,
-                BackendOrder::Managed,
-                capture.max_rows,
+                &PageReadInputs {
+                    statement,
+                    order: BackendOrder::Managed,
+                    view: &capture.view,
+                    max_rows: capture.max_rows,
+                    max_bytes: capture.max_bytes,
+                    recency: &page_recency,
+                },
             )?)),
             crate::query::ir::Anchor::Block => Ok(ManagedQueryAnswer::Blocks(read_results(
                 snapshot,
@@ -423,7 +437,7 @@ fn empty_answer(anchor: crate::query::ir::Anchor) -> ManagedQueryAnswer {
 fn answer_total(answer: &ManagedQueryAnswer) -> usize {
     match answer {
         ManagedQueryAnswer::Blocks(pre) => pre.total,
-        ManagedQueryAnswer::Pages(pages) => pages.total,
+        ManagedQueryAnswer::Pages(pages) => pages.matched_total,
         ManagedQueryAnswer::Counts(_) => 0,
     }
 }

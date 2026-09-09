@@ -2100,9 +2100,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // S3 export adds one import-only tuple for the shared executor's existing
     // read-only PhysicalProjectionQuerySnapshot. Full old/new inventories
     // reconstruct both digests exactly; all write-boundary tuples are unchanged.
+    // S3 page results add 14 tuples (437 -> 451): operation-owned rank errors
+    // and cancellation import, bound sort/property/limit values, admitted page
+    // IDs, and the existing raw page estimator in reader and walk oracle.
+    // The full multiset reconstructs both digests; no write boundary changes.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "6ce5d6c4d7eae4211c9bef12542076c7631d202cc52c9355f52dac81457b5bb6",
+        "8e47c443a7295506a1d981e80ffcc24f23ff5253628cf8a6d72a9ae4acca6384",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
