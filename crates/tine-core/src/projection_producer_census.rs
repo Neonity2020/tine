@@ -2094,9 +2094,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // adds one narrowed Managed import (437 rows): pending query database
     // open/apply/validation, its registry patch binds, the second snapshot and
     // mask decoding disappear. No authority write boundary is added.
+    // Final single-source cleanup removes exactly one additional tuple: the
+    // compiler-only PhysicalQueryValue::Blob binding for the deleted page mask.
+    // Adding that tuple back reconstructs c2cd2827 byte-for-byte (436 rows now).
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "c2cd28274ce4450f04f7f48030226808d433cca4e2ce41f3124ef3248b1df76e",
+        "349b90be6e8cbe6c7cda949abb1f63f26adb9887d8e2719e3c3bb6c7fea70965",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

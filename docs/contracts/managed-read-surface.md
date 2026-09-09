@@ -78,7 +78,7 @@ adapter call edges.
 | application_resolve_blocks_ready | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Materializes resolved Managed UUID groups. |
 | application_simple_query | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Handle-side Managed simple-query driver: off-actor execution over one current main SQLite snapshot, with bounded stale recapture and typed errors. |
 | application_simple_query_prepared_ir | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Stamps parsed IR with the actual main frontier and captures shared registry input only for a property query. |
-| application_simple_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Actor half of a Managed simple query: readiness, memo hit, or one main-snapshot capture. |
+| application_simple_query_turn | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Actor half of a Managed simple query: observational readiness and one main-snapshot capture. |
 | application_subtree_nodes | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Counts nodes in a Managed DTO subtree for admission. |
 | application_templates_ready | `crates/tine-core/src/sync_runtime.rs` | adapter | application_page_templates | Supplies hydrated Managed pages to the canonical template walk. |
 | application_unit_page_home_hints | `crates/tine-core/src/sync_runtime.rs` | necessary | — | Managed unit-transaction page-location hints. |
@@ -116,7 +116,7 @@ adapter call edges.
 | --- | --- | --- | --- |
 | Direct-ready | Physical projection is a hint; ambiguity falls back and parser-order first claimant owns the UUID. | c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968 | `deps/graph-parser/src/logseq/graph_parser/block.cljs` (`fix-block-id-if-duplicated!`) |
 | Direct-fallback | Parser-order first claimant owns the UUID. | c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968 | `deps/graph-parser/src/logseq/graph_parser/block.cljs` (`fix-block-id-if-duplicated!`) |
-| Managed-main while editor pending | Live query reads the current main SQLite image; pending editor/navigation state does not alter query UUID ownership. | c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968 | `deps/graph-parser/src/logseq/graph_parser/block.cljs` (`fix-block-id-if-duplicated!`) |
+| Managed-pending | Ordinary UUID navigation merges exact pending editor pages and SQLite pages in graph path/tree order; first claimant owns the UUID. | c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968 | `deps/graph-parser/src/logseq/graph_parser/block.cljs` (`fix-block-id-if-duplicated!`) |
 | Managed-drained | A unique SQLite hint is accepted; ambiguity is resolved from pages in graph path/tree order, first claimant. | c67b8b5fa47f8fe1e1954226c9bdfabd46ebb968 | `deps/graph-parser/src/logseq/graph_parser/block.cljs` (`fix-block-id-if-duplicated!`) |
 
 OG also declares `:block/uuid` unique identity in

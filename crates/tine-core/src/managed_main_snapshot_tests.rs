@@ -52,7 +52,6 @@ fn live_query_and_registry_read_actual_main_when_required_frontier_is_ahead() {
         retained,
         crate::oplog::operational_coordinator::CleanLocalMutationState::DurablePending(_)
     ));
-    drop(retained);
     let hot = resources.runtime.engine().accepted_frontier_root().unwrap();
     let required = resources
         .runtime
@@ -75,12 +74,31 @@ fn live_query_and_registry_read_actual_main_when_required_frontier_is_ahead() {
         Arc::clone(&shared),
     )
     .unwrap();
+    assert!(matches!(
+        actor.clean.as_mut().unwrap().retain_outcome(retained),
+        CleanActorMutationOutcome::DurablePending { .. }
+    ));
+    let pending_before = actor.clean.as_ref().unwrap().pending_failure();
+    assert!(pending_before.is_some());
+    let assert_read_only = |actor: &RuntimeActor, stage: &str| {
+        assert_eq!(
+            actor.active_database().unwrap().frontier_root().unwrap(),
+            actual,
+            "{stage} must not advance the main projection"
+        );
+        assert_eq!(
+            actor.clean.as_ref().unwrap().pending_failure(),
+            pending_before,
+            "{stage} must leave the ordinary save continuation untouched"
+        );
+    };
     let SimpleQueryTurn::Captured(query) = actor
         .application_simple_query_turn("(task TODO)", 128, 1 << 20)
         .expect("current main queries must not wait for the required editor frontier")
     else {
         panic!("a complete current main image must yield a query capture")
     };
+    assert_read_only(&actor, "simple capture");
     assert_eq!(
         query.stamp.acceptance_sequence,
         actual.acceptance_sequence()
@@ -103,6 +121,35 @@ fn live_query_and_registry_read_actual_main_when_required_frontier_is_ahead() {
         .blocks
         .iter()
         .any(|block| block.raw.contains("newer hot editor text"))));
+    assert_read_only(&actor, "simple execution");
+
+    let IrQueryTurn::Captured(ir) = actor
+        .application_captured_query_turn(
+            &ManagedQueryTurnInput::Ir {
+                query: query.query.clone(),
+                view: query.view.clone(),
+                context: crate::query::ir::ExecutionContext::none(),
+                explain: false,
+            },
+            128,
+            1 << 20,
+        )
+        .expect("IR capture must read current main without settling a save")
+    else {
+        panic!("a complete current main image must yield an IR capture")
+    };
+    assert_read_only(&actor, "IR capture");
+    let crate::managed_query::ManagedQueryOutcome::Answered(
+        crate::managed_query::ManagedQueryAnswer::Blocks(ir_answer),
+    ) = shared.execute(&ir)
+    else {
+        panic!("the current main IR query must answer")
+    };
+    assert_eq!(
+        serde_json::to_value(&ir_answer.groups).unwrap(),
+        serde_json::to_value(&answer.groups).unwrap()
+    );
+    assert_read_only(&actor, "IR execution");
 
     let RegistryTurn::Captured(capture) = actor
         .application_captured_registry_turn()
@@ -110,6 +157,7 @@ fn live_query_and_registry_read_actual_main_when_required_frontier_is_ahead() {
     else {
         panic!("a complete current main image must yield a registry capture")
     };
+    assert_read_only(&actor, "registry capture");
     assert_eq!(
         capture.stamp.acceptance_sequence,
         actual.acceptance_sequence()
@@ -136,6 +184,7 @@ fn live_query_and_registry_read_actual_main_when_required_frontier_is_ahead() {
         .rows
         .iter()
         .any(|row| row.normalized_name == "lonely"));
+    assert_read_only(&actor, "registry execution");
     assert_eq!(
         actor.active_database().unwrap().frontier_root().unwrap(),
         actual,

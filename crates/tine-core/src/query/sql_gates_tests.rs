@@ -268,24 +268,6 @@ impl Corpus {
         }
     }
 
-    /// One page's id, read through the seam — the value §5.9's overlay masking
-    /// binds.
-    pub(crate) fn page_id(&self, name: &str) -> [u8; 16] {
-        let rows = self
-            .reader
-            .run_projection_query(
-                "SELECT page_id FROM pages WHERE name = ?1",
-                &[PhysicalQueryValue::Text(name.to_string())],
-            )
-            .expect("the page id is readable through the seam");
-        match rows.first().and_then(|row| row.first()) {
-            Some(PhysicalQueryValue::Blob(id)) => {
-                id.as_slice().try_into().expect("a 16-byte page id")
-            }
-            other => panic!("{name} has no page row: {other:?}"),
-        }
-    }
-
     /// Every block id on one page, in the same spelling `sql` returns.
     fn block_ids_on_page(&self, name: &str) -> BTreeSet<String> {
         let rows = self
@@ -313,9 +295,8 @@ impl Corpus {
         source: &str,
         dialect: QueryDialect,
         fts_ready: bool,
-        masked_pages: &[[u8; 16]],
     ) -> (Anchor, SqlQuery) {
-        self.lower_as(source, dialect, fts_ready, masked_pages, RESULT_SET_RULE)
+        self.lower_as(source, dialect, fts_ready, RESULT_SET_RULE)
     }
 
     /// The same lowering under one named spelling of §5.3's result-set rule, so
@@ -325,7 +306,6 @@ impl Corpus {
         source: &str,
         dialect: QueryDialect,
         fts_ready: bool,
-        masked_pages: &[[u8; 16]],
         result_set_rule: ResultSetRule,
     ) -> (Anchor, SqlQuery) {
         let today = self.today();
@@ -335,7 +315,6 @@ impl Corpus {
         let inputs = LoweringInputs {
             today,
             registry: &registry,
-            masked_pages,
             cutoff: None,
             compiled: &compiled,
             fts_ready,
@@ -358,30 +337,24 @@ impl Corpus {
 
     /// The lowering's answer over the same graph, through the D-15 seam.
     fn sql(&self, source: &str, dialect: QueryDialect) -> BTreeSet<String> {
-        self.sql_with(source, dialect, self.fts_ready(), &[])
+        self.sql_with(source, dialect, self.fts_ready())
     }
 
-    fn sql_with(
-        &self,
-        source: &str,
-        dialect: QueryDialect,
-        fts_ready: bool,
-        masked_pages: &[[u8; 16]],
-    ) -> BTreeSet<String> {
-        self.sql_as(source, dialect, fts_ready, masked_pages, RESULT_SET_RULE)
+    fn sql_with(&self, source: &str, dialect: QueryDialect, fts_ready: bool) -> BTreeSet<String> {
+        self.sql_as(source, dialect, fts_ready, RESULT_SET_RULE)
     }
 
-    /// The SQL page answer with multiplicity preserved, including the outer
-    /// pending-page mask. This is intentionally separate from [`Corpus::sql`],
+    /// The SQL page answer with multiplicity preserved. This is intentionally
+    /// separate from [`Corpus::sql`],
     /// whose set result is the right identity for block rows but would hide a
     /// duplicate display name.
-    fn sql_page_names_with(&self, source: &str, masked_pages: &[[u8; 16]]) -> Vec<String> {
+    fn sql_page_names(&self, source: &str) -> Vec<String> {
         let today = self.today();
         let (query, _view) = crate::query::parse_query_text(source, QueryDialect::Tql, today);
-        self.sql_page_names_for_query(&query, masked_pages)
+        self.sql_page_names_for_query(&query)
     }
 
-    fn sql_page_names_for_query(&self, query: &Query, masked_pages: &[[u8; 16]]) -> Vec<String> {
+    fn sql_page_names_for_query(&self, query: &Query) -> Vec<String> {
         assert_eq!(
             query.anchor,
             Anchor::Page,
@@ -392,7 +365,6 @@ impl Corpus {
         let inputs = LoweringInputs {
             today: self.today(),
             registry: &registry,
-            masked_pages,
             cutoff: None,
             compiled: &compiled,
             fts_ready: self.fts_ready(),
@@ -417,35 +389,14 @@ impl Corpus {
         names
     }
 
-    /// One physical page id selected by its persisted path. Name lookup is
-    /// deliberately insufficient for the duplicate-display-name mask case.
-    fn page_id_at_path(&self, path: &str) -> [u8; 16] {
-        let rows = self
-            .reader
-            .run_projection_query(
-                "SELECT page_id FROM pages WHERE path = ?1",
-                &[PhysicalQueryValue::Text(path.to_string())],
-            )
-            .expect("the page id is readable through the seam");
-        assert_eq!(rows.len(), 1, "{path} must name one physical page");
-        match rows[0].first() {
-            Some(PhysicalQueryValue::Blob(id)) => {
-                id.as_slice().try_into().expect("a 16-byte page id")
-            }
-            other => panic!("{path} has no page row: {other:?}"),
-        }
-    }
-
     fn sql_as(
         &self,
         source: &str,
         dialect: QueryDialect,
         fts_ready: bool,
-        masked_pages: &[[u8; 16]],
         result_set_rule: ResultSetRule,
     ) -> BTreeSet<String> {
-        let (anchor, statement) =
-            self.lower_as(source, dialect, fts_ready, masked_pages, result_set_rule);
+        let (anchor, statement) = self.lower_as(source, dialect, fts_ready, result_set_rule);
         self.bind_regexes(&statement.regexes);
         let rows = self
             .reader
@@ -480,18 +431,6 @@ impl Corpus {
         source: &str,
         dialect: QueryDialect,
     ) -> (crate::query::ir::Query, SqlQuery) {
-        self.lower_block_anchored_masked(source, dialect, &[])
-    }
-
-    /// The same statement with §5.9's overlay mask applied — the shape the
-    /// Managed PENDING route lowers its ACCEPTED source with (R5a). One
-    /// producer, so a masked gate cannot drift from the unmasked one.
-    pub(crate) fn lower_block_anchored_masked(
-        &self,
-        source: &str,
-        dialect: QueryDialect,
-        masked_pages: &[[u8; 16]],
-    ) -> (crate::query::ir::Query, SqlQuery) {
         let today = self.today();
         let (parsed, _view) = crate::query::parse_query_text(source, dialect, today);
         let query = crate::query::block_anchored_query(&parsed);
@@ -500,7 +439,6 @@ impl Corpus {
         let inputs = LoweringInputs {
             today,
             registry: &registry,
-            masked_pages,
             cutoff: None,
             compiled: &compiled,
             fts_ready: self.fts_ready(),
@@ -512,18 +450,7 @@ impl Corpus {
 
     /// `(plan, positively_bounded, matches_nothing)`.
     fn explain(&self, source: &str, dialect: QueryDialect) -> (Vec<String>, bool, bool) {
-        self.explain_masked(source, dialect, &[])
-    }
-
-    /// The same plan with §5.9's overlay mask applied — what the pending
-    /// route's ACCEPTED source actually runs (R5a).
-    fn explain_masked(
-        &self,
-        source: &str,
-        dialect: QueryDialect,
-        masked_pages: &[[u8; 16]],
-    ) -> (Vec<String>, bool, bool) {
-        let (_anchor, statement) = self.lower(source, dialect, self.fts_ready(), masked_pages);
+        let (_anchor, statement) = self.lower(source, dialect, self.fts_ready());
         self.bind_regexes(&statement.regexes);
         // The parameters are bound for the EXPLAIN too: with `sqlite_stat4`
         // present the planner may choose differently for a bound value than for
@@ -887,7 +814,7 @@ fn page_blocks_quantifies_the_physical_page_forest_with_full_block_semantics() {
         );
         let expected = expected_page_names(expected);
         let walk = corpus.walk_page_names(source);
-        let sql = corpus.sql_page_names_with(source, &[]);
+        let sql = corpus.sql_page_names(source);
         assert_eq!(walk, expected, "walk membership for {source}");
         assert_eq!(sql, expected, "SQL membership for {source}");
     }
@@ -916,7 +843,7 @@ fn page_blocks_quantifies_the_physical_page_forest_with_full_block_semantics() {
 /// shorthand exposes page attributes and page properties rather than a general
 /// `any(page, ...)` spelling.
 #[test]
-fn page_blocks_supports_finite_page_blocks_reentry_and_outer_physical_masks() {
+fn page_blocks_supports_finite_page_blocks_reentry() {
     let _serial = serialize();
     let root = scratch("page-blocks-reentry");
     write_page_blocks_corpus(&root);
@@ -937,22 +864,7 @@ fn page_blocks_supports_finite_page_blocks_reentry_and_outer_physical_masks() {
     );
     let expected = expected_page_names(&["deep", "multi", "org", "root", "Shared Title"]);
     assert_eq!(corpus.walk_page_names_for_query(&nested), expected);
-    assert_eq!(corpus.sql_page_names_for_query(&nested, &[]), expected);
-
-    let source = "@page and any(blocks, task = 'TODO')";
-    let dup_a = corpus.page_id_at_path("pages/dup-a.md");
-    let dup_b = corpus.page_id_at_path("pages/dup-b.md");
-    let without_matching_twin = expected_page_names(&["deep", "multi", "org", "root"]);
-    assert_eq!(
-        corpus.sql_page_names_with(source, &[dup_a]),
-        without_matching_twin,
-        "the outer mask removes exactly the matching physical twin"
-    );
-    assert_eq!(
-        corpus.sql_page_names_with(source, &[dup_b]),
-        expected,
-        "masking the nonmatching twin cannot hide the matching twin"
-    );
+    assert_eq!(corpus.sql_page_names_for_query(&nested), expected);
 }
 
 #[test]
@@ -964,7 +876,7 @@ fn page_blocks_keeps_invalid_and_wrong_scope_inputs_empty() {
 
     let invalid = "@page and any(blocks, task = )";
     assert!(corpus.walk_page_names(invalid).is_empty());
-    assert!(corpus.sql_page_names_with(invalid, &[]).is_empty());
+    assert!(corpus.sql_page_names(invalid).is_empty());
 
     let wrong_scope = "@block and any(blocks, true)";
     assert!(corpus.walk(wrong_scope, QueryDialect::Tql).is_empty());
@@ -1514,8 +1426,8 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
     let mut differences = Vec::new();
     let mut bounded_shapes = 0usize;
     for (source, dialect) in CONTENT_SHAPES {
-        let bounded = corpus.sql_with(source, *dialect, true, &[]);
-        let exact = corpus.sql_with(source, *dialect, false, &[]);
+        let bounded = corpus.sql_with(source, *dialect, true);
+        let exact = corpus.sql_with(source, *dialect, false);
         let walk = corpus.walk(source, *dialect);
         if bounded != exact {
             differences.push(format!(
@@ -1534,7 +1446,7 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
                 walk.difference(&bounded).count()
             ));
         }
-        let (_anchor, statement) = corpus.lower(source, *dialect, true, &[]);
+        let (_anchor, statement) = corpus.lower(source, *dialect, true);
         if statement.sql.contains("search_substring_fts") {
             bounded_shapes += 1;
         }
@@ -1566,7 +1478,7 @@ fn a_building_fts_index_answers_every_content_shape_from_the_ready_columns() {
     let corpus = Corpus::open(root, true);
     let mut differences = Vec::new();
     for (source, dialect) in CONTENT_SHAPES {
-        let (_anchor, statement) = corpus.lower(source, *dialect, false, &[]);
+        let (_anchor, statement) = corpus.lower(source, *dialect, false);
         if statement.sql.contains("search_substring_fts")
             || statement.sql.contains("search_fts_owners")
             || statement.sql.contains("MATCH ")
@@ -1574,7 +1486,7 @@ fn a_building_fts_index_answers_every_content_shape_from_the_ready_columns() {
             differences.push(format!("{source}: the building path still asks the index"));
             continue;
         }
-        let sql = corpus.sql_with(source, *dialect, false, &[]);
+        let sql = corpus.sql_with(source, *dialect, false);
         let walk = corpus.walk(source, *dialect);
         if walk != sql {
             differences.push(format!(
@@ -1618,8 +1530,8 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
     let mut rows = 0usize;
     let mut classes = std::collections::BTreeMap::<String, usize>::new();
     for (source, dialect) in CONTENT_SHAPES {
-        let ready = corpus.sql_with(source, *dialect, true, &[]);
-        let building = corpus.sql_with(source, *dialect, false, &[]);
+        let ready = corpus.sql_with(source, *dialect, true);
+        let building = corpus.sql_with(source, *dialect, false);
         let walk = corpus.walk(source, *dialect);
         rows += ready.len();
         for (label, answer) in [("ready", &ready), ("building", &building)] {
@@ -1633,7 +1545,7 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
                 ));
             }
         }
-        let (_anchor, statement) = corpus.lower(source, *dialect, true, &[]);
+        let (_anchor, statement) = corpus.lower(source, *dialect, true);
         if statement.positively_bounded {
             bounded += 1;
         }
@@ -1655,33 +1567,6 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
     );
 }
 
-/// §5.9's overlay masking composes with a content leaf and its candidate bound:
-/// the masked page's rows leave the statement, and every other row still
-/// answers exactly as the walk does. The masked read and the overlay walk
-/// cannot both answer for one page.
-#[test]
-fn a_masked_overlay_page_leaves_a_content_result() {
-    let _serial = serialize();
-    let root = scratch("masked-content");
-    write_fast_corpus(&root);
-    let corpus = Corpus::open(root, true);
-    let masked = corpus.page_id("search");
-    for (source, dialect) in CONTENT_SHAPES {
-        let all = corpus.sql_with(source, *dialect, true, &[]);
-        let visible = corpus.sql_with(source, *dialect, true, std::slice::from_ref(&masked));
-        let on_masked = corpus.block_ids_on_page("search");
-        assert!(
-            visible.is_subset(&all),
-            "{source}: masking may only remove rows"
-        );
-        let expected: BTreeSet<String> = all.difference(&on_masked).cloned().collect();
-        assert_eq!(
-            visible, expected,
-            "{source}: exactly the masked page leaves"
-        );
-    }
-}
-
 /// §5.10 asks for the short/unindexable, regex and transient-building plan
 /// classes to be recorded SEPARATELY from the indexed case. A gate that could
 /// not name them would have to choose between failing them and exempting every
@@ -1693,7 +1578,7 @@ fn the_content_plan_classes_are_recorded_separately_from_the_indexed_case() {
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
     for (source, dialect, expected) in CONTENT_PLAN_SHAPES {
-        let (_anchor, statement) = corpus.lower(source, *dialect, true, &[]);
+        let (_anchor, statement) = corpus.lower(source, *dialect, true);
         assert_eq!(
             statement.content_plans,
             vec![*expected],
@@ -1701,7 +1586,7 @@ fn the_content_plan_classes_are_recorded_separately_from_the_indexed_case() {
         );
         // The same leaf, with the index still building, is the transient class
         // on every shape that would otherwise reach it.
-        let (_anchor, building) = corpus.lower(source, *dialect, false, &[]);
+        let (_anchor, building) = corpus.lower(source, *dialect, false);
         let expected_building = match expected {
             ContentPlan::Regex => ContentPlan::Regex,
             _ => ContentPlan::FtsBuilding,
@@ -1741,7 +1626,7 @@ fn the_two_result_set_spellings_answer_identically() {
         let walk = corpus.walk(source, *dialect);
         let answers: Vec<_> = SPELLINGS
             .iter()
-            .map(|rule| corpus.sql_as(source, *dialect, fts_ready, &[], *rule))
+            .map(|rule| corpus.sql_as(source, *dialect, fts_ready, *rule))
             .collect();
         compared += 1;
         for (rule, rows) in SPELLINGS.iter().zip(&answers) {
@@ -1900,7 +1785,7 @@ fn manager_regex_missing_payload_is_a_read_error() {
     let root = scratch("missing-regex-payload");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let (_, statement) = corpus.lower("content regexp '.'", QueryDialect::Tql, true, &[]);
+    let (_, statement) = corpus.lower("content regexp '.'", QueryDialect::Tql, true);
     corpus.bind_regexes(&statement.regexes);
     let damage =
         rusqlite::Connection::open(corpus.projection_dir().join("projection.sqlite")).unwrap();
@@ -1994,8 +1879,7 @@ fn a_regex_predicate_reads_the_exact_visible_text_through_a_statement_scoped_tab
     // cannot outlive its statement. Install one statement's program, then the
     // EMPTY program a regex-free statement installs, and the first statement's
     // ID no longer answers — it FAILS the read rather than matching nothing.
-    let (_anchor, statement) =
-        corpus.lower("content regexp 'SHOUTING'", QueryDialect::Tql, true, &[]);
+    let (_anchor, statement) = corpus.lower("content regexp 'SHOUTING'", QueryDialect::Tql, true);
     assert_eq!(statement.regexes.bindings.len(), 1);
     corpus.bind_regexes(&statement.regexes);
     assert_eq!(
@@ -2044,58 +1928,6 @@ fn a_positively_bounded_query_searches_its_anchor_and_indexes_its_subqueries() {
          is not measuring them:\n{}",
         vacuous.join("\n")
     );
-}
-
-/// §5.9 + §5.7 together (R5a): the ACCEPTED source of a pending read is lowered
-/// with a non-empty overlay mask, and a mask is a `NOT IN (…)` on the anchor's
-/// page column — the one shape that could push a planner off a positive index
-/// and onto a base-table scan, turning a bounded query into a graph-sized one
-/// (I-13). Every `PLAN_SHAPES` entry therefore has to hold its plan with the
-/// mask on, and a shape that does not is REPORTED here, not quietly excused.
-#[test]
-fn a_masked_statement_keeps_every_plan_shape_off_a_base_table_scan() {
-    let _serial = serialize();
-    let root = scratch("plan-masked");
-    write_fast_corpus(&root);
-    let corpus = Corpus::open(root, true);
-    let masked = mask_sample(&corpus);
-    assert!(
-        masked.len() >= 2,
-        "the mask must name real pages or the gate measures the unmasked plan"
-    );
-    let (failures, vacuous) = measure_plans_masked(&corpus, &masked);
-    assert!(
-        failures.is_empty(),
-        "§5.7 plan gate failures with §5.9's overlay mask applied:\n{}",
-        failures.join("\n")
-    );
-    // Masking pages must not make a shape unsatisfiable either: the fast corpus
-    // spreads every shape over more pages than the mask names.
-    assert!(
-        vacuous.is_empty(),
-        "the mask emptied these plan shapes, so the gate is not measuring them:\n{}",
-        vacuous.join("\n")
-    );
-}
-
-/// A few real page ids from the corpus, in the projection's own order, to mask
-/// with. Ids the projection does not name would be lowered into the statement
-/// all the same, but they would not exercise a planner decision.
-fn mask_sample(corpus: &Corpus) -> Vec<[u8; 16]> {
-    corpus
-        .reader
-        .run_projection_query("SELECT page_id FROM pages ORDER BY path LIMIT 3", &[])
-        .expect("the projection names its pages")
-        .into_iter()
-        .filter_map(|row| match row.first() {
-            Some(PhysicalQueryValue::Blob(id)) if id.len() == 16 => {
-                let mut page = [0u8; 16];
-                page.copy_from_slice(id);
-                Some(page)
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 /// The same gate on the anonymized graph, where the row counts are real and the
@@ -2209,15 +2041,10 @@ fn a_nested_refs_child_predicate_cannot_bound_its_anchor() {
 
 /// `(failures, shapes that provably read nothing on this corpus)`.
 fn measure_plans(corpus: &Corpus) -> (Vec<String>, Vec<String>) {
-    measure_plans_masked(corpus, &[])
-}
-
-/// `(failures, shapes that provably read nothing on this corpus)`.
-fn measure_plans_masked(corpus: &Corpus, masked_pages: &[[u8; 16]]) -> (Vec<String>, Vec<String>) {
     let mut failures = Vec::new();
     let mut vacuous = Vec::new();
     for (source, dialect) in PLAN_SHAPES {
-        let (plan, bounded, nothing) = corpus.explain_masked(source, *dialect, masked_pages);
+        let (plan, bounded, nothing) = corpus.explain(source, *dialect);
         if nothing {
             vacuous.push(format!(
                 "{source}: unsatisfiable on this corpus (the key's effective type \
@@ -2534,10 +2361,10 @@ fn time_rule(
     repeats: u32,
     rule: ResultSetRule,
 ) -> Option<(usize, u128)> {
-    let first = corpus.sql_as(source, dialect, fts_ready, &[], rule);
+    let first = corpus.sql_as(source, dialect, fts_ready, rule);
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = corpus.sql_as(source, dialect, fts_ready, &[], rule);
+        let _ = corpus.sql_as(source, dialect, fts_ready, rule);
     }
     Some((first.len(), (start.elapsed() / repeats).as_micros()))
 }
@@ -2553,7 +2380,7 @@ fn measure_shape(
     fts_ready: bool,
 ) {
     // Warm both sides once so neither pays for the other's first-touch cost.
-    let first = corpus.sql_with(source, dialect, fts_ready, &[]);
+    let first = corpus.sql_with(source, dialect, fts_ready);
     let _ = corpus.walk(source, dialect);
     let walk_start = Instant::now();
     for _ in 0..repeats {
@@ -2562,10 +2389,10 @@ fn measure_shape(
     let walk = walk_start.elapsed() / repeats;
     let sql_start = Instant::now();
     for _ in 0..repeats {
-        let _ = corpus.sql_with(source, dialect, fts_ready, &[]);
+        let _ = corpus.sql_with(source, dialect, fts_ready);
     }
     let sql = sql_start.elapsed() / repeats;
-    let (_anchor, statement) = corpus.lower(source, dialect, fts_ready, &[]);
+    let (_anchor, statement) = corpus.lower(source, dialect, fts_ready);
     let plan = if statement.content_plans.is_empty() {
         if statement.positively_bounded {
             "indexed".to_string()
@@ -2639,7 +2466,7 @@ fn dump_the_lowered_statements_as_a_measurement_baseline() {
     let mut captured: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (source, dialect) in MEASURE_SHAPES {
-        let (_anchor, statement) = corpus.lower(source, *dialect, fts_ready, &[]);
+        let (_anchor, statement) = corpus.lower(source, *dialect, fts_ready);
         captured.insert((*source).to_string(), statement.sql);
     }
     std::fs::write(
@@ -2712,7 +2539,7 @@ fn the_baseline_and_current_statements_are_measured_against_each_other() {
             disagreements.push(format!("{source}: absent from the captured baseline"));
             continue;
         };
-        let (anchor, statement) = corpus.lower(source, *dialect, fts_ready, &[]);
+        let (anchor, statement) = corpus.lower(source, *dialect, fts_ready);
         corpus.bind_regexes(&statement.regexes);
         // The two statements bind the SAME values in the SAME order — this
         // packet changes projection lists and one join, never a bound value —
@@ -2897,7 +2724,7 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
     // access must be its OWN scoped subquery, so removing the candidate-stage
     // join cannot have moved a page predicate's table access anywhere.
     for source in ["(task TODO)", "(journal)", "[[Project]]"] {
-        let (anchor, statement) = corpus.lower(source, QueryDialect::Og, fts_ready, &[]);
+        let (anchor, statement) = corpus.lower(source, QueryDialect::Og, fts_ready);
         assert_eq!(anchor, Anchor::Block, "{source}");
         assert!(
             statement.sql.starts_with(
@@ -2957,7 +2784,6 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
         "(task TODO)",
         QueryDialect::Og,
         fts_ready,
-        &[],
         ResultSetRule::CorrelatedProbe,
     );
     assert!(
@@ -2975,12 +2801,7 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
 
     // `@page` output is untouched by this packet: four columns, name and kind
     // included, because the page result construction reads them.
-    let (anchor, page) = corpus.lower(
-        "@page and journal = true",
-        QueryDialect::Tql,
-        fts_ready,
-        &[],
-    );
+    let (anchor, page) = corpus.lower("@page and journal = true", QueryDialect::Tql, fts_ready);
     assert_eq!(anchor, Anchor::Page);
     assert!(
         page.sql

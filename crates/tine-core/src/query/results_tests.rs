@@ -1316,12 +1316,8 @@ fn a_page_anchored_statement_has_no_block_descriptor() {
     let root = scratch("r3-page-anchor");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let (anchor, statement) = corpus.lower(
-        "@page and name like 'proj/%'",
-        QueryDialect::Tql,
-        false,
-        &[],
-    );
+    let (anchor, statement) =
+        corpus.lower("@page and name like 'proj/%'", QueryDialect::Tql, false);
     assert_eq!(anchor, crate::query::ir::Anchor::Page);
     assert!(
         descriptor_statement(&statement, BackendOrder::Direct).is_err(),

@@ -131,8 +131,6 @@ pub(crate) enum ManagedQueryOutcome {
 #[derive(Debug, Default)]
 pub(crate) struct ManagedQueryCensus {
     pub(crate) statement_reads: AtomicUsize,
-    /// Deliberate witness: no traversal fallback may reconnect silently.
-    pub(crate) fallback_reads: AtomicUsize,
     pub(crate) failed_reads: AtomicUsize,
     pub(crate) stale_recaptures: AtomicUsize,
     pub(crate) metadata_reads: AtomicUsize,
@@ -142,7 +140,6 @@ pub(crate) struct ManagedQueryCensus {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedQueryCensusSnapshot {
     pub(crate) statement_reads: usize,
-    pub(crate) fallback_reads: usize,
     pub(crate) failed_reads: usize,
     pub(crate) stale_recaptures: usize,
     pub(crate) metadata_reads: usize,
@@ -169,7 +166,6 @@ impl ManagedQueryCensus {
     pub(crate) fn snapshot(&self) -> ManagedQueryCensusSnapshot {
         ManagedQueryCensusSnapshot {
             statement_reads: self.statement_reads.load(Ordering::Relaxed),
-            fallback_reads: self.fallback_reads.load(Ordering::Relaxed),
             failed_reads: self.failed_reads.load(Ordering::Relaxed),
             stale_recaptures: self.stale_recaptures.load(Ordering::Relaxed),
             metadata_reads: self.metadata_reads.load(Ordering::Relaxed),
@@ -179,7 +175,6 @@ impl ManagedQueryCensus {
     #[cfg(test)]
     pub(crate) fn reset(&self) {
         self.statement_reads.store(0, Ordering::Relaxed);
-        self.fallback_reads.store(0, Ordering::Relaxed);
         self.failed_reads.store(0, Ordering::Relaxed);
         self.stale_recaptures.store(0, Ordering::Relaxed);
         self.metadata_reads.store(0, Ordering::Relaxed);
@@ -291,7 +286,6 @@ fn execute_main_source(
             &LoweringInputs {
                 today: capture.today,
                 registry,
-                masked_pages: &[],
                 cutoff: None,
                 compiled: &compiled,
                 fts_ready,

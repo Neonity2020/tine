@@ -6687,9 +6687,6 @@ impl Graph {
         let inputs = LoweringInputs {
             today,
             registry: &registry,
-            // Direct Files has no unaccepted local overlay; masking is Managed
-            // Storage's read-your-writes route (§5.9), which is P1-e's.
-            masked_pages: &[],
             // NOT `max_rows`: the walk reports `total` as the number of matches
             // it SAW, not the number it admitted, so a `LIMIT` in the statement
             // would silently truncate the count the user is shown. The bounds
@@ -6952,7 +6949,6 @@ impl Graph {
                 &LoweringInputs {
                     today,
                     registry: &registry,
-                    masked_pages: &[],
                     // NOT `max_rows`: the page loop's `exceeded` is decided by the
                     // row AFTER the cap, so a `LIMIT` would hide it.
                     cutoff: None,
@@ -7023,7 +7019,6 @@ impl Graph {
                         &LoweringInputs {
                             today,
                             registry: &registry,
-                            masked_pages: &[],
                             cutoff: None,
                             compiled: &compiled,
                             fts_ready,

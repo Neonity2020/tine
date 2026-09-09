@@ -336,9 +336,6 @@ pub(crate) struct LoweringInputs<'a> {
     /// The registry snapshot that decides each property key's effective type
     /// (§6.3). The walk reads the same snapshot for the same execution.
     pub(crate) registry: &'a Registry,
-    /// Page ids an unaccepted local overlay covers (§5.9, Managed Storage).
-    /// Empty on Direct Files.
-    pub(crate) masked_pages: &'a [[u8; 16]],
     /// `LIMIT cutoff + 1` when the caller supplies a cutoff (§5.6).
     pub(crate) cutoff: Option<usize>,
     /// The ONE parse of every `content match` payload for this execution
@@ -500,26 +497,11 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
     // The anchor of the statement, once the result-set rule has chosen its
     // shape: `blocks b` for the correlated probe, the materialized match set for
     // the CTE. `@page` has no suppression rule and keeps `pages p`.
-    let (select, from, mask_column) = match (row, &cte) {
-        (Row::Block(scope), None) => (select, from, format!("{}.page_id", scope.alias)),
-        // The mask stays on the ANCHOR, outside `m`, exactly as it is outside
-        // the correlated probe today: a block and its parent are always on the
-        // same page, so masking inside `m` would be unobservable either way, and
-        // staying outside keeps the masked statement the same predicate.
-        (Row::Block(_), Some(_)) => (MATCH_SET_SELECT, MATCH_SET_FROM, "m.page_id".to_string()),
-        (Row::Page(alias), _) => (select, from, format!("{alias}.page_id")),
+    let (select, from) = match (row, &cte) {
+        (Row::Block(_), None) => (select, from),
+        (Row::Block(_), Some(_)) => (MATCH_SET_SELECT, MATCH_SET_FROM),
+        (Row::Page(_), _) => (select, from),
     };
-    // §5.9: the overlay-masked page ids are removed inside the statement, so the
-    // masked read and the overlay walk cannot both answer for one page.
-    if !inputs.masked_pages.is_empty() {
-        let list = inputs
-            .masked_pages
-            .iter()
-            .map(|page| compiler.bind(PhysicalQueryValue::Blob(page.to_vec())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        where_ = fold_and(vec![where_, format!("{mask_column} NOT IN ({list})")]);
-    }
     // The selection relation answers membership only. Descriptor/page wrappers
     // apply backend order using persisted Direct page positions and preorder,
     // or Managed paths. Keeping presentation order out of this relation also
@@ -1325,10 +1307,9 @@ impl Compiler<'_> {
     /// reproduces `closure_names`' own `!name.is_empty()` filter, so a page whose
     /// name normalizes away contributes nothing on either engine.
     ///
-    /// A block and its ancestors are always on ONE page, which is why this
-    /// relation stays page-local ([`crate::query::ir::PageLocality`]) even
-    /// though it reads three tables: references compare STORED NAMES and never
-    /// traverse the reference graph.
+    /// A block and its ancestors are always on ONE page. Although this reads
+    /// three tables, references compare STORED NAMES and never traverse the
+    /// reference graph.
     fn refs(&mut self, quant: Quant, pred: &Filter, scope: BlockScope<'_>) -> String {
         // The walk's fast path: for the ONE predicate shape v1 accepts, `Every`
         // answers membership exactly as `Any` does (`eval_refs`'s
@@ -2606,7 +2587,6 @@ mod tests {
         LoweringInputs {
             today: JournalDate::from_ordinal(20260905),
             registry,
-            masked_pages: &[],
             cutoff: None,
             compiled: &NO_COMPILED_LEAVES,
             fts_ready: true,
@@ -3466,30 +3446,6 @@ mod tests {
         assert_ne!(every, nested(Quant::Any, general));
     }
 
-    /// §5.9: the overlay-masked page ids leave the statement, so the masked read
-    /// and the overlay walk cannot both answer for one page.
-    #[test]
-    fn masked_pages_leave_the_statement() {
-        let registry = Registry::none().clone();
-        let masked = [[7u8; 16]];
-        let mut inputs = inputs(&registry);
-        inputs.masked_pages = &masked;
-        let query = Query::new(Anchor::Block, Filter::page_ref("x"), Source::Builder);
-        let statement = lower_query(&query, &inputs);
-        // The mask sits on the ANCHOR, which under §5.3's CTE spelling is the
-        // materialized match set: a block and its parent are always on the same
-        // page, so masking inside `m` would be unobservable, and staying outside
-        // keeps the masked statement the same predicate it is today.
-        assert!(
-            statement.sql.contains("m.page_id NOT IN ("),
-            "{}",
-            statement.sql
-        );
-        assert!(statement
-            .params
-            .contains(&PhysicalQueryValue::Blob(vec![7u8; 16])));
-    }
-
     /// A page `blocks` quantifier inherits the block predicate's real bound:
     /// a selective task probe can drive page ids, while a broad enumeration
     /// and either complement quantifier cannot claim an indexed anchor.
@@ -3510,10 +3466,6 @@ mod tests {
         assert!(!lower(Quant::Any, Filter::True).positively_bounded);
         assert!(!lower(Quant::None, task()).positively_bounded);
         assert!(!lower(Quant::Every, task()).positively_bounded);
-        assert_eq!(
-            Rel::Blocks.page_locality(),
-            crate::query::ir::PageLocality::Local
-        );
     }
 
     #[test]

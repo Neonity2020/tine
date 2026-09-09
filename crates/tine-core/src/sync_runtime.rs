@@ -16320,7 +16320,7 @@ impl RuntimeActor {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<SimpleQueryTurn, SyncApplicationPageRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.current_query_readiness() {
             return Ok(SimpleQueryTurn::Deferred(state));
         }
         let today = crate::date::JournalDate::today();
@@ -16764,7 +16764,7 @@ impl RuntimeActor {
         max_bytes: usize,
     ) -> Result<IrQueryTurn, SyncApplicationPageRequestError> {
         use crate::managed_query::ManagedQueryRequest;
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.current_query_readiness() {
             return Ok(IrQueryTurn::Deferred(state));
         }
         let (resolved, view, explain) = match input {
@@ -16885,7 +16885,7 @@ impl RuntimeActor {
     fn application_captured_registry_turn(
         &mut self,
     ) -> Result<RegistryTurn, SyncApplicationPageRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.current_query_readiness() {
             return Ok(RegistryTurn::Deferred(state));
         }
         let config = self.graph.config.parse_config();
@@ -21630,6 +21630,18 @@ impl RuntimeActor {
             batch_id: None,
             phase: SyncLocalMutationPhase::Bindings,
         })
+    }
+
+    /// A query may read the coherent main image while ordinary publication is
+    /// retained. Inspect lifecycle readiness without retrying that publication;
+    /// the captured stamp and owned read transaction validate SQLite itself.
+    fn current_query_readiness(&self) -> EditorTurnReadiness {
+        match self.read_only_editor_turn_readiness() {
+            EditorTurnReadiness::Deferred(SyncEditorDeferred::RetryableRetainedPublication {
+                ..
+            }) => EditorTurnReadiness::Ready,
+            readiness => readiness,
+        }
     }
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {

@@ -3893,10 +3893,10 @@ fn crash_replayed_task_is_in_main_before_queries_resume() {
     );
     // R4a: the drained cold open holds no pending suffix, so the accepted
     // frontier IS the whole story and the query is answered from the database
-    // off the actor -- one statement read, no fallback, no failed read.
+    // off the actor -- one statement read and no failed read.
     assert_eq!(
         r4b_census(&reopened),
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "a crash-replayed drained runtime answers from the accepted projection"
     );
 
@@ -27184,10 +27184,10 @@ fn managed_query_search_manual_receipt(
         // R4a: the indexed task query is answered from ONE owned read
         // snapshot of the accepted projection, off the actor. The retired
         // sparse runner's shape claim ("one candidate-bounded attempt, no
-        // page evaluator fallback") is now this: one statement read, no
-        // fallback, no failed read, no re-capture.
+        // page evaluator fallback") is now one statement read, no failed read,
+        // and no re-capture.
         assert_eq!(
-            census, (1, 0, 0, 0),
+            census, (1, 0, 0),
             "indexed task query must be answered by exactly one accepted-frontier statement read: {census:?}"
         );
         assert_eq!(
@@ -27241,7 +27241,7 @@ fn managed_query_search_manual_receipt(
         // indexed shape: how many rows a shape selects does not decide the
         // route, only whether the accepted frontier is the whole story.
         assert_eq!(
-            regex_census, (1, 0, 0, 0),
+            regex_census, (1, 0, 0),
             "Regex-All must be answered by exactly one accepted-frontier statement read: {regex_census:?}"
         );
         assert_eq!(
@@ -27314,7 +27314,7 @@ fn managed_query_search_manual_receipt(
     let graph_search_p50 = startup_median(&graph_search_samples);
     let graph_search_p95 = startup_p95(&graph_search_samples);
     eprintln!(
-            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} indexed_complete_page_p50_ms={:.3} indexed_complete_page_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_statement_reads_max={} indexed_fallback_reads_max={} indexed_failed_reads_max={} indexed_stale_recaptures_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} indexed_complete_page_p50_ms={:.3} indexed_complete_page_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_statement_reads_max={} indexed_failed_reads_max={} indexed_stale_recaptures_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
             startup_ms(indexed_p50),
             startup_ms(indexed_p95),
             startup_ms(complete_page_p50),
@@ -27326,7 +27326,6 @@ fn managed_query_search_manual_receipt(
             indexed_census.iter().map(|census| census.0).max().unwrap_or(0),
             indexed_census.iter().map(|census| census.1).max().unwrap_or(0),
             indexed_census.iter().map(|census| census.2).max().unwrap_or(0),
-            indexed_census.iter().map(|census| census.3).max().unwrap_or(0),
             max_query_gate_counter(&indexed_counters, |counters| counters.full_inventory_passes),
             max_query_gate_counter(&indexed_counters, |counters| counters.result_page_hydrations),
             max_query_gate_counter(&indexed_counters, |counters| counters.metadata_page_hydrations),
@@ -27583,8 +27582,8 @@ fn clean_runtime_task_query_is_answered_from_the_database_without_hydrating_page
     // from the walk.
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
-        "one statement read, no fallback, no failed read, no re-capture"
+        (1, 0, 0),
+        "one statement read, no failed read, no re-capture"
     );
 
     assert!(matches!(
@@ -27593,8 +27592,8 @@ fn clean_runtime_task_query_is_answered_from_the_database_without_hydrating_page
     ));
 }
 
-/// Every simple-query request executes again, while pending and accepted
-/// edits remain visible to the next execution.
+/// Every simple-query request executes again against current main, and normal
+/// save drainage makes an edit visible to a later execution.
 #[test]
 fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
     const TOTAL_PAGES: usize = 24;
@@ -27657,7 +27656,7 @@ fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
     assert_eq!(cold.total, 0);
     assert_eq!(
         census,
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the cold evaluation reads the accepted projection once: {census:?}"
     );
     assert_eq!(
@@ -27681,7 +27680,7 @@ fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
     assert_eq!(repeat.total, 0);
     assert_eq!(
         census,
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the repeated evaluation executes another statement read: {census:?}"
     );
     assert_eq!(serde_json::to_value(&repeat).unwrap(), cold_value);
@@ -27710,35 +27709,29 @@ fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
         "the repeat fixture edit was not accepted: {save:?}"
     );
 
-    // While the save is still an undrained local suffix, R5a's executor
-    // answers from the overlay and the masked accepted projection.
+    // An undrained local edit leaves the current main answer unchanged.
     assert_eq!(handle.status().unwrap().managed_local_pending, 1);
     let (pending, counters, census) = run("query while the save is pending");
     assert_eq!(
-        pending.total, 1,
-        "the pending execution must observe the new row"
+        pending.total, 0,
+        "an editor-pending row is not yet in the current main image"
     );
     assert_eq!(
         census,
-        (1, 0, 0, 0),
-        "R5a: a pending page-local query is one off-actor two-source read, not a walk: {census:?}"
+        (1, 0, 0),
+        "the pending edit does not change the one-main SQL route: {census:?}"
     );
     assert_eq!(
         counters.result_page_hydrations, 0,
-        "R5a: the off-actor pending read loads no page document at all: {counters:?}"
+        "the current main read loads no page document: {counters:?}"
     );
-    assert_managed_simple_query_matches_direct(
-        "query while the save is pending",
-        pending,
-        direct_oracle_answer(crate::query::run_query_bounded(
-            &Graph::open(&fixture.graph_root),
-            &query,
-            MAX_ROWS,
-            MAX_BYTES,
-        )),
+    assert_eq!(
+        serde_json::to_value(&pending).unwrap(),
+        cold_value,
+        "the pending save leaves the complete committed answer unchanged"
     );
 
-    // Once the batch is accepted the frontier is the whole story again.
+    // The normal save pipeline updates main, then the next query sees the edit.
     drain_managed_local(&handle);
     let (after_save, counters, census) = run("query after an accepted batch");
     assert_eq!(
@@ -27747,7 +27740,7 @@ fn clean_runtime_repeated_simple_queries_execute_again_and_follow_edits() {
     );
     assert_eq!(
         census,
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the query executes from the accepted projection: {census:?}"
     );
     assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
@@ -32465,11 +32458,10 @@ fn r4b_inject(
     queue.extend(outcomes);
 }
 
-fn r4b_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize, usize) {
+fn r4b_census(handle: &SyncRuntimeHandle) -> (usize, usize, usize) {
     let census = handle.managed_query_census();
     (
         census.statement_reads,
-        census.fallback_reads,
         census.failed_reads,
         census.stale_recaptures,
     )
@@ -32505,10 +32497,10 @@ fn assert_query_execution_error(
 /// NOT the actor walk it was before this packet.
 ///
 /// The census is the load-bearing half: zero statement reads (the executor
-/// never opened a snapshot) AND zero fallback reads (there is no walk left to
-/// count). The recovery leg then proves the refusal fabricated nothing: the
-/// next attempt captures, reads ONE statement, and answers exactly what the
-/// independent Direct Files oracle answers over the same graph — so the error
+/// never opened a snapshot). The recovery leg then proves the refusal
+/// fabricated nothing: the next attempt captures, reads ONE statement, and
+/// answers exactly what the independent Direct Files oracle answers over the
+/// same graph — so the error
 /// could not have been an empty success in disguise.
 #[test]
 fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
@@ -32530,15 +32522,15 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
     );
     assert_eq!(
         r4b_census(&handle),
-        (0, 0, 0, 0),
-        "a Busy executor is no statement read and NO fallback: RET2 left no walk to fall back to"
+        (0, 0, 0),
+        "a Busy executor performs no statement read"
     );
 
     // The executor's queue is empty now, so this attempt runs for real.
     let first = r4b_query(&handle).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the retry is one database read after the Busy refusal"
     );
     assert!(
@@ -32551,7 +32543,7 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
     let second = r4b_query(&handle).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (2, 0, 0, 0),
+        (2, 0, 0),
         "the repeated query performs a second statement read"
     );
     assert_managed_simple_query_matches_direct("repeated query", second, r4b_oracle(&fixture));
@@ -32567,8 +32559,8 @@ fn r4b_an_accepted_only_query_is_captured_and_a_busy_executor_is_not_ready() {
 /// projection meanwhile holds exactly the pending page.
 ///
 /// RET2 updated the disposition leg: an injected `Busy` is now typed
-/// `NotReady(Busy)` and counts no fallback, because there is no walk under
-/// this route at all. The pending ANSWER below is unchanged and is still
+/// `NotReady(Busy)`, because there is no walk under this route at all. The
+/// pending ANSWER below is unchanged and is still
 /// compared against the independent Direct Files oracle.
 #[test]
 fn r4b_a_stale_snapshot_recaptures_twice_then_reports_pending_edits() {
@@ -32592,7 +32584,7 @@ fn r4b_a_stale_snapshot_recaptures_twice_then_reports_pending_edits() {
     );
     let answered = r4b_query(&handle).unwrap();
     assert_eq!(answered.total, 0, "the third capture's answer is served");
-    assert_eq!(r4b_census(&handle), (0, 0, 0, 2));
+    assert_eq!(r4b_census(&handle), (0, 0, 2));
 
     // A third Stale is readiness, not a walk: the caller is told to ask again.
     r4b_inject(
@@ -32607,13 +32599,13 @@ fn r4b_a_stale_snapshot_recaptures_twice_then_reports_pending_edits() {
     );
     assert_eq!(
         r4b_census(&handle),
-        (0, 0, 0, 2),
-        "the two re-captures are counted; the exhaustion is not a fallback"
+        (0, 0, 2),
+        "the two re-captures are counted"
     );
 
     // The retry is answered by the database and equals the independent oracle.
     let answered = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (1, 0, 0, 2));
+    assert_eq!(r4b_census(&handle), (1, 0, 2));
     assert!(answered.total > 0, "an empty success is impossible here");
     assert_managed_simple_query_matches_direct("read after three Stale", answered, oracle);
 
@@ -32640,20 +32632,20 @@ fn r4b_busy_is_not_ready_and_cancelled_is_cancelled() {
         &busy,
         QueryExecutionError::NotReady(QueryReadinessReason::Busy),
     );
-    assert_eq!(r4b_census(&handle), (0, 0, 0, 0));
+    assert_eq!(r4b_census(&handle), (0, 0, 0));
 
     r4b_inject(&handle, vec![Outcome::Cancelled]);
     let cancelled = r4b_query(&handle).unwrap_err();
     assert_query_execution_error("Cancelled", &cancelled, QueryExecutionError::Cancelled);
     assert_eq!(
         r4b_census(&handle),
-        (0, 0, 0, 0),
+        (0, 0, 0),
         "a drain's cancellation counts nothing and is not a failed read"
     );
 
     // Neither disposition poisoned the route: the next attempt reads.
     let answered = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (1, 0, 0, 0));
+    assert_eq!(r4b_census(&handle), (1, 0, 0));
     assert_managed_simple_query_matches_direct(
         "read after Busy and Cancelled",
         answered,
@@ -32687,12 +32679,12 @@ fn r4b_a_failed_managed_read_is_an_error_and_the_next_query_recovers() {
         !error.backend_wire_string().contains("injected"),
         "the executor's internal reason must not reach the wire"
     );
-    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+    assert_eq!(r4b_census(&handle), (0, 1, 0));
 
     // The failure was the read's, not the runtime's: the next query captures
     // again and is answered from the accepted projection.
     let recovered = r4b_query(&handle).unwrap();
-    assert_eq!(r4b_census(&handle), (1, 0, 1, 0));
+    assert_eq!(r4b_census(&handle), (1, 1, 0));
     assert_managed_simple_query_matches_direct(
         "query after a failed read",
         recovered,
@@ -32792,14 +32784,7 @@ fn ret2_invalid_simple_source_is_refused_before_query_job_acquisition() {
     assert_eq!(answer.total, 0);
     assert!(!answer.exceeded);
     let census = handle.managed_query_census();
-    assert_eq!(
-        (
-            census.statement_reads,
-            census.failed_reads,
-            census.fallback_reads
-        ),
-        (0, 0, 0)
-    );
+    assert_eq!((census.statement_reads, census.failed_reads), (0, 0));
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
@@ -32838,8 +32823,8 @@ fn r4a_an_accepted_only_query_is_one_statement_read_and_no_page_load() {
     let answered = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
-        "one statement read, no fallback, no failure, no re-capture"
+        (1, 0, 0),
+        "one statement read, no failure, no re-capture"
     );
     let counters = handle.managed_application_query_instrumentation().unwrap();
     assert_eq!(
@@ -32854,7 +32839,7 @@ fn r4a_an_accepted_only_query_is_one_statement_read_and_no_page_load() {
     let repeated = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (2, 0, 0, 0),
+        (2, 0, 0),
         "the repeated query performs a second statement read"
     );
     r4a_assert_same("repeated query", &repeated, &oracle);
@@ -32956,13 +32941,12 @@ fn r4a_parity_over(
             // The route never walked, and it skipped the database only where
             // the filter folded to false and the answer is empty by
             // construction (I-15) -- there is nothing to read for those.
-            let (statement_reads, fallbacks, failures, _) = r4b_census(handle);
+            let (statement_reads, failures, _) = r4b_census(handle);
             let skipped_but_nonempty = statement_reads == 0 && expected.total > 0;
-            if statement_reads > 1 || fallbacks != 0 || failures != 0 || skipped_but_nonempty {
+            if statement_reads > 1 || failures != 0 || skipped_but_nonempty {
                 differences.push(format!(
                     "{at} did not answer from the database: \
-                     statement_reads={statement_reads} fallbacks={fallbacks} \
-                     failures={failures} walk_total={}",
+                     statement_reads={statement_reads} failures={failures} walk_total={}",
                     expected.total
                 ));
             }
@@ -33097,7 +33081,7 @@ fn r4a_the_recency_axis_is_the_walks_journal_name_producer() {
         assert!(oracle.total >= 4, "{query}: {oracle:?}");
         handle.reset_managed_query_census();
         let answered = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap();
-        assert_eq!(r4b_census(&handle), (1, 0, 0, 0), "{query}");
+        assert_eq!(r4b_census(&handle), (1, 0, 0), "{query}");
         r4a_assert_same(query, &answered, &oracle);
     }
 
@@ -33155,7 +33139,7 @@ fn r4a_a_real_frontier_advance_between_capture_and_open_is_a_stale_recapture() {
     crate::managed_query::set_before_managed_open_hook(None);
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 1),
+        (1, 0, 1),
         "one Stale re-capture, then one statement read at the new frontier"
     );
     let after = r4a_oracle(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES);
@@ -33296,7 +33280,7 @@ fn r4a_a_drain_cancels_a_live_read_and_waits_for_its_slot() {
     );
     assert_eq!(
         r4b_census(&handle),
-        (0, 0, 0, 0),
+        (0, 0, 0),
         "a drain's cancellation is counted nowhere and is not a failed read"
     );
     assert!(
@@ -33374,23 +33358,23 @@ fn r4a_a_corrupt_projection_fails_every_read() {
         );
         assert_eq!(
             r4b_census(&handle),
-            (0, 0, 1, 0),
-            "{label}: one failed read, no fallback, no statement read"
+            (0, 1, 0),
+            "{label}: one failed read and no statement read"
         );
 
         // The next query captures and reads again, then fails for the same
         // reason.
         let again = r4a_navigate(&handle, query, R4B_ROWS, R4B_BYTES).unwrap_err();
         assert_eq!(again, error, "{label}");
-        assert_eq!(r4b_census(&handle), (0, 0, 2, 0), "{label}");
+        assert_eq!(r4b_census(&handle), (0, 2, 0), "{label}");
     }
 }
 
 /// **RET2's headline fail-before for capacity.** Through RET1 a real
 /// exhausted job owner ANSWERED: the route walked the parsed graph on the
-/// actor and counted a fallback. It is now a typed `NotReady(Busy)` the
-/// frontend's readiness loop retries, with no statement read, no fallback and
-/// no traversal — and it is a genuine owner exhaustion, not an injected
+/// actor. It is now a typed `NotReady(Busy)` the frontend's readiness loop
+/// retries, with no statement read and no traversal — and it is a genuine
+/// owner exhaustion, not an injected
 /// outcome.
 #[test]
 fn r4a_an_exhausted_job_owner_is_not_ready() {
@@ -33422,8 +33406,8 @@ fn r4a_an_exhausted_job_owner_is_not_ready() {
     );
     assert_eq!(
         r4b_census(&handle),
-        (0, 0, 0, 0),
-        "no slot within the wait is no statement read AND no fallback: nothing walked"
+        (0, 0, 0),
+        "no slot within the wait performs no statement read"
     );
 
     drop(held);
@@ -33431,7 +33415,7 @@ fn r4a_an_exhausted_job_owner_is_not_ready() {
     let read = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap();
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "a freed slot puts the next query back on the database route"
     );
     r4a_assert_same("read after the slots freed", &read, &oracle);
@@ -33711,7 +33695,7 @@ fn ret1_the_public_ir_explanation_matches_the_walk_over_every_shape() {
 
 /// **RET1's counter bar.** Every public IR execution — a block `query_run`, a
 /// `@page` `query_run`, and a `query_explain_empty` — is answered by ONE
-/// statement read, with no fallback, no failure, no re-capture, no page DTO
+/// statement read, with no failure, no re-capture, no page DTO
 /// loaded and no whole-graph inventory pass. A repeat executes another
 /// statement read and returns the same result.
 #[test]
@@ -33764,8 +33748,8 @@ fn ret1_the_public_ir_route_reads_statements_and_hydrates_no_page() {
         );
         assert_eq!(
             r4b_census(&handle),
-            (1, 0, 0, 0),
-            "{label}: one statement read, no fallback, no failure, no re-capture"
+            (1, 0, 0),
+            "{label}: one statement read, no failure, no re-capture"
         );
         let counters = handle.managed_application_query_instrumentation().unwrap();
         assert_eq!(
@@ -33785,11 +33769,11 @@ fn ret1_the_public_ir_route_reads_statements_and_hydrates_no_page() {
     let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
     handle.reset_managed_query_census();
     let first = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
-    assert_eq!(r4b_census(&handle), (1, 0, 0, 0));
+    assert_eq!(r4b_census(&handle), (1, 0, 0));
     let repeated = ret1_ir_navigate(&handle, &query, &view, &context, false, R4B_ROWS, R4B_BYTES);
     assert_eq!(
         r4b_census(&handle),
-        (2, 0, 0, 0),
+        (2, 0, 0),
         "the repeated IR query performs a second statement read"
     );
     ret1_assert_same("repeated IR query", &repeated, &first);
@@ -33894,7 +33878,7 @@ fn ret1_an_actor_edit_turn_completes_while_a_public_ir_selection_waits() {
         crate::managed_query::set_before_managed_open_hook(None);
         assert_eq!(
             r4b_census(&handle),
-            (1, 0, 0, 1),
+            (1, 0, 1),
             "{label}: one Stale re-capture, then one statement read at the new frontier"
         );
         let after = ret1_ir_oracle(
@@ -34005,11 +33989,10 @@ fn ret1_the_public_ir_route_refuses_exactly_as_the_walk_does() {
             let actual = ret1_ir_navigate(
                 &handle, &query, &view, &context, explain, R4B_ROWS, R4B_BYTES,
             );
-            let (_, fallbacks, failures, _) = r4b_census(&handle);
+            let (_, failures, _) = r4b_census(&handle);
             assert_eq!(
-                (fallbacks, failures),
-                (0, 0),
-                "{label} (explain={explain}): a refusal is not a fallback and not a failure"
+                failures, 0,
+                "{label} (explain={explain}): a refusal is not a failure"
             );
             ret1_assert_same(&format!("{label} (explain={explain})"), &actual, &expected);
             let expected_rows = usize::from(explain && executable);
@@ -34168,8 +34151,8 @@ fn ret2_the_public_ir_route_reports_typed_execution_errors_and_never_walks() {
             assert_query_execution_error(&format!("{label} (explain={explain})"), &error, expected);
             assert_eq!(
                 r4b_census(&handle),
-                (0, 0, failures, recaptures),
-                "{label} (explain={explain}): no statement read and NO fallback"
+                (0, failures, recaptures),
+                "{label} (explain={explain}): no statement read"
             );
             let counters = handle.managed_application_query_instrumentation().unwrap();
             assert_eq!(
@@ -34258,7 +34241,7 @@ fn ret2_an_explanation_whose_counts_do_not_match_its_plan_is_never_zero_padded()
         );
         assert_eq!(
             r4b_census(&handle),
-            (0, 0, 1, 0),
+            (0, 1, 0),
             "{label}: a decomposition that contradicts itself is a failed read"
         );
     }
@@ -34302,49 +34285,23 @@ fn ret2_an_answer_of_the_wrong_shape_is_an_invalid_snapshot() {
     r4b_inject(&handle, vec![wrong()]);
     let simple = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap_err();
     assert_query_execution_error("SimpleQuery", &simple, expected);
-    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+    assert_eq!(r4b_census(&handle), (0, 1, 0));
 
     r4b_inject(&handle, vec![wrong()]);
     let ir = ret2_ir_navigate(&handle, &query, &view, &context, false).unwrap_err();
     assert_query_execution_error("query_run", &ir, expected);
-    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+    assert_eq!(r4b_census(&handle), (0, 1, 0));
 
     r4b_inject(&handle, vec![wrong()]);
     let advanced = ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES)
         .unwrap_err();
     assert_query_execution_error("the advanced route", &advanced, expected);
-    assert_eq!(r4b_census(&handle), (0, 0, 1, 0));
+    assert_eq!(r4b_census(&handle), (0, 1, 0));
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
-}
-
-#[test]
-fn ret2_every_public_query_shape_is_page_local() {
-    let today = crate::date::JournalDate::today();
-    for (source, input) in ret1_ir_shapes() {
-        let (query, _) = ret1_parse(&source, input);
-        assert_eq!(
-            query.page_locality(),
-            crate::query::ir::PageLocality::Local,
-            "{source}"
-        );
-    }
-    for source in [
-        R4B_QUERY,
-        "(task TODO)",
-        "(property type note)",
-        "(between -7d today)",
-    ] {
-        let (parsed, _) = crate::query::parse_query_source(source, today);
-        assert_eq!(
-            parsed.page_locality(),
-            crate::query::ir::PageLocality::Local,
-            "{source}"
-        );
-    }
 }
 
 /// The mapping from a deferred actor turn to the public readiness family
@@ -34394,19 +34351,17 @@ fn ret2_a_deferred_turn_maps_to_the_public_readiness_family() {
     }
 }
 
-/// End to end: an actor whose retained publication cannot settle DEFERS its
-/// read turn, and every public query entrypoint reports that as the typed
-/// readiness the frontend retries — never as prose, and never by walking.
-///
-/// Before RET2 the same state produced
-/// `SyncApplicationNavigationOutcome::Deferred`, which the command layer
-/// turned into "Tine-managed storage is updating page navigation. Try again
-/// when it finishes." — a message `classifyNativeCallError` cannot act on, so
-/// the query block stopped instead of retrying.
+/// Retained ordinary publication does not make a coherent main image unready.
+/// Every live query entrypoint continues to execute SQL while that publication
+/// remains the ordinary pipeline's responsibility.
 #[test]
-fn ret2_a_deferred_read_turn_is_typed_readiness_on_every_query_entrypoint() {
-    use crate::query::{QueryExecutionError, QueryReadinessReason};
+fn ret2_retained_publication_does_not_defer_current_main_query_entrypoints() {
     let fixture = ActivationFixture::nested_unicode("ret2-deferred", 0xa1783);
+    fs::write(
+        fixture.graph_root.join("notes/Query witness.md"),
+        "- TODO committed query witness\n",
+    )
+    .unwrap();
     let graph = Graph::open_checked(&fixture.graph_root).unwrap();
     let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
     let open_request = reopen_request(&fixture.request);
@@ -34419,8 +34374,30 @@ fn ret2_a_deferred_read_turn_is_typed_readiness_on_every_query_entrypoint() {
     );
     let handle = opened.handle.expect("clean actor handle opens");
 
-    // Enough faults that the bounded settlement loop cannot clear the retained
-    // continuation within one turn: every later read turn defers.
+    let context = crate::query::ir::ExecutionContext::none();
+    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
+    let read_all = || {
+        vec![
+            serde_json::to_value(r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap())
+                .unwrap(),
+            serde_json::to_value(
+                ret2_ir_navigate(&handle, &query, &view, &context, false).unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_value(ret2_ir_navigate(&handle, &query, &view, &context, true).unwrap())
+                .unwrap(),
+            serde_json::to_value(
+                ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES)
+                    .unwrap(),
+            )
+            .unwrap(),
+        ]
+    };
+    let before = read_all();
+    assert!(before[0]["total"].as_u64().unwrap() > 0);
+
+    // Ordinary file publication remains retained. A new empty page cannot
+    // affect the task answers already present in the coherent main image.
     handle.install_repeated_projection_fault(64).unwrap();
     let prior = handle
         .submit_local_mutation(
@@ -34442,27 +34419,27 @@ fn ret2_a_deferred_read_turn_is_typed_readiness_on_every_query_entrypoint() {
         "{prior:?}"
     );
 
-    let expected = QueryExecutionError::NotReady(QueryReadinessReason::Recovering);
-    let simple = r4a_navigate(&handle, R4B_QUERY, R4B_ROWS, R4B_BYTES).unwrap_err();
-    assert_query_execution_error("a deferred SimpleQuery turn", &simple, expected);
-
-    let context = crate::query::ir::ExecutionContext::none();
-    let (query, view) = ret1_parse("(task TODO)", crate::query::QueryInput::Og);
-    for explain in [false, true] {
-        let ir = ret2_ir_navigate(&handle, &query, &view, &context, explain).unwrap_err();
-        assert_query_execution_error(
-            &format!("a deferred IR turn (explain={explain})"),
-            &ir,
-            expected,
-        );
-    }
-    let advanced = ret2_advanced_navigate(&handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES)
-        .unwrap_err();
-    assert_query_execution_error("a deferred advanced turn", &advanced, expected);
+    handle.reset_managed_query_census();
+    handle
+        .reset_managed_application_query_instrumentation()
+        .unwrap();
     assert_eq!(
-        r4b_census(&handle),
-        (0, 0, 0, 0),
-        "a deferred turn reads nothing and walks nothing"
+        read_all(),
+        before,
+        "current-main queries must not wait for retained file publication"
+    );
+    let (reads, failures, recaptures) = r4b_census(&handle);
+    assert!(
+        reads >= 3,
+        "simple, IR and advanced must execute SQL: {reads}"
+    );
+    assert_eq!((failures, recaptures), (0, 0));
+    assert_eq!(
+        handle
+            .managed_application_query_instrumentation()
+            .unwrap()
+            .result_page_hydrations,
+        0
     );
 }
 
@@ -34515,7 +34492,7 @@ fn ret2_advanced_rows(result: &SyncApplicationBoundedAdvancedResult) -> usize {
 const RET2_ADVANCED_QUERY: &str = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
 
 /// **RET2's counter bar for the public advanced route.** Every public advanced
-/// execution is answered by ONE statement read, with no fallback, no failure,
+/// execution is answered by ONE statement read, with no failure,
 /// no re-capture, no page DTO loaded and no whole-graph inventory pass. A
 /// repeat executes again with the same result, and a task-only source never
 /// scans global properties.
@@ -34583,8 +34560,8 @@ fn ret2_the_public_advanced_route_reads_statements_and_hydrates_no_page() {
         assert_eq!(counters.inventory_pages, 0, "{label}: {counters:?}");
         assert_eq!(
             r4b_census(&handle),
-            (1, 0, 0, 0),
-            "{label}: one statement read, no fallback, no failure, no re-capture"
+            (1, 0, 0),
+            "{label}: one statement read, no failure, no re-capture"
         );
         // C6: only a source with a property LEAF may read the global property
         // registry at all. An ordinary task/ref execution must not scan it —
@@ -34619,7 +34596,7 @@ fn ret2_the_public_advanced_route_reads_statements_and_hydrates_no_page() {
         );
         assert_eq!(
             r4b_census(&handle),
-            (2, 0, 0, 0),
+            (2, 0, 0),
             "{label}: the repeat performs a second statement read"
         );
         assert_eq!(
@@ -34693,8 +34670,8 @@ fn ret2_the_public_advanced_route_reports_typed_execution_errors_and_never_walks
         assert_query_execution_error(label, &error, expected);
         assert_eq!(
             r4b_census(&handle),
-            (0, 0, failures, recaptures),
-            "{label}: no statement read and NO fallback"
+            (0, failures, recaptures),
+            "{label}: no statement read"
         );
         let counters = handle.managed_application_query_instrumentation().unwrap();
         assert_eq!(
@@ -34718,7 +34695,7 @@ fn ret2_the_public_advanced_route_reports_typed_execution_errors_and_never_walks
         ret2_advanced_rows(&answered) > 0,
         "an empty success is impossible here"
     );
-    assert_eq!(r4b_census(&handle), (1, 0, 0, 0));
+    assert_eq!(r4b_census(&handle), (1, 0, 0));
 
     assert!(matches!(
         handle.clean_shutdown().unwrap(),
@@ -34913,11 +34890,11 @@ fn ret2_advanced_parity_over(
                 ret2_advanced_navigate(handle, source, *current_page, max_rows, max_bytes).unwrap();
             // A SUPPORTED source is exactly one database read; a REFUSED one is
             // a semantic answer that never reaches an execution. Neither is
-            // ever a fallback, a failure or a re-capture.
-            let (reads, fallbacks, failures, recaptures) = r4b_census(handle);
+            // ever a failure or a re-capture.
+            let (reads, failures, recaptures) = r4b_census(handle);
             assert_eq!(
-                (reads, fallbacks, failures, recaptures),
-                (usize::from(oracle.result.supported), 0, 0, 0),
+                (reads, failures, recaptures),
+                (usize::from(oracle.result.supported), 0, 0),
                 "{state} shape {label:?} rows={max_rows} bytes={max_bytes}: \
                  the captured route's own census"
             );
@@ -35023,17 +35000,13 @@ fn ret2_repeated_advanced_queries_execute_again_and_follow_drained_edits() {
         (answered, r4b_census(&handle))
     };
     let (cold, census) = run("cold task", RET2_ADVANCED_QUERY);
-    assert_eq!(
-        census,
-        (1, 0, 0, 0),
-        "the cold execution reads the database"
-    );
+    assert_eq!(census, (1, 0, 0), "the cold execution reads the database");
     let cold_rows = ret2_advanced_rows(&cold);
     assert!(cold_rows > 0, "the repeat fixture must answer nonempty");
     let (repeat, census) = run("repeated task", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the second run executes another statement read"
     );
     assert_eq!(
@@ -35068,7 +35041,7 @@ fn ret2_repeated_advanced_queries_execute_again_and_follow_drained_edits() {
     let (pending, census) = run("pending task", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the pending execution reads the current main projection"
     );
     assert_eq!(
@@ -35082,7 +35055,7 @@ fn ret2_repeated_advanced_queries_execute_again_and_follow_drained_edits() {
     let (accepted, census) = run("task after the accepted batch", RET2_ADVANCED_QUERY);
     assert_eq!(
         census,
-        (1, 0, 0, 0),
+        (1, 0, 0),
         "the query executes from the new accepted projection"
     );
     assert_eq!(ret2_advanced_rows(&accepted), cold_rows + 1);
@@ -35145,7 +35118,7 @@ fn ret2_an_actor_edit_turn_completes_while_a_public_advanced_selection_waits() {
     crate::managed_query::set_before_managed_open_hook(None);
     assert_eq!(
         r4b_census(&handle),
-        (1, 0, 0, 1),
+        (1, 0, 1),
         "one Stale re-capture, then one statement read at the new frontier"
     );
     let after = ret2_advanced_oracle(&handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES);
