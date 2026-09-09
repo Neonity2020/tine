@@ -180,7 +180,13 @@ scan is ~flat per-item as scale grows; a fanout (e.g. `find_entry` re-walking th
 dir on every lookup) grows with scale.
 
 There is also `sheets_phase0_bench` (query/edit-cycle costs at 10k–200k blocks) in
-the same examples dir.
+the same examples dir. Two of its columns need reading together. `repeat_vs_warm`
+divides the repeated-identical-query cost by the distinct-query cost against an
+equally warm graph; there is no answer memo any more, so it should sit near 1.00,
+and a value well under 1 means a per-query cache has come back. `edit visible` is
+the wait from a save returning to the query projection committing that edit, kept
+apart from `edit re-scan`, the query call that follows it — a Direct query answers
+from the attached SQLite projection, so those are two different costs.
 
 ## Sparse-oplog sharding and ownership format gate (2026-07-22)
 

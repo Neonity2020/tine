@@ -14,6 +14,7 @@ const CACHE_BUILD_RUNS: usize = 3;
 const WARM_SCAN_RUNS: usize = 5;
 const REPEAT_QUERY_RUNS: usize = 9;
 const EDIT_CYCLES: usize = 12;
+const PROJECTION_WAIT: Duration = Duration::from_secs(60);
 
 const PRIMARY_QUERY: &str = "(task TODO)";
 const COMPOUND_QUERY: &str = "(and (task TODO DOING) #SomeTag)";
@@ -35,6 +36,7 @@ fn main() -> io::Result<()> {
     println!("primary_query={PRIMARY_QUERY}");
     println!("compound_query={COMPOUND_QUERY}");
     println!("note=bare TODO is not accepted by the current simple query parser; (task TODO) is the accepted task predicate");
+    println!("note=repeat_vs_warm is repeat_query over warm_scan; it should sit near 1.00 because no answer memo exists — well under 1 means one has returned");
     println!(
         "runs=cold:{COLD_RUNS} cache_build:{CACHE_BUILD_RUNS} warm_scan:{WARM_SCAN_RUNS} repeat_query:{REPEAT_QUERY_RUNS} edit_cycles:{EDIT_CYCLES}"
     );
@@ -55,14 +57,17 @@ fn main() -> io::Result<()> {
         );
         let row = bench_scale(scale, &root, generated)?;
         println!(
-            "result scale={} cold_total_ms={:.3} cache_build_ms={:.3} warm_scan_ms={:.3} repeat_query_us={:.3} save_page_ms={:.3}/{:.3} edit_rescan_ms={:.3}/{:.3} compound_rescan_ms={:.3}/{:.3} primary_results={} compound_results={}",
+            "result scale={} cold_total_ms={:.3} cache_build_ms={:.3} warm_scan_ms={:.3} repeat_query_us={:.3} repeat_vs_warm={:.2} save_page_ms={:.3}/{:.3} edit_visible_ms={:.3}/{:.3} edit_rescan_ms={:.3}/{:.3} compound_rescan_ms={:.3}/{:.3} primary_results={} compound_results={}",
             row.scale,
             row.cold_total_ms,
             row.cache_build_ms,
             row.warm_scan_ms,
             row.repeat_query_us,
+            row.repeat_query_us / 1_000.0 / row.warm_scan_ms,
             row.save_page_ms.median,
             row.save_page_ms.p95,
+            row.primary_visible_ms.median,
+            row.primary_visible_ms.p95,
             row.primary_rescan_ms.median,
             row.primary_rescan_ms.p95,
             row.compound_rescan_ms.median,
@@ -331,17 +336,66 @@ struct BenchRow {
     warm_scan_ms: f64,
     repeat_query_us: f64,
     save_page_ms: DistributionMs,
+    primary_visible_ms: DistributionMs,
     primary_rescan_ms: DistributionMs,
     compound_rescan_ms: DistributionMs,
     primary_results: usize,
     compound_results: usize,
 }
 
+/// A graph that can answer a query.
+///
+/// A Direct graph answers from an attached SQLite projection; with none
+/// attached, `run_query` refuses with `Unavailable(ProjectionUnavailable)`
+/// rather than walking pages, which is what made this benchmark exit 1 on its
+/// first query for as long as it has been "compiling fine". The projection is
+/// disposable and per-call, so no run inherits another's warm database — the
+/// same shape `graph_scale_bench::bench_warm_query` uses.
+fn open_queryable(root: &Path) -> io::Result<(Graph, tempfile::TempDir)> {
+    let projection_dir = tempfile::tempdir()?;
+    let graph = Graph::open(root);
+    graph.attach_direct_projection(projection_dir.path().join("direct.sqlite"))?;
+    graph.warm_cache();
+    Ok((graph, projection_dir))
+}
+
+/// Blocks until the projection has committed at least one generation past the
+/// one `before` recorded, and returns how long that took.
+///
+/// A query that returns `Ok` right after a save can still be answering from the
+/// PRE-save image, so "did the query stop failing?" is the wrong barrier: wait
+/// for the commit transition instead. `observe_direct_projection_commits` is
+/// the public form of that signal.
+fn wait_for_commit_after(
+    graph: &Graph,
+    before: u64,
+    wake: &std::sync::mpsc::Receiver<()>,
+) -> io::Result<Duration> {
+    let started = Instant::now();
+    loop {
+        let (probe, _probe_rx) = std::sync::mpsc::channel();
+        let now = graph
+            .observe_direct_projection_commits(probe)
+            .ok_or_else(|| io::Error::other("query projection detached mid-run"))?;
+        if now > before {
+            return Ok(started.elapsed());
+        }
+        if started.elapsed() > PROJECTION_WAIT {
+            return Err(io::Error::other(
+                "query projection did not commit the saved edit in time",
+            ));
+        }
+        let _ = wake.recv_timeout(Duration::from_millis(20));
+    }
+}
+
 fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Result<BenchRow> {
+    // Cold now means "from nothing to a first answer", projection build
+    // included: that build IS the cold cost of a Direct query today.
     let mut cold_total = Vec::with_capacity(COLD_RUNS);
     for _ in 0..COLD_RUNS {
-        let graph = Graph::open(root);
         let started = Instant::now();
+        let (graph, _projection) = open_queryable(root)?;
         let groups = graph.run_query(PRIMARY_QUERY).map_err(io::Error::other)?;
         cold_total.push(started.elapsed());
         let primary_results = result_count(&groups);
@@ -359,7 +413,7 @@ fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Resu
         black_box(page_count);
     }
 
-    let warm_graph = Graph::open(root);
+    let (warm_graph, _warm_projection) = open_queryable(root)?;
     warm_graph.with_pages(|pages| black_box(pages.len()));
     let mut warm_scan = Vec::with_capacity(WARM_SCAN_RUNS);
     for i in 0..WARM_SCAN_RUNS {
@@ -373,8 +427,13 @@ fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Resu
 
     // No answer memo exists any more: a repeated identical query re-executes
     // against the current image. This arm measures that repeat cost, which is
-    // why it is no longer called a memo hit.
-    let repeat_graph = Graph::open(root);
+    // why it is no longer called a memo hit — and its remaining value is as a
+    // CONTROL on `warm_scan`, which runs DISTINCT query variants against an
+    // equally warm graph. Repeating one query and asking nine different ones
+    // should now cost the same, so `repeat_vs_warm` in the output is expected
+    // to sit near 1.00. A ratio far below 1 means a per-query answer cache has
+    // come back; that is the reason to keep measuring this at all.
+    let (repeat_graph, _repeat_projection) = open_queryable(root)?;
     let seeded = repeat_graph
         .run_query(PRIMARY_QUERY)
         .map_err(io::Error::other)?;
@@ -402,6 +461,7 @@ fn bench_scale(scale: usize, root: &Path, generated: GeneratedGraph) -> io::Resu
         warm_scan_ms: ms(median(&warm_scan)),
         repeat_query_us: us(median(&repeat_queries)),
         save_page_ms: dist_ms(&primary_edit.save_durations),
+        primary_visible_ms: dist_ms(&primary_edit.visible_durations),
         primary_rescan_ms: dist_ms(&primary_edit.query_durations),
         compound_rescan_ms: dist_ms(&compound_edit.query_durations),
         primary_results: primary_edit.last_result_count,
@@ -419,16 +479,23 @@ fn primary_query_variant(i: usize) -> String {
 
 struct EditCycleResult {
     save_durations: Vec<Duration>,
+    visible_durations: Vec<Duration>,
     query_durations: Vec<Duration>,
     last_result_count: usize,
 }
 
 fn run_edit_cycles(root: &Path, query: &str) -> io::Result<EditCycleResult> {
-    let graph = Graph::open(root);
+    let (graph, _projection) = open_queryable(root)?;
     let initial = graph.run_query(query).map_err(io::Error::other)?;
     assert_nonzero(result_count(&initial), query);
 
+    let (wake, wake_rx) = std::sync::mpsc::channel();
+    let mut commits = graph
+        .observe_direct_projection_commits(wake)
+        .ok_or_else(|| io::Error::other("query projection detached before the edit cycles"))?;
+
     let mut save_durations = Vec::with_capacity(EDIT_CYCLES);
+    let mut visible_durations = Vec::with_capacity(EDIT_CYCLES);
     let mut query_durations = Vec::with_capacity(EDIT_CYCLES);
     let mut last_result_count = result_count(&initial);
 
@@ -449,6 +516,14 @@ fn run_edit_cycles(root: &Path, query: &str) -> io::Result<EditCycleResult> {
         save_durations.push(started.elapsed());
         black_box(new_rev.len());
 
+        // Two separate costs, kept separate: how long until the edit is
+        // visible to a query at all, and how long the query itself then takes.
+        visible_durations.push(wait_for_commit_after(&graph, commits, &wake_rx)?);
+        let (probe, _probe_rx) = std::sync::mpsc::channel();
+        commits = graph
+            .observe_direct_projection_commits(probe)
+            .ok_or_else(|| io::Error::other("query projection detached mid-cycle"))?;
+
         let started = Instant::now();
         let groups = graph.run_query(query).map_err(io::Error::other)?;
         query_durations.push(started.elapsed());
@@ -459,6 +534,7 @@ fn run_edit_cycles(root: &Path, query: &str) -> io::Result<EditCycleResult> {
 
     Ok(EditCycleResult {
         save_durations,
+        visible_durations,
         query_durations,
         last_result_count,
     })
@@ -534,13 +610,13 @@ fn us(duration: Duration) -> f64 {
 }
 
 fn print_table(rows: &[BenchRow]) {
-    println!("| scale | files | pages | journals | cold total ms | cache-build ms | warm scan ms | repeat query us | save_page med/p95 ms | edit re-scan med/p95 ms | compound re-scan med/p95 ms | results primary/compound |");
+    println!("| scale | files | pages | journals | cold total ms | cache-build ms | warm scan ms | repeat query us | save_page med/p95 ms | edit visible med/p95 ms | edit re-scan med/p95 ms | compound re-scan med/p95 ms | results primary/compound |");
     println!(
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     );
     for row in rows {
         println!(
-            "| {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3}/{:.3} | {:.3}/{:.3} | {:.3}/{:.3} | {}/{} |",
+            "| {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3}/{:.3} | {:.3}/{:.3} | {:.3}/{:.3} | {:.3}/{:.3} | {}/{} |",
             row.scale,
             row.files,
             row.pages,
@@ -551,6 +627,8 @@ fn print_table(rows: &[BenchRow]) {
             row.repeat_query_us,
             row.save_page_ms.median,
             row.save_page_ms.p95,
+            row.primary_visible_ms.median,
+            row.primary_visible_ms.p95,
             row.primary_rescan_ms.median,
             row.primary_rescan_ms.p95,
             row.compound_rescan_ms.median,
