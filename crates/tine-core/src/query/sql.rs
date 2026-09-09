@@ -617,36 +617,30 @@ pub(crate) fn descriptor_view_statement(
     let mut recency_expression = None;
     if let Some((view, recency)) = ordered {
         let mut lower = None;
+        let mut property_keys = HashMap::<String, String>::new();
+        let mut binder = StatementSortBinder {
+            ranks: &mut ranks,
+            params: &mut params,
+            lowercase: &mut lower,
+            property_keys: &mut property_keys,
+            recency: Some(recency),
+        };
         for (field, direction) in &view.sort {
-            let expression = match field.as_str().to_ascii_lowercase().as_str() {
-                "page" => {
-                    let lower = bound_lowercase(&mut lower, &mut ranks, &mut params);
-                    format!("tine_query_rank({lower}, p.name)")
-                }
-                "priority" => {
-                    "COALESCE((SELECT priority FROM block_planning WHERE block_id=r.block_id), 'Z')"
-                        .into()
-                }
-                "scheduled" | "deadline" => {
-                    let column = field.as_str().to_ascii_lowercase();
-                    format!("COALESCE((SELECT {column} FROM block_planning WHERE block_id=r.block_id), '~')")
-                }
-                "modified" | "updated" | "updated-at" | "date" => {
-                    recency_expression.get_or_insert_with(|| {
-                        recency_order_expression("p", recency, &mut ranks, &mut params)
-                    });
-                    "p.qe_recency".into()
-                }
-                _ => {
-                    let lower = bound_lowercase(&mut lower, &mut ranks, &mut params);
-                    let key = bind_page_param(
-                        &mut params,
-                        PhysicalQueryValue::Text(property_key_norm(field.as_str())),
-                    );
-                    format!("tine_query_rank({lower}, COALESCE((SELECT value FROM properties WHERE owner_type=1 AND owner_id=r.block_id AND page_id=r.page_id AND normalized_name={key} ORDER BY ordinal, name LIMIT 1), (SELECT CASE WHEN instr(query_visible, char(10))=0 THEN query_visible ELSE substr(query_visible, 1, instr(query_visible, char(10))-1) END FROM block_text WHERE block_id=r.block_id)))")
-                }
+            let Some(expression) =
+                block_sort_expression(field.as_str(), "r", "p", "p.qe_recency", &mut binder)
+            else {
+                continue;
             };
             terms.push(directed_order(expression, *direction));
+        }
+        drop(binder);
+        // A recency field ordered by the page CTE's own column, which only
+        // exists once the CTE is emitted; the binder reports whether any field
+        // asked for it.
+        if terms.iter().any(|term| term.starts_with("p.qe_recency")) {
+            recency_expression.get_or_insert_with(|| {
+                recency_order_expression("p", recency, &mut ranks, &mut params)
+            });
         }
         terms.extend([
             "p.name COLLATE BINARY ASC".into(),
@@ -694,6 +688,155 @@ pub(crate) fn descriptor_view_statement(
     })
 }
 
+/// **What one authored sort field MEANS, in SQL** (I-12).
+///
+/// A `tine.sort::` / `tine.page-sort::` value is one fact, and the reader that
+/// happens to answer a query must not be able to give it a second meaning. The
+/// two vocabularies below are therefore stated once, here, and every reader
+/// that orders pages or blocks — the explicit page/block statements in this
+/// module and the Friendly page/block sections in `query/friendly.rs` — asks
+/// them rather than re-deriving the mapping against its own aliases.
+///
+/// Readers differ only in their BINDING mechanics: which parameter slot holds
+/// the case-folding program, whether a property key has already been bound, and
+/// whether this read captured the page-recency programs at all. Those are what
+/// a [`SortBinder`] lends; the field vocabulary is not negotiable.
+pub(crate) trait SortBinder {
+    /// A `?N` parameter holding the Unicode case-folding rank program, bound on
+    /// first use and reused afterwards.
+    fn lowercase(&mut self) -> String;
+    /// A `?N` parameter holding one normalized property key, reused per key so
+    /// two sorts on the same property bind it once.
+    fn property_key(&mut self, key: String) -> String;
+    /// Whether this read can order by page recency at all. A read that captured
+    /// no `PageRecencyPrograms` answers `false`, and a recency field then
+    /// contributes NO order term rather than a silently different one.
+    fn has_recency(&self) -> bool;
+}
+
+/// The binder the statement compilers in this module use.
+struct StatementSortBinder<'a> {
+    ranks: &'a mut QueryRankPrograms,
+    params: &'a mut Vec<PhysicalQueryValue>,
+    lowercase: &'a mut Option<String>,
+    property_keys: &'a mut HashMap<String, String>,
+    recency: Option<&'a PageRecencyPrograms>,
+}
+
+impl SortBinder for StatementSortBinder<'_> {
+    fn lowercase(&mut self) -> String {
+        self.lowercase
+            .get_or_insert_with(|| {
+                let id = self.ranks.bind_unicode_lowercase();
+                self.params.push(PhysicalQueryValue::Integer(id as i64));
+                format!("?{}", self.params.len())
+            })
+            .clone()
+    }
+
+    fn property_key(&mut self, key: String) -> String {
+        if let Some(bound) = self.property_keys.get(&key) {
+            return bound.clone();
+        }
+        self.params.push(PhysicalQueryValue::Text(key.clone()));
+        let bound = format!("?{}", self.params.len());
+        self.property_keys.insert(key, bound.clone());
+        bound
+    }
+
+    fn has_recency(&self) -> bool {
+        self.recency.is_some()
+    }
+}
+
+/// The ORDER BY expression one authored PAGE sort field means for a page row
+/// under `alias`, or `None` when this reader cannot order by it.
+///
+/// `None` is deliberately not an error. A field a reader cannot carry is
+/// already how the rest of this system answers the question — the Display
+/// picker does not OFFER such a field (`sheet/fields.ts::querySortFieldName`),
+/// and refusing the whole read over an authored one would turn a display
+/// setting into a failed search.
+pub(crate) fn page_sort_expression(
+    field: &str,
+    alias: &str,
+    binder: &mut dyn SortBinder,
+) -> Option<String> {
+    match field.to_ascii_lowercase().as_str() {
+        "name" | "page" => Some(format!(
+            "tine_query_rank({}, {alias}.name)",
+            binder.lowercase()
+        )),
+        // The current text decorations are `journal` and `page`, in that
+        // lexical order. Physical encoding is Page=0, Journal=1, so a raw
+        // numeric sort would silently reverse the established meaning.
+        "kind" => Some(format!(
+            "CASE {alias}.text_kind WHEN 1 THEN 0 WHEN 0 THEN 1 ELSE 2 END"
+        )),
+        "day" | "journal-day" | "journal_day" => Some(format!(
+            "COALESCE({alias}.journal_day, -9223372036854775808)"
+        )),
+        "modified" | "updated" | "updated-at" | "date" => {
+            binder.has_recency().then(|| PAGE_RECENCY_ORDER.to_string())
+        }
+        _ => {
+            let lowercase = binder.lowercase();
+            let key_param = binder.property_key(property_key_norm(field));
+            Some(format!(
+                "tine_query_rank({lowercase}, COALESCE(\
+                   (SELECT property.value FROM properties property \
+                    WHERE property.owner_type = {OWNER_PAGE} \
+                      AND property.owner_id = {alias}.page_id \
+                      AND property.page_id = {alias}.page_id \
+                      AND property.normalized_name = {key_param} \
+                    ORDER BY property.ordinal, property.name LIMIT 1), \
+                   {alias}.name))"
+            ))
+        }
+    }
+}
+
+/// The marker a page-sort recency field lowers to. The statement compiler
+/// substitutes its own recency expression for it; the Friendly reader never
+/// produces it, because its binder reports no recency programs.
+const PAGE_RECENCY_ORDER: &str = "\0recency\0";
+
+/// The ORDER BY expression one authored BLOCK sort field means, given the block
+/// row alias (`.block_id`, `.page_id`) and the page alias (`.name`).
+/// `recency_column` is the column the caller's own page source exposes recency
+/// under; a caller whose binder has no recency programs never reaches it.
+pub(crate) fn block_sort_expression(
+    field: &str,
+    block_alias: &str,
+    page_alias: &str,
+    recency_column: &str,
+    binder: &mut dyn SortBinder,
+) -> Option<String> {
+    match field.to_ascii_lowercase().as_str() {
+        "page" => Some(format!(
+            "tine_query_rank({}, {page_alias}.name)",
+            binder.lowercase()
+        )),
+        "priority" => Some(format!(
+            "COALESCE((SELECT priority FROM block_planning WHERE block_id={block_alias}.block_id), 'Z')"
+        )),
+        "scheduled" | "deadline" => {
+            let column = field.to_ascii_lowercase();
+            Some(format!(
+                "COALESCE((SELECT {column} FROM block_planning WHERE block_id={block_alias}.block_id), '~')"
+            ))
+        }
+        "modified" | "updated" | "updated-at" | "date" => {
+            binder.has_recency().then(|| recency_column.to_string())
+        }
+        _ => {
+            let lowercase = binder.lowercase();
+            let key = binder.property_key(property_key_norm(field));
+            Some(format!("tine_query_rank({lowercase}, COALESCE((SELECT value FROM properties WHERE owner_type=1 AND owner_id={block_alias}.block_id AND page_id={block_alias}.page_id AND normalized_name={key} ORDER BY ordinal, name LIMIT 1), (SELECT CASE WHEN instr(query_visible, char(10))=0 THEN query_visible ELSE substr(query_visible, 1, instr(query_visible, char(10))-1) END FROM block_text WHERE block_id={block_alias}.block_id)))"))
+        }
+    }
+}
+
 fn directed_order(expression: String, direction: crate::query::ir::SortDir) -> String {
     format!(
         "{expression} {}",
@@ -702,19 +845,6 @@ fn directed_order(expression: String, direction: crate::query::ir::SortDir) -> S
             crate::query::ir::SortDir::Desc => "DESC",
         }
     )
-}
-
-fn bound_lowercase(
-    bound: &mut Option<String>,
-    ranks: &mut QueryRankPrograms,
-    params: &mut Vec<PhysicalQueryValue>,
-) -> String {
-    bound
-        .get_or_insert_with(|| {
-            let id = ranks.bind_unicode_lowercase();
-            bind_page_param(params, PhysicalQueryValue::Integer(id as i64))
-        })
-        .clone()
 }
 
 fn recency_order_expression(
@@ -827,53 +957,31 @@ pub(crate) fn page_statement(
     let mut lowercase = None;
     let mut property_keys = HashMap::<String, String>::new();
     let mut order_terms = Vec::new();
+    let mut binder = StatementSortBinder {
+        ranks: &mut ranks,
+        params: &mut params,
+        lowercase: &mut lowercase,
+        property_keys: &mut property_keys,
+        recency: Some(recency),
+    };
     for (field, direction) in &view.sort {
-        let normalized = field.as_str().to_ascii_lowercase();
-        let expression = match normalized.as_str() {
-            "name" | "page" => {
-                let lowercase = lowercase.get_or_insert_with(|| {
-                    let id = ranks.bind_unicode_lowercase();
-                    bind_page_param(&mut params, PhysicalQueryValue::Integer(id as i64))
-                });
-                format!("tine_query_rank({lowercase}, r.name)")
-            }
-            // The current text decorations are `journal` and `page`, in that
-            // lexical order. Physical encoding is Page=0, Journal=1, so a raw
-            // numeric sort would silently reverse the established meaning.
-            "kind" => "CASE r.text_kind WHEN 1 THEN 0 WHEN 0 THEN 1 ELSE 2 END".into(),
-            "day" | "journal-day" | "journal_day" => {
-                "COALESCE(r.journal_day, -9223372036854775808)".into()
-            }
-            "modified" | "updated" | "updated-at" | "date" => {
-                recency_order_expression("r", recency, &mut ranks, &mut params)
-            }
-            _ => {
-                let lowercase = lowercase.get_or_insert_with(|| {
-                    let id = ranks.bind_unicode_lowercase();
-                    bind_page_param(&mut params, PhysicalQueryValue::Integer(id as i64))
-                });
-                let key = property_key_norm(field.as_str());
-                let key_param = property_keys
-                    .entry(key.clone())
-                    .or_insert_with(|| bind_page_param(&mut params, PhysicalQueryValue::Text(key)))
-                    .clone();
-                format!(
-                    "tine_query_rank({lowercase}, COALESCE(\
-                       (SELECT property.value FROM properties property \
-                        WHERE property.owner_type = {OWNER_PAGE} \
-                          AND property.owner_id = r.page_id \
-                          AND property.page_id = r.page_id \
-                          AND property.normalized_name = {key_param} \
-                        ORDER BY property.ordinal, property.name LIMIT 1), \
-                       r.name))"
-                )
-            }
+        let Some(expression) = page_sort_expression(field.as_str(), "r", &mut binder) else {
+            continue;
         };
-        let direction = match direction {
-            crate::query::ir::SortDir::Asc => "ASC",
-            crate::query::ir::SortDir::Desc => "DESC",
-        };
-        order_terms.push(format!("{expression} {direction}"));
+        order_terms.push(directed_order(expression, *direction));
+    }
+    drop(binder);
+    // The shared vocabulary lowers a recency field to a marker, because the
+    // expression is this reader's own captured programs; substitute it once,
+    // and only when a field actually asked for it.
+    if order_terms
+        .iter()
+        .any(|term| term.contains(PAGE_RECENCY_ORDER))
+    {
+        let expression = recency_order_expression("r", recency, &mut ranks, &mut params);
+        for term in &mut order_terms {
+            *term = term.replace(PAGE_RECENCY_ORDER, &expression);
+        }
     }
     if order_terms.is_empty() {
         order_terms.push(base.into());

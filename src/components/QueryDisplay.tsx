@@ -77,6 +77,28 @@ export function readSample(text: string): SampleReading {
  *  control that looks like it saved. */
 export type DisplaySlot = "group" | "sort" | "column" | "aggregate";
 
+/** Which ROW a display vocabulary is being built for.
+ *
+ *  A page and a block are different rows with different attributes, and the
+ *  query IR says so (`queryIr.ts::Attr`). Offering a block builtin as a page
+ *  field would be a control that writes a setting nothing can honour — and
+ *  offering it silently is worse than not offering it, because the author reads
+ *  the empty column as "this page has no tasks". */
+export type DisplayRowKind = "page" | "block";
+
+/** The page-row builtins a display slot can spell.
+ *
+ *  Pages have a name, a kind and a journal day, and that is the whole list: the
+ *  task marker, priority and the two planning dates belong to a BLOCK, and a
+ *  formula is evaluated over block rows. `page` is the block vocabulary's
+ *  spelling for "the page this row is on"; for a page row the same question is
+ *  its own name, so the page vocabulary spells it `name`. */
+const PAGE_BUILTINS: readonly { field: string; label: string }[] = [
+  { field: "name", label: "Name" },
+  { field: "kind", label: "Kind" },
+  { field: "day", label: "Journal day" },
+];
+
 /** The display fields a slot can actually take.
  *
  *   * **group** — every field identity, canonically: the six builtins, any
@@ -100,8 +122,12 @@ export function displayFieldEntries(input: {
   rows: readonly RegistryRow[] | undefined;
   formulas: readonly string[];
   search: string;
+  /** Absent means blocks, which is the vocabulary every existing caller asks
+   *  for and gets unchanged. */
+  rowKind?: DisplayRowKind;
 }): VocabularyEntry[] {
   const search = input.search.trim().toLowerCase();
+  const page = input.rowKind === "page";
   const matches = (label: string) => !search || label.toLowerCase().includes(search);
   const out: VocabularyEntry[] = [];
   const push = (value: string, label: string, icon: string, count?: number) => {
@@ -112,30 +138,52 @@ export function displayFieldEntries(input: {
       label,
       choice: { kind: "field", field: value },
       icon,
-      unit: "blocks",
+      // Applicability is counted on the row the vocabulary is FOR: a property
+      // on 400 blocks and 2 pages is a poor page column and a good block one.
+      unit: page ? "pages" : "blocks",
       ...(count === undefined ? {} : { count }),
     });
   };
-  if (input.slot === "group" || input.slot === "column") {
-    for (const field of BUILTIN_FIELDS) {
-      if (input.slot === "column" && field === "page") continue; // the table's own breadcrumb
-      push(input.slot === "group" ? field : field, fieldLabel(field), "◆");
+  if (page) {
+    // No task state, priority, planning or formula: none of them is a page
+    // attribute, and none of the writers can spell one for a page row.
+    if (input.slot === "group" || input.slot === "column" || input.slot === "sort") {
+      for (const builtin of PAGE_BUILTINS) {
+        if (input.slot === "column" && builtin.field === "name") continue; // the row's own link
+        push(input.slot === "group" ? `prop:${builtin.field}` : builtin.field, builtin.label, "◆");
+      }
     }
-  }
-  if (input.slot === "sort") {
-    for (const field of ["priority", "page", "scheduled", "deadline"] as const) {
-      push(field, fieldLabel(field), "◆");
+  } else {
+    if (input.slot === "group" || input.slot === "column") {
+      for (const field of BUILTIN_FIELDS) {
+        if (input.slot === "column" && field === "page") continue; // the table's own breadcrumb
+        push(input.slot === "group" ? field : field, fieldLabel(field), "◆");
+      }
+    }
+    if (input.slot === "sort") {
+      for (const field of ["priority", "page", "scheduled", "deadline"] as const) {
+        push(field, fieldLabel(field), "◆");
+      }
     }
   }
   for (const row of input.rows ?? []) {
     const key = row.normalized_name;
+    // An ordinary property is distinct from a builtin, and it is offered only
+    // where the field grammar preserves that identity — the same gate for both
+    // row kinds, because both write the same property spellings.
     if (input.slot === "column" && queryColumnName(`prop:${key}`) === null) continue;
     if (input.slot === "sort" && querySortFieldName(`prop:${key}`) === null) continue;
     if (input.slot === "aggregate" && queryAggregateFieldName(`prop:${key}`) === null) continue;
+    // Applicability, on the row this vocabulary is for. A property observed on
+    // no page of this graph is not a page field, so the page vocabulary drops
+    // it; the block vocabulary keeps its established combined count, because
+    // narrowing it would retire block choices this packet has no business
+    // retiring.
+    if (page && row.count_pages === 0) continue;
     const value = input.slot === "group" ? `prop:${key}` : key;
-    push(value, key, "•", row.count_blocks + row.count_pages);
+    push(value, key, "•", page ? row.count_pages : row.count_blocks + row.count_pages);
   }
-  if (input.slot === "group") {
+  if (!page && input.slot === "group") {
     for (const name of input.formulas) push(`formula:${name}`, name, "ƒ");
   }
   return out;
@@ -156,6 +204,7 @@ export function displayFieldEntries(input: {
 function FieldPicker(props: {
   label: string;
   slot: DisplaySlot;
+  rowKind: DisplayRowKind;
   registry: RegistryAccess;
   formulas: () => readonly string[];
   parentTransientId: string;
@@ -247,7 +296,7 @@ function FieldPicker(props: {
             id={listId}
             label={props.label}
             placeholder="Search fields"
-            anchor="block"
+            anchor={props.rowKind}
             rows={props.registry.rows}
             pending={props.registry.pending}
             failure={props.registry.failure}
@@ -256,6 +305,7 @@ function FieldPicker(props: {
             entries={(search) =>
               displayFieldEntries({
                 slot: props.slot,
+                rowKind: props.rowKind,
                 rows: props.registry.rows(),
                 formulas: [...props.formulas()],
                 search,
@@ -328,6 +378,10 @@ export function QueryDisplay(props: {
   /** The block's formula field names, which are grouping identities but have no
    *  spelling in any of the other three lists. */
   formulas?: () => readonly string[];
+  /** Which result family this panel controls. Absent means blocks — the single
+   *  family every caller had before mixed results, so an unchanged caller keeps
+   *  its trigger, its dialog name and its whole vocabulary. */
+  rowKind?: DisplayRowKind;
   parentTransientId?: string;
   onOpenChange?: (open: boolean) => void;
 }): JSX.Element {
@@ -336,7 +390,13 @@ export function QueryDisplay(props: {
   onCleanup(() => props.onOpenChange?.(false));
   const view = () => props.control.view;
   const apply = (next: ViewSettings) => props.control.apply(next);
-  const formulas = () => props.formulas?.() ?? [];
+  const formulas = () => (props.rowKind === "page" ? [] : props.formulas?.() ?? []);
+  const rowKind = (): DisplayRowKind => props.rowKind ?? "block";
+  /** The accessible names of this panel's trigger and dialog. Two panels can be
+   *  mounted side by side on one mixed result, so "Display settings" would name
+   *  both of them and neither would say which section it changes. */
+  const triggerName = () => (rowKind() === "page" ? "Display pages" : "Display blocks");
+  const dialogName = () => (rowKind() === "page" ? "Page display" : "Block display");
 
   let triggerEl: HTMLButtonElement | undefined;
   let panelEl: HTMLDivElement | undefined;
@@ -417,9 +477,10 @@ export function QueryDisplay(props: {
   // The Board's grouping default is `viewAfterViewSwitch`'s, shared with the
   // header switcher — one click, one meaning, wherever it is made.
   const setView = (next: ViewKindName) =>
-    apply(viewAfterViewSwitch(view(), next === "list" ? undefined : next));
+    apply(viewAfterViewSwitch(view(), next === "list" ? undefined : next, rowKind()));
 
-  const grouping = createMemo(() => groupingFromViewValue(viewAfterViewSwitch(view(), view().view).group_by));
+  const grouping = createMemo(() =>
+    groupingFromViewValue(viewAfterViewSwitch(view(), view().view, rowKind()).group_by));
   const groupLabel = () => {
     const resolved = grouping();
     if (resolved.kind === "cleared") return "No grouping";
@@ -476,6 +537,8 @@ export function QueryDisplay(props: {
         measure();
       }}
       class="qs-sheet qd-panel"
+      role="dialog"
+      aria-label={dialogName()}
       // The host sheet asks the DOM whether one of its own popovers is open
       // before it treats a press as "outside". This panel is PORTALLED out of
       // the sheet, so it cannot be found under the sheet's element — it carries
@@ -509,6 +572,7 @@ export function QueryDisplay(props: {
           <FieldPicker
             label="Group by field"
             slot="group"
+            rowKind={rowKind()}
             registry={props.registry}
             formulas={formulas}
             parentTransientId={layerId}
@@ -566,6 +630,7 @@ export function QueryDisplay(props: {
         <FieldPicker
           label="Sort field"
           slot="sort"
+          rowKind={rowKind()}
           registry={props.registry}
           formulas={formulas}
           parentTransientId={layerId}
@@ -602,6 +667,7 @@ export function QueryDisplay(props: {
         <FieldPicker
           label="Column"
           slot="column"
+          rowKind={rowKind()}
           registry={props.registry}
           formulas={formulas}
           parentTransientId={layerId}
@@ -650,6 +716,7 @@ export function QueryDisplay(props: {
           <FieldPicker
             label="Aggregate property"
             slot="aggregate"
+            rowKind={rowKind()}
             registry={props.registry}
             formulas={formulas}
             parentTransientId={layerId}
@@ -706,7 +773,9 @@ export function QueryDisplay(props: {
         ref={triggerEl}
         class="qb-sort qd-trigger"
         classList={{ active: open() }}
-        title="Display settings — view, grouping, sorts, columns, summaries and sample"
+        title={`${triggerName()} — view, grouping, sorts, columns, summaries and sample`}
+        aria-label={triggerName()}
+        aria-haspopup="dialog"
         aria-expanded={open() ? "true" : "false"}
         onClick={(e) => {
           e.stopPropagation();

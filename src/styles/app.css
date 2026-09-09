@@ -12242,3 +12242,96 @@ html.drag-selection-suppressed * {
   max-height: 12rem;
   overflow: auto;
 }
+
+/* Mixed result families (SPEC §7.6, Q3)
+   ------------------------------------------------------------------
+   A Friendly search answers two questions at once, so its result is two
+   independently controlled sections rather than one flat list. Each keeps its
+   heading, its own Display control and its own empty state — an empty family
+   still draws its controls, because a section that vanished would take the only
+   way out of the state with it (I-10). */
+.query-result-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.query-result-section {
+  min-width: 0;
+}
+.query-result-section-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.query-result-section-header h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.query-result-section-count,
+.query-result-section-truncated,
+.query-result-section-empty,
+.query-result-section-pending {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.query-result-section-error {
+  font-size: 0.8rem;
+  color: var(--error-color, #dc2626);
+}
+.query-result-section-empty,
+.query-result-section-pending,
+.query-result-section-error,
+.query-result-section-truncated {
+  margin: 4px 0 0;
+}
+.query-search-results > [role="listitem"] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+/* **The page family carries GH #140's own guarantee** (Q3). Page rows used to
+   BE `.query-result-row`s and inherited its wrapping; they are their own control
+   now, so the intrinsically wide page title has to be told to wrap here or the
+   whole pane grows horizontally again. */
+.query-page-link {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.query-page-alias {
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+.query-page-match {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.query-scoped-reset,
+.query-scoped-clear {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+.query-scoped-reset:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

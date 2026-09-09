@@ -23,12 +23,25 @@ icon:: 🔍
 - ## Keep the search: make a search tab
   - 1. From any Ctrl+K search, press **Open search tab** in the footer. The whole search becomes its own tab with its own search box — nothing is written to your graph yet, and the tab comes back after a restart.
   - 2. Refine it there: switch **Search / List / Table / Board** freely — that changes only how results are shown, never which blocks matched. Open **Filters / Advanced** for fields and date ranges, or **Edit as visual query** to edit the conditions one row at a time; **Explain query** describes what Tine understood.
-  - 3. Worth keeping? Type a name into **Name this search to save it as a page** and press **Save page**.
-  - 4. What you should see: the tab becomes an ordinary page in your graph holding one query block. You can link to it, favorite it, and its results refresh themselves; an existing page with the same name is never overwritten.
+  - 3. A text search answers two questions at once, so the results arrive in two sections: **Pages** and **Blocks**, in that order, each with its own **Display pages** / **Display blocks** button. Set the pages as a table of their own properties and leave the blocks as a list if that is what you want — the two are independent, and neither choice changes which pages or blocks matched. A section with nothing in it says so and keeps its button, so you can always change what it selects.
+  - 4. **Page matches** beside the Pages section decides which pages count as matches at all: **Names and aliases** (the default), **Page content** — a page counts when one of its own blocks matches — or **Both**. It changes page membership only; the Blocks section still lists the blocks that matched, whichever you pick.
+  - 5. Worth keeping? Type a name into **Name this search to save it as a page** and press **Save page**. Everything the two sections were showing is saved with it, so reopening the page reopens the same search, not a plainer one.
+  - 6. What you should see: the tab becomes an ordinary page in your graph holding one query block. You can link to it, favorite it, and its results refresh themselves; an existing page with the same name is never overwritten.
 - ## Try it: find every mention of one page
   - 1. Text search finds visible words. A page query asks a different question: "which blocks connect to [[Project/Roadmap]]?" — written as the page's name inside a query, like this live example:
   - {{query [[Project/Roadmap]]}}
   - 2. What you should see in a copied Guide or the public demo: the Roadmap outline itself (a block always counts its own page, and a nested bullet counts whatever its parents mention), the bullets elsewhere in the Guide that link there — [[Welcome to Tine]] has one — and this numbered bullet, which links too. In this read-only Guide the same block runs against your own graph instead, so it lists your pages' mentions — often nothing yet; it comes alive after you copy the Guide into your graph.
+- ## Give pages and blocks their own settings
+  - 1. The two sections keep their settings in the block's own properties, so a saved query reopens the way you left it. The Pages half is `tine.page-*`, the Blocks half is `tine.block-*`, and `tine.page-match-scope` holds the **Page matches** choice. Here is one written out:
+  - {{query (search "roadmap")}}
+    tine.page-view:: table
+    tine.page-display:: 1
+    tine.page-columns:: status
+    tine.block-display:: 1
+    tine.page-match-scope:: both
+  - 2. `tine.page-display:: 1` is the marker that says "this section has its own settings". Without the marker the section simply follows the query's own settings — that is **Use inherited settings**. With the marker and nothing else, the section shows nothing extra — that is **Clear settings**. They are different requests, so they are different buttons.
+  - 3. The block above therefore reads: pages as a table with a `status` column, blocks with no extra settings of their own, and a page counts as a match by its name or by its content. Change any of it from the section's own **Display** button; nothing you change in one section touches the other, the query text, or a `tine.*` property Tine does not recognize.
+  - What you should see: the Pages section draws a table whose columns are the pages' own properties, the Blocks section stays an ordinary list, and both refresh together from one read — they can never describe two different moments of your graph.
 - ## Read a query, then edit it
   - Queries order all matches before taking a sample. Without an explicit sort, the sample now follows the complete default page/document order, so an existing sampled query may show different rows.
   - Statistics describe the complete sample, including rows hidden by the presentation's reveal limit. The summary and table footer use the same returned statistics. **Unavailable** with a reason means the requested number is undefined, empty, non-numeric or non-finite; it does not mean zero.

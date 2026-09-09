@@ -622,14 +622,24 @@ describe("QueryWorkspace", () => {
     await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
     expect(root.querySelector(".query-workspace-diagnostics")?.textContent).toContain("Results are limited");
     expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["Alpha", "alpha"]);
-    expect(root.querySelector(".search-result-context")?.textContent).toContain("Page");
-    expect(root.querySelectorAll(".query-result-row")).toHaveLength(2);
-    const resultRows = [...root.querySelectorAll<HTMLButtonElement>(".query-result-row")];
-    resultRows[0].click();
+    // **Two families, not one list** (§7.6, Q3): the page hit lives in the Pages
+    // section and the block hit in the Blocks section, and each is reached
+    // through its own section rather than by index into a combined list.
+    const pageSection = root.querySelector('[data-query-result-kind="page"]')!;
+    const blockSection = root.querySelector('[data-query-result-kind="block"]')!;
+    expect(pageSection.querySelector("h3")?.textContent).toBe("Pages");
+    expect(blockSection.querySelector("h3")?.textContent).toBe("Blocks");
+    expect(pageSection.querySelector(".switcher-kind")?.textContent).toContain("page");
+    expect(blockSection.querySelector(".search-result-context")?.textContent).toContain("Research");
+    const pageRows = [...pageSection.querySelectorAll<HTMLButtonElement>(".query-page-link")];
+    const blockRows = [...blockSection.querySelectorAll<HTMLButtonElement>(".query-result-row")];
+    expect(pageRows).toHaveLength(1);
+    expect(blockRows).toHaveLength(1);
+    pageRows[0].click();
     expect(router.openPageTarget).toHaveBeenCalledWith({
       name: "Alpha notes", pageKind: "page", path: "pages/alpha.md",
     });
-    resultRows[1].click();
+    blockRows[0].click();
     expect(router.openPageAtBlock).toHaveBeenCalledWith({
       name: "Research", pageKind: "page", path: "pages/client-b/Research.md", block: "authored-block-1",
     });
@@ -650,7 +660,13 @@ describe("QueryWorkspace", () => {
     const explain = root.querySelector(".query-explain-toggle") as HTMLButtonElement;
     explain.click();
     await waitFor(() => expect(root.querySelector(".query-workspace-explanation")?.textContent).toContain("contains alpha"));
-    expect(deps.runGraphSearch).toHaveBeenLastCalledWith("alpha", 40, 100, "query-workspace:query-test", true);
+    // The Display options ride the SAME request (§7.6, Q3): the two families'
+    // resolved views are part of what this search asks for, not a separate
+    // question asked afterwards.
+    expect(deps.runGraphSearch).toHaveBeenLastCalledWith(
+      "alpha", 40, 100, "query-workspace:query-test", true,
+      { pageView: { view: "board" }, blockView: { view: "board" } },
+    );
 
     dispose();
   });
@@ -922,5 +938,185 @@ describe("QueryWorkspace", () => {
     expect(document.activeElement).toBe(toggle);
 
     dispose();
+  });
+});
+
+// **Scoped Display settings in the workspace** (SPEC §7.6, Q3).
+//
+// The workspace's route carries the whole envelope: the singular compatibility
+// view, a scoped draft and presentation per family, and the Friendly membership
+// scope. These cases are the evidence that all of it reaches execution, all of
+// it reaches disk, and that a save publishes the state it CAPTURED rather than
+// whatever the user has typed since.
+describe("q3: scoped display settings in the workspace", () => {
+  const scopedRoute = (overrides: Partial<QueryRoute> = {}): QueryRoute => ({
+    kind: "query",
+    id: "query-scoped",
+    sourceKind: "search",
+    source: "alpha",
+    presentation: "list",
+    ...overrides,
+  });
+
+  it("q3_workspace_executes_page_anchor_and_both_displays", async () => {
+    // FAIL-BEFORE: resource identity omitted Display entirely and the explicit
+    // route ran through a groups-only adapter, so a page-anchored query lost
+    // its rows and every query ran under whatever the singular view said.
+    const route = scopedRoute({
+      sourceKind: "dsl",
+      source: "(page-property status open)",
+      pagePresentation: "table",
+      pageDisplay: { columns: ["status"] },
+      blockDisplay: {},
+    });
+    const router = routerMock(route);
+    const deps = workspaceDeps();
+    deps.runQuery = vi.fn(async () => ({
+      anchor: "page" as const,
+      pages: [{
+        name: "Alpha notes", kind: "page" as const, path: "pages/alpha.md",
+        properties: [["status", "open"]] as [string, string][],
+      }],
+      diagnostics: [],
+      report: { ran: [], ignored: [], supported: true },
+      total: 1,
+      exceeded: false,
+    }));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route} router={router} deps={deps} />, root);
+    try {
+      await waitFor(() => expect(root.querySelector('[data-query-result-kind="page"] table')).not.toBeNull());
+      // BOTH views travel, because only the parse knows which anchor the query
+      // declares. The page half carries the scoped draft; the block half is a
+      // present EMPTY draft, which clears rather than inherits.
+      expect(deps.runQuery).toHaveBeenCalledWith("(page-property status open)", {
+        page: { view: "table", columns: ["status"] },
+        block: { view: "list" },
+      });
+      // The page rows survive the adapter WHOLE: the column reads the page's own
+      // authored property, which a groups-only conversion had thrown away.
+      const table = root.querySelector('[data-query-result-kind="page"] table')!;
+      expect([...table.querySelectorAll("thead th")].map((th) => th.textContent)).toEqual(["Page", "status"]);
+      expect(table.querySelector("tbody tr")?.textContent).toContain("open");
+      // An explicit query renders the section its anchor declares — and the
+      // other family still says so rather than disappearing (I-10).
+      expect(root.querySelector('[data-query-result-kind="block"]')?.textContent)
+        .toContain("No matching blocks.");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("q3_scoped_save_reopen_md_org", async () => {
+    // FAIL-BEFORE: `savedQueryRaw` filtered its writes to `tine.view`, so every
+    // other setting the workspace was showing was dropped and the saved query
+    // reopened as a different query than the one that was saved.
+    const input = {
+      title: "Saved scoped",
+      sourceKind: "search" as const,
+      source: "alpha",
+      presentation: "list" as const,
+      display: { sort: [["page", "asc"]] as [string, "asc" | "desc"][] },
+      pagePresentation: "table" as const,
+      pageDisplay: { columns: ["status"] },
+      // Present and EMPTY: the Blocks section clears rather than inherits.
+      blockDisplay: {},
+      pageMatchScope: "both" as const,
+      routeId: "q",
+    };
+    for (const format of ["md", "org"] as const) {
+      const deps = materializeDeps();
+      const result = await materializeQueryWorkspace({ ...input, format }, deps);
+      expect(result.ok).toBe(true);
+      const saved = vi.mocked(deps.savePage).mock.calls[0][0];
+      const raw = saved.blocks[0].raw;
+
+      // The whole envelope reached disk, in the spelling the reader reads back.
+      const property = (key: string) => new RegExp(
+        format === "org" ? `^:${key}:\\s*(.*)$` : `^${key}::\\s*(.*)$`,
+        "m",
+      ).exec(raw)?.[1];
+      expect(raw.startsWith('{{query (search "alpha")}}')).toBe(true);
+      expect(property("tine.sort")).toBe("page asc");
+      expect(property("tine.page-view")).toBe("table");
+      expect(property("tine.page-display")).toBe("1");
+      expect(property("tine.page-columns")).toBe("status");
+      // The marker with NO members is the present-empty draft: it clears.
+      expect(property("tine.block-display")).toBe("1");
+      expect(raw).not.toMatch(/tine\.block-columns/);
+      expect(raw).not.toMatch(/tine\.block-sort/);
+      expect(property("tine.page-match-scope")).toBe("both");
+      // A list workspace still writes no `tine.view`: absence IS the default.
+      expect(raw).not.toMatch(/tine\.view/);
+      // And the property lines go where THIS format reads them back from:
+      // markdown `key:: value` inside an org file is visible body text that is
+      // never read back as a property (GH #25).
+      if (format === "org") {
+        expect(raw).toContain(":PROPERTIES:");
+        expect(raw).not.toMatch(/tine\.sort::/);
+      } else {
+        expect(raw).not.toContain(":PROPERTIES:");
+      }
+    }
+  });
+
+  it("q3_scoped_save_omits_a_namespace_that_has_no_draft", async () => {
+    // Absence is a value here too: a workspace with no page draft must not
+    // write a page marker, or reopening it would CLEAR settings it inherits.
+    const deps = materializeDeps();
+    const result = await materializeQueryWorkspace({
+      title: "Saved plain",
+      sourceKind: "search",
+      source: "alpha",
+      presentation: "list",
+      routeId: "q",
+    }, deps);
+    expect(result.ok).toBe(true);
+    const raw = vi.mocked(deps.savePage).mock.calls[0][0].blocks[0].raw;
+    expect(raw).toBe('{{query (search "alpha")}}');
+  });
+
+  it("q3_materialize_scoped_capture_is_revision_safe", async () => {
+    // FAIL-BEFORE (I-20): the attempt read the route's live drafts, so a draft
+    // the user kept editing during the await reached back into the write that
+    // was already publishing.
+    openGraph("/graphs/A");
+    const [route, setRoute] = createSignal<QueryRoute>(scopedRoute({
+      id: "query-capture",
+      pageDisplay: { columns: ["status"] },
+      pageMatchScope: "names",
+    }));
+    const router = routerMock(route());
+    router.route = route;
+    const { deps, open } = gatedDeps("save");
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QueryWorkspace route={route()} router={router} deps={deps} />, root);
+    try {
+      await waitFor(() => expect(root.querySelector(".query-workspace-status")?.textContent).toContain("2 results"));
+      submitSave(root, "Captured");
+      await waitFor(() => expect(deps.savePage).toHaveBeenCalled());
+
+      // The user keeps editing while the write is in flight.
+      setRoute(scopedRoute({
+        id: "query-capture",
+        pageDisplay: { columns: ["owner", "status"] },
+        pageMatchScope: "both",
+      }));
+      open();
+      // The write had already begun, so it lands — and the workspace says so
+      // rather than hijacking the route the user has since changed.
+      await waitFor(() => expect(text(root, ".query-workspace-save-notice")).not.toBe(""));
+      expect(router.replaceActiveRoute).not.toHaveBeenCalled();
+
+      // What landed is what was CAPTURED, deep-copied at submit.
+      const raw = vi.mocked(deps.savePage).mock.calls[0][0].blocks[0].raw;
+      expect(raw).toMatch(/^tine\.page-columns:: status$/m);
+      expect(raw).not.toMatch(/owner/);
+      expect(raw).toMatch(/^tine\.page-match-scope:: names$/m);
+    } finally {
+      dispose();
+    }
   });
 });

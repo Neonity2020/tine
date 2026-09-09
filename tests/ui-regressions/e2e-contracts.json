@@ -753,6 +753,12 @@
      "userOutcome": "A query's grouping is one canonical field identity: an existing note spelled with the older ambiguous key keeps grouping by the same field it always did, and the first save that states the grouping writes the canonical key and removes the ambiguous one rather than leaving two answers in the file.",
      "blocking": true,
      "authority": "docs/contracts/query-display.md \u00a73 (the grouping resolution and its precedence), pinned across both languages by crates/tine-core/tests/fixtures/query-grouping/resolution.json"
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A search that answers with both pages and blocks shows them as two named sections, each with its own display settings and its own way back: the Pages section can be shown as a table while the Blocks section is a board, page membership can be matched by name, by content or by both, and after a restart a section given no settings of its own is still distinguishable from one whose settings were cleared.",
+     "blocking": true,
+     "authority": "docs/contracts/query-display.md \u00a715 (mixed results: two families, one operation)"
     }
    ],
    "acceptableVariations": [

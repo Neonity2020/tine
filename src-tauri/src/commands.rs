@@ -305,6 +305,7 @@ fn enforce_query_execution_budget(
                 display_text,
                 evidence,
                 matched_alias,
+                row,
                 ..
             } => {
                 page.name.len()
@@ -312,6 +313,18 @@ fn enforce_query_execution_budget(
                     + display_text.len()
                     + matched_alias.as_ref().map_or(0, String::len)
                     + evidence.len() * 128
+                    // The hydrated page row is real payload crossing the same
+                    // bridge, so it is counted here. A Display setting cannot
+                    // buy capacity the ceiling does not have.
+                    + row.as_ref().map_or(0, |row| {
+                        row.name.len()
+                            + row.path.len()
+                            + row
+                                .properties
+                                .iter()
+                                .map(|(name, value)| name.len() + value.len() + 8)
+                                .sum::<usize>()
+                    })
                     + 256
             }
             QueryHit::Block {
@@ -2010,6 +2023,34 @@ pub(crate) async fn export_query_subtrees(
     .map_err(CommandError::worker)?
 }
 
+/// The Display half of a graph-search request (SPEC §7.6, Q3).
+///
+/// One optional trailing object, with every member optional: a caller that
+/// states nothing sends `null` and gets exactly the search it got before this
+/// packet. Members are serialized explicitly rather than flattened so the
+/// physical `QueryPageScope` — a different question, answered by a different
+/// request member — can never be confused with page MEMBERSHIP scope.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GraphSearchDisplayOptions {
+    #[serde(default)]
+    page_match_scope: Option<tine_core::query::ir::FriendlyPageMatchScope>,
+    #[serde(default)]
+    page_view: Option<tine_core::query::ir::ViewSettings>,
+    #[serde(default)]
+    block_view: Option<tine_core::query::ir::ViewSettings>,
+}
+
+impl From<GraphSearchDisplayOptions> for tine_core::query_plan::FriendlyDisplayOptions {
+    fn from(options: GraphSearchDisplayOptions) -> Self {
+        Self {
+            page_match_scope: options.page_match_scope,
+            page_view: options.page_view,
+            block_view: options.block_view,
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn run_graph_search(
     source: String,
@@ -2018,8 +2059,10 @@ pub(crate) async fn run_graph_search(
     lane: Option<String>,
     explain: bool,
     scope: Option<tine_core::query_plan::QueryPageScope>,
+    options: Option<GraphSearchDisplayOptions>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, CommandError> {
+    let display: tine_core::query_plan::FriendlyDisplayOptions = options.unwrap_or_default().into();
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -2036,6 +2079,7 @@ pub(crate) async fn run_graph_search(
                     lane,
                     explain,
                     scope,
+                    display,
                 },
             )? {
                 SyncApplicationNavigationReply::GraphSearch(execution) => Ok(execution),
@@ -2044,20 +2088,22 @@ pub(crate) async fn run_graph_search(
                 )),
             },
             None => (match lane.as_deref() {
-                Some(lane) => slot.legacy_graph()?.run_graph_search_latest_scoped(
+                Some(lane) => slot.legacy_graph()?.run_graph_search_latest_displayed(
                     lane,
                     &source,
                     page_limit,
                     block_limit,
                     scope,
                     explain,
+                    display,
                 ),
-                None => slot.legacy_graph()?.run_graph_search_scoped(
+                None => slot.legacy_graph()?.run_graph_search_displayed(
                     &source,
                     page_limit,
                     block_limit,
                     scope,
                     explain,
+                    display,
                 ),
             })
             .map_err(CommandError::from),
@@ -6048,6 +6094,59 @@ mod query_command_surface_tests {
             wire["block_display"]["aggregates"],
             serde_json::json!([["", "count"]])
         );
+    }
+
+    /// The cross-language presence contract, at the wire rather than in a
+    /// comment. `queryDisplayDraft.ts` asks `Object.hasOwn(parsed,
+    /// "page_display")` to tell "no scoped draft — inherit the singular
+    /// settings" from "an empty scoped draft — clear them". `Object.hasOwn` is
+    /// true for an explicit `null`, so a `page_display: None` that serialized
+    /// as `"page_display": null` would silently turn every INHERIT into a
+    /// CLEAR: each query with no scoped draft would lose the display settings
+    /// it inherits, on the frontend, with no Rust test noticing — the Rust
+    /// struct is `None` either way.
+    ///
+    /// The only thing standing between here and that bug is
+    /// `skip_serializing_if = "Option::is_none"` on `ScopedDisplaySettings`.
+    /// This test is what fails if it is ever dropped.
+    #[test]
+    fn an_absent_scoped_draft_omits_its_wire_key_entirely() {
+        let absent = parse_query_pair(
+            "(task TODO)",
+            QueryTextDialect::Og,
+            &[("tine.view".to_string(), "table".to_string())],
+            &graph_free_registry(),
+        );
+        assert_eq!(absent.scoped.page_display, None);
+        assert_eq!(absent.scoped.block_display, None);
+        let wire = serde_json::to_value(&absent).expect("parsed query serializes");
+        for key in ["page_display", "block_display", "page_match_scope"] {
+            assert!(
+                wire.get(key).is_none(),
+                "an absent scoped draft must OMIT `{key}`, never send null: \
+                 `Object.hasOwn` is true for null, so a null here turns the \
+                 frontend's inherit into a clear. Keep \
+                 `skip_serializing_if = \"Option::is_none\"` on \
+                 ScopedDisplaySettings. Wire was: {wire}"
+            );
+        }
+
+        // …and the other half of the same contract: a marker with no members
+        // is a PRESENT, empty draft, which is the explicit clear.
+        let empty = parse_query_pair(
+            "(task TODO)",
+            QueryTextDialect::Og,
+            &[("tine.page-display".to_string(), "1".to_string())],
+            &graph_free_registry(),
+        );
+        assert_eq!(empty.scoped.page_display, Some(DisplayDraft::default()));
+        let wire = serde_json::to_value(&empty).expect("parsed query serializes");
+        assert_eq!(
+            wire.get("page_display"),
+            Some(&serde_json::json!({})),
+            "a marker with no members is a present, empty draft: {wire}"
+        );
+        assert!(wire.get("block_display").is_none(), "{wire}");
     }
 
     #[test]

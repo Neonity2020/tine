@@ -464,4 +464,64 @@ describe("the display field vocabulary", () => {
   it("filters by the typed search", () => {
     expect(entries("group", "cos")).toEqual(["prop:cost"]);
   });
+
+  // **A page is not a block** (§7.6, Q3). The vocabulary above is the BLOCK
+  // vocabulary, and every caller that does not say otherwise keeps it. A page
+  // row has no task state, no priority, no planning dates and no formula, and
+  // none of the writers can spell one for a page — so offering them would be
+  // six controls that save a setting the row can never show.
+  it("q3_page_vocabulary_excludes_block_fields", () => {
+    // FAIL-BEFORE: `rowKind` did not exist, so a Pages section's panel offered
+    // the block builtins and the block formula list.
+    const pageRows = [
+      { ...registryRow("cost", 12), count_pages: 3 },
+      { ...registryRow("severity", 4), count_pages: 0 },
+    ] as RegistryRow[];
+    const page = (slot: "group" | "sort" | "column" | "aggregate") =>
+      displayFieldEntries({ slot, rows: pageRows, formulas: ["effort"], search: "", rowKind: "page" })
+        .map((entry) => (entry.choice.kind === "field" ? entry.choice.field : ""));
+
+    // Grouping: the three page attributes, canonically, then the properties the
+    // graph's PAGES actually carry. No `state`, no `priority`, no `formula:`.
+    expect(page("group")).toEqual(["prop:name", "prop:kind", "prop:day", "prop:cost"]);
+    expect(page("group").some((field) => field.startsWith("formula:"))).toBe(false);
+    // Sorting: page-name ordering and the supported page attributes.
+    expect(page("sort")).toEqual(["name", "kind", "day", "cost"]);
+    // Columns: no `name` — that is the row's own link — and no block builtin.
+    expect(page("column")).toEqual(["kind", "day", "cost"]);
+    // Aggregates: literal property keys only, for both row kinds.
+    expect(page("aggregate")).toEqual(["cost"]);
+
+    // `severity` is observed on no page of this graph, so it is not a page
+    // field. The BLOCK vocabulary is untouched by that judgement.
+    expect(page("column")).not.toContain("severity");
+    expect(
+      displayFieldEntries({ slot: "column", rows: pageRows, formulas: [], search: "" })
+        .map((entry) => (entry.choice.kind === "field" ? entry.choice.field : "")),
+    ).toContain("severity");
+  });
+
+  it("q3_page_panel_names_its_own_trigger_and_dialog", () => {
+    // Two panels can be mounted side by side on one mixed result, so "Display
+    // settings" would name both of them and neither would say which section it
+    // changes.
+    const registry: RegistryAccess = {
+      rows: () => ROWS, pending: () => false, failure: () => null,
+      unavailable: () => false, request: () => {}, retry: () => {},
+    };
+    const mounted = mount(() => (
+      <QueryDisplay rowKind="page" control={{ view: {}, apply: () => {} }} registry={registry} />
+    ));
+    try {
+      const trigger = mounted.root.querySelector<HTMLButtonElement>(".qd-trigger")!;
+      expect(trigger.getAttribute("aria-label")).toBe("Display pages");
+      expect(trigger.getAttribute("aria-haspopup")).toBe("dialog");
+      trigger.click();
+      const panel = document.querySelector<HTMLElement>(".qd-panel")!;
+      expect(panel.getAttribute("role")).toBe("dialog");
+      expect(panel.getAttribute("aria-label")).toBe("Page display");
+    } finally {
+      mounted.dispose();
+    }
+  });
 });

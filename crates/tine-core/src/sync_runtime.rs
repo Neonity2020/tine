@@ -2642,6 +2642,11 @@ pub enum SyncApplicationNavigationRequest {
         lane: Option<String>,
         explain: bool,
         scope: Option<crate::query_plan::QueryPageScope>,
+        /// The already-resolved page/block Display settings and page membership
+        /// scope this search runs under (SPEC §7.6, Q3). Default = "the caller
+        /// stated nothing", which is exactly the request every existing caller
+        /// sends, so an old consumer keeps its behaviour byte for byte.
+        display: crate::query_plan::FriendlyDisplayOptions,
     },
     BlockSearch {
         query: String,
@@ -4781,16 +4786,16 @@ impl SyncRuntimeHandle {
                 block_limit,
                 explain,
                 scope,
+                display,
                 ..
             } => {
-                let plan = match scope {
-                    Some(scope) => {
-                        crate::query_plan::QueryPlan::friendly_for_page(&source, block_limit, scope)
-                    }
-                    None => {
-                        crate::query_plan::QueryPlan::friendly(&source, page_limit, block_limit)
-                    }
-                };
+                let plan = crate::query_plan::friendly_search_plan(
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope,
+                    display,
+                );
                 return self.application_captured_friendly(&plan, explain, false, cancellation);
             }
             SyncApplicationNavigationRequest::BlockSearch { query, limit, .. } => {
@@ -8833,6 +8838,27 @@ fn validate_application_load_request(
     Ok(())
 }
 
+/// The authored bytes one search's Display settings carry. Field names are
+/// this build's own; only the AUTHORED values — sort/grouping/column/aggregate
+/// field names — can grow without bound, so they are what is measured.
+fn friendly_display_request_bytes(display: &crate::query_plan::FriendlyDisplayOptions) -> usize {
+    fn view_bytes(view: Option<&crate::query::ir::ViewSettings>) -> usize {
+        let Some(view) = view else { return 0 };
+        view.sort
+            .iter()
+            .map(|(field, _)| field.as_str().len())
+            .chain(view.columns.iter().map(|field| field.as_str().len()))
+            .chain(
+                view.aggregates
+                    .iter()
+                    .map(|(field, _)| field.as_str().len()),
+            )
+            .chain(view.group_by.iter().map(|field| field.as_str().len()))
+            .fold(0usize, |total, len| total.saturating_add(len))
+    }
+    view_bytes(display.page_view.as_ref()).saturating_add(view_bytes(display.block_view.as_ref()))
+}
+
 fn validate_application_navigation_request(
     request: &SyncApplicationNavigationRequest,
 ) -> Result<(), SyncApplicationPageRequestError> {
@@ -8991,6 +9017,7 @@ fn validate_application_navigation_request(
         block_limit,
         lane,
         scope,
+        display,
         ..
     } = request
     {
@@ -9003,7 +9030,11 @@ fn validate_application_navigation_request(
                     .name
                     .len()
                     .saturating_add(scope.path.as_ref().map_or(0, String::len))
-            }));
+            }))
+            // Display settings are authored request text like every other
+            // member, so they are measured against the SAME editor-request
+            // bound rather than being allowed to raise it.
+            .saturating_add(friendly_display_request_bytes(display));
         if rows > MAX_SYNC_APPLICATION_RESULT_ROWS || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES {
             return Err(SyncApplicationPageRequestError::RequestTooLarge(
                 SyncEditorRequestSize {

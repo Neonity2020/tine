@@ -326,9 +326,15 @@ export function groupingFromViewValue(value: string | undefined | null): QueryGr
 export function viewAfterViewSwitch(
   view: ViewSettings,
   next: ViewSettings["view"],
+  /** Which family this switch is for. A PAGE Board has no task marker to fall
+   *  back to — `state` is a block field — so an unset page grouping stays unset
+   *  and the board is one ungrouped column. Inheriting the block Board's
+   *  default would show the author a grouping their pages cannot have. */
+  rowKind: "page" | "block" = "block",
 ): ViewSettings {
   const settings: ViewSettings = { ...view, view: next };
-  if (next === "board" && groupingFromViewValue(view.group_by).kind === "unset") {
+  if (rowKind === "block" && next === "board"
+    && groupingFromViewValue(view.group_by).kind === "unset") {
     settings.group_by = "state";
   }
   return settings;

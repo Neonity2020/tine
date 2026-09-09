@@ -17,12 +17,24 @@ import { queryMacroExtents, QUERY_MACRO_NAMES } from "../editor/queryMacro";
 import {
   groupingFromViewValue,
   queryDisplayPropertyWrites,
+  queryPageMatchScopePropertyPatch,
+  queryScopedDisplayPropertyPatch,
   queryViewPropertyPatch,
   retainedQueryAggregateSegments,
   serializeQuerySort,
   viewAfterViewSwitch,
   type QueryDisplayControl,
 } from "../editor/queryViewProperties";
+import {
+  queryParsedDisplaySettings,
+  queryScopedDraftFrom,
+  type FriendlyPageMatchScope,
+  type QueryDisplayDraft,
+} from "../editor/queryDisplayDraft";
+import { QueryResultSections } from "./QueryResultSections";
+import { QueryPageResults, type QueryPageHit } from "./QueryPageResults";
+import { QueryDisplay } from "./QueryDisplay";
+import { createQueryRegistryAccess } from "./QueryBuilder";
 import {
   macroPrintDialect,
   macroTextDialect,
@@ -324,16 +336,76 @@ export function QueryMacro(props: {
   // `latest` rather than `parsed()`: a re-parse after an edit keeps the previous
   // reading visible instead of blanking the query for a frame.
   const source = (): Source | undefined => parsed.latest?.query.source;
+  /** **The COMPLETE display state a reading carries** (§7.6, Q3).
+   *
+   *  `query_parse` returns the singular `{query, view}` pair with the scoped
+   *  `tine.page-*` / `tine.block-*` state and the membership scope flattened
+   *  beside it, plus the names of any authored setting it could not read. The
+   *  optimistic commit below has to carry ALL of it: a commit that carried only
+   *  the singular view would, for one parse round-trip, show the block's scoped
+   *  settings as absent — which reads as "inherit", which is a different query
+   *  than the one the user just saved. */
+  type DisplayEnvelope = Pick<
+    ParsedQuery,
+    "page_presentation" | "block_presentation" | "page_display" | "block_display"
+    | "page_match_scope" | "unreadable_settings"
+  > & { view: ViewSettings };
+  const parsedEnvelope = (): DisplayEnvelope => {
+    const reading = parsed.latest;
+    if (!reading) return { view: {} };
+    // Presence is copied with `Object.hasOwn`, never with `??`: a present empty
+    // scoped draft is `{}`, and `{} ?? x` is `{}` but `undefined ?? x` is `x`.
+    return {
+      view: reading.view ?? {},
+      ...(reading.page_presentation !== undefined ? { page_presentation: reading.page_presentation } : {}),
+      ...(reading.block_presentation !== undefined ? { block_presentation: reading.block_presentation } : {}),
+      ...(Object.hasOwn(reading, "page_display") ? { page_display: reading.page_display } : {}),
+      ...(Object.hasOwn(reading, "block_display") ? { block_display: reading.block_display } : {}),
+      ...(reading.page_match_scope !== undefined ? { page_match_scope: reading.page_match_scope } : {}),
+      ...(reading.unreadable_settings ? { unreadable_settings: reading.unreadable_settings } : {}),
+    };
+  };
   const view = (): ViewSettings => parsed.latest?.view ?? {};
-  const [displayCommit, setDisplayCommit] = createSignal<{ raw: string; epoch: number; view: ViewSettings }>();
-  const displayView = (): ViewSettings => {
+  const [displayCommit, setDisplayCommit] = createSignal<{ raw: string; epoch: number; envelope: DisplayEnvelope }>();
+  /** The envelope this block is CURRENTLY showing: the optimistic commit while
+   *  it still describes these exact bytes under this exact graph, and the
+   *  engine's own reading otherwise. */
+  const displayEnvelope = (): DisplayEnvelope => {
     const committed = displayCommit();
     return committed && committed.epoch === graphEpoch() && committed.raw === doc.byId[props.blockId ?? ""]?.raw
-      ? committed.view : view();
+      ? committed.envelope : parsedEnvelope();
   };
-  const rememberDisplay = (settings: ViewSettings) => {
+  const displayView = (): ViewSettings => displayEnvelope().view;
+  /** The block's own presentation property, read straight from its bytes. */
+  const currentView = (): QueryView => {
+    if (!props.blockId) return "list";
+    const view = blockProperty(props.blockId, "tine.view");
+    return view === "search" || view === "table" || view === "board" ? view : "list";
+  };
+  /** The two effective section views, through the ONE resolver. Absent scoped
+   *  draft inherits the singular state; a present one replaces it wholesale.
+   *
+   *  The singular presentation handed to the resolver is `currentView()` — the
+   *  block's OWN `tine.view` bytes — rather than the reading's, because the
+   *  reading is asynchronous and the property is not: keying the sections off
+   *  the reading would show both families under the previous presentation for
+   *  one round-trip after a view switch. They are the same fact; this is the
+   *  copy that is already in hand. */
+  const displayResolutionEnvelope = createMemo(() => {
+    const envelope = displayEnvelope();
+    return { ...envelope, view: { ...envelope.view, view: envelope.view.view ?? currentView() } };
+  });
+  const pageResultView = createMemo(() => queryParsedDisplaySettings(displayResolutionEnvelope(), "page"));
+  const blockResultView = createMemo(() => queryParsedDisplaySettings(displayResolutionEnvelope(), "block"));
+  /** The Blocks family's own presentation. Independently overridable, and never
+   *  the Pages family's: "pages as a table, blocks as a list" is one query. The
+   *  Pages family reads its own presentation straight off `pageResultView()`,
+   *  which is the whole settings object its renderer needs. */
+  const blockPresentation = (): QueryView => (blockResultView().view ?? "list") as QueryView;
+  const pageMatchScope = () => displayEnvelope().page_match_scope;
+  const rememberDisplay = (envelope: DisplayEnvelope) => {
     const raw = doc.byId[props.blockId ?? ""]?.raw;
-    if (raw !== undefined) setDisplayCommit({ raw, epoch: graphEpoch(), view: settings });
+    if (raw !== undefined) setDisplayCommit({ raw, epoch: graphEpoch(), envelope });
   };
   const form = (): string => {
     const s = source();
@@ -412,11 +484,6 @@ export function QueryMacro(props: {
     if (!props.blockId || !doc.byId[props.blockId]) return null;
     return sheetConfig(facetsOf(doc.byId[props.blockId].raw, formatForBlock(props.blockId)).properties);
   });
-  const currentView = (): QueryView => {
-    if (!props.blockId) return "list";
-    const view = blockProperty(props.blockId, "tine.view");
-    return view === "search" || view === "table" || view === "board" ? view : "list";
-  };
   const sheetFace = () => currentView() === "table" || currentView() === "board";
   const legacyTable = () => currentView() === "list" && tableViewOption();
   /** The header's view switcher, for the hosts the inline Display panel is not
@@ -576,7 +643,7 @@ export function QueryMacro(props: {
     // The notice is the user half of the crossing (§7.5): the bytes changed
     // under the user without asking, so say so and offer the way back.
     if (crossing && node) setCrossed(props.blockId, changed);
-    rememberDisplay(next.view);
+    rememberDisplay({ ...displayEnvelope(), view: next.view });
     return true;
   };
   /** **The view lives in the block's `tine.*` properties (§7.6), for BOTH macro
@@ -685,7 +752,100 @@ export function QueryMacro(props: {
     withUndoUnit(`query:display:${blockId}`, [node.page], () => {
       for (const [key, value] of writes) setBlockProperty(blockId, key, value);
     });
-    rememberDisplay(next);
+    rememberDisplay({ ...displayEnvelope(), view: next });
+  };
+  /** **Apply a SCOPED display change** — one namespace, nothing else (§7.6, Q3).
+   *
+   *  Three rules make this different from the singular writer above:
+   *
+   *   1. **The first scoped edit clones the effective snapshot.** A scoped draft
+   *      is complete or it is absent, so an edit that stated only the fact it
+   *      changed would silently clear everything this section was already
+   *      showing. `queryScopedDraftFrom` writes the whole effective non-view
+   *      snapshot down, then the requested change goes on top.
+   *   2. **Presentation is independently scoped.** Switching one section's view
+   *      says nothing about the other's, and nothing about the predicate.
+   *   3. **It never touches the other namespace, the singular settings, or an
+   *      authored key it does not own** — that is `queryScopedDisplayPropertyPatch`'s
+   *      contract, and it is why an unknown `tine.*` property survives an edit.
+   *
+   *  Nothing is reprinted: the scoped keys have no spelling in the query TEXT
+   *  at all, so a scoped sort or sample is a property write and only that.
+   */
+  const applyScopedDisplay = (
+    namespace: "page" | "block",
+    change: (current: ViewSettings) => ViewSettings,
+  ) => {
+    const blockId = props.blockId;
+    const node = blockId ? doc.byId[blockId] : undefined;
+    const properties = blockPropertyPairs();
+    if (!blockId || !node || !properties) return;
+    const envelope = displayEnvelope();
+    const before = namespace === "page" ? pageResultView() : blockResultView();
+    const next = change(before);
+    const { view, ...rest } = next;
+    const draft: QueryDisplayDraft = queryScopedDraftFrom(rest as ViewSettings);
+    const writes = [
+      ...queryScopedDisplayPropertyPatch({
+        namespace,
+        ...(view !== undefined && view !== "list" ? { presentation: view } : {}),
+        display: draft,
+        properties,
+      }),
+    ];
+    if (writes.length === 0) return;
+    withUndoUnit(`query:display:${namespace}:${blockId}`, [node.page], () => {
+      for (const [key, value] of writes) setBlockProperty(blockId, key, value);
+    });
+    // Optimistically show exactly what was written, including PRESENCE: the
+    // reparse is asynchronous and an envelope that dropped the new draft would
+    // show the section inheriting for a frame.
+    rememberDisplay({
+      ...envelope,
+      ...(namespace === "page"
+        ? { page_display: draft, ...(view !== undefined ? { page_presentation: view } : {}) }
+        : { block_display: draft, ...(view !== undefined ? { block_presentation: view } : {}) }),
+    });
+  };
+  /** Remove one namespace's scoped draft, so the section INHERITS again. This is
+   *  a different action from clearing, which writes an empty draft — and the two
+   *  have to stay distinct, because "show what the query says" and "show
+   *  nothing extra" are different requests (I-10: both have a way out). */
+  const inheritScopedDisplay = (namespace: "page" | "block") => {
+    const blockId = props.blockId;
+    const node = blockId ? doc.byId[blockId] : undefined;
+    const properties = blockPropertyPairs();
+    if (!blockId || !node || !properties) return;
+    const writes = queryScopedDisplayPropertyPatch({ namespace, properties });
+    if (writes.length === 0) return;
+    withUndoUnit(`query:display:${namespace}:${blockId}`, [node.page], () => {
+      for (const [key, value] of writes) setBlockProperty(blockId, key, value);
+    });
+    const envelope = { ...displayEnvelope() };
+    delete envelope[namespace === "page" ? "page_display" : "block_display"];
+    delete envelope[namespace === "page" ? "page_presentation" : "block_presentation"];
+    rememberDisplay(envelope);
+  };
+  /** Friendly page membership scope. It is neither namespace's: it changes
+   *  which pages are MEMBERS, and the Blocks section still evaluates the
+   *  ordinary block predicate. */
+  const applyPageMatchScope = (scope: FriendlyPageMatchScope | undefined) => {
+    const blockId = props.blockId;
+    const node = blockId ? doc.byId[blockId] : undefined;
+    const properties = blockPropertyPairs();
+    if (!blockId || !node || !properties) return;
+    const writes = queryPageMatchScopePropertyPatch({
+      ...(scope !== undefined ? { scope } : {}),
+      properties,
+    });
+    if (writes.length === 0) return;
+    withUndoUnit(`query:page-match-scope:${blockId}`, [node.page], () => {
+      for (const [key, value] of writes) setBlockProperty(blockId, key, value);
+    });
+    const envelope = { ...displayEnvelope() };
+    if (scope === undefined) delete envelope.page_match_scope;
+    else envelope.page_match_scope = scope;
+    rememberDisplay(envelope);
   };
   // Edit the query's display title (:title "…" in the options map). Only offered
   // for a user-authored standalone query (blockId set, no app-supplied title).
@@ -872,7 +1032,17 @@ export function QueryMacro(props: {
     // The IR, not the text, is what runs — so it is what identifies the run. Two
     // blocks whose text differs only in whitespace share a request; two blocks
     // whose text is identical but whose `tine.*` properties differ do not.
-    const identity = JSON.stringify([reading.query, reading.view]);
+    // The COMPLETE settings envelope, not the singular view alone: two blocks
+    // whose text and singular view are identical but whose scoped settings or
+    // page membership scope differ are two different questions, and sharing one
+    // answer between them is how a late result lands on the wrong state (I-20).
+    const identity = JSON.stringify([
+      reading.query,
+      reading.view,
+      pageResultView(),
+      blockResultView(),
+      pageMatchScope() ?? null,
+    ]);
     // Only a query that binds `?current-page` needs the focused page in its key:
     // for those the text is identical on both pages and only the execution
     // context differs. A `<% current page %>` query must NOT key off it — the
@@ -918,7 +1088,15 @@ export function QueryMacro(props: {
             500,
             5_000,
             `inline-query:${props.blockId ?? currentPage() ?? "global"}`,
-            false
+            false,
+            // No PHYSICAL page scope: an inline Friendly search is a whole-graph
+            // question. The Display options beside it are a different member.
+            undefined,
+            {
+              ...(pageMatchScope() !== undefined ? { pageMatchScope: pageMatchScope()! } : {}),
+              pageView: pageResultView(),
+              blockView: blockResultView(),
+            },
           ),
           signal,
         );
@@ -934,16 +1112,22 @@ export function QueryMacro(props: {
           ? execution.hits.filter((hit) => !(hit.entity === "block" && hit.block.id === props.blockId))
           : execution.hits;
         const visibleExecution = hits.length === execution.hits.length ? execution : { ...execution, hits };
-        const grouped = new Map<string, RefGroup>();
+        // Adjacency, not identity (Q4): with an explicit block sort one page
+        // can legitimately open more than one group, and re-clustering by page
+        // would reorder rows the backend deliberately placed.
+        const grouped: RefGroup[] = [];
+        let groupKey: string | null = null;
         for (const hit of hits) {
           if (hit.entity !== "block") continue;
           const key = `${hit.kind}\0${hit.page}\0${hit.path ?? ""}`;
-          const group = grouped.get(key) ?? { page: hit.page, kind: hit.kind, path: hit.path, blocks: [] };
-          group.blocks.push(hit.block);
-          grouped.set(key, group);
+          if (key !== groupKey) {
+            grouped.push({ page: hit.page, kind: hit.kind, path: hit.path, blocks: [] });
+            groupKey = key;
+          }
+          grouped[grouped.length - 1].blocks.push(hit.block);
         }
         return {
-          groups: [...grouped.values()],
+          groups: grouped,
           advInfo: null,
           pageRows: null,
           matchedTotal: null,
@@ -966,7 +1150,14 @@ export function QueryMacro(props: {
       const result = await sharedQueryResult(
         scope,
         `ir\0${page ?? ""}\0${requestKey}`,
-        () => backend().queryRun(reading.query, reading.view, page ? { current_page: page } : undefined),
+        // The effective view of `reading.query.anchor` (§7.6, Q3): a page-anchored
+        // query is a Pages section, so it runs under the Pages settings. Running
+        // it under the Blocks settings would order pages by a block field.
+        () => backend().queryRun(
+          reading.query,
+          reading.query.anchor === "page" ? pageResultView() : blockResultView(),
+          page ? { current_page: page } : undefined,
+        ),
         signal,
       );
       // I-20: the user has edited since this run started; its answer is about a
@@ -980,7 +1171,7 @@ export function QueryMacro(props: {
           advInfo: isAdvanced() ? reportInfo(result.report) : null,
           pageRows: result.pages,
           statistics: result.statistics,
-          statisticsView: reading.view,
+          statisticsView: pageResultView(),
           matchedTotal: result.matched_total ?? result.total,
           searchExecution: null,
           diagnostics: result.diagnostics ?? [],
@@ -989,7 +1180,7 @@ export function QueryMacro(props: {
       return {
         groups: result.groups,
         statistics: isAdvanced() ? undefined : result.statistics,
-        statisticsView: reading.view,
+        statisticsView: blockResultView(),
         advInfo: isAdvanced() ? reportInfo(result.report) : null,
         pageRows: null,
         matchedTotal: null,
@@ -1092,9 +1283,37 @@ export function QueryMacro(props: {
       evidence: [],
     })));
   });
-  const total = () => currentView() === "search"
+  /** **The returned operation, PARTITIONED — never refetched per family** (Q3).
+   *
+   *  One Friendly read answers both questions at once, so the Pages and Blocks
+   *  sections are two views of ONE operation. Fetching a family on its own
+   *  would let the two halves describe two different graph states, which is the
+   *  shape I-20 forbids. */
+  const pageHits = createMemo(() =>
+    searchPresentationHits().filter((hit): hit is QueryPageHit => hit.entity === "page"));
+  const blockSectionHits = createMemo(() => searchPresentationHits().filter((hit) => hit.entity === "block"));
+  /** An explicit `@page`-anchored result, adapted into the ONE page renderer.
+   *
+   *  A `PageRow` is already everything the Pages section shows — path, kind,
+   *  journal day and the page's own ordered properties — so this is a shape
+   *  change and nothing more. It fabricates no evidence and no block: the row
+   *  matched a predicate, not a text, and claiming a highlighted excerpt it
+   *  never had would be an invented fact. */
+  const pageRowHits = createMemo<QueryPageHit[]>(() => (pageRows() ?? []).map((row) => ({
+    entity: "page" as const,
+    page: { name: row.name, kind: row.kind, date_key: row.journal_day ?? null, path: row.path },
+    display_text: row.name,
+    // No evidence and no score: the row matched a PREDICATE, not a text. A
+    // highlighted excerpt or a rank it never had would be an invented fact.
+    evidence: [],
+    score: 0,
+    row,
+  })));
+  const total = () => friendlySearch() !== null
     ? searchPresentationHits().length
-    : (pageRows() ? (matchedTotal() ?? pageRows()!.length) : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
+    : currentView() === "search"
+      ? searchPresentationHits().length
+      : (pageRows() ? (matchedTotal() ?? pageRows()!.length) : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
   // **Why empty? (Q14, N19; B1).** `query_explain_empty` was decoded and never
   // rendered, so a query that matched nothing said only "No results" — which is
   // the one moment a user most needs to know WHICH conjunct emptied it. Asked
@@ -1325,6 +1544,350 @@ export function QueryMacro(props: {
   const unsupportedAdvanced = () => isAdvanced() && advInfo() && (
     !advInfo()!.supported || (props.strictAdvanced === true && advInfo()!.ignored.length > 0)
   );
+
+  // ---------------------------------------------------------------------------
+  // Result families (§7.6, Q3)
+  // ---------------------------------------------------------------------------
+
+  /** **The Blocks family's SEARCH rows.**
+   *
+   *  Only blocks: a page that matched has its own section now, with its own
+   *  presentation and its own Display control, so a flat list that mixed the
+   *  two under one heading no longer exists. Each row is a listitem CONTAINING
+   *  its control rather than being it — a button that is also the row has no
+   *  row semantics left to announce. */
+  const blockSearchRows = () => (
+    <div class="query-search-results" role="list" aria-label="Block results" onClick={stop}>
+      <For each={blockSectionHits()}>
+        {(hit) => (
+          <Show when={hit.entity === "block" ? hit : null}>
+            {(blockHit) => (
+              <div role="listitem">
+                <button
+                  type="button"
+                  class="query-search-hit switcher-row block-result"
+                  onMouseDown={internalLinkMouseDown}
+                  onClick={(e) => {
+                    const bh = blockHit();
+                    const uuid = blockDtoExternalId(bh.block);
+                    const dest = internalLinkDest(e);
+                    if (dest === "sidebar") {
+                      openBlockInSidebar({ uuid, page: bh.page, pageKind: bh.kind, ...(bh.path ? { path: bh.path } : {}) });
+                    } else if (dest === "background") {
+                      openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
+                    } else if (dest === "pane") {
+                      openRouteInOtherPane({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
+                    } else {
+                      openPageAtBlock({
+                        name: bh.page,
+                        pageKind: bh.kind,
+                        block: uuid,
+                        ...(bh.path ? { path: bh.path } : {}),
+                      });
+                    }
+                  }}
+                  onAuxClick={(e) => internalLinkAuxClick(e, () => {
+                    const bh = blockHit();
+                    openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: blockDtoExternalId(bh.block), ...(bh.path ? { path: bh.path } : {}) });
+                  })}
+                >
+                  <SearchResultRow
+                    page={blockHit().page}
+                    breadcrumb={blockHit().block.breadcrumb ?? []}
+                    text={blockHit().display_text}
+                    spans={blockHit().evidence.flatMap((evidence) => evidence.spans)}
+                  />
+                </button>
+              </div>
+            )}
+          </Show>
+        )}
+      </For>
+    </div>
+  );
+  /** Open the page a Pages-section row names, honouring the application's link
+   *  gestures. The row is the SAME control the rest of the app uses to open a
+   *  page; only its host is new. */
+  const openPageHit = (hit: QueryPageHit, e: MouseEvent) => {
+    const target = {
+      name: hit.page.name,
+      pageKind: hit.page.kind,
+      ...(hit.page.path ? { path: hit.page.path } : {}),
+    };
+    const dest = internalLinkDest(e);
+    if (dest === "sidebar") openPageInSidebar(target);
+    else if (dest === "background") openPageTargetInNewTab(target);
+    else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
+    else openPageTarget(target);
+  };
+  const pageHitLinkAttrs = (hit: QueryPageHit) => ({
+    onMouseDown: internalLinkMouseDown,
+    onAuxClick: (e: MouseEvent) => internalLinkAuxClick(e, () => openPageTargetInNewTab({
+      name: hit.page.name,
+      pageKind: hit.page.kind,
+      ...(hit.page.path ? { path: hit.page.path } : {}),
+    })),
+  });
+  /** **Each section's own Display panel, and only its own** (§7.6, Q3).
+   *
+   *  One registry read serves both, gated on either panel being open: two
+   *  panels asking the graph the same question twice is the second producer
+   *  D-14 forbids, and the answer is the same answer.
+   *
+   *  Every edit lands through `applyScopedDisplay`, which clones the effective
+   *  snapshot on the FIRST edit in a namespace — a scoped draft is complete or
+   *  it is absent, so an edit that stated only what it changed would silently
+   *  clear everything the section was already showing. */
+  const [sectionDisplayOpen, setSectionDisplayOpen] = createSignal(false);
+  const sectionRegistry = createQueryRegistryAccess(() => sectionDisplayOpen());
+  const sectionDisplay = (kind: "page" | "block") => (
+    <QueryDisplay
+      rowKind={kind}
+      registry={sectionRegistry}
+      onOpenChange={setSectionDisplayOpen}
+      {...(kind === "block" ? { formulas: queryFormulaNames } : {})}
+      control={{
+        view: kind === "page" ? pageResultView() : blockResultView(),
+        apply: (next: ViewSettings) => applyScopedDisplay(kind, () => next),
+        ...(displayedOperation()?.statistics ? { statistics: displayedOperation()!.statistics } : {}),
+        statisticsView: kind === "page" ? pageResultView() : blockResultView(),
+      }}
+    />
+  );
+  /** **Inherit and clear are DIFFERENT actions** (§7.6.7, I-10).
+   *
+   *  "Show what the query says" removes the scoped draft; "show nothing extra"
+   *  writes an empty one. A single control could not say both, and a section
+   *  whose settings could only be replaced and never given back would be a
+   *  state with no way out. */
+  const scopedResetControls = (kind: "page" | "block") => {
+    const scoped = () => Object.hasOwn(
+      displayEnvelope(),
+      kind === "page" ? "page_display" : "block_display",
+    ) || (kind === "page" ? displayEnvelope().page_presentation : displayEnvelope().block_presentation) !== undefined;
+    return (
+      <>
+        <button
+          type="button"
+          class="query-scoped-reset"
+          disabled={!scoped()}
+          onClick={(e) => { e.stopPropagation(); inheritScopedDisplay(kind); }}
+        >
+          Use inherited settings
+        </button>
+        <button
+          type="button"
+          class="query-scoped-clear"
+          onClick={(e) => { e.stopPropagation(); applyScopedDisplay(kind, () => ({})); }}
+        >
+          Clear settings
+        </button>
+      </>
+    );
+  };
+  /** **Page matches** — which pages are MEMBERS of this search (§7.6, Q3).
+   *
+   *  It is neither namespace's display setting: it changes membership, and the
+   *  Blocks section still evaluates the ordinary block predicate either way.
+   *  Absence resolves to names-and-aliases at execution, and picking that value
+   *  explicitly states the same query — one question, one answer (I-12). */
+  const PAGE_MATCH_CHOICES: [FriendlyPageMatchScope, string][] = [
+    ["names", "Names and aliases"],
+    ["content", "Page content"],
+    ["both", "Both"],
+  ];
+  const pageMatchControl = () => (
+    <label class="query-page-match" onClick={stop}>
+      <span>Page matches</span>
+      <select
+        value={pageMatchScope() ?? "names"}
+        disabled={!props.blockId}
+        onChange={(event) => applyPageMatchScope(event.currentTarget.value as FriendlyPageMatchScope)}
+      >
+        <For each={PAGE_MATCH_CHOICES}>
+          {([value, label]) => <option value={value}>{label}</option>}
+        </For>
+      </select>
+    </label>
+  );
+  const pageSectionControls = () => (
+    <>
+      {pageMatchControl()}
+      {sectionDisplay("page")}
+      {scopedResetControls("page")}
+    </>
+  );
+  const blockSectionControl = () => (
+    <>
+      {sectionDisplay("block")}
+      {scopedResetControls("block")}
+    </>
+  );
+  /** §7.5: zero results is the one moment a user most needs to know WHICH
+   *  conjunct emptied the query, and the engine can already say. */
+  const whyEmptyAffordance = () => (
+    <>
+      <button
+        type="button"
+        class="query-why-empty"
+        disabled={groupResource.loading || !!groupResource.error}
+        onClick={(e) => { e.stopPropagation(); setExplainOpen(!explainOpen()); }}
+      >
+        {explainOpen() ? "hide" : "why empty?"}
+      </button>
+      <Show when={explainOpen()}>
+        <div class="query-why-empty-panel" onClick={stop}>
+          <Show when={explained.loading}>
+            <span class="query-why-empty-pending">Checking…</span>
+          </Show>
+          <Show when={explainNotice()}>
+            {(notice) => <div class="query-why-empty-notice">{notice()}</div>}
+          </Show>
+          <Show when={explainRows().length > 0}>
+            <table class="md-table query-why-empty-table">
+              <thead>
+                <tr>
+                  <th>Condition</th>
+                  <th>Alone</th>
+                  <th>Without it</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={explainRows()}>
+                  {(row) => (
+                    <tr classList={{ "query-why-empty-culprit": row.alone === 0 }}>
+                      <td><code>{row.conjunct}</code></td>
+                      <td>{row.alone}</td>
+                      <td>{row.without ?? "—"}</td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </Show>
+        </div>
+      </Show>
+    </>
+  );
+  const emptyResultPanel = () => (
+    <div class="query-empty">
+      {emptyResultsMessage()}{" "}
+      {whyEmptyAffordance()}
+    </div>
+  );
+  /** The Blocks family's ORDINARY rows: the same editable renderers an inline
+   *  query has always used. */
+  const blockGroupRows = () => (
+    <>
+    <Show
+      when={legacyTable()}
+      fallback={
+        <Show
+          when={globalSort()}
+          fallback={
+            <For each={[...groupedQueryByKey().keys()]}>
+              {(key) => <QueryGroup group={() => groupedQueryByKey().get(key)} />}
+            </For>
+          }
+        >
+          {/* Sorted: flat global order (each group holds one block). Iterate the
+              groups DIRECTLY and pass the group object — re-`find()`ing the group
+              by page/id for every row was O(groups²) on broad queries (audit #3). */}
+          <For each={[...flatQueryByKey().keys()]}>
+            {(key) => <QueryGroup group={() => flatQueryByKey().get(key)} flat />}
+          </For>
+        </Show>
+      }
+    >
+      <table class="md-table query-table">
+        <thead>
+          <tr onClick={stop}>
+            <th onClick={() => sortBy("content")}>Content{arrow("content")}</th>
+            <th onClick={() => sortBy("page")}>Page{arrow("page")}</th>
+            <For each={cols()}>
+              {(c) => <th onClick={() => sortBy(c)}>{c}{arrow(c)}</th>}
+            </For>
+          </tr>
+        </thead>
+        <tbody>
+          <For each={sorted()}>
+            {(r) => (
+              <tr>
+                <td>
+                  <InlineText text={r.text} format={formatForPage(r.page)} />
+                </td>
+                <td
+                  class="qt-page"
+                  onMouseDown={internalLinkMouseDown}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const target = { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) };
+                    const dest = internalLinkDest(e);
+                    if (dest === "sidebar") openPageInSidebar(target);
+                    else if (dest === "background") openPageTargetInNewTab(target);
+                    else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
+                    else openPageTarget(target);
+                  }}
+                  onAuxClick={(e) => {
+                    if (internalLinkAuxClick(e, () =>
+                      openPageTargetInNewTab({ name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) })
+                    )) e.stopPropagation();
+                  }}
+                  onContextMenu={(e) => {
+                    if (!shouldOpenTextContextMenu(e.target)) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    openPageContextMenu(e.clientX, e.clientY, { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) });
+                  }}
+                >
+                  {r.page}
+                </td>
+                <For each={cols()}>{(c) => <td>{r.props[c] ?? ""}</td>}</For>
+              </tr>
+            )}
+          </For>
+        </tbody>
+      </table>
+    </Show>
+    </>
+  );
+  /** Whether a presentation can be drawn as the typed SHEET face. It needs a
+   *  block to own the schema and a sheet configuration to read it from; without
+   *  one, a table presentation falls back to the ordinary grouped renderers
+   *  rather than rendering nothing at all (I-10). */
+  const sheetFaceFor = (presentation: QueryView) =>
+    (presentation === "table" || presentation === "board")
+    && !!props.blockId
+    && (sheet()?.view === "table" || sheet()?.view === "board");
+  /** The Blocks family under a SHEET face (table/board), which owns its own
+   *  editing surface. The presentation is passed in because a SCOPED block
+   *  presentation is not the block's `tine.view` — the sheet config only knows
+   *  the singular one. */
+  const blockSheetRows = (presentation?: QueryView) => (
+    <Show when={presentation ? !!props.blockId : (sheet()?.view === "table" || sheet()?.view === "board") && props.blockId}>
+      <SheetContainer>
+        <Switch>
+          <Match when={(presentation ?? sheet()?.view) === "table"}>
+            <SheetTable
+              ownerId={props.blockId!}
+              rowSource="query"
+              groups={groups() ?? []}
+              queryDisplay={queryDisplayControl()}
+            />
+          </Match>
+          <Match when={(presentation ?? sheet()?.view) === "board"}>
+            <SheetBoard
+              ownerId={props.blockId!}
+              rowSource="query"
+              groups={groups() ?? []}
+              queryGrouping={queryGroupingControl()}
+            />
+          </Match>
+        </Switch>
+      </SheetContainer>
+    </Show>
+  );
+
 
   return (
     <Show when={!hidden()}>
@@ -1574,278 +2137,101 @@ export function QueryMacro(props: {
                       )}
                     </Show>
               </Show>
+              {/* **One mixed result, two independently controlled families**
+                  (§7.6, Q3). A Friendly search answers two questions at once —
+                  which PAGES match and which BLOCKS match — so it mounts a
+                  Pages section and a Blocks section, each under its own
+                  effective presentation and its own Display control. An
+                  explicit query is not mixed: it renders the one section its
+                  anchor declares, through the renderers it always had. */}
               <Show
-                when={sheetFace()}
+                when={friendlySearch() !== null}
                 fallback={
-                  <>
-                    <Show when={currentView() === "search"}>
-                      <div class="query-search-results" role="list" aria-label="Search results" onClick={stop}>
-                        <Show
-                          when={searchPresentationHits().length > 0}
-                          fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
-                        >
-                          <For each={searchPresentationHits()}>
-                            {(hit) => (
-                              <Show
-                                when={hit.entity === "block" ? hit : null}
-                                fallback={hit.entity === "page" ? (
-                                  <button
-                                    type="button"
-                                    class="query-search-page"
-                                    onMouseDown={internalLinkMouseDown}
-                                    onClick={(e) => {
-                                      const target = {
-                                        name: hit.page.name,
-                                        pageKind: hit.page.kind,
-                                        ...(hit.page.path ? { path: hit.page.path } : {}),
-                                      };
-                                      const dest = internalLinkDest(e);
-                                      if (dest === "sidebar") openPageInSidebar(target);
-                                      else if (dest === "background") openPageTargetInNewTab(target);
-                                      else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
-                                      else openPageTarget(target);
-                                    }}
-                                    onAuxClick={(e) => internalLinkAuxClick(e, () => openPageTargetInNewTab({
-                                      name: hit.page.name,
-                                      pageKind: hit.page.kind,
-                                      ...(hit.page.path ? { path: hit.page.path } : {}),
-                                    }))}
-                                  >
-                                    <span class="switcher-kind">{hit.page.kind}</span>
-                                    <span>{hit.display_text}</span>
-                                  </button>
-                                ) : null}
-                              >
-                                {(blockHit) => (
-                                  <button
-                                    type="button"
-                                    class="query-search-hit switcher-row block-result"
-                                    onMouseDown={internalLinkMouseDown}
-                                    onClick={(e) => {
-                                      const bh = blockHit();
-                                      const uuid = blockDtoExternalId(bh.block);
-                                      const dest = internalLinkDest(e);
-                                      if (dest === "sidebar") {
-                                        openBlockInSidebar({ uuid, page: bh.page, pageKind: bh.kind, ...(bh.path ? { path: bh.path } : {}) });
-                                      } else if (dest === "background") {
-                                        openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
-                                      } else if (dest === "pane") {
-                                        openRouteInOtherPane({ kind: "page", name: bh.page, pageKind: bh.kind, block: uuid, ...(bh.path ? { path: bh.path } : {}) });
-                                      } else {
-                                        openPageAtBlock({
-                                          name: bh.page,
-                                          pageKind: bh.kind,
-                                          block: uuid,
-                                          ...(bh.path ? { path: bh.path } : {}),
-                                        });
-                                      }
-                                    }}
-                                    onAuxClick={(e) => internalLinkAuxClick(e, () => {
-                                      const bh = blockHit();
-                                      openInNewTab({ kind: "page", name: bh.page, pageKind: bh.kind, block: blockDtoExternalId(bh.block), ...(bh.path ? { path: bh.path } : {}) });
-                                    })}
-                                  >
-                                    <SearchResultRow
-                                      page={blockHit().page}
-                                      breadcrumb={blockHit().block.breadcrumb ?? []}
-                                      text={blockHit().display_text}
-                                      spans={blockHit().evidence.flatMap((evidence) => evidence.spans)}
-                                    />
-                                  </button>
-                                )}
-                              </Show>
-                            )}
-                          </For>
+                  <Show
+                    when={sheetFace()}
+                    fallback={
+                      <>
+                        <Show when={currentView() === "search"}>{blockSearchRows()}</Show>
+                        <Show when={currentView() !== "search"}>
+                          {/* `@page`-anchored results are pages, not blocks (K16):
+                              they carry their physical owner and need no document
+                              load, so they render through the Pages renderer —
+                              under the PAGE settings, which is the only reason a
+                              page-anchored query's columns and grouping can show
+                              at all. */}
+                          <Show when={pageRows()}>
+                            <QueryPageResults
+                              hits={pageRowHits}
+                              view={pageResultView}
+                              onOpen={openPageHit}
+                              linkAttrs={pageHitLinkAttrs}
+                              linkClass="query-page-row"
+                            />
+                          </Show>
+                          <Show
+                            when={groups() && groups()!.length > 0}
+                            fallback={<Show when={!pageRows()?.length}>{emptyResultPanel()}</Show>}
+                          >
+                            {blockGroupRows()}
+                          </Show>
                         </Show>
-                      </div>
-                    </Show>
-                    <Show when={currentView() !== "search"}>
-                    {/* `@page`-anchored results are pages, not blocks (K16): they
-                        carry their physical owner and need no document
-                        load, so they render as page links rather than as empty
-                        block groups. */}
-                    <Show when={pageRows()}>
-                      {(rows) => (
-                        <div class="query-page-rows" role="list" aria-label="Matching pages" onClick={stop}>
-                          <For each={rows()}>
-                            {(row) => (
-                              <button
-                                type="button"
-                                class="query-page-row"
-                                role="listitem"
-                                onMouseDown={internalLinkMouseDown}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const target = { name: row.name, pageKind: row.kind, path: row.path };
-                                  const dest = internalLinkDest(e);
-                                  if (dest === "sidebar") openPageInSidebar(target);
-                                  else if (dest === "background") openPageTargetInNewTab(target);
-                                  else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
-                                  else openPageTarget(target);
-                                }}
-                                onAuxClick={(e) => internalLinkAuxClick(e, () =>
-                                  openPageTargetInNewTab({ name: row.name, pageKind: row.kind, path: row.path })
-                                )}
-                              >
-                                <span class="switcher-kind">{row.kind}</span>
-                                <span>{row.name}</span>
-                              </button>
-                            )}
-                          </For>
-                        </div>
-                      )}
-                    </Show>
+                      </>
+                    }
+                  >
                     <Show
                       when={groups() && groups()!.length > 0}
-                      fallback={
-                        <Show when={!pageRows()?.length}>
-                          <div class="query-empty">
-                            {emptyResultsMessage()}{" "}
-                            {/* §7.5: zero results is the one moment a user most
-                                needs to know WHICH conjunct emptied the query,
-                                and the engine can already say. */}
-                            <button
-                              type="button"
-                              class="query-why-empty"
-                              disabled={groupResource.loading || !!groupResource.error}
-                              onClick={(e) => { e.stopPropagation(); setExplainOpen(!explainOpen()); }}
-                            >
-                              {explainOpen() ? "hide" : "why empty?"}
-                            </button>
-                            <Show when={explainOpen()}>
-                              <div class="query-why-empty-panel" onClick={stop}>
-                                <Show when={explained.loading}>
-                                  <span class="query-why-empty-pending">Checking…</span>
-                                </Show>
-                                <Show when={explainNotice()}>
-                                  {(notice) => <div class="query-why-empty-notice">{notice()}</div>}
-                                </Show>
-                                <Show when={explainRows().length > 0}>
-                                  <table class="md-table query-why-empty-table">
-                                    <thead>
-                                      <tr>
-                                        <th>Condition</th>
-                                        <th>Alone</th>
-                                        <th>Without it</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      <For each={explainRows()}>
-                                        {(row) => (
-                                          <tr classList={{ "query-why-empty-culprit": row.alone === 0 }}>
-                                            <td><code>{row.conjunct}</code></td>
-                                            <td>{row.alone}</td>
-                                            <td>{row.without ?? "—"}</td>
-                                          </tr>
-                                        )}
-                                      </For>
-                                    </tbody>
-                                  </table>
-                                </Show>
-                              </div>
-                            </Show>
-                          </div>
-                        </Show>
-                      }
+                      fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
                     >
-                      <Show
-                        when={legacyTable()}
-                        fallback={
-                          <Show
-                            when={globalSort()}
-                            fallback={
-                              <For each={[...groupedQueryByKey().keys()]}>
-                                {(key) => <QueryGroup group={() => groupedQueryByKey().get(key)} />}
-                              </For>
-                            }
-                          >
-                            {/* Sorted: flat global order (each group holds one block). Iterate the
-                                groups DIRECTLY and pass the group object — re-`find()`ing the group
-                                by page/id for every row was O(groups²) on broad queries (audit #3). */}
-                            <For each={[...flatQueryByKey().keys()]}>
-                              {(key) => <QueryGroup group={() => flatQueryByKey().get(key)} flat />}
-                            </For>
-                          </Show>
-                        }
-                      >
-                        <table class="md-table query-table">
-                          <thead>
-                            <tr onClick={stop}>
-                              <th onClick={() => sortBy("content")}>Content{arrow("content")}</th>
-                              <th onClick={() => sortBy("page")}>Page{arrow("page")}</th>
-                              <For each={cols()}>
-                                {(c) => <th onClick={() => sortBy(c)}>{c}{arrow(c)}</th>}
-                              </For>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <For each={sorted()}>
-                              {(r) => (
-                                <tr>
-                                  <td>
-                                    <InlineText text={r.text} format={formatForPage(r.page)} />
-                                  </td>
-                                  <td
-                                    class="qt-page"
-                                    onMouseDown={internalLinkMouseDown}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      const target = { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) };
-                                      const dest = internalLinkDest(e);
-                                      if (dest === "sidebar") openPageInSidebar(target);
-                                      else if (dest === "background") openPageTargetInNewTab(target);
-                                      else if (dest === "pane") openRouteInOtherPane({ kind: "page", ...target });
-                                      else openPageTarget(target);
-                                    }}
-                                    onAuxClick={(e) => {
-                                      if (internalLinkAuxClick(e, () =>
-                                        openPageTargetInNewTab({ name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) })
-                                      )) e.stopPropagation();
-                                    }}
-                                    onContextMenu={(e) => {
-                                      if (!shouldOpenTextContextMenu(e.target)) return;
-                                      e.preventDefault();
-                                      e.stopPropagation();
-                                      openPageContextMenu(e.clientX, e.clientY, { name: r.page, pageKind: r.kind, ...(r.path ? { path: r.path } : {}) });
-                                    }}
-                                  >
-                                    {r.page}
-                                  </td>
-                                  <For each={cols()}>{(c) => <td>{r.props[c] ?? ""}</td>}</For>
-                                </tr>
-                              )}
-                            </For>
-                          </tbody>
-                        </table>
-                      </Show>
+                      {blockSheetRows()}
                     </Show>
-                    </Show>
-                  </>
+                  </Show>
                 }
               >
-                <Show when={groups() && groups()!.length > 0} fallback={<div class="query-empty">{emptyResultsMessage()}</div>}>
-                  <Show when={(sheet()?.view === "table" || sheet()?.view === "board") && props.blockId}>
-                    <SheetContainer>
-                      <Switch>
-                        <Match when={sheet()?.view === "table"}>
-                          <SheetTable
-                            ownerId={props.blockId!}
-                            rowSource="query"
-                            groups={groups() ?? []}
-                            queryDisplay={queryDisplayControl()}
-                          />
-                        </Match>
-                        <Match when={sheet()?.view === "board"}>
-                          <SheetBoard
-                            ownerId={props.blockId!}
-                            rowSource="query"
-                            groups={groups() ?? []}
-                            queryGrouping={queryGroupingControl()}
-                          />
-                        </Match>
-                      </Switch>
-                    </SheetContainer>
-                  </Show>
+                <QueryResultSections
+                  pending={() => groupResource.loading}
+                  pendingMessage={() => groupsPending()?.message ?? "Searching…"}
+                  failure={() => {
+                    const error = groupsError();
+                    return error ? `${error.lead} ${error.message}` : null;
+                  }}
+                  families={[
+                    {
+                      kind: "page",
+                      control: pageSectionControls(),
+                      empty: () => pageHits().length === 0,
+                      hasMore: () => !!searchExecution()?.has_more?.pages,
+                      countLabel: () => `${pageHits().length} shown`,
+                      body: () => (
+                        <QueryPageResults
+                          hits={pageHits}
+                          view={pageResultView}
+                          onOpen={openPageHit}
+                          linkAttrs={pageHitLinkAttrs}
+                          linkClass="query-search-page"
+                        />
+                      ),
+                    },
+                    {
+                      kind: "block",
+                      control: blockSectionControl(),
+                      empty: () => blockSectionHits().length === 0,
+                      hasMore: () => !!searchExecution()?.has_more?.blocks,
+                      countLabel: () => `${blockSectionHits().length} shown`,
+                      body: () => (
+                        <Switch>
+                          <Match when={blockPresentation() === "search"}>{blockSearchRows()}</Match>
+                          <Match when={sheetFaceFor(blockPresentation())}>{blockSheetRows(blockPresentation())}</Match>
+                          <Match when={true}>{blockGroupRows()}</Match>
+                        </Switch>
+                      ),
+                    },
+                  ]}
+                />
+                {/* The empty ANSWER still deserves its explanation, and the two
+                    section-local empty states say only that this family has no
+                    rows. */}
+                <Show when={total() === 0 && !groupResource.loading && !groupsError()}>
+                  <div class="query-empty">{whyEmptyAffordance()}</div>
                 </Show>
               </Show>
             </Show>

@@ -27293,6 +27293,7 @@ fn managed_query_search_manual_receipt(
                 lane: Some("performance-receipt".into()),
                 explain: false,
                 scope: None,
+                display: Default::default(),
             })
             .unwrap();
         let elapsed = started.elapsed();
@@ -27533,6 +27534,7 @@ fn managed_friendly_reads_main_while_pending_then_follows_drain() {
                 lane: Some("friendly-main".into()),
                 explain: false,
                 scope: None,
+                display: Default::default(),
             },
         );
         let blocks = c7b_navigation(
@@ -27644,6 +27646,7 @@ fn managed_friendly_selection_releases_actor_operation() {
             lane: None,
             explain: false,
             scope: None,
+            display: Default::default(),
         },
     );
     let SyncApplicationNavigationReply::GraphSearch(answer) = answer else {
@@ -27678,6 +27681,7 @@ fn managed_friendly_selection_releases_actor_operation() {
             lane: None,
             explain: false,
             scope: None,
+            display: Default::default(),
         },
     );
     let SyncApplicationNavigationReply::GraphSearch(quiet) = quiet else {
@@ -28079,6 +28083,7 @@ fn managed_graph_search(
             lane: None,
             explain: false,
             scope: None,
+            display: Default::default(),
         })
         .unwrap();
     let SyncApplicationNavigationOutcome::Loaded {

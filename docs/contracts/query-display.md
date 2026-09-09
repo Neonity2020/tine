@@ -32,7 +32,13 @@ Implementation:
   (`queryColumnName`, `querySortFieldName`, `boardGroupByOptions`,
   `groupKeysForBlock`).
 - `src/editor/queryDisplayDraft.ts` — the workspace draft's ONE normalizer
-  (§11), shared by `router.ts`'s mutation and by `session.ts`'s two directions.
+  (§11), shared by `router.ts`'s mutation and by `session.ts`'s two directions,
+  and the ONE scoped resolver behind §15 (`queryScopedDisplaySettings`, with its
+  route and parsed-query adapters).
+- `src/components/QueryResultSections.tsx` — the mixed result's two family
+  boundaries, headings, control slots and states (§15.3).
+- `src/components/QueryPageResults.tsx` — the Pages family's four presentations
+  and its page-field vocabulary (§15.4).
 - `src/components/QueryWorkspace.tsx` — `materializeQueryWorkspace`, the
   workspace's one publication path, and the captured-input guard around it
   (§13).
@@ -69,6 +75,35 @@ pipe-table conversion, which is children-backed only.
 **`tine.group-by` is the ambiguous predecessor of `tine.group-field`.** It is
 still read for compatibility and retired on the first save that states the
 grouping, and nothing writes it (§3, §4).
+
+**The same six facts exist once more per result family** (§15). A mixed result
+has a Pages half and a Blocks half, and each may state the six independently
+under its own prefix — `tine.page-` and `tine.block-` — plus one presence marker
+each. The seven scoped keys per namespace are `-view`, `-display`, `-sort`,
+`-group-field`, `-columns`, `-col-aggregates`, `-sample`; the eighth key,
+`tine.page-match-scope`, is not a display fact at all and is settled in §15.2.
+
+| Property | Value |
+| --- | --- |
+| `tine.{page,block}-display` | exactly `1` — the PRESENCE marker, nothing else |
+| `tine.{page,block}-view` | as `tine.view`, for that family only |
+| `tine.{page,block}-sort` etc. | as the singular key of the same name, for that family only |
+
+The marker is what makes the difference between the two ways a family can carry
+no settings:
+
+| Marker | Members | Meaning |
+| --- | --- | --- |
+| missing | any | **no scoped draft**: inherit the singular facts, even if orphan member keys exist |
+| `1` | none | **present and empty**: clear the inherited non-view facts |
+| `1` | some | **a complete scoped snapshot**: an omitted member does not inherit |
+
+An invalid marker or member is retained byte for byte and reported through
+`unreadable_settings`; the namespace is rejected atomically, and a valid
+independent presentation still stands. Presence is decided by `Object.hasOwn` on
+the frontend and by the marker in Rust — never by truthiness, because `[]`,
+`group_by: ""`, `sample: 0` and `{}` are all meaningful values that a truthiness
+test reads as absence.
 
 Tests: `crates/tine-core/src/query/view.rs` (module tests),
 `src/editor/queryViewProperties.test.ts`, `src/components/QueryColumns.test.tsx`.
@@ -498,11 +533,19 @@ closed-sheet access and zero-at-rest regression is in `QueryMacro.test.tsx`.
 `QueryDisplay.tsx` edits all six facts in one place, as what they are: two
 enums, three ordered lists and a number.
 
-- It is an **opt-in capability**. `QueryBuilder` takes `inlineDisplay`,
-  defaulting to false, and every existing caller keeps the `+ sort` /
-  `+ summarize` pills it had. `Macro.tsx` turns it on only where a builder is
-  shown and the block is not a friendly search — exactly where the full display
-  vocabulary is meaningful.
+- It is **the only display control the sheet offers**. `+ sort` and
+  `+ summarize` are gone: each could state a FRACTION of one fact — one sort
+  pair, one aggregate — and each rewrote a longer authored list as a one-element
+  one. `QueryBuilder.inlineDisplay` no longer decides *whether* the panel is
+  mounted, only *whose writer* it uses: a host that owns the block's `tine.*`
+  writer hands its own control in, and every other host gets the builder's
+  session writer. A friendly search reaches the panel through its two result
+  sections instead (§15.3), which is where the vocabulary is meaningful.
+- It takes a **`rowKind`**. Absent means blocks — the single family every caller
+  had before mixed results, keeping its trigger name, dialog name and whole
+  vocabulary unchanged. `rowKind="page"` names itself **Display pages** /
+  **Page display**, offers only the page vocabulary (§15.4), and counts
+  applicability on pages rather than on blocks.
 - It **never writes a property**. It computes the next `ViewSettings` and hands
   it to `QueryDisplayControl.apply`, which is the host's one writer (§4). That
   is what keeps the entries it cannot represent — an unrecognized aggregate
@@ -638,12 +681,15 @@ Tests: `crates/tine-core/src/publish.rs`
 
 Deliberately open, and owned by the next package rather than guessed forward:
 
-- the workspace draft's EXECUTION and its format-aware materialization. Where
-  the draft lives, and what it may contain, is settled in §11;
 - session/UI caps on a column selection;
 - a saved sort by title, `state`, `tags` or a formula: that needs an engine sort
   vocabulary, not a frontend replacement sorter, and P5B deliberately shows the
-  limit (§8) rather than papering over it with a second answer;
+  limit (§8) rather than papering over it with a second answer. A Friendly page
+  sort by recency is the same limit seen from the other side: the Friendly read
+  captures no page-recency programs, so a recency field contributes no order
+  term and the page Display picker never offers one;
+- query-wide statistical grouping by a FORMULA. Formula columns still group
+  visual rows; the exact breakdown is deferred outside S3;
 - `formula:` columns in `tine.columns`: they have no name in that grammar, so a
   table showing one cannot save its column order at all (§8). A grammar that
   could name them is a new columns grammar, which P5B is not authorized to add;
@@ -652,11 +698,6 @@ Deliberately open, and owned by the next package rather than guessed forward:
   (§9);
 - a saved grouping on a **children**-backed sheet, which still reads its own
   `tine.group-by` (§9);
-- the `+ sort` and `+ summarize` pills. They are the display controls on the
-  faces `inlineDisplay` is not enabled for — the friendly-search face and the
-  workspace draft — and they still write a one-element sort and a one-element
-  aggregate list through `withSort` / `withAgg`. Reading is already correct
-  there (§6); replacing the writers belongs with whoever settles those faces.
 
 Manager review pin: legacy-schema recognition applies only to query tables;
 ordinary children tables keep their existing schema interpretation. A schema
@@ -822,11 +863,17 @@ Tests: `clean_runtime_repeated_simple_queries_execute_again_and_follow_edits`,
 
 A workspace has no block, so making one is a **publication**: it creates a page
 that did not exist. `materializeQueryWorkspace` is that one path, and this
-section settles what it is allowed to publish and when. It settles **no**
-execution, no result rendering, no Display UI and no effective-view
-materialization — the workspace still writes exactly the one `tine.view`
-property §1 gives it, and complete effective-view materialization is the next
-package's.
+section settles what it is allowed to publish and when.
+
+It publishes the **complete** display envelope (Q3). The `tine.view`-only filter
+it used to apply dropped every other setting the workspace was showing, so a
+saved query reopened as a different query than the one that was saved. Each part
+now goes through the writer that owns it — `queryViewPropertyPatch` for the
+singular facts, `queryScopedDisplayPropertyPatch` once per namespace, and
+`queryPageMatchScopePropertyPatch` for membership scope — and each writer states
+only what it owns. A workspace with no scoped drafts still materializes a bare
+query block, because absence is a value: writing a marker for a namespace that
+has none would CLEAR settings the reopened query should inherit.
 
 ### 13.1 A save publishes the input it captured, or nothing
 
@@ -851,10 +898,15 @@ Two guards, deliberately distinct:
   (`captureGraphScope`/`isScopeCurrent`: the graph BINDING, per I-20, never the
   render epoch), and the ACTIVE route is still this workspace's route. It is
   what decides whether a completion may touch the local surface at all.
-- **`sameInput`** — `sameWorkspace`, and the source, kind, presentation, title
-  and graph format all still equal the capture. A monotonic input revision also
-  includes the route Display draft and rejects edits that restore an earlier
-  value; equal text after a newer edit is not the original submission.
+- **`sameInput`** — `sameWorkspace`, and the source, kind, title, graph format
+  and the whole captured settings envelope all still equal the capture. The
+  envelope is captured as ONE serialized value (`captureSettings`), which is
+  both the deep copy and the comparison: the user can keep editing a draft while
+  the write is in flight, and an attempt that shared the route's arrays would
+  publish whatever the draft became. Presence survives the round trip — a key
+  absent from the route is absent from the capture, and a present empty draft
+  survives as `{}`. A monotonic input revision also rejects edits that restore an
+  earlier value; equal text after a newer edit is not the original submission.
 
 `isCurrent` is optional. A direct caller that passes none is unguarded, exactly
 as before this section existed.
@@ -993,3 +1045,148 @@ Org sheet conversion uses the physical path, including uppercase `.ORG` files.
 Proof: `print_query_reader_regression_renders_matches_on_both_backends`, the
 `print_*` executor/route tests, `src/print.query.test.ts`, and the native page-menu
 journey in `scripts/e2e-print-security.mjs` for each backend.
+
+## 15. Mixed results: two families, one operation (Q3)
+
+A **mixed result** is the Friendly search's union and nothing else: it answers
+"which pages match" and "which blocks match" at the same time. An explicit query
+is not mixed — it renders the one section its declared anchor names.
+
+Before this, both halves arrived in one flat list under one presentation. That
+made "show the pages as a table and the blocks as a list" unsayable, it made a
+page's own Display settings unreachable, and outside the Search face the page
+half was dropped entirely.
+
+### 15.1 The effective settings of one family
+
+One resolver answers "what is this family showing", for every caller:
+`queryDisplayDraft.ts::queryScopedDisplaySettings`. The workspace adapts its
+route through `queryResultDisplaySettings`; an inline query adapts the flattened
+`ParsedQuery` fields through `queryParsedDisplaySettings`. **There is no second
+resolver in a component.**
+
+- A scoped **presentation** independently overrides the singular presentation.
+- A scoped **draft** independently overrides the ENTIRE singular non-view
+  snapshot. It is complete or it is absent (§1's marker table); a missing member
+  of a present draft never merges back from the singular state.
+- A first scoped edit therefore **clones the effective non-view snapshot**
+  (`queryScopedDraftFrom`), applies the change on top, and persists the whole
+  thing. An edit that stated only the fact it changed would silently clear
+  everything the section was already showing.
+- **Use inherited settings** removes the draft; **Clear settings** writes `{}`.
+  They are distinct actions because "show what the query says" and "show nothing
+  extra" are different requests, and a section that could only be replaced and
+  never given back would be a state with no way out (I-10). Presentation
+  inheritance is independently controllable.
+- Switching a presentation changes neither the predicate nor the membership
+  scope. Unsupported authored settings stay visible as retained settings and are
+  never silently rewritten (§5).
+
+### 15.2 Friendly page membership — `tine.page-match-scope`
+
+**Page matches** takes exactly three wire values, and nothing else:
+
+| Value | Meaning |
+| --- | --- |
+| `names` | the existing page-name/alias matcher — exact, prefix, substring, fuzzy, Unicode/case, boolean and regex. "Names" does **not** mean exact-equality-only |
+| `content` | a stored page qualifies when an individual contained block satisfies the Friendly block predicate; that page's best matching block supplies its rank and evidence |
+| `both` | the union of qualifying physical pages by identity |
+
+An absent or unreadable value resolves to `names` at execution — the historical
+default. Absence stays distinct from `names` in the reader; only the execution
+layer applies the fallback.
+
+- Under `both` and with no explicit sort, Names winners precede Content-only
+  winners, a page matching both keeps its Names winner, and physical-path
+  tie-breaking is preserved.
+- The owner-local exact-name/alias override still runs before global ranking; the
+  physical owner is returned once, keeping its winning alias and evidence.
+- `content` never concatenates blocks and never matches separate terms across
+  unrelated blocks. One block satisfies the predicate, or the page does not
+  qualify by content.
+- This is **not** a renamed-page history search. An old name participates only
+  through existing current name/alias/reference metadata.
+- Scope changes affect page membership only. The Blocks section still evaluates
+  the ordinary Friendly block predicate.
+- Virtual reference-name navigation suggestions survive in applicable name
+  search, are distinguishable from stored page rows, never hydrate fake
+  properties, and never consume the stored-page limit.
+- The physical `QueryPageScope` is a different member and keeps its meaning:
+  "search within one routed page". Membership scope never overloads it.
+
+### 15.3 The DOM contract
+
+| Contract | Required DOM/behaviour |
+| --- | --- |
+| Family boundary | `<section data-query-result-kind="page\|block" aria-labelledby="…">` with per-MOUNT ids; headings **Pages** and **Blocks**, Pages first |
+| Controls | buttons named **Display pages** / **Display blocks**, each controlling only its own section; dialogs named **Page display** / **Block display** |
+| Search/List | native list semantics or `role="list"` named **Page results** / **Block results**; each row is a listitem CONTAINING its navigation/edit control, never a button that is also the row |
+| Table | native `<table>` with a matching `<caption>`, `scope="col"` headers and body rows |
+| Board | named grouping sections containing lists; page cards navigate, block cards keep ordinary editing |
+| Identity | stored pages key by physical path and kind, virtual suggestions by name, blocks by physical owner plus block identity — never by display name alone and never by array index |
+| Pending/error | the family container exposes `aria-busy`; pending text is `role="status"` and a failure is `role="alert"`. A read failure is not an empty-state message |
+| Empty | a family with no rows says so and **keeps its controls** (I-10) |
+| Truncation | `has_more.pages` / `has_more.blocks` beside the corresponding section; the label describes shown rows and never infers completeness from rendered length |
+
+The two sections are two views of ONE returned operation, partitioned in the
+frontend. Neither half is refetched on its own: two independent reads could
+describe two different graph states, which is exactly what I-20 forbids.
+Grouping may arrange admitted rows but must preserve backend order within
+groups — with an explicit sort one group value legitimately opens twice, so
+grouping is by **adjacency**, never by re-clustering on the value.
+
+### 15.4 The page vocabulary
+
+A page is not a block, and its Display panel says so.
+
+- Page builtins are `name`, `kind` and `day` only. Task state, priority,
+  planning dates and formulas are **not** offered: none of them is a page
+  attribute, and none of the writers can spell one for a page row.
+- Everything else is an ordinary authored property, offered only where the
+  existing field grammar preserves that identity (§5's gates apply unchanged to
+  both row kinds, because both write the same property spellings).
+- Applicability is counted on the row the vocabulary is FOR: a property observed
+  on no page of this graph is not a page field. The block vocabulary keeps its
+  established combined count.
+- A page Board with no applicable grouping is **one ungrouped column**. It never
+  inherits the block Board's task-state default, which would show the author a
+  grouping their pages cannot have.
+- A page row's columns come from the page's own hydrated `PageRow`, in its
+  authored spelling. A page the backend did not hydrate has no properties to
+  show; the cell is empty and the row still navigates.
+
+### 15.5 Limits and ordering
+
+Workspace defaults remain 40 pages / 100 blocks; inline Friendly defaults remain
+500 pages / 5,000 blocks. Each family's own sample reduces only its own
+requested rows: `sample: 0` empties that family alone, an absent sample keeps
+that consumer's bound, and **no unused capacity transfers between families**.
+
+The combined bridge ceiling is unchanged at 20,000 rows / 32 MiB estimated
+bytes, enforced across search hits; the added page-row payload counts toward it.
+Scoped settings cannot raise that ceiling or any per-consumer budget.
+
+Complete matches are ordered **before** sampling and output admission (Martin,
+2026-09-09). Q3 carries both views and preserves the returned order; the
+order-before-cap correction itself is Q4's, consumed rather than duplicated. A
+frontend re-sort or truncation would replace a complete answer with an answer
+about whichever rows happened to fit, so neither family's renderer does either.
+
+Tests: `src/components/QueryResultSections.test.tsx`,
+`src/components/QueryPageResults.test.tsx`,
+`src/components/QueryDisplay.test.tsx` (`q3_page_vocabulary_excludes_block_fields`),
+`src/components/QueryBuilder.test.tsx` (`q3_shared_display_retires_legacy_controls`),
+`src/components/QueryMacro.test.tsx` (`q3_macro_consumes_flattened_scopes`,
+`q3_absent_scope_inherits_and_present_empty_clears`,
+`q3_scoped_edit_preserves_sibling_and_source`,
+`q3_mixed_operation_rejects_stale_completion`),
+`src/components/QueryWorkspace.test.tsx`
+(`q3_workspace_executes_page_anchor_and_both_displays`,
+`q3_scoped_save_reopen_md_org`, `q3_materialize_scoped_capture_is_revision_safe`),
+`crates/tine-core/src/query/friendly_tests.rs`
+(`q3_friendly_scope_membership_and_evidence`, `q3_mixed_limits_are_independent`,
+`q3_friendly_page_display_hydrates_stored_rows_only`,
+`q3_friendly_sections_sort_the_complete_set_before_their_bound`),
+`crates/tine-core/src/onboarding.rs`
+(`q3_guide_scoped_display_example_roundtrips`); native journeys in
+`scripts/e2e-query-workspace.mjs` and `scripts/e2e-query-display.mjs`.

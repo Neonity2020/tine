@@ -22,6 +22,11 @@
 //  4. The retirement of `tine.group-by::` is a two-property edit inside ONE undo
 //     unit. Only a real run can show both properties changing together in the
 //     file rather than one write racing the other.
+//  5. A mixed Friendly result carries TWO scoped namespaces plus a membership
+//     scope (Q3), and the difference that matters is between a namespace that
+//     is ABSENT and one that is present and empty. That difference only exists
+//     once the properties have been printed by Rust, re-read by Rust and handed
+//     back to a section — which is to say, across a restart.
 import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -87,6 +92,20 @@ const LEGACY_PAGE = [
   "",
 ].join("\n");
 fs.writeFileSync(`${GRAPH}/pages/Legacy.md`, LEGACY_PAGE);
+
+// **A mixed Friendly result** (Q3). `(search "roadmap")` admits PAGES by name
+// and BLOCKS by content from one question, which is the only shape that can
+// show two independently controlled families. The two Roadmap pages exist to be
+// the Pages half; the two bullets under the query are the Blocks half.
+const SCOPED_PAGE = [
+  '- {{query (search "roadmap")}}',
+  "- The roadmap review is next week",
+  "- Another block that names the roadmap",
+  "",
+].join("\n");
+fs.writeFileSync(`${GRAPH}/pages/Scoped.md`, SCOPED_PAGE);
+fs.writeFileSync(`${GRAPH}/pages/Roadmap north.md`, "status:: open\n\n- North body\n");
+fs.writeFileSync(`${GRAPH}/pages/Roadmap south.md`, "status:: done\n\n- South body\n");
 
 const env = {
   ...process.env,
@@ -192,6 +211,32 @@ function properties(page) {
     if (found) out.set(found[1], found[2]);
   }
   return out;
+}
+
+/** One section's Display panel, addressed through the family it belongs to.
+ *  Two panels are mounted side by side on a mixed result, so a bare
+ *  `.qd-trigger` would be satisfied by whichever came first in the DOM. */
+async function openSectionDisplay(browser, kind) {
+  const trigger = await browser.$(`[data-query-result-kind="${kind}"] .qd-trigger`);
+  await trigger.waitForExist({ timeout: 15_000 });
+  if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
+  await browser.$(".qd-panel").waitForExist({ timeout: 10_000 });
+}
+
+/** Wait until a block's own property map satisfies a predicate. A wdio timeout
+ *  says only that a condition failed; what is needed here is the FILE, because
+ *  a write that never happened and a write that landed under another key look
+ *  identical from the browser. */
+async function waitForProperties(browser, page, predicate, description) {
+  try {
+    await browser.waitUntil(async () => predicate(properties(page)), { timeout: 15_000 });
+  } catch {
+    fail(
+      `${page}: ${description}\n`
+        + `  read properties: ${JSON.stringify([...properties(page)])}\n`
+        + `  file:\n${fs.readFileSync(`${GRAPH}/pages/${page}.md`, "utf8")}`,
+    );
+  }
 }
 
 async function waitForProperty(browser, page, key, value) {
@@ -412,9 +457,127 @@ await withApp(0, async (browser) => {
   await closeDisplay(browser);
   await browser.setWindowSize(1280, 900);
   await sleep(400);
+
+  // --- 8. a mixed result is two families, each with its own settings (Q3) ----
+  //
+  // A Friendly search answers two questions at once — which PAGES match and
+  // which BLOCKS match. Before this they arrived in one flat list under one
+  // presentation, so "the pages as a table, the blocks as a board" was
+  // unsayable and a page's own display settings were unreachable. What a real
+  // engine and a real browser add over jsdom is the same thing they add above:
+  // the scoped keys are written by the frontend, printed by Rust and re-read by
+  // Rust, and only a restart can show that the file says what the panel said.
+  await browser.keys("Escape");
+  await openPage(browser, "Scoped");
+  await browser.$('[data-query-result-kind="page"]').waitForExist({ timeout: 20_000 });
+  const families = await browser.execute(() => {
+    const sections = [...document.querySelectorAll("[data-query-result-kind]")];
+    return sections.map((section) => {
+      const heading = section.querySelector("h3");
+      return {
+        kind: section.getAttribute("data-query-result-kind"),
+        heading: heading?.textContent?.trim() ?? null,
+        labelled: !!heading?.id && section.getAttribute("aria-labelledby") === heading.id,
+        trigger: section.querySelector(".qd-trigger")?.getAttribute("aria-label") ?? null,
+        // Both ways out of a scoped state are offered, and "use inherited" is
+        // dead until there IS something scoped to give back (I-10).
+        inherit: section.querySelector(".query-scoped-reset")?.disabled ?? null,
+        clear: !!section.querySelector(".query-scoped-clear"),
+        // Page membership scope is neither namespace's display setting, so it
+        // sits on the Pages section and only there.
+        matchScope: section.querySelector(".query-page-match select")?.value ?? null,
+      };
+    });
+  });
+  if (families.length !== 2 || families[0].kind !== "page" || families[1].kind !== "block") {
+    fail(`the mixed result is not two families, Pages first: ${JSON.stringify(families)}`);
+  }
+  if (families[0].heading !== "Pages" || families[1].heading !== "Blocks"
+    || families.some((family) => !family.labelled)) {
+    fail(`the families do not name their own regions: ${JSON.stringify(families)}`);
+  }
+  if (families[0].trigger !== "Display pages" || families[1].trigger !== "Display blocks") {
+    fail(`the two Display controls do not say which section they change: ${JSON.stringify(families)}`);
+  }
+  if (families[0].inherit !== true || families[1].inherit !== true
+    || !families[0].clear || !families[1].clear) {
+    fail(`the scoped reset controls are wrong before any scoped edit: ${JSON.stringify(families)}`);
+  }
+  if (families[0].matchScope !== "names" || families[1].matchScope !== null) {
+    fail(`page membership scope is missing or on the wrong section: ${JSON.stringify(families)}`);
+  }
+
+  // The Pages section takes a table. It writes the PAGE namespace and nothing
+  // else: not the singular `tine.view` the whole query used to share, and not
+  // the other family's keys.
+  await openSectionDisplay(browser, "page");
+  await press(browser, ".qd-panel .qd-view", "Table");
+  await waitForProperty(browser, "Scoped", "tine.page-view", "table");
+  await waitForProperty(browser, "Scoped", "tine.page-display", "1");
+  await waitForProperties(
+    browser,
+    "Scoped",
+    (props) => !props.has("tine.view") && ![...props.keys()].some((key) => key.startsWith("tine.block-")),
+    "the page section's edit wrote outside its own namespace",
+  );
+  await closeDisplay(browser);
+
+  // The Blocks section takes a board, and the Pages section keeps its table.
+  await openSectionDisplay(browser, "block");
+  await press(browser, ".qd-panel .qd-view", "Board");
+  await waitForProperty(browser, "Scoped", "tine.block-view", "board");
+  await waitForProperty(browser, "Scoped", "tine.block-display", "1");
+  await waitForProperty(browser, "Scoped", "tine.page-view", "table");
+  await closeDisplay(browser);
+  const bothFaces = await browser.execute(() => ({
+    page: document.querySelector('[data-query-result-kind="page"] .query-results-table') ? "table" : null,
+    block: document.querySelector('[data-query-result-kind="block"] .query-results-board') ? "board" : null,
+  }));
+  if (bothFaces.page !== "table" || bothFaces.block !== "board") {
+    fail(`the two families do not render their own presentations: ${JSON.stringify(bothFaces)}`);
+  }
+
+  // Page membership scope: three exact values, and the one that is stated is
+  // the one that is stored. `both` is not a display setting — it changes which
+  // pages are MEMBERS — so it lives outside both namespaces.
+  const scopeSelect = await browser.$('[data-query-result-kind="page"] .query-page-match select');
+  const scopeChoices = await browser.execute(() =>
+    [...document.querySelectorAll('[data-query-result-kind="page"] .query-page-match option')]
+      .map((option) => option.value));
+  if (JSON.stringify(scopeChoices) !== JSON.stringify(["names", "content", "both"])) {
+    fail(`page membership scope does not offer the three stored values: ${JSON.stringify(scopeChoices)}`);
+  }
+  await scopeSelect.selectByAttribute("value", "both");
+  await waitForProperty(browser, "Scoped", "tine.page-match-scope", "both");
+
+  // **Absent and present-but-empty are different states, and both are
+  // reachable.** "Use inherited settings" REMOVES the namespace, so the section
+  // shows what the query says again; membership scope and the other family are
+  // untouched by it.
+  await browser.$('[data-query-result-kind="page"] .query-scoped-reset').click();
+  await waitForProperties(
+    browser,
+    "Scoped",
+    (props) => ![...props.keys()].some((key) => key.startsWith("tine.page-view") || key === "tine.page-display")
+      && props.get("tine.page-match-scope") === "both"
+      && props.get("tine.block-view") === "board",
+    "inheriting the page settings did not remove exactly that namespace",
+  );
+
+  // "Clear settings" writes an EMPTY draft: the marker is there with no members,
+  // which says "show nothing extra" rather than "show what the query says".
+  await browser.$('[data-query-result-kind="page"] .query-scoped-clear').click();
+  await waitForProperties(
+    browser,
+    "Scoped",
+    (props) => props.get("tine.page-display") === "1" && !props.has("tine.page-view")
+      && !props.has("tine.page-columns") && !props.has("tine.page-sort"),
+    "clearing the page settings did not leave a present-but-empty draft",
+  );
+  console.log(`scoped display wrote: ${JSON.stringify([...properties("Scoped")])}`);
 });
 
-// --- 8. restart: the display the panel wrote is the display that comes back --
+// --- 9. restart: the display the panel wrote is the display that comes back --
 await withApp(1, async (browser) => {
   await openPage(browser, "Display");
   await browser.$(".sheet-board").waitForExist({ timeout: 20_000 });
@@ -429,6 +592,37 @@ await withApp(1, async (browser) => {
     fail(`the complete saved aggregate summary did not come back: ${JSON.stringify(reopened)}`);
   }
   console.log(`reopened: ${JSON.stringify(reopened)}`);
+
+  // Q3: what a restart has to reproduce here is not one setting but three
+  // distinct answers in one file — a page draft that is PRESENT AND EMPTY, a
+  // populated block draft, and a membership scope that belongs to neither. A
+  // reader that used truthiness would collapse the first into "absent" and hand
+  // the Pages section the query's settings instead of the empty draft it was
+  // given.
+  await openPage(browser, "Scoped");
+  await browser.$('[data-query-result-kind="block"]').waitForExist({ timeout: 20_000 });
+  await browser.waitUntil(
+    async () => (await browser.$$('[data-query-result-kind="block"] .query-results-board')).length === 1,
+    { timeout: 15_000, timeoutMsg: "the saved block board did not come back" },
+  );
+  const scopedAgain = await browser.execute(() => ({
+    matchScope: document.querySelector('[data-query-result-kind="page"] .query-page-match select')?.value ?? null,
+    pageList: !!document.querySelector('[data-query-result-kind="page"] .query-results-list'),
+    pageTable: !!document.querySelector('[data-query-result-kind="page"] .query-results-table'),
+    blockBoard: !!document.querySelector('[data-query-result-kind="block"] .query-results-board'),
+    // An empty draft is still a draft, so the way back to inherited is live.
+    pageInherit: document.querySelector('[data-query-result-kind="page"] .query-scoped-reset')?.disabled ?? null,
+  }));
+  if (scopedAgain.matchScope !== "both") {
+    fail(`the saved page membership scope did not come back: ${JSON.stringify(scopedAgain)}`);
+  }
+  if (!scopedAgain.blockBoard || scopedAgain.pageTable || !scopedAgain.pageList) {
+    fail(`the two saved presentations did not come back independently: ${JSON.stringify(scopedAgain)}`);
+  }
+  if (scopedAgain.pageInherit !== false) {
+    fail(`a present-but-empty page draft was read as absent: ${JSON.stringify(scopedAgain)}`);
+  }
+  console.log(`scoped reopened: ${JSON.stringify(scopedAgain)}`);
 });
 
 console.log("query-display OK");

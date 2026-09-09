@@ -68,24 +68,36 @@ function mountBuilder(filter: Filter = taskFilter(["TODO"])) {
  *  open sheet. The GH #472 report was that ONE of them had hand-rolled its
  *  outside-click handling; the fix was to give them all the same one, so every
  *  case below drives all of them through the same gesture. */
-const FAMILIES: Array<{ name: string; open: (sheet: HTMLElement) => HTMLButtonElement; visible: string }> = [
+interface PopoverFamily {
+  name: string;
+  open: (sheet: HTMLElement) => HTMLButtonElement;
+  visible: string;
+  /** Portalled to `<body>` rather than mounted inside the sheet. The shared
+   *  Display panel is: the query block's own compositing layer is a containing
+   *  block for `fixed` children, so a panel drawn inside it could not escape.
+   *  It still belongs to the sheet's transient rung — which is exactly what
+   *  these cases prove — so it is looked for in the document instead. */
+  portalled?: boolean;
+}
+const FAMILIES: PopoverFamily[] = [
   { name: "anchor menu", open: (s) => s.querySelector<HTMLButtonElement>(".qs-anchor-button")!, visible: ".qs-menu" },
   { name: "row field menu", open: (s) => s.querySelector<HTMLButtonElement>(".qs-row .qs-field")!, visible: ".qs-menu" },
   { name: "row operator menu", open: (s) => s.querySelector<HTMLButtonElement>(".qs-row .qs-op")!, visible: ".qs-menu" },
   { name: "add-condition picker", open: (s) => s.querySelector<HTMLButtonElement>(".qs-add")!, visible: ".qs-menu" },
   {
-    name: "sort popover",
-    open: (s) => [...s.querySelectorAll<HTMLButtonElement>(".qb-sort")]
-      .find((button) => button.textContent?.trim() === "+ sort")!,
-    visible: ".qb-sort-picker",
-  },
-  {
-    name: "summarize popover",
-    open: (s) => [...s.querySelectorAll<HTMLButtonElement>(".qb-sort")]
-      .find((button) => button.textContent?.includes("summarize"))!,
-    visible: ".qb-picker",
+    // `+ sort` and `+ summarize` are gone (P5B, Q3): the sheet mounts the ONE
+    // shared Display panel, which states all six display facts instead of a
+    // fraction of two of them.
+    name: "display panel",
+    open: (s) => s.querySelector<HTMLButtonElement>(".qd-trigger")!,
+    visible: ".qd-panel",
+    portalled: true,
   },
 ];
+
+/** Where a family's panel is drawn. */
+const shown = (family: PopoverFamily, sheet: HTMLElement): Element | null =>
+  (family.portalled ? document : sheet).querySelector(family.visible);
 
 /** Let the shared registry request resolve through its promise chain, and
  *  report how many backend calls it took. */
@@ -221,10 +233,10 @@ describe("QueryBuilder transient ownership (post-GH #161)", () => {
       try {
         const sheet = open();
         family.open(sheet).click();
-        expect(sheet.querySelector(family.visible), `${family.name} did not open`).not.toBeNull();
+        expect(shown(family, sheet), `${family.name} did not open`).not.toBeNull();
 
         expect(dismissTopTransient(reason)).toBe(true);
-        expect(sheet.querySelector(family.visible), `${family.name} survived its own rung`).toBeNull();
+        expect(shown(family, sheet), `${family.name} survived its own rung`).toBeNull();
         expect(sheet.isConnected, "the sheet went with the menu").toBe(true);
         expect(lower).not.toHaveBeenCalled();
 
@@ -295,11 +307,11 @@ describe("GH #472: every Query Builder popover closes on an outside press", () =
       try {
         const sheet = open();
         popover.open(sheet).click();
-        expect(sheet.querySelector(popover.visible), `${popover.name} did not open`).not.toBeNull();
+        expect(shown(popover, sheet), `${popover.name} did not open`).not.toBeNull();
 
         pressOutside(type);
 
-        expect(sheet.querySelector(popover.visible), `${popover.name} stayed open`).toBeNull();
+        expect(shown(popover, sheet), `${popover.name} stayed open`).toBeNull();
         expect(sheet.isConnected, `${popover.name} took the sheet with it`).toBe(true);
 
         pressOutside(type);
@@ -327,9 +339,9 @@ describe("GH #472: every Query Builder popover closes on an outside press", () =
       try {
         const sheet = open();
         popover.open(sheet).click();
-        const panel = sheet.querySelector(popover.visible)!;
+        const panel = shown(popover, sheet)!;
         panel.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-        expect(sheet.querySelector(popover.visible), `${popover.name} closed on an inside press`).not.toBeNull();
+        expect(shown(popover, sheet), `${popover.name} closed on an inside press`).not.toBeNull();
       } finally {
         dispose();
       }
@@ -353,7 +365,7 @@ describe("GH #472: every Query Builder popover closes on an outside press", () =
           `the sheet closed on the press that opens ${popover.name}`,
         ).not.toBeNull();
         trigger.click();
-        expect(sheet.querySelector(popover.visible), `${popover.name} never opened`).not.toBeNull();
+        expect(shown(popover, sheet), `${popover.name} never opened`).not.toBeNull();
       } finally {
         dispose();
       }
@@ -369,12 +381,12 @@ describe("GH #472: every Query Builder popover closes on an outside press", () =
         const sheet = open();
         const trigger = popover.open(sheet);
         trigger.click();
-        expect(sheet.querySelector(popover.visible)).not.toBeNull();
+        expect(shown(popover, sheet)).not.toBeNull();
 
         trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-        expect(sheet.querySelector(popover.visible), `${popover.name} closed before its own click`).not.toBeNull();
+        expect(shown(popover, sheet), `${popover.name} closed before its own click`).not.toBeNull();
         trigger.click();
-        expect(sheet.querySelector(popover.visible), `${popover.name} did not toggle shut`).toBeNull();
+        expect(shown(popover, sheet), `${popover.name} did not toggle shut`).toBeNull();
       } finally {
         dispose();
       }

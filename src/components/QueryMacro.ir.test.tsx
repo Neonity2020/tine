@@ -174,7 +174,11 @@ describe("B1: a TQL block executes through query_run", () => {
 
       const [query, view] = run.mock.calls[0];
       expect(query.source).toMatchObject({ kind: "tql", original: "-- task TODO" });
-      expect(view).toEqual({});
+      // The effective view of the reading's anchor (§7.6, Q3). A block with no
+      // display settings at all still HAS a presentation — the resolver's
+      // default — and sending the resolved view rather than the raw reading is
+      // what makes a scoped one reach the executor at all.
+      expect(view).toEqual({ view: "list" });
     } finally {
       dispose();
     }

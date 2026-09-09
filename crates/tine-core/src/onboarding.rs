@@ -977,6 +977,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The Guide's scoped-Display example, read by the reader it documents**
+    /// (SPEC §7.6, Q3).
+    ///
+    /// The page tells the reader what those five property lines mean: pages as a
+    /// table with a `status` column, blocks with a present-but-empty draft that
+    /// clears rather than inherits, and a page counting as a match by name or by
+    /// content. A string assertion would only prove the lines are PRINTED. This
+    /// runs them through `read_scoped_display_settings` — the one reader every
+    /// query block goes through — so the sentence is checked against the
+    /// behaviour it promises, and a change to either one has to change both.
+    #[test]
+    fn q3_guide_scoped_display_example_roundtrips() {
+        use crate::query::ir::{Field, FriendlyPageMatchScope, ViewKind};
+
+        let workflow = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Workflows/Find and revisit")
+            .expect("the find-and-revisit workflow is registered");
+        // The example is prose AND a live block: find the one query block that
+        // carries the scoped properties, rather than re-typing them here.
+        fn find(blocks: &[crate::doc::DocBlock]) -> Option<Vec<(String, String)>> {
+            for block in blocks {
+                let properties = &block.projection().properties;
+                if properties
+                    .iter()
+                    .any(|(key, _)| key == "tine.page-match-scope")
+                {
+                    return Some(properties.clone());
+                }
+                if let Some(found) = find(&block.children) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let document = crate::doc::parse(workflow.markdown);
+        let properties = find(&document.roots)
+            .expect("the workflow page carries the scoped-display example block");
+
+        let state = crate::query::view::read_scoped_display_settings(&properties);
+        assert!(
+            state.unreadable_settings.is_empty(),
+            "the Guide must not print a setting Tine cannot read: {:?}",
+            state.unreadable_settings
+        );
+        // "pages as a table with a `status` column"
+        assert_eq!(state.page_presentation, Some(ViewKind::Table));
+        let page = state
+            .page_display
+            .as_ref()
+            .expect("the page marker is present, so the page draft is present");
+        assert_eq!(page.columns, Some(vec![Field::new("status")]));
+        // "blocks with no extra settings of their own" — PRESENT and empty, which
+        // clears; an absent draft would inherit instead, and the page says so.
+        let block = state
+            .block_display
+            .as_ref()
+            .expect("the block marker is present, so the block draft is present");
+        assert_eq!(block.columns, None);
+        assert_eq!(block.sort, None);
+        assert_eq!(block.group_by, None);
+        assert_eq!(block.sample, None);
+        assert_eq!(state.block_presentation, None);
+        // "a page counts as a match by its name or by its content"
+        assert_eq!(state.page_match_scope, Some(FriendlyPageMatchScope::Both));
+
+        // And the prose that explains them is on the page the reader lands on.
+        assert!(workflow.markdown.contains("**Page matches**"));
+        assert!(workflow.markdown.contains("**Use inherited settings**"));
+        assert!(workflow.markdown.contains("**Clear settings**"));
+        assert!(workflow.markdown.contains("**Display pages**"));
+
+        let reference = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Pages, links, references, and search")
+            .expect("the pages/search reference page is registered");
+        // The exact wire values, spelled where the reference reader looks.
+        assert!(reference.markdown.contains("`names`"));
+        assert!(reference.markdown.contains("`content`"));
+        assert!(reference.markdown.contains("`both`"));
+        assert!(reference.markdown.contains("`tine.page-match-scope`"));
+        assert!(reference.markdown.contains("`tine.page-display:: 1`"));
+    }
+
     #[test]
     fn journals_scheduling_reference_page_is_registered_linked_and_copyable() {
         let title = "Reference/Journals, tasks, and scheduling";

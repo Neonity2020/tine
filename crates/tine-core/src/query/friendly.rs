@@ -14,14 +14,18 @@ use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
 use crate::direct_projection::page_kind_from_sql;
 use crate::model::{BlockDto, PageEntry, PageKind};
+use crate::query::ir::FriendlyPageMatchScope;
 use crate::query::rank::QueryRankPrograms;
 use crate::query::results::{
-    blob16, count, integer, read_admitted_payload, resolve_identity, sql_or_cancelled, text,
-    PayloadChannel, PayloadFacts, ResultIdentity, ResultReadError, PAYLOAD_BATCH,
+    blob16, count, hydrate_page_rows, integer, read_admitted_payload, resolve_identity,
+    sql_or_cancelled, text, PageResultDescriptor, PayloadChannel, PayloadFacts, ResultIdentity,
+    ResultReadError, PAYLOAD_BATCH,
 };
+use crate::query::sql::{block_sort_expression, page_sort_expression, SortBinder};
 use crate::query_plan::{
-    admitted_block_evidence, admitted_page_evidence, rank_block_text, rank_page_text, QueryBranch,
-    QueryExecution, QueryExplanation, QueryHasMore, QueryHit, QueryPlan, QueryTarget,
+    admitted_block_evidence, admitted_page_evidence, rank_block_text, rank_page_text,
+    ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation, QueryHasMore, QueryHit,
+    QueryPlan, QueryTarget,
 };
 
 /// Everything the shared Friendly reader needs besides its caller-owned
@@ -216,6 +220,25 @@ pub(crate) fn read_friendly_results(
             }
         }
     }
+    // The sort vocabulary's case-folding program has to exist in THIS table
+    // before the rank function is installed: a program bound afterwards is not
+    // callable from the statement that needs it. Bound only when a section
+    // actually states a sort, so a plain search binds nothing extra.
+    let page_sort_program = plan
+        .page_view()
+        .filter(|view| !view.sort.is_empty())
+        .map(|_| programs.bind_unicode_lowercase());
+    let block_sort_program = plan
+        .block_view()
+        .filter(|view| !view.sort.is_empty())
+        .map(|_| programs.bind_unicode_lowercase());
+    // Page membership by CONTENT asks the Blocks section's own predicate of a
+    // page's blocks, so it reuses that branch's already-bound rank program
+    // rather than compiling a second copy of the same predicate.
+    let content = branches.iter().find_map(|bound| match bound {
+        BoundBranch::Blocks { branch, rank } => Some((branch.clone(), *rank)),
+        BoundBranch::Pages { .. } => None,
+    });
     let cancellation = snapshot.cancellation();
     let rank = programs.function(cancellation.clone());
     let lane = inputs.lane.clone();
@@ -256,6 +279,8 @@ pub(crate) fn read_friendly_results(
                         branch,
                         *owner_rank,
                         *global_rank,
+                        content.as_ref().map(|(branch, rank)| (branch, *rank)),
+                        page_sort_program,
                         &inputs.lane,
                     )?;
                     hits.append(&mut section);
@@ -268,6 +293,7 @@ pub(crate) fn read_friendly_results(
                         &plan,
                         branch,
                         *rank,
+                        block_sort_program,
                         &inputs.lane,
                     )?;
                     hits.append(&mut section);
@@ -284,6 +310,95 @@ pub(crate) fn read_friendly_results(
         has_more,
         cancelled: false,
     })
+}
+
+/// **The Friendly reader's half of the shared sort vocabulary** (I-12).
+///
+/// `query/sql.rs` owns what a sort field MEANS; this owns only how this
+/// statement binds the parameters that meaning needs. The case-folding program
+/// is bound into the operation's ONE program table before the rank function is
+/// installed — a program registered afterwards would not be callable from the
+/// statement that needs it — so the id arrives already bound and this binder
+/// only places it in a parameter slot.
+///
+/// [`SortBinder::has_recency`] is `false` and stays false: a Friendly read
+/// captures no `PageRecencyPrograms`, and inventing a second recency producer
+/// to fill the gap is the twin D-14 forbids. A recency field therefore
+/// contributes no order term. Nothing offers one: the Display picker's sort
+/// vocabulary (`sheet/fields.ts::querySortFieldName`) does not include recency
+/// for either family.
+struct FriendlySortBinder<'a> {
+    program: u64,
+    params: &'a mut Vec<PhysicalQueryValue>,
+    lowercase: Option<String>,
+    keys: HashMap<String, String>,
+}
+
+impl<'a> FriendlySortBinder<'a> {
+    fn new(program: u64, params: &'a mut Vec<PhysicalQueryValue>) -> Self {
+        Self {
+            program,
+            params,
+            lowercase: None,
+            keys: HashMap::new(),
+        }
+    }
+}
+
+impl SortBinder for FriendlySortBinder<'_> {
+    fn lowercase(&mut self) -> String {
+        if let Some(bound) = &self.lowercase {
+            return bound.clone();
+        }
+        self.params
+            .push(PhysicalQueryValue::Integer(self.program as i64));
+        let bound = format!("?{}", self.params.len());
+        self.lowercase = Some(bound.clone());
+        bound
+    }
+
+    fn property_key(&mut self, key: String) -> String {
+        if let Some(bound) = self.keys.get(&key) {
+            return bound.clone();
+        }
+        self.params.push(PhysicalQueryValue::Text(key.clone()));
+        let bound = format!("?{}", self.params.len());
+        self.keys.insert(key, bound.clone());
+        bound
+    }
+
+    fn has_recency(&self) -> bool {
+        false
+    }
+}
+
+/// The authored ORDER BY terms of one section, or an empty list when the
+/// section states no sort this reader can carry — and then the section keeps
+/// its established relevance order.
+fn sort_terms(
+    view: Option<&crate::query::ir::ViewSettings>,
+    program: Option<u64>,
+    params: &mut Vec<PhysicalQueryValue>,
+    mut expression: impl FnMut(&str, &mut dyn SortBinder) -> Option<String>,
+) -> Vec<String> {
+    let (Some(view), Some(program)) = (view, program) else {
+        return Vec::new();
+    };
+    let mut binder = FriendlySortBinder::new(program, params);
+    let mut terms = Vec::new();
+    for (field, direction) in &view.sort {
+        let Some(sql) = expression(field.as_str(), &mut binder) else {
+            continue;
+        };
+        terms.push(format!(
+            "{sql} {}",
+            match direction {
+                crate::query::ir::SortDir::Asc => "ASC",
+                crate::query::ir::SortDir::Desc => "DESC",
+            }
+        ));
+    }
+    terms
 }
 
 fn cancelled(snapshot: &PhysicalProjectionQuerySnapshot) -> Result<(), ResultReadError> {
@@ -310,7 +425,13 @@ fn framed_pair_sql(left: &str, right: &str) -> String {
     format!("CAST(length(CAST({left} AS BLOB)) AS TEXT) || ':' || {left} || {right}")
 }
 
+/// One admitted page candidate, before its evidence and payload are built.
 struct PageDescriptor {
+    /// Which membership source admitted it: names/aliases, or contained block
+    /// text. The two are ranked in different key spaces and verified against
+    /// different branches, so the row says which it is rather than leaving the
+    /// reader to infer it from a rank blob.
+    from_content: bool,
     page_id: Option<[u8; 16]>,
     name: String,
     kind: PageKind,
@@ -319,8 +440,12 @@ struct PageDescriptor {
     matched_text: String,
     matched_alias: bool,
     rank_key: Vec<u8>,
+    /// The producer's stored payload facts, selected only on the
+    /// Display-enabled path, which is the only one that hydrates.
+    payload: Option<(usize, usize)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_pages(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     graph_root: &Path,
@@ -328,20 +453,43 @@ fn read_pages(
     branch: &QueryBranch,
     owner_rank: u64,
     global_rank: u64,
+    content: Option<(&QueryBranch, u64)>,
+    sort_program: Option<u64>,
     lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
     if branch.limit == 0 {
         return Ok((Vec::new(), false));
     }
+    let scope = plan.page_match_scope();
+    let want_names = matches!(
+        scope,
+        FriendlyPageMatchScope::Names | FriendlyPageMatchScope::Both
+    );
+    // Content membership is the BLOCK predicate asked of a page's own blocks.
+    // A plan with no block branch states no such predicate, so a Content-only
+    // search over it admits nothing rather than falling back to names.
+    let content = matches!(
+        scope,
+        FriendlyPageMatchScope::Content | FriendlyPageMatchScope::Both
+    )
+    .then_some(content)
+    .flatten();
+    if !want_names && content.is_none() {
+        return Ok((Vec::new(), false));
+    }
+    let hydrate = plan.page_view().is_some();
     let mut params = vec![
         PhysicalQueryValue::Integer(owner_rank as i64),
         PhysicalQueryValue::Integer(global_rank as i64),
     ];
-    let limit = limit_clause(branch.limit, &mut params);
     let framed_physical = framed_pair_sql("w.name", "w.matched_text");
     let framed_virtual = framed_pair_sql("v.raw_name", "v.raw_name");
-    let sql = format!(
-        "WITH page_text_candidates(page_id, name, text_kind, journal_day, path, \
+    // Names and aliases: unchanged selection, ranking, owner-local override and
+    // virtual reference-name suggestions. `match_source` is a constant 0 here,
+    // so a Names search orders exactly as it did before this packet.
+    let names_ctes = if want_names {
+        format!(
+            "page_text_candidates(page_id, name, text_kind, journal_day, path, \
                   matched_text, source_kind, source_ordinal) AS (\
              SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path, \
                     p.name, 0, -1 FROM pages p \
@@ -362,7 +510,7 @@ fn read_pages(
              ) AS owner_choice \
              FROM ranked r WHERE r.owner_key IS NOT NULL\
          ), physical AS MATERIALIZED (\
-             SELECT 0 AS candidate_kind, w.page_id, w.name, w.text_kind, \
+             SELECT 0 AS match_source, 0 AS candidate_kind, w.page_id, w.name, w.text_kind, \
                     w.journal_day, w.path, w.matched_text, w.source_kind, \
                     tine_query_rank(?2, {framed_physical}) AS global_key, w.path AS tie_key \
              FROM choices w WHERE w.owner_choice = 1\
@@ -380,19 +528,100 @@ fn read_pages(
                AND NOT EXISTS (SELECT 1 FROM real_identities i \
                                WHERE i.name_key = r.normalized_name)\
          ), virtual AS MATERIALIZED (\
-             SELECT 1 AS candidate_kind, NULL AS page_id, v.raw_name AS name, \
+             SELECT 0 AS match_source, 1 AS candidate_kind, NULL AS page_id, v.raw_name AS name, \
                     0 AS text_kind, NULL AS journal_day, '' AS path, \
                     v.raw_name AS matched_text, 0 AS source_kind, \
                     tine_query_rank(?2, {framed_virtual}) AS global_key, \
                     v.normalized_name AS tie_key \
              FROM reference_choices v WHERE v.name_choice = 1\
-         ), candidates AS (\
-             SELECT * FROM physical WHERE global_key IS NOT NULL \
-             UNION ALL SELECT * FROM virtual WHERE global_key IS NOT NULL\
-         ) \
-         SELECT candidate_kind, page_id, name, text_kind, journal_day, path, \
-                matched_text, source_kind, global_key \
-         FROM candidates ORDER BY global_key, tie_key COLLATE BINARY{limit}"
+         )"
+        )
+    } else {
+        String::new()
+    };
+    // Content membership: one page qualifies through ONE of its own blocks, and
+    // that block is chosen by the same block rank program the Blocks section
+    // ranks with. Terms are never matched across unrelated blocks and blocks are
+    // never concatenated — the window picks a single winning row per page.
+    let content_ctes = content.map(|(_, rank)| {
+        params.push(PhysicalQueryValue::Integer(rank as i64));
+        let program = params.len();
+        // In Both, a page that also matched by name keeps its NAMES winner:
+        // the union is by physical identity, and the name evidence is the
+        // stronger statement about why the page is in the answer.
+        let dedupe = if want_names {
+            " AND NOT EXISTS (SELECT 1 FROM physical x WHERE x.page_id = k.page_id)"
+        } else {
+            ""
+        };
+        format!(
+            "content_ranked AS MATERIALIZED (\
+                 SELECT b.page_id, bt.query_visible AS matched_text, \
+                        tine_query_rank(?{program}, bt.query_visible) AS content_key \
+                 FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id\
+             ), content_choices AS (\
+                 SELECT k.*, ROW_NUMBER() OVER (\
+                     PARTITION BY k.page_id ORDER BY k.content_key, k.matched_text\
+                 ) AS content_choice \
+                 FROM content_ranked k WHERE k.content_key IS NOT NULL{dedupe}\
+             ), content AS MATERIALIZED (\
+                 SELECT 1 AS match_source, 0 AS candidate_kind, p.page_id, p.name, p.text_kind, \
+                        p.journal_day, p.path, k.matched_text, 0 AS source_kind, \
+                        k.content_key AS global_key, p.path AS tie_key \
+                 FROM content_choices k JOIN pages p ON p.page_id = k.page_id \
+                 WHERE k.content_choice = 1\
+             )"
+        )
+    });
+    let mut ctes = Vec::new();
+    if want_names {
+        ctes.push(names_ctes);
+    }
+    if let Some(content_ctes) = content_ctes {
+        ctes.push(content_ctes);
+    }
+    let mut arms = Vec::new();
+    if want_names {
+        arms.push("SELECT * FROM physical WHERE global_key IS NOT NULL".to_string());
+        arms.push("SELECT * FROM virtual WHERE global_key IS NOT NULL".to_string());
+    }
+    if content.is_some() {
+        arms.push("SELECT * FROM content WHERE global_key IS NOT NULL".to_string());
+    }
+    ctes.push(format!("candidates AS ({})", arms.join(" UNION ALL ")));
+    // An authored page sort orders the COMPLETE union before any bound applies
+    // (Q4's settled ordering). With no authored sort the established Friendly
+    // order stands, and `match_source` is what puts Names winners before
+    // Content-only ones.
+    let authored = sort_terms(
+        plan.page_view(),
+        sort_program,
+        &mut params,
+        |field, binder| page_sort_expression(field, "c", binder),
+    );
+    let order = if authored.is_empty() {
+        "c.match_source, c.global_key, c.tie_key COLLATE BINARY".to_string()
+    } else {
+        format!(
+            "{}, c.path COLLATE BINARY, c.name COLLATE BINARY",
+            authored.join(", ")
+        )
+    };
+    let (payload_columns, payload_join) = if hydrate {
+        (
+            ", q.estimated_bytes, q.property_count",
+            " LEFT JOIN query_page_results q ON q.page_id = c.page_id",
+        )
+    } else {
+        ("", "")
+    };
+    let limit = limit_clause(branch.limit, &mut params);
+    let sql = format!(
+        "WITH {} \
+         SELECT c.match_source, c.candidate_kind, c.page_id, c.name, c.text_kind, c.journal_day, \
+                c.path, c.matched_text, c.source_kind, c.global_key{payload_columns} \
+         FROM candidates c{payload_join} ORDER BY {order}{limit}",
+        ctes.join(", ")
     );
     let rows = snapshot
         .run_projection_query(&sql, &params)
@@ -401,14 +630,41 @@ fn read_pages(
     note_friendly(|census| census.page_descriptors += rows.len());
     let mut descriptors = rows
         .iter()
-        .map(|row| decode_page_descriptor(row))
+        .map(|row| decode_page_descriptor(row, hydrate))
         .collect::<Result<Vec<_>, _>>()
         .map_err(ResultReadError::Corrupt)?;
     let has_more = descriptors.len() > branch.limit;
     descriptors.truncate(branch.limit);
+    // Hydrate only ADMITTED stored pages, through the shared page hydrator, and
+    // only once the descriptors are final. A virtual suggestion names no stored
+    // page, so it is not in this batch and gains no fabricated properties.
+    let mut hydrated: HashMap<[u8; 16], crate::query::ir::PageRow> = HashMap::new();
+    if hydrate {
+        let admitted = descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let page_id = descriptor.page_id?;
+                let (estimated_bytes, property_count) = descriptor.payload?;
+                Some(PageResultDescriptor {
+                    page_id,
+                    name: descriptor.name.clone(),
+                    kind: descriptor.kind,
+                    journal_day: descriptor.journal_day,
+                    path: descriptor.path.clone(),
+                    estimated_bytes,
+                    property_count,
+                    matched_total: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        check_lane(snapshot, lane)?;
+        for (descriptor, row) in admitted.iter().zip(hydrate_page_rows(snapshot, &admitted)?) {
+            hydrated.insert(descriptor.page_id, row);
+        }
+    }
     let mut seen_physical = HashSet::new();
     let mut hits = Vec::with_capacity(descriptors.len());
-    for descriptor in descriptors {
+    for mut descriptor in descriptors {
         check_lane(snapshot, lane)?;
         if let Some(page_id) = descriptor.page_id {
             if !seen_physical.insert(page_id) {
@@ -417,27 +673,64 @@ fn read_pages(
                 ));
             }
         }
-        let rank = rank_page_text(plan, branch, &descriptor.matched_text).ok_or_else(|| {
-            ResultReadError::Corrupt(
-                "a selected page text no longer satisfies its rank program".into(),
-            )
-        })?;
-        let expected = rank.global_order_key(&descriptor.name);
-        if descriptor.rank_key != expected {
-            return Err(ResultReadError::Corrupt(
-                "a selected page rank disagrees with its compiled plan".into(),
-            ));
-        }
-        let evidence =
-            admitted_page_evidence(plan, branch, &descriptor.matched_text).ok_or_else(|| {
+        let (evidence, score, match_class) = if descriptor.from_content {
+            let (block_branch, _) = content.ok_or_else(|| {
                 ResultReadError::Corrupt(
-                    "a selected page text no longer satisfies its evidence program".into(),
+                    "a content page candidate arrived without a block branch".into(),
                 )
             })?;
+            let rank =
+                rank_block_text(plan, block_branch, &descriptor.matched_text).ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "a selected page's block no longer satisfies its rank program".into(),
+                    )
+                })?;
+            if descriptor.rank_key != rank.order_key() {
+                return Err(ResultReadError::Corrupt(
+                    "a selected content page rank disagrees with its compiled plan".into(),
+                ));
+            }
+            let evidence = admitted_block_evidence(plan, block_branch, &descriptor.matched_text)
+                .ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "a selected page's block no longer satisfies its evidence program".into(),
+                    )
+                })?;
+            // A page admitted by what a block of it SAYS is body evidence, which
+            // is the class this vocabulary already has for exactly that. Its
+            // score is the winning block's, so two content winners order by how
+            // well their own best block matched.
+            (evidence, rank.score(), ObjectiveMatchClass::BodyEvidence)
+        } else {
+            let rank = rank_page_text(plan, branch, &descriptor.matched_text).ok_or_else(|| {
+                ResultReadError::Corrupt(
+                    "a selected page text no longer satisfies its rank program".into(),
+                )
+            })?;
+            let expected = rank.global_order_key(&descriptor.name);
+            if descriptor.rank_key != expected {
+                return Err(ResultReadError::Corrupt(
+                    "a selected page rank disagrees with its compiled plan".into(),
+                ));
+            }
+            let evidence = admitted_page_evidence(plan, branch, &descriptor.matched_text)
+                .ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "a selected page text no longer satisfies its evidence program".into(),
+                    )
+                })?;
+            (
+                evidence,
+                rank.global_score(&descriptor.name),
+                rank.match_class(),
+            )
+        };
         let physical = descriptor.page_id.is_some();
-        let score = rank.global_score(&descriptor.name);
+        let row = descriptor
+            .page_id
+            .and_then(|page_id| hydrated.remove(&page_id));
         let page = PageEntry {
-            name: descriptor.name,
+            name: std::mem::take(&mut descriptor.name),
             kind: descriptor.kind,
             date_key: descriptor.journal_day,
             rel_path: descriptor.path.clone(),
@@ -453,58 +746,87 @@ fn read_pages(
             page,
             evidence,
             score,
-            match_class: rank.match_class(),
+            match_class,
+            row,
         });
     }
     cancelled(snapshot)?;
     Ok((hits, has_more))
 }
 
-fn decode_page_descriptor(row: &[PhysicalQueryValue]) -> Result<PageDescriptor, String> {
-    if row.len() != 9 {
+fn decode_page_descriptor(
+    row: &[PhysicalQueryValue],
+    hydrate: bool,
+) -> Result<PageDescriptor, String> {
+    let expected = if hydrate { 12 } else { 10 };
+    if row.len() != expected {
         return Err(format!(
-            "Friendly page descriptor has {} columns, expected 9",
+            "Friendly page descriptor has {} columns, expected {expected}",
             row.len()
         ));
     }
-    let candidate_kind = integer(row, 0, "Friendly page candidate kind")?;
-    let page_id = match (candidate_kind, row.get(1)) {
-        (0, _) => Some(blob16(row, 1, "Friendly physical page_id")?),
+    let from_content = match integer(row, 0, "Friendly page match source")? {
+        0 => false,
+        1 => true,
+        _ => return Err("Friendly page match source is not 0 or 1".into()),
+    };
+    let candidate_kind = integer(row, 1, "Friendly page candidate kind")?;
+    let page_id = match (candidate_kind, row.get(2)) {
+        (0, _) => Some(blob16(row, 2, "Friendly physical page_id")?),
         (1, Some(PhysicalQueryValue::Null)) => None,
         (1, _) => return Err("Friendly virtual page has a physical page_id".into()),
         _ => return Err("Friendly page candidate kind is not 0 or 1".into()),
     };
-    let kind_value = integer(row, 3, "pages.text_kind")?;
+    if from_content && page_id.is_none() {
+        return Err("a virtual page cannot match by content".into());
+    }
+    let kind_value = integer(row, 4, "pages.text_kind")?;
     let kind = page_kind_from_sql(kind_value)
         .ok_or_else(|| format!("pages.text_kind {kind_value} is not a page kind"))?;
-    let journal_day = match row.get(4) {
+    let journal_day = match row.get(5) {
         Some(PhysicalQueryValue::Null) => None,
         Some(PhysicalQueryValue::Integer(value)) => Some(*value),
         _ => return Err("pages.journal_day is not an integer or null".into()),
     };
-    let matched_alias = match integer(row, 7, "Friendly page matched-alias flag")? {
+    let matched_alias = match integer(row, 8, "Friendly page matched-alias flag")? {
         0 => false,
-        1 if page_id.is_some() => true,
+        1 if page_id.is_some() && !from_content => true,
         _ => return Err("Friendly page matched-alias flag is invalid".into()),
     };
-    let rank_key = match row.get(8) {
+    let rank_key = match row.get(9) {
         Some(PhysicalQueryValue::Blob(value)) => value.clone(),
         _ => return Err("Friendly page global rank is not a blob".into()),
     };
-    let name = text(row, 2, "pages.name")?;
-    let path = text(row, 5, "pages.path")?;
+    let name = text(row, 3, "pages.name")?;
+    let path = text(row, 6, "pages.path")?;
     if page_id.is_none() && (kind != PageKind::Page || journal_day.is_some() || !path.is_empty()) {
         return Err("Friendly virtual page carries physical metadata".into());
     }
+    // A stored page with no producer row has nothing to hydrate against; the
+    // hydrator validates the stored count and estimate, so an absent pair skips
+    // the row rather than inventing one.
+    let payload = if hydrate && page_id.is_some() {
+        match (row.get(10), row.get(11)) {
+            (Some(PhysicalQueryValue::Null), _) | (_, Some(PhysicalQueryValue::Null)) => None,
+            _ => Some((
+                count(row, 10, "query_page_results.estimated_bytes")?,
+                count(row, 11, "query_page_results.property_count")?,
+            )),
+        }
+    } else {
+        None
+    };
     Ok(PageDescriptor {
+        from_content,
         page_id,
         name,
         kind,
         journal_day,
         path,
-        matched_text: text(row, 6, "Friendly matched page text")?,
+        matched_text: text(row, 7, "Friendly matched page text")?,
         matched_alias,
         rank_key,
+        payload,
     })
 }
 
@@ -529,6 +851,7 @@ fn read_blocks(
     plan: &QueryPlan,
     branch: &QueryBranch,
     rank_program: u64,
+    sort_program: Option<u64>,
     lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
     if branch.limit == 0 {
@@ -555,6 +878,19 @@ fn read_blocks(
         }
         None => String::new(),
     };
+    // The Blocks section's own authored sort, over the COMPLETE matched set:
+    // the bound below is applied after this ORDER BY, never before it.
+    let authored = sort_terms(
+        plan.block_view(),
+        sort_program,
+        &mut params,
+        |field, binder| block_sort_expression(field, "r", "r", "", binder),
+    );
+    let order = if authored.is_empty() {
+        "r.rank_key, r.path COLLATE BINARY, r.preorder".to_string()
+    } else {
+        format!("{}, r.path COLLATE BINARY, r.preorder", authored.join(", "))
+    };
     let limit = limit_clause(branch.limit, &mut params);
     let sql = format!(
         "WITH ranked AS MATERIALIZED (\
@@ -570,11 +906,11 @@ fn read_blocks(
              LEFT JOIN pages p ON p.page_id = b.page_id \
              LEFT JOIN query_block_results q ON q.block_id = b.block_id{scope_sql}\
          ) \
-         SELECT block_id, page_id, parent_block_id, order_key, query_visible, \
-                name, text_kind, path, result_page_id, preorder, result_id, estimated_bytes, \
-                tag_count, property_count, rank_key \
-         FROM ranked WHERE missing_text = 1 OR rank_key IS NOT NULL \
-         ORDER BY missing_text DESC, rank_key, path COLLATE BINARY, preorder{limit}"
+         SELECT r.block_id, r.page_id, r.parent_block_id, r.order_key, r.query_visible, \
+                r.name, r.text_kind, r.path, r.result_page_id, r.preorder, r.result_id, \
+                r.estimated_bytes, r.tag_count, r.property_count, r.rank_key \
+         FROM ranked r WHERE r.missing_text = 1 OR r.rank_key IS NOT NULL \
+         ORDER BY r.missing_text DESC, {order}{limit}"
     );
     let rows = snapshot
         .run_projection_query(&sql, &params)

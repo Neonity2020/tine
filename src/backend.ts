@@ -4,6 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
+import type { GraphSearchDisplayOptions } from "./editor/queryIr";
 import type {
   Diagnostic,
   DiagnosticKind,
@@ -1052,14 +1053,23 @@ export interface Backend {
    *  appeared or vanished). Returns an unlisten fn. */
   onConflictsChanged(cb: () => void): Promise<() => void>;
   search(query: string, limit: number, lane?: string): Promise<RefGroup[]>;
-  /** One Rust-authoritative graph selection plan for page and block hits. */
+  /** One Rust-authoritative graph selection plan for page and block hits.
+   *
+   *  `scope` is the PHYSICAL routed page a block search is confined to.
+   *  `options` is the Display half — page membership scope and the two already
+   *  resolved per-kind views (§7.6, Q3). They are separate members because they
+   *  answer different questions, and overloading the physical one to carry
+   *  membership would make "search inside this page" and "match pages by their
+   *  content" the same request. Omitting `options` is exactly the request every
+   *  caller sent before Display existed. */
   runGraphSearch(
     source: string,
     pageLimit: number,
     blockLimit: number,
     lane?: string,
     explain?: boolean,
-    scope?: QueryPageScope
+    scope?: QueryPageScope,
+    options?: GraphSearchDisplayOptions
   ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   /** Capture-only page/tag completion capability. It is intentionally not the
@@ -1861,8 +1871,21 @@ class TauriBackend implements Backend {
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
   }
-  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope) {
-    const execution = await this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain, scope: scope ?? null });
+  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope, options?: GraphSearchDisplayOptions) {
+    const execution = await this.call<QueryExecution>("run_graph_search", {
+      source, pageLimit, blockLimit, lane, explain,
+      scope: scope ?? null,
+      // Members are serialized EXPLICITLY rather than spread: an options object
+      // carrying a key this build does not know would otherwise cross the
+      // bridge and be refused by the command's `deny_unknown_fields`.
+      options: options
+        ? {
+          pageMatchScope: options.pageMatchScope ?? null,
+          pageView: options.pageView ?? null,
+          blockView: options.blockView ?? null,
+        }
+        : null,
+    });
     return {
       ...execution,
       has_more: execution.has_more ?? { pages: false, blocks: false },

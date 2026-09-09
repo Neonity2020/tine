@@ -11,7 +11,12 @@ import {
   type JSX,
 } from "solid-js";
 import { backend } from "../backend";
-import type { QueryResult, QueryStatistics, ViewSettings } from "../editor/queryIr";
+import type {
+  GraphSearchDisplayOptions,
+  QueryResult,
+  QueryStatistics,
+  ViewSettings,
+} from "../editor/queryIr";
 import { querySummary } from "../editor/queryAggregate";
 import { QUERY_MACRO_NAMES } from "../editor/queryMacroName";
 import {
@@ -23,7 +28,6 @@ import type { PaneRouter, QueryPresentation, QueryRoute } from "../router";
 import type {
   AdvancedQueryResult,
   Format,
-  MatchSpan,
   PageDto,
   QueryDiagnostic,
   QueryExecution,
@@ -32,8 +36,9 @@ import type {
   RefGroup,
   SavePageResult,
 } from "../types";
-import { QueryBuilder, type BuilderSession } from "./QueryBuilder";
-import { SearchResultRow, buildSearchExcerpt } from "./SearchResultRow";
+import { QueryBuilder, createQueryRegistryAccess, type BuilderSession } from "./QueryBuilder";
+import { QueryDisplay } from "./QueryDisplay";
+import { SearchResultRow } from "./SearchResultRow";
 import { registerTransientLayer } from "../transientLayers";
 import { bumpPageInventoryRev, graphMeta } from "../ui";
 import { blockDtoExternalId } from "../blockIdentity";
@@ -43,7 +48,18 @@ import { createReadyQueryResource } from "../createReadyQueryResource";
 import { runQueryWhenReady } from "../queryReadiness";
 import { onGraphRebound } from "../modeHooks";
 import { markdownRawWithProperty, orgRawWithProperty } from "../editor/properties";
-import { queryViewPropertyPatch } from "../editor/queryViewProperties";
+import {
+  queryPageMatchScopePropertyPatch,
+  queryScopedDisplayPropertyPatch,
+  queryViewPropertyPatch,
+} from "../editor/queryViewProperties";
+import {
+  queryResultDisplaySettings,
+  type FriendlyPageMatchScope,
+  type QueryDisplayDraft,
+} from "../editor/queryDisplayDraft";
+import { QueryResultSections } from "./QueryResultSections";
+import { QueryPageResults, MarkedText, hitMatchSpans, type QueryPageHit } from "./QueryPageResults";
 
 const PAGE_LIMIT = 40;
 const BLOCK_LIMIT = 100;
@@ -54,6 +70,19 @@ export interface MaterializeQueryInput {
   sourceKind: QueryRoute["sourceKind"];
   source: string;
   presentation: QueryPresentation;
+  /** The singular non-view settings the workspace is showing. Deep-copied at
+   *  capture, so a draft the user keeps editing during the await cannot reach
+   *  back into the attempt that is already publishing. */
+  display?: QueryDisplayDraft;
+  /** The two scoped namespaces. ABSENT means "no scoped draft, inherit"; a
+   *  present empty object means "clear". Presence is carried by `Object.hasOwn`
+   *  the whole way through, never by truthiness. */
+  pagePresentation?: QueryPresentation;
+  blockPresentation?: QueryPresentation;
+  pageDisplay?: QueryDisplayDraft;
+  blockDisplay?: QueryDisplayDraft;
+  /** Friendly page membership scope, written to its own property. */
+  pageMatchScope?: FriendlyPageMatchScope;
   /** Stable workspace identity: also bounds the native validation cancellation lane. */
   routeId: string;
   /** The graph's preferred on-disk format, captured at submit. A property line
@@ -72,8 +101,17 @@ export type IsCurrentInput = () => boolean;
 export interface MaterializeQueryDependencies {
   getPage(name: string, kind: "page"): Promise<PageDto | null>;
   savePage(page: PageDto, baseRev: null, force: false): Promise<SavePageResult>;
-  /** Rust-authoritative friendly-search validation; required before every nonblank friendly save. */
-  runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane: string, explain: boolean): Promise<QueryExecution>;
+  /** Rust-authoritative friendly-search validation; required before every nonblank friendly save.
+   *  `options` carries page membership scope and the two already-resolved
+   *  per-kind views; omitting it is the request this dependency has always made. */
+  runGraphSearch(
+    source: string,
+    pageLimit: number,
+    blockLimit: number,
+    lane: string,
+    explain: boolean,
+    options?: GraphSearchDisplayOptions,
+  ): Promise<QueryExecution>;
 }
 
 export type MaterializeQueryResult =
@@ -92,7 +130,17 @@ const SUPERSEDED_MESSAGE =
   "This workspace changed while it was being saved, so nothing was written. Try saving again.";
 
 export interface QueryWorkspaceDependencies extends MaterializeQueryDependencies {
-  runQuery(source: string, view?: ViewSettings): Promise<RefGroup[] | QueryResult>;
+  /** Run an explicit query through the typed IR route.
+   *
+   *  `views` carries BOTH effective section views because the anchor is the
+   *  parse's answer, not the caller's: a page-anchored query is a Pages section
+   *  and a block-anchored one is a Blocks section, and only the parse knows
+   *  which. Sending one view and hoping is how a page query ends up ordered by
+   *  a block field. */
+  runQuery(
+    source: string,
+    views?: { page: ViewSettings; block: ViewSettings },
+  ): Promise<RefGroup[] | QueryResult>;
   runAdvancedQuery(source: string): Promise<AdvancedQueryResult>;
 }
 
@@ -105,7 +153,11 @@ export interface QueryWorkspaceProps {
 }
 
 function savedQueryRaw(
-  input: Pick<MaterializeQueryInput, "source" | "sourceKind" | "presentation" | "format">
+  input: Pick<
+    MaterializeQueryInput,
+    "source" | "sourceKind" | "presentation" | "format" | "display"
+    | "pagePresentation" | "blockPresentation" | "pageDisplay" | "blockDisplay" | "pageMatchScope"
+  >
 ): string {
   const source = input.source.trim();
   const dsl = input.sourceKind === "search" ? friendlySearchToSavedDsl(source) : source;
@@ -120,13 +172,44 @@ function savedQueryRaw(
   // An absent `tine.view` IS the default list view (the patch spells it that
   // way too), so a list workspace still materializes a bare query block.
   //
-  // This packet materializes only the one property the workspace has always
-  // written; C2B owns complete effective-view materialization, so any other
-  // write the map would produce belongs to that packet, not this one.
-  const writes = queryViewPropertyPatch({
-    view: { view: input.presentation === "list" ? undefined : input.presentation },
-    properties: [],
-  }).filter(([key]) => key === "tine.view");
+  // The COMPLETE envelope, through the existing writers (Q3). The old
+  // `tine.view`-only filter dropped every other setting the workspace was
+  // showing, so a saved query reopened as a different query than the one that
+  // was saved — the singular sort, grouping, columns and sample simply were not
+  // written down anywhere.
+  //
+  // Each namespace goes through the writer that owns it. `queryViewPropertyPatch`
+  // states the singular compatibility view; `queryScopedDisplayPropertyPatch`
+  // states one scoped namespace without touching the other or any authored key
+  // it does not own; `queryPageMatchScopePropertyPatch` states membership scope,
+  // which belongs to neither namespace.
+  const writes: (readonly [string, string | null])[] = [
+    ...queryViewPropertyPatch({
+      view: {
+        ...(input.display ?? {}),
+        ...(input.presentation === "list" ? {} : { view: input.presentation }),
+      },
+      properties: [],
+    }),
+    ...queryScopedDisplayPropertyPatch({
+      namespace: "page",
+      ...(input.pagePresentation !== undefined && input.pagePresentation !== "list"
+        ? { presentation: input.pagePresentation } : {}),
+      ...(Object.hasOwn(input, "pageDisplay") ? { display: input.pageDisplay ?? {} } : {}),
+      properties: [],
+    }),
+    ...queryScopedDisplayPropertyPatch({
+      namespace: "block",
+      ...(input.blockPresentation !== undefined && input.blockPresentation !== "list"
+        ? { presentation: input.blockPresentation } : {}),
+      ...(Object.hasOwn(input, "blockDisplay") ? { display: input.blockDisplay ?? {} } : {}),
+      properties: [],
+    }),
+    ...queryPageMatchScopePropertyPatch({
+      ...(input.pageMatchScope !== undefined ? { scope: input.pageMatchScope } : {}),
+      properties: [],
+    }),
+  ];
   // WHERE it goes is the format's own rule, and the two pure writers the store
   // already uses are the rule. Writing markdown `key:: value` into an org file
   // produces visible body text that is never read back as a property (GH #25).
@@ -245,11 +328,14 @@ function defaultDependencies(): QueryWorkspaceDependencies {
   return {
     getPage: (name, kind) => api.getPage(name, kind),
     savePage: (page, baseRev, force) => api.savePage(page, baseRev, force),
-    runGraphSearch: (source, pageLimit, blockLimit, lane, explain) =>
-      api.runGraphSearch(source, pageLimit, blockLimit, lane, explain),
-    runQuery: async (source, view) => {
+    runGraphSearch: (source, pageLimit, blockLimit, lane, explain, options) =>
+      api.runGraphSearch(source, pageLimit, blockLimit, lane, explain, undefined, options),
+    runQuery: async (source, views) => {
       const parsed = await api.parseQuery(source, "og");
-      return api.queryRun(parsed.query, { ...parsed.view, ...view });
+      // The effective view of the anchor this query DECLARES (§7.6, Q3). With
+      // no views supplied the parse's own settings stand, exactly as before.
+      const effective = views?.[parsed.query.anchor];
+      return api.queryRun(parsed.query, effective ?? parsed.view);
     },
     runAdvancedQuery: (source) => api.runAdvancedQuery(source),
   };
@@ -295,11 +381,6 @@ function groupsToExecution(
   };
 }
 
-function hitSpans(hit: QueryHit): MatchSpan[] {
-  const field = hit.entity === "page" ? "page_name" : "visible_content";
-  return hit.evidence.filter((item) => item.field === field).flatMap((item) => item.spans);
-}
-
 function hitPage(hit: QueryHit): string {
   return hit.entity === "page" ? hit.page.name : hit.page;
 }
@@ -308,37 +389,6 @@ function hitKind(hit: QueryHit): "Page" | "Block" {
   return hit.entity === "page" ? "Page" : "Block";
 }
 
-function MarkedText(props: { text: string; spans: MatchSpan[] }): JSX.Element {
-  const segments = () => {
-    const spans = props.spans
-      .map((span) => ({
-        start: Math.max(0, Math.min(props.text.length, span.start)),
-        end: Math.max(0, Math.min(props.text.length, span.end)),
-      }))
-      .filter((span) => span.end > span.start)
-      .sort((a, b) => a.start - b.start || a.end - b.end);
-    const merged: MatchSpan[] = [];
-    for (const span of spans) {
-      const previous = merged[merged.length - 1];
-      if (previous && span.start <= previous.end) previous.end = Math.max(previous.end, span.end);
-      else merged.push({ ...span });
-    }
-    const out: { text: string; marked: boolean }[] = [];
-    let cursor = 0;
-    for (const span of merged) {
-      if (span.start > cursor) out.push({ text: props.text.slice(cursor, span.start), marked: false });
-      out.push({ text: props.text.slice(span.start, span.end), marked: true });
-      cursor = span.end;
-    }
-    if (cursor < props.text.length) out.push({ text: props.text.slice(cursor), marked: false });
-    return out;
-  };
-  return (
-    <For each={segments()}>{(segment) => segment.marked
-      ? <mark>{segment.text}</mark>
-      : segment.text}</For>
-  );
-}
 
 function ExplainTree(props: { nodes: QueryExplainNode[] }): JSX.Element {
   return (
@@ -679,8 +729,44 @@ interface CapturedSave {
   source: string;
   sourceKind: QueryRoute["sourceKind"];
   presentation: QueryPresentation;
+  /** The complete Display state this attempt publishes, DEEP-COPIED. The user
+   *  can keep editing a draft while the write is in flight; an attempt that
+   *  shared the route's arrays would publish whatever the draft became. Serialized
+   *  once so the same string is both the copy and the comparison (§"Save,
+   *  reopen and operation lifetime"). */
+  settings: string;
   format: Format;
   scope: GraphScope | null;
+}
+
+/** The captured Display envelope, as one comparable value. Presence is
+ *  preserved: a key that is absent from the route is absent here, and a present
+ *  empty draft survives as `{}`. */
+function captureSettings(route: QueryRoute): string {
+  return JSON.stringify({
+    presentation: route.presentation,
+    ...(Object.hasOwn(route, "display") ? { display: route.display ?? null } : {}),
+    ...(route.pagePresentation !== undefined ? { pagePresentation: route.pagePresentation } : {}),
+    ...(route.blockPresentation !== undefined ? { blockPresentation: route.blockPresentation } : {}),
+    ...(Object.hasOwn(route, "pageDisplay") ? { pageDisplay: route.pageDisplay ?? {} } : {}),
+    ...(Object.hasOwn(route, "blockDisplay") ? { blockDisplay: route.blockDisplay ?? {} } : {}),
+    ...(route.pageMatchScope !== undefined ? { pageMatchScope: route.pageMatchScope } : {}),
+  });
+}
+
+/** …and back, as the members `materializeQueryWorkspace` takes. */
+function settingsInput(captured: string): Partial<MaterializeQueryInput> {
+  const parsed = JSON.parse(captured) as Record<string, unknown>;
+  const out: Partial<MaterializeQueryInput> = {};
+  if (Object.hasOwn(parsed, "display")) {
+    out.display = (parsed.display ?? undefined) as QueryDisplayDraft | undefined;
+  }
+  if (Object.hasOwn(parsed, "pagePresentation")) out.pagePresentation = parsed.pagePresentation as QueryPresentation;
+  if (Object.hasOwn(parsed, "blockPresentation")) out.blockPresentation = parsed.blockPresentation as QueryPresentation;
+  if (Object.hasOwn(parsed, "pageDisplay")) out.pageDisplay = parsed.pageDisplay as QueryDisplayDraft;
+  if (Object.hasOwn(parsed, "blockDisplay")) out.blockDisplay = parsed.blockDisplay as QueryDisplayDraft;
+  if (Object.hasOwn(parsed, "pageMatchScope")) out.pageMatchScope = parsed.pageMatchScope as FriendlyPageMatchScope;
+  return out;
 }
 
 export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
@@ -707,6 +793,9 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   // A changed-and-restored value is still a newer edit. Include the route
   // object so its non-presentation Display draft participates in the revision.
   const inputRevision = createMemo((previous: number) => {
+    // The whole route, so every scoped draft, presentation and the membership
+    // scope participate: a saved query has to reopen as the query that was
+    // saved, and a setting that did not bump this would publish the previous one.
     props.route;
     source();
     sourceKind();
@@ -749,6 +838,25 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     });
   });
 
+  /** **The two effective views, resolved once, for everything** (I-12).
+   *
+   *  Request identity, the execution arguments, the Display controls and the
+   *  rendered rows all read THESE — so a section cannot be executed under one
+   *  set of settings and rendered under another. */
+  /** The route, with the presentation the user has actually picked. The local
+   *  signal leads the route by one round-trip — `updatePresentation` sets it and
+   *  then tells the router — and reading the route alone would render both
+   *  sections under the PREVIOUS presentation until the route came back. */
+  const settingsRoute = createMemo(() => ({ ...props.route, presentation: presentation() }));
+  const pageView = createMemo(() => queryResultDisplaySettings(settingsRoute(), undefined, "page"));
+  const blockView = createMemo(() => queryResultDisplaySettings(settingsRoute(), undefined, "block"));
+  const displayOptions = createMemo((): GraphSearchDisplayOptions => ({
+    ...(props.route.pageMatchScope !== undefined
+      ? { pageMatchScope: props.route.pageMatchScope } : {}),
+    pageView: pageView(),
+    blockView: blockView(),
+  }));
+
   const [executionResource, executionPending] = createReadyQueryResource(
     () => ({
       id: props.route.id,
@@ -756,6 +864,11 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
       sourceKind: sourceKind(),
       explain: explain(),
       presentation: presentation(),
+      // The complete captured settings ARE part of what this request asks: two
+      // workspaces whose text is identical but whose Display differs are two
+      // different questions, and re-using one's answer for the other is how a
+      // late result lands on the wrong state (I-20).
+      display: JSON.stringify(displayOptions()),
     }),
     async (request): Promise<QueryExecution & { statistics?: QueryStatistics }> => {
       if (!request.source) {
@@ -767,21 +880,42 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
           PAGE_LIMIT,
           BLOCK_LIMIT,
           `query-workspace:${request.id}`,
-          request.explain
+          request.explain,
+          JSON.parse(request.display) as GraphSearchDisplayOptions,
         );
       }
       if (ADVANCED_QUERY_RE.test(request.source)) {
         const result = await deps().runAdvancedQuery(request.source);
         return groupsToExecution(result.groups, request.explain, diagnosticsFromAdvanced(result));
       }
-      const result = await deps().runQuery(request.source, { view: request.presentation });
+      // An explicit query runs through the typed IR route under the view of its
+      // OWN declared anchor: a page-anchored query is a Pages section, and
+      // handing it the Blocks section's settings would order pages by a block
+      // field. The anchor is the parse's, so the route asks for the view the
+      // anchor names rather than guessing from the presentation.
+      const options = JSON.parse(request.display) as GraphSearchDisplayOptions;
+      const result = await deps().runQuery(request.source, {
+        page: options.pageView ?? {},
+        block: options.blockView ?? {},
+      });
       if (Array.isArray(result)) return groupsToExecution(result, request.explain);
       const execution = result.anchor === "block"
         ? groupsToExecution(result.groups, request.explain)
         : {
-          hits: result.pages.map((page): QueryHit => ({ entity: "page", page: {
-            name: page.name, kind: page.kind, path: page.path, date_key: page.journal_day ?? null,
-          }, display_text: page.name, evidence: [], score: 0 })),
+          // Page rows survive the adapter WHOLE: the hydrated row is what the
+          // page table's columns and the page board's grouping read, and the
+          // old adapter threw it away and kept the display name.
+          hits: result.pages.map((page): QueryHit => ({
+            entity: "page",
+            page: {
+              name: page.name, kind: page.kind, path: page.path,
+              date_key: page.journal_day ?? null,
+            },
+            display_text: page.name,
+            evidence: [],
+            score: 0,
+            row: page,
+          })),
           diagnostics: [], explanation: { branches: [] }, cancelled: false,
         };
       return { ...execution, statistics: result.statistics };
@@ -793,16 +927,48 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   );
   const statisticsSummary = createMemo(() => querySummary({ statistics: execution()?.statistics }));
   const hits = () => execution()?.hits ?? [];
+  /** **The returned operation, PARTITIONED — never refetched per family.**
+   *
+   *  One read answers both questions, so the two sections are two views of one
+   *  operation. Fetching a family on its own would let the halves describe two
+   *  different graph states, which is the exact shape I-20 forbids. */
+  const pageHits = createMemo(() =>
+    hits().filter((hit): hit is QueryPageHit => hit.entity === "page"));
+  const blockHits = createMemo(() => hits().filter((hit) => hit.entity === "block"));
   const boardGroups = createMemo(() => {
-    const grouped = new Map<string, QueryHit[]>();
-    for (const hit of hits()) {
+    // Adjacency, not identity: with an explicit sort one page name can
+    // legitimately open more than one group, and re-clustering by name would
+    // reorder rows the backend deliberately placed.
+    const out: [string, QueryHit[]][] = [];
+    for (const hit of blockHits()) {
       const page = hitPage(hit);
-      const group = grouped.get(page);
-      if (group) group.push(hit);
-      else grouped.set(page, [hit]);
+      const last = out[out.length - 1];
+      if (last && last[0] === page) last[1].push(hit);
+      else out.push([page, [hit]]);
     }
-    return [...grouped.entries()];
+    return out;
   });
+  /** Each section's Display panel writes only its OWN namespace on the route. */
+  const [displayOpen, setDisplayOpen] = createSignal(false);
+  const registry = createQueryRegistryAccess(() => displayOpen());
+  const sectionControl = (kind: "page" | "block") => (
+    <QueryDisplay
+      rowKind={kind}
+      registry={registry}
+      onOpenChange={setDisplayOpen}
+      control={{
+        view: kind === "page" ? pageView() : blockView(),
+        apply: (next: ViewSettings) => {
+          const { view, ...draft } = next;
+          props.router.updateActiveQuery(kind === "page"
+            ? { pagePresentation: (view ?? "list") as QueryPresentation, pageDisplay: draft }
+            : { blockPresentation: (view ?? "list") as QueryPresentation, blockDisplay: draft });
+        },
+        ...(execution()?.statistics ? { statistics: execution()!.statistics } : {}),
+        statisticsView: kind === "page" ? pageView() : blockView(),
+      }}
+    />
+  );
 
   const updateSource = (next: string, kind = sourceKind()) => {
     setSource(next);
@@ -843,6 +1009,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     source: source(),
     sourceKind: sourceKind(),
     presentation: presentation(),
+    settings: captureSettings(props.route),
     // The graph's format decides WHERE the view property goes, so it is part of
     // what this attempt publishes, not something to re-read at completion.
     format: graphMeta()?.preferred_format ?? "md",
@@ -868,6 +1035,10 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     && source() === captured.source
     && sourceKind() === captured.sourceKind
     && presentation() === captured.presentation
+    // A captured draft mutated and RESTORED during the await is still a newer
+    // edit as far as `inputRevision` is concerned; comparing the envelope as
+    // well is what makes a scope or draft change supersede the attempt too.
+    && captureSettings(props.route) === captured.settings
     && (graphMeta()?.preferred_format ?? "md") === captured.format;
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
@@ -884,6 +1055,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         sourceKind: captured.sourceKind,
         source: captured.source,
         presentation: captured.presentation,
+        ...settingsInput(captured.settings),
         routeId: captured.routeId,
         format: captured.format,
       }, deps(), () => sameInput(captured), saveController.signal);
@@ -1050,82 +1222,118 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
         <p class="query-workspace-empty">No matching pages or blocks.</p>
       </Show>
 
-      <Switch>
-        <Match when={presentation() === "search"}>
-          <div class="query-results-search" role="list" aria-label="Search results">
-            <For each={hits()}>{(hit) => (
-              <div role="listitem">
-                {hit.entity === "block"
-                  ? resultButton(hit, <SearchResultRow
-                    page={hit.page}
-                    breadcrumb={hit.block.breadcrumb ?? []}
-                    text={hit.display_text}
-                    spans={hitSpans(hit)}
-                  />)
-                  : resultButton(hit, <>
-                    <span class="switcher-kind">page</span>
-                    <span class="search-result-body">
-                      <span class="search-result-context">Page</span>
-                      <span class="search-result-excerpt">
-                        <For each={buildSearchExcerpt(hit.display_text, hitSpans(hit))}>{(segment) => segment.marked
-                          ? <mark>{segment.text}</mark>
-                          : segment.text}</For>
-                      </span>
-                    </span>
-                  </>)}
-              </div>
-            )}</For>
-          </div>
-        </Match>
+      {/* **Two families, mounted Pages before Blocks, each independently
+          controlled** (§7.6, Q3). The rows are rendered in the order the
+          backend returned them: ordering and sampling happen in SQL over the
+          complete matched set, so a re-sort here would silently replace a
+          complete answer with an answer about whatever fitted. */}
+      <QueryResultSections
+        pending={() => !!source().trim() && executionResource.loading}
+        pendingMessage={() => executionPending()?.message ?? "Searching…"}
+        failure={() => {
+          if (!source().trim() || executionResource.loading) return null;
+          const error = executionResource.error;
+          if (error) {
+            return `Search failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          // A superseded read is not an empty answer either: nothing about the
+          // graph was learned, so saying "no results" would be a claim this
+          // operation never made.
+          return execution()?.cancelled ? "Search superseded by a newer request." : null;
+        }}
+        families={[
+          {
+            kind: "page",
+            control: sectionControl("page"),
+            empty: () => pageHits().length === 0,
+            hasMore: () => !!execution()?.has_more?.pages,
+            countLabel: () => `${pageHits().length} shown`,
+            body: () => (
+              <QueryPageResults
+                hits={pageHits}
+                view={pageView}
+                onOpen={openHit}
+                surfaceId={hitSurfaceId}
+              />
+            ),
+          },
+          {
+            kind: "block",
+            control: sectionControl("block"),
+            empty: () => blockHits().length === 0,
+            hasMore: () => !!execution()?.has_more?.blocks,
+            countLabel: () => `${blockHits().length} shown`,
+            body: () => (
+              <Switch>
+                <Match when={(blockView().view ?? "list") === "search"}>
+                  <div class="query-results-search" role="list" aria-label="Block results">
+                    <For each={blockHits()}>{(hit) => (
+                      <div role="listitem">
+                        {resultButton(hit, <SearchResultRow
+                          page={hitPage(hit)}
+                          breadcrumb={hit.entity === "block" ? hit.block.breadcrumb ?? [] : []}
+                          text={hit.display_text}
+                          spans={hitMatchSpans(hit)}
+                        />)}
+                      </div>
+                    )}</For>
+                  </div>
+                </Match>
 
-        <Match when={presentation() === "list"}>
-          <ul class="query-results-list" aria-label="Query results">
-            <For each={hits()}>{(hit) => (
-              <li>
-                <button type="button" data-inpage-find-surface={hitSurfaceId(hit)} onClick={() => openHit(hit)}>
-                  <span class="query-list-context">{hitPage(hit)}</span>
-                  <span class="query-list-text"><MarkedText text={hit.display_text} spans={hitSpans(hit)} /></span>
-                </button>
-              </li>
-            )}</For>
-          </ul>
-        </Match>
+                <Match when={(blockView().view ?? "list") === "list"}>
+                  <ul class="query-results-list" aria-label="Block results">
+                    <For each={blockHits()}>{(hit) => (
+                      <li>
+                        <button type="button" data-inpage-find-surface={hitSurfaceId(hit)} onClick={() => openHit(hit)}>
+                          <span class="query-list-context">{hitPage(hit)}</span>
+                          <span class="query-list-text"><MarkedText text={hit.display_text} spans={hitMatchSpans(hit)} /></span>
+                        </button>
+                      </li>
+                    )}</For>
+                  </ul>
+                </Match>
 
-        <Match when={presentation() === "table"}>
-          <div class="query-results-table-wrap">
-            <table class="query-results-table">
-              <caption class="sr-only">Query results</caption>
-              <thead><tr><th scope="col">Type</th><th scope="col">Page</th><th scope="col">Content</th></tr></thead>
-              <tbody>
-                <For each={hits()}>{(hit) => (
-                  <tr data-inpage-find-surface={hitSurfaceId(hit)}>
-                    <td>{hitKind(hit)}</td>
-                    <td><button type="button" onClick={() => openHit(hit)}>{hitPage(hit)}</button></td>
-                    <td><MarkedText text={hit.display_text} spans={hitSpans(hit)} /></td>
-                  </tr>
-                )}</For>
-              </tbody>
-            </table>
-          </div>
-        </Match>
+                <Match when={(blockView().view ?? "list") === "table"}>
+                  <div class="query-results-table-wrap">
+                    <table class="query-results-table">
+                      <caption class="sr-only">Block results</caption>
+                      <thead><tr><th scope="col">Page</th><th scope="col">Content</th></tr></thead>
+                      <tbody>
+                        <For each={blockHits()}>{(hit) => (
+                          <tr data-inpage-find-surface={hitSurfaceId(hit)}>
+                            <td><button type="button" onClick={() => openHit(hit)}>{hitPage(hit)}</button></td>
+                            <td><MarkedText text={hit.display_text} spans={hitMatchSpans(hit)} /></td>
+                          </tr>
+                        )}</For>
+                      </tbody>
+                    </table>
+                  </div>
+                </Match>
 
-        <Match when={presentation() === "board"}>
-          <div class="query-results-board" aria-label="Query results grouped by page">
-            <For each={boardGroups()}>{([page, pageHits]) => (
-              <section class="query-board-column">
-                <h2>{page}<span class="query-board-count">{pageHits.length}</span></h2>
-                <div role="list">
-                  <For each={pageHits}>{(hit) => (
-                    <button type="button" role="listitem" class="query-board-card" data-inpage-find-surface={hitSurfaceId(hit)} onClick={() => openHit(hit)}>
-                      <span class="sr-only">{hitKind(hit)}: </span><MarkedText text={hit.display_text} spans={hitSpans(hit)} />
-                    </button>
-                  )}</For>
-                </div>
-              </section>
-            )}</For>
-          </div>
-        </Match>
-      </Switch>
+                <Match when={(blockView().view ?? "list") === "board"}>
+                  <div class="query-results-board" aria-label="Block results grouped by page">
+                    <For each={boardGroups()}>{([page, groupHits]) => (
+                      <section class="query-board-column" aria-label={page}>
+                        <h4>{page}<span class="query-board-count">{groupHits.length}</span></h4>
+                        <div role="list" aria-label="Block results">
+                          <For each={groupHits}>{(hit) => (
+                            <div role="listitem" class="query-board-card">
+                              <button type="button" data-inpage-find-surface={hitSurfaceId(hit)} onClick={() => openHit(hit)}>
+                                <span class="sr-only">{hitKind(hit)}: </span>
+                                <MarkedText text={hit.display_text} spans={hitMatchSpans(hit)} />
+                              </button>
+                            </div>
+                          )}</For>
+                        </div>
+                      </section>
+                    )}</For>
+                  </div>
+                </Match>
+              </Switch>
+            ),
+          },
+        ]}
+      />
 
       <Show when={advancedOpen()}>
         <AdvancedModal

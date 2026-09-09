@@ -45,6 +45,17 @@ export interface QueryReading {
    *  test that needs a real filter states it here; it does not ask a mock with
    *  no parser to derive one. */
   filter?: Filter;
+  /** **The scoped display state `query_parse` flattens beside `{query, view}`**
+   *  (§7.6, Q3). A reading that mentions none of these is a block with no
+   *  scoped drafts at all — which is what every existing caller declares, and
+   *  it is DIFFERENT from a block whose drafts are present and empty. Presence
+   *  is therefore stated by mentioning the key, never by its value. */
+  page_presentation?: ParsedQuery["page_presentation"];
+  block_presentation?: ParsedQuery["block_presentation"];
+  page_display?: ParsedQuery["page_display"];
+  block_display?: ParsedQuery["block_display"];
+  page_match_scope?: ParsedQuery["page_match_scope"];
+  unreadable_settings?: ParsedQuery["unreadable_settings"];
 }
 
 function readingToIr(reading: QueryReading): ParsedQuery {
@@ -69,7 +80,19 @@ function readingToIr(reading: QueryReading): ParsedQuery {
     diagnostics: [],
     source,
   };
-  return { query, view: reading.view ?? {} };
+  return {
+    query,
+    view: reading.view ?? {},
+    // `Object.hasOwn`, never `??`: a present-but-empty scoped draft is `{}`,
+    // and `{} ?? x` is `{}` while `undefined ?? x` is `x` — the two readings a
+    // truthiness copy cannot tell apart.
+    ...(reading.page_presentation !== undefined ? { page_presentation: reading.page_presentation } : {}),
+    ...(reading.block_presentation !== undefined ? { block_presentation: reading.block_presentation } : {}),
+    ...(Object.hasOwn(reading, "page_display") ? { page_display: reading.page_display } : {}),
+    ...(Object.hasOwn(reading, "block_display") ? { block_display: reading.block_display } : {}),
+    ...(reading.page_match_scope !== undefined ? { page_match_scope: reading.page_match_scope } : {}),
+    ...(reading.unreadable_settings ? { unreadable_settings: reading.unreadable_settings } : {}),
+  };
 }
 
 /** Install a `query_parse` stub that answers only for the arguments listed.

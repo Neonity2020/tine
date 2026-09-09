@@ -309,6 +309,9 @@ await withApp(0, async (browser) => {
   // GH #140: every persistent presentation keeps the authoritative evidence
   // highlights, and every visible result remains an in-page-find surface.
   await browser.setWindowSize(720, 700);
+  // Q3: a mixed result is TWO families now, so a bare presentation selector
+  // could be satisfied by the other section's container. Each one is addressed
+  // through its own section.
   const presentations = [
     ["Search", ".query-results-search"],
     ["List", ".query-results-list"],
@@ -317,7 +320,7 @@ await withApp(0, async (browser) => {
   ];
   for (const [label, selector] of presentations) {
     await (await presentationButton(browser, label)).click();
-    await browser.$(selector).waitForExist({ timeout: 5_000 });
+    await browser.$(`[data-query-result-kind="block"] ${selector}`).waitForExist({ timeout: 5_000 });
     await browser.waitUntil(async () => (await browser.$$(".query-workspace mark")).length >= 4, {
       timeout: 5_000, timeoutMsg: `${label} presentation dropped search highlights`,
     });
@@ -331,10 +334,38 @@ await withApp(0, async (browser) => {
       throw new Error(`${label} evidence/surface mismatch: ${JSON.stringify(presentationProof)}`);
     }
   }
+  // This fixture's answer is blocks-only, and that is exactly the case an empty
+  // family must survive: the Pages section stays mounted, keeps its own Display
+  // control, and SAYS it is empty. A section that vanished with its rows would
+  // take the only way to change what it selects with it (I-10).
+  const sectionProof = await browser.execute(() => {
+    const sections = [...document.querySelectorAll(".query-workspace [data-query-result-kind]")];
+    return sections.map((section) => {
+      const heading = section.querySelector("h3");
+      return {
+        kind: section.getAttribute("data-query-result-kind"),
+        heading: heading?.textContent?.trim() ?? null,
+        labelled: !!heading?.id && section.getAttribute("aria-labelledby") === heading.id,
+        controls: [...section.querySelectorAll(".query-result-section-header .qd-trigger")]
+          .map((button) => button.getAttribute("aria-label")),
+        empty: !!section.querySelector(".query-result-section-empty"),
+      };
+    });
+  });
+  if (sectionProof.length !== 2
+    || sectionProof[0].kind !== "page" || sectionProof[1].kind !== "block"
+    || sectionProof[0].heading !== "Pages" || sectionProof[1].heading !== "Blocks"
+    || sectionProof.some((section) => !section.labelled)
+    || sectionProof[0].controls.length !== 1 || sectionProof[0].controls[0] !== "Display pages"
+    || sectionProof[1].controls.length !== 1 || sectionProof[1].controls[0] !== "Display blocks"
+    || !sectionProof[0].empty || sectionProof[1].empty) {
+    throw new Error(`the two result families are not independently mounted: ${JSON.stringify(sectionProof)}`);
+  }
+
   await (await presentationButton(browser, "Search")).click();
   const wrapProof = await browser.execute(() => {
     const workspace = document.querySelector(".query-workspace")?.getBoundingClientRect();
-    return [...document.querySelectorAll(".query-result-row")].map((row) => {
+    return [...document.querySelectorAll('[data-query-result-kind="block"] .query-result-row')].map((row) => {
       const rect = row.getBoundingClientRect();
       return {
         scrollWidth: row.scrollWidth,
@@ -371,15 +402,19 @@ await withApp(0, async (browser) => {
   await friendlyInputs[0].setValue("Overflow");
   await browser.$(".query-advanced-actions .primary").click();
   await browser.$(".query-advanced-modal").waitForExist({ reverse: true, timeout: 5_000 });
-  await browser.waitUntil(async () => (await browser.$$(".query-results-search .query-result-row")).length === 140, {
+  // The reporter's 140 rows are 40 PAGE hits and 100 BLOCK hits; Q3 puts them in
+  // two sections instead of one flat list, so both halves are measured. The
+  // intrinsically wide title is a page name, which is now `.query-page-link`.
+  const ROW_SELECTOR = '[data-query-result-kind="page"] .query-page-link, [data-query-result-kind="block"] .query-result-row';
+  await browser.waitUntil(async () => (await browser.$$(ROW_SELECTOR)).length === 140, {
     timeout: 15_000, timeoutMsg: "persistent workspace did not render the 140 page-result fixture",
   });
-  const fullPaneWrapProof = await browser.execute(() => {
+  const fullPaneWrapProof = await browser.execute((rowSelector) => {
     const pane = document.querySelector(".query-workspace")?.closest(".main-content");
     const workspace = document.querySelector(".query-workspace");
-    const grid = document.querySelector(".query-results-search");
-    const items = [...document.querySelectorAll('.query-results-search > [role="listitem"]')];
-    const rows = [...document.querySelectorAll(".query-results-search .query-result-row")];
+    const grids = [...document.querySelectorAll(".query-result-section .query-results-search")];
+    const items = [...document.querySelectorAll('.query-result-section .query-results-search > [role="listitem"]')];
+    const rows = [...document.querySelectorAll(rowSelector)];
     const measure = (element) => element ? {
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth,
@@ -391,17 +426,18 @@ await withApp(0, async (browser) => {
       bodyScrollWidth: document.body.scrollWidth,
       pane: measure(pane),
       workspace: measure(workspace),
-      grid: measure(grid),
+      grids: grids.map(measure),
       items: items.map(measure),
       rows: rows.map(measure),
     };
-  });
+  }, ROW_SELECTOR);
   const overflows = (entry) => !entry || entry.scrollWidth > entry.clientWidth + 1
     || entry.left < -1 || entry.right > fullPaneWrapProof.viewport + 1;
   if (fullPaneWrapProof.bodyScrollWidth > fullPaneWrapProof.viewport + 1
     || overflows(fullPaneWrapProof.pane)
     || overflows(fullPaneWrapProof.workspace)
-    || overflows(fullPaneWrapProof.grid)
+    || fullPaneWrapProof.grids.length !== 2
+    || fullPaneWrapProof.grids.some(overflows)
     || fullPaneWrapProof.items.length !== 140
     || fullPaneWrapProof.items.some(overflows)
     || fullPaneWrapProof.rows.length !== 140

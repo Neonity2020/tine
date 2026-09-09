@@ -2133,9 +2133,20 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // and requested raw-property/group keys account for the net additions.
     // Full base/post multisets reconstruct both digests with no removals;
     // snapshot openers and the physical-write token inventory above stand.
+    // Q3 scoped display ADDS AND REMOVES NOTHING: the row count stands at 471
+    // and exactly three tuples change file, all of them read-only bound values.
+    // `query/sql.rs` goes 16 -> 14 `PhysicalQueryValue::Integer(` and 35 -> 34
+    // `PhysicalQueryValue::Text(`; `query/friendly.rs` goes 6 -> 8 and 2 -> 3 by
+    // the same amounts. That is the shared sort vocabulary moving, not a new
+    // producer: the explicit page/block statements and the Friendly sections
+    // now bind their sort terms through one `SortBinder`, so the Friendly
+    // implementation of it owns the bindings its own arm makes. Diffing the
+    // full 471-row base and post multisets shows these three moves and nothing
+    // else — no snapshot opener is added, no reader is opened anywhere new, and
+    // the write-boundary token inventory above is byte-for-byte the pinned one.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "cd2b662b6830e1821b78be8573ca8bbef8244ba91050be40f1650d5072624de1",
+        "beb3e08325ddedce83eca0a5a92c79def4020dde610aec02458b4111f7af5db0",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

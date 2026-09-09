@@ -157,6 +157,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   offers to retry, instead of silently reporting that nothing matched. An empty
   result now means "nothing matches", and only that.
 
+- **A search that returns both pages and blocks is now two results, each with
+  its own controls.** A mixed query used to render one undifferentiated run of
+  hits and offer one set of display settings for all of them, so choosing a
+  table because the pages suited one meant the blocks got a table too, and a row
+  limit meant to trim a long block list also trimmed the pages. **Pages** and
+  **Blocks** are now separate sections, pages first, each with its own Display
+  button, its own view, its own columns and sort, and its own row limit. Setting
+  one says nothing about the other: emptying the Blocks section leaves every
+  page in place, and neither section can borrow the room the other did not use.
+  A section that matches nothing says so and keeps its controls, so you can
+  change the setting that emptied it.
+
+  A section that leaves its display unset still follows the query's own
+  settings, exactly as before. Saying *nothing* and saying *nothing, on purpose*
+  are different states and Tine keeps them apart: clearing a section's settings
+  is recorded, survives a save and reopen in both Markdown and Org, and does not
+  quietly revert to the inherited ones the next time the file is read.
+
+- **Choose what makes a page a match.** A search that returns pages matched them
+  on their name and aliases only. A query can now ask for pages matched on their
+  **content** — a page whose own blocks satisfy the search — or on **both**.
+  A page admitted by its content is returned once, showing its best-matching
+  block as the evidence, and the Blocks section is unaffected by the choice.
+  Leaving it unset keeps the existing name-and-alias behaviour byte for byte.
+
 ### Fixed
 
 - **A query and a board no longer disagree about what `group by state` means.**
@@ -286,6 +311,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   left alone when you edit a neighbour.
 
 ### Changed
+
+- **The query sheet's `+ sort` and `+ summarize` buttons are gone.** Everything
+  they did — and the three settings they never reached — is in the **Display**
+  panel that now sits beside every query, on the sheet and inline alike. Notes
+  written with the old controls are read and rendered unchanged; only the place
+  you go to edit them has moved.
 
 - **Queries order all matches before sampling and display limits.** Without an
   explicit sort, a sample is taken from the complete default page/document

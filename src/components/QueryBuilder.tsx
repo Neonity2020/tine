@@ -14,21 +14,10 @@ import { Portal } from "solid-js/web";
 import { backend, OperationCancelledError, QueryNotReadyError } from "../backend";
 import {
   builderRoot,
-  currentAgg,
-  currentGroup,
-  currentSort,
   filterLabel,
   removeAt,
-  sortLabel,
-  withAgg,
-  withGroup,
-  withSort,
-  SORT_PRESETS,
-  type AggState,
-  type SortPreset,
 } from "../editor/queryBuilder";
 import type {
-  AggFn,
   Anchor,
   Diagnostic,
   Filter,
@@ -45,7 +34,6 @@ import {
   QuerySheet,
   countConditions,
   rawLeaves,
-  registerVisiblePopover,
   stop,
   type AnchorPrompt,
   type RegistryAccess,
@@ -102,247 +90,10 @@ export interface BuilderSession {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-// A small "+ sort" / "sort: field ↑" control in the bar (NOT a filter chip).
-// The popover leads with one-click presets (the common cases — no typing, no
-// syntax to get wrong) and keeps a free-text row for sorting by any other
-// property. `SORT_PRESETS` is the single source of truth (see queryBuilder.ts).
-//
-// **It edits `ViewSettings`, not the filter (§7.6, Q15).** Sort used to live in
-// the clause tree as a fake `sortBy` child, which is why wrapping it in an OR
-// silently disabled it and why the chip menu had to special-case it. Presentation
-// is now a separate value and the printers re-emit it.
-function SortControl(props: {
-  view: () => ViewSettings;
-  apply: (view: ViewSettings) => void;
-  parentTransientId?: string;
-}): JSX.Element {
-  const [open, setOpen] = createSignal(false);
-  const cur = () => currentSort(props.view());
-  // The free-text escape hatch: sort by an arbitrary property name.
-  const [field, setField] = createSignal("");
-  const [dir, setDir] = createSignal<"asc" | "desc">("asc");
-  let triggerEl: HTMLButtonElement | undefined;
-  let pickerEl: HTMLDivElement | undefined;
-  const layerId = `query-sort-${createUniqueId()}`;
-  registerVisiblePopover(open, {
-    id: layerId,
-    parentId: props.parentTransientId,
-    root: () => pickerEl ?? null,
-    trigger: () => triggerEl ?? null,
-    dismiss: () => { setOpen(false); return true; },
-  });
-  const isPreset = (c: { field: string; dir: "asc" | "desc" } | null) =>
-    !!c && SORT_PRESETS.some((p) => p.field === c.field && p.dir === c.dir);
-  const activePreset = (p: SortPreset) => {
-    const c = cur();
-    return !!c && c.field === p.field && c.dir === p.dir;
-  };
-  const openPopover = () => {
-    const c = cur();
-    // Pre-fill the free-text row only for a non-preset (custom-property) sort;
-    // a preset sort is reflected by its highlighted button instead.
-    setField(c && !isPreset(c) ? c.field : "");
-    setDir(c?.dir ?? "asc");
-    setOpen(true);
-  };
-  const applyPreset = (p: SortPreset) => {
-    props.apply(withSort(props.view(), { field: p.field, dir: p.dir }));
-    setOpen(false);
-  };
-  const applyCustom = () => {
-    if (!field().trim()) return;
-    props.apply(withSort(props.view(), { field: field().trim(), dir: dir() }));
-    setOpen(false);
-  };
-  const clearSort = () => {
-    props.apply(withSort(props.view(), null));
-    setOpen(false);
-  };
-  return (
-    <span class="qb-add-wrap">
-      {/* A stable "+ sort" affordance — it does NOT morph into the current sort
-          value. It just gains an `active` highlight and opens the popover. */}
-      <button
-        ref={triggerEl}
-        class="qb-sort"
-        classList={{ active: !!cur() }}
-        title={cur() ? `Sorted by ${sortLabel(cur()!.field, cur()!.dir)}. Click to change.` : "Sort results"}
-        onClick={(e) => { stop(e); open() ? setOpen(false) : openPopover(); }}
-      >
-        {cur() ? `sort: ${sortLabel(cur()!.field, cur()!.dir)}` : "+ sort"}
-      </button>
-      <Show when={open()}>
-        <div ref={pickerEl} class="qb-picker qb-sort-picker" onClick={stop}>
-          <div class="qb-picker-title">Sort by</div>
-          {/* One click = applied. No typing for the common cases. */}
-          <div class="qb-sort-presets">
-            <For each={SORT_PRESETS}>
-              {(p) => (
-                <button
-                  class="qb-sort-preset"
-                  classList={{ active: activePreset(p) }}
-                  title={p.hint}
-                  onClick={() => applyPreset(p)}
-                >
-                  {p.label}
-                </button>
-              )}
-            </For>
-          </div>
-          <div class="qb-divider" />
-          {/* Escape hatch: sort by any other property (still no required syntax —
-              just the bare property name + a direction). */}
-          <div class="qb-sort-custom-label">Or by a property</div>
-          <input
-            class="qb-input"
-            placeholder="property name (e.g. rating)"
-            value={field()}
-            onInput={(e) => setField(e.currentTarget.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") applyCustom(); }}
-          />
-          <div class="qb-conn-row">
-            <button class="qb-conn" classList={{ active: dir() === "asc" }} onClick={() => setDir("asc")}>Asc ↑</button>
-            <button class="qb-conn" classList={{ active: dir() === "desc" }} onClick={() => setDir("desc")}>Desc ↓</button>
-            <button class="qb-conn" classList={{ disabled: !field().trim() }} onClick={applyCustom}>Apply</button>
-          </div>
-          <Show when={cur()}>
-            <button class="qb-sort-clear" onClick={clearSort}>Clear sort</button>
-          </Show>
-        </div>
-      </Show>
-    </span>
-  );
-}
-
-// A "+ summarize" control: no-code aggregation (count / sum / average of a
-// property) and grouping (by page or a property). Modeled on SortControl — a
-// single pill + popover, dismiss-on-outside-click. Aggregate + group are
-// independent (you can group by page AND count per group). The numbers are
-// computed in the frontend from the returned block list (Macro.tsx); this edits
-// the VIEW SETTINGS the printers re-emit (§7.6).
-function SummarizeControl(props: {
-  view: () => ViewSettings;
-  apply: (view: ViewSettings) => void;
-  /** The host's ONE registry read. P4 removed `query_facets(false)`, whose only
-   *  other consumer this was; the keys it offers are the same keys, ordered by
-   *  the count the registry already knows. P5 rewrites this control — until
-   *  then it reads the same rows the picker does rather than a second graph
-   *  question (§6.4, I-13). */
-  registry: RegistryAccess;
-  parentTransientId?: string;
-}): JSX.Element {
-  const [open, setOpen] = createSignal(false);
-  // Two-step property choice: null = show the top-level buttons; "sum"/"avg" =
-  // pick a property to aggregate; "group" = pick a property to group by.
-  const [pick, setPick] = createSignal<"sum" | "avg" | "group" | null>(null);
-  const keys = () =>
-    [...(props.registry.rows() ?? [])]
-      .sort(
-        (a, b) =>
-          b.count_blocks + b.count_pages - (a.count_blocks + a.count_pages)
-          || a.normalized_name.localeCompare(b.normalized_name),
-      )
-      .map((row) => row.normalized_name);
-  const agg = () => currentAgg(props.view());
-  const group = () => currentGroup(props.view());
-  const active = () => !!agg() || !!group();
-  let triggerEl: HTMLButtonElement | undefined;
-  let pickerEl: HTMLDivElement | undefined;
-  const layerId = `query-summarize-${createUniqueId()}`;
-  registerVisiblePopover(open, {
-    id: layerId,
-    parentId: props.parentTransientId,
-    root: () => pickerEl ?? null,
-    trigger: () => triggerEl ?? null,
-    dismiss: () => { setOpen(false); return true; },
-  });
-  const openPopover = () => {
-    setPick(null);
-    setOpen(true);
-  };
-  // Each pick applies and closes the popover (like SortControl's presets). To set
-  // BOTH an aggregate and a grouping, reopen — the two are independent, so the
-  // view keeps whichever the other pick already set.
-  const setAgg = (a: AggState | null) => {
-    props.apply(withAgg(props.view(), a));
-    setPick(null);
-    setOpen(false);
-  };
-  const setGroup = (f: string | null) => {
-    props.apply(withGroup(props.view(), f));
-    setPick(null);
-    setOpen(false);
-  };
-  const label = () => {
-    const parts: string[] = [];
-    const a = agg();
-    if (a) parts.push(a.agg === "count" ? "count" : `${a.agg} of ${a.field ?? "?"}`);
-    const g = group();
-    if (g) parts.push(`by ${g}`);
-    return parts.join(", ");
-  };
-  return (
-    <span class="qb-add-wrap">
-      <button
-        ref={triggerEl}
-        class="qb-sort"
-        classList={{ active: active() }}
-        title={active() ? `Summary: ${label()}. Click to change.` : "Summarize results (count / sum / average / group)"}
-        onClick={(e) => { stop(e); open() ? setOpen(false) : openPopover(); }}
-      >
-        {active() ? `∑ ${label()}` : "+ summarize"}
-      </button>
-      <Show when={open()}>
-        <div ref={pickerEl} class="qb-picker" onClick={stop}>
-          {/* Step: pick a property for sum / avg / group-by. */}
-          <Show when={pick() != null} fallback={
-            <>
-              <div class="qb-picker-title">Aggregate</div>
-              <button class="qb-menu-item" classList={{ active: agg()?.agg === "count" }} onClick={() => setAgg({ agg: "count", field: null })}>Count</button>
-              <button class="qb-menu-item" classList={{ active: agg()?.agg === "sum" }} onClick={() => setPick("sum")}>Sum of a property…</button>
-              <button class="qb-menu-item" classList={{ active: agg()?.agg === "avg" }} onClick={() => setPick("avg")}>Average of a property…</button>
-              <Show when={agg()}>
-                <button class="qb-sort-clear" onClick={() => setAgg(null)}>Clear aggregate</button>
-              </Show>
-              <div class="qb-divider" />
-              <div class="qb-picker-title">Group by</div>
-              <button class="qb-menu-item" classList={{ active: group() === "page" }} onClick={() => setGroup("page")}>Page</button>
-              <button class="qb-menu-item" classList={{ active: !!group() && group() !== "page" }} onClick={() => setPick("group")}>Property…</button>
-              <Show when={group()}>
-                <button class="qb-sort-clear" onClick={() => setGroup(null)}>Clear grouping</button>
-              </Show>
-            </>
-          }>
-            <div class="qb-picker-title">{pick() === "group" ? "Group by property" : `${pick() === "sum" ? "Sum" : "Average"} of property`}</div>
-            <For each={keys()}>
-              {(k) => (
-                <button class="qb-menu-item" onClick={() => (pick() === "group" ? setGroup(k) : setAgg({ agg: pick() as AggFn, field: k }))}>
-                  {k}
-                </button>
-              )}
-            </For>
-            <PropNameInput onCommit={(k) => (pick() === "group" ? setGroup(k) : setAgg({ agg: pick() as AggFn, field: k }))} />
-          </Show>
-        </div>
-      </Show>
-    </span>
-  );
-}
-
-// A free-text property-name input (Enter commits) for the summarize picker, so a
-// property not yet used in the graph (absent from facets) can still be chosen.
-function PropNameInput(props: { onCommit: (key: string) => void }): JSX.Element {
-  const [v, setV] = createSignal("");
-  return (
-    <input
-      class="qb-input"
-      placeholder="or type a property name"
-      value={v()}
-      onInput={(e) => setV(e.currentTarget.value)}
-      onKeyDown={(e) => { if (e.key === "Enter" && v().trim()) props.onCommit(v().trim()); }}
-    />
-  );
-}
+// **`+ sort` and `+ summarize` are gone** (P5B, Q3). They were two pills that
+// each stated a FRACTION of one display fact — one sort pair, one aggregate —
+// and each rewrote a longer authored list as a one-element one. The shared
+// Display panel states all six facts, so the sheet mounts that instead.
 
 // ---------------------------------------------------------------------------
 // The text pane (§4.3.1, §7.1)
@@ -783,6 +534,111 @@ export function resetQueryRegistryRevisionForTests(): void {
   setDeclarationBump({ epoch: -1, revision: 0 });
 }
 
+/** **One registry read, however many surfaces ask for it** (D-14, I-12).
+ *
+ *  The builder's sheet, the inline Display panel and each mixed-result section
+ *  all need the observed property registry to build a field vocabulary. They
+ *  differ only in WHEN they are asking — which is the `active` gate — so the
+ *  read, its readiness retry, its terminal-failure capture and its scoping are
+ *  stated once here rather than once per surface. A second owner would grow a
+ *  second retry policy and a second answer to "does this graph have that
+ *  property".
+ *
+ *  With no surface open there is deliberately no read at all (I-13). */
+export function createQueryRegistryAccess(active: () => boolean): RegistryAccess {
+  const registryScope = () => sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
+  const registryKey = () =>
+    active() ? `${dataRev()}\0${declarationRevision()}` : undefined;
+  //  - **Readiness is the shared owner's, not this component's (RET2-Direct).**
+  //    `query_registry` is SQL-only on both backends now and reports typed
+  //    `query-not-ready` while the index is indexing, recovering or applying a
+  //    save, instead of answering from a debounced document walk. The retry and
+  //    its binding/epoch cancellation are `createReadyQueryResource`'s, exactly
+  //    as for `query_run`; nothing mode-specific is decided here.
+  //  - **A read that FAILS is an answer the sheet has to give (RET2-UI).**
+  //    A terminal `query-unavailable` used to reject the resource, and the two
+  //    things that happen next are both wrong: `latest` RETHROWS a rejected
+  //    resource, so the field picker threw out of its own render and could not
+  //    be opened at all, and rows stayed `undefined`, which every consumer
+  //    reads as "still reading" — an indexing line that never ends. So a
+  //    terminal failure is captured as a VALUE here, which is what stops the
+  //    automatic retry, and is surfaced through `failure` below.
+  //
+  //    Readiness and cancellation are deliberately NOT captured. Readiness is
+  //    the shared owner's to retry (`runQueryWhenReady`), and a cancellation is
+  //    the ABSENCE of an answer for a superseded request — turning either into
+  //    a value would invent a second retry policy or publish a supersede as a
+  //    result.
+  const [registrySnapshot] = createReadyQueryResource(
+    () => {
+      const key = registryKey();
+      return key === undefined ? undefined : { scope: registryScope(), key };
+    },
+    async (request): Promise<RegistryRead> => {
+      try {
+        return {
+          scope: request.scope,
+          key: request.key,
+          snapshot: await sharedQueryResult(
+            request.scope,
+            `query-registry\0${request.key}`,
+            () => backend().queryRegistry(),
+          ),
+          failure: null,
+        };
+      } catch (error) {
+      if (error instanceof QueryNotReadyError || error instanceof OperationCancelledError) throw error;
+      return {
+        scope: request.scope,
+        key: request.key,
+        snapshot: null,
+        failure: error instanceof Error ? error : new Error(errorMessage(error)),
+      };
+    }
+  },
+  );
+  // A type declaration changes operator semantics: an answer is usable only for
+  // the current graph AND revision, including while a refresh is pending — and
+  // that is as true of a failure as of a snapshot, so a stale graph's error can
+  // no more be shown than its rows can.
+  const registryRead = (): RegistryRead | undefined => {
+    // Reading `latest` on an errored resource RETHROWS, which is how a failed
+    // read used to take the field picker's own render with it. Terminal
+    // failures are values above, so the only error left is a superseded
+    // request's cancellation — and both binding bumps (`onGraphRebound`, and
+    // `resetSaveState` behind `graphTransitioning`) re-key this source in the
+    // same synchronous update, so Solid discards that rejection rather than
+    // storing it. This is the net under that, never a state to render: a
+    // cancellation is the absence of an answer, not one.
+    if (registrySnapshot.error !== undefined) return undefined;
+    const landed = registrySnapshot.latest;
+    return landed && landed.scope === registryScope() && landed.key === registryKey()
+    ? landed : undefined;
+  };
+  const registryRows = () => registryRead()?.snapshot?.rows;
+  const registryFailure = () => registryRead()?.failure ?? null;
+  const registry: RegistryAccess = {
+    rows: registryRows,
+    // **Undefined rows have three different meanings, and the UI must not read
+    // the wrong one.** With no sheet open there is deliberately no read at all
+    // (I-13), so `undefined` is "nobody asked". With a sheet open it is either
+    // "the answer for THIS graph and THIS declaration revision has not landed"
+    // or "the read for it failed" — and a surface that treats either as a
+    // known-empty graph shows a graph with no properties, or coerces a freshly
+    // declared key as text.
+    pending: () => registryKey() !== undefined && registryRows() === undefined
+      && registryFailure() === null,
+    failure: registryFailure,
+    unavailable: () => registryKey() !== undefined && registryRows() === undefined,
+    request: requestQueryRegistryRefresh,
+    // Explicit retry is the SAME owner as the declaration refresh, not a second
+    // one: it re-keys the one shared read, so every open builder recovers from
+    // one request and no builder grows a backoff or a cache of its own.
+    retry: requestQueryRegistryRefresh,
+  };
+  return registry;
+}
+
 /** Deepest-and-rightmost first, so removing several leaves in one pass never
  *  invalidates a `loc` that has not been used yet. */
 function compareLocsDescending(a: number[], b: number[]): number {
@@ -935,96 +791,7 @@ export function QueryBuilder(props: {
   //  - **Rows never cross a graph.** A reply for the previous graph may still
   //    settle; it can never be published, because what is exposed is gated on
   //    the scope the rows were fetched under.
-  const registryScope = () => sharedQueryScope(graphMeta()?.root, graphEpoch(), graphBinding());
-  const registryKey = () =>
-    sheetOpen() || displayOpen() ? `${dataRev()}\0${declarationRevision()}` : undefined;
-  //  - **Readiness is the shared owner's, not this component's (RET2-Direct).**
-  //    `query_registry` is SQL-only on both backends now and reports typed
-  //    `query-not-ready` while the index is indexing, recovering or applying a
-  //    save, instead of answering from a debounced document walk. The retry and
-  //    its binding/epoch cancellation are `createReadyQueryResource`'s, exactly
-  //    as for `query_run`; nothing mode-specific is decided here.
-  //  - **A read that FAILS is an answer the sheet has to give (RET2-UI).**
-  //    A terminal `query-unavailable` used to reject the resource, and the two
-  //    things that happen next are both wrong: `latest` RETHROWS a rejected
-  //    resource, so the field picker threw out of its own render and could not
-  //    be opened at all, and rows stayed `undefined`, which every consumer
-  //    reads as "still reading" — an indexing line that never ends. So a
-  //    terminal failure is captured as a VALUE here, which is what stops the
-  //    automatic retry, and is surfaced through `failure` below.
-  //
-  //    Readiness and cancellation are deliberately NOT captured. Readiness is
-  //    the shared owner's to retry (`runQueryWhenReady`), and a cancellation is
-  //    the ABSENCE of an answer for a superseded request — turning either into
-  //    a value would invent a second retry policy or publish a supersede as a
-  //    result.
-  const [registrySnapshot] = createReadyQueryResource(
-    () => {
-      const key = registryKey();
-      return key === undefined ? undefined : { scope: registryScope(), key };
-    },
-    async (request): Promise<RegistryRead> => {
-      try {
-        return {
-          scope: request.scope,
-          key: request.key,
-          snapshot: await sharedQueryResult(
-            request.scope,
-            `query-registry\0${request.key}`,
-            () => backend().queryRegistry(),
-          ),
-          failure: null,
-        };
-      } catch (error) {
-        if (error instanceof QueryNotReadyError || error instanceof OperationCancelledError) throw error;
-        return {
-          scope: request.scope,
-          key: request.key,
-          snapshot: null,
-          failure: error instanceof Error ? error : new Error(errorMessage(error)),
-        };
-      }
-    },
-  );
-  // A type declaration changes operator semantics: an answer is usable only for
-  // the current graph AND revision, including while a refresh is pending — and
-  // that is as true of a failure as of a snapshot, so a stale graph's error can
-  // no more be shown than its rows can.
-  const registryRead = (): RegistryRead | undefined => {
-    // Reading `latest` on an errored resource RETHROWS, which is how a failed
-    // read used to take the field picker's own render with it. Terminal
-    // failures are values above, so the only error left is a superseded
-    // request's cancellation — and both binding bumps (`onGraphRebound`, and
-    // `resetSaveState` behind `graphTransitioning`) re-key this source in the
-    // same synchronous update, so Solid discards that rejection rather than
-    // storing it. This is the net under that, never a state to render: a
-    // cancellation is the absence of an answer, not one.
-    if (registrySnapshot.error !== undefined) return undefined;
-    const landed = registrySnapshot.latest;
-    return landed && landed.scope === registryScope() && landed.key === registryKey()
-      ? landed : undefined;
-  };
-  const registryRows = () => registryRead()?.snapshot?.rows;
-  const registryFailure = () => registryRead()?.failure ?? null;
-  const registry: RegistryAccess = {
-    rows: registryRows,
-    // **Undefined rows have three different meanings, and the UI must not read
-    // the wrong one.** With no sheet open there is deliberately no read at all
-    // (I-13), so `undefined` is "nobody asked". With a sheet open it is either
-    // "the answer for THIS graph and THIS declaration revision has not landed"
-    // or "the read for it failed" — and a surface that treats either as a
-    // known-empty graph shows a graph with no properties, or coerces a freshly
-    // declared key as text.
-    pending: () => registryKey() !== undefined && registryRows() === undefined
-      && registryFailure() === null,
-    failure: registryFailure,
-    unavailable: () => registryKey() !== undefined && registryRows() === undefined,
-    request: requestQueryRegistryRefresh,
-    // Explicit retry is the SAME owner as the declaration refresh, not a second
-    // one: it re-keys the one shared read, so every open builder recovers from
-    // one request and no builder grows a backoff or a cache of its own.
-    retry: requestQueryRegistryRefresh,
-  };
+  const registry = createQueryRegistryAccess(() => sheetOpen() || displayOpen());
   const suggestions = createMemo(() => suggestedKeys(registry.rows()));
   const vocabulary = () => (registry.rows() ?? []).map((row) => row.normalized_name);
 
@@ -1228,7 +995,18 @@ export function QueryBuilder(props: {
   // It is cleared on unmount: a route that leads nowhere is not offered.
   const [paneHandle, setPaneHandle] = createSignal<PaneHandle | null>(null);
 
-  const inlineDisplay = () => (props.inlineDisplay ? props.display?.() : undefined);
+  /** **The ONE display control this sheet offers** (P5B, Q3).
+   *
+   *  A host that owns the block's `tine.*` writer hands its own control in
+   *  (`inlineDisplay`); every other host gets the builder's session writer,
+   *  which is the same `ViewSettings` under a different owner. It is one
+   *  control either way — `+ sort` and `+ summarize` used to sit here instead,
+   *  and each could state only a FRACTION of one fact (one sort pair, one
+   *  aggregate), rewriting a longer list as a one-element one. Two controls
+   *  writing the same keys with different ideas of how many entries there are
+   *  is exactly the disagreement this replaces. */
+  const inlineDisplay = (): QueryDisplayControl | undefined =>
+    props.inlineDisplay ? props.display?.() : (session() ? { view: view(), apply: applyView } : undefined);
   const displayControl = (parentTransientId?: string) => (
     <Show when={inlineDisplay()}>
       {(control) => (
@@ -1245,10 +1023,6 @@ export function QueryBuilder(props: {
   const footer = () => (
     <>
       {displayControl(sheetLayerId)}
-      <Show when={!props.inlineDisplay}>
-        <SortControl view={view} apply={applyView} parentTransientId={sheetLayerId} />
-        <SummarizeControl view={view} apply={applyView} registry={registry} parentTransientId={sheetLayerId} />
-      </Show>
       {/* **Visible and editable, always, inside an open sheet (§7.5).** It was a
           collapsed `<details>`, which meant the one control that can express
           everything the rows cannot was the one control a user had to know to

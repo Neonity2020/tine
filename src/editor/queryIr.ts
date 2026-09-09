@@ -235,6 +235,23 @@ export interface ScopedDisplaySettings {
   unreadable_settings?: string[];
 }
 
+/** The Display half of a `run_graph_search` request (§7.6, Q3).
+ *
+ * Every member is optional and an absent object is "this caller states
+ * nothing", which is exactly the request that existed before Display did. Each
+ * supplied view is ALREADY RESOLVED — inheritance between a scoped draft and
+ * the singular settings happens on this side, in `queryDisplayDraft.ts`, so
+ * Rust never re-inherits a missing member and the two halves cannot disagree
+ * about what a query shows (I-12).
+ *
+ * `pageMatchScope` is page MEMBERSHIP and is unrelated to `QueryPageScope`,
+ * which is the physical routed page a block search is confined to. */
+export interface GraphSearchDisplayOptions {
+  pageMatchScope?: FriendlyPageMatchScope;
+  pageView?: ViewSettings;
+  blockView?: ViewSettings;
+}
+
 /** `query_parse`'s answer. `Query` and `ViewSettings` are SEPARATE values: the
  * filter never contains presentation (§3.1). Scoped display state is flattened
  * beside that unchanged pair. */

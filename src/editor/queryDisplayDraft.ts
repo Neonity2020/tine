@@ -239,20 +239,143 @@ export function queryDisplaySettings(
   };
 }
 
+/** The result kind a display resolution is being asked about. */
+export type QueryResultKind = "page" | "block";
+
+/** The state one surface holds about a query's display, singular and scoped.
+ *
+ *  A workspace fills it from its route; an inline macro fills it from the
+ *  flattened `ParsedQuery` fields Rust returns. Presence is stated by
+ *  `Object.hasOwn` on the caller's side and carried here as an explicit
+ *  `Partial`, never by truthiness: `{}`, `[]`, `group_by: ""` and `sample: 0`
+ *  are all things a user can mean. */
+export interface QueryScopedDisplayState {
+  /** The singular presentation — the compatibility answer both kinds fall back
+   *  to when their own is unset. */
+  presentation: ViewKind;
+  /** The singular non-view settings: a route's own draft, or the parse's view
+   *  where the surface has no draft of its own. */
+  display?: QueryDisplayDraft;
+  /** The query text's own settings, which an ABSENT singular draft inherits. */
+  parsed?: ViewSettings;
+  pagePresentation?: ViewKind;
+  blockPresentation?: ViewKind;
+  /** Present with `undefined` means "a scoped draft exists and is empty" is NOT
+   *  what this says — use `Object.hasOwn`. Callers build this object with the
+   *  key omitted entirely when there is no scoped draft. */
+  pageDisplay?: QueryDisplayDraft;
+  blockDisplay?: QueryDisplayDraft;
+}
+
+/** **The one resolver for a mixed result's two halves** (I-12).
+ *
+ *  Three rules, and each of them is a distinct user statement:
+ *
+ *   * A scoped PRESENTATION independently overrides the singular one. Switching
+ *     one section's view says nothing about the other's.
+ *   * An ABSENT scoped draft inherits the entire singular non-view snapshot —
+ *     which is itself the singular draft, or the query text where there is no
+ *     draft.
+ *   * A PRESENT scoped draft replaces that snapshot WHOLESALE. `{}` is
+ *     therefore the clear, and a present draft's missing members are NOT merged
+ *     back from the singular state: a scoped draft says what this section
+ *     shows, in full.
+ *
+ *  Presence is asked with `Object.hasOwn`, never with `??` or truthiness. An
+ *  empty column list, a cleared grouping and a zero sample are all values a
+ *  user chose, and every one of them is falsy. */
+export function queryScopedDisplaySettings(
+  state: QueryScopedDisplayState,
+  kind: QueryResultKind,
+): ViewSettings {
+  const page = kind === "page";
+  const scopedKey = page ? "pageDisplay" : "blockDisplay";
+  const presentation = (page ? state.pagePresentation : state.blockPresentation)
+    ?? state.presentation;
+  if (Object.hasOwn(state, scopedKey)) {
+    // Present: this scope's own complete snapshot. `parsed` is deliberately not
+    // passed on — a present draft does not inherit from the query text either.
+    return queryDisplaySettings(state[scopedKey] ?? {}, undefined, presentation);
+  }
+  return queryDisplaySettings(state.display, state.parsed, presentation);
+}
+
 /** Resolve one half of a mixed-result route. Scoped presentation and draft
  *  override the singular compatibility fields independently. A present `{}`
  *  is therefore a clear, while an absent scoped draft inherits `display`. */
 export function queryResultDisplaySettings(
   route: QueryRoute,
   parsed: ViewSettings | undefined,
-  target: "page" | "block",
+  target: QueryResultKind,
 ): ViewSettings {
-  const page = target === "page";
-  const scopedDraftKey = page ? "pageDisplay" : "blockDisplay";
-  const draft = Object.hasOwn(route, scopedDraftKey)
-    ? route[scopedDraftKey]
-    : route.display;
-  const presentation = (page ? route.pagePresentation : route.blockPresentation)
-    ?? route.presentation;
-  return queryDisplaySettings(draft, parsed, presentation);
+  // The route IS the state; the workspace keeps its existing caller shape and
+  // the resolution above is the only place the three rules are written down.
+  const state: QueryScopedDisplayState = {
+    presentation: route.presentation,
+    ...(Object.hasOwn(route, "display") ? { display: route.display } : {}),
+    ...(parsed !== undefined ? { parsed } : {}),
+    ...(route.pagePresentation !== undefined ? { pagePresentation: route.pagePresentation } : {}),
+    ...(route.blockPresentation !== undefined ? { blockPresentation: route.blockPresentation } : {}),
+    ...(Object.hasOwn(route, "pageDisplay") ? { pageDisplay: route.pageDisplay } : {}),
+    ...(Object.hasOwn(route, "blockDisplay") ? { blockDisplay: route.blockDisplay } : {}),
+  };
+  return queryScopedDisplaySettings(state, target);
+}
+
+/** The same resolution for an INLINE query, whose scoped state arrives already
+ *  flattened beside `{query, view}` by `query_parse` (SPEC §7.6).
+ *
+ *  Rust states presence the same way this module does — a missing marker leaves
+ *  the field absent, and a marker with no members returns an empty object — so
+ *  the adaptation is `Object.hasOwn` on the parse, not a second reading of the
+ *  property bytes. `view` is the singular merge Rust already performed, so it
+ *  plays the singular draft's part here. */
+export function queryParsedDisplaySettings(
+  parsed: {
+    view?: ViewSettings;
+    page_presentation?: ViewKind;
+    block_presentation?: ViewKind;
+    page_display?: QueryDisplayDraft;
+    block_display?: QueryDisplayDraft;
+  } | undefined,
+  kind: QueryResultKind,
+): ViewSettings {
+  const view = parsed?.view ?? {};
+  const state: QueryScopedDisplayState = {
+    presentation: view.view ?? "list",
+    display: {
+      ...(view.sort !== undefined ? { sort: view.sort } : {}),
+      ...(view.group_by !== undefined ? { group_by: view.group_by } : {}),
+      ...(view.columns !== undefined ? { columns: view.columns } : {}),
+      ...(view.aggregates !== undefined ? { aggregates: view.aggregates } : {}),
+      ...(view.sample !== undefined ? { sample: view.sample } : {}),
+    },
+    ...(parsed?.page_presentation !== undefined
+      ? { pagePresentation: parsed.page_presentation } : {}),
+    ...(parsed?.block_presentation !== undefined
+      ? { blockPresentation: parsed.block_presentation } : {}),
+    ...(parsed && Object.hasOwn(parsed, "page_display")
+      ? { pageDisplay: parsed.page_display } : {}),
+    ...(parsed && Object.hasOwn(parsed, "block_display")
+      ? { blockDisplay: parsed.block_display } : {}),
+  };
+  return queryScopedDisplaySettings(state, kind);
+}
+
+/** The complete effective non-view snapshot a FIRST scoped edit clones.
+ *
+ *  §7 of the design: a scoped draft is complete or it is absent, so the first
+ *  edit in a namespace has to write down everything that namespace was already
+ *  showing — otherwise the edit would silently clear the facts it did not
+ *  mention. `view` is dropped because presentation is independently scoped. */
+export function queryScopedDraftFrom(settings: ViewSettings): QueryDisplayDraft {
+  return {
+    ...(settings.sort !== undefined ? { sort: settings.sort.map(([f, d]): [Field, SortDir] => [f, d]) } : {}),
+    ...(settings.group_by !== undefined ? { group_by: settings.group_by } : {}),
+    ...(settings.columns !== undefined ? { columns: [...settings.columns] } : {}),
+    ...(settings.aggregates !== undefined
+      ? { aggregates: settings.aggregates.map(([f, fn]): [Field, AggFn] => [f, fn]) }
+      : {}),
+    ...(settings.sample !== undefined ? { sample: settings.sample } : {}),
+  };
 }

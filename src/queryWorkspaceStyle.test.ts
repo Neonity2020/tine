@@ -32,4 +32,17 @@ describe("persistent search result geometry (GH #140)", () => {
     expect(item).toContain("max-width: 100%");
     expect(item).toContain("min-width: 0");
   });
+
+  // Q3 gave the Pages family its own row control. Before that, a page row WAS a
+  // `.query-result-row` and inherited the rule above; the reporter's case was an
+  // intrinsically wide PAGE title, so the guarantee has to be restated on the
+  // control that now carries it or the whole pane grows horizontally again.
+  it("q3_page_rows_keep_the_persistent_grids_wrap_guarantee", () => {
+    const rule = app.match(/\.query-page-link\s*\{([^}]*)\}/s)?.[1] ?? "";
+    expect(rule).toContain("box-sizing: border-box");
+    expect(rule).toContain("max-width: 100%");
+    expect(rule).toContain("min-width: 0");
+    expect(rule).toContain("white-space: normal");
+    expect(rule).toContain("overflow-wrap: anywhere");
+  });
 });

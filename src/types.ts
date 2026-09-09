@@ -947,6 +947,11 @@ export type QueryHit =
       score: number;
       match_class?: ObjectiveMatchClass;
       matched_alias?: string;
+      /** The hydrated page row, present exactly when this hit came from the
+       * Display-enabled search AND names a stored page (§7.6, Q3). A virtual
+       * reference-name suggestion has no stored page and therefore no row: its
+       * absence is the honest answer, never an empty property list. */
+      row?: import("./editor/queryIr").PageRow;
     }
   | {
       entity: "block";

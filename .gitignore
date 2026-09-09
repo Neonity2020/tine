@@ -45,6 +45,8 @@ reddit-backup/
 /baseline-*.txt
 /necessity-*.txt
 /*-fail-before.log
+/failbefore-*.log
+/fail-before-*.log
 /baseline-*.log
 /post-*.log
 /mgr-*.log

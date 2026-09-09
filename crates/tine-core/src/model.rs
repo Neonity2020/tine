@@ -17989,12 +17989,35 @@ impl Graph {
         scope: Option<crate::query_plan::QueryPageScope>,
         explain: bool,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
-        let plan = match scope {
-            Some(scope) => {
-                crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
-            }
-            None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
-        };
+        self.run_graph_search_displayed(
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+        )
+    }
+
+    /// The same search under stated Display settings (SPEC §7.6, Q3). The
+    /// caller has already resolved page/block inheritance; this only builds the
+    /// plan those resolved facts describe.
+    pub fn run_graph_search_displayed(
+        &self,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        display: crate::query_plan::FriendlyDisplayOptions,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        let plan = crate::query_plan::friendly_search_plan(
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            display,
+        );
         self.read_friendly_plan(&plan, explain, None)
     }
 
@@ -18049,6 +18072,28 @@ impl Graph {
         scope: Option<crate::query_plan::QueryPageScope>,
         explain: bool,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        self.run_graph_search_latest_displayed(
+            lane,
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_graph_search_latest_displayed(
+        &self,
+        lane: &str,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        display: crate::query_plan::FriendlyDisplayOptions,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         use std::sync::atomic::Ordering;
         let epoch = {
             let mut lanes = self.search_lanes.lock().unwrap();
@@ -18058,12 +18103,13 @@ impl Graph {
                 .clone()
         };
         let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let plan = match scope {
-            Some(scope) => {
-                crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
-            }
-            None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
-        };
+        let plan = crate::query_plan::friendly_search_plan(
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            display,
+        );
         self.read_friendly_plan(
             &plan,
             explain,

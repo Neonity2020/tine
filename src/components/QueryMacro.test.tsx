@@ -532,7 +532,13 @@ describe("QueryMacro sheet integration", () => {
     expect(root.querySelector(".qs-seg-value")?.textContent).toBe("alpha beta");
     expect(root.querySelector(".qs-seg-advanced")).toBeNull();
     expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["alpha", "beta"]);
-    expect(graphSearch).toHaveBeenCalledWith("alpha beta", 500, 5_000, "inline-query:query", false);
+    // An inline Friendly search is a whole-graph question, so it sends NO
+    // physical page scope — and it carries both families' resolved Display
+    // settings beside it (§7.6, Q3).
+    expect(graphSearch).toHaveBeenCalledWith(
+      "alpha beta", 500, 5_000, "inline-query:query", false, undefined,
+      { pageView: { view: "search" }, blockView: { view: "search" } },
+    );
     root.querySelector<HTMLButtonElement>(".query-search-hit")!.click();
     expect(route()).toMatchObject({ kind: "page", name: "Sheet", pageKind: "page" });
 
@@ -1219,5 +1225,275 @@ describe("a query never returns its own block (GH #469)", () => {
     expect(hits).toHaveLength(1);
     expect(hits[0]).toContain("TODO From query");
     dispose();
+  });
+});
+
+// **Scoped Display settings on an inline query** (SPEC §7.6, Q3).
+//
+// A Friendly search answers two questions at once, and its two answers are
+// controlled independently: `tine.page-*` for the Pages section, `tine.block-*`
+// for the Blocks section, `tine.page-match-scope` for which pages are members
+// at all. Rust reads all of it and hands it to the frontend flattened beside
+// `{query, view}`; these cases are the evidence that the frontend consumes it
+// as WRITTEN — including the difference between a draft that is absent and one
+// that is present and empty, which is the difference between "inherit" and
+// "clear".
+describe("q3: scoped display settings on an inline query", () => {
+  const pageHit = (name: string, path: string): QueryHit => ({
+    entity: "page",
+    page: { name, kind: "page", date_key: null, path },
+    display_text: name,
+    evidence: [{ clause_id: 1, field: "page_name", mode: "contains", spans: [{ start: 0, end: 5 }] }],
+    score: 10,
+    row: { name, kind: "page", path, properties: [["status", "open"]] },
+  });
+  const blockHit = (id: string, raw: string): QueryHit => ({
+    entity: "block",
+    page: "Sheet",
+    kind: "page",
+    block: { id, raw, collapsed: false, children: [], breadcrumb: [], properties: [] },
+    display_text: raw,
+    evidence: [{ clause_id: 1, field: "visible_content", mode: "contains", spans: [{ start: 0, end: 5 }] }],
+  });
+  const mixed = (): QueryExecution => ({
+    hits: [pageHit("Alpha notes", "pages/alpha.md"), blockHit("todo", "TODO alpha work")],
+    diagnostics: [],
+    explanation: { branches: [] },
+    cancelled: false,
+    has_more: { pages: true, blocks: false },
+  });
+
+  function loadFriendly(raw: string, reading: Parameters<typeof backendReadsQueries>[0][string]) {
+    setDoc({
+      byId: {
+        query: node("query", raw, null),
+        todo: node("todo", "TODO alpha work", null),
+      },
+      pages: [page(["query", "todo"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    backendReadsQueries({ '(search "alpha")': reading });
+  }
+
+  it("q3_macro_consumes_flattened_scopes", async () => {
+    // FAIL-BEFORE: Macro read the singular `view` only, so both families
+    // rendered under one presentation and the two sections did not exist. The
+    // Pages half of the answer was dropped entirely outside the Search face.
+    loadFriendly('{{query (search "alpha")}}\ntine.view:: list', {
+      form: '(search "alpha")',
+      filter: searchFilter("alpha"),
+      view: { view: "list" },
+      // Pages are a TABLE with a column of the page's own property; blocks stay
+      // on the inherited list. Two families, two presentations, one query.
+      page_presentation: "table",
+      page_display: { columns: ["status"] },
+      page_match_scope: "both",
+    });
+    const search = vi.spyOn(backend(), "runGraphSearch").mockResolvedValue(mixed());
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      // Both resolved views ride the ONE request, with the membership scope.
+      expect(search).toHaveBeenCalledWith(
+        "alpha", 500, 5_000, "inline-query:query", false, undefined,
+        {
+          pageMatchScope: "both",
+          pageView: { view: "table", columns: ["status"] },
+          blockView: { view: "list" },
+        },
+      );
+
+      const pages = root.querySelector<HTMLElement>('[data-query-result-kind="page"]')!;
+      const blocks = root.querySelector<HTMLElement>('[data-query-result-kind="block"]')!;
+      expect(pages.querySelector("h3")?.textContent).toBe("Pages");
+      expect(blocks.querySelector("h3")?.textContent).toBe("Blocks");
+      // The Pages section took its OWN presentation…
+      expect(pages.querySelector("table.query-results-table")).not.toBeNull();
+      expect([...pages.querySelectorAll("thead th")].map((th) => th.textContent)).toEqual(["Page", "status"]);
+      expect(pages.querySelector("tbody tr")?.textContent).toContain("open");
+      // …and the Blocks section kept the inherited one.
+      expect(blocks.querySelector("table")).toBeNull();
+      expect(blocks.textContent).toContain("alpha work");
+      // The backend's own truncation flag, beside the family it describes.
+      expect(pages.textContent).toContain("More pages match than are shown.");
+      expect(blocks.textContent).not.toContain("More blocks match");
+
+      // Each section names its own control and its own dialog.
+      expect(pages.querySelector('[aria-label="Display pages"]')).not.toBeNull();
+      expect(blocks.querySelector('[aria-label="Display blocks"]')).not.toBeNull();
+      // The membership control belongs to neither namespace's display state.
+      const scope = pages.querySelector<HTMLSelectElement>(".query-page-match select")!;
+      expect(scope.value).toBe("both");
+      expect([...scope.options].map((option) => option.textContent))
+        .toEqual(["Names and aliases", "Page content", "Both"]);
+      expect([...scope.options].map((option) => option.value)).toEqual(["names", "content", "both"]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("q3_absent_scope_inherits_and_present_empty_clears", async () => {
+    // FAIL-BEFORE: nothing distinguished the two, because nothing read either.
+    // `{}` is falsy-shaped in every way that matters, so a truthiness copy of
+    // the draft turns "clear" into "inherit" silently.
+    const search = vi.spyOn(backend(), "runGraphSearch").mockResolvedValue(mixed());
+
+    // No page draft at all: the Pages section inherits the singular sort.
+    loadFriendly('{{query (search "alpha")}}\ntine.view:: list', {
+      form: '(search "alpha")',
+      filter: searchFilter("alpha"),
+      view: { view: "list", sort: [["page", "asc"]] },
+    });
+    let mounted = mount(() => <Block id="query" />);
+    await settleQuery();
+    expect(search.mock.calls.at(-1)?.[6]).toEqual({
+      pageView: { view: "list", sort: [["page", "asc"]] },
+      blockView: { view: "list", sort: [["page", "asc"]] },
+    });
+    mounted.dispose();
+    resetStore();
+
+    // A PRESENT, empty page draft: the marker is there and states nothing, so
+    // the Pages section shows nothing extra. The Blocks section is untouched.
+    loadFriendly('{{query (search "alpha")}}\ntine.view:: list', {
+      form: '(search "alpha")',
+      filter: searchFilter("alpha"),
+      view: { view: "list", sort: [["page", "asc"]] },
+      page_display: {},
+    });
+    mounted = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      expect(search.mock.calls.at(-1)?.[6]).toEqual({
+        pageView: { view: "list" },
+        blockView: { view: "list", sort: [["page", "asc"]] },
+      });
+    } finally {
+      mounted.dispose();
+    }
+  });
+
+  it("q3_scoped_edit_preserves_sibling_and_source", async () => {
+    // FAIL-BEFORE: there was no scoped writer on this path at all, and the one
+    // singular writer rewrote `tine.sort`/`tine.columns` for the whole block.
+    loadFriendly(
+      '{{query (search "alpha")}}\ntine.view:: list\ntine.sort:: page asc\n'
+      + 'tine.block-display:: 1\ntine.block-columns:: owner\nunknown.property:: keep me',
+      {
+        form: '(search "alpha")',
+        filter: searchFilter("alpha"),
+        view: { view: "list", sort: [["page", "asc"]] },
+        block_display: { columns: ["owner"] },
+      },
+    );
+    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue(mixed());
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      const before = doc.byId.query.raw;
+
+      // Switch the PAGES section to a board through its own panel.
+      const pages = root.querySelector<HTMLElement>('[data-query-result-kind="page"]')!;
+      pages.querySelector<HTMLButtonElement>('[aria-label="Display pages"]')!.click();
+      const panel = await vi.waitFor(() => {
+        const found = document.querySelector<HTMLElement>('[aria-label="Page display"]');
+        if (!found) throw new Error("the Page display panel never opened");
+        return found;
+      });
+      [...panel.querySelectorAll<HTMLButtonElement>(".qd-view")]
+        .find((button) => button.textContent?.trim() === "Board")!.click();
+
+      // The page namespace gained its own complete draft…
+      expect(blockProperty("query", "tine.page-view")).toBe("board");
+      expect(blockProperty("query", "tine.page-display")).toBe("1");
+      // …cloned from what the section was ALREADY showing, so the edit did not
+      // silently clear the inherited sort.
+      expect(blockProperty("query", "tine.page-sort")).toBe("page asc");
+      // The sibling namespace, the singular settings, the unknown authored
+      // property and the query TEXT are all exactly as they were.
+      expect(blockProperty("query", "tine.block-columns")).toBe("owner");
+      expect(blockProperty("query", "tine.block-display")).toBe("1");
+      expect(blockProperty("query", "tine.sort")).toBe("page asc");
+      expect(blockProperty("query", "tine.view")).toBe("list");
+      expect(blockProperty("query", "unknown.property")).toBe("keep me");
+      expect(doc.byId.query.raw.split("\n")[0]).toBe(before.split("\n")[0]);
+
+      // One undo unit: the whole scoped change comes back in one step.
+      undo();
+      expect(doc.byId.query.raw).toBe(before);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("q3_mixed_operation_rejects_stale_completion", async () => {
+    // FAIL-BEFORE (I-20): request identity carried the query and the singular
+    // view only, so a read started under one section's settings could land on
+    // a screen showing another's — and both families would then describe
+    // different graph states.
+    loadFriendly('{{query (search "alpha")}}\ntine.view:: list', {
+      form: '(search "alpha")',
+      filter: searchFilter("alpha"),
+      view: { view: "list" },
+    });
+    // The reading the ENGINE would give: it reads `tine.*` off the block every
+    // time, so the membership scope the user just wrote is in the next parse.
+    vi.spyOn(backend(), "parseQuery").mockImplementation(async () => {
+      const written = blockProperty("query", "tine.page-match-scope");
+      return {
+        query: {
+          anchor: "block" as const,
+          filter: searchFilter("alpha"),
+          diagnostics: [],
+          source: { kind: "og" as const, original: '(search "alpha")', og_options: "" },
+        },
+        view: { view: "list" as const },
+        ...(written ? { page_match_scope: written as "names" | "content" | "both" } : {}),
+      };
+    });
+    let releaseFirst!: (value: QueryExecution) => void;
+    const first = new Promise<QueryExecution>((resolve) => { releaseFirst = resolve; });
+    const search = vi.spyOn(backend(), "runGraphSearch")
+      .mockImplementationOnce(() => first)
+      .mockResolvedValue({
+        hits: [pageHit("Beta notes", "pages/beta.md")],
+        diagnostics: [],
+        explanation: { branches: [] },
+        cancelled: false,
+      });
+
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await settleQuery();
+      expect(search).toHaveBeenCalledTimes(1);
+
+      // The membership scope changes while the first read is still in flight.
+      // That is a DIFFERENT question, so it starts its own read. The engine
+      // re-reads the block's properties on every parse, so the stub does too —
+      // a stub that kept answering "no scope" would be testing a backend that
+      // cannot see the property the user just wrote.
+      const scope = root.querySelector<HTMLSelectElement>(".query-page-match select")!;
+      scope.value = "content";
+      scope.dispatchEvent(new Event("change", { bubbles: true }));
+      await settleQuery();
+      expect(search.mock.calls.length).toBeGreaterThan(1);
+      expect(search.mock.calls.at(-1)?.[6]).toMatchObject({ pageMatchScope: "content" });
+      await vi.waitFor(() => expect(
+        root.querySelector('[data-query-result-kind="page"]')?.textContent,
+      ).toContain("Beta notes"));
+
+      // The superseded answer lands late. It describes a query that is no
+      // longer on screen, so nothing about it may reach the sections.
+      releaseFirst(mixed());
+      await settleQuery();
+      const pages = root.querySelector<HTMLElement>('[data-query-result-kind="page"]')!;
+      expect(pages.textContent).toContain("Beta notes");
+      expect(pages.textContent).not.toContain("Alpha notes");
+      expect(root.querySelector('[data-query-result-kind="block"]')?.textContent)
+        .toContain("No matching blocks.");
+    } finally {
+      dispose();
+    }
   });
 });

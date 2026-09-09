@@ -180,6 +180,26 @@ impl QueryPlan {
     pub(crate) fn page_scope(&self) -> Option<&QueryPageScope> {
         self.page_scope.as_ref()
     }
+
+    /// The membership source this search asks for, with absence resolved to the
+    /// historic names-and-aliases behaviour. One resolution, at the boundary
+    /// the request crosses, so no reader can pick a different default.
+    pub(crate) fn page_match_scope(&self) -> crate::query::ir::FriendlyPageMatchScope {
+        self.display
+            .page_match_scope
+            .unwrap_or(crate::query::ir::FriendlyPageMatchScope::Names)
+    }
+
+    /// The already-resolved effective view of the Pages section, present only
+    /// where the caller enabled Display for this search.
+    pub(crate) fn page_view(&self) -> Option<&crate::query::ir::ViewSettings> {
+        self.display.page_view.as_ref()
+    }
+
+    /// The already-resolved effective view of the Blocks section.
+    pub(crate) fn block_view(&self) -> Option<&crate::query::ir::ViewSettings> {
+        self.display.block_view.as_ref()
+    }
 }
 
 /// One routed page used to scope a block-search plan. A supplied relative path
@@ -231,6 +251,18 @@ pub enum QueryHit {
         match_class: ObjectiveMatchClass,
         #[serde(skip_serializing_if = "Option::is_none")]
         matched_alias: Option<String>,
+        /// The hydrated page row, present exactly when this hit came from the
+        /// Display-enabled Friendly path AND names a stored page.
+        ///
+        /// It is ADDITIVE: `page`, `display_text`, `evidence`, `score`,
+        /// `match_class` and `matched_alias` keep their meanings, so the
+        /// switcher, the block picker and every other navigation consumer read
+        /// exactly what they read before. A virtual reference-name suggestion
+        /// names no stored page, so it carries no row and consumes no
+        /// hydration budget — fabricating properties for one would be a page
+        /// that does not exist claiming to have them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<crate::query::ir::PageRow>,
     },
     Block {
         page: String,
@@ -284,6 +316,70 @@ pub(crate) struct ApplicationQueryPlanPage {
     pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
 }
 
+/// **The Display facts a Friendly search runs under** (SPEC §7.6, Q3).
+///
+/// These are operation INPUT, exactly like [`QueryPageScope`] beside them: the
+/// caller has already resolved inheritance (an absent scoped draft against the
+/// singular settings) before it gets here, so the reader never re-inherits a
+/// missing member. Absence at this boundary therefore means "this consumer
+/// stated nothing", not "look somewhere else".
+///
+/// They ride on the plan rather than on a parallel input struct because
+/// `page_scope` — the other per-operation Friendly input — already does, and a
+/// second carriage for the same class of fact is the fork this campaign exists
+/// to remove (D-14).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FriendlyDisplayOptions {
+    /// Which source of page membership this search asks for. `None` is the
+    /// historic names-and-aliases behaviour, resolved HERE and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_match_scope: Option<crate::query::ir::FriendlyPageMatchScope>,
+    /// The already-resolved effective view of the Pages section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_view: Option<crate::query::ir::ViewSettings>,
+    /// The already-resolved effective view of the Blocks section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_view: Option<crate::query::ir::ViewSettings>,
+}
+
+impl FriendlyDisplayOptions {
+    /// The row bound one family actually requests: its own `sample`, never
+    /// larger than the bound its consumer already had. `sample: 0` empties that
+    /// family and only that family; an absent sample leaves the consumer's
+    /// bound alone. No unused capacity transfers between the two.
+    fn admitted(view: Option<&crate::query::ir::ViewSettings>, limit: usize) -> usize {
+        match view.and_then(|view| view.sample) {
+            Some(sample) => (sample as usize).min(limit),
+            None => limit,
+        }
+    }
+}
+
+/// **The one Friendly graph-search plan builder** (I-12, D-4).
+///
+/// Every public Friendly route — Direct's `run_graph_search*`, the Managed
+/// `application_navigation` GraphSearch arm — asks THIS function which plan a
+/// `(source, limits, routed scope, Display)` request means. Each used to spell
+/// the same `match scope { … }` itself, and a routed search that forgot to
+/// carry a section's sample or membership scope would have been a difference
+/// between backends nobody could see from either side (I-19).
+pub fn friendly_search_plan(
+    source: &str,
+    page_limit: usize,
+    block_limit: usize,
+    scope: Option<QueryPageScope>,
+    display: FriendlyDisplayOptions,
+) -> QueryPlan {
+    match scope {
+        // A routed search selects blocks inside ONE physical page, so it has no
+        // Pages section and page membership scope does not apply to it.
+        Some(scope) => {
+            QueryPlan::friendly_for_page_with_display(source, block_limit, scope, display)
+        }
+        None => QueryPlan::friendly_with_display(source, page_limit, block_limit, display),
+    }
+}
+
 /// Compiled friendly graph-search plan.  Regexes are compiled once and kept off
 /// the wire; the public expression remains inspectable/serializable.
 #[derive(Debug, Clone)]
@@ -291,6 +387,7 @@ pub struct QueryPlan {
     pub branches: Vec<QueryBranch>,
     pub diagnostics: Vec<QueryDiagnostic>,
     page_scope: Option<QueryPageScope>,
+    display: FriendlyDisplayOptions,
     // Ctrl-K keeps the literal trimmed launcher source so a multi-word page
     // title/alias can retain the objective Exact class. The parsed AND terms
     // alone would otherwise downgrade `Foo Bar` to Prefix/Substring and make
@@ -304,6 +401,32 @@ impl QueryPlan {
     /// ordinary contains/phrase/regex semantics for block content.  Multi-term
     /// and operator searches use the same boolean grammar on both entity kinds.
     pub fn friendly(query: &str, page_limit: usize, block_limit: usize) -> Self {
+        Self::friendly_with_display(
+            query,
+            page_limit,
+            block_limit,
+            FriendlyDisplayOptions::default(),
+        )
+    }
+
+    /// The same plan, under stated Display settings. Each family's `sample`
+    /// reduces ITS OWN requested rows before selection, so the two sections are
+    /// independently bounded and neither can spend the other's capacity.
+    pub fn friendly_with_display(
+        query: &str,
+        page_limit: usize,
+        block_limit: usize,
+        display: FriendlyDisplayOptions,
+    ) -> Self {
+        let page_limit = FriendlyDisplayOptions::admitted(display.page_view.as_ref(), page_limit);
+        let block_limit =
+            FriendlyDisplayOptions::admitted(display.block_view.as_ref(), block_limit);
+        let mut plan = Self::friendly_plan(query, page_limit, block_limit);
+        plan.display = display;
+        plan
+    }
+
+    fn friendly_plan(query: &str, page_limit: usize, block_limit: usize) -> Self {
         let matcher = Matcher::parse(query);
         let mut next_id = 1;
         let mut regexes = HashMap::new();
@@ -352,6 +475,7 @@ impl QueryPlan {
             branches,
             diagnostics,
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: (!query.trim().is_empty()).then(|| canonical_fold(query.trim())),
             regexes,
         }
@@ -360,8 +484,28 @@ impl QueryPlan {
     /// Current-page search is a block-only execution profile of the same typed
     /// friendly plan—not a frontend filter over whole-graph results.
     pub fn friendly_for_page(query: &str, block_limit: usize, scope: QueryPageScope) -> Self {
+        Self::friendly_for_page_with_display(
+            query,
+            block_limit,
+            scope,
+            FriendlyDisplayOptions::default(),
+        )
+    }
+
+    /// Routed-page search under stated Display settings. Page membership scope
+    /// is not consulted: this profile selects blocks inside one physical page,
+    /// so there is no Pages section for it to describe.
+    pub fn friendly_for_page_with_display(
+        query: &str,
+        block_limit: usize,
+        scope: QueryPageScope,
+        display: FriendlyDisplayOptions,
+    ) -> Self {
+        let block_limit =
+            FriendlyDisplayOptions::admitted(display.block_view.as_ref(), block_limit);
         let mut plan = Self::block_search(query, block_limit);
         plan.page_scope = Some(scope);
+        plan.display = display;
         plan
     }
 
@@ -383,6 +527,7 @@ impl QueryPlan {
             }],
             diagnostics: Vec::new(),
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
         }
@@ -422,6 +567,7 @@ impl QueryPlan {
             branches,
             diagnostics,
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes,
         }
@@ -449,6 +595,7 @@ impl QueryPlan {
             branches,
             diagnostics: Vec::new(),
             page_scope: None,
+            display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
         }
@@ -1795,6 +1942,8 @@ fn execute_page_candidates(
                     score: winner.score,
                     match_class: winner.match_class,
                     matched_alias: winner.matched_alias,
+                    // The walk oracle answers no Display-enabled request.
+                    row: None,
                 }
             })
             .collect(),
@@ -2957,6 +3106,9 @@ mod tests {
             score: 1_000,
             match_class: ObjectiveMatchClass::Prefix,
             matched_alias: None,
+            // Additive and absent: the wire shape of a hit that carries no
+            // hydrated row is EXACTLY the shape it had before this field.
+            row: None,
         };
 
         assert_eq!(
