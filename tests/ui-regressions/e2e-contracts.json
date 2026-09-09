@@ -768,7 +768,8 @@
    "nonRequirements": [
     "Pixel geometry of the panel on a wide screen, animation, or the order of rows within one ordered list beyond what the user set."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-09 (Claude): HARNESS DEBT, narrowed but NOT closed. 9336c797 routed every `.qd-panel` interaction through one find-and-activate `browser.execute`, and the burn-in measured 10 of 10 on that binary against 8 of 10 before it, so it was un-quarantined in b9a140c9. That was premature: it failed on the very next run, at b4540f43, on the ONE interaction the repair did not make atomic -- `.qd-panel .qd-sample` is activated in one round trip and then typed into by a SEPARATE `browser.keys` round trip, so a remount between the two swallows the keystrokes and `tine.sample` stays \"5\". Standing evidence: 13 of 14 passes (10 + 3 on rerun, 1 failure); the product is not implicated, because no product code changed between the 10 passes and the failure. The remaining repair is the same pattern once more: set the value and observe the property in a loop that retries the WHOLE interaction, the way scripts/lib/e2e-navigation.mjs retries a whole selection. It was NOT done here because this journey has now taken 5 commits in one batch; Martin released the churn alarm once for the class repair and that release does not carry forward. Keep running it for artifacts; it still holds the only coverage that has ever caught a real product defect on this surface."
   },
   "scripts/e2e-query-workspace.mjs": {
    "contracts": [
