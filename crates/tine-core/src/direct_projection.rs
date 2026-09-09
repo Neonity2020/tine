@@ -3125,6 +3125,107 @@ mod tests {
         }
     }
 
+    /// Reopening a projection database without releasing the previous worker is
+    /// a race, so no fixture may do it.
+    ///
+    /// This is a source scan because the defect is invisible at runtime on a fast
+    /// machine: the two tests that took down the Linux release selection on
+    /// 2026-09-09 pass locally in 0.05s and failed on a loaded hosted runner
+    /// after the full 15s `wait_ready` deadline, reporting `cache_generation=0`
+    /// and `Resource temporarily unavailable (os error 11)`. Eight of the twelve
+    /// sites had already half-noticed it and slept 20ms, which is a guess about
+    /// a handoff nobody observed; `release_projection` waits for the actual
+    /// signal instead. Add the call -- do not add a sleep.
+    #[test]
+    fn every_fixture_that_reopens_a_projection_database_releases_the_previous_worker() {
+        const SOURCE: &str = include_str!("direct_projection.rs");
+        // Deliberate exception: this test IS the two-live-owners scenario, and
+        // its second instance must meet a held lease.
+        const TWO_OWNERS: &str = "concurrent_graph_instance_cannot_replace_ready_projection_facts";
+
+        let mut offenders: Vec<&str> = Vec::new();
+        let mut current = "<file scope>";
+        let mut attaches = 0usize;
+        let mut releases = 0usize;
+        let mut flush =
+            |name: &'static str, attaches: usize, releases: usize| -> Option<&'static str> {
+                (attaches >= 2 && releases == 0 && name != TWO_OWNERS).then_some(name)
+            };
+        for line in SOURCE.lines() {
+            if let Some(rest) = line
+                .strip_prefix("    fn ")
+                .or_else(|| line.strip_prefix("    pub(crate) fn "))
+            {
+                if let Some(offender) = flush(
+                    Box::leak(current.to_owned().into_boxed_str()),
+                    attaches,
+                    releases,
+                ) {
+                    offenders.push(offender);
+                }
+                current = Box::leak(
+                    rest.split('(')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned()
+                        .into_boxed_str(),
+                );
+                attaches = 0;
+                releases = 0;
+            }
+            if line.contains("attach_direct_projection(database") {
+                attaches += 1;
+            }
+            if line.contains("release_projection(&") {
+                releases += 1;
+            }
+        }
+        if let Some(offender) = flush(
+            Box::leak(current.to_owned().into_boxed_str()),
+            attaches,
+            releases,
+        ) {
+            offenders.push(offender);
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these fixtures reattach the same projection database without calling \
+             release_projection first, so the reopen races the previous worker's \
+             exclusive writer lease and fails only under load: {offenders:?}. Call \
+             release_projection(&graph) as the last statement of the first session; \
+             a sleep is a guess, not a handoff."
+        );
+    }
+
+    /// Release a projection so the SAME database can be reattached.
+    ///
+    /// `Drop` deliberately does NOT wait for the worker (see
+    /// [`DirectProjection::close_and_wait_for_worker`]: an app teardown must not
+    /// block on SQLite), and the worker releases its exclusive writer lease only
+    /// just before it publishes its exit. So a fixture that drops one graph and
+    /// immediately reattaches the same path can find the lease still held. The
+    /// second instance then never becomes ready -- by design, proven by
+    /// `concurrent_graph_instance_cannot_replace_ready_projection_facts` -- and
+    /// `wait_ready` spins its whole 15s before panicking "did not converge" with
+    /// `cache_generation=0`, naming the reopen rather than the handoff.
+    ///
+    /// That is not hypothetical: it is what took down the Linux release
+    /// selection on 2026-09-09, on a loaded hosted runner, in two tests that
+    /// pass locally in 0.05s. Every fixture that reopens a projection database
+    /// calls this first.
+    fn release_projection(graph: &Graph) {
+        let Some(projection) = graph.direct_projection_test() else {
+            return;
+        };
+        assert!(
+            projection.close_and_wait_for_worker(Duration::from_secs(15)),
+            "the projection worker did not release its writer lease, so reattaching \
+             the same database would race it"
+        );
+    }
+
     fn wait_ready(graph: &Graph) {
         let started = Instant::now();
         while !graph.direct_projection_ready_test() {
@@ -4067,6 +4168,7 @@ mod tests {
             graph.save_page(&page, baseline.as_deref()).unwrap();
             wait_ready(&graph);
             assert_eq!(*projection.session_pages_test(), ids(&graph, &["one"]));
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
 
@@ -5437,6 +5539,7 @@ mod tests {
             graph.warm_cache();
             wait_ready(&graph);
             assert_eq!(lowerings(), 2);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
 
@@ -5447,6 +5550,7 @@ mod tests {
             graph.warm_cache();
             wait_ready(&graph);
             assert_eq!(lowerings(), 0, "unchanged pages must stay inside SQLite");
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
 
@@ -5897,6 +6001,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database).unwrap();
@@ -6045,6 +6150,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database).unwrap();
@@ -6088,6 +6194,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database).unwrap();
@@ -6136,6 +6243,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
 
@@ -6730,6 +6838,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database).unwrap();
@@ -6802,6 +6911,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(root.join("pages/two.md"), "- TODO two changed\n").unwrap();
@@ -6845,6 +6955,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
         // Schema damage (a dropped fact table) is the in-scope shape: the open
@@ -7412,6 +7523,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
         let graph = Graph::open(&root);
@@ -7450,6 +7562,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
         let graph = Graph::open(&root);
@@ -7490,6 +7603,7 @@ mod tests {
             graph.attach_direct_projection(database.clone()).unwrap();
             graph.warm_cache();
             wait_ready(&graph);
+            release_projection(&graph);
         }
         std::thread::sleep(Duration::from_millis(20));
 
