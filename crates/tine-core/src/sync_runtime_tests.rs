@@ -31172,26 +31172,35 @@ fn c7b_query_walk_boundaries_are_shared_and_live_sql_does_not_restore_a_walk() {
         "Managed SQL rows must reach the shared final view transform"
     );
 
-    // Copy / Export intentionally remains a production walk. Its Direct and
-    // Managed adapters still share one selection/hydration driver, while the
-    // non-export walk above remains a differential oracle for SQL.
-    for producer in ["export_query_subtrees", "export_application_query_subtrees"] {
-        let body = c7b_fn_body(C7B_QUERY_RS, producer);
+    // The backend boundaries supply captures; ONE shared SQLite executor owns
+    // export selection and subtree hydration. The remaining walk is an oracle.
+    for (file, producer) in [
+        ("crates/tine-core/src/model.rs", "export_query_subtrees"),
+        ("crates/tine-core/src/managed_query.rs", "execute_export"),
+    ] {
+        let body = c7b_fn_body(file, producer);
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            body.contains("export_query_subtrees_over("),
-            "{producer} must delegate to the shared export walk"
+            compact.contains("prepared.execute("),
+            "{producer} must call the shared SQL export executor"
         );
-        for marker in [
+        for forbidden in [
+            "export_query_subtrees_over(",
             "select_export_queries(",
-            "hydrate_selected_export_queries(",
-            "QUERY_EXPORT_CONSTRUCTION_ROWS",
+            "with_hydration_pages(",
+            "hydrate_located_export_queries(",
         ] {
             assert!(
-                !body.contains(marker),
-                "{producer} duplicated export-walk algorithm `{marker}`"
+                !body.contains(forbidden),
+                "{producer} duplicated or restored export traversal: {forbidden}"
             );
         }
     }
+    let public = c7b_fn_body(C7B_SYNC_RUNTIME_RS, "application_navigation");
+    assert!(
+        public.contains("application_captured_export("),
+        "Managed export must leave the navigation actor before SQL"
+    );
     let export = c7b_fn_body(C7B_QUERY_RS, "export_query_subtrees_over");
     for marker in [
         "select_export_queries(",
@@ -31212,6 +31221,11 @@ fn c7b_query_walk_boundaries_are_shared_and_live_sql_does_not_restore_a_walk() {
     // The retired managed evaluator must be gone from production, not renamed.
     let files = crate::projection_producer_census::production_rust();
     for retired in [
+        "export_application_query_subtrees",
+        "application_export_query_subtrees_ready",
+        "export_query_subtrees_over",
+        "hydrate_selected_export_queries",
+        "application_property_registry_ready",
         "run_application_pred_pages_bounded",
         "application_page_block_referrers_dto",
     ] {
@@ -35492,6 +35506,22 @@ fn managed_live_reads_hold_main_while_editor_state_is_pending_then_follow_drain(
             ),
             ret2_advanced_navigate(handle, RET2_ADVANCED_QUERY, None, R4B_ROWS, R4B_BYTES).unwrap(),
             registry(handle),
+            c7b_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                    specs: vec![crate::query::QueryExportSpec {
+                        key: "pending".into(),
+                        query: "(property main-only pending)".into(),
+                        advanced: false,
+                        simple_dialect: None,
+                        current_page: None,
+                    }],
+                    max_queries: 8,
+                    max_roots: 128,
+                    max_nodes: 512,
+                    max_bytes: 1 << 20,
+                },
+            ),
         )
     };
 
@@ -35560,6 +35590,12 @@ fn managed_live_reads_hold_main_while_editor_state_is_pending_then_follow_drain(
         "public property metadata follows the accepted drain"
     );
 
+    assert_ne!(
+        serde_json::to_value(&after.5).unwrap(),
+        serde_json::to_value(&before.5).unwrap(),
+        "public export follows the accepted property change"
+    );
+
     let (mut page, revision) = load_application_exact(&handle, &witness_path);
     page.blocks
         .retain(|block| !block.raw.contains("TODO pending main"));
@@ -35590,6 +35626,11 @@ fn managed_live_reads_hold_main_while_editor_state_is_pending_then_follow_drain(
         serde_json::to_value(&deleted.1).unwrap(),
         serde_json::to_value(&after.1).unwrap(),
         "the page query's blocks relation follows the accepted deletion"
+    );
+    assert_ne!(
+        serde_json::to_value(&deleted.5).unwrap(),
+        serde_json::to_value(&after.5).unwrap(),
+        "public export follows the accepted deletion"
     );
 }
 

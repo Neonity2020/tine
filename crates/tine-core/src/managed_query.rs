@@ -53,6 +53,28 @@ pub(crate) struct ManagedReadInput<'a> {
     pub(crate) registry: Option<&'a ManagedRegistryCapture>,
 }
 
+/// Immutable inputs for any operation reading the current main projection.
+pub(crate) struct ManagedReadCapture {
+    pub(crate) job_epoch: crate::query_jobs::QueryJobEpoch,
+    pub(crate) path: PathBuf,
+    pub(crate) graph_root: PathBuf,
+    pub(crate) stamp: ManagedQueryStamp,
+    pub(crate) config: ParseConfig,
+    pub(crate) journal_format: JournalFormat,
+    pub(crate) registry: Option<ManagedRegistryCapture>,
+}
+
+impl ManagedReadCapture {
+    pub(crate) fn read_input(&self) -> ManagedReadInput<'_> {
+        ManagedReadInput {
+            path: &self.path,
+            stamp: &self.stamp,
+            config: &self.config,
+            registry: self.registry.as_ref(),
+        }
+    }
+}
+
 pub(crate) struct ManagedQueryCapture {
     pub(crate) job_epoch: crate::query_jobs::QueryJobEpoch,
     pub(crate) path: PathBuf,
@@ -189,31 +211,46 @@ pub(crate) fn execute_managed_query(
     census: &ManagedQueryCensus,
     wait: Duration,
 ) -> ManagedQueryOutcome {
-    let slot = match owner.acquire_at_within(capture.job_epoch, wait) {
+    match with_managed_read(
+        capture.job_epoch,
+        &capture.read_input(),
+        owner,
+        wait,
+        |opened| {
+            Ok(execute_main_source(
+                capture,
+                opened.snapshot,
+                &opened.registry,
+                census,
+            ))
+        },
+    ) {
+        Ok(outcome) | Err(outcome) => outcome,
+    }
+}
+
+/// Admission precedes opening the transaction; every exit drops the snapshot
+/// before releasing capacity and checks cancellation after construction.
+pub(crate) fn with_managed_read<T>(
+    epoch: crate::query_jobs::QueryJobEpoch,
+    input: &ManagedReadInput<'_>,
+    owner: &QueryJobOwner,
+    wait: Duration,
+    read: impl FnOnce(OpenedManagedRead) -> Result<T, ManagedQueryOutcome>,
+) -> Result<T, ManagedQueryOutcome> {
+    let slot = match owner.acquire_at_within(epoch, wait) {
         Admission::Slot(slot) => slot,
-        Admission::Busy => return ManagedQueryOutcome::Busy,
-        Admission::Cancelled => return ManagedQueryOutcome::Cancelled,
+        Admission::Busy => return Err(ManagedQueryOutcome::Busy),
+        Admission::Cancelled => return Err(ManagedQueryOutcome::Cancelled),
     };
-    let outcome = execute_on_slot(capture, &slot, census);
+    let outcome = open_managed_read(input, &slot).and_then(read);
     let outcome = if slot.is_cancelled() {
-        ManagedQueryOutcome::Cancelled
+        Err(ManagedQueryOutcome::Cancelled)
     } else {
         outcome
     };
     drop(slot);
     outcome
-}
-
-fn execute_on_slot(
-    capture: &ManagedQueryCapture,
-    slot: &JobSlot<'_>,
-    census: &ManagedQueryCensus,
-) -> ManagedQueryOutcome {
-    let opened = match open_managed_read(&capture.read_input(), slot) {
-        Ok(opened) => opened,
-        Err(outcome) => return outcome,
-    };
-    execute_main_source(capture, opened.snapshot, &opened.registry, census)
 }
 
 pub(crate) struct OpenedManagedRead {
@@ -457,6 +494,57 @@ impl ManagedQueryShared {
             return outcome;
         }
         execute_managed_query(capture, &self.jobs, &self.census, self.job_wait())
+    }
+
+    pub(crate) fn execute_export(
+        &self,
+        capture: &ManagedReadCapture,
+        prepared: &crate::query::export_execute::PreparedExportBatch,
+        max_roots: usize,
+        max_nodes: usize,
+        max_bytes: usize,
+    ) -> Result<crate::query::QueryExportBatch, ManagedQueryOutcome> {
+        let answer = with_managed_read(
+            capture.job_epoch,
+            &capture.read_input(),
+            &self.jobs,
+            self.job_wait(),
+            |mut opened| {
+                let recency = |page: RecencyPage<'_>| {
+                    capture.journal_format.page_recency_secs(
+                        page.kind == PageKind::Journal,
+                        page.name,
+                        &capture.graph_root.join(page.path),
+                    )
+                };
+                prepared
+                    .execute(
+                        &mut opened.snapshot,
+                        &crate::query::export_execute::ExportExecutionInputs {
+                            registry: &opened.registry,
+                            identity: &ResultIdentity::Stored,
+                            order: BackendOrder::Managed,
+                            recency: &recency,
+                            max_roots,
+                            max_nodes,
+                            max_bytes,
+                        },
+                    )
+                    .map_err(|error| match error {
+                        ResultReadError::Cancelled => ManagedQueryOutcome::Cancelled,
+                        ResultReadError::Sql(_) => {
+                            ManagedQueryOutcome::Failed("managed export statement")
+                        }
+                        ResultReadError::Corrupt(_) => {
+                            ManagedQueryOutcome::Failed("managed export result rows")
+                        }
+                    })
+            },
+        );
+        if answer.is_ok() {
+            self.census.note_statement_read();
+        }
+        answer
     }
 
     pub(crate) fn execute_metadata(

@@ -1961,14 +1961,13 @@ pub(crate) async fn export_query_subtrees(
             },
             None => {
                 let graph = slot.legacy_graph()?;
-                tine_core::query::export_query_subtrees(
-                    &graph,
+                graph.export_query_subtrees(
                     &specs,
                     QUERY_EXPORT_MAX_QUERIES,
                     QUERY_EXPORT_MAX_ROOTS,
                     QUERY_EXPORT_MAX_NODES,
                     QUERY_EXPORT_MAX_BYTES,
-                )
+                )?
             }
         };
         let bytes = batch

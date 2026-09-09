@@ -185,9 +185,39 @@ fn live_query_and_registry_read_actual_main_when_required_frontier_is_ahead() {
         .iter()
         .any(|row| row.normalized_name == "lonely"));
     assert_read_only(&actor, "registry execution");
+
+    let specs = [crate::query::QueryExportSpec {
+        key: "committed".into(),
+        query: "(task TODO)".into(),
+        advanced: false,
+        simple_dialect: None,
+        current_page: None,
+    }];
+    let prepared =
+        crate::query::export_execute::PreparedExportBatch::prepare(&specs, 8, query.today);
+    let export_capture = actor
+        .capture_current_query_read(prepared.requires_registry())
+        .expect("export capture must not settle retained publication");
+    assert_read_only(&actor, "export capture");
+    let exported = shared
+        .execute_export(&export_capture, &prepared, 128, 1024, 1 << 20)
+        .expect("export must read the current main image without settling retained publication");
+    assert_eq!(
+        serde_json::to_value(&exported.results[0].groups).unwrap(),
+        serde_json::to_value(&answer.groups).unwrap()
+    );
+    assert_read_only(&actor, "export execution");
     assert_eq!(
         actor.active_database().unwrap().frontier_root().unwrap(),
         actual,
         "query execution must not drain or write the pending accepted operation"
+    );
+    shared.jobs.begin_drain();
+    assert!(
+        matches!(
+            shared.execute_export(&export_capture, &prepared, 128, 1024, 1 << 20),
+            Err(crate::managed_query::ManagedQueryOutcome::Cancelled)
+        ),
+        "a retired projection cannot execute a captured export"
     );
 }

@@ -50,6 +50,7 @@
     "e2e:external-assets": "node scripts/e2e-external-assets.mjs",
     "e2e:outline-guide": "node scripts/e2e-outline-guide.mjs",
     "e2e:query-scroll": "node scripts/e2e-query-result-scroll.mjs",
+    "e2e:query-export": "node scripts/e2e-query-export.mjs",
     "e2e:query-scroll:sorted": "E2E_QUERY_TEXT='(task TODO) (sort-by page asc)' E2E_QUERY_FLAT=1 node scripts/e2e-query-result-scroll.mjs",
     "e2e:linux:smoke": "node scripts/run-e2e.mjs linux-smoke",
     "e2e:linux:release": "node scripts/run-e2e.mjs linux-release",

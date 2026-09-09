@@ -6752,6 +6752,58 @@ impl Graph {
         DirectAttempt::Answered(pre)
     }
 
+    /// Export selected query subtrees from the current committed projection.
+    /// Preparation and construction are shared with every backend adapter.
+    pub fn export_query_subtrees(
+        &self,
+        specs: &[crate::query::QueryExportSpec],
+        max_queries: usize,
+        max_roots: usize,
+        max_nodes: usize,
+        max_bytes: usize,
+    ) -> Result<crate::query::QueryExportBatch, crate::query::QueryExecutionError> {
+        use crate::query::export_execute::{ExportExecutionInputs, PreparedExportBatch};
+        let prepared =
+            PreparedExportBatch::prepare(specs, max_queries, crate::date::JournalDate::today());
+        if let Some(answer) = prepared.all_refused_result(max_roots) {
+            return Ok(answer);
+        }
+        let sensitivity = if prepared.requires_registry() {
+            crate::direct_projection::RegistrySensitivity::Required
+        } else {
+            crate::direct_projection::RegistrySensitivity::Insensitive
+        };
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_read_job(request, sensitivity, |job| {
+                let registry = self.direct_lowering_registry(prepared.requires_registry(), job)?;
+                let identity = crate::query::results::ResultIdentity::DirectStructural {
+                    session_pages: Arc::clone(&job.session_pages),
+                    all_session: false,
+                };
+                let recency = |page: crate::query::results::RecencyPage<'_>| {
+                    crate::query::page_recency_secs_for(
+                        page.journal_day,
+                        &self.root.join(page.path),
+                    )
+                };
+                prepared
+                    .execute(
+                        &mut job.snapshot,
+                        &ExportExecutionInputs {
+                            registry: &registry,
+                            identity: &identity,
+                            order: crate::query::results::BackendOrder::Direct,
+                            recency: &recency,
+                            max_roots,
+                            max_nodes,
+                            max_bytes,
+                        },
+                    )
+                    .map_err(Into::into)
+            })
+        })
+    }
+
     /// **SPEC §7.1 `query_run`'s Direct Files execution** (RET1).
     ///
     /// The public IR command used to hand `GraphQueryPages` to the shared
@@ -6883,6 +6935,21 @@ impl Graph {
             bool,
         ) -> Result<T, crate::query::QueryExecutionError>,
     ) -> DirectAttempt<T> {
+        self.direct_projection_read_job(request, registry_sensitivity, |job| {
+            let fts_ready = crate::query::results::probe_fts_ready(&mut job.snapshot)?;
+            read(job, fts_ready)
+        })
+    }
+
+    /// Own admission and one current read job; callers supply only their reads.
+    fn direct_projection_read_job<T>(
+        &self,
+        request: &DirectQueryRequest,
+        registry_sensitivity: crate::direct_projection::RegistrySensitivity,
+        read: impl FnOnce(
+            &mut crate::direct_projection::DirectQueryJob,
+        ) -> Result<T, crate::query::QueryExecutionError>,
+    ) -> DirectAttempt<T> {
         let Some((projection, _)) = request.as_ref() else {
             return DirectAttempt::Unavailable(
                 crate::query::QueryUnavailableReason::ProjectionUnavailable,
@@ -6897,11 +6964,7 @@ impl Graph {
             }
             crate::direct_projection::QueryJobOpen::Cancelled => return DirectAttempt::Cancelled,
         };
-        let fts_ready = match crate::query::results::probe_fts_ready(&mut job.snapshot) {
-            Ok(ready) => ready,
-            Err(error) => return direct_attempt_from_read(Err(error.into())),
-        };
-        direct_attempt_from_read(read(&mut job, fts_ready))
+        direct_attempt_from_read(read(&mut job))
     }
 
     /// The §6.2 lowering inputs one Direct execution runs under: ONE registry

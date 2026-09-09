@@ -49,6 +49,7 @@ pub(crate) mod results;
 // Managed export adapters will call rather than something a release build
 // reaches yet — that migration is the manager's next packet, and until it lands
 // the module says "not called yet" once, here.
+pub(crate) mod export_execute;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod export_results;
 pub(crate) mod tql;
@@ -2189,6 +2190,7 @@ pub(crate) trait QueryPageSource {
     /// hydration resolves selected roots in query order, not page order, so it
     /// cannot emit while streaming. Streaming callers use
     /// [`QueryPageSource::for_each_page`] and allocate nothing extra.
+    #[cfg(test)]
     fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>]));
 
     /// The graph config the property atomizer reads (§5.8 M21). Supplied by the
@@ -2230,6 +2232,7 @@ impl QueryPageSource for GraphQueryPagesInMode<'_> {
     fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
         self.0.for_each_page(visit);
     }
+    #[cfg(test)]
     fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
         self.0.with_hydration_pages(run);
     }
@@ -2287,6 +2290,7 @@ impl QueryPageSource for GraphQueryPages<'_> {
         });
     }
 
+    #[cfg(test)]
     fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
         self.0.with_pages(|pages| {
             let pages = pages
@@ -2343,6 +2347,7 @@ impl QueryPageSource for ApplicationQueryPages<'_> {
         }
     }
 
+    #[cfg(test)]
     fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
         let pages = self
             .pages
@@ -5301,6 +5306,7 @@ pub struct QueryExportBatch {
     pub omitted_queries: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SelectedExportRoot {
     page: String,
@@ -5322,6 +5328,7 @@ pub(crate) struct SelectedExportQueryOf<R> {
     pub(crate) roots: Vec<R>,
 }
 
+#[cfg(test)]
 type SelectedExportQuery = SelectedExportQueryOf<SelectedExportRoot>;
 
 /// What ONE evaluated query macro contributed, before root admission.
@@ -5334,12 +5341,14 @@ pub(crate) struct ExportSelectionAnswer<B> {
 /// One page as export hydration sees it. Built by each backend's
 /// [`QueryPageSource::with_hydration_pages`]; neither export entry point
 /// constructs it.
+#[cfg(test)]
 pub(crate) struct ExportHydrationPage<'a> {
     kind: PageKind,
     name: &'a str,
     roots: &'a [DocBlock],
 }
 
+#[cfg(test)]
 fn hydrate_selected_export_queries(
     selected: Vec<SelectedExportQuery>,
     source: &dyn QueryPageSource,
@@ -5395,6 +5404,7 @@ fn hydrate_selected_export_queries(
 /// Emit the bounded DTOs for the already-located roots, in SELECTED-QUERY order
 /// (not page order): the node and byte budget is cumulative across macros, so
 /// the emission order is part of the contract.
+#[cfg(test)]
 fn emit_selected_export_queries(
     selected: &[SelectedExportQuery],
     found: &HashMap<(PageKind, String, String), &DocBlock>,
@@ -5509,6 +5519,7 @@ pub(crate) fn select_export_queries_over<B, R, E>(
     Ok((query_limit, selected))
 }
 
+#[cfg(test)]
 fn select_export_queries(
     specs: &[QueryExportSpec],
     max_queries: usize,
@@ -5552,6 +5563,7 @@ fn select_export_queries(
 /// export limit. Each relevant source document is scanned at most once and only
 /// references to the requested roots are retained while the graph snapshot is
 /// borrowed.
+#[cfg(test)]
 pub fn export_query_subtrees(
     graph: &Graph,
     specs: &[QueryExportSpec],
@@ -5570,39 +5582,15 @@ pub fn export_query_subtrees(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn export_application_query_subtrees(
-    pages: &[ApplicationQueryPage],
-    specs: &[QueryExportSpec],
-    max_queries: usize,
-    max_roots: usize,
-    max_nodes: usize,
-    max_bytes: usize,
-    config: crate::config::ParseConfig,
-    registry: std::sync::Arc<registry::Registry>,
-) -> QueryExportBatch {
-    export_query_subtrees_over(
-        &ApplicationQueryPages {
-            pages,
-            config,
-            registry,
-        },
-        specs,
-        max_queries,
-        max_roots,
-        max_nodes,
-        max_bytes,
-    )
-}
-
 /// The construction ceiling one exported query macro may reach while SELECTING
 /// its roots, before the caller's own node/byte budget bounds hydration. One
 /// definition: the two storage modes previously carried a private copy each.
 pub(crate) const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
 pub(crate) const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
 
-/// The ONE query-export driver: selection ceiling, simple/advanced dispatch,
-/// root selection under the global root budget, and hydration.
+/// Independent walk oracle for export selection and hydration. Production
+/// adapters use export_execute::PreparedExportBatch on one SQLite snapshot.
+#[cfg(test)]
 fn export_query_subtrees_over(
     source: &dyn QueryPageSource,
     specs: &[QueryExportSpec],

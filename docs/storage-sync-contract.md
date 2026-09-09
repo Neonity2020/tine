@@ -870,7 +870,7 @@ The authoritative pending editor and navigation state remains in its ordinary jo
 
 Lifecycle cancellation reaches both queued captures and open read handles. Capacity is acquired before transactions; the transaction ends before the job slot is released. Closure and projection replacement cancel and drain the existing job owner before closing the projection. Ordinary accepted writes coexist with readers under WAL and do not cancel them. A stale acquisition recaptures at most twice, then reports typed readiness; busy admission reports busy readiness; cancellation remains cancellation; failed reads report unavailability. No outcome switches to traversal. The independent traversal oracle remains test-only for these migrated surfaces. Advanced source parsing, binding, limits and refused-source reports keep their existing shared owner and semantics.
 
-Copy/export and Friendly query routing are separate remaining campaign consumers until their SQL migration is accepted; this live-read contract does not claim they have already migrated.
+Copy/export query subtrees use the same current-main snapshot boundary and one shared SQL export executor on both backends. The Managed adapter releases the actor before SQL selection and subtree hydration; it neither includes pending editor pages nor advances their save continuation. Root/node/byte limits remain cumulative over the command. The previous export walkers and actor merged-registry cache exist only as test oracles. Static publication query rendering and Friendly search remain separate campaign consumers until their SQL migration is accepted.
 
 ## 2. Enrollment and synchronization state machine
 

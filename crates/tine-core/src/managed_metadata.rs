@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use crate::config::ParseConfig;
 use crate::managed_query::{
-    open_managed_read, ManagedQueryCensus, ManagedQueryOutcome, ManagedQueryStamp,
+    with_managed_read, ManagedQueryCensus, ManagedQueryOutcome, ManagedQueryStamp,
     ManagedReadInput, ManagedRegistryCapture,
 };
 use crate::query::ir::RegistrySnapshot;
-use crate::query_jobs::{Admission, QueryJobOwner};
+use crate::query_jobs::QueryJobOwner;
 
 #[cfg(test)]
 thread_local! {
@@ -56,33 +56,25 @@ pub(crate) fn execute_managed_metadata(
     census: &ManagedQueryCensus,
     wait: Duration,
 ) -> ManagedMetadataOutcome {
-    let slot = match owner.acquire_at_within(capture.job_epoch, wait) {
-        Admission::Slot(slot) => slot,
-        Admission::Busy => return ManagedMetadataOutcome::NotAnswered(ManagedQueryOutcome::Busy),
-        Admission::Cancelled => {
-            return ManagedMetadataOutcome::NotAnswered(ManagedQueryOutcome::Cancelled)
-        }
-    };
-    let outcome = match open_managed_read(&capture.read_input(), &slot) {
-        Ok(opened) => {
+    let outcome = with_managed_read(
+        capture.job_epoch,
+        &capture.read_input(),
+        owner,
+        wait,
+        |opened| {
             let snapshot = opened.registry.snapshot();
             #[cfg(test)]
             if DRAIN_AFTER_CONSTRUCTION.with(|enabled| enabled.replace(false)) {
                 owner.begin_drain();
             }
-            drop(opened);
+            Ok(snapshot)
+        },
+    );
+    match outcome {
+        Ok(snapshot) => {
+            census.note_metadata_read();
             ManagedMetadataOutcome::Answered(snapshot)
         }
         Err(outcome) => ManagedMetadataOutcome::NotAnswered(outcome),
-    };
-    let outcome = if slot.is_cancelled() {
-        ManagedMetadataOutcome::NotAnswered(ManagedQueryOutcome::Cancelled)
-    } else {
-        if matches!(&outcome, ManagedMetadataOutcome::Answered(_)) {
-            census.note_metadata_read();
-        }
-        outcome
-    };
-    drop(slot);
-    outcome
+    }
 }

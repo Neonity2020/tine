@@ -2096,10 +2096,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // mask decoding disappear. No authority write boundary is added.
     // Final single-source cleanup removes exactly one additional tuple: the
     // compiler-only PhysicalQueryValue::Blob binding for the deleted page mask.
-    // Adding that tuple back reconstructs c2cd2827 byte-for-byte (436 rows now).
+    // Adding that tuple back reconstructs c2cd2827 byte-for-byte (436 rows then).
+    // S3 export adds one import-only tuple for the shared executor's existing
+    // read-only PhysicalProjectionQuerySnapshot. Full old/new inventories
+    // reconstruct both digests exactly; all write-boundary tuples are unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "349b90be6e8cbe6c7cda949abb1f63f26adb9887d8e2719e3c3bb6c7fea70965",
+        "6ce5d6c4d7eae4211c9bef12542076c7631d202cc52c9355f52dac81457b5bb6",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

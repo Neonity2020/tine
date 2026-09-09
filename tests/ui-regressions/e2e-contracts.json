@@ -9,8 +9,12 @@
      "blocking": true
     }
    ],
-   "acceptableVariations": ["Subpixel layout rounding within the harness tolerance."],
-   "nonRequirements": ["This synthetic control is not proof of the cause of every reported query scroll jump."],
+   "acceptableVariations": [
+    "Subpixel layout rounding within the harness tolerance."
+   ],
+   "nonRequirements": [
+    "This synthetic control is not proof of the cause of every reported query scroll jump."
+   ],
    "stability": "stable"
   },
   "scripts/e2e-alias.mjs": {
@@ -1428,6 +1432,23 @@
    "stability": "quarantined",
    "quarantineReason": "2026-08-10 (464a8ed4): Harness debt, not a product defect. The forbidden shape is a force that RACES the watcher re-observation; this journey waits 8s first, so it observes increment 2's designed outcome instead. Constructing the race needs a deterministic hook the harness lacks; gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers it at the core boundary.",
    "notes": "GH #254. This is the sequence increment 2's adversarial rounds 3 and 4 each found broken in different places, and which nothing outside a mocked backend has ever driven. The failure is silent: \"Keep mine\" appears to work, and what is lost is someone else's write that the user cannot see was ever there. The non-wedging half is blocking because a refusal that leaves no live banner strands the edit \u2014 a conflicted page is skipped by the ordinary save path, so the user has no route back. QUARANTINED 2026-08-10, harness debt, NOT a product defect. Run against the branch binary it reproducibly showed \"Keep mine\" overwriting the second external winner. That is increment 2's DESIGNED outcome for this timing: a conflicted page is skipped by the ordinary save path, so the only thing that mints authority for a newer winner is the watcher's re-observation \u2014 and once that runs, the banner is re-armed and the click legitimately answers the CURRENT conflict. The harm the contract actually forbids is answering with authority minted for a DIFFERENT winner, i.e. a click that RACES the re-observation, which this journey does not construct: it waits 8s first. Fixing it means driving the stale-click shape (issue the force while a re-observation is in flight), which needs a deterministic hook the harness does not have. gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers that shape at the core boundary meanwhile."
+  },
+  "scripts/e2e-query-export.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Copy / Export of a query page expands matching Markdown and Org roots with their descendants, without nonmatching siblings or literal unresolved query text.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "Export punctuation and indentation may vary while subtree membership remains correct."
+   ],
+   "nonRequirements": [
+    "No clipboard permissions, screenshots, download dialogs or exact geometry are asserted."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-09: Initial parallel Direct run timed out creating its WebDriver session before the app launched; unchanged binary and script passed when rerun sequentially. Managed also passed. Retain as nonblocking until startup instability is resolved and sequential burn-in is recorded."
   }
  }
 }

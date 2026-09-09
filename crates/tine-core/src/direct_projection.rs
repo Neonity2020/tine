@@ -5807,6 +5807,55 @@ mod tests {
     /// block-ref counts, the property registry, `list_pages` — answers from
     /// SQL with the cache still absent.
     #[test]
+    fn public_export_reads_committed_subtrees_without_source_documents() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("export-current-main");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/Tasks.md"),
+            "- TODO export root\n\t- exported child\n",
+        )
+        .unwrap();
+        let database = scratch("export-current-main-db").join("projection.sqlite");
+        {
+            let graph = Graph::open(&root);
+            graph.attach_direct_projection(database.clone()).unwrap();
+            graph.warm_cache();
+            wait_ready(&graph);
+        }
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert!(!graph.has_parsed_cache_test());
+        // A later source change has not reached the ordinary projection worker.
+        // The export must still answer the coherent committed image it opens.
+        std::fs::remove_file(root.join("pages/Tasks.md")).unwrap();
+        let specs = [crate::query::QueryExportSpec {
+            key: "todo".into(),
+            query: "(task TODO)".into(),
+            advanced: false,
+            simple_dialect: None,
+            current_page: None,
+        }];
+        let answer = graph
+            .export_query_subtrees(&specs, 4, 8, 32, 100_000)
+            .expect("current main export");
+        assert_eq!(answer.results.len(), 1);
+        assert_eq!(
+            answer.results[0].groups.len(),
+            1,
+            "export must use the committed SQLite image"
+        );
+        assert_eq!(answer.results[0].groups[0].blocks.len(), 1);
+        assert_eq!(answer.results[0].groups[0].blocks[0].children.len(), 1);
+        assert!(
+            !graph.has_parsed_cache_test(),
+            "export must not hydrate parsed pages"
+        );
+    }
+
+    #[test]
     fn public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = r6_graph("public-ir-warm");

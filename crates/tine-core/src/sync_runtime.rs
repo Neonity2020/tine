@@ -464,7 +464,8 @@ struct ApplicationJournalFeedIndexKey {
 /// The frontier pair covers the accepted rows exactly as it does for the
 /// journal day index; the config digest covers the atomizer's rules, which are
 /// not in the frontier stamp. A pending local suffix is deliberately not part
-/// of it because the remaining actor registry serves export and test oracles.
+/// of it because the actor registry now serves independent test oracles only.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ApplicationPropertyRegistryKey {
     acceptance_sequence: u64,
@@ -487,6 +488,7 @@ struct ApplicationPropertyRegistryProbe {
 /// built from. R5c: only ACCEPTED tables are published, so the key is always
 /// present — the walk's merged table while a suffix is pending is built per
 /// read and never enters this slot.
+#[cfg(test)]
 struct ApplicationPropertyRegistryState {
     registry: std::sync::Arc<crate::query::registry::Registry>,
     key: ApplicationPropertyRegistryKey,
@@ -4818,6 +4820,21 @@ impl SyncRuntimeHandle {
             SyncApplicationNavigationRequest::PropertyRegistry => {
                 return self.application_captured_registry()
             }
+            SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                specs,
+                max_queries,
+                max_roots,
+                max_nodes,
+                max_bytes,
+            } => {
+                return self.application_captured_export(
+                    &specs,
+                    max_queries,
+                    max_roots,
+                    max_nodes,
+                    max_bytes,
+                )
+            }
             request => request,
         };
         let lane = match &request {
@@ -5105,6 +5122,46 @@ impl SyncRuntimeHandle {
                 ManagedMetadataOutcome::NotAnswered(outcome) => {
                     return Err(managed_execution_error(&shared.census, outcome))
                 }
+            }
+        }
+    }
+
+    fn application_captured_export(
+        &self,
+        specs: &[crate::query::QueryExportSpec],
+        max_queries: usize,
+        max_roots: usize,
+        max_nodes: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
+        let prepared = crate::query::export_execute::PreparedExportBatch::prepare(
+            specs,
+            max_queries,
+            crate::date::JournalDate::today(),
+        );
+        let loaded = |batch| SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::ExportQuerySubtrees(batch),
+        };
+        if let Some(answer) = prepared.all_refused_result(max_roots) {
+            return Ok(loaded(answer));
+        }
+        let shared = &self.inner.managed_query;
+        let mut recaptures = 0;
+        loop {
+            let capture =
+                self.application_request(|reply| ActorRequest::ApplicationCurrentQueryRead {
+                    requires_registry: prepared.requires_registry(),
+                    reply,
+                })?;
+            match shared.execute_export(&capture, &prepared, max_roots, max_nodes, max_bytes) {
+                Ok(answer) => return Ok(loaded(answer)),
+                Err(crate::managed_query::ManagedQueryOutcome::Stale)
+                    if recaptures < crate::managed_query::MAX_STALE_RECAPTURES =>
+                {
+                    recaptures += 1;
+                    shared.census.note_stale_recapture();
+                }
+                Err(outcome) => return Err(managed_execution_error(&shared.census, outcome)),
             }
         }
     }
@@ -10990,6 +11047,12 @@ enum ActorRequest {
     ApplicationCapturedRegistryTurn {
         reply: mpsc::Sender<Result<RegistryTurn, SyncApplicationPageRequestError>>,
     },
+    ApplicationCurrentQueryRead {
+        requires_registry: bool,
+        reply: mpsc::Sender<
+            Result<crate::managed_query::ManagedReadCapture, SyncApplicationPageRequestError>,
+        >,
+    },
     LoadApplicationPage {
         request: SyncApplicationPageLoadRequest,
         reply:
@@ -11296,6 +11359,14 @@ fn run_actor_loop(
             }
             ActorRequest::ApplicationCapturedRegistryTurn { reply } => {
                 let result = actor.application_captured_registry_turn();
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationCurrentQueryRead {
+                requires_registry,
+                reply,
+            } => {
+                let result = actor.capture_current_query_read(requires_registry);
                 let _ = reply.send(result);
                 false
             }
@@ -13487,6 +13558,7 @@ struct RuntimeActor {
     /// (§6.1–§6.4): a disposable in-memory snapshot, swapped atomically, built
     /// under the mask-and-overlay merge so a query sees one generation end to
     /// end. Nothing is persisted (D-3).
+    #[cfg(test)]
     application_property_registry: std::cell::RefCell<Option<ApplicationPropertyRegistryState>>,
     /// Converted managed block trees retained across query evaluations. See
     /// [`crate::query::ApplicationProjectionCache`]: it is content-addressed by
@@ -13582,6 +13654,7 @@ struct RuntimeActor {
 /// enclosing symbol and the classification then records a location that does
 /// not exist. Its Direct Files twin `direct_registry_page_key` is module level
 /// for the same reason.
+#[cfg(test)]
 fn managed_registry_page_key(page_id: PageId) -> String {
     format!("page:{}", page_id.as_uuid())
 }
@@ -14114,6 +14187,7 @@ impl RuntimeActor {
             prepared_application_reply: None,
             hot_application_save_page: None,
             managed_query,
+            #[cfg(test)]
             application_property_registry: std::cell::RefCell::new(None),
             application_projection_cache: std::cell::RefCell::new(
                 crate::query::ApplicationProjectionCache::default(),
@@ -14908,26 +14982,12 @@ impl RuntimeActor {
             | SyncApplicationNavigationRequest::QueryRun { .. }
             | SyncApplicationNavigationRequest::QueryExplainEmpty { .. }
             | SyncApplicationNavigationRequest::AdvancedQuery { .. }
+            | SyncApplicationNavigationRequest::ExportQuerySubtrees { .. }
             | SyncApplicationNavigationRequest::PropertyRegistry => {
                 return Err(SyncApplicationPageRequestError::ActorRefusedAt(
                     "application_navigation_query_is_captured",
                 ))
             }
-            SyncApplicationNavigationRequest::ExportQuerySubtrees {
-                specs,
-                max_queries,
-                max_roots,
-                max_nodes,
-                max_bytes,
-            } => SyncApplicationNavigationReply::ExportQuerySubtrees(
-                self.application_export_query_subtrees_ready(
-                    &specs,
-                    max_queries,
-                    max_roots,
-                    max_nodes,
-                    max_bytes,
-                )?,
-            ),
             SyncApplicationNavigationRequest::OrphanAssets => {
                 SyncApplicationNavigationReply::OrphanAssets(
                     self.application_orphan_assets_ready()?,
@@ -15976,8 +16036,8 @@ impl RuntimeActor {
     /// materialized owner rows of the accepted frontier, with NO mask and NO
     /// pending overlay.
     ///
-    /// This actor-side cache remains for export and the independent test
-    /// oracles. Live result and metadata queries capture the database-owned
+    /// This actor-side cache remains only for independent test oracles.
+    /// Production result, export and metadata queries capture the database-owned
     /// committed registry cache instead.
     ///
     /// Deliberately NOT named `application_*`: R5c adds no read-surface entry
@@ -15986,6 +16046,7 @@ impl RuntimeActor {
     /// sense `application_family_is_pinned_by_name` means by the exemplar
     /// `application_equivalent_page_names_ready` + `equivalent_page_names` —
     /// cores carry no prefix and no row in `docs/contracts/managed-read-surface.md`.
+    #[cfg(test)]
     fn accepted_property_registry_ready(
         &self,
     ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
@@ -16020,6 +16081,7 @@ impl RuntimeActor {
     ///
     /// The merged table is built per actor-side read and never published. Live
     /// query execution does not call this function.
+    #[cfg(test)]
     fn application_property_registry_ready(
         &self,
     ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
@@ -16046,6 +16108,7 @@ impl RuntimeActor {
     /// owner row and page whose path is not in `overlay`, then the overlay
     /// pages' own rows appended under `overlay:<path>` keys. An empty `overlay`
     /// is the accepted build — no mask, no overlay rows, the same two scans.
+    #[cfg(test)]
     fn build_application_property_registry(
         &self,
         overlay: &ApplicationNavigationOverlay,
@@ -16206,6 +16269,7 @@ impl RuntimeActor {
     /// The slot holds accepted tables only, and a suffix cannot change what an
     /// accepted table says — the pending route patches that table off the actor
     /// and the walk's merged build is never published.
+    #[cfg(test)]
     fn application_property_registry_cache_key(
         &self,
         config: &crate::config::ParseConfig,
@@ -16233,6 +16297,7 @@ impl RuntimeActor {
     /// Publish a freshly built ACCEPTED Managed registry, advancing the
     /// generation when its rows or its config digest differ from the last
     /// published snapshot (§6.2, G7), and swapping it in atomically.
+    #[cfg(test)]
     fn publish_application_property_registry(
         &self,
         built: crate::query::registry::Registry,
@@ -16257,23 +16322,9 @@ impl RuntimeActor {
         published
     }
 
-    /// The registry the REMAINING merged-table readers coerce against (the
-    /// merged table while a suffix is pending). A refusal from the materialized
-    /// read is never a reason to answer with a half-built table: the last
-    /// published ACCEPTED snapshot stands — a coherent, honest, older answer,
-    /// never a merged table from some other pending revision — and an empty one
-    /// is the honest answer before the first build.
-    ///
-    /// **RET2-Managed-Metadata retired its PUBLIC consumer.** SPEC §7.1's
-    /// `query_registry` used to be `application_property_registry().snapshot()`,
-    /// which is exactly how the frontend's query type information could be a
-    /// stale or empty table after a read that actually failed. It is now the
-    /// captured off-actor read (`application_captured_registry`), which returns
-    /// a typed error instead. What is left here is one production consumer —
-    /// `application_export_query_subtrees_ready`, whose own migration is a later
-    /// packet — and the `#[cfg(test)]` walk oracles the parity gates compare
-    /// against. The fallback policy stays theirs and is deliberately NOT the
-    /// public route's.
+    /// Registry for the independent editor-state walk oracle. Production
+    /// query/export/metadata routes use the shared current-main snapshot.
+    #[cfg(test)]
     fn application_property_registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {
         self.serve_application_property_registry(self.application_property_registry_ready())
     }
@@ -16282,6 +16333,7 @@ impl RuntimeActor {
     /// property query under, so the capture carries the base the executor
     /// patches (R5c). With nothing pending it is the same table
     /// `application_property_registry` returns.
+    #[cfg(test)]
     fn accepted_property_registry(
         &self,
     ) -> Result<std::sync::Arc<crate::query::registry::Registry>, SyncApplicationPageRequestError>
@@ -16294,6 +16346,7 @@ impl RuntimeActor {
         })
     }
 
+    #[cfg(test)]
     fn serve_application_property_registry(
         &self,
         built: Result<
@@ -16412,20 +16465,9 @@ impl RuntimeActor {
         max_bytes: usize,
     ) -> Result<PreparedSimpleQuery, SyncApplicationPageRequestError> {
         let profile = crate::query::ConstructionProfile::from_view(&view);
-        let config = self.graph.config.parse_config();
         let props = parsed.filter.has_props_leaf();
-        let stamp = self.managed_simple_query_stamp(&config)?;
-        let registry = if props {
-            let database = self
-                .active_database()
-                .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-            let (owner, capture) = database
-                .query_registry_capture(stamp.acceptance_sequence, &config)
-                .map_err(SyncApplicationPageRequestError::QueryExecution)?;
-            Some(crate::managed_query::ManagedRegistryCapture { owner, capture })
-        } else {
-            None
-        };
+        let read = self.capture_current_query_read(props)?;
+        let config = read.config;
         Ok(PreparedSimpleQuery {
             query: parsed,
             view,
@@ -16434,8 +16476,8 @@ impl RuntimeActor {
             #[cfg(test)]
             props,
             config: config.clone(),
-            registry,
-            stamp,
+            registry: read.registry,
+            stamp: read.stamp,
             #[cfg(test)]
             walk_registry: std::sync::Arc::new(crate::query::registry::Registry::empty(&config)),
         })
@@ -16640,27 +16682,6 @@ impl RuntimeActor {
         })
     }
 
-    fn application_export_query_subtrees_ready(
-        &self,
-        specs: &[crate::query::QueryExportSpec],
-        max_queries: usize,
-        max_roots: usize,
-        max_nodes: usize,
-        max_bytes: usize,
-    ) -> Result<crate::query::QueryExportBatch, SyncApplicationPageRequestError> {
-        let pages = self.application_all_query_pages_ready()?;
-        Ok(crate::query::export_application_query_subtrees(
-            &pages,
-            specs,
-            max_queries,
-            max_roots,
-            max_nodes,
-            max_bytes,
-            self.graph.config.parse_config(),
-            self.application_property_registry(),
-        ))
-    }
-
     /// The selection tree and the row-shape request ONE IR execution runs
     /// under, or the complete answer when a refused binding leaves nothing
     /// honest to count (§Q14/N19).
@@ -16838,31 +16859,19 @@ impl RuntimeActor {
             Err(reply) => return Ok(IrQueryTurn::Answered(reply)),
         };
         let profile = crate::query::ConstructionProfile::from_view(view);
-        let config = self.graph.config.parse_config();
         let props = selection.filter.has_props_leaf()
             || matches!(&request, ManagedQueryRequest::Counts(probes)
                 if probes.iter().any(|probe| probe.filter.has_props_leaf()));
-        let stamp = self.managed_simple_query_stamp(&config)?;
-        let database = self
-            .active_database()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let registry = if props {
-            let (owner, capture) = database
-                .query_registry_capture(stamp.acceptance_sequence, &config)
-                .map_err(SyncApplicationPageRequestError::QueryExecution)?;
-            Some(crate::managed_query::ManagedRegistryCapture { owner, capture })
-        } else {
-            None
-        };
+        let read = self.capture_current_query_read(props)?;
         Ok(IrQueryTurn::Captured(Box::new(
             crate::managed_query::ManagedQueryCapture {
-                job_epoch: self.managed_query.jobs.capture_epoch(),
-                path: database.path().to_path_buf(),
-                graph_root: self.graph.root.clone(),
-                stamp,
-                config,
-                journal_format: self.graph.journal_format.clone(),
-                registry,
+                job_epoch: read.job_epoch,
+                path: read.path,
+                graph_root: read.graph_root,
+                stamp: read.stamp,
+                config: read.config,
+                journal_format: read.journal_format,
+                registry: read.registry,
                 query: selection,
                 view: view.clone(),
                 today,
@@ -16873,6 +16882,41 @@ impl RuntimeActor {
                 report: resolved.report().clone(),
             },
         )))
+    }
+
+    /// Capture only the current SQL image and immutable execution inputs.
+    /// Ordinary save/tick progression remains the sole owner of pending work.
+    fn capture_current_query_read(
+        &self,
+        requires_registry: bool,
+    ) -> Result<crate::managed_query::ManagedReadCapture, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.current_query_readiness() {
+            return Err(SyncApplicationPageRequestError::QueryExecution(
+                deferred_query_execution_error(&state),
+            ));
+        }
+        let config = self.graph.config.parse_config();
+        let stamp = self.managed_simple_query_stamp(&config)?;
+        let database = self
+            .active_database()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let registry = if requires_registry {
+            let (owner, capture) = database
+                .query_registry_capture(stamp.acceptance_sequence, &config)
+                .map_err(SyncApplicationPageRequestError::QueryExecution)?;
+            Some(crate::managed_query::ManagedRegistryCapture { owner, capture })
+        } else {
+            None
+        };
+        Ok(crate::managed_query::ManagedReadCapture {
+            job_epoch: self.managed_query.jobs.capture_epoch(),
+            path: database.path().to_path_buf(),
+            graph_root: self.graph.root.clone(),
+            stamp,
+            config,
+            journal_format: self.graph.journal_format.clone(),
+            registry,
+        })
     }
 
     /// Phase one of the PUBLIC property-registry route (RET2, SPEC §7.1
@@ -16888,21 +16932,14 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.current_query_readiness() {
             return Ok(RegistryTurn::Deferred(state));
         }
-        let config = self.graph.config.parse_config();
-        let stamp = self.managed_simple_query_stamp(&config)?;
-        let database = self
-            .active_database()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-        let (owner, capture) = database
-            .query_registry_capture(stamp.acceptance_sequence, &config)
-            .map_err(SyncApplicationPageRequestError::QueryExecution)?;
+        let read = self.capture_current_query_read(true)?;
         Ok(RegistryTurn::Captured(Box::new(
             crate::managed_metadata::ManagedMetadataCapture {
-                job_epoch: self.managed_query.jobs.capture_epoch(),
-                path: database.path().to_path_buf(),
-                stamp,
-                config,
-                registry: crate::managed_query::ManagedRegistryCapture { owner, capture },
+                job_epoch: read.job_epoch,
+                path: read.path,
+                stamp: read.stamp,
+                config: read.config,
+                registry: read.registry.expect("a required registry is captured"),
             },
         )))
     }
