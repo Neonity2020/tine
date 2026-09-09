@@ -161,14 +161,34 @@ async function openSheet(browser) {
   await browser.$(".qs-sheet").waitForExist({ timeout: 10_000 });
 }
 
+/** Press a Display trigger until its panel is up, finding and clicking it in ONE
+ *  round trip.
+ *
+ *  The sections and the sheet footer re-render as a read settles, so a handle
+ *  taken by `browser.$()` can be detached by the time `.click()` reaches it:
+ *  the click goes to a node that is no longer in the document, nothing happens,
+ *  and the journey fails ten seconds later on the panel rather than on the
+ *  press. That is the same shape `scripts/lib/e2e-navigation.mjs` exists to
+ *  stop, one control down. The panel's EXISTENCE is the condition — not the
+ *  trigger's `aria-expanded`, which describes a control that may already have
+ *  been replaced — and the check and the click share a round trip so a panel
+ *  that opened in between is never toggled back shut. */
+async function pressDisplayTrigger(browser, selector, description) {
+  await browser.$(selector).waitForExist({ timeout: 15_000 });
+  await browser.waitUntil(async () => {
+    await browser.execute((where) => {
+      if (document.querySelector(".qd-panel")) return;
+      document.querySelector(where)?.click();
+    }, selector);
+    return await browser.$(".qd-panel").isExisting();
+  }, { timeout: 15_000, interval: 400, timeoutMsg: `${description} never opened` });
+}
+
 /** The panel lives in the sheet's footer, and a write can remount the sheet
  *  under it — so reopen whatever is shut rather than assuming either is up. */
 async function openDisplay(browser) {
   if (!(await browser.$(".qd-trigger").isExisting())) await openSheet(browser);
-  const trigger = await browser.$(".qd-trigger");
-  await trigger.waitForExist({ timeout: 10_000 });
-  if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-  await browser.$(".qd-panel").waitForExist({ timeout: 10_000 });
+  await pressDisplayTrigger(browser, ".qd-trigger", "the Display panel");
 }
 
 async function closeDisplay(browser) {
@@ -217,10 +237,11 @@ function properties(page) {
  *  Two panels are mounted side by side on a mixed result, so a bare
  *  `.qd-trigger` would be satisfied by whichever came first in the DOM. */
 async function openSectionDisplay(browser, kind) {
-  const trigger = await browser.$(`[data-query-result-kind="${kind}"] .qd-trigger`);
-  await trigger.waitForExist({ timeout: 15_000 });
-  if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-  await browser.$(".qd-panel").waitForExist({ timeout: 10_000 });
+  await pressDisplayTrigger(
+    browser,
+    `[data-query-result-kind="${kind}"] .qd-trigger`,
+    `the ${kind} section's Display panel`,
+  );
 }
 
 /** Wait until a block's own property map satisfies a predicate. A wdio timeout
