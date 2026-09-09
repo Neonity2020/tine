@@ -3248,13 +3248,20 @@ mod tests {
         let entry = graph.list_pages().into_iter().next().unwrap();
         let (paused, observed) = std::sync::mpsc::channel();
         let (resume, resumed) = std::sync::mpsc::channel();
+        // Load and settle BEFORE arming the pause. `load_page` assigns runtime
+        // ids and enqueues its own projection turn, and the hook is one-shot:
+        // armed any earlier it is consumed by the load's turn, so the worker
+        // pauses before save B exists and the queued capture below is served
+        // against the pre-B image. That is what made this test red -- the
+        // capture was measured against the wrong turn, not against a save.
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO save B".into();
+        wait_ready(&graph);
         *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
             paused.send(()).unwrap();
             resumed.recv().unwrap();
         }));
-        let mut page = graph.load_page(&entry).unwrap();
-        let baseline = page.rev.clone();
-        page.blocks[0].raw = "TODO save B".into();
         graph.save_page(&page, baseline.as_deref()).unwrap();
         observed.recv_timeout(Duration::from_secs(3)).unwrap();
         let query_projection = Arc::clone(&projection);
@@ -3477,6 +3484,13 @@ mod tests {
                 .config,
         );
         let generation = graph.cache_generation();
+        // The `wait_ready` above is stale by this point: the inventory loop
+        // reads every page, and each read advances the cache generation, so the
+        // projection is mid-reconciliation at `generation` and correctly refuses
+        // a strict-generation job. Readiness here is a precondition of the test,
+        // not the property under test -- which is what an ordinary inventory
+        // reconciliation does to an OPEN job.
+        wait_generation(generation);
         let QueryJobOpen::Job(job) = projection.open_query_job(generation) else {
             panic!("initial job");
         };
