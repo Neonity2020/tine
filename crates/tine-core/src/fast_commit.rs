@@ -763,6 +763,7 @@ mod fixtures {
                 block_id,
                 home_document_id,
                 birth: None,
+                reconstruction: None,
                 before: Some(state(&before)),
                 after: Some(state(&after)),
             }],

@@ -285,6 +285,7 @@ pub(crate) fn last_local_mutation_detail_timings() -> LocalMutationDetailTimings
 #[cfg(test)]
 thread_local! {
     static RECONSTRUCT_FRONTIER_CALLS: Cell<usize> = const { Cell::new(0) };
+    static AUTHORITATIVE_SEMANTIC_POINT_LOADS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -295,6 +296,16 @@ pub(crate) fn reset_reconstruct_frontier_calls() {
 #[cfg(test)]
 pub(crate) fn reconstruct_frontier_calls() -> usize {
     RECONSTRUCT_FRONTIER_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_authoritative_semantic_point_loads() {
+    AUTHORITATIVE_SEMANTIC_POINT_LOADS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn authoritative_semantic_point_loads() -> usize {
+    AUTHORITATIVE_SEMANTIC_POINT_LOADS.get()
 }
 
 /// Process-wide live-write benchmark observations. Unlike the legacy TLS
@@ -850,6 +861,12 @@ enum EffectiveTitleTransitionSeal {
 }
 
 const MAX_TRANSIENT_EFFECTIVE_VIEWS: usize = 256;
+
+/// How many accepted batches the editor reconstruction walk may inspect before
+/// it reports that a deleted identity is no longer resolvable. An undo stack is
+/// a session's worth of edits; this bound keeps a pathological history from
+/// turning one refused save into a walk of the whole shard.
+const EDITOR_RECONSTRUCTION_ANCESTRY_BUDGET: usize = 256;
 
 /// A nonconstructible, transient proof that one page-local exact-title
 /// post-state was selected by authenticated ownership provenance.
@@ -1749,6 +1766,7 @@ pub struct PagePreambleRewrite {
 pub struct BlockRestore {
     pub block: BlockLocation,
     pub claim: MembershipClaim,
+    pub source: super::BlockReconstructionSource,
 }
 
 /// A concurrent same-block conflict pair, ordered by batch id so every
@@ -1798,6 +1816,7 @@ pub enum ConflictResolutionIntent {
         page_id: PageId,
         block: BlockLocation,
         claim: MembershipClaim,
+        source: super::BlockReconstructionSource,
         pair: ConflictPair,
     },
     /// move-vs-delete: the tombstone won the owner-register race against a
@@ -1807,6 +1826,7 @@ pub enum ConflictResolutionIntent {
         page_id: PageId,
         block: BlockLocation,
         claim: MembershipClaim,
+        source: super::BlockReconstructionSource,
         pair: ConflictPair,
     },
     /// Overlapping same-block text edits: the CRDT merge is an interleave
@@ -1986,12 +2006,8 @@ fn block_delta_edit_page(delta: &BlockDelta) -> Option<PageId> {
 }
 
 fn block_delta_is_delete(delta: &BlockDelta) -> bool {
-    matches!(
-        (&delta.before, &delta.after),
-        (Some(before), Some(after))
-            if matches!(before.owner, BlockOwner::Page(_))
-                && after.owner == BlockOwner::Tombstone
-    )
+    matches!((&delta.before, &delta.after), (Some(before), None)
+        if matches!(before.owner, BlockOwner::Page(_)))
 }
 
 fn block_delta_move_target(delta: &BlockDelta) -> Option<PageId> {
@@ -2090,6 +2106,7 @@ pub enum SemanticOperation {
         name: LogicalPageName,
         path: ManagedPath,
         kind: ManagedTextKind,
+        deletion_batch_id: Option<BatchId>,
         predecessor_frontier: FrontierV2,
         prior_present_intent_id: Option<ProjectionIntentId>,
     },
@@ -2099,10 +2116,10 @@ pub enum SemanticOperation {
         page_preamble_rewrites: Vec<PagePreambleRewrite>,
     },
     /// Deterministic conflict-resolution restore (GH #351): re-assert page
-    /// ownership and membership for blocks whose visibility lost a race with
-    /// a concurrent tombstone. Writes only owner/membership map registers —
-    /// never text — so independently authored restores with equal values
-    /// converge.
+    /// reconstruct blocks whose visibility lost a race or whose accepted
+    /// deletion is being undone. The explicit source selects accepted content
+    /// and identity; every author inserts a new ordinary text container, and
+    /// semantic conflict handling converges independently authored restores.
     RestoreSubtree {
         page_id: PageId,
         blocks: Vec<BlockRestore>,
@@ -4003,11 +4020,12 @@ impl AcceptedRootMaterializer<'_> {
             .ok_or(EngineError::MissingDocument(page_document_id))?;
         let home_document_ids = {
             let page_document = self.document(page_key)?;
-            validate_shard(
+            validate_shard_metadata(
                 self.engine.catalog_document_id,
                 page_document_id,
                 page_document,
             )?;
+            read_page_preamble(page_document_id, page_document)?;
             if shard_page_id(page_document)? != Some(page_id) {
                 return Err(EngineError::MalformedDocument {
                     document_id: page_document_id,
@@ -6468,7 +6486,7 @@ impl LazyGenesisCheckpointBuilder {
                 .map_err(loro_error)?;
             document
                 .get_map(SHARD_CONTENT)
-                .ensure_mergeable_text(&block.block_id.to_string())
+                .insert_container(&block.block_id.to_string(), loro::LoroText::new())
                 .map_err(loro_error)?
                 .insert(0, &block.content)
                 .map_err(loro_error)?;
@@ -7441,6 +7459,36 @@ impl ShardedHotEngine {
         Ok(self
             .clone_current_hot_document(document_id, 1)?
             .get_deep_value())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_live_keys_for_test(
+        &self,
+        home_document_id: DocumentId,
+        block_id: BlockId,
+    ) -> Result<(bool, bool, bool, bool), EngineError> {
+        let document = self.clone_current_hot_document(home_document_id, 1)?;
+        let key = block_id.to_string();
+        Ok((
+            document.get_map(SHARD_OWNERS).get(&key).is_some(),
+            document.get_map(SHARD_CONTENT).get(&key).is_some(),
+            document.get_map(SHARD_LOGSEQ_UUIDS).get(&key).is_some(),
+            document
+                .get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS)
+                .get(&key)
+                .is_some(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shallow_document_bytes_for_test(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Vec<u8>, EngineError> {
+        let document = self.clone_current_hot_document(document_id, 1)?;
+        document
+            .export(ExportMode::shallow_snapshot(&document.oplog_frontiers()))
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
     }
 
     /// Test construction for the production clean archive-attach route.
@@ -10824,7 +10872,9 @@ impl ShardedHotEngine {
         let page_document = self
             .load_document_at_accepted_frontier(root, page_document_id)?
             .ok_or(EngineError::MissingDocument(page_document_id))?;
-        validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
+        validate_shard_metadata(self.catalog_document_id, page_document_id, &page_document)?;
+        read_page_preamble(page_document_id, &page_document)?;
+        read_memberships(page_document_id, &page_document)?;
         if shard_page_id(&page_document)? != Some(page_id) {
             return Err(EngineError::MalformedDocument {
                 document_id: page_document_id,
@@ -12717,7 +12767,7 @@ impl ShardedHotEngine {
             .semantic_effect
             .blocks()
             .iter()
-            .filter(|delta| delta.before.is_none() && delta.after.is_some())
+            .filter(|delta| delta.has_birth_authority())
             .collect::<Vec<_>>();
         let created_ids = created
             .iter()
@@ -13058,7 +13108,8 @@ impl ShardedHotEngine {
             match (&delta.before, &delta.after) {
                 (Some(before), Some(after)) => identity(before) != identity(after),
                 (None, Some(after)) => {
-                    after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some()
+                    delta.reconstruction.is_none()
+                        && (after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some())
                 }
                 (Some(_), None) | (None, None) => false,
             }
@@ -13174,10 +13225,11 @@ impl ShardedHotEngine {
             &before_snapshots,
             &after_snapshots,
         )?;
+        self.validate_reconstruction_deltas(effect)?;
         let created = effect
             .blocks()
             .iter()
-            .filter(|delta| delta.before.is_none() && delta.after.is_some())
+            .filter(|delta| delta.has_birth_authority())
             .collect::<Vec<_>>();
         let created_ids = created
             .iter()
@@ -15592,11 +15644,31 @@ impl ShardedHotEngine {
                 }
             })
             .collect();
-        let effect = derive_effect_from_snapshots_for_revivals(
+        let mut effect = derive_effect_from_snapshots_for_revivals(
             &before_snapshots,
             &after_snapshots,
             &revival_pages,
         )?;
+        for operation in &transaction.operations {
+            if let SemanticOperation::RestoreSubtree { blocks, .. } = operation {
+                for restore in blocks {
+                    if effect
+                        .blocks()
+                        .binary_search_by_key(
+                            &(restore.block.home_document_id, restore.block.block_id),
+                            |delta| (delta.home_document_id, delta.block_id),
+                        )
+                        .is_ok()
+                    {
+                        effect.mark_block_reconstruction(
+                            restore.block.home_document_id,
+                            restore.block.block_id,
+                            restore.source.clone(),
+                        )?;
+                    }
+                }
+            }
+        }
         let effect_bytes = effect.encode()?;
         // A new block's birth names its creation page and that page's home
         // shard, which the birth itself writes; the shard is therefore already
@@ -17834,6 +17906,104 @@ impl ShardedHotEngine {
         self.materialize_page_from_documents(page_id, &documents)
     }
 
+    fn materialize_page_from_deletion_effect(
+        &self,
+        page_id: PageId,
+        deletion_batch_id: BatchId,
+    ) -> Result<MaterializedPage, EngineError> {
+        let effect = self.authoritative_semantic_effect_by_id(deletion_batch_id)?;
+        let pages = effect
+            .pages()
+            .iter()
+            .filter(|delta| delta.page_id == page_id)
+            .collect::<Vec<_>>();
+        let [page] = pages.as_slice() else {
+            return Err(EngineError::InvalidTransaction(
+                "Restore deletion source does not identify one deleted page".into(),
+            ));
+        };
+        let (
+            Some(PageState::Live {
+                name,
+                path,
+                home_document_id,
+                kind,
+            }),
+            Some(PageState::Tombstone {
+                home_document_id: tombstone_home,
+                ..
+            }),
+        ) = (page.before.as_ref(), page.after.as_ref())
+        else {
+            return Err(EngineError::InvalidTransaction(
+                "Restore deletion source has no page before-image".into(),
+            ));
+        };
+        if home_document_id != tombstone_home {
+            return Err(EngineError::InvalidTransaction(
+                "Restore deletion source changes the page home shard".into(),
+            ));
+        }
+        let preamble = effect
+            .page_preambles()
+            .iter()
+            .find(|delta| delta.page_id == page_id && delta.home_document_id == *home_document_id)
+            .and_then(|delta| delta.before.as_ref())
+            .and_then(|state| state.preamble.clone());
+        let mut blocks = Vec::new();
+        for membership in effect.memberships().iter().filter(|delta| {
+            delta.page_id == page_id && delta.before.is_some() && delta.after.is_none()
+        }) {
+            let claim = membership
+                .before
+                .as_ref()
+                .expect("filtered deletion membership before-image");
+            let states = effect
+                .blocks()
+                .iter()
+                .filter(|delta| {
+                    delta.block_id == membership.block_id
+                        && delta.home_document_id == claim.home_document_id
+                        && delta.before.is_some()
+                        && delta.after.is_none()
+                })
+                .collect::<Vec<_>>();
+            let [state] = states.as_slice() else {
+                return Err(EngineError::InvalidTransaction(
+                    "Restore deletion source has an unmatched block membership".into(),
+                ));
+            };
+            let state = state.before.as_ref().expect("filtered block before-image");
+            if state.owner != BlockOwner::Page(page_id) {
+                return Err(EngineError::InvalidTransaction(
+                    "Restore deletion source block before-image has the wrong owner".into(),
+                ));
+            }
+            blocks.push(MaterializedBlock {
+                block_id: membership.block_id,
+                home_document_id: claim.home_document_id,
+                parent: claim.parent,
+                order: claim.order.clone(),
+                logseq_uuid: state.logseq_uuid,
+                logseq_identity_origin: state.logseq_identity_origin,
+                content: state.content.clone(),
+            });
+        }
+        blocks.sort_unstable_by(|left, right| {
+            (&left.order, left.block_id).cmp(&(&right.order, right.block_id))
+        });
+        Ok(MaterializedPage {
+            page_id,
+            home_document_id: *home_document_id,
+            name: name.clone(),
+            path: path.clone(),
+            kind: *kind,
+            preamble,
+            blocks,
+            stats: MaterializationStats::default(),
+        })
+    }
+
     /// Recompute the complete semantic operation diff from the current shard
     /// state to one immutable accepted predecessor snapshot. The caller may
     /// take a bounded prefix, commit it, and call again; no returned operation
@@ -17841,12 +18011,16 @@ impl ShardedHotEngine {
     pub(crate) fn plan_revive_page_operations(
         &self,
         page_id: PageId,
+        deletion_batch_id: Option<BatchId>,
         predecessor_frontier: &FrontierV2,
         prior_present_intent_id: Option<ProjectionIntentId>,
     ) -> Result<Vec<SemanticOperation>, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        let target = self.materialize_page_at_projection_frontier(page_id, predecessor_frontier)?;
+        let target = match deletion_batch_id {
+            Some(batch_id) => self.materialize_page_from_deletion_effect(page_id, batch_id)?,
+            None => self.materialize_page_at_projection_frontier(page_id, predecessor_frontier)?,
+        };
         let current_state = self.current_hot_catalog_page_state(page_id)?;
         if current_state.home_document_id() != target.home_document_id {
             return Err(EngineError::InvalidTransaction(format!(
@@ -17910,6 +18084,7 @@ impl ShardedHotEngine {
                 name: target.name.clone(),
                 path: target.path.clone(),
                 kind: target.kind,
+                deletion_batch_id,
                 predecessor_frontier: predecessor_frontier.clone(),
                 prior_present_intent_id,
             }),
@@ -17982,17 +18157,27 @@ impl ShardedHotEngine {
         };
         let mut target_blocks = target.blocks.iter().collect::<Vec<_>>();
         target_blocks.sort_unstable_by_key(|block| (target_depth(block.block_id), block.block_id));
+        let mut reconstructed = BTreeSet::new();
         for block in &target_blocks {
             let home = documents
                 .get(&block.home_document_id)
                 .ok_or(EngineError::MissingDocument(block.home_document_id))?;
-            let raw = read_block_state(block.home_document_id, home, block.block_id)?
-                .ok_or(EngineError::BlockNotFound(block.block_id))?;
+            let raw = read_block_state(block.home_document_id, home, block.block_id)?;
             let desired_claim =
                 MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
-            if raw.owner != BlockOwner::Page(page_id)
+            if raw
+                .as_ref()
+                .is_none_or(|raw| raw.owner != BlockOwner::Page(page_id))
                 || current_memberships.get(&block.block_id) != Some(&desired_claim)
             {
+                let source = match deletion_batch_id {
+                    Some(deletion_batch_id) => {
+                        super::BlockReconstructionSource::DeletedBeforeImage { deletion_batch_id }
+                    }
+                    None => super::BlockReconstructionSource::PredecessorFrontier {
+                        frontier: predecessor_frontier.clone(),
+                    },
+                };
                 operations.push(SemanticOperation::RestoreSubtree {
                     page_id,
                     blocks: vec![BlockRestore {
@@ -18001,11 +18186,18 @@ impl ShardedHotEngine {
                             home_document_id: block.home_document_id,
                         },
                         claim: desired_claim,
+                        source,
                     }],
                 });
+                if raw.is_none() {
+                    reconstructed.insert(block.block_id);
+                }
             }
         }
         for block in &target_blocks {
+            if reconstructed.contains(&block.block_id) {
+                continue;
+            }
             let home = documents
                 .get(&block.home_document_id)
                 .ok_or(EngineError::MissingDocument(block.home_document_id))?;
@@ -19055,7 +19247,9 @@ impl ShardedHotEngine {
         };
         let page_document =
             document(page_document_id).ok_or(EngineError::MissingDocument(page_document_id))?;
-        validate_shard(self.catalog_document_id, page_document_id, page_document)?;
+        validate_shard_metadata(self.catalog_document_id, page_document_id, page_document)?;
+        read_page_preamble(page_document_id, page_document)?;
+        read_memberships(page_document_id, page_document)?;
         if shard_page_id(page_document)? != Some(page_id) {
             return Err(EngineError::MalformedDocument {
                 document_id: page_document_id,
@@ -19118,8 +19312,22 @@ impl ShardedHotEngine {
                 .then(|| document(*home_document_id))
                 .transpose()?;
             let home = loaded.as_deref().unwrap_or(page_document);
-            validate_shard(self.catalog_document_id, *home_document_id, home)?;
+            // Materialization validates the shard envelope, not every block
+            // it contains: authoring and receiving already validate each
+            // transition in full (`validate_shard` on the batch paths), and a
+            // read must tolerate the honest sparse intermediate an ordinary
+            // merge can leave behind between two validated transitions.
+            validate_shard_metadata(self.catalog_document_id, *home_document_id, home)?;
+            read_page_preamble(*home_document_id, home)?;
+            read_memberships(*home_document_id, home)?;
             for (block_id, claim) in claims {
+                if !has_block_state(home, *block_id)? {
+                    // A concurrent move can win the owner register while a
+                    // physical deletion wins the content-map key. This
+                    // unauthored intermediate is invisible until the
+                    // deterministic conflict actor reconstructs it.
+                    continue;
+                }
                 let Some(state) = read_block_state(*home_document_id, home, *block_id)? else {
                     return Err(EngineError::MalformedDocument {
                         document_id: *home_document_id,
@@ -19174,7 +19382,7 @@ impl ShardedHotEngine {
             return Err(EngineError::PageDeleted(page_id));
         };
         let page_document = self.clone_current_hot_document(page_document_id, 1)?;
-        validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
+        validate_shard_metadata(self.catalog_document_id, page_document_id, &page_document)?;
         if include_frontier {
             frontier_documents.insert(
                 page_document_id,
@@ -20657,11 +20865,20 @@ impl ShardedHotEngine {
                 validate_shard_metadata_shape(*document_id, replacement.document())?;
                 new_exact_shards.insert(*document_id);
             } else {
-                validate_shard(
+                // Each authored transition was validated in full against its
+                // exact causal base above. Their honest CRDT merge may still
+                // be temporarily sparse across independently merged map keys
+                // (for example move wins `owners` while delete wins
+                // `content`). Validate the stable shard envelope here; the
+                // semantic conflict actor reconstructs the selected complete
+                // state before it becomes the settled projection.
+                validate_shard_metadata(
                     self.catalog_document_id,
                     *document_id,
                     replacement.document(),
                 )?;
+                read_page_preamble(*document_id, replacement.document())?;
+                read_memberships(*document_id, replacement.document())?;
                 validate_immutable_shard_identity(
                     *document_id,
                     current_page_id.or(exact_before_page_ids[document_id]),
@@ -21074,6 +21291,448 @@ impl ShardedHotEngine {
         Ok(SemanticEffect::decode(semantic_objects[0].payload())?)
     }
 
+    /// Resolve exactly one authoritative semantic object without loading the
+    /// batch's CRDT updates. Accepted history and the journal-committed local
+    /// prefix are the only eligible sources; the latter is needed when editor
+    /// undo follows a durable deletion before its normal drain completes.
+    fn authoritative_semantic_effect_by_id(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<SemanticEffect, EngineError> {
+        #[cfg(test)]
+        AUTHORITATIVE_SEMANTIC_POINT_LOADS
+            .set(AUTHORITATIVE_SEMANTIC_POINT_LOADS.get().saturating_add(1));
+        let accepted = matches!(
+            self.archive_status(batch_id)?,
+            Some(ArchiveStatus::Accepted { .. })
+        );
+        let committed_local = self.local_overlay.entry_by_batch.contains_key(&batch_id);
+        if !accepted && !committed_local {
+            return Err(EngineError::MissingDependency(batch_id));
+        }
+        if let Some(batch) = self.archive.get(&batch_id) {
+            return self.accepted_semantic_effect(batch);
+        }
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or(EngineError::MissingDependency(batch_id))?;
+        let manifest = store
+            .resolve_logical_manifest(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .ok_or(EngineError::MissingDependency(batch_id))?;
+        let descriptors = manifest
+            .required_objects()
+            .iter()
+            .filter(|descriptor| descriptor.kind() == ObjectKind::SemanticEffect)
+            .collect::<Vec<_>>();
+        let [descriptor] = descriptors.as_slice() else {
+            return Err(EngineError::Archive(
+                "authoritative batch has non-unique semantic effect".into(),
+            ));
+        };
+        let object = store
+            .resolve_logical_object(descriptor.content_digest())
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if object
+            .descriptor()
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            != **descriptor
+            || SemanticEffectDigest::of(object.payload()) != manifest.semantic_effect_digest()
+        {
+            return Err(EngineError::Archive(
+                "authoritative semantic effect is not manifest-bound".into(),
+            ));
+        }
+        Ok(SemanticEffect::decode(object.payload())?)
+    }
+
+    fn reconstruction_material(
+        &self,
+        block: BlockLocation,
+        source: &super::BlockReconstructionSource,
+    ) -> Result<(BlockState, MembershipClaim, bool), EngineError> {
+        match source {
+            super::BlockReconstructionSource::PredecessorFrontier { frontier } => {
+                let documents = self.reconstruct_projection_frontier(frontier)?;
+                let catalog = documents
+                    .get(&self.catalog_document_id)
+                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+                let pages = read_all_pages(catalog)?;
+                for (page_id, state) in pages {
+                    if !matches!(state, PageState::Live { .. }) {
+                        continue;
+                    }
+                    let page_home = state.home_document_id();
+                    let Some(page_document) = documents.get(&page_home) else {
+                        continue;
+                    };
+                    let Some(claim) = read_membership(page_document, block.block_id)? else {
+                        continue;
+                    };
+                    if claim.home_document_id != block.home_document_id {
+                        continue;
+                    }
+                    let home = documents
+                        .get(&block.home_document_id)
+                        .ok_or(EngineError::MissingDocument(block.home_document_id))?;
+                    let state = read_block_state(block.home_document_id, home, block.block_id)?
+                        .ok_or(EngineError::BlockNotFound(block.block_id))?;
+                    if state.owner == BlockOwner::Page(page_id) {
+                        return Ok((state, claim, false));
+                    }
+                }
+                Err(EngineError::BlockNotFound(block.block_id))
+            }
+            super::BlockReconstructionSource::DeletedBeforeImage { deletion_batch_id }
+            | super::BlockReconstructionSource::ConflictAfterImage {
+                deletion_batch_id, ..
+            } => {
+                let deletion = self.authoritative_semantic_effect_by_id(*deletion_batch_id)?;
+                let matching = deletion
+                    .blocks()
+                    .iter()
+                    .filter(|delta| {
+                        delta.block_id == block.block_id
+                            && delta.home_document_id == block.home_document_id
+                            && delta.before.is_some()
+                            && delta.after.is_none()
+                    })
+                    .collect::<Vec<_>>();
+                if matching.is_empty()
+                    && matches!(
+                        source,
+                        super::BlockReconstructionSource::DeletedBeforeImage { .. }
+                    )
+                {
+                    let retired_births = deletion
+                        .blocks()
+                        .iter()
+                        .filter(|delta| {
+                            delta.block_id == block.block_id
+                                && delta.home_document_id == block.home_document_id
+                                && delta.before.is_none()
+                                && delta
+                                    .after
+                                    .as_ref()
+                                    .is_some_and(|state| state.owner == BlockOwner::Tombstone)
+                        })
+                        .collect::<Vec<_>>();
+                    if let [retired] = retired_births.as_slice() {
+                        let state = retired
+                            .after
+                            .clone()
+                            .expect("filtered atomic birth retirement state");
+                        // An atomic birth/retirement has no accepted membership
+                        // before-image. Its caller supplies the placement while
+                        // the source still authenticates content, identity,
+                        // immutable home and owning page.
+                        let placeholder = MembershipClaim::new(
+                            block.home_document_id,
+                            None,
+                            "atomic-birth-retirement",
+                        )?;
+                        return Ok((state, placeholder, true));
+                    }
+                }
+                let [deleted] = matching.as_slice() else {
+                    return Err(EngineError::InvalidTransaction(
+                        "reconstruction source does not identify one deleted block before-image"
+                            .into(),
+                    ));
+                };
+                let before = deleted
+                    .before
+                    .as_ref()
+                    .expect("matched delete before-image");
+                let memberships = deletion
+                    .memberships()
+                    .iter()
+                    .filter(|delta| {
+                        delta.block_id == block.block_id
+                            && delta.before.as_ref().is_some_and(|claim| {
+                                claim.home_document_id == block.home_document_id
+                            })
+                            && delta.after.is_none()
+                    })
+                    .collect::<Vec<_>>();
+                let [membership] = memberships.as_slice() else {
+                    return Err(EngineError::InvalidTransaction(
+                        "reconstruction source does not identify one removed membership".into(),
+                    ));
+                };
+                let claim = membership
+                    .before
+                    .clone()
+                    .expect("matched deletion membership before-image");
+                match source {
+                    super::BlockReconstructionSource::DeletedBeforeImage { .. } => {
+                        Ok((before.clone(), claim, false))
+                    }
+                    super::BlockReconstructionSource::ConflictAfterImage {
+                        selected_batch_id,
+                        ..
+                    } => {
+                        if selected_batch_id == deletion_batch_id {
+                            return Err(EngineError::InvalidTransaction(
+                                "conflict reconstruction must select the racing accepted batch"
+                                    .into(),
+                            ));
+                        }
+                        let selected_effect =
+                            self.authoritative_semantic_effect_by_id(*selected_batch_id)?;
+                        let selected = selected_effect
+                            .blocks()
+                            .iter()
+                            .find(|delta| {
+                                delta.block_id == block.block_id
+                                    && delta.home_document_id == block.home_document_id
+                            })
+                            .and_then(|delta| delta.after.as_ref())
+                            .ok_or_else(|| {
+                                EngineError::InvalidTransaction(
+                                    "conflict reconstruction selection has no matching post-state"
+                                        .into(),
+                                )
+                            })?;
+                        if selected.logseq_uuid != before.logseq_uuid
+                            || selected.logseq_identity_origin != before.logseq_identity_origin
+                        {
+                            return Err(EngineError::InvalidTransaction(
+                                "conflict reconstruction changed retained identity provenance"
+                                    .into(),
+                            ));
+                        }
+                        let mut state = before.clone();
+                        state.owner = selected.owner;
+                        state.content.clone_from(&selected.content);
+                        let claim = selected_effect
+                            .memberships()
+                            .iter()
+                            .find(|delta| {
+                                delta.block_id == block.block_id
+                                    && delta.after.as_ref().is_some_and(|claim| {
+                                        claim.home_document_id == block.home_document_id
+                                    })
+                            })
+                            .and_then(|delta| delta.after.clone())
+                            .unwrap_or(claim);
+                        Ok((state, claim, true))
+                    }
+                    super::BlockReconstructionSource::PredecessorFrontier { .. } => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconstruction_material_for_test(
+        &self,
+        block: BlockLocation,
+        source: &super::BlockReconstructionSource,
+    ) -> Result<(BlockState, MembershipClaim), EngineError> {
+        self.reconstruction_material(block, source)
+            .map(|(state, claim, _)| (state, claim))
+    }
+
+    fn validate_reconstruction_deltas(&self, effect: &SemanticEffect) -> Result<(), EngineError> {
+        for delta in effect
+            .blocks()
+            .iter()
+            .filter(|delta| delta.reconstruction.is_some())
+        {
+            let source = delta
+                .reconstruction
+                .as_ref()
+                .expect("filtered reconstruction source");
+            let block = BlockLocation {
+                block_id: delta.block_id,
+                home_document_id: delta.home_document_id,
+            };
+            let (selected, source_claim, conflict) = self.reconstruction_material(block, source)?;
+            let after = delta.after.as_ref().ok_or_else(|| {
+                EngineError::InvalidTransaction(
+                    "reconstruction semantic effect has no live post-state".into(),
+                )
+            })?;
+            if delta.before.as_ref().is_some_and(|before| {
+                before.owner != BlockOwner::Tombstone
+                    || before.block_id != selected.block_id
+                    || before.home_document_id != selected.home_document_id
+                    || before.content != selected.content
+                    || before.logseq_uuid != selected.logseq_uuid
+                    || before.logseq_identity_origin != selected.logseq_identity_origin
+            }) || after.block_id != selected.block_id
+                || after.home_document_id != selected.home_document_id
+                || after.logseq_uuid != selected.logseq_uuid
+                || after.logseq_identity_origin != selected.logseq_identity_origin
+            {
+                return Err(EngineError::InvalidTransaction(
+                    "reconstruction semantic effect differs from accepted source identity".into(),
+                ));
+            }
+            let BlockOwner::Page(page_id) = after.owner else {
+                return Err(EngineError::InvalidTransaction(
+                    "reconstruction semantic effect has no live page owner".into(),
+                ));
+            };
+            let memberships = effect
+                .memberships()
+                .iter()
+                .filter(|membership| {
+                    membership.page_id == page_id
+                        && membership.block_id == delta.block_id
+                        && membership.before.is_none()
+                        && membership.after.is_some()
+                })
+                .collect::<Vec<_>>();
+            match memberships.as_slice() {
+                [membership] => {
+                    let claim = membership
+                        .after
+                        .as_ref()
+                        .expect("filtered restored membership");
+                    if claim.home_document_id != delta.home_document_id
+                        || (!conflict && claim != &source_claim)
+                    {
+                        return Err(EngineError::InvalidTransaction(
+                            "reconstruction semantic effect has invalid restored placement".into(),
+                        ));
+                    }
+                }
+                [] if conflict => {}
+                _ => {
+                    return Err(EngineError::InvalidTransaction(
+                        "reconstruction semantic effect has no unique restored membership".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn editor_reconstruction_for_deleted_block(
+        &self,
+        page_id: PageId,
+        block_id: Option<BlockId>,
+        logseq_uuid: Option<LogseqUuid>,
+    ) -> Result<
+        Option<(
+            BlockLocation,
+            BlockState,
+            MembershipClaim,
+            super::BlockReconstructionSource,
+        )>,
+        EngineError,
+    > {
+        if block_id.is_some() == logseq_uuid.is_some() {
+            return Err(EngineError::InvalidTransaction(
+                "deleted editor identity must select exactly one identity kind".into(),
+            ));
+        }
+        let page_home = self
+            .current_hot_catalog_page_state(page_id)?
+            .home_document_id();
+        let dependencies = self.current_hot_document_dependencies_by_id(page_home)?;
+        // The editor's undo stack is not one batch deep: typing in another
+        // block and then undoing back past a delete puts ordinary batches
+        // between the deletion and its undo. Walk this page shard's accepted
+        // ancestry newest-first and answer from the nearest generation that
+        // deleted the selected identity. The walk is bounded because an undo
+        // stack is a session's worth of edits, not a graph's history, and an
+        // ancestor whose semantic effect no longer resolves ends that branch
+        // rather than the request: below the retention floor the honest
+        // answer is that the deletion is no longer undoable.
+        let mut frontier = dependencies.direct_dependency_heads().to_vec();
+        let mut visited = frontier.iter().copied().collect::<BTreeSet<_>>();
+        let mut budget = EDITOR_RECONSTRUCTION_ANCESTRY_BUDGET;
+        while !frontier.is_empty() && budget > 0 {
+            let mut matches = Vec::new();
+            let mut next = Vec::new();
+            for batch_id in &frontier {
+                budget = budget.saturating_sub(1);
+                let Ok(effect) = self.authoritative_semantic_effect_by_id(*batch_id) else {
+                    continue;
+                };
+                for head in self.authoritative_document_dependency_heads(*batch_id, page_home) {
+                    if visited.insert(head) {
+                        next.push(head);
+                    }
+                }
+                for membership in effect.memberships().iter().filter(|delta| {
+                    delta.page_id == page_id && delta.before.is_some() && delta.after.is_none()
+                }) {
+                    let claim = membership
+                        .before
+                        .as_ref()
+                        .expect("filtered deleted membership");
+                    let Some(delta) = effect.blocks().iter().find(|delta| {
+                        delta.block_id == membership.block_id
+                            && delta.home_document_id == claim.home_document_id
+                            && delta.before.is_some()
+                            && delta.after.is_none()
+                    }) else {
+                        continue;
+                    };
+                    let state = delta.before.as_ref().expect("filtered deleted block");
+                    if block_id.is_some_and(|selected| selected != delta.block_id)
+                        || logseq_uuid.is_some_and(|selected| state.logseq_uuid != Some(selected))
+                    {
+                        continue;
+                    }
+                    matches.push((
+                        BlockLocation {
+                            block_id: delta.block_id,
+                            home_document_id: delta.home_document_id,
+                        },
+                        state.clone(),
+                        claim.clone(),
+                        super::BlockReconstructionSource::DeletedBeforeImage {
+                            deletion_batch_id: *batch_id,
+                        },
+                    ));
+                }
+            }
+            match matches.len() {
+                0 => {}
+                1 => return Ok(matches.pop()),
+                _ => {
+                    return Err(EngineError::InvalidTransaction(
+                        "deleted editor identity is ambiguous in one accepted generation".into(),
+                    ))
+                }
+            }
+            frontier = next;
+        }
+        Ok(None)
+    }
+
+    /// This page shard's accepted predecessors of one batch. Used only by the
+    /// editor reconstruction walk, which tolerates an unresolvable ancestor.
+    fn authoritative_document_dependency_heads(
+        &self,
+        batch_id: BatchId,
+        document_id: DocumentId,
+    ) -> Vec<BatchId> {
+        let heads = |manifest: &OperationBatch| {
+            manifest
+                .dependency_frontier()
+                .documents()
+                .iter()
+                .find(|document| document.document_id() == document_id)
+                .map(|document| document.direct_dependency_heads().to_vec())
+                .unwrap_or_default()
+        };
+        if let Some(batch) = self.archive.get(&batch_id) {
+            return heads(batch.manifest());
+        }
+        self.archive_store
+            .as_ref()
+            .and_then(|store| store.resolve_logical_manifest(batch_id).ok().flatten())
+            .map(|manifest| heads(&manifest))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn accepted_batch_revives_page(
         &self,
         batch_id: BatchId,
@@ -21235,6 +21894,11 @@ impl ShardedHotEngine {
     #[cfg(test)]
     pub(crate) fn drop_conflict_history_index_for_test(&self) {
         *self.conflict_history_index.borrow_mut() = ConflictHistoryIndex::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evict_cached_batch_for_test(&mut self, batch_id: BatchId) {
+        self.archive.remove(&batch_id);
     }
 
     #[cfg(test)]
@@ -21464,18 +22128,29 @@ impl ShardedHotEngine {
             return Ok(());
         }
         let merged_doc = self.clone_validation_document(home, 1)?;
-        let Some(merged_state) = read_block_state(home, &merged_doc, block_id)? else {
-            return Ok(());
+        let merged_state = if has_block_state(&merged_doc, block_id)? {
+            read_block_state(home, &merged_doc, block_id)?
+        } else {
+            None
+        };
+        let z_batch_id = if pair.min_batch == x_batch_id {
+            pair.max_batch
+        } else {
+            pair.min_batch
         };
         let restore_after_tombstone =
             |page_id: PageId,
              claim: Option<MembershipClaim>,
              moved: bool,
+             source: super::BlockReconstructionSource,
              intents: &mut Vec<ConflictResolutionIntent>| {
-                // Only when the tombstone actually holds the merged register
-                // is there anything to re-assert; if the surviving side won
-                // the LWW race the outcome is already the resolved one.
-                if merged_state.owner != BlockOwner::Tombstone {
+                // Physical deletion leaves no owner register. If the selected
+                // side already survives as a live page-owned block, there is
+                // nothing to reconstruct.
+                if merged_state
+                    .as_ref()
+                    .is_some_and(|state| state.owner != BlockOwner::Tombstone)
+                {
                     return;
                 }
                 let Some(mut claim) = claim else {
@@ -21495,6 +22170,7 @@ impl ShardedHotEngine {
                         page_id,
                         block,
                         claim,
+                        source,
                         pair: pair.clone(),
                     }
                 } else {
@@ -21502,6 +22178,7 @@ impl ShardedHotEngine {
                         page_id,
                         block,
                         claim,
+                        source,
                         pair: pair.clone(),
                     }
                 };
@@ -21523,6 +22200,10 @@ impl ShardedHotEngine {
                     page,
                     membership_claim_in_effect(z_effect, page, block_id, false),
                     false,
+                    super::BlockReconstructionSource::ConflictAfterImage {
+                        deletion_batch_id: z_batch_id,
+                        selected_batch_id: x_batch_id,
+                    },
                     intents,
                 );
             }
@@ -21531,6 +22212,10 @@ impl ShardedHotEngine {
                     page,
                     membership_claim_in_effect(x_effect, page, block_id, false),
                     false,
+                    super::BlockReconstructionSource::ConflictAfterImage {
+                        deletion_batch_id: x_batch_id,
+                        selected_batch_id: z_batch_id,
+                    },
                     intents,
                 );
             }
@@ -21540,6 +22225,10 @@ impl ShardedHotEngine {
                     target,
                     membership_claim_in_effect(x_effect, target, block_id, true),
                     true,
+                    super::BlockReconstructionSource::ConflictAfterImage {
+                        deletion_batch_id: z_batch_id,
+                        selected_batch_id: x_batch_id,
+                    },
                     intents,
                 );
             }
@@ -21548,11 +22237,20 @@ impl ShardedHotEngine {
                     target,
                     membership_claim_in_effect(z_effect, target, block_id, true),
                     true,
+                    super::BlockReconstructionSource::ConflictAfterImage {
+                        deletion_batch_id: x_batch_id,
+                        selected_batch_id: z_batch_id,
+                    },
                     intents,
                 );
             }
             // edit-vs-edit: classify against the ancestor and the CRDT merge.
             (Some(page), _, _, Some(_), _, _) => {
+                let Some(merged_state) = merged_state.as_ref() else {
+                    // A separate deletion pair owns reconstruction of a
+                    // physically absent block.
+                    return Ok(());
+                };
                 let BlockOwner::Page(current_page) = merged_state.owner else {
                     // The block lost a separate race with a tombstone; that
                     // pair produces its own restore intent.
@@ -22945,6 +23643,15 @@ impl ShardedHotEngine {
                     .map(|_| (delta.home_document_id, delta.block_id))
             })
             .collect();
+        let temporarily_absent_conflict_blocks = effect
+            .blocks()
+            .iter()
+            .filter(|delta| {
+                (delta.before.is_some() && delta.after.is_none())
+                    || block_delta_move_target(delta).is_some()
+            })
+            .map(|delta| (delta.home_document_id, delta.block_id))
+            .collect::<AHashSet<_>>();
         let mut new_memberships = AHashMap::<PageId, Vec<(BlockId, MembershipClaim)>>::new();
         for delta in effect.memberships() {
             for claim in [&delta.before, &delta.after].into_iter().flatten() {
@@ -23009,7 +23716,10 @@ impl ShardedHotEngine {
                             &mut referenced_homes,
                             claim.home_document_id,
                         )?;
-                        if !has_block_state(home, *block_id)? {
+                        if !has_block_state(home, *block_id)?
+                            && !temporarily_absent_conflict_blocks
+                                .contains(&(claim.home_document_id, *block_id))
+                        {
                             return Err(EngineError::MalformedDocument {
                                 document_id: *document_id,
                                 reason: format!(
@@ -23029,7 +23739,10 @@ impl ShardedHotEngine {
                     &mut referenced_homes,
                     claim.home_document_id,
                 )?;
-                if !has_block_state(home, block_id)? {
+                if !has_block_state(home, block_id)?
+                    && !temporarily_absent_conflict_blocks
+                        .contains(&(claim.home_document_id, block_id))
+                {
                     return Err(EngineError::MalformedDocument {
                         document_id: *document_id,
                         reason: format!(
@@ -23138,6 +23851,7 @@ impl ShardedHotEngine {
         before_snapshots: &BTreeMap<DocumentId, SemanticDocumentSnapshot>,
     ) -> Result<IdentityPublicationCandidate, EngineError> {
         let validation_started = Instant::now();
+        self.validate_reconstruction_deltas(effect)?;
         for delta in effect.pages() {
             for state in [&delta.before, &delta.after].into_iter().flatten() {
                 if state.home_document_id() == self.catalog_document_id {
@@ -23182,6 +23896,10 @@ impl ShardedHotEngine {
                 });
             }
             if delta.before.is_some() || delta.after.is_none() {
+                continue;
+            }
+            if let Some(source) = &delta.reconstruction {
+                let _ = source;
                 continue;
             }
             let birth = delta
@@ -23512,34 +24230,122 @@ impl ShardedHotEngine {
                 }
             }
             SemanticOperation::DeletePage { page_id } => {
-                let catalog = self.ensure_working_document(
-                    working,
-                    before_vectors,
-                    before_snapshots,
-                    self.catalog_document_id,
-                    peer_id,
-                )?;
-                let state = require_live_page(catalog, *page_id)?;
-                insert_page_state(
-                    catalog,
-                    *page_id,
-                    &PageState::Tombstone {
-                        name: state.name().clone(),
-                        home_document_id: state.home_document_id(),
-                        kind: state.kind(),
-                    },
-                )?;
+                let state = {
+                    let catalog = self.ensure_working_document(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        self.catalog_document_id,
+                        peer_id,
+                    )?;
+                    let state = require_live_page(catalog, *page_id)?;
+                    insert_page_state(
+                        catalog,
+                        *page_id,
+                        &PageState::Tombstone {
+                            name: state.name().clone(),
+                            home_document_id: state.home_document_id(),
+                            kind: state.kind(),
+                        },
+                    )?;
+                    state
+                };
+                let page_home = state.home_document_id();
+                let mut newly_loaded = BTreeSet::new();
+                if !working.contains_key(&page_home) {
+                    newly_loaded.insert(page_home);
+                }
+                let memberships = {
+                    let shard = self.ensure_working_document(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        page_home,
+                        peer_id,
+                    )?;
+                    read_memberships(page_home, shard)?
+                };
+                for (block_id, claim) in &memberships {
+                    if !working.contains_key(&claim.home_document_id) {
+                        newly_loaded.insert(claim.home_document_id);
+                    }
+                    let home = self.ensure_working_document(
+                        working,
+                        before_vectors,
+                        before_snapshots,
+                        claim.home_document_id,
+                        peer_id,
+                    )?;
+                    if read_block_state(claim.home_document_id, home, *block_id)?
+                        .is_some_and(|block| block.owner == BlockOwner::Page(*page_id))
+                    {
+                        let existed_at_batch_base = before_snapshots
+                            .get(&claim.home_document_id)
+                            .is_some_and(|snapshot| match snapshot {
+                                SemanticDocumentSnapshot::Shard { blocks, .. } => {
+                                    blocks.contains_key(block_id)
+                                }
+                                SemanticDocumentSnapshot::Catalog(_) => false,
+                            });
+                        if existed_at_batch_base {
+                            delete_block_live_state(home, *block_id)?;
+                        } else {
+                            // An atomic create/delete has no accepted deletion
+                            // before-image to reconstruct. Keep its birth-retirement
+                            // provenance as the existing tombstone state; real
+                            // deletion applies to payload that was live at the
+                            // operation's causal base.
+                            set_owner(home, *block_id, BlockOwner::Tombstone)?;
+                        }
+                    }
+                }
+                let shard = working
+                    .get(&page_home)
+                    .expect("deleted page shard is working")
+                    .document();
+                let members = shard.get_map(SHARD_MEMBERS);
+                for block_id in memberships.keys() {
+                    members.delete(&block_id.to_string()).map_err(loro_error)?;
+                }
+                if shard
+                    .get_map(SHARD_PAGE_PREAMBLE)
+                    .get(SHARD_PAGE_PREAMBLE_VALUE)
+                    .is_some()
+                {
+                    shard
+                        .get_map(SHARD_PAGE_PREAMBLE)
+                        .delete(SHARD_PAGE_PREAMBLE_VALUE)
+                        .map_err(loro_error)?;
+                }
+                for document_id in newly_loaded {
+                    let unchanged = working.get(&document_id).is_some_and(|document| {
+                        before_vectors
+                            .get(&document_id)
+                            .is_some_and(|before| document.document().oplog_vv() == *before)
+                    });
+                    if unchanged {
+                        working.remove(&document_id);
+                        before_vectors.remove(&document_id);
+                        before_snapshots.remove(&document_id);
+                    }
+                }
             }
             SemanticOperation::RevivePage {
                 page_id,
                 name,
                 path,
                 kind,
+                deletion_batch_id,
                 predecessor_frontier,
                 prior_present_intent_id: _,
             } => {
-                let target =
-                    self.materialize_page_at_projection_frontier(*page_id, predecessor_frontier)?;
+                let target = match deletion_batch_id {
+                    Some(batch_id) => {
+                        self.materialize_page_from_deletion_effect(*page_id, *batch_id)?
+                    }
+                    None => self
+                        .materialize_page_at_projection_frontier(*page_id, predecessor_frontier)?,
+                };
                 if target.name != *name || target.path != *path || target.kind != *kind {
                     return Err(EngineError::InvalidTransaction(format!(
                         "RevivePage target for {page_id} differs from its authenticated predecessor frontier"
@@ -23591,14 +24397,6 @@ impl ShardedHotEngine {
                     page_home_hints,
                     *page_id,
                 )?;
-                // Restores re-assert values that one side of a concurrent race
-                // may already hold, and loro skips same-value map writes, so a
-                // touched document can end up with zero new operations. A
-                // zero-operation working document must not stay in the batch:
-                // its exported "update" would declare an empty start frontier
-                // and be refused by every receiver. Track which documents this
-                // operation pulled into the working set and evict the ones it
-                // did not actually change.
                 let mut touched: BTreeMap<DocumentId, (bool, VersionVector)> = BTreeMap::new();
                 for restore in blocks {
                     if restore.claim.home_document_id != restore.block.home_document_id {
@@ -23607,6 +24405,22 @@ impl ShardedHotEngine {
                         ));
                     }
                     restore.claim.validate()?;
+                    let (mut selected, source_claim, conflict) =
+                        self.reconstruction_material(restore.block, &restore.source)?;
+                    if conflict && selected.owner == BlockOwner::Tombstone {
+                        selected.owner = BlockOwner::Page(*page_id);
+                    }
+                    if selected.owner != BlockOwner::Page(*page_id) {
+                        return Err(EngineError::InvalidTransaction(
+                            "reconstruction source selects a different page owner".into(),
+                        ));
+                    }
+                    if !conflict && restore.claim != source_claim {
+                        return Err(EngineError::InvalidTransaction(
+                            "ordinary reconstruction placement differs from the delete before-image"
+                                .into(),
+                        ));
+                    }
                     let vacant = !working.contains_key(&restore.block.home_document_id);
                     let home = self.ensure_working_document(
                         working,
@@ -23618,16 +24432,50 @@ impl ShardedHotEngine {
                     touched
                         .entry(restore.block.home_document_id)
                         .or_insert_with(|| (vacant, home.oplog_vv()));
-                    if read_block_state(
-                        restore.block.home_document_id,
-                        home,
-                        restore.block.block_id,
-                    )?
-                    .is_none()
-                    {
-                        return Err(EngineError::BlockNotFound(restore.block.block_id));
+                    let current = if has_block_state(home, restore.block.block_id)? {
+                        read_block_state(
+                            restore.block.home_document_id,
+                            home,
+                            restore.block.block_id,
+                        )?
+                    } else {
+                        None
+                    };
+                    if current.as_ref().is_some_and(|current| {
+                        current.owner == BlockOwner::Page(*page_id)
+                            && current.content == selected.content
+                            && current.logseq_uuid == selected.logseq_uuid
+                            && current.logseq_identity_origin == selected.logseq_identity_origin
+                    }) {
+                        continue;
                     }
-                    set_owner(home, restore.block.block_id, BlockOwner::Page(*page_id))?;
+                    if current.is_some() {
+                        delete_block_live_state(home, restore.block.block_id)?;
+                    }
+                    home.get_map(SHARD_OWNERS)
+                        .insert(&restore.block.block_id.to_string(), page_id.to_string())
+                        .map_err(loro_error)?;
+                    home.get_map(SHARD_CONTENT)
+                        .insert_container(
+                            &restore.block.block_id.to_string(),
+                            loro::LoroText::new(),
+                        )
+                        .map_err(loro_error)?
+                        .insert(0, &selected.content)
+                        .map_err(loro_error)?;
+                    if let Some(logseq_uuid) = selected.logseq_uuid {
+                        home.get_map(SHARD_LOGSEQ_UUIDS)
+                            .insert(&restore.block.block_id.to_string(), logseq_uuid.to_string())
+                            .map_err(loro_error)?;
+                        home.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS)
+                            .insert(
+                                &restore.block.block_id.to_string(),
+                                encode_canonical(&selected.logseq_identity_origin.expect(
+                                    "accepted UUID source retains paired identity origin",
+                                ))?,
+                            )
+                            .map_err(loro_error)?;
+                    }
                 }
                 let vacant = !working.contains_key(&page_home);
                 let destination = self.ensure_working_document(
@@ -23698,7 +24546,7 @@ impl ShardedHotEngine {
                     .map_err(loro_error)?;
                 shard
                     .get_map(SHARD_CONTENT)
-                    .ensure_mergeable_text(&block.block_id.to_string())
+                    .insert_container(&block.block_id.to_string(), loro::LoroText::new())
                     .map_err(loro_error)?
                     .insert(0, content)
                     .map_err(loro_error)?;
@@ -24044,7 +24892,25 @@ impl ShardedHotEngine {
                         claim.home_document_id,
                         peer_id,
                     )?;
-                    set_owner(home, *block_id, BlockOwner::Tombstone)?;
+                    if read_block_state(claim.home_document_id, home, *block_id)?
+                        .is_some_and(|block| block.owner == BlockOwner::Page(*page_id))
+                    {
+                        let existed_at_batch_base = before_snapshots
+                            .get(&claim.home_document_id)
+                            .is_some_and(|snapshot| match snapshot {
+                                SemanticDocumentSnapshot::Shard { blocks, .. } => {
+                                    blocks.contains_key(block_id)
+                                }
+                                SemanticDocumentSnapshot::Catalog(_) => false,
+                            });
+                        if existed_at_batch_base {
+                            delete_block_live_state(home, *block_id)?;
+                        } else {
+                            // See DeletePage above: same-batch birth retirement
+                            // remains the one non-reconstructable tombstone case.
+                            set_owner(home, *block_id, BlockOwner::Tombstone)?;
+                        }
+                    }
                 }
                 let page = working
                     .get(&page_document_id)
@@ -26754,6 +27620,7 @@ fn derive_effect_from_snapshots_with_catalog(
                         block_id: *block_id,
                         home_document_id: document_id,
                         birth: birth.clone(),
+                        reconstruction: None,
                         before: None,
                         after: Some(state.clone()),
                     }));
@@ -26762,6 +27629,7 @@ fn derive_effect_from_snapshots_with_catalog(
                         block_id: *block_id,
                         home_document_id: document_id,
                         birth: None,
+                        reconstruction: None,
                         before: Some(state.clone()),
                         after: None,
                     }));
@@ -26783,6 +27651,7 @@ fn derive_effect_from_snapshots_with_catalog(
                                 } else {
                                     None
                                 },
+                                reconstruction: None,
                                 before: before_state,
                                 after: after_state,
                             });
@@ -27619,6 +28488,22 @@ fn set_owner(document: &LoroDoc, block_id: BlockId, owner: BlockOwner) -> Result
         .get_map(SHARD_OWNERS)
         .insert(&block_id.to_string(), value)
         .map_err(loro_error)
+}
+
+fn delete_block_live_state(document: &LoroDoc, block_id: BlockId) -> Result<(), EngineError> {
+    let key = block_id.to_string();
+    for map in [
+        SHARD_OWNERS,
+        SHARD_CONTENT,
+        SHARD_LOGSEQ_UUIDS,
+        SHARD_LOGSEQ_IDENTITY_ORIGINS,
+    ] {
+        let root = document.get_map(map);
+        if root.get(&key).is_some() {
+            root.delete(&key).map_err(loro_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn block_text(document: &LoroDoc, block_id: BlockId) -> Option<loro::LoroText> {
@@ -30131,6 +31016,7 @@ pub(crate) mod validation_tests {
                 page_id: extra_page_id,
                 page_document_id: extra_home_id,
             }),
+            reconstruction: None,
             before: None,
             after: Some(block_state(
                 extra_block_id,
@@ -30463,6 +31349,7 @@ pub(crate) mod validation_tests {
                     page_id: birth_page_id,
                     page_document_id: home,
                 }),
+                reconstruction: None,
                 before: None,
                 after: Some(block_state(
                     block_id,
@@ -30961,6 +31848,7 @@ pub(crate) mod validation_tests {
                 page_id: extra_declaration.page_id,
                 page_document_id: extra_declaration.home_id,
             }),
+            reconstruction: None,
             before: None,
             after: Some(block_state(
                 extra_block_id,
@@ -31685,6 +32573,9 @@ pub(crate) mod validation_tests {
                             home_document_id: page_home,
                         },
                         claim: MembershipClaim::new(page_home, None, "a").unwrap(),
+                        source: crate::oplog::BlockReconstructionSource::DeletedBeforeImage {
+                            deletion_batch_id: deletion.manifest().batch_id(),
+                        },
                     }],
                 }])
                 .unwrap(),
@@ -32210,6 +33101,7 @@ pub(crate) mod validation_tests {
                 block_id,
                 home_document_id: home_id,
                 birth: None,
+                reconstruction: None,
                 before: Some(before_state),
                 after: None,
             }],
@@ -32538,6 +33430,7 @@ pub(crate) mod validation_tests {
                     block_id,
                     home_document_id: home_a,
                     birth: None,
+                    reconstruction: None,
                     before: Some(removed_state),
                     after: None,
                 },
@@ -32548,6 +33441,7 @@ pub(crate) mod validation_tests {
                         page_id: page_b,
                         page_document_id: home_b,
                     }),
+                    reconstruction: None,
                     before: None,
                     after: Some(recreated_state),
                 },

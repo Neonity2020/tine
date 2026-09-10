@@ -741,6 +741,133 @@ fn managed_new_then_existing_save_preserves_nested_editor_identity() {
 }
 
 #[test]
+fn managed_delete_undo_redo_reconstructs_and_redeletes() {
+    let fixture = ActivationFixture::nested_unicode("managed-delete-undo-redo", 0xc7a2_1000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = activated.handle.expect("undo fixture activates");
+    drive_initial_feed(&handle);
+
+    let (before_delete, revision) = load_application_exact(&handle, "Root.md");
+    let mut deleted_page = before_delete.clone();
+    deleted_page.blocks.clear();
+    let deleted = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: deleted_page.path.clone(),
+                revision,
+            },
+            page: deleted_page,
+        })
+        .unwrap();
+    let (deleted_page, deletion_revision) =
+        accepted_application_save(&handle, deleted, "Root logical", SyncPageKind::Page);
+    drain_managed_local(&handle);
+
+    let mut undo_then_type = before_delete.clone();
+    undo_then_type.blocks[0]
+        .raw
+        .push_str(" typed before debounce");
+    let restored = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: before_delete.path.clone(),
+                revision: deletion_revision,
+            },
+            page: undo_then_type.clone(),
+        })
+        .unwrap();
+    let (restored_page, restored_revision) =
+        accepted_application_save(&handle, restored, "Root logical", SyncPageKind::Page);
+    assert_eq!(
+        serde_json::to_value(&restored_page.blocks).unwrap(),
+        serde_json::to_value(&undo_then_type.blocks).unwrap(),
+        "undo reconstruction is followed by the coalesced ordinary edit"
+    );
+    drain_managed_local(&handle);
+
+    let redone = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: deleted_page.path.clone(),
+                revision: restored_revision,
+            },
+            page: deleted_page,
+        })
+        .unwrap();
+    let (redone_page, _) =
+        accepted_application_save(&handle, redone, "Root logical", SyncPageKind::Page);
+    assert!(redone_page.blocks.is_empty());
+}
+
+/// Undo of an accepted deletion must still reconstruct after an ordinary
+/// unrelated save has landed on the same page shard. The editor's undo stack
+/// is not one batch deep: typing in another block and then undoing back past
+/// the delete puts at least one batch between the deletion and its undo.
+#[test]
+fn managed_delete_undo_reconstructs_after_an_intervening_page_batch() {
+    let fixture = ActivationFixture::nested_unicode("managed-delete-undo-intervening", 0xc7a2_1100);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = activated.handle.expect("undo fixture activates");
+    drive_initial_feed(&handle);
+
+    let (before_delete, revision) = load_application_exact(&handle, "Root.md");
+    let original = before_delete.blocks[0].raw.clone();
+    let mut cleared = before_delete.clone();
+    cleared.blocks.clear();
+    let deleted = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: cleared.path.clone(),
+                revision,
+            },
+            page: cleared,
+        })
+        .unwrap();
+    let (deleted_page, deletion_revision) =
+        accepted_application_save(&handle, deleted, "Root logical", SyncPageKind::Page);
+    drain_managed_local(&handle);
+
+    let mut intervening = deleted_page.clone();
+    intervening
+        .blocks
+        .push(application_move_test_root("intervening", 0));
+    let saved = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: intervening.path.clone(),
+                revision: deletion_revision,
+            },
+            page: intervening,
+        })
+        .unwrap();
+    let (intervening_page, intervening_revision) =
+        accepted_application_save(&handle, saved, "Root logical", SyncPageKind::Page);
+    drain_managed_local(&handle);
+
+    let mut undone = intervening_page.clone();
+    undone.blocks.splice(0..0, before_delete.blocks.clone());
+    let restored = handle
+        .save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: undone.path.clone(),
+                revision: intervening_revision,
+            },
+            page: undone,
+        })
+        .unwrap();
+    let (restored_page, _) =
+        accepted_application_save(&handle, restored, "Root logical", SyncPageKind::Page);
+    assert!(
+        restored_page
+            .blocks
+            .iter()
+            .any(|block| block.raw == original),
+        "undo after an intervening batch did not reconstruct the deleted block: {:?}",
+        restored_page.blocks
+    );
+}
+
+#[test]
 fn template_extraction_matches_og_property_rule_in_md_and_org() {
     fn signature(templates: Vec<TemplateDto>) -> Vec<(String, String, Vec<String>)> {
         let mut rows = templates

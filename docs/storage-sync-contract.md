@@ -1228,17 +1228,28 @@ Interactive state uses one catalog document plus one shard document per page.
 The catalog holds every page's live-or-tombstone state, including its immutable
 home shard. A page shard binds its page identity in `shard_meta` and holds that
 page's `owners`, `members`, `content`, `logseq_uuids` and preamble maps; each
-block's content is one mergeable text container under `content`. A block's
+block's content is one ordinary upstream `LoroText` container inserted under
+`content`. A block's
 immutable home is the shard of the page it was created on, and its
 `BlockBirth { page_id, page_document_id }` names exactly that page and shard.
-The birth is authenticated in semantic-effect schema 8 against the shard's
+The birth is authenticated in semantic-effect schema 9 against the shard's
 immutable page identity at the batch's declared causal base, or against a page
-born in the same batch; deletion, Restore, replay and moves never rewrite it,
-the block's home, or its content text `ContainerID`. No document exists per
+born in the same batch. Delete removes the live owner, content, membership and
+paired sparse UUID/origin keys for payload live at that causal base. An atomic
+create/delete has no accepted deletion before-image: it retains the existing
+birth-retirement tombstone provenance and is the sole physical-removal
+exception. Restore is explicitly marked as reconstruction,
+selects an accepted delete before-image (or the recorded predecessor frontier
+for an activation-era sweep without a deletion id), retains the BlockId,
+immutable home and Logseq identity, and inserts a new text container; moves and
+replay never rewrite the immutable home. No document exists per
 block or per membership. Accepted frontier roots, the run-local accepted
 document map, SQLite frontier rows and point reads key a live document by its
 16 UUID bytes; a key of any other length is refused, never truncated. Journal
-and manifest commit points and checkpoint recovery are unchanged.
+and manifest commit points and checkpoint recovery are unchanged. This is one
+current format: operation schema 11, semantic-effect schema 9 and lazy genesis
+schema 7. Earlier managed stores are preserved as backups and take the existing
+Direct-files rebuild path; there is no old-format decoder or migration.
 
 A cross-page `MoveSubtree` rewrites the moved blocks' owners in their home
 shards and their membership in the source and destination shards; content stays
@@ -1252,12 +1263,17 @@ since the caller observed it; the moved owners then name the tombstoned page,
 and exact revival removes them again.
 
 Whole-file external deletion is represented by `DeletePage` alone. It
-tombstones the page's catalog state and leaves its shard's block content,
-owners and memberships available to historical materialization and Restore;
-page liveness is what hides them. Moving a subtree to another live
-or newly created page still occurs before the source page tombstone and keeps its
-identity. Removing only part of a still-live page remains `DeleteSubtree` and
-does change the selected block owners and memberships. Deferred pages keep
+tombstones the page's catalog identity, removes each still-owned block's live
+owner/content and paired sparse identity keys, removes the page's memberships,
+and clears its live preamble. `DeleteSubtree` performs the same physical removal
+for the selected owned subtree. The accepted semantic effect records complete
+block, membership and preamble before-images with absent post-state, so Restore
+does not depend on retained CRDT payload. A block already moved to another live
+or newly created page is not removed when the source page is deleted and keeps
+its immutable identity and home. An atomic same-batch birth/retirement retains
+its tombstone payload and birth authority because no earlier accepted state can
+supply a before-image; a later Restore validates that authority and authors a
+new container while taking its placement from the Restore operation. Deferred pages keep
 their existing behavior. A path rename preserves its matched `PageId` and is
 therefore not a whole-file page deletion.
 
@@ -1736,6 +1752,16 @@ ambiguous baseline claims remain unresolved after reconstruction.
    unopenable store. Guarded by
    `a4_run_local_identity_indexes_have_no_fixed_capacity` and the `a4_*`
    past-capacity tests (`hot_engine_integration_tests.rs`).
+11. A `None -> Some` block transition is exactly one of two authenticated
+    semantic cases: a fresh `BlockBirth`, or a marked reconstruction naming an
+    accepted deletion source. Reconstruction retains BlockId, immutable home,
+    UUID and UUID-origin provenance. The author creates and carries the new
+    Loro text container in the ordinary document update; receivers validate
+    the source, update and final semantic effect together before publication.
+    If editor undo text differs from the selected delete before-image, the
+    ordered transaction reconstructs first and performs an ordinary edit on
+    the new container second. Full accepted replay and shallow reopen must
+    produce the same semantic state and Logseq-readable projection.
 
 ### 3.1 Refusal scenarios
 
@@ -1758,6 +1784,17 @@ in this table.
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
 | `APP-REF-PLUGIN-IMMUTABLE-COLLISION` | Two honest concurrent installs, or a crash-recovered retry racing a completed install, present different bytes for the same plugin id and version | Keep the no-clobber winner byte-exact and refuse the other install as `immutable plugin version ... different bytes`; never overwrite or merge the package |
+
+Reconstruction applies those scenarios at these concrete call sites:
+
+| Condition | Scenario ID | In-scope failure and required response |
+| --- | --- | --- |
+| Selected batch/object is still arriving | `MS-REF-CRASH-TRUNCATED` | Interrupted sync delivery has not supplied the manifest-bound semantic effect. Keep Restore retryable, preserve the selector and source bytes, and never synthesize empty text. |
+| Accepted source is missing or damaged in both archive tiers | `MS-REF-DISK-CORRUPT` | Disk/media failure removed or changed the selected immutable object. Use existing archive repair where possible; otherwise fail the affected action naming the exact batch/object. |
+| One immutable source identity has conflicting bytes | `MS-REF-SYNC-CONFLICT` | Provider delivery produced a stable immutable collision. Preserve both pieces of evidence and never select by arrival order or mtime. |
+| Reconstruction names the wrong block/home, is malformed, or exceeds an existing bound | `MS-REF-MALFORMED-IMPORT` / `MS-REF-BOUNDS` | Malformed imported/shared operation input attempts identity substitution or excess allocation. Reject before publication or allocation beyond the bound. |
+| Imported reconstruction update, source and declared effect disagree | `MS-REF-MALFORMED-IMPORT` | Malformed peer/import input substitutes content, identity, placement, or container operations. Reject the complete batch atomically; install no document or replacement. |
+| Restore planning state advances | `MS-REF-STALE-GENERATION` | An honest concurrent operation changed the page/frontier after validation. Re-diff through the existing bounded retry/action cursor; do not publish the stale plan. |
 
 Three retryable refusals are intentionally recorded outside the durable-scenario
 table:
@@ -2803,8 +2840,13 @@ files, so watcher observations cannot fight the action. Started/progress/
 completion records make it restart-resumable and idempotent. Keep-deletion is
 also recorded before it releases grace.
 
-Restore is a whole-sweep actor action. It renders each member from the accepted
-predecessor state immediately before that member's deletion batch. A retained
+Restore is a whole-sweep actor action. For an ordinary member it point-resolves
+the exact deletion batch's manifest-bound semantic effect and reconstructs the
+page from complete block, membership and preamble before-images. This reads no
+SQLite content and performs no history-namespace scan or unrelated frontier
+replay. A legitimate activation-era member with no `deletion_batch_id` retains
+the recorded predecessor-frontier reconstruction path; it never guesses the
+latest deletion. A retained
 Present intent can contribute exact layout and annotation evidence, yielding a
 `byte_identical` fidelity grade. Without that evidence the ordinary canonical
 renderer yields `semantically_identical`: the accepted semantic state is exact,
@@ -2828,10 +2870,17 @@ decoder or wire-version peek—and the enrollment graph-schema floor is
 unchanged. Already-shipped pre-0.7 builds treat the unsupported clean
 descriptor as benign non-join.
 
+`RevivePage` carries the optional exact deletion selector. With one present,
+its target is the accepted deletion effect rather than current raw shard keys;
+each absent block becomes a source-marked `RestoreSubtree` that creates a new
+text container while retaining block/home/UUID identity. Catalog revival stays
+first, and the exceptional selector-less case uses only its recorded
+predecessor frontier.
+
 The first operation in every revival batch is the catalog flip, making the
 following content operations legal in vector order. The remaining operations
 are a state-targeted semantic-tree diff from the **current** shard to the
-immutable predecessor snapshot: block insert/remove/move/edit, membership,
+immutable accepted target: block reconstruct/remove/move/edit, membership,
 preamble, and metadata changes. An already-equal page emits no content work.
 Peers admit and replay these as ordinary CRDT operations, so concurrent remote
 edits resolve through the normal merge rather than a special restore channel.
@@ -2955,8 +3004,11 @@ clear the only discovery mark for another that has not caught up.
 
 **Restore pins.** `CurrentActionRoots::retention_closure()` is the bounded
 interface a generation capture reads: the documents, dependency heads, pages,
-intents and sweeps that unfinished actions and explicit pending Restore still
-require. Membership means "cold relocation must keep this logical object
+intents, exact deletion batch ids and sweeps that unfinished actions and
+explicit pending Restore still require. The predecessor frontier and prior
+Present intent remain fidelity/layout evidence; the deletion batch's semantic
+effect is ordinary Restore text authority. Membership means "cold relocation
+must keep this logical object
 reachable", not "keep this record active". Completing a sweep removes it from
 current actionable state; it does not erase its Restore predecessor page
 identity, its predecessor `FrontierV2`, or its prior intent, all of which the
@@ -3078,8 +3130,9 @@ writer incarnations, are carried in the clean checkpoint state section
 second index.
 
 **Schema.** This is one coherent current format with no reader for the previous
-one (D-1): `OPERATION_SCHEMA_VERSION` 10, writer-lane record schema 2, clean
-checkpoint state schema 4. Every persisted point-index key encoding carries the
+one (D-1): `OPERATION_SCHEMA_VERSION` 11,
+`SEMANTIC_EFFECT_SCHEMA_VERSION` 9, lazy-genesis schema 7, writer-lane record
+schema 2, and clean checkpoint state schema 4. Every persisted point-index key encoding carries the
 full 16-byte incarnation UUID; none of them truncates or hashes it.
 
 ### 2.10a Durability barriers by artifact class

@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
-use super::{BlockId, DocumentId, LogseqUuid, ManagedPath, ManagedTextKind, PageId};
+use super::{BatchId, BlockId, DocumentId, LogseqUuid, ManagedPath, ManagedTextKind, PageId};
 
-/// 8: block homes are again their creation-page shard documents; 7 added
-/// `BlockDelta::birth`. One current format only (D-1).
-pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 8;
+/// 9: physically absent blocks distinguish accepted-history reconstruction
+/// from a fresh birth. One current format only (D-1).
+pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 9;
 pub const CATALOG_PAGE_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SEMANTIC_EFFECT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SEMANTIC_DELTA_ENTRIES: usize = 100_000;
@@ -748,14 +748,42 @@ pub struct BlockBirth {
     pub page_document_id: DocumentId,
 }
 
+/// Accepted authority for rematerializing one physically absent block.
+/// Ordinary Restore selects the delete before-image directly. Conflict
+/// resolution may select the accepted post-state of the racing edit/move.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlockReconstructionSource {
+    DeletedBeforeImage {
+        deletion_batch_id: BatchId,
+    },
+    ConflictAfterImage {
+        deletion_batch_id: BatchId,
+        selected_batch_id: BatchId,
+    },
+    /// Exceptional activation-era Restore whose sweep predates an exact
+    /// deletion BatchId. This retains the existing accepted-frontier oracle;
+    /// it never guesses a later deletion.
+    PredecessorFrontier {
+        frontier: super::FrontierV2,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockDelta {
     pub block_id: BlockId,
     pub home_document_id: DocumentId,
     pub birth: Option<BlockBirth>,
+    pub reconstruction: Option<BlockReconstructionSource>,
     pub before: Option<BlockState>,
     pub after: Option<BlockState>,
+}
+
+impl BlockDelta {
+    pub(crate) const fn has_birth_authority(&self) -> bool {
+        self.birth.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -826,6 +854,41 @@ impl SemanticEffect {
 
     pub fn blocks(&self) -> &[BlockDelta] {
         &self.blocks
+    }
+
+    pub(crate) fn mark_block_reconstruction(
+        &mut self,
+        home_document_id: DocumentId,
+        block_id: BlockId,
+        source: BlockReconstructionSource,
+    ) -> Result<(), SemanticError> {
+        let index = self
+            .blocks
+            .binary_search_by_key(&(home_document_id, block_id), |delta| {
+                (delta.home_document_id, delta.block_id)
+            })
+            .map_err(|_| SemanticError::InvalidBlockReconstruction)?;
+        let delta = &mut self.blocks[index];
+        let reconstructable_absence = delta.before.is_none()
+            || matches!(
+                (&delta.before, &delta.after),
+                (
+                    Some(BlockState {
+                        owner: BlockOwner::Tombstone,
+                        ..
+                    }),
+                    Some(BlockState {
+                        owner: BlockOwner::Page(_),
+                        ..
+                    })
+                )
+            );
+        if !reconstructable_absence || delta.after.is_none() {
+            return Err(SemanticError::InvalidBlockReconstruction);
+        }
+        delta.birth = None;
+        delta.reconstruction = Some(source);
+        self.validate()
     }
 
     pub fn memberships(&self) -> &[MembershipDelta] {
@@ -1024,9 +1087,6 @@ impl SemanticEffect {
             if delta.before == delta.after {
                 return Err(SemanticError::UnchangedDelta);
             }
-            if delta.before.is_some() && delta.after.is_none() {
-                return Err(SemanticError::PagePreambleStateRemoved);
-            }
             for state in [&delta.before, &delta.after].into_iter().flatten() {
                 if state.page_id != delta.page_id
                     || state.home_document_id != delta.home_document_id
@@ -1039,16 +1099,54 @@ impl SemanticEffect {
                     }
                 }
             }
+            if delta.before.is_some()
+                && delta.after.is_none()
+                && !self.pages.iter().any(|page| {
+                    page.page_id == delta.page_id
+                        && matches!(
+                            (&page.before, &page.after),
+                            (
+                                Some(PageState::Live {
+                                    home_document_id: before_home,
+                                    ..
+                                }),
+                                Some(PageState::Tombstone {
+                                    home_document_id: after_home,
+                                    ..
+                                })
+                            ) if *before_home == delta.home_document_id
+                                && before_home == after_home
+                        )
+                })
+            {
+                return Err(SemanticError::InvalidPageLifecycle);
+            }
         }
         for delta in &self.blocks {
             if delta.before == delta.after {
                 return Err(SemanticError::UnchangedDelta);
             }
-            if delta.before.is_some() && delta.after.is_none() {
-                return Err(SemanticError::BlockStateRemoved);
-            }
-            if (delta.before.is_none() && delta.after.is_some()) != delta.birth.is_some() {
-                return Err(SemanticError::InvalidBlockBirth);
+            match (&delta.before, &delta.after) {
+                (None, Some(_)) if delta.birth.is_some() == delta.reconstruction.is_some() => {
+                    return Err(if delta.birth.is_some() {
+                        SemanticError::InvalidBlockReconstruction
+                    } else {
+                        SemanticError::InvalidBlockBirth
+                    });
+                }
+                (Some(_), None) if delta.birth.is_some() || delta.reconstruction.is_some() => {
+                    return Err(SemanticError::InvalidBlockReconstruction);
+                }
+                (Some(before), Some(after))
+                    if delta.birth.is_some()
+                        || (delta.reconstruction.is_some()
+                            && !(before.owner == BlockOwner::Tombstone
+                                && matches!(after.owner, BlockOwner::Page(_)))) =>
+                {
+                    return Err(SemanticError::InvalidBlockReconstruction);
+                }
+                (None, None) => return Err(SemanticError::UnchangedDelta),
+                _ => {}
             }
             for state in [&delta.before, &delta.after].into_iter().flatten() {
                 if state.block_id != delta.block_id
@@ -1120,8 +1218,7 @@ pub enum SemanticError {
     UnchangedDelta,
     InvalidPageLifecycle,
     InvalidBlockBirth,
-    BlockStateRemoved,
-    PagePreambleStateRemoved,
+    InvalidBlockReconstruction,
     HomeShardChanged,
 }
 
@@ -1157,12 +1254,9 @@ impl fmt::Display for SemanticError {
             Self::InvalidBlockBirth => f.write_str(
                 "block birth provenance must appear exactly on a None-to-Some block transition",
             ),
-            Self::BlockStateRemoved => {
-                f.write_str("authoritative block state cannot be physically removed")
-            }
-            Self::PagePreambleStateRemoved => {
-                f.write_str("authoritative page preamble state cannot be physically removed")
-            }
+            Self::InvalidBlockReconstruction => f.write_str(
+                "block reconstruction provenance must appear exactly on a non-birth None-to-Some transition",
+            ),
             Self::HomeShardChanged => f.write_str("stable home shard identity changed"),
         }
     }
@@ -1318,6 +1412,7 @@ mod tests {
                 block_id,
                 home_document_id: home,
                 birth: None,
+                reconstruction: None,
                 before: Some(block_before),
                 after: Some(block_after),
             }],
@@ -1653,6 +1748,7 @@ mod tests {
                     page_id: page_id(1),
                     page_document_id: document_id(1),
                 }),
+                reconstruction: None,
                 before: None,
                 after: Some(BlockState {
                     block_id: block,

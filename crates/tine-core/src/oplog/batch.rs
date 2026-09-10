@@ -15,14 +15,9 @@ pub use tine_storage::formats::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-/// Bumped to 10 when the live write path returned to one catalog document
-/// plus per-page shard documents: every manifest descriptor, object envelope
-/// and per-document frontier again names a bare page-shard or catalog
-/// `DocumentId`. Version 9 named the retired per-block/membership
-/// `DocumentKey` addresses; version 8 added persisted causal writer
-/// incarnations. One current format only — there is no reader for version 9
-/// or 8 (D-1).
-pub const OPERATION_SCHEMA_VERSION: u32 = 10;
+/// 11 carries accepted-source reconstruction and author-created ordinary text
+/// containers. One current format only; older private state is rebuilt (D-1).
+pub const OPERATION_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

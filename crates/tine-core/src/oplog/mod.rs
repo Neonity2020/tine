@@ -193,10 +193,10 @@ pub use reference_catalog::{
 pub use refusal::ManagedStorageRefusalScenario;
 pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
-    BlockBirth, BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName,
-    LogicalPageNameError, LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta,
-    PageDeltaLifecycle, PageNameKeyDigest, PagePreambleDelta, PagePreambleState, PageState,
-    PolicyGeneratedAnchorReason, SemanticEffect, SemanticError, VisibleMembership,
+    BlockBirth, BlockDelta, BlockOwner, BlockReconstructionSource, BlockState, CanonicalSnapshot,
+    LogicalPageName, LogicalPageNameError, LogseqIdentityOrigin, MembershipClaim, MembershipDelta,
+    PageDelta, PageDeltaLifecycle, PageNameKeyDigest, PagePreambleDelta, PagePreambleState,
+    PageState, PolicyGeneratedAnchorReason, SemanticEffect, SemanticError, VisibleMembership,
     CATALOG_PAGE_STATE_SCHEMA_VERSION, MAX_LOGICAL_PAGE_NAME_BYTES, PAGE_NAME_KEY_VERSION,
     SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
@@ -264,11 +264,12 @@ mod external_surface_tests {
         let digest = Sha256::digest(public_uses.join("\n").as_bytes());
         assert_eq!(
             format!("{digest:x}"),
-            // Re-pinned for the one current birth-authority schema:
-            // `BlockBirth` joins the semantic re-exports because it is the
-            // public field type of `BlockDelta::birth`. No declaration was
-            // added or removed; there are still exactly 20.
-            "1074d14285efc91d1a65478dc8052cd60ec906d87d868b8f5b1255d88e9897cd",
+            // Re-pinned for P2's one current reconstruction-authority schema:
+            // `BlockReconstructionSource` joins the semantic re-exports
+            // because it is the public field type of
+            // `BlockDelta::reconstruction`. No declaration was added or
+            // removed; there are still exactly 20.
+            "3ddb5191baad1a5c56d8998696a1fc9f4e2d0f24b6854cc58276b2da54dc1e51",
             "the exact public oplog re-export surface changed"
         );
 

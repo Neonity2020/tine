@@ -7303,6 +7303,29 @@
   "failBefore": "proven at the real-app boundary: at base 1c2707fc the journey fails 3 runs of 3, the last move reaching only the third loaded journal while the app reported all commands accepted and raised no error (tine-agents/evidence/rebaselining-v2-p1/e2e/base-journal-feed.log, base-journal-feed-failure.json); at the candidate it passes 8 runs of 8 (cand-journal-feed.log, cand-journal-feed-receipt.json, realapp-252e0422-run1.log, realapp-252e0422-run2.log, realapp-5474841f-recorded.log)"
  },
  "notes": "This is the user-visible face of the P4 write cost, carded separately because the harm is different in kind: not a slow move but a LOST one, reported as successful. Under the per-block layout a 200-block move rewrote 601 documents, so a burst of moves outran settlement and the tail was dropped without a diagnostic; the page-shard layout rewrites 2 and the burst completes. Keeping it as its own row means a future regression that restores the loss without restoring the cost -- or the reverse -- still has a named owner. The journey's semantic contract already carries this outcome ('accepts a rapid uninterrupted block move across several day boundaries without losing commands or flooding errors') in tests/ui-regressions/e2e-contracts.json; the assertion cited above is the one that fails. Its inner wait budget is 180 s, which must stay strictly under the suite's scenario ceiling: an inner wait at or above the ceiling makes the runner SIGKILL the scenario with an empty stderr, which is the nested-timeout collision that made this family read as flaky."
+},
+{
+ "id": "REG-MANAGED-REAL-DELETION-RESTORE-RECONSTRUCTION",
+ "title": "Managed deletion removes live block payload and Restore reconstructs the accepted identity into a new text container",
+ "family": "managed-storage-rebaselining",
+ "sources": { "issues": [], "commits": [], "internal": "Rebaselining v2 packet P2" },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::real_delete_restore_reconstructs_exact_accepted_before_image_hot_and_cold",
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::real_delete_receiver_rejects_reconstruction_source_effect_mismatch_atomically",
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::real_delete_attachment_seams_use_upstream_insert_container",
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::real_delete_uuid_reuse_selects_exact_deletion_incarnation",
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::real_delete_full_replay_matches_shallow_state",
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::real_delete_fixed_live_page_shallow_growth",
+   "crates/tine-core/src/sync_runtime_tests.rs::managed_delete_undo_redo_reconstructs_and_redeletes"
+  ],
+  "scenario": "managed-storage.real-deletion-restore-reconstruction",
+  "failBefore": "baseline-real-delete-*.log: the unchanged Packet 1 base retains owner/content state after deletion, restores the old text container instead of reconstructing an accepted before-image, and rejects editor replay as causal identity reuse"
+ },
+ "notes": "Packet P2 removes owner, membership, content and paired sparse identity keys from live page shards. Restore retains BlockId, immutable home and Logseq UUID but authors a new ordinary text container from the exact accepted deletion source; receiver admission validates source, update and semantic-effect agreement. Three mandatory map-key tombstones per deleted block are accepted residual growth; retained deleted text is not. Pre-P2 state follows the one-format backup-and-rebuild boundary."
 }
 ]
 }

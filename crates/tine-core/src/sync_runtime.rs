@@ -154,17 +154,17 @@ use crate::oplog::MANAGED_LOCAL_ANCHOR_V2_BYTES;
 use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
 use crate::oplog::{
     managed_local_v2_anchor_name, parse_managed_local_v2_anchor_name, BatchId, BatchOrigin,
-    BlobDescription, BlockId, BlockLocation, CanonicalGraphResourceId, CanonicalSnapshot,
-    ContentDigest, CurrentPageAtPath, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest,
-    LogicalPageName, LogseqIdentityOrigin, LogseqUuid, ManagedLocalAppendError,
-    ManagedLocalGenerationAnchorV2, ManagedLocalJournal, ManagedLocalJournalPayloadKind,
-    ManagedLocalRecord, ManagedPath, ManagedTextKind, MaterializedBlock, MaterializedBlockRow,
-    MaterializedEntityId, MaterializedPage, MaterializedPageRow, MaterializedPropertyRow,
-    MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow, OperationBatch,
-    OperationObject, OperationTransaction, PageId, PageState, PreparedBatch, ProjectionClaim,
-    ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1,
-    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
-    SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
+    BlobDescription, BlockId, BlockLocation, BlockReconstructionSource, BlockState,
+    CanonicalGraphResourceId, CanonicalSnapshot, ContentDigest, CurrentPageAtPath, DeviceId,
+    DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin,
+    LogseqUuid, ManagedLocalAppendError, ManagedLocalGenerationAnchorV2, ManagedLocalJournal,
+    ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath, ManagedTextKind,
+    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
+    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
+    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId, PageState,
+    PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
+    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
+    SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
     MAX_MATERIALIZATION_QUERY_ROWS,
 };
 use uuid::Uuid;
@@ -13062,6 +13062,13 @@ struct EditorCurrentPage {
 }
 
 #[derive(Clone)]
+struct EditorBlockReconstruction {
+    block: MaterializedBlock,
+    claim: crate::oplog::MembershipClaim,
+    source: BlockReconstructionSource,
+}
+
+#[derive(Clone)]
 struct ApplicationCurrentPage {
     page: PageDto,
     revision: String,
@@ -18169,7 +18176,9 @@ impl RuntimeActor {
         }
         #[cfg(test)]
         let request_started = Instant::now();
-        let (editor_request, reload_target, prepared_existing) = match &request.target {
+        let (editor_request, reload_target, prepared_existing, reconstructions) = match &request
+            .target
+        {
             SyncApplicationPageSaveTarget::Existing { path, revision }
             | SyncApplicationPageSaveTarget::ResolveConflict {
                 path,
@@ -18237,10 +18246,14 @@ impl RuntimeActor {
                 } else {
                     validate_existing_application_page_shape(&request.page, &current.page)?;
                 }
-                let blocks = match application_editor_blocks_existing(
+                let engine = self
+                    .active_engine()
+                    .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+                let (blocks, reconstructions) = match application_editor_blocks_existing(
                     &request.page,
                     &current,
                     resolve_conflict,
+                    engine,
                 ) {
                     Ok(blocks) => blocks,
                     Err(reason) => return Ok(SyncApplicationPageSaveOutcome::Conflict { reason }),
@@ -18256,6 +18269,7 @@ impl RuntimeActor {
                     },
                     ApplicationSaveReloadTarget::ExistingPath(path.clone()),
                     Some(current),
+                    reconstructions,
                 )
             }
             SyncApplicationPageSaveTarget::New { name, page_kind } => {
@@ -18298,6 +18312,7 @@ impl RuntimeActor {
                     },
                     ApplicationSaveReloadTarget::CreatedPage,
                     None,
+                    HashMap::new(),
                 )
             }
         };
@@ -18312,6 +18327,7 @@ impl RuntimeActor {
             .prepare_or_save_editor_page_with_existing_application(
                 editor_request,
                 prepared_existing,
+                reconstructions,
                 preflight,
             )
             .map_err(map_editor_application_error)?;
@@ -19912,8 +19928,13 @@ impl RuntimeActor {
         let mut appended = source_page.blocks;
         relabel_application_blocks_for_merge(&mut appended, &mut 0);
         merged.blocks.extend(appended);
-        let blocks = application_editor_blocks_existing(&merged, &destination, false)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("merge_block_identity"))?;
+        let engine = self
+            .active_engine()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+        let (blocks, reconstructions) =
+            application_editor_blocks_existing(&merged, &destination, false, engine).map_err(
+                |_| SyncApplicationPageRequestError::ActorRefusedAt("merge_block_identity"),
+            )?;
         let request = SyncEditorSaveRequest {
             target: SyncEditorSaveTarget::Existing {
                 page_id: destination.editor.page.page_id.to_string(),
@@ -19925,10 +19946,14 @@ impl RuntimeActor {
         validate_editor_save_request(&request).map_err(map_editor_application_error)?;
         let resolved =
             resolve_editor_block_ids(&request.blocks).map_err(map_editor_application_error)?;
-        let mut operations =
-            build_existing_editor_transaction(&destination.editor, &request, &resolved)
-                .map_err(map_editor_application_error)?
-                .map_or_else(Vec::new, |transaction| transaction.operations);
+        let mut operations = build_existing_editor_transaction(
+            &destination.editor,
+            &request,
+            &resolved,
+            &reconstructions,
+        )
+        .map_err(map_editor_application_error)?
+        .map_or_else(Vec::new, |transaction| transaction.operations);
         if let Some((page_changes, block_rewrites, page_preamble_rewrites)) = rename_operation {
             if page_changes.is_empty() {
                 operations.extend(block_rewrites.into_iter().map(|rewrite| {
@@ -21068,6 +21093,7 @@ impl RuntimeActor {
         self.prepare_or_save_editor_page_with_existing_application(
             request,
             prepared_existing,
+            HashMap::new(),
             false,
         )
     }
@@ -21076,6 +21102,7 @@ impl RuntimeActor {
         &mut self,
         request: SyncEditorSaveRequest,
         mut prepared_existing: Option<ApplicationCurrentPage>,
+        reconstructions: HashMap<BlockId, EditorBlockReconstruction>,
         preflight: bool,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         self.prepared_application_reply = None;
@@ -21180,8 +21207,12 @@ impl RuntimeActor {
                     });
                     #[cfg(test)]
                     let requested_page_started = Instant::now();
-                    let requested_page =
-                        requested_existing_editor_page(&current, &request, &resolved)?;
+                    let requested_page = requested_existing_editor_page(
+                        &current,
+                        &request,
+                        &resolved,
+                        &reconstructions,
+                    )?;
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
                         timings.editor_requested_page_build = timings
@@ -21441,10 +21472,15 @@ impl RuntimeActor {
                             .editor_identity_and_rename_kind_checks
                             .saturating_add(identity_rename_kind_started.elapsed());
                     });
-                    let content = build_existing_editor_transaction(&current, &request, &resolved)
-                        .map_err(|error| {
-                            editor_refusal_at(error, "building the semantic page transaction")
-                        })?;
+                    let content = build_existing_editor_transaction(
+                        &current,
+                        &request,
+                        &resolved,
+                        &reconstructions,
+                    )
+                    .map_err(|error| {
+                        editor_refusal_at(error, "building the semantic page transaction")
+                    })?;
                     #[cfg(test)]
                     let outer_transaction_started = Instant::now();
                     if let Some(content) = content {
@@ -23194,7 +23230,9 @@ impl RuntimeActor {
             };
             let intents = match engine.conflict_resolution_intents(batch_id) {
                 Ok(intents) => intents,
-                Err(_) => {
+                Err(error) => {
+                    #[cfg(test)]
+                    eprintln!("conflict-resolution derivation failed for {batch_id}: {error}");
                     derivation_incomplete = true;
                     break 'derive None;
                 }
@@ -23206,12 +23244,14 @@ impl RuntimeActor {
                         page_id,
                         block,
                         claim,
+                        source,
                         pair,
                     }
                     | crate::oplog::ConflictResolutionIntent::RestoreMoved {
                         page_id,
                         block,
                         claim,
+                        source,
                         pair,
                     } => {
                         if pair.min_author_device != my_device
@@ -23245,7 +23285,11 @@ impl RuntimeActor {
                         resolution =
                             OperationTransaction::new(vec![SemanticOperation::RestoreSubtree {
                                 page_id,
-                                blocks: vec![crate::oplog::BlockRestore { block, claim }],
+                                blocks: vec![crate::oplog::BlockRestore {
+                                    block,
+                                    claim,
+                                    source,
+                                }],
                             }])
                             .ok()
                             .map(|transaction| (transaction, page.path));
@@ -24200,6 +24244,7 @@ impl RuntimeActor {
                     .map(|member| {
                         clean.runtime.engine().plan_revive_page_operations(
                             member.page_id,
+                            member.deletion_batch_id,
                             &member.predecessor_accepted_state.frontier,
                             member.prior_present_intent_id,
                         )
@@ -25405,7 +25450,14 @@ fn application_editor_blocks_existing(
     page: &PageDto,
     current: &ApplicationCurrentPage,
     recreate_missing: bool,
-) -> Result<Vec<SyncEditorBlockDto>, SyncApplicationPageConflict> {
+    engine: &ShardedHotEngine,
+) -> Result<
+    (
+        Vec<SyncEditorBlockDto>,
+        HashMap<BlockId, EditorBlockReconstruction>,
+    ),
+    SyncApplicationPageConflict,
+> {
     let current_blocks = flatten_application_blocks(&current.page.blocks);
     let exposed = current_blocks
         .iter()
@@ -25414,6 +25466,7 @@ fn application_editor_blocks_existing(
         .collect::<HashMap<_, _>>();
     let requested = flatten_application_blocks(&page.blocks);
     let mut keys = Vec::with_capacity(requested.len());
+    let mut reconstructions = HashMap::new();
     for (index, block) in requested.iter().enumerate() {
         let key = match exposed.get(block.block.id.as_str()) {
             Some(key) => key.clone(),
@@ -25425,14 +25478,110 @@ fn application_editor_blocks_existing(
                 if recreate_missing {
                     SyncEditorBlockKey::Temporary(format!("gateway-{index}"))
                 } else {
-                    return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                    let block_id = block
+                        .block
+                        .id
+                        .strip_prefix(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX)
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        .map(BlockId::from_uuid);
+                    let selected = engine
+                        .editor_reconstruction_for_deleted_block(
+                            current.editor.page.page_id,
+                            block_id,
+                            None,
+                        )
+                        .ok()
+                        .flatten()
+                        .ok_or(SyncApplicationPageConflict::UnknownOrForeignBlock)?;
+                    let (location, state, claim, source) = selected;
+                    let BlockState {
+                        owner: crate::oplog::BlockOwner::Page(owner),
+                        content,
+                        logseq_uuid,
+                        logseq_identity_origin,
+                        ..
+                    } = state
+                    else {
+                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                    };
+                    if owner != current.editor.page.page_id {
+                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                    }
+                    reconstructions.insert(
+                        location.block_id,
+                        EditorBlockReconstruction {
+                            block: MaterializedBlock {
+                                block_id: location.block_id,
+                                home_document_id: location.home_document_id,
+                                parent: claim.parent,
+                                order: claim.order.clone(),
+                                logseq_uuid,
+                                logseq_identity_origin,
+                                content,
+                            },
+                            claim,
+                            source,
+                        },
+                    );
+                    SyncEditorBlockKey::Existing(location.block_id.to_string())
                 }
             }
-            None => SyncEditorBlockKey::Temporary(format!("gateway-{index}")),
+            None => {
+                let logseq_uuid = Uuid::parse_str(&block.block.id)
+                    .ok()
+                    .map(LogseqUuid::from_uuid);
+                let selected = logseq_uuid.and_then(|uuid| {
+                    engine
+                        .editor_reconstruction_for_deleted_block(
+                            current.editor.page.page_id,
+                            None,
+                            Some(uuid),
+                        )
+                        .ok()
+                        .flatten()
+                });
+                if let Some((location, state, claim, source)) = selected {
+                    let BlockState {
+                        owner: crate::oplog::BlockOwner::Page(owner),
+                        content,
+                        logseq_uuid,
+                        logseq_identity_origin,
+                        ..
+                    } = state
+                    else {
+                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                    };
+                    if owner != current.editor.page.page_id {
+                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                    }
+                    reconstructions.insert(
+                        location.block_id,
+                        EditorBlockReconstruction {
+                            block: MaterializedBlock {
+                                block_id: location.block_id,
+                                home_document_id: location.home_document_id,
+                                parent: claim.parent,
+                                order: claim.order.clone(),
+                                logseq_uuid,
+                                logseq_identity_origin,
+                                content,
+                            },
+                            claim,
+                            source,
+                        },
+                    );
+                    SyncEditorBlockKey::Existing(location.block_id.to_string())
+                } else {
+                    SyncEditorBlockKey::Temporary(format!("gateway-{index}"))
+                }
+            }
         };
         keys.push(key);
     }
-    Ok(application_editor_blocks(&requested, &keys))
+    Ok((
+        application_editor_blocks(&requested, &keys),
+        reconstructions,
+    ))
 }
 
 fn application_editor_blocks(
@@ -26307,6 +26456,7 @@ fn requested_existing_editor_page(
     current: &EditorCurrentPage,
     request: &SyncEditorSaveRequest,
     resolved: &[BlockId],
+    reconstructions: &HashMap<BlockId, EditorBlockReconstruction>,
 ) -> Result<MaterializedPage, SyncEditorRequestError> {
     let current_by_id = current
         .blocks
@@ -26321,6 +26471,7 @@ fn requested_existing_editor_page(
         .any(|(block_id, block)| {
             matches!(block.key, SyncEditorBlockKey::Existing(_))
                 && !current_by_id.contains_key(block_id)
+                && !reconstructions.contains_key(block_id)
         })
     {
         return Err(SyncEditorRequestError::InvalidRequest(
@@ -26356,7 +26507,13 @@ fn requested_existing_editor_page(
                 SyncEditorBlockKey::Existing(_) => {
                     let existing = current_by_id
                         .get(block_id)
-                        .expect("existing editor ID was validated");
+                        .copied()
+                        .or_else(|| {
+                            reconstructions
+                                .get(block_id)
+                                .map(|reconstruction| &reconstruction.block)
+                        })
+                        .expect("existing or reconstructed editor ID was validated");
                     (
                         existing.home_document_id,
                         existing.logseq_uuid,
@@ -26432,6 +26589,7 @@ fn build_existing_editor_transaction(
     current: &EditorCurrentPage,
     request: &SyncEditorSaveRequest,
     resolved: &[BlockId],
+    reconstructions: &HashMap<BlockId, EditorBlockReconstruction>,
 ) -> Result<Option<OperationTransaction>, SyncEditorRequestError> {
     #[cfg(test)]
     let current_map_started = Instant::now();
@@ -26448,6 +26606,7 @@ fn build_existing_editor_transaction(
         .any(|(block_id, block)| {
             matches!(block.key, SyncEditorBlockKey::Existing(_))
                 && !current_by_id.contains_key(block_id)
+                && !reconstructions.contains_key(block_id)
         })
     {
         return Err(SyncEditorRequestError::InvalidRequest(
@@ -26496,6 +26655,33 @@ fn build_existing_editor_transaction(
     });
     let mut operations = Vec::new();
 
+    let mut reconstruction_indexes = request
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            matches!(block.key, SyncEditorBlockKey::Existing(_))
+                .then(|| reconstructions.contains_key(&resolved[index]))
+                .unwrap_or(false)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    reconstruction_indexes.sort_unstable_by_key(|index| (depths[*index], *index));
+    for index in reconstruction_indexes {
+        let reconstruction = &reconstructions[&resolved[index]];
+        operations.push(SemanticOperation::RestoreSubtree {
+            page_id: current.page.page_id,
+            blocks: vec![crate::oplog::BlockRestore {
+                block: BlockLocation {
+                    block_id: reconstruction.block.block_id,
+                    home_document_id: reconstruction.block.home_document_id,
+                },
+                claim: reconstruction.claim.clone(),
+                source: reconstruction.source.clone(),
+            }],
+        });
+    }
+
     #[cfg(test)]
     let create_started = Instant::now();
     let mut new_indexes = request
@@ -26538,12 +26724,17 @@ fn build_existing_editor_transaction(
         let SyncEditorBlockKey::Existing(_) = &block.key else {
             continue;
         };
-        let existing =
-            current_by_id
-                .get(&resolved[index])
-                .ok_or(SyncEditorRequestError::InvalidRequest(
-                    SyncEditorInvalidRequest::InvalidExistingId,
-                ))?;
+        let existing = current_by_id
+            .get(&resolved[index])
+            .copied()
+            .or_else(|| {
+                reconstructions
+                    .get(&resolved[index])
+                    .map(|reconstruction| &reconstruction.block)
+            })
+            .ok_or(SyncEditorRequestError::InvalidRequest(
+                SyncEditorInvalidRequest::InvalidExistingId,
+            ))?;
         if existing.content != block.content {
             operations.push(SemanticOperation::EditBlockContent {
                 block: BlockLocation {
@@ -26576,7 +26767,11 @@ fn build_existing_editor_transaction(
             let SyncEditorBlockKey::Existing(_) = &block.key else {
                 return None;
             };
-            let existing = current_by_id.get(&resolved[index])?;
+            let existing = current_by_id.get(&resolved[index]).copied().or_else(|| {
+                reconstructions
+                    .get(&resolved[index])
+                    .map(|reconstruction| &reconstruction.block)
+            })?;
             (existing.parent != desired[index].0 || existing.order != desired[index].1)
                 .then_some(index)
         })

@@ -21,11 +21,9 @@ use super::{
     OPLOG_PROTOCOL_VERSION,
 };
 
-/// 6: each page capsule again carries one page-shard checkpoint and its one
-/// unheaded dependency record. Schema 5 named per-block and membership
-/// document bundles; it decodes as a superseded containing format and takes
-/// the preserve-and-rebuild route (D-1).
-const LAZY_GENESIS_SCHEMA_VERSION: u32 = 6;
+/// 7: page shards use ordinary text children and physically remove live block
+/// keys. Older private state takes the preserve-and-rebuild route (D-1).
+const LAZY_GENESIS_SCHEMA_VERSION: u32 = 7;
 const LAZY_GENESIS_PAGE_CAPSULE_SCHEMA_VERSION: u32 = 6;
 const LAZY_GENESIS_SQLITE_RECEIPT_SCHEMA_VERSION: u32 = 1;
 /// Bump whenever the parser-to-materialized-page projection changes. A stale
