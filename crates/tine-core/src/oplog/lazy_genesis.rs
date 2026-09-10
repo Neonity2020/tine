@@ -1952,6 +1952,105 @@ mod tests {
     }
 
     #[test]
+    fn lazy_genesis_page_home_index_agrees_before_and_after_reopen() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0xa180));
+        let lineage = LineageDigest::of(b"lazy-genesis-document-index-test");
+        let inputs = [
+            page(81, "pages/indexed-a.md", 2),
+            page(82, "pages/indexed-b.md", 1),
+        ];
+        let expected = inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.home_document_id,
+                    (
+                        input.page_id,
+                        input.document_dependencies.clone().unwrap(),
+                        input.document_checkpoint.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut builder = LazyGenesisPackBuilder::new(
+            workspace,
+            lineage,
+            catalog_document_id(),
+            BlobDescription::of(b"capture"),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        for input in inputs {
+            builder.push(input).unwrap();
+        }
+        let candidate = builder
+            .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
+            .unwrap();
+        // The index is derived from a manifest that must name each page home,
+        // and each home's causal row, exactly once.
+        let mut shared_home = candidate.manifest.clone();
+        shared_home.pages[1].home_document_id = shared_home.pages[0].home_document_id;
+        shared_home.pages[1].document_dependencies =
+            shared_home.pages[0].document_dependencies.clone();
+        let mut repeated_row = candidate.manifest.clone();
+        repeated_row.pages[1].document_dependencies =
+            repeated_row.pages[0].document_dependencies.clone();
+        for duplicate in [&shared_home, &repeated_row] {
+            assert!(
+                validate_manifest(duplicate)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity is malformed"),
+                "the derived index must refuse a repeated page home or causal row"
+            );
+        }
+        let sealed = std::env::temp_dir().join(format!(
+            "tine-lazy-genesis-document-index-{}",
+            Uuid::new_v4()
+        ));
+        let (candidate, commit) = candidate.stage_into(&sealed).unwrap();
+        let reopened = LazyGenesisCandidate::open_sealed(&sealed, commit).unwrap();
+
+        for indexed in [&candidate, &reopened] {
+            assert_eq!(
+                indexed.frontier_document(catalog_document_id()),
+                Some(catalog_dependencies())
+            );
+            for (home, (page_id, dependencies, checkpoint)) in &expected {
+                assert_eq!(
+                    indexed.frontier_document(*home).as_ref(),
+                    Some(dependencies)
+                );
+                assert_eq!(indexed.page_home_document_id(*page_id), Some(*home));
+                assert_eq!(
+                    indexed.document_checkpoint(*home).unwrap().as_ref(),
+                    Some(checkpoint)
+                );
+            }
+            let unknown = Uuid::from_u128(0xdead_beef);
+            assert_eq!(
+                indexed.frontier_document(DocumentId::from_uuid(unknown)),
+                None
+            );
+            assert_eq!(
+                indexed
+                    .document_checkpoint(DocumentId::from_uuid(unknown))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                indexed.page_home_document_id(PageId::from_uuid(unknown)),
+                None
+            );
+        }
+        assert_eq!(
+            candidate.frontier_documents(),
+            reopened.frontier_documents()
+        );
+    }
+
+    #[test]
     fn capsule_decoder_accepts_only_the_current_receipted_shape() {
         #[derive(Serialize)]
         struct PreviousCapsule {

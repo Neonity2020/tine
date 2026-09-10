@@ -28855,6 +28855,286 @@ pub(crate) mod validation_tests {
     }
 
     #[test]
+    fn bulk_projection_selects_membership_at_each_historical_move_and_delete_root() {
+        let lineage = LineageDigest::of(b"bulk-projection-historical-membership");
+        let (root, writer, mut engine, _) = archive_test_engine(93_070, lineage);
+        let page_a = PageId::from_uuid(Uuid::from_u128(93_071));
+        let page_a_home = DocumentId::from_uuid(Uuid::from_u128(93_072));
+        let page_b = PageId::from_uuid(Uuid::from_u128(93_073));
+        let page_b_home = DocumentId::from_uuid(Uuid::from_u128(93_074));
+        let block = BlockId::from_uuid(Uuid::from_u128(93_075));
+        let block_home = page_a_home;
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_076,
+            OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: page_a,
+                    home_document_id: page_a_home,
+                    name: LogicalPageName::parse("Historical A").unwrap(),
+                    path: ManagedPath::parse("pages/historical-a.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: page_b,
+                    home_document_id: page_b_home,
+                    name: LogicalPageName::parse("Historical B").unwrap(),
+                    path: ManagedPath::parse("pages/historical-b.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    page_id: page_a,
+                    parent: None,
+                    order: "a".into(),
+                    content: "historical membership".into(),
+                },
+            ])
+            .unwrap(),
+        );
+        let r1 = engine.accepted_frontier_root().unwrap();
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_077,
+            OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                root: BlockLocation {
+                    block_id: block,
+                    home_document_id: block_home,
+                },
+                from_page_id: page_a,
+                to_page_id: page_b,
+                parent: None,
+                order: "b".into(),
+            }])
+            .unwrap(),
+        );
+        let r2 = engine.accepted_frontier_root().unwrap();
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_078,
+            OperationTransaction::new(vec![SemanticOperation::DeleteSubtree {
+                root_block_id: block,
+                page_id: page_b,
+            }])
+            .unwrap(),
+        );
+        let r3 = engine.accepted_frontier_root().unwrap();
+
+        let materialized_ids = |root: &AcceptedFrontierRoot, page_id| {
+            engine
+                .clean_projection_bulk_materializer(root)
+                .unwrap()
+                .materialize_pages(&[page_id])
+                .unwrap()
+                .into_iter()
+                .next()
+                .flatten()
+                .unwrap()
+                .blocks
+                .into_iter()
+                .map(|block| block.block_id)
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(materialized_ids(&r1, page_a), BTreeSet::from([block]));
+        assert!(materialized_ids(&r1, page_b).is_empty());
+        assert!(materialized_ids(&r2, page_a).is_empty());
+        assert_eq!(materialized_ids(&r2, page_b), BTreeSet::from([block]));
+        assert!(materialized_ids(&r3, page_a).is_empty());
+        assert!(materialized_ids(&r3, page_b).is_empty());
+
+        drop(engine);
+        drop(writer);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_projection_historical_membership_uses_merged_owner_in_both_arrival_orders() {
+        let lineage = LineageDigest::of(b"bulk-projection-historical-concurrent-owner");
+        let (root, writer, mut forward, catalog) = archive_test_engine(93_080, lineage);
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(93_080));
+        let page_a = PageId::from_uuid(Uuid::from_u128(93_081));
+        let page_a_home = DocumentId::from_uuid(Uuid::from_u128(93_082));
+        let page_b = PageId::from_uuid(Uuid::from_u128(93_083));
+        let page_b_home = DocumentId::from_uuid(Uuid::from_u128(93_084));
+        let page_c = PageId::from_uuid(Uuid::from_u128(93_085));
+        let page_c_home = DocumentId::from_uuid(Uuid::from_u128(93_086));
+        let block = BlockId::from_uuid(Uuid::from_u128(93_087));
+        let block_home = page_a_home;
+        let genesis = stage_cursor_transaction(
+            &mut forward,
+            93_088,
+            OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: page_a,
+                    home_document_id: page_a_home,
+                    name: LogicalPageName::parse("Concurrent historical A").unwrap(),
+                    path: ManagedPath::parse("pages/concurrent-historical-a.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: page_b,
+                    home_document_id: page_b_home,
+                    name: LogicalPageName::parse("Concurrent historical B").unwrap(),
+                    path: ManagedPath::parse("pages/concurrent-historical-b.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: page_c,
+                    home_document_id: page_c_home,
+                    name: LogicalPageName::parse("Concurrent historical C").unwrap(),
+                    path: ManagedPath::parse("pages/concurrent-historical-c.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    page_id: page_a,
+                    parent: None,
+                    order: "a".into(),
+                    content: "concurrent historical membership".into(),
+                },
+            ])
+            .unwrap(),
+        );
+
+        let open_peer = || {
+            let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+            let mut engine =
+                ShardedHotEngine::with_clean_archive_store_for_test(store, lineage, catalog);
+            assert!(matches!(
+                engine.stage_archive_batch(genesis).unwrap().disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+            engine
+        };
+        let move_to_b = forward
+            .prepare_fixture_transaction(
+                test_author(93_089, 93_089),
+                &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    from_page_id: page_a,
+                    to_page_id: page_b,
+                    parent: None,
+                    order: "b".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let author_c = open_peer();
+        let move_to_c = author_c
+            .prepare_fixture_transaction(
+                test_author(93_090, 93_090),
+                &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id: block,
+                        home_document_id: block_home,
+                    },
+                    from_page_id: page_a,
+                    to_page_id: page_c,
+                    parent: None,
+                    order: "c".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        writer.publish_prepared(&move_to_b).unwrap();
+        writer.publish_prepared(&move_to_c).unwrap();
+
+        let mut reverse = open_peer();
+        let verify =
+            |engine: &mut ShardedHotEngine, batches: [&PreparedBatch; 2], later_seed: u128| {
+                for prepared in batches {
+                    assert!(matches!(
+                        engine
+                            .stage_archive_batch(prepared.manifest().batch_id())
+                            .unwrap()
+                            .disposition(),
+                        BatchDisposition::Accepted { .. }
+                    ));
+                }
+                let historical_root = engine.accepted_frontier_root().unwrap();
+                let accepted_ids = (1..=historical_root.acceptance_sequence())
+                    .map(|sequence| engine.accepted_batch_id_at(sequence).unwrap().unwrap())
+                    .collect::<BTreeSet<_>>();
+                assert!(accepted_ids.contains(&move_to_b.manifest().batch_id()));
+                assert!(accepted_ids.contains(&move_to_c.manifest().batch_id()));
+                let expected = [page_a, page_b, page_c]
+                    .into_iter()
+                    .map(|page_id| {
+                        let blocks = engine
+                            .materialize_page(page_id)
+                            .unwrap()
+                            .blocks
+                            .into_iter()
+                            .map(|block| block.block_id)
+                            .collect::<BTreeSet<_>>();
+                        (page_id, blocks)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert!(expected[&page_a].is_empty());
+                let winning_owner = [page_b, page_c]
+                    .into_iter()
+                    .find(|page_id| !expected[page_id].is_empty())
+                    .expect("one concurrent destination must win");
+                let losing_owner = if winning_owner == page_b {
+                    page_c
+                } else {
+                    page_b
+                };
+                assert!(expected[&losing_owner].is_empty());
+
+                stage_cursor_transaction(
+                    engine,
+                    later_seed,
+                    OperationTransaction::new(vec![SemanticOperation::SetPagePreamble {
+                        page_id: page_a,
+                        preamble: Some("unrelated later edit".into()),
+                    }])
+                    .unwrap(),
+                );
+                let materializer = engine
+                    .clean_projection_bulk_materializer(&historical_root)
+                    .unwrap();
+                for page_id in [page_a, page_b, page_c] {
+                    let actual = materializer
+                        .materialize_pages(&[page_id])
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .unwrap()
+                        .blocks
+                        .into_iter()
+                        .map(|block| block.block_id)
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(actual, expected[&page_id]);
+                }
+                winning_owner
+            };
+        let forward_owner = verify(&mut forward, [&move_to_b, &move_to_c], 93_091);
+        let reverse_owner = verify(&mut reverse, [&move_to_c, &move_to_b], 93_092);
+        assert_eq!(forward_owner, reverse_owner);
+
+        drop(author_c);
+        drop(forward);
+        drop(reverse);
+        drop(writer);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
     fn bulk_projection_preserves_ambiguous_uuid_rejection_from_chunk_documents() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(93_100));
         let lineage = LineageDigest::of(b"bulk-projection-uuid-ambiguity");
@@ -29927,7 +30207,7 @@ pub(crate) mod validation_tests {
     }
 
     #[test]
-    fn borrowed_comparator_uses_page_order_and_retains_disjoint_duplicate_page_sources() {
+    fn borrowed_comparator_uses_page_order_and_rejects_a_duplicated_pair() {
         let low_document_id = DocumentId::from_uuid(Uuid::from_u128(81_001));
         let high_document_id = DocumentId::from_uuid(Uuid::from_u128(81_002));
         let low_page_id = PageId::from_uuid(Uuid::from_u128(81_003));
@@ -29935,6 +30215,8 @@ pub(crate) mod validation_tests {
         let low_block_id = BlockId::from_uuid(Uuid::from_u128(81_005));
         let high_block_id = BlockId::from_uuid(Uuid::from_u128(81_006));
         let before = BTreeMap::new();
+        // Two shards, each addressing a different page. The derived deltas are
+        // ordered by page identity, not by document address.
         let after = BTreeMap::from([
             (
                 low_document_id,
@@ -29975,43 +30257,10 @@ pub(crate) mod validation_tests {
                 .is_ok()
         );
 
+        // Two distinct shards that name the SAME semantic (page, block) pair
+        // are a duplicate the derivation must reject, even though their
+        // document addresses differ.
         let duplicate_page_id = PageId::from_uuid(Uuid::from_u128(81_007));
-        let disjoint_duplicate_after = BTreeMap::from([
-            (
-                low_document_id,
-                shard_snapshot(
-                    low_document_id,
-                    Some(duplicate_page_id),
-                    Vec::new(),
-                    vec![(
-                        low_block_id,
-                        MembershipClaim::new(low_document_id, None, "a").unwrap(),
-                    )],
-                ),
-            ),
-            (
-                high_document_id,
-                shard_snapshot(
-                    high_document_id,
-                    Some(duplicate_page_id),
-                    Vec::new(),
-                    vec![(
-                        high_block_id,
-                        MembershipClaim::new(high_document_id, None, "b").unwrap(),
-                    )],
-                ),
-            ),
-        ]);
-        let disjoint_declared =
-            derive_effect_from_snapshots(&before, &disjoint_duplicate_after).unwrap();
-        assert_eq!(disjoint_declared.memberships().len(), 2);
-        assert!(compare_declared_effect_against_snapshots_with_catalog(
-            &disjoint_declared,
-            &before,
-            &disjoint_duplicate_after
-        )
-        .is_ok());
-
         let duplicate_key_after = BTreeMap::from([
             (
                 low_document_id,
@@ -30048,6 +30297,55 @@ pub(crate) mod validation_tests {
             ),
             Err(EngineError::SemanticEffectMismatch)
         ));
+    }
+
+    #[test]
+    fn borrowed_comparator_retains_disjoint_duplicate_page_sources() {
+        let low_document_id = DocumentId::from_uuid(Uuid::from_u128(81_101));
+        let high_document_id = DocumentId::from_uuid(Uuid::from_u128(81_102));
+        let duplicate_page_id = PageId::from_uuid(Uuid::from_u128(81_103));
+        let low_block_id = BlockId::from_uuid(Uuid::from_u128(81_104));
+        let high_block_id = BlockId::from_uuid(Uuid::from_u128(81_105));
+        let before = BTreeMap::new();
+        // Two shards that name one page but disjoint blocks are two distinct
+        // semantic (page, block) pairs, so the derivation keeps both. Which
+        // shard is the page's home is the catalog's and birth authority's
+        // question, not the comparator's.
+        let disjoint_duplicate_after = BTreeMap::from([
+            (
+                low_document_id,
+                shard_snapshot(
+                    low_document_id,
+                    Some(duplicate_page_id),
+                    Vec::new(),
+                    vec![(
+                        low_block_id,
+                        MembershipClaim::new(low_document_id, None, "a").unwrap(),
+                    )],
+                ),
+            ),
+            (
+                high_document_id,
+                shard_snapshot(
+                    high_document_id,
+                    Some(duplicate_page_id),
+                    Vec::new(),
+                    vec![(
+                        high_block_id,
+                        MembershipClaim::new(high_document_id, None, "b").unwrap(),
+                    )],
+                ),
+            ),
+        ]);
+        let disjoint_declared =
+            derive_effect_from_snapshots(&before, &disjoint_duplicate_after).unwrap();
+        assert_eq!(disjoint_declared.memberships().len(), 2);
+        assert!(compare_declared_effect_against_snapshots_with_catalog(
+            &disjoint_declared,
+            &before,
+            &disjoint_duplicate_after
+        )
+        .is_ok());
     }
 
     #[test]
@@ -30934,6 +31232,496 @@ pub(crate) mod validation_tests {
             engine.materialize_page(new_page),
             Err(EngineError::PageNotFound(_))
         ));
+    }
+
+    #[test]
+    fn forged_initial_block_birth_page_and_home_reject_without_fragments() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(114_100));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(114_101));
+        let page_a = PageId::from_uuid(Uuid::from_u128(114_102));
+        let page_b = PageId::from_uuid(Uuid::from_u128(114_103));
+        let page_home_a = DocumentId::from_uuid(Uuid::from_u128(114_104));
+        let page_home_b = DocumentId::from_uuid(Uuid::from_u128(114_105));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(114_106));
+        let never_page = PageId::from_uuid(Uuid::from_u128(114_108));
+        let never_home = DocumentId::from_uuid(Uuid::from_u128(114_109));
+        let mut engine =
+            ShardedHotEngine::new(workspace, LineageDigest::of(b"forged-block-birth"), catalog);
+        let pages = engine
+            .prepare_fixture_transaction(
+                test_author(114_110, 114_110),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id: page_a,
+                        home_document_id: page_home_a,
+                        name: LogicalPageName::parse("Birth A").unwrap(),
+                        path: ManagedPath::parse("pages/birth-a.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreatePage {
+                        page_id: page_b,
+                        home_document_id: page_home_b,
+                        name: LogicalPageName::parse("Birth B").unwrap(),
+                        path: ManagedPath::parse("pages/birth-b.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.stage_ready(ValidatedBatch::new(pages)).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        // A block is born in one shard: its owner, text and membership land in
+        // that document, and its birth is derived from the shard's immutable
+        // page identity.
+        let born_in = |shard: LoroDoc, home: DocumentId, owner_page: PageId| {
+            shard
+                .get_map(SHARD_OWNERS)
+                .insert(&block_id.to_string(), owner_page.to_string())
+                .unwrap();
+            shard
+                .get_map(SHARD_CONTENT)
+                .insert_container(&block_id.to_string(), LoroText::new())
+                .unwrap()
+                .insert(0, "forged-birth-control")
+                .unwrap();
+            insert_membership(
+                &shard,
+                block_id,
+                &MembershipClaim::new(home, None, "a").unwrap(),
+            )
+            .unwrap();
+            shard
+        };
+        let legitimate = |engine: &ShardedHotEngine, peer: u64| {
+            let before = engine.clone_visible_document(page_home_a, peer).unwrap();
+            let after = born_in(clone_doc(&before, peer).unwrap(), page_home_a, page_a);
+            let before = BTreeMap::from([(page_home_a, before)]);
+            let after = BTreeMap::from([(page_home_a, after)]);
+            let effect = derive_effect(catalog, &before, &after).unwrap();
+            (before, after, effect)
+        };
+
+        let with_birth = |effect: &SemanticEffect, birth: BlockBirth| {
+            let mut blocks = effect.blocks().to_vec();
+            blocks[0].birth = Some(birth);
+            SemanticEffect::new_with_page_preambles(
+                effect.pages().to_vec(),
+                effect.page_preambles().to_vec(),
+                blocks,
+                effect.memberships().to_vec(),
+            )
+            .unwrap()
+        };
+        let not_creation_shard = "block birth page document is not the block's creation shard";
+        let lacks_live_identity =
+            "block birth page/home lacks live identity at the declared causal base";
+
+        // Changing only the shard's immutable page identity, from which birth
+        // is derived, while retaining the legitimate declaration must fail at
+        // the exact snapshot/effect comparison. This is the mismatch control,
+        // distinct from birth authority below.
+        let (before, after, legitimate_effect) = legitimate(&engine, 114_119);
+        after[&page_home_a]
+            .get_map(SHARD_META)
+            .insert(SHARD_PAGE_ID, page_b.to_string())
+            .unwrap();
+        let batch = validated_transition_with_effect(
+            &engine,
+            test_author(114_119, 114_119),
+            &before,
+            &after,
+            FrontierV2::new(vec![dependencies_for(&engine, page_home_a, 114_119)]).unwrap(),
+            legitimate_effect,
+        );
+        let disposition = engine.stage_ready(batch).disposition().clone();
+        assert!(
+            matches!(
+                &disposition,
+                BatchDisposition::Rejected {
+                    error: EngineError::MalformedDocument { document_id, reason },
+                } if *document_id == page_home_a && reason == "stable shard page identity changed"
+            ),
+            "metadata-only birth forgery reached the wrong boundary: {disposition:?}"
+        );
+        assert!(engine.materialize_page(page_a).unwrap().blocks.is_empty());
+        assert!(engine
+            .recover_block_state(page_home_a, block_id)
+            .unwrap()
+            .is_none());
+
+        // Retaining the legitimate CRDT change while declaring a birth that
+        // disagrees with the creation shard is refused by birth authority: a
+        // birth document other than the block's home fails the creation-shard
+        // rule, and a wrong page at the right home fails the shard's causal
+        // page identity. The stage-path comparator does not re-derive births
+        // into an existing shard, so these two rules are the whole defence.
+        for (index, (forged_birth, expected_reason)) in [
+            (
+                BlockBirth {
+                    page_id: page_b,
+                    page_document_id: page_home_b,
+                },
+                not_creation_shard,
+            ),
+            (
+                BlockBirth {
+                    page_id: page_a,
+                    page_document_id: page_home_b,
+                },
+                not_creation_shard,
+            ),
+            (
+                BlockBirth {
+                    page_id: never_page,
+                    page_document_id: never_home,
+                },
+                not_creation_shard,
+            ),
+            (
+                BlockBirth {
+                    page_id: page_b,
+                    page_document_id: page_home_a,
+                },
+                lacks_live_identity,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let peer = 114_120 + index as u64;
+            let (before, after, effect) = legitimate(&engine, peer);
+            let batch = validated_transition_with_effect(
+                &engine,
+                test_author(114_120 + index as u128, peer),
+                &before,
+                &after,
+                FrontierV2::new(vec![dependencies_for(&engine, page_home_a, peer)]).unwrap(),
+                with_birth(&effect, forged_birth),
+            );
+            let disposition = engine.stage_ready(batch).disposition().clone();
+            assert!(
+                matches!(
+                    &disposition,
+                    BatchDisposition::Rejected {
+                        error: EngineError::MalformedDocument { reason, .. },
+                    } if reason == expected_reason
+                ),
+                "declared-birth forgery reached the wrong boundary: {disposition:?}"
+            );
+            assert!(engine.materialize_page(page_a).unwrap().blocks.is_empty());
+            assert!(engine
+                .recover_block_state(page_home_a, block_id)
+                .unwrap()
+                .is_none());
+        }
+
+        // A declared birth may not borrow a page born in the same batch whose
+        // catalog home is an existing shard: that shard's immutable identity
+        // is still page A.
+        let alias_page = PageId::from_uuid(Uuid::from_u128(114_107));
+        let peer = 114_125;
+        let before_catalog = engine.clone_visible_document(catalog, peer).unwrap();
+        let after_catalog = clone_doc(&before_catalog, peer).unwrap();
+        insert_page_state(
+            &after_catalog,
+            alias_page,
+            &live_page(page_home_a, "pages/birth-alias.md"),
+        )
+        .unwrap();
+        let before_home = engine.clone_visible_document(page_home_a, peer).unwrap();
+        let after_home = born_in(clone_doc(&before_home, peer).unwrap(), page_home_a, page_a);
+        let before = BTreeMap::from([(catalog, before_catalog), (page_home_a, before_home)]);
+        let after = BTreeMap::from([(catalog, after_catalog), (page_home_a, after_home)]);
+        let effect = derive_effect(catalog, &before, &after).unwrap();
+        let batch = validated_transition_with_effect(
+            &engine,
+            test_author(114_125, peer),
+            &before,
+            &after,
+            FrontierV2::new(vec![
+                dependencies_for(&engine, catalog, peer),
+                dependencies_for(&engine, page_home_a, peer),
+            ])
+            .unwrap(),
+            with_birth(
+                &effect,
+                BlockBirth {
+                    page_id: alias_page,
+                    page_document_id: page_home_a,
+                },
+            ),
+        );
+        let disposition = engine.stage_ready(batch).disposition().clone();
+        assert!(
+            matches!(
+                &disposition,
+                BatchDisposition::Rejected {
+                    error: EngineError::MalformedDocument { document_id, reason },
+                } if *document_id == page_home_a
+                    && *reason == format!(
+                        "catalog page {alias_page} does not match its immutable home shard identity"
+                    )
+            ),
+            "same-batch page aliasing reached the wrong boundary: {disposition:?}"
+        );
+        assert!(engine.materialize_page(page_a).unwrap().blocks.is_empty());
+        assert!(engine
+            .recover_block_state(page_home_a, block_id)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            engine.materialize_page(alias_page),
+            Err(EngineError::PageNotFound(_))
+        ));
+
+        // Now make the shard AND the declared BlockBirth agree. A real page id,
+        // or a never-created page, claimed by a shard that is not that page's
+        // catalog home is an internally coherent CRDT/effect transition. Under
+        // page shards the shard/catalog home binding refuses it before birth
+        // authority is consulted; birth authority's causal rule is exercised
+        // by the wrong-page case above. (A real page id at another real page's
+        // shard cannot be coherent: that shard's page identity is immutable,
+        // as `accepted_shard_page_identity_cannot_change` pins.)
+        for (index, (forged_page, frontier, expected_reason)) in [
+            (
+                page_a,
+                FrontierV2::new(vec![dependencies_for(&engine, page_home_a, 114_130)]).unwrap(),
+                format!("shard identity {page_a} is not its catalog home"),
+            ),
+            (
+                never_page,
+                FrontierV2::new(Vec::new()).unwrap(),
+                format!("shard identity references missing catalog page {never_page}"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let peer = 114_130 + index as u64;
+            let shard = LoroDoc::new();
+            shard.set_peer_id(peer).unwrap();
+            shard
+                .get_map(SHARD_META)
+                .insert(SHARD_PAGE_ID, forged_page.to_string())
+                .unwrap();
+            let before = BTreeMap::from([(never_home, LoroDoc::new())]);
+            let after = BTreeMap::from([(never_home, born_in(shard, never_home, forged_page))]);
+            let forged_effect = derive_effect(catalog, &before, &after).unwrap();
+            assert_eq!(
+                forged_effect.blocks()[0].birth,
+                Some(BlockBirth {
+                    page_id: forged_page,
+                    page_document_id: never_home,
+                })
+            );
+            let batch = validated_transition_with_effect(
+                &engine,
+                test_author(114_130 + index as u128, peer),
+                &before,
+                &after,
+                frontier,
+                forged_effect,
+            );
+            let disposition = engine.stage_ready(batch).disposition().clone();
+            assert!(
+                matches!(
+                    &disposition,
+                    BatchDisposition::Rejected {
+                        error: EngineError::MalformedDocument { document_id, reason },
+                    } if *document_id == never_home && *reason == expected_reason
+                ),
+                "coherent birth forgery reached the wrong boundary: {disposition:?}"
+            );
+            assert!(engine.materialize_page(page_a).unwrap().blocks.is_empty());
+            assert!(!engine.visible_documents.contains_key(&never_home));
+            assert!(matches!(
+                engine.materialize_page(never_page),
+                Err(EngineError::PageNotFound(_))
+            ));
+        }
+
+        // A correct hand-built twin through the identical payload constructor
+        // is accepted, ruling out malformed lane/frontier setup as the reason
+        // the negative cases failed.
+        let (before, after, legitimate_effect) = legitimate(&engine, 114_140);
+        assert_eq!(
+            legitimate_effect.blocks()[0].birth,
+            Some(BlockBirth {
+                page_id: page_a,
+                page_document_id: page_home_a,
+            })
+        );
+        let valid = validated_transition_with_effect(
+            &engine,
+            test_author(114_140, 114_140),
+            &before,
+            &after,
+            FrontierV2::new(vec![dependencies_for(&engine, page_home_a, 114_140)]).unwrap(),
+            legitimate_effect,
+        );
+        let valid_disposition = engine.stage_ready(valid).disposition().clone();
+        assert!(
+            matches!(valid_disposition, BatchDisposition::Accepted { .. }),
+            "valid hand-built birth twin was not accepted: {valid_disposition:?}"
+        );
+        assert_eq!(engine.materialize_page(page_a).unwrap().blocks.len(), 1);
+    }
+
+    #[test]
+    fn block_birth_identity_and_content_text_id_survive_delete_restore_and_replay() {
+        use loro::ContainerTrait;
+
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(114_200));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(114_201));
+        let page_id = PageId::from_uuid(Uuid::from_u128(114_202));
+        let page_home = DocumentId::from_uuid(Uuid::from_u128(114_203));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(114_204));
+        let mut engine = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"stable-block-document-identity"),
+            catalog,
+        );
+        // Only the creating batch declares where a block was born; a delete
+        // or restore of it is a state change in that same creation shard.
+        let declared_birth = |prepared: &PreparedBatch| {
+            let semantic = prepared
+                .objects()
+                .iter()
+                .find(|object| object.kind() == ObjectKind::SemanticEffect)
+                .unwrap();
+            SemanticEffect::decode(semantic.payload())
+                .unwrap()
+                .blocks()
+                .iter()
+                .find(|delta| delta.block_id == block_id)
+                .map(|delta| delta.birth.clone())
+                .expect("the batch changes the block")
+        };
+        let birth = engine
+            .prepare_fixture_transaction(
+                test_author(114_210, 114_210),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id,
+                        home_document_id: page_home,
+                        name: LogicalPageName::parse("Stable Block").unwrap(),
+                        path: ManagedPath::parse("pages/stable-block.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id: page_home,
+                        },
+                        page_id,
+                        parent: None,
+                        order: "a".into(),
+                        content: "stable root text".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            declared_birth(&birth),
+            Some(BlockBirth {
+                page_id,
+                page_document_id: page_home,
+            })
+        );
+        let birth = ValidatedBatch::new(birth);
+        assert!(matches!(
+            engine.stage_ready(birth.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let born = engine.clone_visible_document(page_home, 114_211).unwrap();
+        assert_eq!(shard_page_id(&born).unwrap(), Some(page_id));
+        let born_state = engine
+            .recover_block_state(page_home, block_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(born_state.owner, BlockOwner::Page(page_id));
+        let born_text = block_text(&born, block_id).unwrap().id();
+
+        let deletion = engine
+            .prepare_fixture_transaction(
+                test_author(114_212, 114_212),
+                &OperationTransaction::new(vec![SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(declared_birth(&deletion), None);
+        let deletion = ValidatedBatch::new(deletion);
+        assert!(matches!(
+            engine.stage_ready(deletion.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let deleted = engine.clone_visible_document(page_home, 114_213).unwrap();
+        assert_eq!(shard_page_id(&deleted).unwrap(), Some(page_id));
+        assert_eq!(
+            engine.recover_block_state(page_home, block_id).unwrap(),
+            Some(BlockState {
+                owner: BlockOwner::Tombstone,
+                ..born_state.clone()
+            })
+        );
+        assert_eq!(block_text(&deleted, block_id).unwrap().id(), born_text);
+
+        let restoration = engine
+            .prepare_fixture_transaction(
+                test_author(114_214, 114_214),
+                &OperationTransaction::new(vec![SemanticOperation::RestoreSubtree {
+                    page_id,
+                    blocks: vec![BlockRestore {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id: page_home,
+                        },
+                        claim: MembershipClaim::new(page_home, None, "a").unwrap(),
+                    }],
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(declared_birth(&restoration), None);
+        let restoration = ValidatedBatch::new(restoration);
+        assert!(matches!(
+            engine.stage_ready(restoration.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let restored = engine.clone_visible_document(page_home, 114_215).unwrap();
+        assert_eq!(shard_page_id(&restored).unwrap(), Some(page_id));
+        assert_eq!(
+            engine.recover_block_state(page_home, block_id).unwrap(),
+            Some(born_state.clone())
+        );
+        assert_eq!(block_text(&restored, block_id).unwrap().id(), born_text);
+
+        let mut replay = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"stable-block-document-identity"),
+            catalog,
+        );
+        for batch in [birth, deletion, restoration] {
+            assert!(matches!(
+                replay.stage_ready(batch).disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+        }
+        let replayed = replay.clone_visible_document(page_home, 114_216).unwrap();
+        assert_eq!(shard_page_id(&replayed).unwrap(), Some(page_id));
+        assert_eq!(
+            replay.recover_block_state(page_home, block_id).unwrap(),
+            Some(born_state)
+        );
+        assert_eq!(block_text(&replayed, block_id).unwrap().id(), born_text);
     }
 
     #[test]
@@ -32033,6 +32821,65 @@ pub(crate) mod validation_tests {
                 "the legacy staging entry point {legacy:?} must stay test-only"
             );
         }
+    }
+
+    /// `BlockDelta::birth` is a transient authorization input, not stored state.
+    ///
+    /// Under page shards a block's birth is no longer carried in a per-block
+    /// CRDT document that the snapshot comparator would compare byte for byte;
+    /// `compare_block_deltas` deliberately ignores `delta.birth`. What makes
+    /// that safe is that birth is never trusted as a free value and never
+    /// persisted: it is read at exactly two production sites, each of which
+    /// pins it to something the engine derives for itself — the block's
+    /// immutable home shard, and that shard's page identity at the declared
+    /// causal base (or the same batch's catalog row). Nothing writes it to
+    /// durable state, so a declared birth cannot outlive the batch that
+    /// carried it.
+    ///
+    /// This test is the enforcement of that claim (I-11). If a third read
+    /// appears, the argument above must be re-made for it before this list
+    /// grows: a birth that reaches storage, or that authorizes anything the
+    /// engine does not independently derive, is a different design and needs
+    /// its own comparator check. The behavioural half — that every forged
+    /// birth is refused with an exact reason — is
+    /// `forged_initial_block_birth_page_and_home_reject_without_fragments`.
+    #[test]
+    fn block_birth_is_read_only_by_the_two_authorization_sites() {
+        let source = include_str!("hot_engine.rs");
+        let production = source
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
+            .next()
+            .expect("the hot-engine production half remains identifiable");
+        let mut enclosing = "<file scope>";
+        let mut readers = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+            {
+                enclosing = rest
+                    .split(['(', '<'])
+                    .next()
+                    .expect("a function declaration names a function");
+            }
+            // `.birth_page_identity_lookups` is a counter, not a birth read.
+            if !line.contains(".birth") || line.contains(".birth_") {
+                continue;
+            }
+            readers.push(enclosing);
+        }
+        assert_eq!(
+            readers,
+            vec![
+                "validate_and_prepare_semantic_roles_and_block_homes",
+                "validate_new_exact_shard_against_declared",
+            ],
+            "BlockDelta::birth is authorization-only and is never persisted; a \
+             new read site must independently derive what it authorizes, or \
+             carry a comparator check. Imitate the two sites listed here."
+        );
     }
 
     /// The checkpoint state section must carry accepted writer-lane ownership,
