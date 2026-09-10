@@ -31559,8 +31559,15 @@ fn c7b_query_walk_boundaries_are_shared_and_live_sql_does_not_restore_a_walk() {
 fn c7b_reference_grouping_has_one_algorithm_owner() {
     // Budget admission, per-page grouping, total/exceeded and display order all
     // belong to `query::BoundedReferenceGroups`; these three are call sites.
+    //
+    // The Direct owner is `collect_reference_occurrences_in`, not the
+    // `_bounded` wrapper above it: WHICH pages to look at became a policy
+    // question (index and wait, or walk and answer) once the panels stopped
+    // parsing the whole graph during a projection turn, and the wrapper is the
+    // walking policy's entry point. Finding the occurrences inside a resolved
+    // candidate set is still one algorithm, and this is its one owner.
     for (file, producer) in [
-        (C7B_QUERY_RS, "collect_reference_occurrences_bounded"),
+        (C7B_QUERY_RS, "collect_reference_occurrences_in"),
         (C7B_SYNC_RUNTIME_RS, "bound_application_reference_sources"),
         (C7B_SYNC_RUNTIME_RS, "application_block_referrers_ready"),
     ] {
