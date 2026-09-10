@@ -41,7 +41,54 @@ const ORG_DIRECTIVES = new Set([
   "attr_html", "attr_org",
 ]);
 const URL_SCHEMES = new Set(["http", "https", "ftp", "ftps", "file", "mailto", "tel", "data", "irc", "ircs", "ssh", "git", "magnet"]);
+
+// Built-in macro names, org block types, and the query DSL's own operators are
+// fixed parser grammar exactly as TASK_MARKERS and STANDARD_PROPERTIES are, and
+// they are protected for the same reason: an export that scrambles them is not
+// a graph any more.  Until 2026-09-10 they were not protected, so a real graph
+// exported `{{query (and (task TODO) ...)}}` as `{{ratry (kek (frqf ZLYK) ...)}}`
+// and `#+BEGIN_QUERY` as `#+BEGIN_MRQH`.  Nothing could find the queries, and
+// the 2026-09 query campaign concluded from a grep that the corpus contained
+// none -- so every benchmarked query shape was invented instead of observed.
+//
+// Only the OPERATORS are protected.  Page names, property names, property
+// values and search strings inside a query body stay pseudonymous, which is
+// what keeps the export anonymous while making it a usable query corpus.
+const MACRO_NAMES = new Set([
+  "query", "embed", "cloze", "renderer", "video", "youtube", "vimeo", "bilibili",
+  "twitter", "tweet", "namespace", "cards", "function", "zotero-imported-file",
+  "zotero-linked-file", "mldoc", "tutorial-video",
+]);
+const ORG_BLOCK_TYPES = new Set([
+  "query", "src", "quote", "example", "export", "center", "comment", "verse",
+  "note", "tip", "important", "caution", "warning", "pinned",
+]);
+const QUERY_KEYWORDS = new Set([
+  "and", "or", "not", "between", "task", "todo", "doing", "done", "now", "later",
+  "waiting", "wait", "canceled", "cancelled", "in", "priority", "page", "namespace",
+  "property", "page-tags", "all-page-tags", "page-property", "block-content",
+  "full-text-search", "sample", "sort-by", "group-by", "page-ref", "current-page",
+  "journal", "find", "where", "pull", "keyword", "title", "inputs", "result-transform",
+  "collapsed?", "rules", "block", "attr", "asc", "desc", "query",
+  // Fixed datascript attribute names in `:block/…` and `:page/…` positions.
+  "marker", "content", "refs", "path-refs", "parent", "left", "uuid", "properties",
+  "original-name", "journal-day", "created-at", "updated-at", "format", "children",
+  "scheduled", "deadline",
+]);
+
+/// The fixed priority values.  `(priority A)` is grammar to the last character,
+/// and a scrambled `A` makes the query mean something else.  Scoped to a query
+/// body, because a bare `A` in prose is a word.
+const QUERY_PRIORITIES = new Set(["a", "b", "c"]);
+// QUERY_PRIORITIES is deliberately NOT folded in below: the one-glyph domain has
+// 26 members and reserving three of them starves the derangement that
+// `exports exhausted one-glyph domains...` pins.  A generated single letter that
+// happens to be `A` is harmless -- it is already indistinguishable from any
+// other letter, and priority values only mean anything inside a query body.
 const GENERATED_PUBLIC_WORDS = new Set([
+  ...MACRO_NAMES,
+  ...ORG_BLOCK_TYPES,
+  ...QUERY_KEYWORDS,
   ...TASK_MARKERS,
   ...[...STANDARD_PROPERTIES].flatMap((name) => name.split(/[-.]/)),
   ...ORG_DIRECTIVES,
@@ -142,6 +189,21 @@ function addMatchRange(ranges, match, capture = 0) {
   ranges.push({ start: match.index + offset, end: match.index + offset + matched.length });
 }
 
+/// The regions in which QUERY_KEYWORDS are operators rather than ordinary
+/// words.  Scoping matters: `and` is grammar inside `(and (task TODO) ...)` and
+/// is just an English word three lines below it, and only the first may survive
+/// the export.
+function queryBodySpans(text) {
+  const spans = [];
+  for (const match of text.matchAll(/\{\{\s*query\b[\s\S]*?\}\}/gi)) {
+    spans.push({ start: match.index, text: match[0] });
+  }
+  for (const match of text.matchAll(/#\+BEGIN_QUERY\b[\s\S]*?#\+END_QUERY/gi)) {
+    spans.push({ start: match.index, text: match[0] });
+  }
+  return spans;
+}
+
 function grammarProtectedRanges(text) {
   const ranges = [];
 
@@ -154,6 +216,21 @@ function grammarProtectedRanges(text) {
   for (const match of text.matchAll(/\b(SCHEDULED|DEADLINE|CLOSED)(?=:)/gi)) addMatchRange(ranges, match, 1);
   for (const match of text.matchAll(/\b(https?|ftp|ftps|file|mailto|tel|data|irc|ircs|ssh|git|magnet)(?=:)/gi)) addMatchRange(ranges, match, 1);
   for (const match of text.matchAll(/#\+(BEGIN|END)(?=_)/gi)) addMatchRange(ranges, match, 1);
+  // The block TYPE after the underscore, which the rule above deliberately
+  // stopped short of: `#+BEGIN_QUERY` is grammar all the way to the Y.
+  for (const match of text.matchAll(/#\+(?:BEGIN|END)_([A-Za-z][A-Za-z0-9_-]*)/gi)) {
+    if (ORG_BLOCK_TYPES.has(match[1].toLowerCase())) addMatchRange(ranges, match, 1);
+  }
+  for (const match of text.matchAll(/\{\{\s*([A-Za-z][A-Za-z0-9_-]*)/g)) {
+    if (MACRO_NAMES.has(match[1].toLowerCase())) addMatchRange(ranges, match, 1);
+  }
+  for (const span of queryBodySpans(text)) {
+    for (const match of span.text.matchAll(/[A-Za-z][A-Za-z0-9_-]*\??/g)) {
+      const token = match[0].toLowerCase();
+      if (!QUERY_KEYWORDS.has(token) && !(QUERY_PRIORITIES.has(token) && match[0].length === 1)) continue;
+      ranges.push({ start: span.start + match.index, end: span.start + match.index + match[0].length });
+    }
+  }
   for (const match of text.matchAll(/#\+(TITLE|ALIAS|TAGS|FILETAGS|ROAM_TAGS|PROPERTY|PROPERTIES|OPTIONS|STARTUP|AUTHOR|DATE|NAME|CAPTION|RESULTS|ATTR_HTML|ATTR_ORG)(?=:)/gi)) {
     addMatchRange(ranges, match, 1);
   }
