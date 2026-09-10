@@ -312,6 +312,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Opening a page no longer reads the whole graph while the index is catching
+  up.** Linked and Unlinked References used to answer a question the index was
+  still preparing by parsing every page in the graph instead. Right after a
+  graph opens, that is every file you have, once for each of the two panels, to
+  produce rows the index serves a moment later anyway. The panels now wait the
+  same fraction of a second a query block already waits, and the Unlinked
+  References header says what it is waiting for. Printing, publishing and the
+  reference diagnostics are unchanged: they have nothing to wait on, so they
+  still read the pages directly.
+
 - **The query sheet's `+ sort` and `+ summarize` buttons are gone.** Everything
   they did — and the three settings they never reached — is in the **Display**
   panel that now sits beside every query, on the sheet and inline alike. Notes

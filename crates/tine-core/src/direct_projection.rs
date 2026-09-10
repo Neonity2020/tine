@@ -723,6 +723,22 @@ pub(crate) enum ProjectionProgress {
     Stopped,
 }
 
+/// Whether the projection can narrow THIS reference target at all.
+///
+/// A `Plain` (unlinked) target with no alphanumeric character has no usable
+/// posting to look up, so the index cannot say which pages might contain it and
+/// the exact parser walk is the only answer. This is a property of the TARGET,
+/// not of the projection's readiness, which is why it is a free function: the
+/// caller that decides between "wait for the index" and "walk every page" must
+/// ask the same question the read itself asks, and one definition is the only
+/// way those two can stay in agreement.
+pub(crate) fn reference_narrowing_supported(names_norm: &[String], kind: ReferenceKind) -> bool {
+    kind != ReferenceKind::Plain
+        || names_norm
+            .iter()
+            .all(|name| name.chars().any(char::is_alphanumeric))
+}
+
 /// What one attempt to answer through the D-15 statement seam produced
 /// (SPEC §5.9). See [`DirectProjection::run_statement`].
 pub(crate) enum StatementRead {
@@ -1652,11 +1668,7 @@ impl DirectProjection {
         if !self.ready_at(cache_generation) {
             return None;
         }
-        if kind == ReferenceKind::Plain
-            && names_norm
-                .iter()
-                .any(|name| !name.chars().any(char::is_alphanumeric))
-        {
+        if !reference_narrowing_supported(names_norm, kind) {
             return None;
         }
         let mut reader = self.shared.reader.lock().unwrap();
@@ -5501,6 +5513,95 @@ mod tests {
             result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             true,
             "the converged lookup must use current indexed candidates"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A reference read that finds the projection mid-turn has two possible
+    /// answers, and they are not equally good. Parsing every page in the graph
+    /// is the OLD one: it is correct, but during the cold-open window it is the
+    /// whole graph, once per panel, to produce rows the index would have served
+    /// a moment later. Reporting the state is the new one, because the panel has
+    /// the same readiness retry a query block has.
+    ///
+    /// Both policies are asserted here on one held worker, so the difference
+    /// between them is the subject of the test rather than a claim about it.
+    #[test]
+    fn a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_every_page() {
+        let _serial = serialize_projection_tests();
+        let root = scratch("reference-working-refusal");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+        for index in 0..6 {
+            std::fs::write(
+                root.join(format!("pages/source{index}.md")),
+                "- unrelated\n",
+            )
+            .unwrap();
+        }
+
+        let graph = Arc::new(Graph::open(&root));
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let (worker_paused_tx, worker_paused_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+            worker_paused_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+        }));
+
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "source0")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "[[target]]".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        worker_paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the one-page projection delta reached the worker");
+
+        let names = [crate::refs::page_key("target")];
+        let reader = Arc::clone(&graph);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let walked = reader.reference_candidate_pages(&names, ReferenceKind::Explicit);
+            let indexed = reader.reference_candidate_pages_indexed(&names, ReferenceKind::Explicit);
+            result_tx
+                .send((
+                    walked.indexed,
+                    walked.pages.len(),
+                    walked.full_page_count,
+                    indexed.err(),
+                ))
+                .unwrap();
+        });
+
+        let (walk_indexed, walked_pages, full_pages, refusal) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("neither policy may block on the held worker");
+        // Release the real worker before any assertion can unwind.
+        release_worker_tx.send(()).unwrap();
+
+        assert!(
+            !walk_indexed && walked_pages == full_pages && full_pages == 7,
+            "the walking policy still answers by parsing every page \
+             (indexed={walk_indexed} pages={walked_pages} of {full_pages})"
+        );
+        assert!(
+            matches!(
+                refusal,
+                Some(crate::query::QueryExecutionError::NotReady(_))
+            ),
+            "the panel policy must report the working projection, not parse \
+             every page: {refusal:?}"
         );
 
         let _ = std::fs::remove_dir_all(root);

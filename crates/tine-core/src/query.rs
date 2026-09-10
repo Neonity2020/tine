@@ -1222,10 +1222,37 @@ fn collect_reference_occurrences_bounded(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
+    let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
+    collect_reference_occurrences_in(
+        graph,
+        canonical,
+        self_page,
+        names_norm,
+        kind,
+        &candidate_pages,
+        max_rows,
+        max_bytes,
+    )
+}
+
+/// The occurrence engine itself. It takes the candidate set already resolved,
+/// because WHICH pages to look at is a policy question (index or walk, wait or
+/// answer) and finding the occurrences inside them is not. Both reference
+/// surfaces and both policies share this one body; there is no second copy that
+/// could drift from it.
+fn collect_reference_occurrences_in(
+    graph: &Graph,
+    canonical: &str,
+    self_page: &str,
+    names_norm: &[String],
+    kind: ReferenceKind,
+    candidate_pages: &crate::model::ReferenceCandidatePages,
+    max_rows: usize,
+    max_bytes: usize,
+) -> BoundedGroups {
     let exclude =
         refs::ReferenceSourceExclusions::new(self_page, graph.config.favorites_page.as_deref());
     let mut accumulator = BoundedReferenceGroups::new(max_rows, max_bytes);
-    let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
     let pages = candidate_pages.pages.as_slice();
     let mut sources = pages.iter().collect::<Vec<_>>();
     sources.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
@@ -1328,6 +1355,32 @@ pub fn backlinks_bounded(
         max_rows,
         max_bytes,
     )
+}
+
+/// Linked references for an interactive panel: the same rows as
+/// [`backlinks_bounded`], but a projection that is mid-turn is REPORTED rather
+/// than answered by parsing every page in the graph. The caller owns the
+/// readiness retry, exactly as a query block does.
+pub fn backlinks_bounded_indexed(
+    graph: &Graph,
+    target: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<BoundedGroups, QueryExecutionError> {
+    let aliases = graph.page_aliases();
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
+    let candidate_pages =
+        graph.reference_candidate_pages_indexed(&names_norm, ReferenceKind::Explicit)?;
+    Ok(collect_reference_occurrences_in(
+        graph,
+        &canonical,
+        &self_page,
+        &names_norm,
+        ReferenceKind::Explicit,
+        &candidate_pages,
+        max_rows,
+        max_bytes,
+    ))
 }
 
 pub(crate) const BACKLINK_FILTER_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -1644,6 +1697,30 @@ pub fn unlinked_refs_bounded(
         max_rows,
         max_bytes,
     )
+}
+
+/// Unlinked references for an interactive panel. See
+/// [`backlinks_bounded_indexed`]; the only difference is the reference kind.
+pub fn unlinked_refs_bounded_indexed(
+    graph: &Graph,
+    target: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<BoundedGroups, QueryExecutionError> {
+    let aliases = graph.page_aliases();
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
+    let candidate_pages =
+        graph.reference_candidate_pages_indexed(&names_norm, ReferenceKind::Plain)?;
+    Ok(collect_reference_occurrences_in(
+        graph,
+        &canonical,
+        &self_page,
+        &names_norm,
+        ReferenceKind::Plain,
+        &candidate_pages,
+        max_rows,
+        max_bytes,
+    ))
 }
 
 /// Target-scoped trace for bug reports. Membership comes from the exact same

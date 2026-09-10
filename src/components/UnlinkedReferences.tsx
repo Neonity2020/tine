@@ -8,10 +8,11 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { ReferenceExcerptBlocks } from "./ReferenceEvidence";
 import type { RefGroup } from "../types";
 import {
-  classifyReferenceLoadError,
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
+import { createReferenceFetcher } from "../lib/referenceFetch";
+import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
   sectionOverride,
@@ -60,17 +61,15 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
     setOpenSignal(sectionOverride("unlinked", page) ?? false);
     setCollapsedGroupsSignal(collapsedGroupsFor("unlinked", page));
   });
+  const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
+  const fetchReferences = createReferenceFetcher({
+    currentName: () => props.name,
+    setLoadError,
+    setIndexPending,
+  });
   const [groups] = createResource(
     () => props.name,
-    async (n) => {
-      setLoadError(null);
-      try {
-        return await backend().getUnlinkedRefs(n);
-      } catch (error) {
-        setLoadError(classifyReferenceLoadError(error));
-        return [];
-      }
-    }
+    (n) => fetchReferences(n, () => backend().getUnlinkedRefs(n))
   );
   const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
   const count = () => mergedGroups().reduce((a, g) => a + g.blocks.length, 0);
@@ -106,7 +105,9 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
         <Show when={groups()}>
           <span class="references-count">{count()}</span>
         </Show>
-        <Show when={groups.loading}><span class="references-loading"> Loading…</span></Show>
+        <Show when={groups.loading}>
+          <span class="references-loading"> {indexPending()?.message ?? "Loading…"}</span>
+        </Show>
         <button
           type="button"
           class="reference-export-toggle"

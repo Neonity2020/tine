@@ -7230,6 +7230,27 @@
     "failBefore": "manager-native-root-diagnostic exits 1 with a flat four-row query reopened as nested binary groups; PageBlocks89744 returns no page for a matching nested page_prop"
    },
    "notes": "The P6 native journey persisted the right one-line tine-query and kept its sheet open, but sqlparser's binary associativity leaked into the editable IR. TQL lowering also decided Page hops from the outer anchor, so page_prop inside an @page blocks relation stayed on the block. The correction preserves explicit same-operator parentheses, flattens only unparenthesized parser chains, and resolves page targets from the current Scope. Exact manager-owned Rust and native pass-after evidence remains pending."
+  },
+{
+ "id": "REG-REF-INDEXED-PANEL-POLICY-001",
+ "title": "A references panel waits for the index instead of parsing every page while the projection is mid-turn",
+ "family": "references",
+ "sources": { "issues": [], "commits": [], "internal": "Martin 2026-09-10: repeated stale-projection lines while opening a query-bearing page" },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection.rs::tests::a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_every_page",
+   "crates/tine-core/tests/public_query_executor_census.rs::the_reference_panel_commands_use_the_indexed_policy",
+   "src/lib/referenceFetch.test.ts"
+  ],
+  "scenario": "references.indexed-panel-policy",
+  "failBefore": "With the projection worker held mid-delta, reference_candidate_pages_indexed answered Ok with indexed=false over all 7 pages; excising the ProjectionProgress arm fails the test with 'the panel policy must report the working projection, not parse every page: None'"
+ },
+ "notes": "Linked and Unlinked References answered a projection that was indexing, recovering, applying pending edits or busy by parsing every page in the graph. During the cold-open window that is the whole graph, once per panel, for rows the index serves a moment later. The panels now use the indexed policy and wait through runQueryWhenCurrent, the same readiness retry a query block uses. Print, publish, diagnostics and the unbounded entry points keep the walk because they have no retry loop to wait on. A stopped worker, an absent projection, and a Plain target with no alphanumeric character also keep the walk: nothing is coming for them, and refusing there would remove the only route to an answer rather than delay it."
   }
 ]
 }

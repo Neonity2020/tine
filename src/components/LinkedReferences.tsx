@@ -9,10 +9,10 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 import {
-  classifyReferenceLoadError,
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
+import { createReferenceFetcher } from "../lib/referenceFetch";
 import {
   collapsedGroupsFor,
   sectionOverride,
@@ -108,17 +108,16 @@ const referenceCollapseThreshold = () =>
 
 export function LinkedReferences(props: { name: string }): JSX.Element {
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
+  // The section renders nothing until it has groups, so waiting for the index
+  // looks exactly like the first load already does. No extra affordance here.
+  const fetchReferences = createReferenceFetcher({
+    currentName: () => props.name,
+    setLoadError,
+    setIndexPending: () => {},
+  });
   const [groups] = createResource(
     () => props.name,
-    async (n) => {
-      setLoadError(null);
-      try {
-        return await backend().getBacklinks(n);
-      } catch (error) {
-        setLoadError(classifyReferenceLoadError(error));
-        return [];
-      }
-    }
+    (n) => fetchReferences(n, () => backend().getBacklinks(n))
   );
   const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
   // GH #272: held outside the component so a remount cannot silently re-collapse

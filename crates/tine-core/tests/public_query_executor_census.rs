@@ -407,3 +407,43 @@ fn an_oracle_module_is_test_only_without_a_test_filename_suffix() {
     assert!(compiled_source(&oracle).contains("fn selected()"));
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+/// The reference panels reach the engine through the INDEXED policy.
+///
+/// `Graph::backlinks_bounded` and `Graph::unlinked_refs_bounded` answer a
+/// projection that is only mid-turn by parsing every page in the graph. That is
+/// the right answer for print, publish and diagnostics, which have no readiness
+/// retry to wait on. It is the wrong answer for a panel, which does: during the
+/// cold-open window it parses the whole graph, once per panel, to produce rows
+/// the index serves a moment later.
+///
+/// The two policies differ by a suffix, so nothing but this guard stops the next
+/// panel from picking whichever name autocompletes first.
+#[test]
+fn the_reference_panel_commands_use_the_indexed_policy() {
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    for path in production_source_files() {
+        if !path.starts_with(root.join("src-tauri/src")) {
+            continue;
+        }
+        let relative = relative_path(&root, &path);
+        for (number, line) in compiled_source(&path).lines().enumerate() {
+            for walking in ["backlinks_bounded(", "unlinked_refs_bounded("] {
+                if line.contains(walking) {
+                    offenders.push(format!("{relative}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a Tauri command uses the walking reference policy at:\n{}\n\n\
+         Use `backlinks_bounded_indexed` / `unlinked_refs_bounded_indexed` \
+         instead. They return `Result<_, QueryExecutionError>`; `?` at the \
+         command boundary turns a `NotReady` into the same tagged wire error a \
+         query block already retries through `runQueryWhenCurrent`. \
+         `src-tauri/src/commands.rs`'s `get_backlinks` is the exemplar.",
+        offenders.join("\n")
+    );
+}

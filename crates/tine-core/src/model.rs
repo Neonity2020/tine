@@ -4159,6 +4159,16 @@ pub fn ref_groups_estimated_bytes(groups: &[RefGroup]) -> usize {
         .sum()
 }
 
+fn bounded_ref_groups(computed: crate::query::BoundedGroups) -> BoundedRefGroups {
+    BoundedRefGroups {
+        matched_total: None,
+        statistics: None,
+        groups: Arc::new(computed.groups),
+        total: computed.total,
+        exceeded: computed.exceeded,
+    }
+}
+
 fn touch_lru(lru: &mut std::collections::VecDeque<String>, key: &str) {
     if let Some(pos) = lru.iter().position(|candidate| candidate == key) {
         lru.remove(pos);
@@ -15339,6 +15349,12 @@ impl Graph {
     /// Resolve a bounded set of physical cached pages that could contain one of
     /// `names_norm`. An unusable/stale/incomplete index returns the complete
     /// snapshot, so callers preserve exact full-scan correctness.
+    ///
+    /// This is the WALK policy: it always answers. Use it where no readiness
+    /// retry exists to wait on — print/publish, diagnostics, tests. An
+    /// interactive surface uses [`Graph::reference_candidate_pages_indexed`]
+    /// instead, so a projection that is merely mid-turn does not cost a
+    /// whole-graph parse.
     pub(crate) fn reference_candidate_pages(
         &self,
         names_norm: &[String],
@@ -15360,6 +15376,51 @@ impl Graph {
             pages,
             indexed: false,
         }
+    }
+
+    /// The same resolution for a surface that CAN wait, which is the whole
+    /// difference: a reference panel has the readiness retry loop a query block
+    /// has, so a projection that is indexing, recovering, applying pending
+    /// edits or busy is reported rather than answered by parsing every page in
+    /// the graph. That fallback is not free — during the cold-open window it is
+    /// the entire graph, once per reference panel — and it is not more correct,
+    /// because the same read a moment later is served from the index.
+    ///
+    /// It refuses ONLY where waiting has an end, because the caller's retry is
+    /// unbounded and a refusal nothing will ever clear is a hang. `Working` is
+    /// the one state a queued worker turn resolves, and it is the state the
+    /// cold-open window actually produces. Everything else keeps the walk:
+    ///
+    /// * `Ready` while the narrowing read still declined — a save landed between
+    ///   the two reads, or the read itself failed. The save case heals on the
+    ///   caller's next request anyway, and the failure case would otherwise
+    ///   refuse forever with no repair behind it, so one walk is both the
+    ///   cheaper and the terminating answer. Repair belongs to the query
+    ///   dispatcher, which can bound it; a panel read cannot.
+    /// * `Stale`, `Stopped`, no projection at all, and a target the index cannot
+    ///   narrow (`reference_narrowing_supported`) — nothing is coming for any of
+    ///   these, and refusing would remove the only route to an answer rather
+    ///   than delay it.
+    pub(crate) fn reference_candidate_pages_indexed(
+        &self,
+        names_norm: &[String],
+        kind: ReferenceKind,
+    ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
+        use crate::direct_projection::ProjectionProgress;
+        if let Some(pages) = self.direct_projection_reference_candidate_pages(names_norm, kind) {
+            let full_page_count = self.list_pages().len();
+            return Ok(ReferenceCandidatePages {
+                pages,
+                indexed: true,
+                full_page_count,
+            });
+        }
+        if crate::direct_projection::reference_narrowing_supported(names_norm, kind) {
+            if let Some(ProjectionProgress::Working(reason)) = self.direct_projection_progress() {
+                return Err(crate::query::QueryExecutionError::NotReady(reason));
+            }
+        }
+        Ok(self.reference_candidate_pages(names_norm, kind))
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {
@@ -16825,17 +16886,20 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> crate::query::BoundedGroups,
     ) -> BoundedRefGroups {
-        self.derived_memo_entry(key, || {
-            let computed = compute();
-            DerivedEntry::plain(BoundedRefGroups {
-                matched_total: None,
-                statistics: None,
-                groups: Arc::new(computed.groups),
-                total: computed.total,
-                exceeded: computed.exceeded,
-            })
-        })
-        .result
+        self.derived_memo_entry(key, || DerivedEntry::plain(bounded_ref_groups(compute())))
+            .result
+    }
+
+    fn derived_memo_bounded_fallible<E>(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Result<crate::query::BoundedGroups, E>,
+    ) -> Result<BoundedRefGroups, E> {
+        Ok(self
+            .derived_memo_entry_fallible(key, || {
+                compute().map(|computed| DerivedEntry::plain(bounded_ref_groups(computed)))
+            })?
+            .result)
     }
 
     /// Execute the selection into operation-scoped PRE-VIEW groups, apply this
@@ -16875,6 +16939,21 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> DerivedEntry,
     ) -> DerivedEntry {
+        match self.derived_memo_entry_fallible::<std::convert::Infallible>(key, || Ok(compute())) {
+            Ok(entry) => entry,
+            Err(never) => match never {},
+        }
+    }
+
+    /// The one memo body. A `compute` that REFUSES (a projection that is only
+    /// mid-turn, say) must not be cached: the same key answers normally a
+    /// moment later, and a stored refusal would outlive the condition that
+    /// produced it until the next cache generation.
+    fn derived_memo_entry_fallible<E>(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Result<DerivedEntry, E>,
+    ) -> Result<DerivedEntry, E> {
         use std::sync::atomic::Ordering;
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
@@ -16886,16 +16965,16 @@ impl Graph {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
         }
-        let result = compute();
+        let result = compute()?;
         let result_bytes = ref_groups_estimated_bytes(result.result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
-            return result;
+            return Ok(result);
         }
         let mut g = self.derived_cache.write().unwrap();
         match g.as_mut() {
@@ -16923,7 +17002,7 @@ impl Graph {
                 });
             }
         }
-        result
+        Ok(result)
     }
 
     fn derived_memo(
@@ -17028,6 +17107,23 @@ impl Graph {
         })
     }
 
+    /// Linked references for an interactive panel. Same rows, same memo key as
+    /// [`Graph::backlinks_bounded`] -- the only difference is that a projection
+    /// which is merely mid-turn is reported instead of answered by parsing
+    /// every page in the graph.
+    pub fn backlinks_bounded_indexed(
+        &self,
+        target: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
+        let normalized = crate::refs::normalize(target);
+        self.derived_memo_bounded_fallible(
+            format!("B\0{max_rows}\0{max_bytes}\0{normalized}"),
+            || crate::query::backlinks_bounded_indexed(self, target, max_rows, max_bytes),
+        )
+    }
+
     /// Block-level referrers for a block uuid: every block across the graph that
     /// references it, grouped by source page (memoized). Includes same-page
     /// referrers (see `query::block_referrers`).
@@ -17122,6 +17218,21 @@ impl Graph {
         self.derived_memo_bounded(format!("U\0{max_rows}\0{max_bytes}\0{normalized}"), || {
             crate::query::unlinked_refs_bounded(self, target, max_rows, max_bytes)
         })
+    }
+
+    /// Unlinked references for an interactive panel. See
+    /// [`Graph::backlinks_bounded_indexed`].
+    pub fn unlinked_refs_bounded_indexed(
+        &self,
+        target: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
+        let normalized = crate::refs::normalize(target);
+        self.derived_memo_bounded_fallible(
+            format!("U\0{max_rows}\0{max_bytes}\0{normalized}"),
+            || crate::query::unlinked_refs_bounded_indexed(self, target, max_rows, max_bytes),
+        )
     }
 
     /// Explicit, uncached target-scoped trace of the exact reference engine.
