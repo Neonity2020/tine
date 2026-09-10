@@ -723,6 +723,33 @@ pub(crate) enum ProjectionProgress {
     Stopped,
 }
 
+/// Whether the projection can narrow THIS reference target at all.
+///
+/// A `Plain` (unlinked) target with no alphanumeric character has no usable
+/// posting to look up, so the index cannot say which pages might contain it and
+/// the exact parser walk is the only answer. This is a property of the TARGET,
+/// not of the projection's readiness, which is why it is a free function: the
+/// caller that decides between "wait for the index" and "walk every page" must
+/// ask the same question the read itself asks, and one definition is the only
+/// way those two can stay in agreement.
+pub(crate) fn reference_narrowing_supported(names_norm: &[String], kind: ReferenceKind) -> bool {
+    kind != ReferenceKind::Plain
+        || names_norm
+            .iter()
+            .all(|name| name.chars().any(char::is_alphanumeric))
+}
+
+/// One reference target's candidate set, as the index can name it.
+///
+/// `blocks` is `Some` only when the index enumerated the referring blocks for
+/// EVERY name in the target's equivalence class. A `None` there means "classify
+/// every block of every candidate page", which is what the walk did before this
+/// existed, so a partial index can never silently drop a row.
+pub(crate) struct ReferenceCandidateIndex {
+    pub paths: std::collections::BTreeSet<PathBuf>,
+    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
+}
+
 /// What one attempt to answer through the D-15 statement seam produced
 /// (SPEC §5.9). See [`DirectProjection::run_statement`].
 pub(crate) enum StatementRead {
@@ -1643,20 +1670,32 @@ impl DirectProjection {
         self.ready_at(cache_generation).then_some(names)
     }
 
-    pub(crate) fn reference_candidate_paths(
+    /// The candidate set for one reference target: the pages that may contain a
+    /// match and, when the index can name them, the BLOCKS.
+    ///
+    /// The block set is not an optimization bolted on afterwards — it is what
+    /// `page_referrer_candidates_after` already returns. Its rows are
+    /// `(source_page_id, source_entity)` and the caller used to drop the
+    /// entity, so the read narrowed to 184 pages and then re-parsed all 3,434
+    /// of their blocks to find the 412 that referred to the target (measured on
+    /// the anonymized graph; see `sql_gates_tests.rs`'s narrowing receipt).
+    /// Carrying the entity through spends nothing extra in SQL and removes
+    /// roughly nine of every ten per-block parses.
+    ///
+    /// The block set is a SUPERSET filter and never the answer: the parser
+    /// still decides membership, exactly as before. It is `None` whenever the
+    /// index cannot name blocks for this target, and then every block of every
+    /// candidate page is classified as it was.
+    pub(crate) fn reference_candidates(
         &self,
         cache_generation: u64,
         names_norm: &[String],
         kind: ReferenceKind,
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+    ) -> Option<ReferenceCandidateIndex> {
         if !self.ready_at(cache_generation) {
             return None;
         }
-        if kind == ReferenceKind::Plain
-            && names_norm
-                .iter()
-                .any(|name| !name.chars().any(char::is_alphanumeric))
-        {
+        if !reference_narrowing_supported(names_norm, kind) {
             return None;
         }
         let mut reader = self.shared.reader.lock().unwrap();
@@ -1665,6 +1704,8 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let mut page_ids = std::collections::BTreeSet::new();
+        let mut blocks = std::collections::HashSet::new();
+        let mut blocks_are_complete = true;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
@@ -1673,6 +1714,17 @@ impl DirectProjection {
                         |row| (row.source_page_id, row.source),
                         |row| {
                             page_ids.insert(row.source_page_id);
+                            match row.source {
+                                PhysicalEntityId::Block(block_id) => {
+                                    blocks.insert(block_id);
+                                }
+                                // A page-level posting names no block. The
+                                // page-property pseudo-block it stands for is
+                                // built from the page preamble and never
+                                // classified through the block walk, so the
+                                // block set stays complete for the walk.
+                                PhysicalEntityId::Page(_) => {}
+                            }
                             Ok(())
                         },
                         |_, _| None,
@@ -1680,6 +1732,11 @@ impl DirectProjection {
                     .ok()?;
                 }
                 ReferenceKind::Plain => {
+                    // FTS narrows to pages here; `plain_text_candidate_pages_after`
+                    // projects `owner.page_id` and does not expose the owning
+                    // entity, so the walk still classifies every block of a
+                    // candidate page.
+                    blocks_are_complete = false;
                     drain_after(
                         |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
                         |row| row.page_id,
@@ -1700,7 +1757,11 @@ impl DirectProjection {
                 .ok()??;
             paths.insert(PathBuf::from(page.path));
         }
-        self.ready_at(cache_generation).then_some(paths)
+        self.ready_at(cache_generation)
+            .then_some(ReferenceCandidateIndex {
+                paths,
+                blocks: blocks_are_complete.then_some(blocks),
+            })
     }
 
     /// Outer `None` means projection unavailable/stale and requires parser
@@ -5501,6 +5562,95 @@ mod tests {
             result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             true,
             "the converged lookup must use current indexed candidates"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A reference read that finds the projection mid-turn has two possible
+    /// answers, and they are not equally good. Parsing every page in the graph
+    /// is the OLD one: it is correct, but during the cold-open window it is the
+    /// whole graph, once per panel, to produce rows the index would have served
+    /// a moment later. Reporting the state is the new one, because the panel has
+    /// the same readiness retry a query block has.
+    ///
+    /// Both policies are asserted here on one held worker, so the difference
+    /// between them is the subject of the test rather than a claim about it.
+    #[test]
+    fn a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_every_page() {
+        let _serial = serialize_projection_tests();
+        let root = scratch("reference-working-refusal");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/target.md"), "- target\n").unwrap();
+        for index in 0..6 {
+            std::fs::write(
+                root.join(format!("pages/source{index}.md")),
+                "- unrelated\n",
+            )
+            .unwrap();
+        }
+
+        let graph = Arc::new(Graph::open(&root));
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let (worker_paused_tx, worker_paused_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+            worker_paused_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+        }));
+
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "source0")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "[[target]]".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        worker_paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the one-page projection delta reached the worker");
+
+        let names = [crate::refs::page_key("target")];
+        let reader = Arc::clone(&graph);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let walked = reader.reference_candidate_pages(&names, ReferenceKind::Explicit);
+            let indexed = reader.reference_candidate_pages_indexed(&names, ReferenceKind::Explicit);
+            result_tx
+                .send((
+                    walked.indexed,
+                    walked.pages.len(),
+                    walked.full_page_count,
+                    indexed.err(),
+                ))
+                .unwrap();
+        });
+
+        let (walk_indexed, walked_pages, full_pages, refusal) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("neither policy may block on the held worker");
+        // Release the real worker before any assertion can unwind.
+        release_worker_tx.send(()).unwrap();
+
+        assert!(
+            !walk_indexed && walked_pages == full_pages && full_pages == 7,
+            "the walking policy still answers by parsing every page \
+             (indexed={walk_indexed} pages={walked_pages} of {full_pages})"
+        );
+        assert!(
+            matches!(
+                refusal,
+                Some(crate::query::QueryExecutionError::NotReady(_))
+            ),
+            "the panel policy must report the working projection, not parse \
+             every page: {refusal:?}"
         );
 
         let _ = std::fs::remove_dir_all(root);

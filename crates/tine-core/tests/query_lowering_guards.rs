@@ -172,7 +172,7 @@ fn hand_written_cursor_drains_are_pinned() {
         "referenced_page_names",
         "page_aliases_with_owners",
         "real_page_names",
-        "reference_candidate_paths",
+        "reference_candidates",
         "block_ref_counts",
         "block_referrer_candidate_paths",
     ] {
@@ -261,7 +261,7 @@ fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static s
         (DIRECT, "real_page_names", "navigation_pages_after_with_header_validation") => {
             ("other-question", "Direct real page ownership")
         }
-        (DIRECT, "reference_candidate_paths", "page_referrer_candidates_after") => {
+        (DIRECT, "reference_candidates", "page_referrer_candidates_after") => {
             ("other-question", "Direct explicit reference candidates")
         }
         (
@@ -439,7 +439,7 @@ fn expected_census() -> BTreeSet<CensusRecord> {
         (
             "page_referrer_candidates_after",
             DIRECT,
-            "reference_candidate_paths",
+            "reference_candidates",
             "Direct explicit reference candidates",
         ),
         (

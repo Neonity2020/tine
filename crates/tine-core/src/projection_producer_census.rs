@@ -2148,17 +2148,41 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // full 471-row base and post multisets shows these three moves and nothing
     // else — no snapshot opener is added, no reader is opened anywhere new, and
     // the write-boundary token inventory above is byte-for-byte the pinned one.
-    // Re-pinned 2026-09-10 (rebaselining v2 P1, page-shard live layout). The
-    // complete tuple delta from the 471-row base multiset is exactly two
-    // tuples, proved by rebuilding the base digest from the new multiset:
-    // hot_engine.rs's sealed-index `use` no longer names
-    // `AuthenticatedMapLinkV1`/`AuthenticatedMapRootV1` in production (only
-    // the test-only run-local root comparison needs them), and identity.rs
-    // gains one `AuthenticatedMapKey::from(` for `DocumentId`'s 16-byte live
-    // key. No write boundary, reader or storage call is added or removed.
+    // Re-pinned 2026-09-10 for BOTH changes that landed on this file today; the
+    // merge conflicted here because each side re-pinned this digest from the
+    // same 471-row base, so neither side's value survives the combination.
+    //
+    // (a) rebaselining v2 P1 (page-shard live layout): hot_engine.rs's
+    //     sealed-index `use` no longer names `AuthenticatedMapLinkV1` /
+    //     `AuthenticatedMapRootV1` in production (only the test-only run-local
+    //     root comparison needs them), and identity.rs gains one
+    //     `AuthenticatedMapKey::from(` for `DocumentId`'s 16-byte live key.
+    //
+    // (b) block-level reference narrowing: `direct_projection.rs` gains two
+    //     read-only tuples inside `reference_candidates` (the former
+    //     `reference_candidate_paths`) —
+    //       `import-associated:PhysicalEntityId::Block(`   3 -> 4
+    //       `import-associated:PhysicalEntityId::Page(`    3 -> 4
+    //     the two arms of one `match` over the `source` a
+    //     `page_referrer_candidates_after` row already carries.
+    //
+    // Neither change adds a write boundary, opens a reader anywhere new, or
+    // adds a statement; `PhysicalEntityId` is not in `write_capable_types`, the
+    // write-crossing table above is byte-identical, and the certified
+    // dependency stays at v0.20.0.
+    //
+    // The value below is derived, not assumed, and the derivation is the whole
+    // point: a merge that combines two independent re-pins of one digest is
+    // exactly where a third, unnoticed surface change would hide, because each
+    // side's own guard was green in isolation. So the merged multiset was
+    // dumped here (474 rows) and (b)'s two documented occurrences were removed
+    // from it; the remaining 472 rows hash to 592d0bce…, which is precisely
+    // what (a) pinned before the merge. Nothing else in the tine-storage
+    // surface moved. Row counts reconcile end to end: 471 base, +1 from (a),
+    // +2 from (b), 474 here.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "592d0bcec3df40f2d6e15b1ab0d9f3505dc5084312b58f2843b6beb3f4e58ee3",
+        "e59cb1446f050ad29c860be5dbba4a9c7c8ab4f7bb6cb0df464dc5251dcf4839",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

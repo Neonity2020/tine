@@ -1413,11 +1413,11 @@ pub(crate) async fn get_backlinks(
                 }
                 _ => Err(CommandError::prose("managed backlinks returned the wrong reply kind")),
             },
-            None => bounded_groups_or_error(slot.legacy_graph()?.backlinks_bounded(
+            None => bounded_groups_or_error(slot.legacy_graph()?.backlinks_bounded_indexed(
                 &name,
                 RESULT_BRIDGE_MAX_ROWS,
                 RESULT_BRIDGE_MAX_BYTES,
-            )),
+            )?),
         }
     })
     .await
@@ -1492,11 +1492,11 @@ pub(crate) async fn get_unlinked_refs(
                 }
                 _ => Err(CommandError::prose("managed unlinked references returned the wrong reply kind")),
             },
-            None => bounded_groups_or_error(slot.legacy_graph()?.unlinked_refs_bounded(
+            None => bounded_groups_or_error(slot.legacy_graph()?.unlinked_refs_bounded_indexed(
                 &name,
                 RESULT_BRIDGE_MAX_ROWS,
                 RESULT_BRIDGE_MAX_BYTES,
-            )),
+            )?),
         }
     })
     .await
