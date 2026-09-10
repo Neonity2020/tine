@@ -2144,9 +2144,26 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // full 471-row base and post multisets shows these three moves and nothing
     // else — no snapshot opener is added, no reader is opened anywhere new, and
     // the write-boundary token inventory above is byte-for-byte the pinned one.
+    // Block-level reference narrowing (2026-09-10) adds exactly TWO read-only
+    // tuples, 471 -> 473, both in `direct_projection.rs` and both inside
+    // `reference_candidates` (the former `reference_candidate_paths`):
+    //   `import-associated:PhysicalEntityId::Block(`   3 -> 4
+    //   `import-associated:PhysicalEntityId::Page(`    3 -> 4
+    // They are the two arms of one `match` over the `source` a
+    // `page_referrer_candidates_after` row already carries. The reader kept
+    // only the row's page id and threw the entity away, so the reference walk
+    // narrowed to 184 pages and then classified all 3,434 of their blocks to
+    // find the 412 that referred to the target; keeping the entity narrows to
+    // the blocks. `PhysicalEntityId` is not in `write_capable_types`, no
+    // statement is added, and no reader is opened anywhere new — the read is
+    // the same call, on the same open handle, with its second column no longer
+    // discarded. Derived, not assumed: the full 473-row multiset was dumped at
+    // the working head and diffed against the pinned 471; these two are the
+    // only additions and there are no removals. The write-crossing table above
+    // is byte-identical and the certified dependency stays at v0.20.0.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "beb3e08325ddedce83eca0a5a92c79def4020dde610aec02458b4111f7af5db0",
+        "8e3376e96851c3f2090d9e41f8faf33f40f3e0c1047309262fc695264cab87f5",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

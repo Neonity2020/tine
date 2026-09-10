@@ -1235,6 +1235,56 @@ fn collect_reference_occurrences_bounded(
     )
 }
 
+/// Whether the resolved candidate set still admits this block.
+///
+/// `None` is the walk's own answer — every block is a candidate — and is what
+/// a missing, stale or block-blind index produces. When the set is `Some`, a
+/// block whose runtime UUID is absent from it cannot refer to the target, so
+/// the caller skips it WITHOUT forcing `DocBlock::projection()`. That is the
+/// whole saving: on the anonymized graph the busiest target narrows to 184
+/// pages holding 3,434 blocks, of which 412 refer to it.
+///
+/// A block whose UUID does not parse is admitted rather than skipped. The
+/// projection refuses to lower such a block at all (`lower_blocks` errors on
+/// it), so it cannot be in the set, and dropping it here would lose a row the
+/// walk would have found.
+fn candidate_blocks_admit(
+    blocks: Option<&std::collections::HashSet<[u8; 16]>>,
+    block: &DocBlock,
+) -> bool {
+    let admitted = match blocks {
+        None => true,
+        Some(blocks) => match uuid::Uuid::parse_str(&block.uuid) {
+            Ok(uuid) => blocks.contains(uuid.as_bytes()),
+            Err(_) => true,
+        },
+    };
+    #[cfg(test)]
+    if admitted {
+        REFERENCE_CLASSIFICATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+    admitted
+}
+
+/// How many blocks the reference walk actually classified — i.e. how many had
+/// their lsdoc projection forced to answer "does this refer to the target".
+/// The saving block narrowing exists for is the drop in this number, so the
+/// gate measures it rather than asserting it in prose.
+#[cfg(test)]
+thread_local! {
+    static REFERENCE_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reference_classifications() -> usize {
+    REFERENCE_CLASSIFICATIONS.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reference_classifications() {
+    REFERENCE_CLASSIFICATIONS.with(|count| count.set(0));
+}
+
 /// The occurrence engine itself. It takes the candidate set already resolved,
 /// because WHICH pages to look at is a policy question (index or walk, wait or
 /// answer) and finding the occurrences inside them is not. Both reference
@@ -1290,6 +1340,14 @@ fn collect_reference_occurrences_in(
             &doc.roots,
             &mut path,
             &mut |block, _| {
+                // The index already named the referring blocks for this target,
+                // so a block outside that set cannot match and never needs its
+                // lsdoc projection forced. `None` (no index, or an index that
+                // cannot name blocks for this kind) classifies every block, as
+                // the walk always did.
+                if !candidate_blocks_admit(candidate_pages.blocks.as_ref(), block) {
+                    return None;
+                }
                 if construction_closed.get() {
                     block_has_reference(block, names_norm, kind, &graph.config).then_some(None)
                 } else {
@@ -1324,6 +1382,70 @@ fn collect_reference_occurrences_in(
         );
     }
     accumulator.finish()
+}
+
+/// Test-only: answer the SAME target twice from the SAME candidate resolution,
+/// once with the index's block set and once with it discarded.
+///
+/// This is the oracle for block narrowing and the only thing that makes it
+/// safe. The walk is the authority; the block set is a filter in front of it,
+/// and a filter is correct exactly when removing it changes nothing. Returning
+/// whether a block set was present at all keeps the gate from passing
+/// vacuously on a corpus where the index never named one.
+#[cfg(test)]
+pub(crate) fn reference_occurrences_narrowed_and_walked(
+    graph: &Graph,
+    target: &str,
+    kind: ReferenceKind,
+    max_rows: usize,
+    max_bytes: usize,
+) -> (BoundedGroups, BoundedGroups, NarrowingReceipt) {
+    let aliases = graph.page_aliases();
+    let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
+    let mut candidates = graph.reference_candidate_pages(&names_norm, kind);
+    reset_reference_classifications();
+    let narrowed = collect_reference_occurrences_in(
+        graph,
+        &canonical,
+        &self_page,
+        &names_norm,
+        kind,
+        &candidates,
+        max_rows,
+        max_bytes,
+    );
+    let narrowed_classifications = reference_classifications();
+    let narrowing_applied = candidates.blocks.take().is_some();
+    reset_reference_classifications();
+    let walked = collect_reference_occurrences_in(
+        graph,
+        &canonical,
+        &self_page,
+        &names_norm,
+        kind,
+        &candidates,
+        max_rows,
+        max_bytes,
+    );
+    let walked_classifications = reference_classifications();
+    (
+        narrowed,
+        walked,
+        NarrowingReceipt {
+            applied: narrowing_applied,
+            narrowed_classifications,
+            walked_classifications,
+        },
+    )
+}
+
+/// What block narrowing did on one target: whether the index named blocks at
+/// all, and how many blocks each policy had to classify.
+#[cfg(test)]
+pub(crate) struct NarrowingReceipt {
+    pub applied: bool,
+    pub narrowed_classifications: usize,
+    pub walked_classifications: usize,
 }
 
 pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {

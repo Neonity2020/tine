@@ -739,6 +739,17 @@ pub(crate) fn reference_narrowing_supported(names_norm: &[String], kind: Referen
             .all(|name| name.chars().any(char::is_alphanumeric))
 }
 
+/// One reference target's candidate set, as the index can name it.
+///
+/// `blocks` is `Some` only when the index enumerated the referring blocks for
+/// EVERY name in the target's equivalence class. A `None` there means "classify
+/// every block of every candidate page", which is what the walk did before this
+/// existed, so a partial index can never silently drop a row.
+pub(crate) struct ReferenceCandidateIndex {
+    pub paths: std::collections::BTreeSet<PathBuf>,
+    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
+}
+
 /// What one attempt to answer through the D-15 statement seam produced
 /// (SPEC §5.9). See [`DirectProjection::run_statement`].
 pub(crate) enum StatementRead {
@@ -1659,12 +1670,28 @@ impl DirectProjection {
         self.ready_at(cache_generation).then_some(names)
     }
 
-    pub(crate) fn reference_candidate_paths(
+    /// The candidate set for one reference target: the pages that may contain a
+    /// match and, when the index can name them, the BLOCKS.
+    ///
+    /// The block set is not an optimization bolted on afterwards — it is what
+    /// `page_referrer_candidates_after` already returns. Its rows are
+    /// `(source_page_id, source_entity)` and the caller used to drop the
+    /// entity, so the read narrowed to 184 pages and then re-parsed all 3,434
+    /// of their blocks to find the 412 that referred to the target (measured on
+    /// the anonymized graph; see `sql_gates_tests.rs`'s narrowing receipt).
+    /// Carrying the entity through spends nothing extra in SQL and removes
+    /// roughly nine of every ten per-block parses.
+    ///
+    /// The block set is a SUPERSET filter and never the answer: the parser
+    /// still decides membership, exactly as before. It is `None` whenever the
+    /// index cannot name blocks for this target, and then every block of every
+    /// candidate page is classified as it was.
+    pub(crate) fn reference_candidates(
         &self,
         cache_generation: u64,
         names_norm: &[String],
         kind: ReferenceKind,
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+    ) -> Option<ReferenceCandidateIndex> {
         if !self.ready_at(cache_generation) {
             return None;
         }
@@ -1677,6 +1704,8 @@ impl DirectProjection {
         }
         let read = reader.as_ref()?.read();
         let mut page_ids = std::collections::BTreeSet::new();
+        let mut blocks = std::collections::HashSet::new();
+        let mut blocks_are_complete = true;
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
@@ -1685,6 +1714,17 @@ impl DirectProjection {
                         |row| (row.source_page_id, row.source),
                         |row| {
                             page_ids.insert(row.source_page_id);
+                            match row.source {
+                                PhysicalEntityId::Block(block_id) => {
+                                    blocks.insert(block_id);
+                                }
+                                // A page-level posting names no block. The
+                                // page-property pseudo-block it stands for is
+                                // built from the page preamble and never
+                                // classified through the block walk, so the
+                                // block set stays complete for the walk.
+                                PhysicalEntityId::Page(_) => {}
+                            }
                             Ok(())
                         },
                         |_, _| None,
@@ -1692,6 +1732,11 @@ impl DirectProjection {
                     .ok()?;
                 }
                 ReferenceKind::Plain => {
+                    // FTS narrows to pages here; `plain_text_candidate_pages_after`
+                    // projects `owner.page_id` and does not expose the owning
+                    // entity, so the walk still classifies every block of a
+                    // candidate page.
+                    blocks_are_complete = false;
                     drain_after(
                         |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
                         |row| row.page_id,
@@ -1712,7 +1757,11 @@ impl DirectProjection {
                 .ok()??;
             paths.insert(PathBuf::from(page.path));
         }
-        self.ready_at(cache_generation).then_some(paths)
+        self.ready_at(cache_generation)
+            .then_some(ReferenceCandidateIndex {
+                paths,
+                blocks: blocks_are_complete.then_some(blocks),
+            })
     }
 
     /// Outer `None` means projection unavailable/stale and requires parser

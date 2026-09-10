@@ -312,6 +312,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Linked References looks only at the blocks that link to the page.** The
+  index has always known which blocks refer to a page, but the panel asked it
+  only which PAGES did, and then re-examined every block on each of them. On a
+  1,045-page graph the busiest page narrowed to 184 pages holding 3,434 blocks,
+  of which 412 actually referred to it. The panel now asks for the blocks, so it
+  examines about one block for every ten it examined before. The rows, their
+  order, their breadcrumbs and their highlighted matches are unchanged, and a
+  page the index cannot narrow is still read the old way rather than answered
+  wrongly. Unlinked References is unaffected: its index narrows to pages.
+
 - **Opening a page no longer reads the whole graph while the index is catching
   up.** Linked and Unlinked References used to answer a question the index was
   still preparing by parsing every page in the graph instead. Right after a

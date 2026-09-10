@@ -3739,6 +3739,11 @@ enum DirectCreationEvidence {
 
 pub(crate) struct ReferenceCandidatePages {
     pub pages: Vec<(PageEntry, Arc<Document>)>,
+    /// The referring blocks, when the index named them. `None` means "classify
+    /// every block of every candidate page", which is what every caller did
+    /// before this field existed, so the walk is the behaviour a partial or
+    /// absent index falls back to rather than a lossy shortcut.
+    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub indexed: bool,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -7348,7 +7353,10 @@ impl Graph {
         &self,
         names_norm: &[String],
         kind: ReferenceKind,
-    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+    ) -> Option<(
+        Vec<(PageEntry, Arc<Document>)>,
+        Option<std::collections::HashSet<[u8; 16]>>,
+    )> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let projection = self
             .direct_projection
@@ -7359,8 +7367,9 @@ impl Graph {
         if !projection.wait_for_reference_generation(generation) {
             return None;
         }
-        let paths = projection.reference_candidate_paths(generation, names_norm, kind)?;
-        self.direct_projection_pages_for_paths(generation, paths)
+        let candidates = projection.reference_candidates(generation, names_norm, kind)?;
+        let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
+        Some((pages, candidates.blocks))
     }
 
     fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
@@ -15360,12 +15369,15 @@ impl Graph {
         names_norm: &[String],
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        if let Some(pages) = self.direct_projection_reference_candidate_pages(names_norm, kind) {
+        if let Some((pages, blocks)) =
+            self.direct_projection_reference_candidate_pages(names_norm, kind)
+        {
             // R6: the inventory is the projection's (memoized), never a reason
             // to build the whole parsed graph.
             let full_page_count = self.list_pages().len();
             return ReferenceCandidatePages {
                 pages,
+                blocks,
                 indexed: true,
                 full_page_count,
             };
@@ -15374,6 +15386,7 @@ impl Graph {
         ReferenceCandidatePages {
             full_page_count: pages.len(),
             pages,
+            blocks: None,
             indexed: false,
         }
     }
@@ -15407,10 +15420,13 @@ impl Graph {
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
-        if let Some(pages) = self.direct_projection_reference_candidate_pages(names_norm, kind) {
+        if let Some((pages, blocks)) =
+            self.direct_projection_reference_candidate_pages(names_norm, kind)
+        {
             let full_page_count = self.list_pages().len();
             return Ok(ReferenceCandidatePages {
                 pages,
+                blocks,
                 indexed: true,
                 full_page_count,
             });

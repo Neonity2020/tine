@@ -42,7 +42,7 @@ use crate::query::sql::{
     lower_query, ContentPlan, LoweringInputs, QueryRegexProgram, ResultSetRule, SqlQuery,
     RESULT_SET_RULE,
 };
-use crate::query::QueryDialect;
+use crate::query::{QueryDialect, ReferenceKind};
 
 /// The Direct Files projection worker is a process-wide singleton per graph and
 /// the tests below each start one; serialize them as the neighbouring
@@ -2817,4 +2817,258 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
     for row in &page_rows {
         assert_eq!(row.len(), 4, "the page row shape is unchanged: {row:?}");
     }
+}
+
+/// **The measurement that chooses item 1's design** (packet
+/// `2026-09-10-references-on-sqlite-packet.md`). Lowering the reference panels
+/// onto SQL has two possible shapes, and the difference between them is not an
+/// argument, it is a ratio on Martin's own graph:
+///
+/// * **Page-level.** Keep today's candidate set (SQL narrows to PAGES) and read
+///   every block of every candidate page from SQL instead of parsing the file.
+///   This removes the file parse but still runs the per-block lsdoc projection
+///   over EVERY block of every candidate page, because that is what decides
+///   membership.
+/// * **Block-level.** `page_referrer_candidates_after` already returns
+///   `(source_page_id, source_entity)`; today's caller throws the entity away.
+///   Narrowing to the referring BLOCKS makes the per-block parse run only on
+///   blocks that actually reference the target.
+///
+/// The deciding number is `blocks_in_candidate_pages / referring_blocks`. If it
+/// is close to 1 the page-level shape is enough; if it is large, page-level
+/// lowering leaves the dominant cost in place. Only counts and elapsed times
+/// are printed — never a page name, a target name or any block text.
+#[test]
+#[ignore = "measurement receipt over a real corpus: set TINE_QUERY_IDENTITY_GRAPH"]
+fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
+    let _serial = serialize();
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH to a corpus directory");
+        return;
+    };
+    let corpus = Corpus::open(PathBuf::from(&root), false);
+    let mut snapshot = corpus.snapshot();
+
+    let total_pages = corpus.graph.list_pages().len();
+    let total_blocks = snapshot
+        .run_projection_query("SELECT COUNT(*) FROM blocks", &[])
+        .expect("blocks counted")
+        .first()
+        .and_then(|row| match row.first() {
+            Some(PhysicalQueryValue::Integer(value)) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(-1);
+    eprintln!("reference_narrowing corpus=real pages={total_pages} blocks={total_blocks}");
+
+    // The busiest explicit targets, ranked by how many pages refer to them.
+    // The NAME is read only to run the panel query; it is never printed.
+    let ranked = snapshot
+        .run_projection_query(
+            "SELECT normalized_name, COUNT(DISTINCT source_page_id) AS pages
+             FROM reference_postings
+             WHERE target_type = 0 AND reference_kind <= 4
+             GROUP BY normalized_name
+             ORDER BY pages DESC, normalized_name
+             LIMIT 8",
+            &[],
+        )
+        .expect("the ranking runs");
+
+    for (rank, row) in ranked.iter().enumerate() {
+        let Some(PhysicalQueryValue::Text(name)) = row.first() else {
+            continue;
+        };
+        let candidate_pages = match row.get(1) {
+            Some(PhysicalQueryValue::Integer(value)) => *value,
+            _ => -1,
+        };
+        let referring_blocks = snapshot
+            .run_projection_query(
+                "SELECT COUNT(DISTINCT source_entity_id) FROM reference_postings
+                 WHERE target_type = 0 AND reference_kind <= 4
+                   AND normalized_name = ?1 AND source_entity_type = 1",
+                &[PhysicalQueryValue::Text(name.clone())],
+            )
+            .expect("the block count runs")
+            .first()
+            .and_then(|row| match row.first() {
+                Some(PhysicalQueryValue::Integer(value)) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(-1);
+        let blocks_in_candidates = snapshot
+            .run_projection_query(
+                "SELECT COUNT(*) FROM blocks WHERE page_id IN (
+                     SELECT DISTINCT source_page_id FROM reference_postings
+                     WHERE target_type = 0 AND reference_kind <= 4
+                       AND normalized_name = ?1)",
+                &[PhysicalQueryValue::Text(name.clone())],
+            )
+            .expect("the candidate block count runs")
+            .first()
+            .and_then(|row| match row.first() {
+                Some(PhysicalQueryValue::Integer(value)) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or(-1);
+
+        let started = Instant::now();
+        let linked = crate::query::backlinks_bounded(&corpus.graph, name, 500, 4 * 1024 * 1024);
+        let linked_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let unlinked =
+            crate::query::unlinked_refs_bounded(&corpus.graph, name, 500, 4 * 1024 * 1024);
+        let unlinked_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let linked_rows: usize = linked.groups.iter().map(|group| group.blocks.len()).sum();
+        let unlinked_rows: usize = unlinked.groups.iter().map(|group| group.blocks.len()).sum();
+        let ratio = if referring_blocks > 0 {
+            blocks_in_candidates as f64 / referring_blocks as f64
+        } else {
+            f64::NAN
+        };
+        eprintln!(
+            "reference_narrowing rank={rank} candidate_pages={candidate_pages} \
+             blocks_in_candidate_pages={blocks_in_candidates} referring_blocks={referring_blocks} \
+             ratio={ratio:.1} linked_rows={linked_rows} linked_ms={linked_ms:.1} \
+             unlinked_rows={unlinked_rows} unlinked_ms={unlinked_ms:.1}"
+        );
+    }
+}
+
+/// **The block-narrowing oracle.** `page_referrer_candidates_after` returns
+/// `(source_page_id, source_entity)`; the reference read now keeps the entity
+/// and skips blocks the index did not name, instead of forcing every block of
+/// every candidate page through lsdoc to ask whether it matches.
+///
+/// The walk stays the authority, so the filter is correct exactly when removing
+/// it changes nothing. This runs both reference kinds over every page of the
+/// corpus and compares the two answers row for row, evidence included. It also
+/// requires that narrowing actually applied somewhere, so a corpus where the
+/// index never named a block cannot pass the gate by doing nothing.
+/// `narrowed_classifications` / `walked_classifications` count EXPLICIT targets
+/// only. Plain (unlinked) references are narrowed to pages by FTS and not to
+/// blocks — `plain_text_candidate_pages_after` projects the owning page and not
+/// the owning entity — so folding them in would dilute the one number this
+/// change is supposed to move.
+struct NarrowingComparison {
+    differences: Vec<String>,
+    narrowed_targets: usize,
+    narrowed_classifications: usize,
+    walked_classifications: usize,
+}
+
+fn compare_narrowed_against_walked(corpus: &Corpus) -> NarrowingComparison {
+    let mut differences = Vec::new();
+    let mut narrowed_targets = 0_usize;
+    let mut narrowed_classifications = 0_usize;
+    let mut walked_classifications = 0_usize;
+    for entry in corpus.graph.list_pages() {
+        for kind in [ReferenceKind::Explicit, ReferenceKind::Plain] {
+            let (narrowed, walked, receipt) =
+                crate::query::reference_occurrences_narrowed_and_walked(
+                    &corpus.graph,
+                    &entry.name,
+                    kind,
+                    5_000,
+                    32 * 1024 * 1024,
+                );
+            if kind == ReferenceKind::Explicit {
+                narrowed_classifications += receipt.narrowed_classifications;
+                walked_classifications += receipt.walked_classifications;
+            }
+            if receipt.applied {
+                narrowed_targets += 1;
+            }
+            let narrowed_json = serde_json::to_string(&narrowed.groups).expect("groups serialize");
+            let walked_json = serde_json::to_string(&walked.groups).expect("groups serialize");
+            if narrowed_json != walked_json
+                || narrowed.total != walked.total
+                || narrowed.exceeded != walked.exceeded
+            {
+                // Page names and block text never reach this message: only the
+                // page's ordinal in `list_pages`, the kind, and the row counts.
+                differences.push(format!(
+                    "target#{} kind={kind:?}: narrowed {} rows in {} groups (total {}, exceeded {}), \
+                     walked {} rows in {} groups (total {}, exceeded {})",
+                    narrowed_targets,
+                    narrowed.groups.iter().map(|g| g.blocks.len()).sum::<usize>(),
+                    narrowed.groups.len(),
+                    narrowed.total,
+                    narrowed.exceeded,
+                    walked.groups.iter().map(|g| g.blocks.len()).sum::<usize>(),
+                    walked.groups.len(),
+                    walked.total,
+                    walked.exceeded,
+                ));
+            }
+        }
+    }
+    NarrowingComparison {
+        differences,
+        narrowed_targets,
+        narrowed_classifications,
+        walked_classifications,
+    }
+}
+
+#[test]
+fn block_narrowing_answers_exactly_what_the_walk_answers() {
+    let _serial = serialize();
+    let root = scratch("block-narrowing");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let comparison = compare_narrowed_against_walked(&corpus);
+    assert!(
+        comparison.differences.is_empty(),
+        "block narrowing loses or invents reference rows:\n{}",
+        comparison.differences.join("\n")
+    );
+    assert!(
+        comparison.narrowed_targets > 0,
+        "the index named no candidate blocks on this corpus, so the gate proved nothing"
+    );
+    assert!(
+        comparison.narrowed_classifications < comparison.walked_classifications,
+        "narrowing classified {} blocks and the walk classified {}: the filter is inert",
+        comparison.narrowed_classifications,
+        comparison.walked_classifications
+    );
+}
+
+/// The same oracle over the anonymized graph (AGENTS §4 tier 2). A disagreement
+/// here is a CORPUS DEFECT in the fixture above: extract the minimal shape,
+/// never weaken the gate.
+#[test]
+#[ignore = "acceptance gate over a real corpus: set TINE_QUERY_IDENTITY_GRAPH"]
+fn block_narrowing_answers_exactly_what_the_walk_answers_on_a_real_corpus() {
+    let _serial = serialize();
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH to a corpus directory");
+        return;
+    };
+    let corpus = Corpus::open(PathBuf::from(&root), false);
+    let comparison = compare_narrowed_against_walked(&corpus);
+    eprintln!(
+        "block_narrowing corpus=real narrowed_targets={} classified_narrowed={} classified_walked={}",
+        comparison.narrowed_targets,
+        comparison.narrowed_classifications,
+        comparison.walked_classifications
+    );
+    assert!(
+        comparison.differences.is_empty(),
+        "block narrowing loses or invents reference rows:\n{}",
+        comparison.differences.join("\n")
+    );
+    assert!(
+        comparison.narrowed_targets > 0,
+        "the index named no candidate blocks"
+    );
+    assert!(
+        comparison.narrowed_classifications < comparison.walked_classifications,
+        "narrowing classified {} blocks and the walk classified {}: the filter is inert",
+        comparison.narrowed_classifications,
+        comparison.walked_classifications
+    );
 }
