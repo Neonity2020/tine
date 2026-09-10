@@ -1161,6 +1161,23 @@ impl SemanticEffect {
                     return Err(SemanticError::InvalidLogseqIdentityState);
                 }
             }
+            if let (Some(before), None) = (&delta.before, &delta.after) {
+                let BlockOwner::Page(page_id) = before.owner else {
+                    return Err(SemanticError::InvalidBlockDeletion);
+                };
+                let removes_membership = self.memberships.iter().any(|membership| {
+                    membership.page_id == page_id
+                        && membership.block_id == delta.block_id
+                        && membership.after.is_none()
+                        && membership
+                            .before
+                            .as_ref()
+                            .is_some_and(|claim| claim.home_document_id == delta.home_document_id)
+                });
+                if !removes_membership {
+                    return Err(SemanticError::InvalidBlockDeletion);
+                }
+            }
         }
         for delta in &self.memberships {
             if delta.before == delta.after {
@@ -1218,6 +1235,7 @@ pub enum SemanticError {
     UnchangedDelta,
     InvalidPageLifecycle,
     InvalidBlockBirth,
+    InvalidBlockDeletion,
     InvalidBlockReconstruction,
     HomeShardChanged,
 }
@@ -1253,6 +1271,9 @@ impl fmt::Display for SemanticError {
             ),
             Self::InvalidBlockBirth => f.write_str(
                 "block birth provenance must appear exactly on a None-to-Some block transition",
+            ),
+            Self::InvalidBlockDeletion => f.write_str(
+                "physical block deletion must remove its matching live membership",
             ),
             Self::InvalidBlockReconstruction => f.write_str(
                 "block reconstruction provenance must appear exactly on a non-birth None-to-Some transition",

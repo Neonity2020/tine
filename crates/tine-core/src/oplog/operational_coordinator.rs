@@ -3243,7 +3243,21 @@ mod tests {
         // an ACCEPTED-STATE question, so the ordinary lane has to have actually
         // authored something before "an import may not advance it" can mean
         // anything; an unused lane is unowned and refuses nobody.
-        expect_clean_local_complete(fixture.local_edit("- local lane owner edit\n").unwrap());
+        let live_block = fixture
+            .engine()
+            .materialize_page(fixture.page_id)
+            .unwrap()
+            .blocks[0]
+            .clone();
+        let live_edit = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: live_block.block_id,
+                home_document_id: live_block.home_document_id,
+            },
+            content: "local lane owner edit".into(),
+        }])
+        .unwrap();
+        expect_clean_local_complete(fixture.execute_local(&live_edit).unwrap());
         assert_eq!(
             fixture
                 .engine()

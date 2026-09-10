@@ -18168,6 +18168,16 @@ impl ShardedHotEngine {
             let raw = read_block_state(block.home_document_id, home, block.block_id)?;
             let desired_claim =
                 MembershipClaim::new(block.home_document_id, block.parent, block.order.clone())?;
+            // A concurrent move out of the deleted page can already have
+            // settled by the time the user restores the page. The deletion
+            // before-image still names that block, but page revival restores
+            // absence on this page; it must not turn an already-live block on
+            // another page into a reconstruction back to the old owner.
+            if raw.as_ref().is_some_and(
+                |state| matches!(state.owner, BlockOwner::Page(owner) if owner != page_id),
+            ) {
+                continue;
+            }
             if raw
                 .as_ref()
                 .is_none_or(|raw| raw.owner != BlockOwner::Page(page_id))
@@ -19328,8 +19338,23 @@ impl ShardedHotEngine {
                     // A concurrent move can win the owner register while a
                     // physical deletion wins the content-map key. This
                     // unauthored intermediate is invisible until the
-                    // deterministic conflict actor reconstructs it.
-                    continue;
+                    // deterministic conflict actor reconstructs it. The
+                    // disposable conflict index is advanced with every
+                    // accepted batch, so this is an in-memory lookup rather
+                    // than a per-block archive read. A dangling membership
+                    // without an unresolved accepted pair is malformed
+                    // imported input or damaged private state
+                    // (`MS-REF-MALFORMED-IMPORT` / `MS-REF-DISK-CORRUPT`).
+                    let conflict_index = self.conflict_history_index.borrow();
+                    if conflict_index.is_current(self.next_acceptance_sequence)
+                        && conflict_index.block_has_unresolved_pair(*block_id)
+                    {
+                        continue;
+                    }
+                    return Err(EngineError::MalformedDocument {
+                        document_id: *home_document_id,
+                        reason: format!("membership references missing block {block_id}"),
+                    });
                 }
                 let Some(state) = read_block_state(*home_document_id, home, *block_id)? else {
                     return Err(EngineError::MalformedDocument {
@@ -21316,14 +21341,31 @@ impl ShardedHotEngine {
         if let Some(batch) = self.archive.get(&batch_id) {
             return self.accepted_semantic_effect(batch);
         }
-        let store = self
-            .archive_store
-            .as_ref()
-            .ok_or(EngineError::MissingDependency(batch_id))?;
+        let store = self.archive_store.as_ref().ok_or_else(|| {
+            if accepted {
+                EngineError::Archive(format!(
+                    "accepted reconstruction source batch {batch_id} has no attached archive"
+                ))
+            } else {
+                EngineError::MissingDependency(batch_id)
+            }
+        })?;
         let manifest = store
             .resolve_logical_manifest(batch_id)
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .ok_or(EngineError::MissingDependency(batch_id))?;
+            .map_err(|error| {
+                EngineError::Archive(format!(
+                    "reconstruction source batch {batch_id} manifest lookup failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                if accepted {
+                    EngineError::Archive(format!(
+                        "accepted reconstruction source batch {batch_id} manifest is missing"
+                    ))
+                } else {
+                    EngineError::MissingDependency(batch_id)
+                }
+            })?;
         let descriptors = manifest
             .required_objects()
             .iter()
@@ -21336,7 +21378,12 @@ impl ShardedHotEngine {
         };
         let object = store
             .resolve_logical_object(descriptor.content_digest())
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+            .map_err(|error| {
+                EngineError::Archive(format!(
+                    "reconstruction source semantic object {} for batch {batch_id} failed: {error}",
+                    descriptor.content_digest()
+                ))
+            })?;
         if object
             .descriptor()
             .map_err(|error| EngineError::Archive(error.to_string()))?
@@ -21670,8 +21717,20 @@ impl ShardedHotEngine {
             let mut next = Vec::new();
             for batch_id in &frontier {
                 budget = budget.saturating_sub(1);
-                let Ok(effect) = self.authoritative_semantic_effect_by_id(*batch_id) else {
-                    continue;
+                let effect = match self.authoritative_semantic_effect_by_id(*batch_id) {
+                    Ok(effect) => effect,
+                    Err(EngineError::MissingDependency(missing))
+                        if self.local_overlay.entry_by_batch.contains_key(&missing) =>
+                    {
+                        // The local journal commit is authoritative, but its
+                        // immutable manifest/object publication has not
+                        // drained yet (`MS-REF-CRASH-TRUNCATED`). Preserve the
+                        // exact batch identity so the application can keep
+                        // Restore retryable instead of calling it unknown.
+                        return Err(EngineError::MissingDependency(missing));
+                    }
+                    Err(EngineError::MissingDependency(_)) => continue,
+                    Err(error) => return Err(error),
                 };
                 for head in self.authoritative_document_dependency_heads(*batch_id, page_home) {
                     if visited.insert(head) {
@@ -32558,6 +32617,15 @@ pub(crate) mod validation_tests {
                         order: "a".into(),
                         content: "stable root text".into(),
                     },
+                    SemanticOperation::MutateBlockLogseqIdentity {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id: page_home,
+                        },
+                        mutation: LogseqIdentityMutation::AssignExternal {
+                            logseq_uuid: LogseqUuid::from_uuid(Uuid::from_u128(114_205)),
+                        },
+                    },
                 ])
                 .unwrap(),
             )
@@ -32603,12 +32671,15 @@ pub(crate) mod validation_tests {
         assert_eq!(shard_page_id(&deleted).unwrap(), Some(page_id));
         assert_eq!(
             engine.recover_block_state(page_home, block_id).unwrap(),
-            Some(BlockState {
-                owner: BlockOwner::Tombstone,
-                ..born_state.clone()
-            })
+            None
         );
-        assert_eq!(block_text(&deleted, block_id).unwrap().id(), born_text);
+        assert_eq!(
+            engine
+                .block_live_keys_for_test(page_home, block_id)
+                .unwrap(),
+            (false, false, false, false)
+        );
+        assert!(block_text(&deleted, block_id).is_none());
 
         let restoration = engine
             .prepare_fixture_transaction(
@@ -32641,7 +32712,8 @@ pub(crate) mod validation_tests {
             engine.recover_block_state(page_home, block_id).unwrap(),
             Some(born_state.clone())
         );
-        assert_eq!(block_text(&restored, block_id).unwrap().id(), born_text);
+        let restored_text = block_text(&restored, block_id).unwrap().id();
+        assert_ne!(restored_text, born_text);
 
         let mut replay = ShardedHotEngine::new(
             workspace,
@@ -32660,7 +32732,7 @@ pub(crate) mod validation_tests {
             replay.recover_block_state(page_home, block_id).unwrap(),
             Some(born_state)
         );
-        assert_eq!(block_text(&replayed, block_id).unwrap().id(), born_text);
+        assert_eq!(block_text(&replayed, block_id).unwrap().id(), restored_text);
     }
 
     #[test]
@@ -33069,7 +33141,7 @@ pub(crate) mod validation_tests {
     }
 
     #[test]
-    fn raw_block_removal_rejects_before_merge_in_both_delivery_orders() {
+    fn proved_physical_removal_converges_and_unproved_removal_rejects_atomically() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(301));
         let catalog_id = DocumentId::from_uuid(Uuid::from_u128(302));
         let home_id = DocumentId::from_uuid(Uuid::from_u128(320));
@@ -33169,6 +33241,39 @@ pub(crate) mod validation_tests {
             removed_effect,
         );
 
+        let unproved_before = engine.clone_visible_document(home_id, 403).unwrap();
+        let unproved_after = clone_doc(&unproved_before, 403).unwrap();
+        unproved_after
+            .get_map(SHARD_OWNERS)
+            .delete(&block_id.to_string())
+            .unwrap();
+        unproved_after
+            .get_map(SHARD_CONTENT)
+            .delete(&block_id.to_string())
+            .unwrap();
+        let unproved_state = read_block_state(home_id, &unproved_before, block_id)
+            .unwrap()
+            .unwrap();
+        let unproved = validated_transition_with_payload(
+            &engine,
+            test_author(403, 403),
+            &BTreeMap::from([(home_id, unproved_before)]),
+            &BTreeMap::from([(home_id, unproved_after)]),
+            FrontierV2::new(vec![dependencies_for(&engine, home_id, 403)]).unwrap(),
+            raw_semantic_effect(
+                Vec::new(),
+                vec![BlockDelta {
+                    block_id,
+                    home_document_id: home_id,
+                    birth: None,
+                    reconstruction: None,
+                    before: Some(unproved_state),
+                    after: None,
+                }],
+                Vec::new(),
+            ),
+        );
+
         let edited_before = engine.clone_visible_document(home_id, 402).unwrap();
         let edited_after = clone_doc(&edited_before, 402).unwrap();
         edited_after
@@ -33189,8 +33294,6 @@ pub(crate) mod validation_tests {
             frontier,
         );
 
-        let mut expected_accepted = None;
-        let mut expected_rejected = None;
         let mut expected_snapshot = None;
         for removal_first in [true, false] {
             let mut receiver =
@@ -33204,43 +33307,78 @@ pub(crate) mod validation_tests {
             } else {
                 [edited.clone(), removed.clone()]
             };
-            let mut rejected = Vec::new();
             for batch in ordered {
-                let batch_id = batch.manifest().batch_id();
-                if matches!(
-                    receiver.stage_ready(batch).disposition(),
-                    BatchDisposition::Rejected { .. }
-                ) {
-                    rejected.push(batch_id);
-                }
+                let outcome = receiver.stage_ready(batch);
+                assert!(
+                    matches!(outcome.disposition(), BatchDisposition::Accepted { .. }),
+                    "effect-proved removal or concurrent edit was refused: {outcome:?}"
+                );
             }
-            let accepted = receiver.status().accepted_batch_ids().unwrap();
             let snapshot = receiver.canonical_snapshot().unwrap();
-            assert_eq!(
-                receiver.materialize_page(page_id).unwrap().blocks[0].content,
-                "concurrent replacement"
-            );
-            if let Some(expected) = &expected_accepted {
-                assert_eq!(&accepted, expected);
-                assert_eq!(&rejected, expected_rejected.as_ref().unwrap());
-                assert_eq!(&snapshot, expected_snapshot.as_ref().unwrap());
+            if let Some(expected) = &expected_snapshot {
+                assert_eq!(&snapshot, expected);
             } else {
-                expected_accepted = Some(accepted);
-                expected_rejected = Some(rejected);
                 expected_snapshot = Some(snapshot);
             }
         }
-        assert_eq!(
-            expected_accepted.unwrap(),
-            vec![
-                BatchId::from_uuid(Uuid::from_u128(400)),
-                BatchId::from_uuid(Uuid::from_u128(402)),
-            ]
-        );
-        assert_eq!(
-            expected_rejected.unwrap(),
-            vec![BatchId::from_uuid(Uuid::from_u128(401))]
-        );
+
+        for unproved_first in [true, false] {
+            let mut receiver =
+                ShardedHotEngine::new(workspace, LineageDigest::of(b"merged-residue"), catalog_id);
+            assert!(matches!(
+                receiver.stage_ready(genesis.clone()).disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+            let before = receiver.canonical_snapshot().unwrap();
+            let ordered = if unproved_first {
+                [unproved.clone(), edited.clone()]
+            } else {
+                [edited.clone(), unproved.clone()]
+            };
+            let mut rejected = false;
+            for batch in ordered {
+                let is_unproved = batch.manifest().batch_id() == unproved.manifest().batch_id();
+                let outcome = receiver.stage_ready(batch);
+                if is_unproved {
+                    assert!(
+                        matches!(outcome.disposition(), BatchDisposition::Rejected { .. }),
+                        "unproved removal with dangling membership was admitted: {outcome:?}"
+                    );
+                    rejected = true;
+                } else {
+                    assert!(matches!(
+                        outcome.disposition(),
+                        BatchDisposition::Accepted { .. }
+                    ));
+                }
+            }
+            assert!(rejected);
+            let page = receiver.materialize_page(page_id).unwrap();
+            assert_eq!(page.blocks.len(), 1);
+            assert_eq!(page.blocks[0].content, "concurrent replacement");
+            if unproved_first {
+                assert_eq!(
+                    before.blocks.len(),
+                    1,
+                    "rejection must preserve the live block"
+                );
+            }
+        }
+
+        let damaged = engine.visible_documents.get(&home_id).unwrap();
+        damaged
+            .get_map(SHARD_OWNERS)
+            .delete(&block_id.to_string())
+            .unwrap();
+        damaged
+            .get_map(SHARD_CONTENT)
+            .delete(&block_id.to_string())
+            .unwrap();
+        assert!(matches!(
+            engine.materialize_page(page_id),
+            Err(EngineError::MalformedDocument { document_id, reason })
+                if document_id == home_id && reason.contains("membership references missing block")
+        ));
     }
 
     #[test]
@@ -33521,13 +33659,20 @@ pub(crate) mod validation_tests {
             .unwrap(),
             relocation_effect,
         );
-        assert!(matches!(
-            relocation_engine.stage_ready(relocation).disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::Semantic(_),
-                ..
-            }
-        ));
+        let relocation_disposition = relocation_engine
+            .stage_ready(relocation)
+            .disposition()
+            .clone();
+        assert!(
+            matches!(
+                &relocation_disposition,
+                BatchDisposition::Rejected {
+                    error: EngineError::BlockAlreadyExists(found),
+                    ..
+                } if *found == block_id
+            ),
+            "relocation disposition: {relocation_disposition:?}"
+        );
         assert_eq!(
             relocation_engine.materialize_page(page_a).unwrap().blocks[0].content,
             "immutable home A"

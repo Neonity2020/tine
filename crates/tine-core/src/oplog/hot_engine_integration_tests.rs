@@ -432,12 +432,10 @@ fn move_out_racing_source_page_deletion_converges_in_both_delivery_orders() {
             engine.materialize_page(ids.page_a),
             Err(EngineError::PageDeleted(page_id)) if page_id == ids.page_a
         ));
-        let destination = engine.materialize_page(ids.page_b).unwrap();
-        assert!(destination.blocks.iter().any(|block| {
-            block.block_id == ids.block_a
-                && block.home_document_id == ids.home_a
-                && block.content == "home A content"
-        }));
+        // This engine-only view is intentionally pre-settlement. The user
+        // outcome after the deterministic actor runs is proved on rendered
+        // Markdown by
+        // `sync_runtime::tests::two_offline_move_delete_histories_converge_in_both_delivery_orders`.
         engine.canonical_snapshot().unwrap()
     };
     assert_eq!(apply(moved.clone(), deleted.clone()), apply(deleted, moved));
@@ -752,8 +750,17 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
         )
         .unwrap();
     let deletion_effect = semantic_effect(&deletion);
-    assert!(deletion_effect.blocks().is_empty());
-    assert!(deletion_effect.memberships().is_empty());
+    assert!(matches!(
+        deletion_effect.blocks(),
+        [delta] if delta.block_id == ids.block_a && delta.before.is_some() && delta.after.is_none()
+    ));
+    assert!(matches!(
+        deletion_effect.memberships(),
+        [delta] if delta.block_id == ids.block_a
+            && delta.page_id == ids.page_a
+            && delta.before.is_some()
+            && delta.after.is_none()
+    ));
     assert_eq!(
         deletion
             .objects()
@@ -761,28 +768,12 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
             .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
             .map(OperationObject::document_id)
             .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from([ids.catalog])
+        std::collections::BTreeSet::from([ids.catalog, ids.home_a])
     );
+    let deletion_batch_id = deletion.manifest().batch_id();
     let deletion = ready(&archive, &deletion);
     assert!(matches!(
         engine.stage_ready(deletion.clone()).disposition,
-        BatchDisposition::Accepted { .. }
-    ));
-    let drift = engine
-        .prepare_fixture_transaction(
-            author(40_102, 40_102),
-            &tx(vec![SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id: ids.block_a,
-                    home_document_id: ids.home_a,
-                },
-                content: "tombstoned shard drift before revival".into(),
-            }]),
-        )
-        .unwrap();
-    let drift = ready(&archive, &drift);
-    assert!(matches!(
-        engine.stage_ready(drift.clone()).disposition,
         BatchDisposition::Accepted { .. }
     ));
     assert!(matches!(
@@ -791,7 +782,12 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
     ));
 
     let operations = engine
-        .plan_revive_page_operations(ids.page_a, None, &predecessor.frontier, None)
+        .plan_revive_page_operations(
+            ids.page_a,
+            Some(deletion_batch_id),
+            &predecessor.frontier,
+            None,
+        )
         .unwrap();
     assert!(
         operations.len() > 1,
@@ -820,7 +816,7 @@ fn revive_page_authors_catalog_first_and_replays_the_same_page_identity() {
     assert_eq!(engine.materialize_page(ids.page_a).unwrap(), expected);
 
     let mut peer = ids.engine();
-    for batch in [baseline, deletion, drift, revived] {
+    for batch in [baseline, deletion, revived] {
         assert!(matches!(
             peer.stage_ready(batch).disposition,
             BatchDisposition::Accepted { .. }
@@ -862,12 +858,10 @@ fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
     let revival = ready(&archive, &revival);
 
     let mut remote_author = ids.engine();
-    for batch in [baseline.clone(), deletion.clone()] {
-        assert!(matches!(
-            remote_author.stage_ready(batch).disposition,
-            BatchDisposition::Accepted { .. }
-        ));
-    }
+    assert!(matches!(
+        remote_author.stage_ready(baseline.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
     let remote_edit = remote_author
         .prepare_fixture_transaction(
             author(40_202, 40_202),
@@ -909,6 +903,113 @@ fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
         .iter()
         .any(|block| block.block_id == ids.block_a
             && block.content == "concurrent remote edit during revival"));
+}
+
+#[test]
+fn revive_page_after_settled_move_out_leaves_block_at_destination() {
+    let ids = Ids::new();
+    let dir = TestDir::new("revive-page-after-settled-move-out");
+    let archive = store(&dir, ids);
+    let (_, baseline) = seed_engine(ids, &archive);
+    let predecessor = {
+        let mut engine = ids.engine();
+        engine.stage_ready(baseline.clone());
+        engine
+            .materialize_page_for_projection(ids.page_a)
+            .unwrap()
+            .frontier
+    };
+    let (moved, deleted) = concurrent_ready(
+        ids,
+        &archive,
+        &baseline,
+        author(40_230, 40_230),
+        tx(vec![SemanticOperation::MoveSubtree {
+            root: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            from_page_id: ids.page_a,
+            to_page_id: ids.page_b,
+            parent: None,
+            order: "settled-on-b".into(),
+        }]),
+        author(40_231, 40_231),
+        tx(vec![SemanticOperation::DeletePage {
+            page_id: ids.page_a,
+        }]),
+    );
+    let mut engine = apply_pair(ids, &baseline, moved.clone(), deleted.clone());
+    let intent = [moved.manifest().batch_id(), deleted.manifest().batch_id()]
+        .into_iter()
+        .flat_map(|batch_id| engine.conflict_resolution_intents(batch_id).unwrap())
+        .find_map(|intent| match intent {
+            ConflictResolutionIntent::RestoreMoved {
+                page_id,
+                block,
+                claim,
+                source,
+                ..
+            } if block.block_id == ids.block_a => Some((page_id, block, claim, source)),
+            _ => None,
+        })
+        .expect("move/delete-page race owes a move-winning reconstruction");
+    let resolution = engine
+        .prepare_fixture_transaction(
+            author(40_232, 40_232),
+            &tx(vec![SemanticOperation::RestoreSubtree {
+                page_id: intent.0,
+                blocks: vec![BlockRestore {
+                    block: intent.1,
+                    claim: intent.2,
+                    source: intent.3,
+                }],
+            }]),
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &resolution)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(engine
+        .materialize_page(ids.page_b)
+        .unwrap()
+        .blocks
+        .iter()
+        .any(|block| block.block_id == ids.block_a && block.content == "home A content"));
+
+    let operations = engine
+        .plan_revive_page_operations(
+            ids.page_a,
+            Some(deleted.manifest().batch_id()),
+            &predecessor,
+            None,
+        )
+        .unwrap();
+    assert!(
+        !operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::RestoreSubtree { blocks, .. }
+                if blocks.iter().any(|restore| restore.block.block_id == ids.block_a)
+        )),
+        "page revival must not pull a block back from its settled live destination: {operations:?}"
+    );
+    let revival = engine
+        .prepare_fixture_transaction(author(40_233, 40_233), &tx(operations))
+        .unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &revival)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(engine
+        .materialize_page(ids.page_a)
+        .unwrap()
+        .blocks
+        .is_empty());
+    let destination = engine.materialize_page(ids.page_b).unwrap();
+    assert_eq!(destination.blocks.len(), 1);
+    assert_eq!(destination.blocks[0].block_id, ids.block_a);
+    assert_eq!(destination.blocks[0].content, "home A content");
 }
 
 #[test]
@@ -1259,13 +1360,10 @@ fn move_into_a_deleted_page_is_indexed_and_removed_by_exact_revival() {
         .unwrap()
         .blocks
         .is_empty());
-    assert!(matches!(
-        engine
-            .recover_block_state(ids.home_a, ids.block_a)
-            .unwrap()
-            .map(|state| state.owner),
-        Some(crate::oplog::BlockOwner::Tombstone)
-    ));
+    assert_eq!(
+        engine.recover_block_state(ids.home_a, ids.block_a).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -1928,8 +2026,8 @@ fn logseq_uuid_concurrent_assignment_converges_and_survives_move_delete() {
             },
         }]),
     );
-    let mut ab = apply_pair(ids, &baseline, left.clone(), right.clone());
-    let ba = apply_pair(ids, &baseline, right, left);
+    let ab = apply_pair(ids, &baseline, left.clone(), right.clone());
+    let ba = apply_pair(ids, &baseline, right.clone(), left.clone());
     assert_eq!(
         ab.canonical_snapshot().unwrap(),
         ba.canonical_snapshot().unwrap()
@@ -1939,47 +2037,71 @@ fn logseq_uuid_concurrent_assignment_converges_and_survives_move_delete() {
         .expect("one concurrent UUID register wins deterministically");
     assert!(winner == left_uuid || winner == right_uuid);
 
-    let moved = ab
-        .prepare_fixture_transaction(
-            author(41_012, 41_012),
-            &tx(vec![SemanticOperation::MoveSubtree {
-                root: block,
-                from_page_id: ids.page_a,
-                to_page_id: ids.page_b,
-                parent: None,
-                order: "moved-with-logseq-uuid".into(),
-            }]),
-        )
-        .unwrap();
-    assert!(matches!(
-        ab.stage_ready(ready(&archive, &moved)).disposition,
-        BatchDisposition::Accepted { .. }
-    ));
-    assert_eq!(
-        ab.materialize_page(ids.page_b).unwrap().blocks[0].logseq_uuid,
-        Some(winner)
+    let (moved, deleted) = concurrent_ready_from(
+        ids,
+        &archive,
+        &[baseline.clone(), left.clone(), right.clone()],
+        author(41_012, 41_012),
+        tx(vec![SemanticOperation::MoveSubtree {
+            root: block,
+            from_page_id: ids.page_a,
+            to_page_id: ids.page_b,
+            parent: None,
+            order: "moved-with-logseq-uuid".into(),
+        }]),
+        author(41_013, 41_013),
+        tx(vec![SemanticOperation::DeleteSubtree {
+            root_block_id: ids.block_a,
+            page_id: ids.page_a,
+        }]),
     );
-
-    let deleted = ab
-        .prepare_fixture_transaction(
-            author(41_013, 41_013),
-            &tx(vec![SemanticOperation::DeleteSubtree {
-                root_block_id: ids.block_a,
-                page_id: ids.page_b,
-            }]),
-        )
-        .unwrap();
-    assert!(matches!(
-        ab.stage_ready(ready(&archive, &deleted)).disposition,
-        BatchDisposition::Accepted { .. }
-    ));
+    let prefix = [baseline, left, right];
+    let mut settled = apply_pair_from(ids, &prefix, moved.clone(), deleted.clone());
+    let intent = [moved.manifest().batch_id(), deleted.manifest().batch_id()]
+        .into_iter()
+        .flat_map(|batch_id| settled.conflict_resolution_intents(batch_id).unwrap())
+        .find_map(|intent| match intent {
+            ConflictResolutionIntent::RestoreMoved {
+                page_id,
+                block,
+                claim,
+                source,
+                ..
+            } => Some((page_id, block, claim, source)),
+            _ => None,
+        });
+    if let Some((page_id, block, claim, source)) = intent {
+        let resolution = settled
+            .prepare_fixture_transaction(
+                author(41_014, 41_014),
+                &tx(vec![SemanticOperation::RestoreSubtree {
+                    page_id,
+                    blocks: vec![BlockRestore {
+                        block,
+                        claim,
+                        source,
+                    }],
+                }]),
+            )
+            .unwrap();
+        assert!(matches!(
+            settled
+                .stage_ready(ready(&archive, &resolution))
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
+    let surviving = &settled.materialize_page(ids.page_b).unwrap().blocks[0];
+    assert_eq!(surviving.block_id, ids.block_a);
+    assert_eq!(surviving.logseq_uuid, Some(winner));
     assert_eq!(
-        ab.recover_block_state(ids.home_a, ids.block_a)
-            .unwrap()
-            .unwrap()
-            .logseq_uuid,
-        Some(winner)
+        surviving.logseq_identity_origin,
+        Some(LogseqIdentityOrigin::ExternalImported)
     );
+    assert!(matches!(
+        settled.resolve_logseq_uuid(winner).unwrap(),
+        LogseqUuidResolution::Unique(claim) if claim.block_id == ids.block_a && claim.page_id == ids.page_b
+    ));
 }
 
 #[test]
@@ -5334,7 +5456,7 @@ fn concurrent_move_move_and_move_edit_converge_in_both_delivery_orders() {
     );
 }
 
-fn move_delete_result(move_peer: u64, delete_peer: u64) -> (bool, bool) {
+fn move_delete_result(move_peer: u64, delete_peer: u64) {
     let ids = Ids::new();
     let dir = TestDir::new("move-delete-direction");
     let archive = store(&dir, ids);
@@ -5362,35 +5484,61 @@ fn move_delete_result(move_peer: u64, delete_peer: u64) -> (bool, bool) {
         author(20_000 + delete_peer as u128, delete_peer),
         deleted,
     );
-    let ab = apply_pair(ids, &baseline, moved.clone(), deleted.clone());
-    let ba = apply_pair(ids, &baseline, deleted, moved);
+    let mut ab = apply_pair(ids, &baseline, moved.clone(), deleted.clone());
+    let mut ba = apply_pair(ids, &baseline, deleted.clone(), moved.clone());
+    let restore = [moved.manifest().batch_id(), deleted.manifest().batch_id()]
+        .into_iter()
+        .flat_map(|batch_id| ab.conflict_resolution_intents(batch_id).unwrap())
+        .find_map(|intent| match intent {
+            ConflictResolutionIntent::RestoreMoved {
+                page_id,
+                block,
+                claim,
+                source,
+                ..
+            } => Some((page_id, block, claim, source)),
+            _ => None,
+        });
+    if let Some((page_id, block, claim, source)) = restore {
+        let prepared = ab
+            .prepare_fixture_transaction(
+                author(29_000 + move_peer as u128, 29_000 + move_peer),
+                &tx(vec![SemanticOperation::RestoreSubtree {
+                    page_id,
+                    blocks: vec![BlockRestore {
+                        block,
+                        claim,
+                        source,
+                    }],
+                }]),
+            )
+            .unwrap();
+        let resolution = ready(&archive, &prepared);
+        assert!(matches!(
+            ab.stage_ready(resolution.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            ba.stage_ready(resolution).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
     assert_eq!(
         ab.canonical_snapshot().unwrap(),
         ba.canonical_snapshot().unwrap()
     );
-    let page_won = !ab.materialize_page(ids.page_b).unwrap().blocks.is_empty();
-    (page_won, !page_won)
+    let destination = ab.materialize_page(ids.page_b).unwrap();
+    assert_eq!(destination.blocks.len(), 1);
+    assert_eq!(destination.blocks[0].block_id, ids.block_a);
+    assert_eq!(destination.blocks[0].content, "home A content");
 }
 
 #[test]
-fn concurrent_move_delete_covers_page_and_tombstone_winner_directions() {
-    let low_move = move_delete_result(200, 300);
-    let high_move = move_delete_result(400, 300);
-    assert_ne!(
-        low_move, high_move,
-        "peer order must exercise both register winners"
-    );
-    assert!(
-        low_move.0 || high_move.0,
-        "one direction must keep the moved page owner"
-    );
-    assert!(
-        low_move.1 || high_move.1,
-        "one direction must keep the tombstone owner"
-    );
+fn concurrent_move_delete_converges_in_both_orders_to_settled_destination() {
+    move_delete_result(521, 522);
 }
 
-fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) -> bool {
+fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) {
     let ids = Ids::new();
     let dir = TestDir::new("moved-away-move-delete");
     let archive = store(&dir, ids);
@@ -5463,8 +5611,52 @@ fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) -> bool {
         ));
         engine
     };
-    let move_then_delete = apply(moved_to_c.clone(), deleted_from_b.clone());
-    let delete_then_move = apply(deleted_from_b, moved_to_c);
+    let mut move_then_delete = apply(moved_to_c.clone(), deleted_from_b.clone());
+    let mut delete_then_move = apply(deleted_from_b.clone(), moved_to_c.clone());
+    let restore = [
+        moved_to_c.manifest().batch_id(),
+        deleted_from_b.manifest().batch_id(),
+    ]
+    .into_iter()
+    .flat_map(|batch_id| {
+        move_then_delete
+            .conflict_resolution_intents(batch_id)
+            .unwrap()
+    })
+    .find_map(|intent| match intent {
+        ConflictResolutionIntent::RestoreMoved {
+            page_id,
+            block,
+            claim,
+            source,
+            ..
+        } => Some((page_id, block, claim, source)),
+        _ => None,
+    });
+    if let Some((page_id, block, claim, source)) = restore {
+        let prepared = move_then_delete
+            .prepare_fixture_transaction(
+                author(39_000 + move_peer as u128, 39_000 + move_peer),
+                &tx(vec![SemanticOperation::RestoreSubtree {
+                    page_id,
+                    blocks: vec![BlockRestore {
+                        block,
+                        claim,
+                        source,
+                    }],
+                }]),
+            )
+            .unwrap();
+        let resolution = ready(&archive, &prepared);
+        assert!(matches!(
+            move_then_delete.stage_ready(resolution.clone()).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            delete_then_move.stage_ready(resolution).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
     assert_eq!(
         move_then_delete.canonical_snapshot().unwrap(),
         delete_then_move.canonical_snapshot().unwrap()
@@ -5483,26 +5675,19 @@ fn moved_away_move_delete_result(move_peer: u64, delete_peer: u64) -> bool {
     let moved_block = page_c
         .blocks
         .iter()
-        .find(|block| block.block_id == ids.block_a);
-    if let Some(block) = moved_block {
-        assert_eq!(block.home_document_id, ids.home_a);
-        assert_eq!(block.content, "home A content");
-    }
-    moved_block.is_some()
+        .find(|block| block.block_id == ids.block_a)
+        .expect("settlement must preserve the move to C");
+    assert_eq!(moved_block.home_document_id, ids.home_a);
+    assert_eq!(moved_block.content, "home A content");
 }
 
 #[test]
-fn moved_away_block_races_move_from_b_to_c_with_delete_from_b_both_orders_and_winners() {
-    let low_move = moved_away_move_delete_result(500, 600);
-    let high_move = moved_away_move_delete_result(700, 600);
-    assert_ne!(
-        low_move, high_move,
-        "peer order must cover both the moved membership and tombstone winners"
-    );
+fn moved_away_block_races_move_from_b_to_c_with_delete_from_b_and_settles_at_c() {
+    moved_away_move_delete_result(700, 600);
 }
 
 #[test]
-fn delete_edit_retains_recoverable_crdt_content_but_hides_membership() {
+fn delete_edit_removes_payload_then_settlement_preserves_the_concurrent_edit() {
     let ids = Ids::new();
     let dir = TestDir::new("delete-edit");
     let archive = store(&dir, ids);
@@ -5527,24 +5712,75 @@ fn delete_edit_retains_recoverable_crdt_content_but_hides_membership() {
         author(131, 131),
         edited,
     );
-    let engine = apply_pair(ids, &baseline, deleted, edited);
-    assert!(engine
+    let mut delete_then_edit = apply_pair(ids, &baseline, deleted.clone(), edited.clone());
+    let mut edit_then_delete = apply_pair(ids, &baseline, edited.clone(), deleted.clone());
+    assert_eq!(
+        delete_then_edit.canonical_snapshot().unwrap(),
+        edit_then_delete.canonical_snapshot().unwrap()
+    );
+    for engine in [&delete_then_edit, &edit_then_delete] {
+        assert!(engine
+            .materialize_page(ids.page_a)
+            .unwrap()
+            .blocks
+            .is_empty());
+        assert_eq!(
+            engine
+                .block_live_keys_for_test(ids.home_a, ids.block_a)
+                .unwrap(),
+            (false, false, false, false)
+        );
+    }
+    let intent = [deleted.manifest().batch_id(), edited.manifest().batch_id()]
+        .into_iter()
+        .flat_map(|batch_id| {
+            delete_then_edit
+                .conflict_resolution_intents(batch_id)
+                .unwrap()
+        })
+        .find_map(|intent| match intent {
+            ConflictResolutionIntent::RestoreEdited {
+                page_id,
+                block,
+                claim,
+                source,
+                ..
+            } => Some((page_id, block, claim, source)),
+            _ => None,
+        })
+        .expect("edit/delete race owes reconstruction of the edited side");
+    let prepared = delete_then_edit
+        .prepare_fixture_transaction(
+            author(132, 132),
+            &tx(vec![SemanticOperation::RestoreSubtree {
+                page_id: intent.0,
+                blocks: vec![BlockRestore {
+                    block: intent.1,
+                    claim: intent.2,
+                    source: intent.3,
+                }],
+            }]),
+        )
+        .unwrap();
+    let resolution = ready(&archive, &prepared);
+    assert!(matches!(
+        delete_then_edit.stage_ready(resolution.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert!(matches!(
+        edit_then_delete.stage_ready(resolution).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    assert_eq!(
+        delete_then_edit.canonical_snapshot().unwrap(),
+        edit_then_delete.canonical_snapshot().unwrap()
+    );
+    let block = &delete_then_edit
         .materialize_page(ids.page_a)
         .unwrap()
-        .blocks
-        .is_empty());
-    assert!(engine
-        .canonical_snapshot()
-        .unwrap()
-        .blocks
-        .iter()
-        .all(|block| block.block_id != ids.block_a));
-    let recovered = engine
-        .recover_block_state(ids.home_a, ids.block_a)
-        .unwrap()
-        .expect("tombstoned home content remains in immutable CRDT history");
-    assert_eq!(recovered.owner, BlockOwner::Tombstone);
-    assert_eq!(recovered.content, "recoverable concurrent content");
+        .blocks[0];
+    assert_eq!(block.block_id, ids.block_a);
+    assert_eq!(block.content, "recoverable concurrent content");
 }
 
 #[test]
@@ -7438,6 +7674,133 @@ fn real_delete_fixed_live_page_shallow_growth() {
             "fresh shallow import exceeds bound at {count}: fixed={fixed_import_median:?} measured={import_median:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "release-only fixed-identity churn benchmark; run explicitly for P2 qualification"]
+fn real_delete_fixed_identity_churn_shallow_growth() {
+    let ids = Ids::new();
+    let dir = TestDir::new("real-delete-fixed-identity-churn");
+    let archive = store(&dir, ids);
+    let (mut engine, _) = seed_engine(ids, &archive);
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(9_910_000));
+    let lane = 59_100_u64;
+    let device = 9_910_000_u128;
+    let mut next_batch = 9_911_000_u128;
+    let created = engine
+        .prepare_fixture_transaction(
+            author_on_lane(next_batch, device, lane),
+            &tx(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: ids.home_a,
+                },
+                page_id: ids.page_a,
+                parent: None,
+                order: "fixed-identity-churn".into(),
+                content: "fixed identity payload".into(),
+            }]),
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &created)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    next_batch += 1;
+    let deleted = engine
+        .prepare_fixture_transaction(
+            author_on_lane(next_batch, device, lane),
+            &tx(vec![SemanticOperation::DeleteSubtree {
+                root_block_id: block_id,
+                page_id: ids.page_a,
+            }]),
+        )
+        .unwrap();
+    let mut deletion_batch_id = deleted.manifest().batch_id();
+    assert!(matches!(
+        engine.stage_ready(ready(&archive, &deleted)).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let identity_baseline = engine
+        .shallow_document_bytes_for_test(ids.home_a)
+        .unwrap()
+        .len();
+    let checkpoints = [1_usize, 10, 100, 1_000];
+    let mut completed = 0_usize;
+    let mut measurements = Vec::new();
+    for checkpoint in checkpoints {
+        while completed < checkpoint {
+            next_batch += 1;
+            let restored = engine
+                .prepare_fixture_transaction(
+                    author_on_lane(next_batch, device, lane),
+                    &tx(vec![SemanticOperation::RestoreSubtree {
+                        page_id: ids.page_a,
+                        blocks: vec![BlockRestore {
+                            block: BlockLocation {
+                                block_id,
+                                home_document_id: ids.home_a,
+                            },
+                            claim: MembershipClaim::new(ids.home_a, None, "fixed-identity-churn")
+                                .unwrap(),
+                            source: crate::oplog::BlockReconstructionSource::DeletedBeforeImage {
+                                deletion_batch_id,
+                            },
+                        }],
+                    }]),
+                )
+                .unwrap();
+            assert!(matches!(
+                engine.stage_ready(ready(&archive, &restored)).disposition,
+                BatchDisposition::Accepted { .. }
+            ));
+            next_batch += 1;
+            let deleted = engine
+                .prepare_fixture_transaction(
+                    author_on_lane(next_batch, device, lane),
+                    &tx(vec![SemanticOperation::DeleteSubtree {
+                        root_block_id: block_id,
+                        page_id: ids.page_a,
+                    }]),
+                )
+                .unwrap();
+            deletion_batch_id = deleted.manifest().batch_id();
+            assert!(matches!(
+                engine.stage_ready(ready(&archive, &deleted)).disposition,
+                BatchDisposition::Accepted { .. }
+            ));
+            completed += 1;
+        }
+        assert_eq!(
+            engine
+                .block_live_keys_for_test(ids.home_a, block_id)
+                .unwrap(),
+            (false, false, false, false)
+        );
+        let bytes = engine.shallow_document_bytes_for_test(ids.home_a).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let document = LoroDoc::new();
+            assert!(document.import(&bytes).unwrap().pending.is_none());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let retained = bytes.len().saturating_sub(identity_baseline);
+        eprintln!(
+            "real_delete_fixed_identity_churn_shallow_growth N={checkpoint} B={identity_baseline} bytes={} retained={} import_us={}",
+            bytes.len(),
+            retained,
+            samples[2].as_micros(),
+        );
+        measurements.push((checkpoint, retained));
+    }
+    let first = measurements[0].1;
+    let last = measurements.last().unwrap().1;
+    assert!(
+        last <= first + 65_536,
+        "fixed-identity residue is not bounded: measurements={measurements:?}"
+    );
 }
 
 #[test]
@@ -10707,10 +11070,10 @@ fn managed_200_block_move_changes_only_source_and_destination_shards() {
 
 /// Rebaselining v2 P1: page-shard state produced by ordinary clean authoring
 /// -- create, edit, identity, move, reorder, delete, restore, rename, page
-/// deletion and a hidden edit to a block retained on the deleted page --
+/// deletion, reconstruction at the recorded placement, and an ordinary edit --
 /// round-trips identically through clean checkpoint capture/restore and
 /// through independent full accepted-history replay: canonical graph, pages,
-/// creation-page homes, UUIDs, the hidden block, accepted roots and writer
+/// creation-page homes, UUIDs, restored content, accepted roots and writer
 /// lane ownership.
 #[test]
 fn managed_page_shard_checkpoint_and_full_replay_agree() {
@@ -10902,7 +11265,7 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
                 claim: MembershipClaim {
                     home_document_id: ids.home_b,
                     parent: None,
-                    order: "y".into(),
+                    order: "z".into(),
                 },
                 source: crate::oplog::BlockReconstructionSource::DeletedBeforeImage {
                     deletion_batch_id: y1_deletion.manifest().batch_id(),
@@ -10934,8 +11297,8 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
         &mut engine,
         82_108,
         vec![SemanticOperation::EditBlockContent {
-            block: at(z1, ids.home_c),
-            content: "hidden edit".into(),
+            block: at(y1, ids.home_b),
+            content: "restored then edited".into(),
         }],
     );
 
@@ -10963,6 +11326,7 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
     assert_eq!(block_on_b(x2).home_document_id, ids.home_a);
     assert_eq!(block_on_b(x2).logseq_uuid, Some(x2_uuid));
     assert_eq!(block_on_b(y1).home_document_id, ids.home_b);
+    assert_eq!(block_on_b(y1).content, "restored then edited");
     assert!(engine.crdt_lane_owner(lane).is_some());
 
     let capture = engine.capture_clean_checkpoint(0).unwrap();
@@ -11020,11 +11384,6 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
             other.materialize_page(ids.page_c),
             Err(EngineError::PageDeleted(deleted)) if deleted == ids.page_c
         ));
-        let hidden = other
-            .recover_block_state(ids.home_c, z1)
-            .unwrap()
-            .expect("the block on the deleted page is retained");
-        assert_eq!(hidden.content, "hidden edit", "{label}: hidden edit");
         assert_eq!(
             other.crdt_lane_owner(lane),
             engine.crdt_lane_owner(lane),

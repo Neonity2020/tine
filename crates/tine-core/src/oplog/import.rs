@@ -7631,7 +7631,7 @@ mod tests {
     }
 
     #[test]
-    fn external_delete_last_page_retains_blocks_through_cold_reopen_clean() {
+    fn external_delete_last_page_removes_blocks_and_cold_reopen_is_clean() {
         let mut fixture =
             CleanSnapshotFixture::new("external-delete-last-page-reopen", &["pages/last.md"]);
         let page_id = fixture.page_id(0);
@@ -7647,12 +7647,13 @@ mod tests {
                 Err(crate::oplog::EngineError::PageDeleted(deleted)) if deleted == page_id
             ));
             for block in &original.blocks {
-                let retained = engine
-                    .recover_block_state(block.home_document_id, block.block_id)
-                    .unwrap()
-                    .expect("whole-page deletion retains original block state");
-                assert_eq!(retained.owner, crate::oplog::BlockOwner::Page(page_id));
-                assert_eq!(retained.content, block.content);
+                assert_eq!(
+                    engine
+                        .recover_block_state(block.home_document_id, block.block_id)
+                        .unwrap(),
+                    None,
+                    "whole-page deletion removes live block payload"
+                );
             }
         }
     }

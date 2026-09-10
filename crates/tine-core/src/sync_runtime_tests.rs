@@ -868,6 +868,37 @@ fn managed_delete_undo_reconstructs_after_an_intervening_page_batch() {
 }
 
 #[test]
+fn application_undo_distinguishes_arriving_source_from_unknown_and_damaged() {
+    let batch_id = BatchId::from_uuid(Uuid::from_u128(0xc7a2_1200));
+    assert!(matches!(
+        map_application_editor_reconstruction(Err(EngineError::MissingDependency(batch_id))),
+        Err(ApplicationEditorBlocksError::Conflict(
+            SyncApplicationPageConflict::RestoreSourceStillArriving
+        ))
+    ));
+    assert!(matches!(
+        map_application_editor_reconstruction(Ok(None)),
+        Ok(None)
+    ));
+
+    let object = ContentDigest::of(b"damaged semantic object");
+    let error = restore_source_damage(EngineError::Archive(format!(
+        "reconstruction source semantic object {object} for batch {batch_id} failed: truncated"
+    )));
+    assert!(matches!(
+        error,
+        SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+            stage: "restore_source_lookup",
+            code: SyncEditorRefusalCode::RestoreSourceDiskCorrupt,
+            ..
+        }
+    ));
+    let detail = error.debug_detail().unwrap();
+    assert!(detail.contains(&batch_id.to_string()));
+    assert!(detail.contains(&object.to_string()));
+}
+
+#[test]
 fn template_extraction_matches_og_property_rule_in_md_and_org() {
     fn signature(templates: Vec<TemplateDto>) -> Vec<(String, String, Vec<String>)> {
         let mut rows = templates
@@ -7595,7 +7626,7 @@ fn over_limit_restore_rediffs_after_interference_and_resumes_from_durable_cursor
 }
 
 #[test]
-fn retained_block_edit_on_tombstoned_page_is_projectionless_and_replays() {
+fn deleted_page_projects_nothing_refuses_removed_block_edits_and_replays() {
     let fixture = ActivationFixture::nested_unicode("retained-hidden-edit", 0xc5102_3000);
     fs::write(
         fixture.graph_root.join("Root.md"),
@@ -7703,6 +7734,15 @@ fn retained_block_edit_on_tombstoned_page_is_projectionless_and_replays() {
     assert!(actor.clean.as_ref().unwrap().pending.is_none());
     assert!(!fixture.graph_root.join("Root.md").exists());
     let sweep_id = actor.clean.as_ref().unwrap().sweeps.records_for_test()[0].sweep_id;
+    let _ = sweep_id;
+    let deleted_snapshot = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .canonical_snapshot()
+        .unwrap();
 
     let hidden = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
         block: BlockLocation {
@@ -7728,12 +7768,20 @@ fn retained_block_edit_on_tombstoned_page_is_projectionless_and_replays() {
         )
     };
     assert!(
-        matches!(
-            detailed,
-            Ok(CleanActorMutationOutcome::Durable(_))
-                | Ok(CleanActorMutationOutcome::DurablePending { .. })
-        ),
-        "retained hidden edit detail: {detailed:?}"
+        detailed.is_err(),
+        "removed-block edit was accepted: {detailed:?}"
+    );
+    assert_eq!(
+        actor
+            .clean
+            .as_ref()
+            .unwrap()
+            .runtime
+            .engine()
+            .canonical_snapshot()
+            .unwrap(),
+        deleted_snapshot,
+        "refused edit must not partially mutate deleted state"
     );
     assert!(!fixture.graph_root.join("Root.md").exists());
     drop(actor);
@@ -7747,45 +7795,24 @@ fn retained_block_edit_on_tombstoned_page_is_projectionless_and_replays() {
         resources.runtime.engine().materialize_page(page_id),
         Err(crate::oplog::EngineError::PageDeleted(found)) if found == page_id
     ));
-    let recovered = resources
-        .runtime
-        .engine()
-        .recover_block_state(block.home_document_id, block.block_id)
-        .unwrap()
-        .expect("retained block remains addressable after cold replay");
-    assert_eq!(recovered.owner, crate::oplog::BlockOwner::Page(page_id));
-    assert_eq!(recovered.content, "hidden retained edit");
+    assert_eq!(
+        resources
+            .runtime
+            .engine()
+            .recover_block_state(block.home_document_id, block.block_id)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        resources.runtime.engine().canonical_snapshot().unwrap(),
+        deleted_snapshot,
+        "cold replay and the deleted shallow state must agree"
+    );
     assert!(!fixture.graph_root.join("Root.md").exists());
-
-    let identities = open_request.clean_identities.clone().unwrap();
-    let mut revived = RuntimeActor::from_clean_resources(
-        open_request,
-        identities,
-        resources,
-        SyncRuntimeRecovery::CleanManifestReplay,
-        Arc::new(crate::managed_query::ManagedQueryShared::default()),
-    )
-    .unwrap();
-    revived.restore_absence_sweep(sweep_id).unwrap();
-    let restored = revived
-        .clean
-        .as_ref()
-        .unwrap()
-        .runtime
-        .engine()
-        .materialize_page(page_id)
-        .unwrap();
-    assert_eq!(restored.blocks.len(), 1);
-    assert_eq!(restored.blocks[0].block_id, block.block_id);
-    assert_eq!(restored.blocks[0].home_document_id, block.home_document_id);
-    assert_eq!(restored.blocks[0].content, "live control edit");
-    assert!(fs::read_to_string(fixture.graph_root.join("Root.md"))
-        .unwrap()
-        .contains("live control edit"));
 }
 
 #[test]
-fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() {
+fn deleted_and_visible_pages_project_only_the_visible_edit_and_replay() {
     let fixture = ActivationFixture::nested_unicode("retained-hidden-visible-edit", 0xc5102_3100);
     fs::write(
         fixture.graph_root.join("Hidden.md"),
@@ -7866,22 +7893,13 @@ fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() 
     assert!(actor.clean.as_ref().unwrap().pending.is_none());
     assert!(!fixture.graph_root.join("Hidden.md").exists());
 
-    let mixed = OperationTransaction::new(vec![
-        SemanticOperation::EditBlockContent {
-            block: BlockLocation {
-                block_id: hidden_block.block_id,
-                home_document_id: hidden_block.home_document_id,
-            },
-            content: "hidden batch edit".into(),
+    let visible_edit = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+        block: BlockLocation {
+            block_id: visible_block.block_id,
+            home_document_id: visible_block.home_document_id,
         },
-        SemanticOperation::EditBlockContent {
-            block: BlockLocation {
-                block_id: visible_block.block_id,
-                home_document_id: visible_block.home_document_id,
-            },
-            content: "visible batch edit".into(),
-        },
-    ])
+        content: "visible batch edit".into(),
+    }])
     .unwrap();
     let detailed = {
         let RuntimeActor {
@@ -7894,14 +7912,14 @@ fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() 
         clean.as_mut().unwrap().execute_local(
             graph,
             receipts,
-            &mixed,
+            &visible_edit,
             projection_turns.as_mut().unwrap(),
         )
     };
     let mixed_batch_id = match detailed {
         Ok(CleanActorMutationOutcome::Durable(batch_id))
         | Ok(CleanActorMutationOutcome::DurablePending { batch_id, .. }) => batch_id,
-        other => panic!("mixed hidden/visible edit detail: {other:?}"),
+        other => panic!("visible-page edit detail: {other:?}"),
     };
     for _ in 0..64 {
         if actor.clean.as_ref().unwrap().pending.is_none()
@@ -7917,7 +7935,7 @@ fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() 
     }
     assert!(
         actor.clean.as_ref().unwrap().pending.is_none(),
-        "mixed batch remained pending (hidden {hidden_page_id}, visible {visible_page_id}): {:?}",
+        "visible batch remained pending (hidden {hidden_page_id}, visible {visible_page_id}): {:?}",
         actor
             .clean
             .as_ref()
@@ -7946,6 +7964,14 @@ fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() 
     assert!(fs::read_to_string(fixture.graph_root.join("Visible.md"))
         .unwrap()
         .contains("visible batch edit"));
+    let expected_snapshot = actor
+        .clean
+        .as_ref()
+        .unwrap()
+        .runtime
+        .engine()
+        .canonical_snapshot()
+        .unwrap();
     drop(actor);
 
     let open_request = reopen_request(&fixture.request);
@@ -7956,22 +7982,14 @@ fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() 
         resources.runtime.engine().materialize_page(hidden_page_id),
         Err(crate::oplog::EngineError::PageDeleted(found)) if found == hidden_page_id
     ));
-    let recovered_hidden = resources
-        .runtime
-        .engine()
-        .recover_block_state(hidden_block.home_document_id, hidden_block.block_id)
-        .unwrap()
-        .expect("hidden block remains addressable after cold replay");
-    assert_eq!(recovered_hidden.block_id, hidden_block.block_id);
     assert_eq!(
-        recovered_hidden.home_document_id,
-        hidden_block.home_document_id
+        resources
+            .runtime
+            .engine()
+            .recover_block_state(hidden_block.home_document_id, hidden_block.block_id)
+            .unwrap(),
+        None
     );
-    assert_eq!(
-        recovered_hidden.owner,
-        crate::oplog::BlockOwner::Page(hidden_page_id)
-    );
-    assert_eq!(recovered_hidden.content, "hidden batch edit");
     let replayed_visible = resources
         .runtime
         .engine()
@@ -7984,6 +8002,11 @@ fn retained_hidden_and_visible_edits_project_only_the_visible_page_and_replay() 
         visible_block.home_document_id
     );
     assert_eq!(replayed_visible.blocks[0].content, "visible batch edit");
+    assert_eq!(
+        resources.runtime.engine().canonical_snapshot().unwrap(),
+        expected_snapshot,
+        "cold replay and the shallow deleted/visible state must agree"
+    );
     assert!(!fixture.graph_root.join("Hidden.md").exists());
     assert!(fs::read_to_string(fixture.graph_root.join("Visible.md"))
         .unwrap()
@@ -8100,7 +8123,6 @@ fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
         source.push_str(&format!("- original block {index:04}\n"));
     }
     fs::write(fixture.graph_root.join("Root.md"), source.as_bytes()).unwrap();
-    let expected = source.into_bytes();
 
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     let handle = activated.handle.expect("chunk fixture activates");
@@ -8161,6 +8183,46 @@ fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
     assert_eq!(page.blocks.len(), 1_100);
     phase("first-page-materialize-complete");
 
+    for (chunk_ordinal, blocks) in page.blocks.chunks(400).enumerate() {
+        phase(&format!("edit-live-chunk-{chunk_ordinal}-start"));
+        let operations = blocks
+            .iter()
+            .map(|block| SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: block.block_id,
+                    home_document_id: block.home_document_id,
+                },
+                content: format!("changed before delete {chunk_ordinal}"),
+            })
+            .collect();
+        let outcome = actor.submit_local_mutation(OperationTransaction::new(operations).unwrap());
+        assert!(
+            matches!(
+                outcome,
+                SyncLocalMutationOutcome::Durable { .. }
+                    | SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: Some(_),
+                        ..
+                    }
+            ),
+            "live-block edit chunk {chunk_ordinal}: {outcome:?}"
+        );
+        phase(&format!("edit-live-chunk-{chunk_ordinal}-complete"));
+    }
+    for _ in 0..128 {
+        if actor.clean.as_ref().unwrap().pending.is_none()
+            && actor.projection_turns.as_ref().unwrap().pending_count() == 0
+            && actor
+                .managed_local
+                .as_ref()
+                .is_none_or(|managed| managed.pending_count() == 0)
+        {
+            break;
+        }
+        assert!(!matches!(actor.tick(), SyncRuntimeTick::Terminal(_)));
+    }
+    let expected = fs::read(fixture.graph_root.join("Root.md")).unwrap();
+
     phase("external-delete-start");
     fs::remove_file(fixture.graph_root.join("Root.md")).unwrap();
     phase("external-delete-complete");
@@ -8185,33 +8247,6 @@ fn over_limit_restore_rediffs_case(label: &str, seed: u128) {
         actor.publication_barrier_active(),
         "the sweep hold must remain active while Restore authors chunks"
     );
-
-    for (chunk_ordinal, blocks) in page.blocks.chunks(400).enumerate() {
-        phase(&format!("edit-chunk-{chunk_ordinal}-start"));
-        let operations = blocks
-            .iter()
-            .map(|block| SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id: block.block_id,
-                    home_document_id: block.home_document_id,
-                },
-                content: format!("changed before restore {chunk_ordinal}"),
-            })
-            .collect();
-        let outcome = actor.submit_local_mutation(OperationTransaction::new(operations).unwrap());
-        assert!(
-            matches!(
-                outcome,
-                SyncLocalMutationOutcome::Durable { .. }
-                    | SyncLocalMutationOutcome::RetryableRetainedRecovery {
-                        batch_id: Some(_),
-                        ..
-                    }
-            ),
-            "retained-block edit chunk {chunk_ordinal}: {outcome:?}"
-        );
-        phase(&format!("edit-chunk-{chunk_ordinal}-complete"));
-    }
 
     admit_after_restore_chunks_for_test(
         fixture.request.identities.workspace_id,

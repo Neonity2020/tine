@@ -368,7 +368,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     );
     const managedCodes = [...managedImpl.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
       .map((match) => match[1]);
-    expect(managedCodes).toHaveLength(22);
+    expect(managedCodes).toHaveLength(23);
     for (const code of [...directCodes, ...managedCodes]) expect(contract).toContain(code);
 
     const persistence = source("src/persistence.ts");

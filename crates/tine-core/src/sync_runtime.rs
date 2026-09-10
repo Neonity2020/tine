@@ -156,16 +156,16 @@ use crate::oplog::{
     managed_local_v2_anchor_name, parse_managed_local_v2_anchor_name, BatchId, BatchOrigin,
     BlobDescription, BlockId, BlockLocation, BlockReconstructionSource, BlockState,
     CanonicalGraphResourceId, CanonicalSnapshot, ContentDigest, CurrentPageAtPath, DeviceId,
-    DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin,
-    LogseqUuid, ManagedLocalAppendError, ManagedLocalGenerationAnchorV2, ManagedLocalJournal,
-    ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath, ManagedTextKind,
-    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
-    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
-    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId, PageState,
-    PreparedBatch, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStoreId, RebuildSource,
-    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
-    MAX_MATERIALIZATION_QUERY_ROWS,
+    DocumentId, EngineError, FrontierReferenceHit, LineageDigest, LogicalPageName,
+    LogseqIdentityOrigin, LogseqUuid, ManagedLocalAppendError, ManagedLocalGenerationAnchorV2,
+    ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
+    ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
+    MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
+    MaterializedTagRow, MaterializedTaskRow, MembershipClaim, OperationBatch, OperationObject,
+    OperationTransaction, PageId, PageState, PreparedBatch, ProjectionClaim, ProjectionEndpointId,
+    ProjectionReceiptStoreId, RebuildSource, ReferenceCatalogPolicyV1, ReferenceFactV1,
+    ReferenceSourceLocatorV1, SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 use uuid::Uuid;
 
@@ -3012,6 +3012,7 @@ pub enum SyncApplicationPageConflict {
     AmbiguousPageName,
     DerivedPathOccupied,
     UnknownOrForeignBlock,
+    RestoreSourceStillArriving,
     ReadOnly,
 }
 
@@ -3084,6 +3085,7 @@ pub enum SyncEditorRefusalCode {
     ManagedSequenceOverflow,
     ManagedQueueMonotonicity,
     ManagedRecordDecode,
+    RestoreSourceDiskCorrupt,
 }
 
 impl SyncEditorRefusalCode {
@@ -3115,6 +3117,7 @@ impl SyncEditorRefusalCode {
             Self::ManagedSequenceOverflow => "managed_queue.sequence_overflow",
             Self::ManagedQueueMonotonicity => "managed_queue.monotonicity",
             Self::ManagedRecordDecode => "managed_record.decode",
+            Self::RestoreSourceDiskCorrupt => "restore_source.disk_corrupt",
         }
     }
 }
@@ -18176,146 +18179,150 @@ impl RuntimeActor {
         }
         #[cfg(test)]
         let request_started = Instant::now();
-        let (editor_request, reload_target, prepared_existing, reconstructions) = match &request
-            .target
-        {
-            SyncApplicationPageSaveTarget::Existing { path, revision }
-            | SyncApplicationPageSaveTarget::ResolveConflict {
-                path,
-                observed_revision: revision,
-            } => {
-                let resolve_conflict = matches!(
-                    &request.target,
-                    SyncApplicationPageSaveTarget::ResolveConflict { .. }
-                );
-                #[cfg(test)]
-                let load_started = Instant::now();
-                let load = match self.take_hot_application_save_exact_ready(path, revision)? {
-                    Some(current) => ApplicationExactLoad::Loaded(current),
-                    None => self.load_application_save_exact_ready(path)?,
-                };
-                #[cfg(test)]
-                note_application_save_stage(|timings| {
-                    timings.exact_page_load = load_started.elapsed();
-                });
-                let mut current = match load {
-                    ApplicationExactLoad::Loaded(current) => current,
-                    ApplicationExactLoad::Missing => {
-                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                            reason: SyncApplicationPageConflict::MissingPage,
-                        })
-                    }
-                    ApplicationExactLoad::Ambiguous => {
-                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                            reason: SyncApplicationPageConflict::AmbiguousPageName,
-                        })
-                    }
-                };
-                if current.revision != *revision {
-                    // A just-accepted structural edit can leave SQLite at the
-                    // accepted frontier while its stable block identities lag
-                    // the page returned to the caller. Only this revision
-                    // disagreement takes the retained-engine fallback; an
-                    // ordinary exact SQLite/source rebase remains archive-free
-                    // before transaction execution.
-                    let managed_path = ManagedPath::parse(path.to_owned()).map_err(|_| {
-                        SyncApplicationPageRequestError::InvalidRequest(
-                            SyncApplicationPageInvalidRequest::InvalidPath,
-                        )
-                    })?;
-                    if let ApplicationExactLoad::Loaded(hot) =
-                        self.load_hot_application_exact_ready(&managed_path)?
-                    {
-                        if hot.revision == *revision {
-                            current = hot;
+        let (editor_request, reload_target, prepared_existing, reconstructions) =
+            match &request.target {
+                SyncApplicationPageSaveTarget::Existing { path, revision }
+                | SyncApplicationPageSaveTarget::ResolveConflict {
+                    path,
+                    observed_revision: revision,
+                } => {
+                    let resolve_conflict = matches!(
+                        &request.target,
+                        SyncApplicationPageSaveTarget::ResolveConflict { .. }
+                    );
+                    #[cfg(test)]
+                    let load_started = Instant::now();
+                    let load = match self.take_hot_application_save_exact_ready(path, revision)? {
+                        Some(current) => ApplicationExactLoad::Loaded(current),
+                        None => self.load_application_save_exact_ready(path)?,
+                    };
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.exact_page_load = load_started.elapsed();
+                    });
+                    let mut current = match load {
+                        ApplicationExactLoad::Loaded(current) => current,
+                        ApplicationExactLoad::Missing => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::MissingPage,
+                            })
+                        }
+                        ApplicationExactLoad::Ambiguous => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::AmbiguousPageName,
+                            })
+                        }
+                    };
+                    if current.revision != *revision {
+                        // A just-accepted structural edit can leave SQLite at the
+                        // accepted frontier while its stable block identities lag
+                        // the page returned to the caller. Only this revision
+                        // disagreement takes the retained-engine fallback; an
+                        // ordinary exact SQLite/source rebase remains archive-free
+                        // before transaction execution.
+                        let managed_path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+                            SyncApplicationPageRequestError::InvalidRequest(
+                                SyncApplicationPageInvalidRequest::InvalidPath,
+                            )
+                        })?;
+                        if let ApplicationExactLoad::Loaded(hot) =
+                            self.load_hot_application_exact_ready(&managed_path)?
+                        {
+                            if hot.revision == *revision {
+                                current = hot;
+                            }
                         }
                     }
-                }
-                if current.revision != *revision {
-                    return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                        reason: SyncApplicationPageConflict::StaleBase,
-                    });
-                }
-                if current.page.read_only {
-                    return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                        reason: SyncApplicationPageConflict::ReadOnly,
-                    });
-                }
-                if resolve_conflict {
-                    validate_conflict_resolution_page_shape(&request.page, &current.page)?;
-                } else {
-                    validate_existing_application_page_shape(&request.page, &current.page)?;
-                }
-                let engine = self
-                    .active_engine()
-                    .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
-                let (blocks, reconstructions) = match application_editor_blocks_existing(
-                    &request.page,
-                    &current,
-                    resolve_conflict,
-                    engine,
-                ) {
-                    Ok(blocks) => blocks,
-                    Err(reason) => return Ok(SyncApplicationPageSaveOutcome::Conflict { reason }),
-                };
-                (
-                    SyncEditorSaveRequest {
-                        target: SyncEditorSaveTarget::Existing {
-                            page_id: current.editor.page.page_id.to_string(),
-                            revision: revision.clone(),
+                    if current.revision != *revision {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::StaleBase,
+                        });
+                    }
+                    if current.page.read_only {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::ReadOnly,
+                        });
+                    }
+                    if resolve_conflict {
+                        validate_conflict_resolution_page_shape(&request.page, &current.page)?;
+                    } else {
+                        validate_existing_application_page_shape(&request.page, &current.page)?;
+                    }
+                    let engine = self
+                        .active_engine()
+                        .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?;
+                    let (blocks, reconstructions) = match application_editor_blocks_existing(
+                        &request.page,
+                        &current,
+                        resolve_conflict,
+                        engine,
+                    ) {
+                        Ok(blocks) => blocks,
+                        Err(ApplicationEditorBlocksError::Conflict(reason)) => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict { reason })
+                        }
+                        Err(ApplicationEditorBlocksError::DamagedRestoreSource(error)) => {
+                            return Err(restore_source_damage(error))
+                        }
+                    };
+                    (
+                        SyncEditorSaveRequest {
+                            target: SyncEditorSaveTarget::Existing {
+                                page_id: current.editor.page.page_id.to_string(),
+                                revision: revision.clone(),
+                            },
+                            preamble: request.page.pre_block.clone(),
+                            blocks,
                         },
-                        preamble: request.page.pre_block.clone(),
-                        blocks,
-                    },
-                    ApplicationSaveReloadTarget::ExistingPath(path.clone()),
-                    Some(current),
-                    reconstructions,
-                )
-            }
-            SyncApplicationPageSaveTarget::New { name, page_kind } => {
-                validate_new_application_page_shape(&request.page, name, *page_kind)?;
-                let current_revision = match self
-                    .active_editor_name_state_for_format(
-                        name.clone(),
-                        *page_kind,
-                        request.page.format,
+                        ApplicationSaveReloadTarget::ExistingPath(path.clone()),
+                        Some(current),
+                        reconstructions,
                     )
-                    .map_err(map_editor_application_error)?
-                {
-                    EditorNameState::Missing { revision, .. } => revision,
-                    EditorNameState::Exact(_) => {
-                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                            reason: SyncApplicationPageConflict::PageAlreadyExists,
-                        })
-                    }
-                    EditorNameState::Ambiguous => {
-                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                            reason: SyncApplicationPageConflict::AmbiguousPageName,
-                        })
-                    }
-                    EditorNameState::PathOccupied => {
-                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                            reason: SyncApplicationPageConflict::DerivedPathOccupied,
-                        })
-                    }
-                };
-                (
-                    SyncEditorSaveRequest {
-                        target: SyncEditorSaveTarget::New {
-                            name: name.clone(),
-                            page_kind: *page_kind,
-                            revision: current_revision,
-                            format: Some(request.page.format),
+                }
+                SyncApplicationPageSaveTarget::New { name, page_kind } => {
+                    validate_new_application_page_shape(&request.page, name, *page_kind)?;
+                    let current_revision = match self
+                        .active_editor_name_state_for_format(
+                            name.clone(),
+                            *page_kind,
+                            request.page.format,
+                        )
+                        .map_err(map_editor_application_error)?
+                    {
+                        EditorNameState::Missing { revision, .. } => revision,
+                        EditorNameState::Exact(_) => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::PageAlreadyExists,
+                            })
+                        }
+                        EditorNameState::Ambiguous => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::AmbiguousPageName,
+                            })
+                        }
+                        EditorNameState::PathOccupied => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::DerivedPathOccupied,
+                            })
+                        }
+                    };
+                    (
+                        SyncEditorSaveRequest {
+                            target: SyncEditorSaveTarget::New {
+                                name: name.clone(),
+                                page_kind: *page_kind,
+                                revision: current_revision,
+                                format: Some(request.page.format),
+                            },
+                            preamble: request.page.pre_block.clone(),
+                            blocks: application_editor_blocks_new(&request.page)?,
                         },
-                        preamble: request.page.pre_block.clone(),
-                        blocks: application_editor_blocks_new(&request.page)?,
-                    },
-                    ApplicationSaveReloadTarget::CreatedPage,
-                    None,
-                    HashMap::new(),
-                )
-            }
-        };
+                        ApplicationSaveReloadTarget::CreatedPage,
+                        None,
+                        HashMap::new(),
+                    )
+                }
+            };
         validate_editor_save_request(&editor_request).map_err(map_editor_application_error)?;
         #[cfg(test)]
         note_application_save_stage(|timings| {
@@ -25446,6 +25453,52 @@ fn validate_new_application_page_shape(
     Ok(())
 }
 
+#[derive(Debug)]
+enum ApplicationEditorBlocksError {
+    Conflict(SyncApplicationPageConflict),
+    DamagedRestoreSource(EngineError),
+}
+
+type ApplicationEditorReconstruction = (
+    BlockLocation,
+    BlockState,
+    MembershipClaim,
+    crate::oplog::BlockReconstructionSource,
+);
+
+fn restore_source_damage(error: EngineError) -> SyncApplicationPageRequestError {
+    SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+        stage: "restore_source_lookup",
+        code: SyncEditorRefusalCode::RestoreSourceDiskCorrupt,
+        debug_detail: error.to_string(),
+    }
+}
+
+fn editor_reconstruction(
+    engine: &ShardedHotEngine,
+    page_id: PageId,
+    block_id: Option<BlockId>,
+    logseq_uuid: Option<LogseqUuid>,
+) -> Result<Option<ApplicationEditorReconstruction>, ApplicationEditorBlocksError> {
+    map_application_editor_reconstruction(engine.editor_reconstruction_for_deleted_block(
+        page_id,
+        block_id,
+        logseq_uuid,
+    ))
+}
+
+fn map_application_editor_reconstruction(
+    result: Result<Option<ApplicationEditorReconstruction>, EngineError>,
+) -> Result<Option<ApplicationEditorReconstruction>, ApplicationEditorBlocksError> {
+    match result {
+        Ok(selected) => Ok(selected),
+        Err(EngineError::MissingDependency(_)) => Err(ApplicationEditorBlocksError::Conflict(
+            SyncApplicationPageConflict::RestoreSourceStillArriving,
+        )),
+        Err(error) => Err(ApplicationEditorBlocksError::DamagedRestoreSource(error)),
+    }
+}
+
 fn application_editor_blocks_existing(
     page: &PageDto,
     current: &ApplicationCurrentPage,
@@ -25456,7 +25509,7 @@ fn application_editor_blocks_existing(
         Vec<SyncEditorBlockDto>,
         HashMap<BlockId, EditorBlockReconstruction>,
     ),
-    SyncApplicationPageConflict,
+    ApplicationEditorBlocksError,
 > {
     let current_blocks = flatten_application_blocks(&current.page.blocks);
     let exposed = current_blocks
@@ -25484,15 +25537,11 @@ fn application_editor_blocks_existing(
                         .strip_prefix(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX)
                         .and_then(|value| Uuid::parse_str(value).ok())
                         .map(BlockId::from_uuid);
-                    let selected = engine
-                        .editor_reconstruction_for_deleted_block(
-                            current.editor.page.page_id,
-                            block_id,
-                            None,
-                        )
-                        .ok()
-                        .flatten()
-                        .ok_or(SyncApplicationPageConflict::UnknownOrForeignBlock)?;
+                    let selected =
+                        editor_reconstruction(engine, current.editor.page.page_id, block_id, None)?
+                            .ok_or(ApplicationEditorBlocksError::Conflict(
+                                SyncApplicationPageConflict::UnknownOrForeignBlock,
+                            ))?;
                     let (location, state, claim, source) = selected;
                     let BlockState {
                         owner: crate::oplog::BlockOwner::Page(owner),
@@ -25502,10 +25551,14 @@ fn application_editor_blocks_existing(
                         ..
                     } = state
                     else {
-                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                        return Err(ApplicationEditorBlocksError::Conflict(
+                            SyncApplicationPageConflict::UnknownOrForeignBlock,
+                        ));
                     };
                     if owner != current.editor.page.page_id {
-                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                        return Err(ApplicationEditorBlocksError::Conflict(
+                            SyncApplicationPageConflict::UnknownOrForeignBlock,
+                        ));
                     }
                     reconstructions.insert(
                         location.block_id,
@@ -25530,16 +25583,15 @@ fn application_editor_blocks_existing(
                 let logseq_uuid = Uuid::parse_str(&block.block.id)
                     .ok()
                     .map(LogseqUuid::from_uuid);
-                let selected = logseq_uuid.and_then(|uuid| {
-                    engine
-                        .editor_reconstruction_for_deleted_block(
-                            current.editor.page.page_id,
-                            None,
-                            Some(uuid),
-                        )
-                        .ok()
-                        .flatten()
-                });
+                let selected = match logseq_uuid {
+                    Some(uuid) => editor_reconstruction(
+                        engine,
+                        current.editor.page.page_id,
+                        None,
+                        Some(uuid),
+                    )?,
+                    None => None,
+                };
                 if let Some((location, state, claim, source)) = selected {
                     let BlockState {
                         owner: crate::oplog::BlockOwner::Page(owner),
@@ -25549,10 +25601,14 @@ fn application_editor_blocks_existing(
                         ..
                     } = state
                     else {
-                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                        return Err(ApplicationEditorBlocksError::Conflict(
+                            SyncApplicationPageConflict::UnknownOrForeignBlock,
+                        ));
                     };
                     if owner != current.editor.page.page_id {
-                        return Err(SyncApplicationPageConflict::UnknownOrForeignBlock);
+                        return Err(ApplicationEditorBlocksError::Conflict(
+                            SyncApplicationPageConflict::UnknownOrForeignBlock,
+                        ));
                     }
                     reconstructions.insert(
                         location.block_id,

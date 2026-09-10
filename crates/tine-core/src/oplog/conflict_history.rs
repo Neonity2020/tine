@@ -320,6 +320,12 @@ impl ConflictHistoryIndex {
         })
     }
 
+    pub(crate) fn block_has_unresolved_pair(&self, block_id: BlockId) -> bool {
+        self.blocks
+            .get(&block_id)
+            .is_some_and(|history| !history.unresolved_pairs.is_empty())
+    }
+
     pub(crate) fn unresolved_members(&self, block_id: BlockId) -> Vec<BatchId> {
         let Some(history) = self.blocks.get(&block_id) else {
             return Vec::new();

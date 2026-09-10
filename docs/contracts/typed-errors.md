@@ -144,7 +144,7 @@ Banner-class conflicts use the existing tagged kind:
 | `Unknown` | `unknown` | retry | unclassified source failure |
 
 The frontend save-policy vocabulary is pinned to the union of these 36 strings
-and the 22 `SyncEditorRefusalCode` strings. The pre-existing
+and the 23 `SyncEditorRefusalCode` strings. The pre-existing
 `managed.conflict` tagged prefix is the single documented exception: it remains
 owned by the Managed producer and is cut to E2/E2b rather than being folded into
 the Direct enum.
@@ -174,6 +174,7 @@ trusted_outcome.declined
 managed_queue.sequence_overflow
 managed_queue.monotonicity
 managed_record.decode
+restore_source.disk_corrupt
 ```
 
 Scenario I/O errors retain `std::io::ErrorKind` as
