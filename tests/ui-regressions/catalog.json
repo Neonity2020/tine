@@ -11118,7 +11118,7 @@
         "all"
       ],
       "layer": "native",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "scripts/e2e-managed-p4-rebuild.mjs"
@@ -11126,7 +11126,7 @@
         "scenario": "managed.p4-store-preserved-and-automatically-rebuilt",
         "failBefore": "unavailable"
       },
-      "notes": "Journey scripts/e2e-managed-p4-rebuild.mjs (p4_store_is_preserved_and_automatically_rebuilt_from_text) is registered in tests/ui-regressions/e2e-contracts.json with an exact-safety-interoperability contract for private-byte and source preservation and a core-operation contract for automatic recovery plus edit/save/reopen, and is selected by the run-e2e.mjs suite managed-p4-rebuild. It needs a P4-built producer (TINE_P4_APP) beside the exact candidate (TINE_APP); the P1 lane had no P4 arm, so the journey has not run and failBefore stays unavailable. No new notice, prompt or decision is introduced; the existing graph-open blank-slate lifecycle archives every private byte and reactivates the one current format."
+      "notes": "Journey scripts/e2e-managed-p4-rebuild.mjs (p4_store_is_preserved_and_automatically_rebuilt_from_text) is registered in tests/ui-regressions/e2e-contracts.json with an exact-safety-interoperability contract for private-byte and source preservation and a core-operation contract for automatic recovery plus edit/save/reopen, and is selected by the run-e2e.mjs suite managed-p4-rebuild. It needs a P4-built producer (TINE_P4_APP) beside the exact candidate (TINE_APP); the journey has now run green at candidate 94db49a7 with TINE_P4_APP built from base 1c2707fc, so a genuine per-block producer was used; failBefore stays unavailable because the pre-P1 app IS the P4 writer and therefore never meets foreign P4 bytes, so no build exists in which the journey's premise can fail without deliberately disabling the blank-slate rebuild lifecycle. No new notice, prompt or decision is introduced; the existing graph-open blank-slate lifecycle archives every private byte and reactivates the one current format."
     }
   ]
 }

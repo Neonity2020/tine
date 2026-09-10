@@ -137,6 +137,16 @@ const suites = {
     }],
     ["sparse-v2-two-device-real", "scripts/e2e-sparse-v2-two-device.mjs", {
       TINE_MANAGED_SYNC_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
+      // Same script as the two synthetic sparse-v2 legs, over the 1,046-file
+      // anonymized corpus, so it is the heaviest of the three and was the only
+      // one left on the bare 180s default. It finishes in ~157-164s alone, i.e.
+      // ~9% inside that ceiling, and does not finish inside it when it follows
+      // other native journeys: on 2026-09-10 it was SIGKILLed at 180.1s in
+      // phase device-b-final-receive (7 of 11) with no assertion failed, then
+      // passed standalone at 157.2s on the same binary. Wall clock is not one
+      // of this journey's four declared user outcomes, so the default was
+      // measuring machine contention rather than the product.
+      E2E_SCENARIO_TIMEOUT_MS: "240000",
     }],
   ],
   "linux-smoke": [
