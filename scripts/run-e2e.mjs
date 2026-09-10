@@ -137,16 +137,17 @@ const suites = {
     }],
     ["sparse-v2-two-device-real", "scripts/e2e-sparse-v2-two-device.mjs", {
       TINE_MANAGED_SYNC_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
-      // Same script as the two synthetic sparse-v2 legs, over the 1,046-file
-      // anonymized corpus, so it is the heaviest of the three and was the only
-      // one left on the bare 180s default. It finishes in ~157-164s alone, i.e.
-      // ~9% inside that ceiling, and does not finish inside it when it follows
-      // other native journeys: on 2026-09-10 it was SIGKILLed at 180.1s in
-      // phase device-b-final-receive (7 of 11) with no assertion failed, then
-      // passed standalone at 157.2s on the same binary. Wall clock is not one
-      // of this journey's four declared user outcomes, so the default was
-      // measuring machine contention rather than the product.
-      E2E_SCENARIO_TIMEOUT_MS: "240000",
+      // Deliberately NO E2E_SCENARIO_TIMEOUT_MS here. A per-scenario entry is
+      // merged AFTER process.env (see `env` below), so it OVERRIDES the suite's
+      // own ceiling rather than raising a bare default. This suite is invoked as
+      // `npm run e2e:linux:managed-real-release`, which already exports
+      // E2E_SCENARIO_TIMEOUT_MS=1800000 for the whole run; an entry of "240000"
+      // here silently cut this leg from 30 minutes to 4. That is exactly what
+      // this line used to do, and it is why the leg was SIGKILLed at 240.1s on
+      // 2026-09-10 while passing standalone at 157-164s.
+      //
+      // If you are running this scenario by hand, set the ceiling on the
+      // PROCESS, the way the npm script does — do not add it here.
     }],
   ],
   "linux-smoke": [
