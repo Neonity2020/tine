@@ -3033,6 +3033,34 @@ pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
 }
 
 #[cfg(test)]
+/// Release a projection so the SAME database can be reattached.
+///
+/// `Drop` deliberately does NOT wait for the worker (see
+/// [`DirectProjection::close_and_wait_for_worker`]: an app teardown must not
+/// block on SQLite), and the worker releases its exclusive writer lease only
+/// just before it publishes its exit. So a fixture that drops one graph and
+/// immediately reattaches the same path can find the lease still held. The
+/// second instance then never becomes ready -- by design, proven by
+/// `concurrent_graph_instance_cannot_replace_ready_projection_facts` -- and
+/// `wait_ready` spins its whole 15s before panicking "did not converge" with
+/// `cache_generation=0`, naming the reopen rather than the handoff.
+///
+/// That is not hypothetical: it is what took down the Linux release
+/// selection on 2026-09-09, on a loaded hosted runner, in two tests that
+/// pass locally in 0.05s. Every fixture that reopens a projection database
+/// calls this first.
+pub(crate) fn release_projection(graph: &crate::model::Graph) {
+    let Some(projection) = graph.direct_projection_test() else {
+        return;
+    };
+    assert!(
+        projection.close_and_wait_for_worker(std::time::Duration::from_secs(15)),
+        "the projection worker did not release its writer lease, so reattaching \
+         the same database would race it"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn direct_query_producer_has_no_saved_edit_or_answer_cache_protocol() {
@@ -3126,103 +3154,79 @@ mod tests {
     }
 
     /// Reopening a projection database without releasing the previous worker is
-    /// a race, so no fixture may do it.
+    /// a race, so no fixture in this crate may do it.
     ///
-    /// This is a source scan because the defect is invisible at runtime on a fast
-    /// machine: the two tests that took down the Linux release selection on
+    /// This is a source scan because the defect is invisible at runtime on a
+    /// fast machine: the tests that took down the Linux release selection on
     /// 2026-09-09 pass locally in 0.05s and failed on a loaded hosted runner
-    /// after the full 15s `wait_ready` deadline, reporting `cache_generation=0`
-    /// and `Resource temporarily unavailable (os error 11)`. Eight of the twelve
-    /// sites had already half-noticed it and slept 20ms, which is a guess about
-    /// a handoff nobody observed; `release_projection` waits for the actual
-    /// signal instead. Add the call -- do not add a sleep.
+    /// after their full readiness deadline, reporting `cache_generation=0` and
+    /// `Resource temporarily unavailable (os error 11)`.
+    ///
+    /// It walks the WHOLE crate, deliberately. The first version of this guard
+    /// scanned only `direct_projection.rs`, the file whose fixtures had failed --
+    /// and the very next CI run failed on
+    /// `the_public_ir_route_answers_a_warm_reopen_without_parsing`, the same
+    /// shape one module over, which a file-scoped scan could never see.
     #[test]
     fn every_fixture_that_reopens_a_projection_database_releases_the_previous_worker() {
-        const SOURCE: &str = include_str!("direct_projection.rs");
         // Deliberate exception: this test IS the two-live-owners scenario, and
         // its second instance must meet a held lease.
         const TWO_OWNERS: &str = "concurrent_graph_instance_cannot_replace_ready_projection_facts";
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-        let mut offenders: Vec<&str> = Vec::new();
-        let mut current = "<file scope>";
-        let mut attaches = 0usize;
-        let mut releases = 0usize;
-        let mut flush =
-            |name: &'static str, attaches: usize, releases: usize| -> Option<&'static str> {
-                (attaches >= 2 && releases == 0 && name != TWO_OWNERS).then_some(name)
-            };
-        for line in SOURCE.lines() {
-            if let Some(rest) = line
-                .strip_prefix("    fn ")
-                .or_else(|| line.strip_prefix("    pub(crate) fn "))
-            {
-                if let Some(offender) = flush(
-                    Box::leak(current.to_owned().into_boxed_str()),
-                    attaches,
-                    releases,
-                ) {
-                    offenders.push(offender);
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the crate source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    out.push(path);
                 }
-                current = Box::leak(
-                    rest.split('(')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_owned()
-                        .into_boxed_str(),
-                );
-                attaches = 0;
-                releases = 0;
-            }
-            if line.contains("attach_direct_projection(database") {
-                attaches += 1;
-            }
-            if line.contains("release_projection(&") {
-                releases += 1;
             }
         }
-        if let Some(offender) = flush(
-            Box::leak(current.to_owned().into_boxed_str()),
-            attaches,
-            releases,
-        ) {
-            offenders.push(offender);
+        let mut files = Vec::new();
+        rust_files(&source_root, &mut files);
+        files.sort();
+        assert!(
+            files.len() > 10,
+            "the scan found {} source files, so it is not looking at the crate",
+            files.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("a readable source file");
+            let mut current = String::from("<file scope>");
+            let (mut attaches, mut releases) = (0usize, 0usize);
+            for line in text.lines().chain(std::iter::once("fn <end of file>(")) {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed
+                    .strip_prefix("fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                {
+                    if attaches >= 2 && releases == 0 && current != TWO_OWNERS {
+                        offenders.push(format!("{}::{current}", file.display()));
+                    }
+                    current = rest.split('(').next().unwrap_or_default().trim().to_owned();
+                    attaches = 0;
+                    releases = 0;
+                }
+                if line.contains("attach_direct_projection(database") {
+                    attaches += 1;
+                }
+                if line.contains("release_projection(&") {
+                    releases += 1;
+                }
+            }
         }
 
         assert!(
             offenders.is_empty(),
-            "these fixtures reattach the same projection database without calling \
-             release_projection first, so the reopen races the previous worker's \
-             exclusive writer lease and fails only under load: {offenders:?}. Call \
-             release_projection(&graph) as the last statement of the first session; \
-             a sleep is a guess, not a handoff."
-        );
-    }
-
-    /// Release a projection so the SAME database can be reattached.
-    ///
-    /// `Drop` deliberately does NOT wait for the worker (see
-    /// [`DirectProjection::close_and_wait_for_worker`]: an app teardown must not
-    /// block on SQLite), and the worker releases its exclusive writer lease only
-    /// just before it publishes its exit. So a fixture that drops one graph and
-    /// immediately reattaches the same path can find the lease still held. The
-    /// second instance then never becomes ready -- by design, proven by
-    /// `concurrent_graph_instance_cannot_replace_ready_projection_facts` -- and
-    /// `wait_ready` spins its whole 15s before panicking "did not converge" with
-    /// `cache_generation=0`, naming the reopen rather than the handoff.
-    ///
-    /// That is not hypothetical: it is what took down the Linux release
-    /// selection on 2026-09-09, on a loaded hosted runner, in two tests that
-    /// pass locally in 0.05s. Every fixture that reopens a projection database
-    /// calls this first.
-    fn release_projection(graph: &Graph) {
-        let Some(projection) = graph.direct_projection_test() else {
-            return;
-        };
-        assert!(
-            projection.close_and_wait_for_worker(Duration::from_secs(15)),
-            "the projection worker did not release its writer lease, so reattaching \
-             the same database would race it"
+            "these fixtures reattach the same projection database without releasing the \
+             previous worker, so the reopen races its exclusive writer lease and fails only \
+             under load: {offenders:#?}. Call release_projection(&graph) as the last statement \
+             of the first session; a sleep is a guess, not a handoff."
         );
     }
 

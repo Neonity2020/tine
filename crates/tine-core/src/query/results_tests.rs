@@ -3277,6 +3277,7 @@ fn the_public_ir_route_answers_a_warm_reopen_without_parsing() {
             .expect("the projection worker starts");
         graph.warm_cache();
         ret1_wait_ready(&graph);
+        crate::direct_projection::release_projection(&graph);
     }
 
     let graph = crate::model::Graph::open(&root);
