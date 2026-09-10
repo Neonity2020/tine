@@ -11,7 +11,7 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
-import { createReferenceFetcher } from "../lib/referenceFetch";
+import { createReferenceFetcher, referenceIndexPendingMessage } from "../lib/referenceFetch";
 import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
@@ -106,7 +106,7 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
           <span class="references-count">{count()}</span>
         </Show>
         <Show when={groups.loading}>
-          <span class="references-loading"> {indexPending()?.message ?? "Loading…"}</span>
+          <span class="references-loading"> {referenceIndexPendingMessage(indexPending()) ?? "Loading…"}</span>
         </Show>
         <button
           type="button"

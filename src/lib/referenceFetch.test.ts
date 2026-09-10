@@ -77,3 +77,16 @@ describe("createReferenceFetcher", () => {
     });
   });
 });
+
+describe("referenceIndexPendingMessage", () => {
+  it("states the panel's own subject, and keeps the rebuild distinction", async () => {
+    const { referenceIndexPendingMessage } = await import("./referenceFetch");
+    expect(referenceIndexPendingMessage(null)).toBeNull();
+    expect(referenceIndexPendingMessage(new QueryNotReadyError("indexing"))).toBe("indexing…");
+    expect(referenceIndexPendingMessage(new QueryNotReadyError("pending_edits"))).toBe("indexing…");
+    expect(referenceIndexPendingMessage(new QueryNotReadyError("busy"))).toBe("indexing…");
+    expect(referenceIndexPendingMessage(new QueryNotReadyError("recovering"))).toBe(
+      "rebuilding the index…"
+    );
+  });
+});

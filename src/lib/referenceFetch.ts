@@ -16,6 +16,17 @@ import { classifyReferenceLoadError, type ReferenceLoadError } from "./reference
  * without the unmount half, a disposed panel would keep retrying forever
  * because its captured page name never changes.
  */
+/** What a references panel says while it waits for the index.
+ *
+ * `QueryNotReadyError.message` is worded for a query block ("Updating query
+ * results…"), which reads as the wrong subject beside a reference count. The
+ * distinction it carries — a rebuild takes noticeably longer than a catch-up —
+ * is worth keeping, so restate it rather than dropping it. */
+export function referenceIndexPendingMessage(error: QueryNotReadyError | null): string | null {
+  if (!error) return null;
+  return error.reasonCode === "recovering" ? "rebuilding the index…" : "indexing…";
+}
+
 export function createReferenceFetcher(options: {
   /** The page the panel is currently showing, read live. */
   currentName: () => string;
