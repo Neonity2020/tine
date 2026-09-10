@@ -869,21 +869,18 @@ impl SemanticEffect {
             })
             .map_err(|_| SemanticError::InvalidBlockReconstruction)?;
         let delta = &mut self.blocks[index];
-        let reconstructable_absence = delta.before.is_none()
-            || matches!(
-                (&delta.before, &delta.after),
-                (
-                    Some(BlockState {
-                        owner: BlockOwner::Tombstone,
-                        ..
-                    }),
-                    Some(BlockState {
-                        owner: BlockOwner::Page(_),
-                        ..
-                    })
-                )
-            );
-        if !reconstructable_absence || delta.after.is_none() {
+        // One rule, one implementation: `validate` re-checks the same predicate on
+        // the receiving side, and when these two drifted apart the author could
+        // build an effect the receiver would refuse -- which is how a conflict
+        // settlement became unauthorable while the receiver was ready to take it.
+        let reconstructable = match (&delta.before, &delta.after) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(before), Some(after)) => {
+                reconstruction_may_replace_live_state(&source, before, after)
+            }
+        };
+        if !reconstructable {
             return Err(SemanticError::InvalidBlockReconstruction);
         }
         delta.birth = None;
@@ -1139,9 +1136,9 @@ impl SemanticEffect {
                 }
                 (Some(before), Some(after))
                     if delta.birth.is_some()
-                        || (delta.reconstruction.is_some()
-                            && !(before.owner == BlockOwner::Tombstone
-                                && matches!(after.owner, BlockOwner::Page(_)))) =>
+                        || delta.reconstruction.as_ref().is_some_and(|source| {
+                            !reconstruction_may_replace_live_state(source, before, after)
+                        }) =>
                 {
                     return Err(SemanticError::InvalidBlockReconstruction);
                 }
@@ -1217,6 +1214,35 @@ pub struct CanonicalSnapshot {
     pub blocks: Vec<BlockState>,
     pub memberships: Vec<VisibleMembership>,
     pub path_conflicts: Vec<(ManagedPath, Vec<PageId>)>,
+}
+
+/// Whether a reconstruction may land on a block that is already live.
+///
+/// Ordinarily it may not: a reconstruction revives something that is gone, so it
+/// belongs on a `None -> Some` transition, or on the pre-P2 `Tombstone -> Page`
+/// shape. Overwriting a live block would otherwise be a way to launder arbitrary
+/// content past the identity checks.
+///
+/// A conflict settlement is the exception, and it is not optional. When a page
+/// revival reconstructs a block while another device edits it, the revival's fresh
+/// text container wins the content-map key and orphans the one the edit mutated.
+/// The block is left LIVE holding the deletion before-image, so the settlement
+/// that puts the concurrent edit back is `Page -> Page`. Refusing that shape does
+/// not protect anything -- it just makes the edit unrecoverable.
+fn reconstruction_may_replace_live_state(
+    source: &BlockReconstructionSource,
+    before: &BlockState,
+    after: &BlockState,
+) -> bool {
+    if !matches!(after.owner, BlockOwner::Page(_)) {
+        return false;
+    }
+    match before.owner {
+        BlockOwner::Tombstone => true,
+        BlockOwner::Page(_) => {
+            matches!(source, BlockReconstructionSource::ConflictAfterImage { .. })
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

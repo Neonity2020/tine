@@ -6593,7 +6593,12 @@ fn verify_lazy_genesis_page_checkpoint(
             "lazy genesis page checkpoint header differs from its capsule".into(),
         ));
     }
-    let blocks = read_all_blocks(expected.home_document_id, &document)?;
+    let (blocks, sparse) = read_all_blocks(expected.home_document_id, &document)?;
+    if !sparse.is_empty() {
+        return Err(EngineError::InvalidCrdt(
+            "lazy genesis page checkpoint carries a block with no text".into(),
+        ));
+    }
     let memberships = read_memberships(expected.home_document_id, &document)?;
     if blocks.len() != expected.blocks.len() || memberships.len() != expected.blocks.len() {
         return Err(EngineError::InvalidCrdt(
@@ -21605,14 +21610,43 @@ impl ShardedHotEngine {
                     "reconstruction semantic effect has no live post-state".into(),
                 )
             })?;
-            if delta.before.as_ref().is_some_and(|before| {
-                before.owner != BlockOwner::Tombstone
-                    || before.block_id != selected.block_id
-                    || before.home_document_id != selected.home_document_id
-                    || before.content != selected.content
-                    || before.logseq_uuid != selected.logseq_uuid
-                    || before.logseq_identity_origin != selected.logseq_identity_origin
-            }) || after.block_id != selected.block_id
+            // What a reconstruction is allowed to overwrite depends on whether it
+            // is settling a conflict.
+            //
+            // An ordinary Restore revives something that is gone: physical
+            // deletion leaves no live state, so `before` is absent (a Tombstone
+            // owner matching the source is the pre-P2 shape and stays accepted).
+            //
+            // A conflict settlement is different, and requiring absence here is
+            // what lost data. When a page revival reconstructs a block while an
+            // offline peer edits it, the revival's fresh text container wins the
+            // content-map key and orphans the container carrying that edit. The
+            // block is therefore LIVE, with the before-image's content, and the
+            // settlement that restores the edit is a Some -> Some transition. It
+            // must be authorable, or the concurrent edit is unrecoverable. The
+            // identity is still pinned to the authenticated source; only the
+            // content may differ, which is exactly what the settlement carries.
+            let before_is_valid = match &delta.before {
+                None => true,
+                Some(before) => {
+                    before.block_id == selected.block_id
+                        && before.home_document_id == selected.home_document_id
+                        && before.logseq_uuid == selected.logseq_uuid
+                        && before.logseq_identity_origin == selected.logseq_identity_origin
+                        && match before.owner {
+                            // The pre-P2 shape, and still the one a same-batch
+                            // birth-then-retirement restore produces: the source
+                            // is being revived exactly as it was.
+                            BlockOwner::Tombstone => before.content == selected.content,
+                            // Live only when settling a conflict, where the block
+                            // is live precisely BECAUSE a racing reconstruction
+                            // already put the wrong content there.
+                            BlockOwner::Page(_) => conflict,
+                        }
+                }
+            };
+            if !before_is_valid
+                || after.block_id != selected.block_id
                 || after.home_document_id != selected.home_document_id
                 || after.logseq_uuid != selected.logseq_uuid
                 || after.logseq_identity_origin != selected.logseq_identity_origin
@@ -27101,7 +27135,7 @@ fn validated_shard_source_data(
 > {
     validate_shard_metadata(catalog_document_id, document_id, document)?;
     let preamble = read_page_preamble(document_id, document)?;
-    let blocks = read_all_blocks(document_id, document)?;
+    let (blocks, _sparse) = read_all_blocks(document_id, document)?;
     let memberships = read_memberships(document_id, document)?;
     Ok((preamble, blocks, memberships))
 }
@@ -27287,7 +27321,7 @@ fn snapshot_document(
                 })
             })
             .transpose()?;
-        let blocks = read_all_blocks(document_id, document)?;
+        let (blocks, _sparse) = read_all_blocks(document_id, document)?;
         let memberships = read_memberships(document_id, document)?;
         #[cfg(test)]
         record_owned_semantic_snapshot_entries(blocks.len().saturating_add(memberships.len()));
@@ -28414,19 +28448,32 @@ fn shard_page_id(document: &LoroDoc) -> Result<Option<PageId>, EngineError> {
         .transpose()
 }
 
+/// Every block this shard's owner register names, split into the settled ones and
+/// the sparse ones an unresolved real-delete race left behind (see
+/// [`ShardBlockRead`]). The sparse set is returned rather than skipped so that no
+/// caller can silently lose a block it did not know to look for; the callers that
+/// author or validate a live shard must tolerate it, because refusing the whole
+/// document is what blocked the settlement that clears it.
 fn read_all_blocks(
     document_id: DocumentId,
     document: &LoroDoc,
-) -> Result<BTreeMap<BlockId, BlockState>, EngineError> {
+) -> Result<(BTreeMap<BlockId, BlockState>, BTreeSet<BlockId>), EngineError> {
     let owners = document.get_map(SHARD_OWNERS);
     let content = document.get_map(SHARD_CONTENT);
     let logseq_uuids = document.get_map(SHARD_LOGSEQ_UUIDS);
     let logseq_origins = document.get_map(SHARD_LOGSEQ_IDENTITY_ORIGINS);
     let mut result = BTreeMap::new();
+    let mut sparse = BTreeSet::new();
     for key in owners.keys() {
         let block_id = parse_block_key(document_id, &key)?;
-        if let Some(state) = read_block_state(document_id, document, block_id)? {
-            result.insert(block_id, state);
+        match read_block_state_detailed(document_id, document, block_id)? {
+            ShardBlockRead::Live(state) => {
+                result.insert(block_id, *state);
+            }
+            ShardBlockRead::Sparse => {
+                sparse.insert(block_id);
+            }
+            ShardBlockRead::Absent => {}
         }
     }
     for key in content.keys() {
@@ -28470,20 +28517,45 @@ fn read_all_blocks(
             reason: "Logseq UUID and identity-origin key coverage differs".into(),
         });
     }
-    Ok(result)
+    Ok((result, sparse))
 }
 
-fn read_block_state(
+/// What a shard's owner register says about one block.
+///
+/// `Sparse` is the honest intermediate a real-delete race leaves behind: physical
+/// deletion removes the owner, content, UUID and identity-origin keys, but a
+/// concurrent move rewrites only the OWNER key, and Loro's map merge decides each
+/// key independently. The surviving owner therefore names a block with no text
+/// container. It is neither live nor absent, and it lasts until the deterministic
+/// conflict actor authors the settlement.
+///
+/// This must not be flattened back into `Option`. Reading it as absent silently
+/// loses a block that damaged private state would also present this way; reading
+/// it as an error refuses every edit to the whole shard -- including the very
+/// settlement that repairs it, which is how it wedged
+/// `two_offline_move_delete_histories_converge_in_both_delivery_orders` into an
+/// unbounded retry. The malformed-vs-honest decision needs the conflict index and
+/// so belongs to `ShardedHotEngine::materialize_page`, which owns it; a free
+/// function here cannot make that call and must not pretend to.
+enum ShardBlockRead {
+    Live(Box<BlockState>),
+    Sparse,
+    Absent,
+}
+
+fn read_block_state_detailed(
     document_id: DocumentId,
     document: &LoroDoc,
     block_id: BlockId,
-) -> Result<Option<BlockState>, EngineError> {
+) -> Result<ShardBlockRead, EngineError> {
     let Some(owner) = map_string(&document.get_map(SHARD_OWNERS), &block_id.to_string())? else {
-        return Ok(None);
+        return Ok(ShardBlockRead::Absent);
     };
-    let content = block_text(document, block_id)
-        .ok_or_else(|| EngineError::InvalidCrdt(format!("block {block_id} has no text")))?
-        .to_string();
+    let Some(text) = block_text(document, block_id) else {
+        return Ok(ShardBlockRead::Sparse);
+    };
+    let content = text.to_string();
+
     let logseq_uuid = read_logseq_uuid(document_id, document, block_id)?;
     let logseq_identity_origin = read_logseq_identity_origin(document_id, document, block_id)?;
     if logseq_uuid.is_some() != logseq_identity_origin.is_some() {
@@ -28494,14 +28566,32 @@ fn read_block_state(
             ),
         });
     }
-    Ok(Some(BlockState {
+    Ok(ShardBlockRead::Live(Box::new(BlockState {
         block_id,
         home_document_id: document_id,
         owner: parse_owner(&owner)?,
         logseq_uuid,
         logseq_identity_origin,
         content,
-    }))
+    })))
+}
+
+/// The strict read: a shard that is expected to be settled has no sparse blocks,
+/// so one here is a defect worth naming rather than skipping. Callers that run
+/// against a document which may still carry an unresolved real-delete race use
+/// `read_block_state_detailed` and decide for themselves.
+fn read_block_state(
+    document_id: DocumentId,
+    document: &LoroDoc,
+    block_id: BlockId,
+) -> Result<Option<BlockState>, EngineError> {
+    match read_block_state_detailed(document_id, document, block_id)? {
+        ShardBlockRead::Live(state) => Ok(Some(*state)),
+        ShardBlockRead::Sparse => Err(EngineError::InvalidCrdt(format!(
+            "block {block_id} has no text"
+        ))),
+        ShardBlockRead::Absent => Ok(None),
+    }
 }
 
 fn read_logseq_identity_origin(
@@ -29046,6 +29136,74 @@ pub(crate) mod validation_tests {
     use super::*;
     use crate::oplog::lazy_genesis::LazyGenesisBlockInput;
 
+    /// A sparse block -- an owner register whose text container is gone -- must
+    /// read as sparse, never as an error and never as absent.
+    ///
+    /// Physical deletion removes the owner, content, UUID and identity-origin
+    /// keys together, but Loro merges each map key independently, so a
+    /// concurrent move that rewrites only the OWNER key leaves this behind. It
+    /// is honest, transient state.
+    ///
+    /// Tightening this back into an error is not hardening. Shard validation
+    /// and working-document snapshotting are DOCUMENT-scoped, so refusing one
+    /// sparse block refuses every edit to that page -- including the conflict
+    /// settlement that clears it. That is how
+    /// `two_offline_move_delete_histories_converge_in_both_delivery_orders`
+    /// stopped terminating: the conflict actor retried an author that could
+    /// never succeed. Reading it as absent is the opposite failure, silently
+    /// losing a block that damaged private state also presents this way.
+    ///
+    /// The malformed-versus-honest decision needs the conflict index and so
+    /// belongs to `materialize_page`, which makes it. See the sparse-block
+    /// rules in `docs/storage-sync-contract.md`.
+    #[test]
+    fn a_sparse_block_reads_as_sparse_and_does_not_refuse_the_whole_shard() {
+        let document_id = DocumentId::from_uuid(Uuid::from_u128(9_100));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(9_101));
+        let page_id = PageId::from_uuid(Uuid::from_u128(9_102));
+        let document = LoroDoc::new();
+        let key = block_id.to_string();
+        document
+            .get_map(SHARD_OWNERS)
+            .insert(&key, page_id.to_string())
+            .unwrap();
+        document
+            .get_map(SHARD_CONTENT)
+            .insert_container(&key, LoroText::new())
+            .unwrap()
+            .insert(0, "text that a concurrent physical delete removes")
+            .unwrap();
+
+        assert!(matches!(
+            read_block_state_detailed(document_id, &document, block_id).unwrap(),
+            ShardBlockRead::Live(_)
+        ));
+
+        // The delete half of the race: content goes, the move's owner write stays.
+        document.get_map(SHARD_CONTENT).delete(&key).unwrap();
+
+        assert!(
+            matches!(
+                read_block_state_detailed(document_id, &document, block_id).unwrap(),
+                ShardBlockRead::Sparse
+            ),
+            "an owner register with no text container must read as Sparse, not \
+             Live and not Absent"
+        );
+        let (live, sparse) = read_all_blocks(document_id, &document).expect(
+            "read_all_blocks must tolerate a sparse block: it is document-scoped, so \
+             refusing here refuses every edit to the page, including the conflict \
+             settlement that clears the sparse state",
+        );
+        assert!(live.is_empty(), "a sparse block is not a live block");
+        assert_eq!(
+            sparse,
+            BTreeSet::from([block_id]),
+            "a sparse block must be REPORTED, not skipped: silently dropping it \
+             loses a block that damaged private state presents the same way"
+        );
+    }
+
     /// I-11 / I-8 — the acceptance-only refusal census is enforced, not
     /// asserted in prose.
     ///
@@ -29399,9 +29557,9 @@ pub(crate) mod validation_tests {
     ) -> BTreeMap<(DocumentId, BlockId), BlockState> {
         let mut states = BTreeMap::new();
         for (document_id, document) in documents {
-            for (block_id, state) in read_all_blocks(*document_id, document)
-                .expect("observable terminal documents have canonical block state")
-            {
+            let (live, _sparse) = read_all_blocks(*document_id, document)
+                .expect("observable terminal documents have canonical block state");
+            for (block_id, state) in live {
                 states.insert((*document_id, block_id), state);
             }
         }
@@ -35382,7 +35540,8 @@ pub(crate) fn probe_pruned_checkpoint_bytes(
         }
         validate_catalog(catalog, &document)?;
     } else {
-        for (block, state) in read_all_blocks(dependencies.document_id(), &document)? {
+        let (live_blocks, _sparse) = read_all_blocks(dependencies.document_id(), &document)?;
+        for (block, state) in live_blocks {
             if state.owner == BlockOwner::Tombstone {
                 for root in [
                     SHARD_OWNERS,

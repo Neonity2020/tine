@@ -885,10 +885,56 @@ fn revive_page_concurrent_remote_edit_uses_ordinary_crdt_merge() {
                 "concurrent revive outcome: {outcome:?}"
             );
         }
-        peer.canonical_snapshot().unwrap()
+        peer
     };
-    let revival_then_edit = converge(revival.clone(), remote_edit.clone());
-    let edit_then_revival = converge(remote_edit, revival);
+    let mut revive_first = converge(revival.clone(), remote_edit.clone());
+    let mut edit_first = converge(remote_edit.clone(), revival.clone());
+
+    // Revival reconstructs the block with a FRESH text container, which wins the
+    // content-map key and orphans the container the offline edit mutated. The
+    // merge alone therefore shows the deletion before-image, and the concurrent
+    // edit survives only because the race is reported and settled. Applying that
+    // settlement is the user outcome this test exists for; asserting on the raw
+    // merge would assert that the edit is lost.
+    let settlement = revive_first
+        .conflict_resolution_intents(remote_edit.manifest().batch_id())
+        .unwrap()
+        .into_iter()
+        .find_map(|intent| match intent {
+            ConflictResolutionIntent::RestoreEdited {
+                page_id,
+                block,
+                claim,
+                source,
+                ..
+            } => Some((page_id, block, claim, source)),
+            _ => None,
+        })
+        .expect("a revival racing a concurrent edit must report the race");
+    let (page_id, block, claim, source) = settlement;
+    let resolution = revive_first
+        .prepare_fixture_transaction(
+            author(40_203, 40_203),
+            &tx(vec![SemanticOperation::RestoreSubtree {
+                page_id,
+                blocks: vec![BlockRestore {
+                    block,
+                    claim,
+                    source,
+                }],
+            }]),
+        )
+        .unwrap();
+    let resolution = ready(&archive, &resolution);
+    for peer in [&mut revive_first, &mut edit_first] {
+        let outcome = peer.stage_ready(resolution.clone());
+        assert!(
+            matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+            "settlement outcome: {outcome:?}"
+        );
+    }
+    let revival_then_edit = revive_first.canonical_snapshot().unwrap();
+    let edit_then_revival = edit_first.canonical_snapshot().unwrap();
     assert_eq!(revival_then_edit, edit_then_revival);
     assert!(matches!(
         revival_then_edit

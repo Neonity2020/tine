@@ -1789,12 +1789,40 @@ Reconstruction applies those scenarios at these concrete call sites:
 
 | Condition | Scenario ID | In-scope failure and required response |
 | --- | --- | --- |
-| Selected batch/object is still arriving | `MS-REF-CRASH-TRUNCATED` | Interrupted sync delivery has not supplied the manifest-bound semantic effect. Keep Restore retryable, preserve the selector and source bytes, and never synthesize empty text. |
-| Accepted source is missing or damaged in both archive tiers | `MS-REF-DISK-CORRUPT` | Disk/media failure removed or changed the selected immutable object. Use existing archive repair where possible; otherwise fail the affected action naming the exact batch/object. |
+| Selected batch/object is still arriving | `MS-REF-CRASH-TRUNCATED` | Interrupted sync delivery has not supplied the manifest-bound semantic effect. Keep Restore retryable, preserve the selector and source bytes, and never synthesize empty text. Surfaces as the retryable application conflict `RestoreSourceStillArriving`, never as unknown-block. |
+| Accepted source is missing or damaged in both archive tiers | `MS-REF-DISK-CORRUPT` | Disk/media failure removed or changed the selected immutable object. Use existing archive repair where possible; otherwise fail the affected action naming the exact batch/object. Surfaces as the bounded editor refusal code `restore_source.disk_corrupt` with the batch/object in debug detail. |
 | One immutable source identity has conflicting bytes | `MS-REF-SYNC-CONFLICT` | Provider delivery produced a stable immutable collision. Preserve both pieces of evidence and never select by arrival order or mtime. |
 | Reconstruction names the wrong block/home, is malformed, or exceeds an existing bound | `MS-REF-MALFORMED-IMPORT` / `MS-REF-BOUNDS` | Malformed imported/shared operation input attempts identity substitution or excess allocation. Reject before publication or allocation beyond the bound. |
 | Imported reconstruction update, source and declared effect disagree | `MS-REF-MALFORMED-IMPORT` | Malformed peer/import input substitutes content, identity, placement, or container operations. Reject the complete batch atomically; install no document or replacement. |
 | Restore planning state advances | `MS-REF-STALE-GENERATION` | An honest concurrent operation changed the page/frontier after validation. Re-diff through the existing bounded retry/action cursor; do not publish the stale plan. |
+
+A page shard may transiently hold a **sparse block**: an owner register naming a
+block whose text container is absent. Physical deletion removes the owner,
+content, Logseq UUID and identity-origin keys together, but Loro resolves each
+map key independently, so a concurrent move -- which rewrites only the owner key
+-- leaves the owner behind while the content key stays deleted. This state is
+honest, not damage, and it lasts until the deterministic conflict actor authors
+the settlement.
+
+Two rules follow, and neither is optional:
+
+- **Validation tolerates it; it does not refuse.** Shard validation and working-
+  document snapshotting are document-scoped, so refusing a sparse block refuses
+  every edit to that page -- including the settlement that clears it. That is not
+  hardening, it is an availability bug with no in-scope scenario behind it: it
+  wedged the conflict actor into unbounded retry. The malformed-versus-honest
+  decision is made where the conflict index is available, in page
+  materialization, which reports `MalformedDocument` for a sparse block with no
+  unresolved accepted pair (`MS-REF-MALFORMED-IMPORT` / `MS-REF-DISK-CORRUPT`).
+- **A reconstruction may land on a live block only when settling a conflict.** A
+  page revival that reconstructs a block while another device edits it attaches a
+  fresh text container, which wins the content-map key and orphans the container
+  carrying that edit; the block is therefore live holding the deletion
+  before-image, and the settlement restoring the edit is a `Page -> Page`
+  transition. Ordinary reconstruction stays restricted to absence or the
+  `Tombstone -> Page` shape. Author-side marking and receiver-side validation
+  share one implementation of this predicate, because when they drifted the
+  author could build an effect the receiver would have accepted.
 
 One bound, not a refusal, applies to the same path. Editor undo resolves a
 deleted identity by walking the page shard's accepted ancestry newest-first,
