@@ -932,9 +932,7 @@ fn capture_activation_page_records(
             let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
             terminal_blocks.push(super::MaterializedBlockInput {
                 block_id,
-                // Each block is born in its own document, distinct from the
-                // page's, so the pair of the two addresses its membership.
-                home_document_id: DocumentId::for_unmatched_import_block(workspace_id, block_id),
+                home_document_id,
                 parent,
                 order: imported_order(tree.nodes[index].sibling_position),
                 content: std::mem::take(&mut tree.nodes[index].raw),
@@ -1031,8 +1029,8 @@ fn lazy_genesis_page_input(
         kind: record.page.kind,
         preamble: record.page.preamble.clone(),
         blocks,
-        document_checkpoints: Vec::new(),
-        document_dependencies: Vec::new(),
+        document_checkpoint: Vec::new(),
+        document_dependencies: None,
         sqlite_receipt: crate::oplog::lazy_genesis::LazyGenesisSqliteReceiptV1::new(
             &record.exact_source_bytes,
             sqlite_page,
@@ -1099,8 +1097,7 @@ fn build_lazy_genesis_from_activation_records(
         source_capture,
         working,
     )?;
-    let mut checkpoints =
-        LazyGenesisCheckpointBuilder::new(catalog_document_id, workspace_id, lineage_digest)?;
+    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
     for page_id in pages.path_order() {
         let record = pages.page(*page_id)?.ok_or_else(|| {
             BootstrapStreamingImportError::InvalidOperation(
@@ -1120,10 +1117,9 @@ fn build_lazy_genesis_from_activation_records(
             .collect();
         let sqlite_page = record.sqlite_page();
         let mut page = lazy_genesis_page_input(&record, &sqlite_page)?;
-        let (document_checkpoints, document_dependencies) =
-            checkpoints.push_page(&page, &page_assignments)?;
-        page.document_checkpoints = document_checkpoints;
-        page.document_dependencies = document_dependencies;
+        let (checkpoint, dependencies) = checkpoints.push_page(&page, &page_assignments)?;
+        page.document_checkpoint = checkpoint;
+        page.document_dependencies = Some(dependencies);
         lazy_genesis.push(page)?;
     }
     let (catalog_checkpoint, catalog_dependencies) = checkpoints.finish()?;
@@ -1258,8 +1254,7 @@ fn build_clean_activation_candidates(
         source_capture,
         working,
     )?;
-    let mut checkpoints =
-        LazyGenesisCheckpointBuilder::new(catalog_document_id, workspace_id, lineage_digest)?;
+    let mut checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
     let mut sqlite = super::sqlite::CleanGenesisProjectionBuilder::new(
         database_path,
         super::ProjectionClaim::current(workspace_id, lineage_digest),
@@ -1290,14 +1285,13 @@ fn build_clean_activation_candidates(
         instrumentation.record_and_input_micros = instrumentation
             .record_and_input_micros
             .saturating_add(elapsed_micros(record_started));
-        let (document_checkpoints, document_dependencies) = checkpoints
-            .push_page_with_instrumentation(
-                &capsule,
-                &page_assignments,
-                &mut instrumentation.checkpoint,
-            )?;
-        capsule.document_checkpoints = document_checkpoints;
-        capsule.document_dependencies = document_dependencies;
+        let (checkpoint, dependencies) = checkpoints.push_page_with_instrumentation(
+            &capsule,
+            &page_assignments,
+            &mut instrumentation.checkpoint,
+        )?;
+        capsule.document_checkpoint = checkpoint;
+        capsule.document_dependencies = Some(dependencies);
         let baseline_started = Instant::now();
         baseline.push(capsule)?;
         instrumentation.baseline_pack_micros = instrumentation
@@ -4410,23 +4404,14 @@ fn build_execution_material(
                             })?;
                             (block_id, true, current.block.home_document_id)
                         }
-                        None => {
-                            // A newly imported block is born in its OWN
-                            // document, never in the page's: the ordered pair
-                            // of the two is what addresses its membership.
-                            let block_id = import_id.unmatched_block_id(&ImportLocator::block(
+                        None => (
+                            import_id.unmatched_block_id(&ImportLocator::block(
                                 path.clone(),
                                 locator.clone(),
-                            ));
-                            (
-                                block_id,
-                                false,
-                                DocumentId::for_unmatched_import_block(
-                                    scope.workspace_id,
-                                    block_id,
-                                ),
-                            )
-                        }
+                            )),
+                            false,
+                            page.home_document_id,
+                        ),
                     };
                     if desired_node_ids
                         .insert((path.clone(), index), block_id)
@@ -7524,6 +7509,125 @@ mod tests {
         assert!(!partial_transaction
             .iter()
             .any(|operation| matches!(operation, SemanticOperation::DeletePage { .. })));
+    }
+
+    /// Rebaselining v2 P1: activation writes one catalog document plus one shard
+    /// per page, every activated block is homed in its creation page's shard
+    /// (whose Loro roots carry owners, memberships and content), and a later
+    /// external create or edit rewrites only that page's shard.
+    #[test]
+    fn managed_page_shard_layout_uses_catalog_and_creation_page_homes() {
+        let mut fixture = CleanSnapshotFixture::new_with_graph_config_names_and_contents(
+            "page-shard-layout",
+            &["pages/first.md", "pages/second.md"],
+            "{}",
+            &["First", "Second"],
+            &["alpha\n- beta", "gamma"],
+        );
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
+        let pages = [fixture.page_id(0), fixture.page_id(1)]
+            .map(|page_id| fixture.engine().materialize_page(page_id).unwrap());
+        let frontier = fixture
+            .engine()
+            .exact_frontier()
+            .unwrap()
+            .documents()
+            .iter()
+            .map(crate::oplog::DocumentDependencies::document_id)
+            .collect::<BTreeSet<_>>();
+        let expected = std::iter::once(catalog)
+            .chain(pages.iter().map(|page| page.home_document_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            frontier, expected,
+            "activation binds the catalog and one shard per page, nothing per block"
+        );
+        for page in &pages {
+            assert!(!page.blocks.is_empty());
+            for block in &page.blocks {
+                assert_eq!(
+                    block.home_document_id, page.home_document_id,
+                    "activation homes every block in its creation page shard"
+                );
+                // Baseline blocks carry no run-local home claim, so read the
+                // shard at the home materialization reported.
+                let roots = fixture
+                    .engine()
+                    .document_deep_value_for_test(block.home_document_id)
+                    .unwrap();
+                let loro::LoroValue::Map(roots) = roots else {
+                    panic!("a shard document root is a map");
+                };
+                for container in ["shard_meta", "owners", "members", "content"] {
+                    assert!(
+                        roots.contains_key(container),
+                        "shard root lacks {container}"
+                    );
+                }
+                let Some(loro::LoroValue::Map(content)) = roots.get("content") else {
+                    panic!("the shard content root is a map");
+                };
+                assert!(
+                    content.contains_key(&block.block_id.to_string()),
+                    "block content lives in its home shard"
+                );
+            }
+        }
+
+        let first = &pages[0];
+        let first_path = fixture.graph_root.join("pages/first.md");
+        let archive = crate::oplog::ObjectStore::open(
+            &fixture._root.path().join("clean-archive/operations"),
+            WorkspaceId::from_uuid(Uuid::from_u128(1)),
+        )
+        .unwrap();
+        let changed = |batch_id: BatchId| {
+            archive
+                .read_manifest(batch_id)
+                .unwrap()
+                .expect("accepted manifest")
+                .required_objects()
+                .iter()
+                .filter(|descriptor| descriptor.kind() == crate::oplog::ObjectKind::CrdtUpdate)
+                .map(|descriptor| descriptor.document_id())
+                .collect::<BTreeSet<_>>()
+        };
+
+        let source = fs::read_to_string(&first_path).unwrap();
+        fs::write(&first_path, format!("{}\n- delta\n", source.trim_end())).unwrap();
+        let created = fixture.apply_external_paths(&["pages/first.md"]);
+        assert_eq!(
+            changed(created),
+            BTreeSet::from([first.home_document_id]),
+            "an external block creation rewrites only its creation page shard"
+        );
+        let after_create = fixture.engine().materialize_page(first.page_id).unwrap();
+        let delta = after_create
+            .blocks
+            .iter()
+            .find(|block| block.content.trim() == "delta")
+            .expect("the externally created block exists");
+        assert_eq!(
+            delta.home_document_id, first.home_document_id,
+            "a new block is homed in its creation page shard"
+        );
+        let (claimed_home, _) = fixture
+            .engine()
+            .block_content_container_for_test(delta.block_id)
+            .unwrap();
+        assert_eq!(
+            claimed_home, first.home_document_id,
+            "the new block's run-local home claim names its creation page shard"
+        );
+
+        let source = fs::read_to_string(&first_path).unwrap();
+        fs::write(&first_path, source.replace("- delta", "- delta edited")).unwrap();
+        let edited = fixture.apply_external_paths(&["pages/first.md"]);
+        assert_eq!(
+            changed(edited),
+            BTreeSet::from([first.home_document_id]),
+            "an external edit rewrites only the edited block's home shard"
+        );
     }
 
     #[test]

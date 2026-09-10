@@ -47,7 +47,11 @@ pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
-/// The single current live document layout.
+/// Retained retirable-document codec: dormant qualification machinery only.
+/// The live write path uses the catalog and per-page shard documents, so the
+/// codec's former live-path readers have no caller here.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) mod retirable_document;
 pub(crate) mod semantic;
 pub(crate) mod sqlite;

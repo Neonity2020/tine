@@ -7370,7 +7370,6 @@ fn bounded_provider_files(
 
 #[cfg(test)]
 mod tests {
-    use super::super::identity::DocumentKey;
     use super::*;
     use crate::oplog::{
         BatchCausalDot, BatchOrigin, CausalPeerId, ContentDigest, DocumentId, FrontierV2,
@@ -7402,7 +7401,7 @@ mod tests {
         let payload = b"simulator fixture seam".to_vec();
         let object = OperationObject::new(
             workspace_id,
-            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0x5eee))),
+            DocumentId::from_uuid(Uuid::from_u128(0x5eee)),
             ObjectKind::SemanticEffect,
             payload.clone(),
         )

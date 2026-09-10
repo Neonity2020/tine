@@ -29,7 +29,7 @@ use super::sync_layout::{
     ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, LINEAGE_CLAIM_FILE,
 };
 use super::{
-    BatchError, BatchId, BatchOrigin, ContentDigest, DocumentKey, LineageDigest, ObjectDescriptor,
+    BatchError, BatchId, BatchOrigin, ContentDigest, LineageDigest, ObjectDescriptor,
     OperationBatch, OperationObject, PreparedBatch, ValidatedBatch, WorkspaceId,
     MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
@@ -883,7 +883,7 @@ impl ObjectStore {
     pub(crate) fn reload_accepted_document_object(
         &self,
         manifest: &OperationBatch,
-        document_id: super::DocumentKey,
+        document_id: super::DocumentId,
     ) -> Result<OperationObject, StoreError> {
         let batch_id = manifest.batch_id();
         let descriptor = manifest
@@ -1883,7 +1883,7 @@ pub enum StoreError {
     },
     AcceptedDocumentUpdateMissing {
         batch_id: BatchId,
-        document_id: super::DocumentKey,
+        document_id: super::DocumentId,
     },
     UpgradeRequired {
         store: &'static str,

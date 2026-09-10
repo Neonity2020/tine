@@ -923,7 +923,6 @@ fn name_set_digest<'a>(names: impl Iterator<Item = &'a str>) -> ContentDigest {
 
 #[cfg(test)]
 mod tests {
-    use super::super::identity::DocumentKey;
     use std::path::{Path, PathBuf};
 
     use uuid::Uuid;
@@ -986,7 +985,7 @@ mod tests {
         target_kind: ProjectionTargetKind,
     ) -> ProjectionIntent {
         let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc2_1002))),
+            DocumentId::from_uuid(Uuid::from_u128(0xc2_1002)),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(17), version)],
             Vec::new(),
         )

@@ -1,8 +1,8 @@
-//! Feasibility gate only: no production decoder or alternative live format.
-//! The postcard vector is a disposable benchmark transport, not a generation
-//! manifest. This isolates upstream Loro per-document cost before changing the
-//! accepted transaction protocol. Final packed storage and rendering need their
-//! own end-to-end gates.
+//! Dormant qualification machinery for the retained retirable-document codec.
+//! It does not qualify the live write path: that is one catalog document plus
+//! per-page shard documents, and a block's home is its creation page's shard.
+//! No production decoder or alternative live format lives here. The postcard
+//! vector is a disposable benchmark transport, not a generation manifest.
 use super::*;
 use crate::oplog::retirable_document::{DocumentIdentity, DocumentState, RetirableDocument};
 use crate::oplog::semantic::{MembershipClaim, PagePreambleState, PageState, VisibleMembership};
@@ -30,7 +30,7 @@ fn memory_kib() -> Option<u64> {
 }
 
 #[test]
-#[ignore = "manual release gate: fixed-schema Loro layout on an anonymized corpus copy"]
+#[ignore = "manual gate for the dormant retirable-document codec, not the live layout, on an anonymized corpus copy"]
 fn retirable_loro_layout_real_corpus_gate() {
     assert!(!cfg!(debug_assertions), "release-only corpus gate");
     let source = real_graph_copy_source_from_env("TINE_REBASELINING_GRAPH_COPY");

@@ -880,6 +880,29 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-managed-p4-rebuild.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Opening a graph whose Tine-managed storage was written by the per-block (P4) layout leaves every Markdown/Org source byte unchanged and preserves every original private-store byte in a backup, without asking the user anything.",
+     "blocking": true,
+     "authority": "Rebaselining v2 packet P1 and the Tine-managed storage one-current-format contract: a superseded containing format is preserved and rebuilt from text, never migrated"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "After the automatic rebuild, Tine-managed storage is active again, the earlier edits are visible, and a new edit saves to Markdown and is still visible after a restart.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Progress wording, Settings layout and rebuild duration may vary while source bytes, private-byte preservation and the saved edit remain exact."
+   ],
+   "nonRequirements": [
+    "Exact pixels, DOM nesting, the number of startup phases, the backup directory's basename or internal layout, millisecond timing, migration or replay of history that exists only in the backup, or any new notice."
+   ],
+   "stability": "burn-in",
+   "notes": "Needs a P4-built producer in TINE_P4_APP beside the exact candidate in TINE_APP; without both it stops as HARNESS UNAVAILABLE. Undrained journal files are recorded as preserved evidence only."
+  },
   "scripts/e2e-managed-force-close-recovery.mjs": {
    "contracts": [
     {

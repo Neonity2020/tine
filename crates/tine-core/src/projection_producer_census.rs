@@ -1419,7 +1419,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         // in-memory point transition (`local_overlay.page_names.commit`)
         // alongside `ephemeral_page_names.commit`. Name-shared with the
         // durable choke helper; no new durable write path.
-        ("commit", 7),
+        // 8 since rebaselining v2 P1: the lazy-genesis builder again commits
+        // each page shard's in-memory Loro transaction (`document.commit`), as
+        // the control's page-shard builder did. Also name-shared; no durable
+        // write path.
+        ("commit", 8),
         ("publish_immutable", 6),
         ("install_staged_artifact", 1),
         ("replace_head", 0),
@@ -2144,9 +2148,17 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // full 471-row base and post multisets shows these three moves and nothing
     // else — no snapshot opener is added, no reader is opened anywhere new, and
     // the write-boundary token inventory above is byte-for-byte the pinned one.
+    // Re-pinned 2026-09-10 (rebaselining v2 P1, page-shard live layout). The
+    // complete tuple delta from the 471-row base multiset is exactly two
+    // tuples, proved by rebuilding the base digest from the new multiset:
+    // hot_engine.rs's sealed-index `use` no longer names
+    // `AuthenticatedMapLinkV1`/`AuthenticatedMapRootV1` in production (only
+    // the test-only run-local root comparison needs them), and identity.rs
+    // gains one `AuthenticatedMapKey::from(` for `DocumentId`'s 16-byte live
+    // key. No write boundary, reader or storage call is added or removed.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "beb3e08325ddedce83eca0a5a92c79def4020dde610aec02458b4111f7af5db0",
+        "592d0bcec3df40f2d6e15b1ab0d9f3505dc5084312b58f2843b6beb3f4e58ee3",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

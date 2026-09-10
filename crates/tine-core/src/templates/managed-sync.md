@@ -8,6 +8,11 @@ icon:: 🔄
 - ## Current scope
 	- Managed storage currently covers **page and journal text** only. Assets, PDF sidecars, and configuration remain ordinary provider-synchronized files.
 	- Setup first makes a safety backup and checks that Tine can reconstruct the same Markdown/Org tree. If that cannot be proven, it stops instead of changing graph authority.
+- ## When an older managed store is rebuilt
+	- Earlier test builds kept managed history in a storage format this version no longer reads. When you open such a graph, Tine does not ask you to migrate anything: it first sets that graph's private managed-storage data on this device aside as a backup, then rebuilds managed storage from your Markdown/Org files, which it leaves untouched.
+	- The backup keeps every original byte, including history that never reached your Markdown/Org files, such as edits that were still waiting to be written out. Tine keeps that backup for recovery; it does not replay backup-only history into the rebuilt store.
+	- If the rebuild cannot finish, the graph stays usable in **Direct files**, and Tine tries the rebuild again the next time you open the graph.
+	- What you should see: the graph opens with its Markdown/Org content as it was last saved, and new edits save normally.
 - ## Review a detected group deletion
 	- This safety surface belongs only to a graph using Tine-managed storage. Direct-files graphs keep their ordinary file and snapshot recovery paths.
 	- Four deleted pages together become a **Tier 2** sweep. A deletion reaching at least 10% of the graph's pages (rounded up), or 50 pages when that is lower, becomes **Tier 3**. Tier 1 stays quiet. A Tier 3 sweep also pauses propagation for about five minutes so another device is less likely to carry a mass deletion onward before you can review it.

@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    AnnotatedIdentity, BatchId, BlobDescription, ContentDigest, DeviceId, DocumentId, DocumentKey,
-    FrontierV2, LogicalCompletionId, ManagedPath, ObjectDescriptor, ObjectKind, OperationBatch,
+    AnnotatedIdentity, BatchId, BlobDescription, ContentDigest, DeviceId, DocumentId, FrontierV2,
+    LogicalCompletionId, ManagedPath, ObjectDescriptor, ObjectKind, OperationBatch,
     OperationObject, PageId, PortablePathIndexRoot, PortablePathKeyDigest, ProjectionClaimEvidence,
     ProjectionEndpointId, SessionId, WorkspaceId, PORTABLE_PATH_KEY_VERSION,
 };
@@ -25,7 +25,7 @@ const BASE_MAGIC: &[u8; 8] = b"TINEPRB1";
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestObjectRef {
-    document_id: DocumentKey,
+    document_id: DocumentId,
     content_digest: ContentDigest,
     encoded_byte_length: u64,
 }
@@ -39,7 +39,7 @@ impl ManifestObjectRef {
         }
     }
 
-    pub const fn document_id(&self) -> DocumentKey {
+    pub const fn document_id(&self) -> DocumentId {
         self.document_id
     }
 
@@ -320,13 +320,13 @@ impl ManifestedProjectionIntent {
         &self.claim_evidence
     }
 
-    pub fn descriptor_document_id(&self) -> DocumentKey {
-        DocumentKey::Entity(projection_intent_document_id(
+    pub fn descriptor_document_id(&self) -> DocumentId {
+        projection_intent_document_id(
             self.source_batch_id,
             self.source_endpoint_id,
             self.page_id,
             &self.path,
-        ))
+        )
     }
 
     fn validate(&self) -> Result<(), ProjectionManifestError> {
@@ -495,10 +495,8 @@ impl AnnotatedProjectionBase {
         &self.claim_evidence
     }
 
-    pub fn descriptor_document_id(&self) -> Result<DocumentKey, ProjectionManifestError> {
-        Ok(DocumentKey::Entity(annotated_base_document_id(
-            &self.encode()?,
-        )))
+    pub fn descriptor_document_id(&self) -> Result<DocumentId, ProjectionManifestError> {
+        Ok(annotated_base_document_id(&self.encode()?))
     }
 
     fn validate(&self) -> Result<(), ProjectionManifestError> {
@@ -519,7 +517,7 @@ impl AnnotatedProjectionBase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedProjectionObjects {
     intents: Vec<ManifestedProjectionIntent>,
-    bases: BTreeMap<DocumentKey, AnnotatedProjectionBase>,
+    bases: BTreeMap<DocumentId, AnnotatedProjectionBase>,
 }
 
 impl ValidatedProjectionObjects {
@@ -527,7 +525,7 @@ impl ValidatedProjectionObjects {
         &self.intents
     }
 
-    pub fn bases(&self) -> &BTreeMap<DocumentKey, AnnotatedProjectionBase> {
+    pub fn bases(&self) -> &BTreeMap<DocumentId, AnnotatedProjectionBase> {
         &self.bases
     }
 }
@@ -822,8 +820,8 @@ pub enum ProjectionManifestError {
     InvalidAnnotations,
     DescriptorDocumentMismatch {
         kind: &'static str,
-        expected: DocumentKey,
-        found: DocumentKey,
+        expected: DocumentId,
+        found: DocumentId,
     },
     InvalidBinding(&'static str),
     DuplicateIntent,

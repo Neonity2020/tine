@@ -23324,11 +23324,7 @@ impl RuntimeActor {
                                         pair.min_batch,
                                         pair.max_batch,
                                     ),
-                                    home_document_id: DocumentId::for_conflict_sibling(
-                                        block.block_id,
-                                        pair.min_batch,
-                                        pair.max_batch,
-                                    ),
+                                    home_document_id: page.home_document_id,
                                 },
                                 page_id,
                                 parent: original.parent,
@@ -26516,7 +26512,7 @@ fn build_existing_editor_transaction(
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: resolved[index],
-                home_document_id: DocumentId::new(),
+                home_document_id: current.page.home_document_id,
             },
             page_id: current.page.page_id,
             parent: desired[index].0,
@@ -26745,7 +26741,7 @@ fn build_new_editor_transaction(
         operations.push(SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: resolved[index],
-                home_document_id: DocumentId::new(),
+                home_document_id,
             },
             page_id,
             parent: desired[index].0,

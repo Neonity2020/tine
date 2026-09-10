@@ -11104,6 +11104,29 @@
         "failBefore": "proven"
       },
       "notes": "Stateful-UX. `query_registry` is SQL-only on both backends and answers a snapshot, typed readiness, or a typed terminal failure; the sheet had a rendering for the first two only. A terminal `query-unavailable` rejected the shared `createReadyQueryResource`, and `Resource.latest` RETHROWS a rejected resource — so the throw escaped the reactive graph into an error boundary and the add-condition/field picker could not be opened at all, while every control gated on `registry.pending()` (rows still `undefined`) sat on \"Reading this graph's properties…\" with nothing retrying behind it. Fixed in the ONE registry owner (`QueryBuilder.tsx`): a terminal failure is captured as a scoped VALUE, which is what stops the automatic retry, while readiness stays `runQueryWhenReady`'s to retry and a cancellation is rethrown so a superseded read is never published as a result. `RegistryAccess` gained `failure` (the typed error), `unavailable` (`pending || failure`, which every type-dependent edit now waits on instead of `pending` alone) and `retry` — which IS `request`'s owner, so one shared read serves every open builder and no second retry, backoff or cache exists. The scope/declaration-revision guard covers the failure exactly as it covers rows, so a previous graph's error cannot land either."
+    },
+    {
+      "id": "UI-MANAGED-P4-AUTOMATIC-REBUILD",
+      "title": "Opening a graph whose Managed Storage was written by the per-block (P4) layout preserves the old private store and rebuilds automatically from Markdown/Org",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Rebaselining v2 packet P1"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-managed-p4-rebuild.mjs"
+        ],
+        "scenario": "managed.p4-store-preserved-and-automatically-rebuilt",
+        "failBefore": "unavailable"
+      },
+      "notes": "Journey scripts/e2e-managed-p4-rebuild.mjs (p4_store_is_preserved_and_automatically_rebuilt_from_text) is registered in tests/ui-regressions/e2e-contracts.json with an exact-safety-interoperability contract for private-byte and source preservation and a core-operation contract for automatic recovery plus edit/save/reopen, and is selected by the run-e2e.mjs suite managed-p4-rebuild. It needs a P4-built producer (TINE_P4_APP) beside the exact candidate (TINE_APP); the P1 lane had no P4 arm, so the journey has not run and failBefore stays unavailable. No new notice, prompt or decision is introduced; the existing graph-open blank-slate lifecycle archives every private byte and reactivates the one current format."
     }
   ]
 }

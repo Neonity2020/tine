@@ -1672,8 +1672,6 @@ fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinat
 
 #[cfg(test)]
 mod tests {
-    use super::super::identity::DocumentKey;
-    use crate::oplog::hot_engine::test_block_home;
     /// Explicit, stable fixture writer incarnation for the import lane.
     /// Production reads the saved one from the durable lane record.
     fn fixture_import_incarnation(endpoint: ProjectionEndpointBinding) -> CausalPeerId {
@@ -1747,7 +1745,6 @@ mod tests {
         page_id: PageId,
         home_document_id: DocumentId,
         block_id: BlockId,
-        block_home_document_id: DocumentId,
         path: String,
     }
 
@@ -1895,10 +1892,6 @@ mod tests {
             let page = runtime.engine().materialize_page(page_id).unwrap();
             let home_document_id = page.home_document_id;
             let block_id = page.blocks[0].block_id;
-            // Each block owns its own immutable document, so the accepted home
-            // comes from the materialized block; it is not derivable from the
-            // page or from the block ID.
-            let block_home_document_id = page.blocks[0].home_document_id;
             Self {
                 projection_turns:
                     crate::oplog::projection_turn_journal::open_scratch_projection_turn_journal_for(
@@ -1918,7 +1911,6 @@ mod tests {
                 page_id,
                 home_document_id,
                 block_id,
-                block_home_document_id,
                 path: path.into(),
             }
         }
@@ -1939,7 +1931,7 @@ mod tests {
             OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: self.block_id,
-                    home_document_id: self.block_home_document_id,
+                    home_document_id: self.home_document_id,
                 },
                 content: content.into(),
             }])
@@ -2082,7 +2074,6 @@ mod tests {
                 page_id,
                 home_document_id: _,
                 block_id: _,
-                block_home_document_id: _,
                 path,
             } = self;
             let endpoint = receipts.endpoint_binding().unwrap();
@@ -2164,10 +2155,6 @@ mod tests {
             let page = runtime.engine().materialize_page(page_id).unwrap();
             let home_document_id = page.home_document_id;
             let block_id = page.blocks[0].block_id;
-            // Each block owns its own immutable document, so the accepted home
-            // comes from the materialized block; it is not derivable from the
-            // page or from the block ID.
-            let block_home_document_id = page.blocks[0].home_document_id;
             Self {
                 _root,
                 graph_root,
@@ -2184,7 +2171,6 @@ mod tests {
                 page_id,
                 home_document_id,
                 block_id,
-                block_home_document_id,
                 path,
             }
         }
@@ -2691,14 +2677,7 @@ mod tests {
             );
             assert_eq!(observed.refused, None);
             assert_eq!(observed.optimized_catalog_copies, 0);
-            // The previous derivation reproduced the whole-graph catalog on
-            // every ordinary edit, so this used to be the >= 1 side of a
-            // differential proof. The graph document now carries only fixed
-            // lineage/workspace metadata and no per-page rows, so an ordinary
-            // block edit reproduces it in NEITHER derivation. Asserting the
-            // exact zero is the stronger current statement: it fails if any
-            // graph-sized catalog reproduction is reintroduced on this path.
-            assert_eq!(observed.oracle_catalog_copies, 0);
+            assert!(observed.oracle_catalog_copies >= 1);
             let state = fixture.execute_local(&edit).unwrap();
             settle_clean_local(&mut fixture, state);
             let expected = if path.ends_with(".org") {
@@ -2713,9 +2692,7 @@ mod tests {
             let insert = OperationTransaction::new(vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(Uuid::from_u128(44_900 + index as u128)),
-                    home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(
-                        44_900 + index as u128,
-                    ))),
+                    home_document_id: fixture.home_document_id,
                 },
                 page_id: fixture.page_id,
                 parent: None,
@@ -2730,14 +2707,7 @@ mod tests {
             );
             assert_eq!(observed.refused, None);
             assert_eq!(observed.optimized_catalog_copies, 0);
-            // The previous derivation reproduced the whole-graph catalog on
-            // every ordinary edit, so this used to be the >= 1 side of a
-            // differential proof. The graph document now carries only fixed
-            // lineage/workspace metadata and no per-page rows, so an ordinary
-            // block edit reproduces it in NEITHER derivation. Asserting the
-            // exact zero is the stronger current statement: it fails if any
-            // graph-sized catalog reproduction is reintroduced on this path.
-            assert_eq!(observed.oracle_catalog_copies, 0);
+            assert!(observed.oracle_catalog_copies >= 1);
             let state = fixture.execute_local(&insert).unwrap();
             settle_clean_local(&mut fixture, state);
             fixture.assert_clean_drained();
@@ -3229,20 +3199,17 @@ mod tests {
         for revision in 0..3 {
             fixture.overwrite(format!("- import lane edit {revision}\n").as_bytes());
             expect_clean_external_complete(fixture.execute_external(&[&path]).unwrap());
-            // Page identity and block content now live in separate documents,
-            // so the lane that authored this reconciliation is read from every
-            // document the page currently comprises, not from one page shard.
-            let page = fixture.engine().materialize_page(fixture.page_id).unwrap();
-            for document in std::iter::once(page.home_document_id)
-                .chain(page.blocks.iter().map(|block| block.home_document_id))
-            {
-                peers.extend(
-                    fixture
-                        .engine()
-                        .accepted_document_peer_ids_for_test(DocumentKey::Entity(document))
-                        .unwrap(),
-                );
-            }
+            let document = fixture
+                .engine()
+                .materialize_page(fixture.page_id)
+                .unwrap()
+                .home_document_id;
+            peers.extend(
+                fixture
+                    .engine()
+                    .accepted_document_peer_ids_for_test(document)
+                    .unwrap(),
+            );
         }
         // Lanes are qualified by the first admission, so read them afterwards.
         let lane = fixture

@@ -90,12 +90,12 @@ use super::sync_layout::{
 };
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlobDescription, BlockId, CausalPeerId,
-    ContentDigest, DocumentDependencies, DocumentId, DocumentKey, FrontierV2, LineageDigest,
-    LogicalPageName, LogseqUuid, LogseqUuidResolution, ManagedPath, ObjectKind, ObjectStore,
-    OperationBatch, PageId, PageState, PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1,
-    SemanticEffect, SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId,
-    WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
-    OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
+    ContentDigest, DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName,
+    LogseqUuid, LogseqUuidResolution, ManagedPath, ObjectKind, ObjectStore, OperationBatch, PageId,
+    PageState, PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticEffect,
+    SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId, WorkspaceStatus,
+    MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
+    OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = tine_storage::formats::SQLITE_APPLICATION_ID;
@@ -719,8 +719,7 @@ impl AcceptedBatchEvent {
             })?;
         let mut context = super::sqlite_materialization::EffectValidationContext::linear();
         if !contested_documents.is_empty() {
-            let contested_document =
-                |document: DocumentId| contested_documents.contains(&DocumentKey::Entity(document));
+            let contested_document = |document: DocumentId| contested_documents.contains(&document);
             for delta in effective.pages() {
                 let document = delta
                     .after
@@ -2032,11 +2031,6 @@ pub(crate) struct CleanGenesisProjectionBuilder {
     claim: ProjectionClaim,
     pending: super::sqlite_materialization::TerminalMaterializationChunk,
     observed_pages: usize,
-    /// Documents the observed pages account for. A page is not one document:
-    /// it contributes its own document, one per block and one per
-    /// (block, page) pair, so the baseline's document count can no longer be
-    /// derived from the page count alone.
-    observed_documents: u64,
     expected_pages: usize,
     /// The graph config the derived rows are built under, stamped into the
     /// database so a later config edit rebuilds rather than reads stale atoms
@@ -2085,7 +2079,6 @@ impl CleanGenesisProjectionBuilder {
             claim,
             pending: super::sqlite_materialization::TerminalMaterializationChunk::default(),
             observed_pages: 0,
-            observed_documents: 0,
             expected_pages,
             parse_config,
             instrumentation: CleanGenesisProjectionInstrumentation::default(),
@@ -2102,15 +2095,6 @@ impl CleanGenesisProjectionBuilder {
                 "clean SQLite genesis exceeded its declared page count".into(),
             ));
         }
-        self.observed_documents = self
-            .observed_documents
-            .checked_add(1)
-            .and_then(|total| total.checked_add(2 * page.blocks.len() as u64))
-            .ok_or_else(|| {
-                ProjectionError::Materialization(
-                    "clean SQLite genesis document count overflowed".into(),
-                )
-            })?;
         let reference_started = std::time::Instant::now();
         let mut reference_rows = ReferenceCatalogSourceRows::default();
         let posting = parser_derived_reference_source_posting(policy, &page)?;
@@ -2164,12 +2148,9 @@ impl CleanGenesisProjectionBuilder {
                 "clean SQLite genesis has no immutable baseline binding".into(),
             ));
         };
-        // The immutable baseline always binds the graph metadata document,
-        // including for an otherwise empty graph. Every page then contributes
-        // its own document bundle -- one page document, one per block and one
-        // per (block, page) pair -- which is what this builder counted while
-        // materializing pages.
-        let expected_documents = self.observed_documents.saturating_add(1);
+        // The lazy catalog has causal history only once at least one page
+        // was imported. An empty graph therefore binds zero documents.
+        let expected_documents = self.expected_pages as u64 + u64::from(self.expected_pages != 0);
         if root.acceptance_sequence() != 0 || genesis.document_count() != expected_documents {
             return Err(ProjectionError::InvalidFrontier(
                 "clean SQLite genesis page count differs from its immutable baseline".into(),
@@ -6706,15 +6687,15 @@ fn encode_frontier_document(document: &DocumentDependencies) -> Result<Vec<u8>, 
         .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))
 }
 
-/// `expected_key` is the frontier table's index key: the complete, lossless
-/// `DocumentKey` bytes, not a hash and not a truncation.
+/// `expected_key` is the frontier table's index key: the complete, lossless 16
+/// UUID bytes of one live catalog or page-shard `DocumentId`, not a hash and
+/// not a truncation.
 ///
 /// The decoded canonical bytes are the authoritative address, so this compares
-/// the FULL decoded `DocumentKey` against the requested one -- both by
-/// re-deriving the row key and by decoding the requested key back into a
-/// `DocumentKey` and comparing the addresses themselves. A row can therefore
-/// never answer for a different entity, or for a membership pair that merely
-/// shares one of its two document ids.
+/// the decoded `DocumentId` against the requested one -- both by re-deriving
+/// the row key and by decoding the requested key back into a `DocumentId` and
+/// comparing the addresses themselves. A row can therefore never answer for a
+/// different document.
 fn decode_frontier_document(
     expected_key: &AuthenticatedMapKey,
     bytes: &[u8],
@@ -6722,7 +6703,7 @@ fn decode_frontier_document(
     let document: DocumentDependencies = postcard::from_bytes(bytes)
         .map_err(|error| ProjectionError::Corrupt(format!("invalid frontier document: {error}")))?;
     let expected_address =
-        DocumentKey::from_authenticated_map_key(*expected_key).ok_or_else(|| {
+        DocumentId::from_authenticated_map_key(*expected_key).ok_or_else(|| {
             ProjectionError::Corrupt("frontier row key is not a document address".into())
         })?;
     if document.document_id() != expected_address
@@ -6741,7 +6722,7 @@ fn decode_frontier_document(
 fn authenticated_frontier_document(
     physical: &PhysicalSqliteDatabase,
     root: &AcceptedFrontierRoot,
-    document_id: DocumentKey,
+    document_id: DocumentId,
 ) -> Result<Option<DocumentDependencies>, ProjectionError> {
     let physical_root = lower_physical_frontier_root(root)?;
     let requested_key = document_id.authenticated_map_key();
@@ -9625,7 +9606,6 @@ fn corrupt_equal_length_interior_block_payload_with_coverage(
 
 #[cfg(test)]
 mod tests {
-    use crate::oplog::hot_engine::test_block_home;
     use std::fs;
     use std::io::{BufRead as _, BufReader};
     use std::process::{Child, Command, Stdio};
@@ -9898,7 +9878,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -9939,9 +9919,7 @@ mod tests {
                 tags: vec!["page-tag".into()],
                 blocks: vec![MaterializedBlockInput {
                     block_id: ids.block,
-                    // A block owns its own immutable document; the page home
-                    // is the page's, and the two are never the same address.
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                     parent: None,
                     order: "a".into(),
                     content: content.into(),
@@ -10300,7 +10278,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "visible replacement remains mandatory".into(),
                 }])
@@ -10320,7 +10298,7 @@ mod tests {
 
     fn frontier(document_id: DocumentId, counter: u64, heads: Vec<BatchId>) -> FrontierV2 {
         FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentKey::Entity(document_id),
+            document_id,
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(7), counter)],
             heads,
         )
@@ -10419,14 +10397,14 @@ mod tests {
             .unwrap();
         let semantic = OperationObject::new(
             ids.workspace,
-            DocumentKey::Entity(ids.catalog),
+            ids.catalog,
             ObjectKind::SemanticEffect,
             effect.clone(),
         )
         .unwrap();
         let update = OperationObject::new(
             ids.workspace,
-            DocumentKey::Entity(ids.document),
+            ids.document,
             ObjectKind::CrdtUpdate,
             format!("test update {batch_id}").into_bytes(),
         )
@@ -10912,7 +10890,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -11063,7 +11041,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -11448,7 +11426,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "[[Other]]".into(),
                 }])
@@ -11533,7 +11511,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: tail_content.into(),
                 }])
@@ -11592,7 +11570,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -11709,7 +11687,7 @@ mod tests {
                 "block" => OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "updated".into(),
                 }])
@@ -11879,7 +11857,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "updated".into(),
                 }])
@@ -11970,7 +11948,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -12065,7 +12043,7 @@ mod tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: ids.block,
-                            home_document_id: test_block_home(ids.block),
+                            home_document_id: ids.document,
                         },
                         page_id: ids.page,
                         parent: None,
@@ -12082,7 +12060,7 @@ mod tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: referrer_block,
-                            home_document_id: test_block_home(referrer_block),
+                            home_document_id: referrer_document,
                         },
                         page_id: referrer_page,
                         parent: None,
@@ -12120,7 +12098,7 @@ mod tests {
             tags: Vec::new(),
             blocks: vec![MaterializedBlockInput {
                 block_id: referrer_block,
-                home_document_id: test_block_home(referrer_block),
+                home_document_id: referrer_document,
                 parent: None,
                 order: "a".into(),
                 content: "stable referrer".into(),
@@ -12162,7 +12140,7 @@ mod tests {
             SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 content: "fresh".into(),
             },
@@ -12335,7 +12313,7 @@ mod tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: ids.block,
-                            home_document_id: test_block_home(ids.block),
+                            home_document_id: ids.document,
                         },
                         page_id: ids.page,
                         parent: None,
@@ -12345,7 +12323,7 @@ mod tests {
                     SemanticOperation::CreateBlock {
                         block: BlockLocation {
                             block_id: child,
-                            home_document_id: test_block_home(child),
+                            home_document_id: ids.document,
                         },
                         page_id: ids.page,
                         parent: Some(ids.block),
@@ -12379,7 +12357,7 @@ mod tests {
                     SemanticOperation::EditBlockContent {
                         block: BlockLocation {
                             block_id: ids.block,
-                            home_document_id: test_block_home(ids.block),
+                            home_document_id: ids.document,
                         },
                         content: edited_content.into(),
                     },
@@ -12724,7 +12702,7 @@ mod tests {
             vec![
                 crate::oplog::sqlite_materialization::MaterializedBlockHomeClaimRow {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                     batch_id: Some(create_event.batch_id()),
                     causal_dot: Some(create_event.causal_dot()),
                 }
@@ -12750,7 +12728,7 @@ mod tests {
                 crate::oplog::sqlite_materialization::MaterializedLogseqUuidIntroductionRow {
                     logseq_uuid: external_uuid,
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                     batch_id: Some(assign_event.batch_id()),
                     causal_dot: Some(assign_event.causal_dot()),
                 },
@@ -12796,7 +12774,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: replacement_block,
-                    home_document_id: test_block_home(replacement_block),
+                    home_document_id: replacement_document,
                 },
                 page_id: replacement_page,
                 parent: None,
@@ -12870,7 +12848,7 @@ mod tests {
             operations.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id: document_id,
                 },
                 page_id,
                 parent: None,
@@ -12893,22 +12871,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(page.blocks.len(), 1);
-        // The page's one block owns its own immutable document, so reading
-        // this page touches exactly that block's home and no other page's.
-        assert_eq!(
-            page.stats.distinct_home_documents,
-            vec![test_block_home(ids.block)]
-        );
-        // This page's own document set is exactly three documents: the page,
-        // its one membership, and that member's own home. Reading it must
-        // touch those and nothing belonging to the other seven pages.
+        assert_eq!(page.stats.distinct_home_documents, vec![ids.document]);
         assert!(
-            page.stats.physical_manifest_reads <= 3,
+            page.stats.physical_manifest_reads <= 2,
             "one historical page read scanned unrelated manifests: {:?}",
             page.stats
         );
         assert!(
-            page.stats.physical_object_reads <= 3,
+            page.stats.physical_object_reads <= 2,
             "one historical page read scanned unrelated objects: {:?}",
             page.stats
         );
@@ -12947,7 +12917,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: foreign_ids.block,
-                        home_document_id: test_block_home(foreign_ids.block),
+                        home_document_id: foreign_ids.document,
                     },
                     content: "foreign edited".into(),
                 }])
@@ -13075,7 +13045,7 @@ mod tests {
                         SemanticOperation::CreateBlock {
                             block: BlockLocation {
                                 block_id: target_block,
-                                home_document_id: test_block_home(target_block),
+                                home_document_id: source_document,
                             },
                             page_id: source_page,
                             parent: None,
@@ -13085,7 +13055,7 @@ mod tests {
                         SemanticOperation::CreateBlock {
                             block: BlockLocation {
                                 block_id: referrer_block,
-                                home_document_id: test_block_home(referrer_block),
+                                home_document_id: referrer_document,
                             },
                             page_id: referrer_page,
                             parent: None,
@@ -13113,7 +13083,7 @@ mod tests {
                         "Move Source",
                         vec![block_replacement(
                             target_block,
-                            test_block_home(target_block),
+                            source_document,
                             "target",
                             Vec::new(),
                         )],
@@ -13132,7 +13102,7 @@ mod tests {
                         "Move Referrer",
                         vec![block_replacement(
                             referrer_block,
-                            test_block_home(referrer_block),
+                            referrer_document,
                             "referrer",
                             vec![MaterializedReference {
                                 target: MaterializedEntityId::Block(target_block),
@@ -13154,7 +13124,7 @@ mod tests {
                     &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
                         root: BlockLocation {
                             block_id: target_block,
-                            home_document_id: test_block_home(target_block),
+                            home_document_id: source_document,
                         },
                         from_page_id: source_page,
                         to_page_id: destination_page,
@@ -13186,8 +13156,7 @@ mod tests {
             assert_eq!(destination.blocks.len(), 1);
             assert_eq!(destination.blocks[0].block_id, target_block);
             assert_eq!(
-                destination.blocks[0].home_document_id,
-                test_block_home(target_block),
+                destination.blocks[0].home_document_id, source_document,
                 "a cross-page move must preserve the block's immutable home"
             );
             database
@@ -13228,7 +13197,7 @@ mod tests {
         let unrelated = frontier(ids.document, 2, vec![batch(202)]);
         assert!(!database.contains_frontier(&unrelated).unwrap());
         let missing_peer = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentKey::Entity(ids.document),
+            ids.document,
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(999), 1)],
             vec![child.batch_id()],
         )
@@ -13338,7 +13307,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "child".into(),
                 }])
@@ -13449,7 +13418,7 @@ mod tests {
             operations.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id: document_id,
                 },
                 page_id,
                 parent: None,
@@ -13472,21 +13441,18 @@ mod tests {
         let wide_evidence = engine
             .accepted_batch_evidence(wide.manifest().batch_id())
             .unwrap();
-        // Each page contributes its own document, its one block's own
-        // document and their membership document. The graph document carries
-        // no operations here, so it is absent from the frontier.
         assert_eq!(
             engine.exact_frontier().unwrap().documents().len(),
-            PAGE_COUNT * 3
+            PAGE_COUNT + 1
         );
-        let (block_id, _page_document_id) = target.unwrap();
+        let (block_id, document_id) = target.unwrap();
         let edit = engine
             .prepare_fixture_transaction(
                 author(2_302),
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id,
-                        home_document_id: test_block_home(block_id),
+                        home_document_id: document_id,
                     },
                     content: "bounded edit".into(),
                 }])
@@ -13516,65 +13482,60 @@ mod tests {
         let untouched_document = untouched_document.unwrap();
         assert_eq!(
             engine
-                .accepted_frontier_document(
-                    wide_evidence.post_frontier_root(),
-                    DocumentKey::Entity(untouched_document),
-                )
+                .accepted_frontier_document(wide_evidence.post_frontier_root(), untouched_document,)
                 .unwrap(),
             engine
-                .accepted_frontier_document(
-                    evidence.post_frontier_root(),
-                    DocumentKey::Entity(untouched_document)
-                )
+                .accepted_frontier_document(evidence.post_frontier_root(), untouched_document)
                 .unwrap()
         );
-        // A content edit advances the edited block's own document, which is
-        // the one document this acceptance touched.
-        let edited_document = DocumentKey::Entity(test_block_home(block_id));
         assert_ne!(
             engine
-                .accepted_frontier_document(wide_evidence.post_frontier_root(), edited_document)
+                .accepted_frontier_document(wide_evidence.post_frontier_root(), document_id,)
                 .unwrap(),
             engine
-                .accepted_frontier_document(evidence.post_frontier_root(), edited_document)
+                .accepted_frontier_document(evidence.post_frontier_root(), document_id)
                 .unwrap()
         );
     }
 
     #[test]
-    fn frontier_decoder_rejects_membership_addresses_that_share_only_one_half() {
-        let block_a = DocumentId::from_uuid(uuid(2_340));
-        let block_b = DocumentId::from_uuid(uuid(2_341));
-        let page_a = DocumentId::from_uuid(uuid(2_342));
-        let page_b = DocumentId::from_uuid(uuid(2_343));
-        let requested = DocumentKey::Membership {
-            block_document_id: block_a,
-            page_document_id: page_a,
-        };
-        let requested_key = requested.authenticated_map_key();
-        for wrong_address in [
-            DocumentKey::Membership {
-                block_document_id: block_a,
-                page_document_id: page_b,
-            },
-            DocumentKey::Membership {
-                block_document_id: block_b,
-                page_document_id: page_a,
-            },
-        ] {
-            let wrong = DocumentDependencies::new(
-                wrong_address,
-                vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(2_344), 1)],
-                Vec::new(),
+    fn frontier_decoder_rejects_another_documents_row_and_never_truncates_a_key() {
+        let requested = DocumentId::from_uuid(uuid(2_340));
+        let other = DocumentId::from_uuid(uuid(2_341));
+        let row_for = |document_id| {
+            encode_frontier_document(
+                &DocumentDependencies::new(
+                    document_id,
+                    vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(2_344), 1)],
+                    Vec::new(),
+                )
+                .unwrap(),
             )
-            .unwrap();
-            let bytes = encode_frontier_document(&wrong).unwrap();
-            assert!(matches!(
-                decode_frontier_document(&requested_key, &bytes),
-                Err(ProjectionError::Corrupt(reason))
-                    if reason == "frontier document row has mismatched identity"
-            ));
-        }
+            .unwrap()
+        };
+        assert!(matches!(
+            decode_frontier_document(&requested.authenticated_map_key(), &row_for(other)),
+            Err(ProjectionError::Corrupt(reason))
+                if reason == "frontier document row has mismatched identity"
+        ));
+        // A key of any other width is refused, even when its first 16 bytes
+        // name the row's own document: a live key is never truncated.
+        let mut wide = requested.as_uuid().into_bytes().to_vec();
+        wide.push(0);
+        assert!(matches!(
+            decode_frontier_document(
+                &AuthenticatedMapKey::new(&wide).unwrap(),
+                &row_for(requested)
+            ),
+            Err(ProjectionError::Corrupt(reason))
+                if reason == "frontier row key is not a document address"
+        ));
+        assert_eq!(
+            decode_frontier_document(&requested.authenticated_map_key(), &row_for(requested))
+                .unwrap()
+                .document_id(),
+            requested
+        );
     }
 
     #[test]
@@ -13605,7 +13566,7 @@ mod tests {
             operations.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id: document_id,
                 },
                 page_id,
                 parent: None,
@@ -13648,7 +13609,7 @@ mod tests {
             .unwrap();
         // The row key is the complete document address, not a hash of one.
         let row_key = AuthenticatedMapKey::new(&document_bytes).unwrap();
-        let document_id = DocumentKey::from_authenticated_map_key(row_key).unwrap();
+        let document_id = DocumentId::from_authenticated_map_key(row_key).unwrap();
         let original = decode_frontier_document(&row_key, &dependencies).unwrap();
         let tampered = DocumentDependencies::new(
             document_id,
@@ -13820,7 +13781,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: content.into(),
                 }])
@@ -13901,16 +13862,25 @@ mod tests {
     /// drained database is additionally reopened and re-compared, because the
     /// inductive coverage state is deliberately not carried across an open.
     ///
-    /// The clean replay must resolve the current fixed-layout page/block/pair
-    /// documents and must never resolve the retired whole-graph catalog.
+    /// The whole program then runs a second time with the engine's retained
+    /// catalog decode disabled, which is the pre-cut path kept as an oracle,
+    /// and the two runs must publish identically. That is the differential the
+    /// retained decode has to survive: same accepted history, same rows, same
+    /// digests, same public query results, same duplicate and refusal
+    /// behaviour, with and without reuse.
     #[test]
     fn ordinary_drained_saves_match_clean_archive_replay_across_rich_shapes() {
-        rich_drain_program_observation();
+        let reused = rich_drain_program_observation(true);
+        let decoded_every_time = rich_drain_program_observation(false);
+        assert_eq!(
+            reused, decoded_every_time,
+            "reusing the decoded catalog must publish exactly what decoding it every time does"
+        );
     }
 
-    fn rich_drain_program_observation() -> RichDrainObservation {
+    fn rich_drain_program_observation(retained_catalog: bool) -> RichDrainObservation {
         let ids = TestIds::new(2_420);
-        let dir = TestDir::new("drain-fixed-layout-rich");
+        let dir = TestDir::new(&format!("drain-differential-rich-{retained_catalog}"));
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let mut engine = ShardedHotEngine::with_clean_archive_store_for_test(
@@ -13918,6 +13888,7 @@ mod tests {
             ids.lineage,
             ids.catalog,
         );
+        engine.set_retained_catalog_enabled_for_test(retained_catalog);
         let drained_path = dir.path().join("drained.sqlite");
         let mut database = open_test_projection(
             &drained_path,
@@ -13937,15 +13908,15 @@ mod tests {
 
         let markdown_location = BlockLocation {
             block_id: ids.block,
-            home_document_id: test_block_home(ids.block),
+            home_document_id: ids.document,
         };
         let child_location = BlockLocation {
             block_id: markdown_child,
-            home_document_id: test_block_home(markdown_child),
+            home_document_id: ids.document,
         };
         let org_location = BlockLocation {
             block_id: org_block,
-            home_document_id: test_block_home(org_block),
+            home_document_id: org_document,
         };
 
         // Each entry is one ordinary accepted batch, drained on its own exactly
@@ -14046,7 +14017,7 @@ mod tests {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: doomed_block,
-                        home_document_id: test_block_home(doomed_block),
+                        home_document_id: doomed_document,
                     },
                     page_id: doomed_page,
                     parent: None,
@@ -14226,11 +14197,11 @@ mod tests {
         assert!(exact_frontier
             .documents()
             .iter()
-            .any(|document| matches!(document.document_id(), DocumentKey::Entity(_))));
+            .any(|document| document.document_id() == engine.catalog_document_id()));
         assert!(exact_frontier
             .documents()
             .iter()
-            .any(|document| matches!(document.document_id(), DocumentKey::Membership { .. })));
+            .any(|document| document.document_id() == ids.document));
         let mut sealed_store =
             crate::oplog::checkpoint_generation::CheckpointSealedStore::default();
         let mut sealed_root = tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty();
@@ -14269,11 +14240,7 @@ mod tests {
         ));
         assert!(
             replayed.rebuild.exact_document_loads > 0,
-            "clean replay must read the actual fixed-layout page/block/pair documents"
-        );
-        assert_eq!(
-            replayed.rebuild.exact_catalog_loads, 0,
-            "clean replay must not resolve the retired whole-graph catalog"
+            "clean replay must read the actual catalog and page-shard documents"
         );
         let replayed_observation = observe(&replayed.database);
         let replayed_row_digest = replayed
@@ -14326,18 +14293,38 @@ mod tests {
         let after_refusal = observe(&reopened);
         assert_eq!(after_refusal, replayed_observation);
 
+        // Two runs that agree because neither reused anything would prove
+        // nothing, so state which run is which.
+        let stats = engine.retained_catalog_decode_stats();
+        if retained_catalog {
+            assert!(
+                stats.reuses > 0,
+                "the retained run must actually have reused a decoded catalog"
+            );
+        } else {
+            assert_eq!(
+                (stats.decodes, stats.reuses),
+                (0, 0),
+                "the oracle run must decode the catalog every time"
+            );
+        }
         after_refusal
     }
 
     /// Per-save catalog accounting observed through the ordinary drain.
+    ///
+    /// Decodes and reuses are counted engine-wide across the whole drain of one
+    /// save: building the accepted event proves accepted-root absence for its
+    /// affected pages, and that check resolves the catalog before the
+    /// materialization does.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct CatalogSaveAccounting {
         /// Catalog resolutions this save's materialization performed.
         catalog_loads: usize,
-        /// Of those, the ones that read and imported the whole catalog
-        /// checkpoint again.
+        /// Whole catalog checkpoints this save's drain read and imported.
         catalog_decodes: usize,
-        /// Of those, the ones served from the engine's retained decode.
+        /// Resolutions this save's drain served from the engine's retained
+        /// decode.
         catalog_reuses: usize,
     }
 
@@ -14359,7 +14346,7 @@ mod tests {
         let after = engine.retained_catalog_decode_stats();
         CatalogSaveAccounting {
             catalog_loads: materialization.exact_catalog_loads,
-            catalog_decodes: materialization.exact_catalog_decodes,
+            catalog_decodes: after.decodes - before.decodes,
             catalog_reuses: after.reuses - before.reuses,
         }
     }
@@ -14400,9 +14387,7 @@ mod tests {
             bulk.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(uuid(seed + 300_000 + extra)),
-                    home_document_id: test_block_home(BlockId::from_uuid(uuid(
-                        seed + 300_000 + extra,
-                    ))),
+                    home_document_id: DocumentId::from_uuid(uuid(seed + 200_000 + extra)),
                 },
                 page_id: PageId::from_uuid(uuid(seed + 100_000 + extra)),
                 parent: None,
@@ -14461,26 +14446,51 @@ mod tests {
         accounting
     }
 
-    /// Reading the whole-graph catalog checkpoint used to be the one part of a
-    /// one-page save proportional to total graph pages: a page create decoded
-    /// it, and every following content-only save at least resolved it.
+    /// A content-only save does not touch the page catalog, so the catalog it
+    /// resolves is the byte-identical document this process already decoded.
+    /// Every such save must still *resolve* the catalog — that is the accepted
+    /// root's authority over which causal state is authoritative — but only the
+    /// save that actually changed the catalog may decode one.
     ///
-    /// Page identity now lives in each page's own fixed-schema document, so a
-    /// save resolves that page and nothing graph-sized. The exact zero below is
-    /// the stronger successor of the previous "decode once, then reuse"
-    /// accounting: it fails if any save reintroduces a graph-wide catalog
-    /// resolution. It is still asserted identical at two graph sizes, so a
-    /// reintroduced graph-proportional read cannot hide behind a small fixture.
+    /// Asserted identical at two graph sizes, because reading the catalog
+    /// checkpoint is the one part of a one-page save that was proportional to
+    /// total graph pages.
     #[test]
-    fn ordinary_content_saves_never_resolve_the_graph_document() {
+    fn ordinary_content_saves_decode_the_unchanged_catalog_once() {
         let small = catalog_decode_accounting_for_graph(2_700, 0);
         let large = catalog_decode_accounting_for_graph(2_760, 40);
-        // One page create followed by four content-only edits of one block.
-        let expected = [CatalogSaveAccounting {
-            catalog_loads: 0,
-            catalog_decodes: 0,
-            catalog_reuses: 0,
-        }; 5];
+        let expected = [
+            // Creating the page changes the catalog, so this one decodes. The
+            // accepted-root absence check decodes it and the materialization
+            // then reuses that decode.
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 1,
+                catalog_reuses: 1,
+            },
+            // Four content-only edits of one block, at unchanged catalog
+            // causal identity: both resolutions reuse.
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 0,
+                catalog_reuses: 2,
+            },
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 0,
+                catalog_reuses: 2,
+            },
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 0,
+                catalog_reuses: 2,
+            },
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 0,
+                catalog_reuses: 2,
+            },
+        ];
         assert_eq!(small, expected);
         assert_eq!(
             small, large,
@@ -14488,13 +14498,12 @@ mod tests {
         );
     }
 
-    /// A materialization at an *older* accepted root must produce that root's
-    /// own page identity rather than be served the newest one, and no save —
-    /// create, rename or content edit — may resolve a graph-wide catalog to
-    /// answer it. Page name and path come from the page's own document at the
-    /// requested root.
+    /// The catalog's causal state is the whole key. A save that changes it must
+    /// decode the new state exactly once and then be reused in turn, and a
+    /// materialization at an *older* accepted root must decode that root's own
+    /// catalog rather than be served the newest one.
     #[test]
-    fn page_identity_at_an_older_accepted_root_is_never_confused_with_the_newest() {
+    fn a_changed_catalog_is_decoded_once_and_never_confused_with_another_root() {
         let ids = TestIds::new(2_800);
         let dir = TestDir::new("catalog-change-and-historical-root");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
@@ -14520,9 +14529,9 @@ mod tests {
             .unwrap();
         publish_and_stage_archive(&mut engine, &store, &prepared);
         assert_eq!(
-            drain_one_save_catalog_accounting(&mut database, &engine, &store),
-            CatalogSaveAccounting::default(),
-            "a page create resolves the page's own document, never a graph catalog"
+            drain_one_save_catalog_accounting(&mut database, &engine, &store).catalog_decodes,
+            1,
+            "the first save of a run has nothing to reuse"
         );
         edit_block_content(
             &mut engine,
@@ -14534,7 +14543,11 @@ mod tests {
         );
         assert_eq!(
             drain_one_save_catalog_accounting(&mut database, &engine, &store),
-            CatalogSaveAccounting::default()
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 0,
+                catalog_reuses: 2,
+            }
         );
 
         // A rename moves the page's name and path, which is a catalog mutation.
@@ -14558,8 +14571,12 @@ mod tests {
         publish_and_stage_archive(&mut engine, &store, &renamed);
         assert_eq!(
             drain_one_save_catalog_accounting(&mut database, &engine, &store),
-            CatalogSaveAccounting::default(),
-            "a rename rewrites the page's own document, not a graph catalog"
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 1,
+                catalog_reuses: 1,
+            },
+            "a changed catalog causal state must miss and decode the new state"
         );
         edit_block_content(
             &mut engine,
@@ -14571,23 +14588,33 @@ mod tests {
         );
         assert_eq!(
             drain_one_save_catalog_accounting(&mut database, &engine, &store),
-            CatalogSaveAccounting::default(),
-            "a content edit after a rename still resolves no graph catalog"
+            CatalogSaveAccounting {
+                catalog_loads: 1,
+                catalog_decodes: 0,
+                catalog_reuses: 2,
+            },
+            "the new catalog state is decoded once, then reused in turn"
         );
 
-        // Re-materializing the *first* accepted event asks for a root at which
-        // the page document still carries the original name and path, and it
-        // must get that state rather than the renamed current one.
+        // The retained decode is now the renamed catalog. Re-materializing the
+        // *first* accepted event asks for a root whose catalog still names the
+        // original page, and it must get that one. Constructing the event
+        // already resolves that root's catalog, so the one decode happens there
+        // and materialization reuses exactly that historical state.
         let source = RebuildSource::new(&engine, &store).unwrap();
-        let historical = source.accepted_event_at(1).unwrap();
         let before = engine.retained_catalog_decode_stats();
+        let historical = source.accepted_event_at(1).unwrap();
         let (historical_change, historical_stats) =
             materialize_accepted_event_with_stats(&engine, &historical).unwrap();
         let after = engine.retained_catalog_decode_stats();
         assert_eq!(
-            (historical_stats.exact_catalog_decodes, after.reuses),
-            (0, before.reuses),
-            "a historical accepted root resolves its own page document and reuses no catalog"
+            (
+                after.decodes - before.decodes,
+                historical_stats.exact_catalog_decodes,
+                after.reuses - before.reuses,
+            ),
+            (1, 0, 1),
+            "a historical accepted root must decode its own catalog, not reuse the newest"
         );
         let historical_page = historical_change
             .replacements()
@@ -14644,9 +14671,7 @@ mod tests {
             operations.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(uuid(40_000 + index as u128)),
-                    home_document_id: test_block_home(BlockId::from_uuid(uuid(
-                        40_000 + index as u128,
-                    ))),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -14909,7 +14934,7 @@ mod tests {
                     &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                         block: BlockLocation {
                             block_id: ids.block,
-                            home_document_id: test_block_home(ids.block),
+                            home_document_id: ids.document,
                         },
                         content: index.to_string(),
                     }])
@@ -15289,7 +15314,7 @@ mod tests {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     page_id: ids.page,
                     parent: None,
@@ -15302,7 +15327,7 @@ mod tests {
             OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 content: content.into(),
             }])
@@ -15603,7 +15628,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "child".into(),
                 }])
@@ -16118,7 +16143,7 @@ mod tests {
             operations.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(uuid(4_200 + index)),
-                    home_document_id: test_block_home(BlockId::from_uuid(uuid(4_200 + index))),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -17351,7 +17376,7 @@ mod tests {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: ids.block,
-                    home_document_id: test_block_home(ids.block),
+                    home_document_id: ids.document,
                 },
                 page_id: ids.page,
                 parent: None,
@@ -17389,7 +17414,7 @@ mod tests {
                     SemanticOperation::EditBlockContent {
                         block: BlockLocation {
                             block_id: ids.block,
-                            home_document_id: test_block_home(ids.block),
+                            home_document_id: ids.document,
                         },
                         content: "probe".into(),
                     },
@@ -17397,25 +17422,9 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let exact_frontier = engine.exact_frontier().unwrap();
+        let exact_frontier = probe.manifest().dependency_frontier().clone();
+        assert_eq!(engine.exact_frontier().unwrap(), exact_frontier);
         assert_eq!(accepted_event.exact_frontier(), exact_frontier);
-        // The probe declares only the documents its two edits actually touch:
-        // the page's own document and the edited block's own document. The
-        // membership document neither edit changes stays out of that compact
-        // dependency frontier, even though it is part of the exact frontier.
-        assert_eq!(
-            probe
-                .manifest()
-                .dependency_frontier()
-                .documents()
-                .iter()
-                .map(DocumentDependencies::document_id)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                DocumentKey::Entity(ids.document),
-                DocumentKey::Entity(test_block_home(ids.block)),
-            ])
-        );
         let expected_snapshot = engine.canonical_snapshot().unwrap();
         let database_path = dir.path().join("frontier.sqlite");
 
@@ -17772,7 +17781,7 @@ mod tests {
                 &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: ids.block,
-                        home_document_id: test_block_home(ids.block),
+                        home_document_id: ids.document,
                     },
                     content: "second".into(),
                 }])

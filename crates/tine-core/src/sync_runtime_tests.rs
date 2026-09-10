@@ -2,8 +2,6 @@ use super::*;
 use crate::model::Format;
 use crate::oplog::absence_sweep::SweepActionState;
 use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
-use crate::oplog::hot_engine::test_block_home;
-use crate::oplog::DocumentKey;
 use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
 use std::collections::BTreeMap;
 use std::fs;
@@ -5739,7 +5737,7 @@ fn real_store_oracle_transaction(
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id: document_id,
                 },
                 page_id,
                 parent: None,
@@ -5809,7 +5807,7 @@ fn real_store_oracle_transaction(
             vec![SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id: page.home_document_id,
                 },
                 page_id: page.page_id,
                 parent: Some(BlockId::from_uuid(Uuid::from_u128(seed + 0x13))),
@@ -10857,9 +10855,7 @@ fn a_lost_writer_record_keeps_an_older_published_epoch_causally_apart() {
                 SemanticOperation::CreateBlock {
                     block: BlockLocation {
                         block_id: BlockId::from_uuid(Uuid::from_u128(seed + 0x60)),
-                        home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(
-                            seed + 0x60,
-                        ))),
+                        home_document_id: base_document_id,
                     },
                     page_id: base_page_id,
                     parent: None,
@@ -10869,7 +10865,7 @@ fn a_lost_writer_record_keeps_an_older_published_epoch_causally_apart() {
                 SemanticOperation::EditBlockContent {
                     block: BlockLocation {
                         block_id: base_block_id,
-                        home_document_id: test_block_home(base_block_id),
+                        home_document_id: base_document_id,
                     },
                     content: "base text rewritten by the replacement epoch".into(),
                 },
@@ -11398,49 +11394,60 @@ fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
 /// retryable open failure: no backup, no rebuild, "could not serve".
 #[test]
 fn a_pre_h_sealed_baseline_is_a_durable_protocol_refusal_not_a_retryable_dead_end() {
-    let fixture = ActivationFixture::nested_unicode("pre-h-lazy-genesis-schema", 0x5c4e_a004);
-    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-    assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-    let handle = activated.handle.expect("schema fixture activates");
-    drive_initial_feed(&handle);
-    drain_managed_local(&handle);
-    assert!(matches!(
-        handle.clean_shutdown().unwrap(),
-        SyncShutdownOutcome::Safe(_)
-    ));
+    // Schema 4 is the pre-H containing format; schema 5 is the per-block (P4)
+    // containing format that rebaselining v2 P1 superseded. Both must take the
+    // same preserve-and-rebuild route (D-1), never be decoded as current.
+    for (schema, label, seed) in [
+        (4_u32, "pre-h-lazy-genesis-schema", 0x5c4e_a004_u128),
+        (5_u32, "p4-lazy-genesis-schema", 0x5c4e_a005_u128),
+    ] {
+        let fixture = ActivationFixture::nested_unicode(label, seed);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("schema fixture activates");
+        drive_initial_feed(&handle);
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
 
-    crate::oplog::lazy_genesis::rewrite_sealed_baseline_schema_for_test(
-        &fixture.request.enrollment_root,
-        &clean_baseline_directory(&fixture.request.archive_root),
-        4,
-    )
-    .unwrap();
-    let before = user_graph_bytes(&fixture.graph_root);
+        crate::oplog::lazy_genesis::rewrite_sealed_baseline_schema_for_test(
+            &fixture.request.enrollment_root,
+            &clean_baseline_directory(&fixture.request.archive_root),
+            schema,
+        )
+        .unwrap();
+        let before = user_graph_bytes(&fixture.graph_root);
 
-    let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-    assert!(result.handle.is_none());
-    let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
-        panic!("a pre-H sealed baseline must surface a managed-open refusal: {result:?}");
-    };
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(detail).unwrap(),
-        serde_json::json!({
-            "kind": "clean-open",
-            "reason_code": "clean_open.bootstrap_streaming_import",
-            "detail": { "scenario": "MS-REF-PROTOCOL-INCOMPATIBLE" },
-        }),
-        "the refusal names its source class and protocol scenario without source prose"
-    );
-    assert_eq!(
-        result.status.durable_refusal_scenario(),
-        Some(ManagedStorageRefusalScenario::ProtocolIncompatible),
-        "only this scenario reaches the blank-slate preserve-and-rebuild lifecycle"
-    );
-    assert_eq!(
-        user_graph_bytes(&fixture.graph_root),
-        before,
-        "a refused open must not change one byte of the user's graph"
-    );
+        let result = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert!(
+            result.handle.is_none(),
+            "schema {schema} reopened as current"
+        );
+        let SyncRuntimeOpenStatus::OpenRefused { detail } = &result.status else {
+            panic!("a superseded sealed baseline must surface a managed-open refusal: {result:?}");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(detail).unwrap(),
+            serde_json::json!({
+                "kind": "clean-open",
+                "reason_code": "clean_open.bootstrap_streaming_import",
+                "detail": { "scenario": "MS-REF-PROTOCOL-INCOMPATIBLE" },
+            }),
+            "the refusal names its source class and protocol scenario without source prose"
+        );
+        assert_eq!(
+            result.status.durable_refusal_scenario(),
+            Some(ManagedStorageRefusalScenario::ProtocolIncompatible),
+            "only this scenario reaches the blank-slate preserve-and-rebuild lifecycle"
+        );
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            before,
+            "a refused open must not change one byte of the user's graph"
+        );
+    }
 }
 
 #[test]
@@ -13803,7 +13810,7 @@ fn shared_provider_clean_two_device_unicode_join_and_restart() {
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: shared_block,
-                    home_document_id: test_block_home(shared_block),
+                    home_document_id: shared_document,
                 },
                 page_id: shared_page,
                 parent: None,
@@ -14559,16 +14566,13 @@ fn rebaselining_foundations_real_corpus_gate() {
             .map(|(_, state)| state.home_document_id()),
     ) {
         let compact = engine
-            .build_compact_accepted_document(&cutoff, DocumentKey::Entity(document_id))
+            .build_compact_accepted_document(&cutoff, document_id)
             .unwrap();
         assert_eq!(
             compact.cutoff_state_digest(),
             cutoff.frontier().state_digest()
         );
-        assert_eq!(
-            compact.dependencies().document_id(),
-            DocumentKey::Entity(document_id)
-        );
+        assert_eq!(compact.dependencies().document_id(), document_id);
         roster = roster
             .with_document(&mut capsule_store, &cutoff, &compact)
             .unwrap();
@@ -14585,17 +14589,13 @@ fn rebaselining_foundations_real_corpus_gate() {
             .map(|(_, state)| state.home_document_id()),
     ) {
         let (dependencies, _) = roster
-            .load_document(
-                &disk_nodes,
-                DocumentKey::Entity(engine.catalog_document_id()),
-                DocumentKey::Entity(document_id),
-            )
+            .load_document(&disk_nodes, engine.catalog_document_id(), document_id)
             .unwrap()
             .unwrap();
         assert_eq!(
             Some(dependencies),
             engine
-                .accepted_frontier_document(cutoff.frontier(), DocumentKey::Entity(document_id))
+                .accepted_frontier_document(cutoff.frontier(), document_id)
                 .unwrap()
         );
     }
@@ -14739,57 +14739,46 @@ fn shared_join_owns_ordinary_operation_until_atomic_enrollment_commit() {
 
 #[test]
 fn manager_empty_graph_activates_and_reopens_without_a_phantom_catalog_document() {
+    // K (`a55680c4`): the lazy catalog has causal history only once at least
+    // one page was imported, so an empty graph binds zero documents. Counting
+    // the catalog anyway made a brand-new empty graph fail its genesis count
+    // and never activate Managed Storage. The outcome is the claim: an empty
+    // graph activates, shuts down safely and reopens -- with no document.
     let fixture = ActivationFixture::empty("manager-empty-genesis", 0xefa01);
-    let graph = Graph::open_checked(&fixture.graph_root).unwrap();
-    let resources = activate_clean_runtime_resources(&fixture.request, graph, &mut |_| {}).unwrap();
-    let expected_key = DocumentKey::Entity(fixture.request.identities.catalog_document_id);
-    let frontier = resources.runtime.engine().exact_frontier().unwrap();
-    assert_eq!(frontier.documents().len(), 1);
-    assert_eq!(frontier.documents()[0].document_id(), expected_key);
-    assert_eq!(
-        resources
-            .runtime
-            .engine()
-            .graph_document_identity_for_test()
-            .unwrap(),
-        (
-            expected_key,
-            fixture.request.identities.workspace_id,
-            fixture.request.identities.lineage_digest,
-        )
-    );
-    let snapshot = resources.runtime.engine().canonical_snapshot().unwrap();
-    assert!(snapshot.pages.is_empty());
-    assert!(snapshot.blocks.is_empty());
-    assert!(snapshot.memberships.is_empty());
-    let read = resources.runtime.database().materialized_read().unwrap();
-    assert!(read.pages(None, 1).unwrap().is_empty());
-    drop(read);
-    assert_eq!(
-        resources.runtime.database().frontier_root().unwrap(),
-        resources.runtime.engine().accepted_frontier_root().unwrap()
-    );
-    drop(resources);
+    let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = active
+        .handle
+        .unwrap_or_else(|| panic!("empty activation: {:?}", active.status));
+    drive_initial_feed(&handle);
+    assert!(matches!(
+        handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(handle);
 
     let reopened = open_clean_runtime_resources(&reopen_request(&fixture.request))
         .unwrap()
         .expect("empty activation marker cold-opens");
-    assert_eq!(
-        reopened
-            .runtime
-            .engine()
-            .graph_document_identity_for_test()
-            .unwrap(),
-        (
-            expected_key,
-            fixture.request.identities.workspace_id,
-            fixture.request.identities.lineage_digest,
-        )
+    let frontier = reopened.runtime.engine().exact_frontier().unwrap();
+    assert!(
+        frontier.documents().is_empty(),
+        "an empty graph binds no phantom catalog document: {frontier:?}"
     );
+    let snapshot = reopened.runtime.engine().canonical_snapshot().unwrap();
+    assert!(snapshot.pages.is_empty());
+    assert!(snapshot.blocks.is_empty());
+    assert!(snapshot.memberships.is_empty());
     assert_eq!(
         reopened.runtime.database().frontier_root().unwrap(),
         reopened.runtime.engine().accepted_frontier_root().unwrap()
     );
+    drop(reopened);
+
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+    assert!(matches!(
+        reopened.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
 }
 
 fn activate_and_prepare_shared(fixture: &ActivationFixture) -> SyncSharedEnrollmentDescriptor {
@@ -16351,7 +16340,7 @@ fn submit_shared_page(
             SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id: document_id,
                 },
                 page_id,
                 parent: None,
@@ -16899,7 +16888,7 @@ fn receiver_completion_defers_closed_window_external_deletion_case(
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: test_block_home(block_id),
+                home_document_id: document_id,
             },
             content: "receiver updated bytes must not resurrect".into(),
         }],
@@ -16994,7 +16983,7 @@ fn receiver_incomplete_update_maps_absent_terminal_to_deferral_case() {
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: test_block_home(block_id),
+                home_document_id: document_id,
             },
             content: "receiver recovery target".into(),
         }],
@@ -17231,7 +17220,7 @@ fn provider_edit_projects_markdown_beside_a_concurrent_external_admission() {
         vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id,
-                home_document_id: test_block_home(block_id),
+                home_document_id: document_id,
             },
             content: "second".into(),
         }],
@@ -17298,7 +17287,7 @@ fn provider_cross_page_move_projects_both_pages_beside_a_concurrent_external_adm
         vec![SemanticOperation::MoveSubtree {
             root: BlockLocation {
                 block_id: moved_block,
-                home_document_id: test_block_home(moved_block),
+                home_document_id: source_document,
             },
             from_page_id: source_page_id,
             to_page_id: target_page_id,
@@ -17510,7 +17499,7 @@ fn provider_cross_page_move_then_delete_converges_on_the_receiver() {
             SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 from_page_id: source_page_id,
                 to_page_id: target_page_id,
@@ -19187,7 +19176,7 @@ fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         vec![SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: BlockId::from_uuid(Uuid::from_u128(0xb304)),
-                home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(0xb304))),
+                home_document_id: document_id,
             },
             page_id,
             parent: None,
@@ -19200,7 +19189,7 @@ fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         vec![SemanticOperation::CreateBlock {
             block: BlockLocation {
                 block_id: BlockId::from_uuid(Uuid::from_u128(0xb305)),
-                home_document_id: test_block_home(BlockId::from_uuid(Uuid::from_u128(0xb305))),
+                home_document_id: document_id,
             },
             page_id,
             parent: None,
@@ -21250,7 +21239,7 @@ fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 content: "first offline text".into(),
             }],
@@ -21260,7 +21249,7 @@ fn two_offline_same_page_text_edits_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 content: "second offline text".into(),
             }],
@@ -21391,7 +21380,7 @@ fn two_offline_edit_delete_histories_converge_in_both_delivery_orders() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 content: "offline edit racing deletion".into(),
             }],
@@ -21468,7 +21457,7 @@ fn two_offline_move_delete_histories_converge_in_both_delivery_orders() {
             vec![SemanticOperation::MoveSubtree {
                 root: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 from_page_id: source_page_id,
                 to_page_id: target_page_id,
@@ -21565,7 +21554,7 @@ fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() 
                 block_rewrites: vec![crate::oplog::BlockContentRewrite {
                     block: BlockLocation {
                         block_id: referrer_block,
-                        home_document_id: test_block_home(referrer_block),
+                        home_document_id: referrer_document,
                     },
                     new_content: "referrer [[Rename Referrer Target Renamed]]".into(),
                 }],
@@ -21577,7 +21566,7 @@ fn rename_referrer_rewrite_and_referrer_edit_converge_in_both_delivery_orders() 
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: referrer_block,
-                    home_document_id: test_block_home(referrer_block),
+                    home_document_id: referrer_document,
                 },
                 content: "ordinary referrer edit [[Rename Referrer Target]]".into(),
             }],
@@ -21646,7 +21635,7 @@ fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 content: "ALPHA beta gamma".into(),
             }],
@@ -21656,7 +21645,7 @@ fn two_offline_disjoint_region_edits_of_one_block_merge_silently() {
             vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id,
-                    home_document_id: test_block_home(block_id),
+                    home_document_id,
                 },
                 content: "alpha beta GAMMA".into(),
             }],
@@ -22101,8 +22090,9 @@ fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots()
     )
     .unwrap();
 
-    // Existing page, newly born block: the page document is authority read by
-    // the operation but is not updated. The two new roles have no pre-state.
+    // Existing page, newly born block: the block's immutable home is its
+    // creation page's shard (I-2), so the existing shard is the written
+    // document and carries its pre-state.
     let (mut existing, existing_revision) = match actor
         .load_application_page(SyncApplicationPageLoadRequest {
             page: SyncApplicationPageSelector::ExactPath {
@@ -22187,10 +22177,7 @@ fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots()
         .expect("existing-page record creates one block");
     let existing_block_id = existing_birth.block_id;
     let existing_block_home = existing_birth.home_document_id;
-    let existing_membership = DocumentKey::Membership {
-        block_document_id: existing_block_home,
-        page_document_id: existing_page_home,
-    };
+    assert_eq!(existing_block_home, existing_page_home);
     let existing_pre = existing_record
         .prepared_batch()
         .manifest()
@@ -22198,31 +22185,16 @@ fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots()
     assert!(existing_pre
         .documents()
         .iter()
-        .any(|dependency| dependency.document_id() == DocumentKey::Entity(existing_page_home)));
-    assert!(!existing_pre.documents().iter().any(|dependency| {
-        matches!(
-            dependency.document_id(),
-            document_id if document_id == DocumentKey::Entity(existing_block_home)
-                || document_id == existing_membership
-        )
-    }));
+        .any(|dependency| dependency.document_id() == existing_page_home));
     let existing_witnesses = existing_record.crdt_update_witnesses_for_test();
-    assert!(!existing_witnesses
-        .iter()
-        .any(|(document_id, _)| *document_id == DocumentKey::Entity(existing_page_home)));
-    for document_id in [
-        DocumentKey::Entity(existing_block_home),
-        existing_membership,
-    ] {
-        assert_eq!(
-            existing_witnesses
-                .iter()
-                .find(|(candidate, _)| *candidate == document_id)
-                .map(|(_, witness)| *witness),
-            Some(false),
-            "a born document has an absent causal-state witness"
-        );
-    }
+    assert_eq!(
+        existing_witnesses
+            .iter()
+            .find(|(candidate, _)| *candidate == existing_page_home)
+            .map(|(_, witness)| *witness),
+        Some(true),
+        "the existing page shard has a present causal-state witness"
+    );
 
     let born_page_id = page_record.projection().intent().page_id();
     let born_page_state = page_record
@@ -22241,50 +22213,40 @@ fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots()
         .expect("page-birth record creates its block");
     let born_block_id = born_block.block_id;
     let born_block_home = born_block.home_document_id;
-    let born_membership = DocumentKey::Membership {
-        block_document_id: born_block_home,
-        page_document_id: born_page_home,
-    };
-    let born_keys = [
-        DocumentKey::Entity(born_page_home),
-        DocumentKey::Entity(born_block_home),
-        born_membership,
-    ];
+    assert_eq!(born_block_home, born_page_home);
     let page_pre = page_record
         .prepared_batch()
         .manifest()
         .dependency_frontier();
-    assert!(born_keys.iter().all(|document_id| !page_pre
+    assert!(!page_pre
         .documents()
         .iter()
-        .any(|dependency| dependency.document_id() == *document_id)));
+        .any(|dependency| dependency.document_id() == born_page_home));
     let page_witnesses = page_record.crdt_update_witnesses_for_test();
-    for document_id in born_keys {
-        assert_eq!(
-            page_witnesses
-                .iter()
-                .find(|(candidate, _)| *candidate == document_id)
-                .map(|(_, witness)| *witness),
-            Some(false),
-            "each page-forest birth role has an absent causal-state witness"
-        );
-    }
+    assert_eq!(
+        page_witnesses
+            .iter()
+            .find(|(candidate, _)| *candidate == born_page_home)
+            .map(|(_, witness)| *witness),
+        Some(false),
+        "the born page shard has an absent causal-state witness"
+    );
 
-    let existing_root_before = actor
+    let existing_content_before = actor
         .clean
         .as_ref()
         .unwrap()
         .runtime
         .engine()
-        .block_document_root_value_for_test(existing_block_id)
+        .block_content_container_for_test(existing_block_id)
         .unwrap();
-    let born_root_before = actor
+    let born_content_before = actor
         .clean
         .as_ref()
         .unwrap()
         .runtime
         .engine()
-        .block_document_root_value_for_test(born_block_id)
+        .block_content_container_for_test(born_block_id)
         .unwrap();
     drop(actor);
 
@@ -22294,15 +22256,15 @@ fn foreground_birth_journal_replay_preserves_read_authority_and_document_roots()
     let engine = reopened.runtime.engine();
     assert_eq!(
         engine
-            .block_document_root_value_for_test(existing_block_id)
+            .block_content_container_for_test(existing_block_id)
             .unwrap(),
-        existing_root_before
+        existing_content_before
     );
     assert_eq!(
         engine
-            .block_document_root_value_for_test(born_block_id)
+            .block_content_container_for_test(born_block_id)
             .unwrap(),
-        born_root_before
+        born_content_before
     );
     let existing_page = engine.materialize_page(existing_page_id).unwrap();
     assert!(existing_page.blocks.iter().any(|block| {
@@ -36091,7 +36053,7 @@ fn cold_archive_republication_uses_accepted_names_and_preserves_original_bytes()
         .unwrap();
     let object = OperationObject::new(
         fixture.request.identities.workspace_id,
-        DocumentKey::Entity(fixture.request.identities.catalog_document_id),
+        fixture.request.identities.catalog_document_id,
         crate::oplog::ObjectKind::SemanticEffect,
         effect.clone(),
     )

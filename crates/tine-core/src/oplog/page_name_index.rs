@@ -39,16 +39,10 @@ impl AuthoritativeCatalogPageNameObservationsV1 {
     }
 }
 
-/// Select exact affected-page observations from each page's CURRENT accepted
-/// state.
-///
-/// The previous layout answered this by decoding the one graph-sized catalog
-/// document. A page's state now lives in that page's own document, so the
-/// caller supplies the bounded per-page lookup and nothing graph-sized is
-/// decoded to answer a bounded question.
-pub(crate) fn extract_current_page_name_observations(
+pub(crate) fn extract_authoritative_catalog_page_names(
+    catalog_document_id: DocumentId,
+    document: &loro::LoroDoc,
     requested_page_ids: &[PageId],
-    mut page_state: impl FnMut(PageId) -> Result<Option<PageState>, StoreError>,
 ) -> Result<AuthoritativeCatalogPageNameObservationsV1, StoreError> {
     if requested_page_ids.len() > MAX_PAGE_NAME_POINT_BATCH {
         return Err(StoreError::PageNamePointBatchTooLarge {
@@ -59,9 +53,15 @@ pub(crate) fn extract_current_page_name_observations(
     if requested_page_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(StoreError::NonCanonicalPageNamePointKeys);
     }
+    let validated = super::hot_engine::validate_catalog_document(catalog_document_id, document)
+        .map_err(|_| StoreError::MalformedPageNameIndex)?;
     let entries = requested_page_ids
         .iter()
-        .map(|page_id| page_state(*page_id).map(|state| (*page_id, state)))
+        .map(|page_id| {
+            super::hot_engine::read_validated_catalog_page(validated, *page_id)
+                .map(|state| (*page_id, state))
+                .map_err(|_| StoreError::MalformedPageNameIndex)
+        })
         .collect::<Result<_, _>>()?;
     Ok(AuthoritativeCatalogPageNameObservationsV1 { entries })
 }
@@ -501,20 +501,6 @@ impl EphemeralPageNameOwnershipStateV1 {
             validate_exact_name_ref(*key, name_ref, name)?;
         }
         Ok(())
-    }
-
-    /// The batch that most recently released this canonical key, if any.
-    ///
-    /// A page created under the fixed layout touches only brand-new documents,
-    /// so nothing in its dependency frontier names the deletion that freed the
-    /// name it reuses. The drafting engine reads that release here and declares
-    /// it as a causal dependency, which is what the shared catalog document
-    /// used to encode implicitly.
-    pub(crate) fn latest_release_batch(&self, key: PageNameKeyDigest) -> Option<BatchId> {
-        self.records
-            .get(&key)
-            .and_then(PageNameOwnershipRecordV1::latest_release)
-            .map(|released| released.release_batch)
     }
 
     pub(crate) fn resolve_current(&self, key: PageNameKeyDigest) -> Option<PageId> {

@@ -1714,7 +1714,6 @@ fn clear_rows(directory: &Dir) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::identity::DocumentKey;
     use std::path::PathBuf;
 
     use uuid::Uuid;
@@ -1798,7 +1797,7 @@ mod tests {
             target: &[u8],
         ) -> ProjectionIntent {
             let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-                DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(0xc6_1001))),
+                DocumentId::from_uuid(Uuid::from_u128(0xc6_1001)),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(7), counter)],
                 Vec::new(),
             )
@@ -1851,7 +1850,7 @@ mod tests {
             document: u128,
         ) -> ProjectionIntent {
             let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-                DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(document))),
+                DocumentId::from_uuid(Uuid::from_u128(document)),
                 vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(7), counter)],
                 Vec::new(),
             )

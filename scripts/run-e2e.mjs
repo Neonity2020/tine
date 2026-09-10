@@ -117,6 +117,12 @@ const suites = {
   "managed-journal-feed": [
     ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
   ],
+  // A per-block (P4) Managed store must be preserved and rebuilt from
+  // Markdown/Org. The journey needs a P4-built producer in TINE_P4_APP beside
+  // the exact candidate, so it is its own suite rather than a hosted one.
+  "managed-p4-rebuild": [
+    ["managed-p4-rebuild", "scripts/e2e-managed-p4-rebuild.mjs", {}],
+  ],
   "absence-sweeps": [
     ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
   ],

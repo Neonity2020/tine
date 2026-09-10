@@ -87,3 +87,4 @@ see the project `CLAUDE.md`.
 | [0058](0058-privacy-safe-diagnostic-flight-recorder.md) | Production diagnostics use a bounded privacy-safe flight recorder, separate from detailed debug logs | Accepted |
 | [0059](0059-bounded-theme-presentation-presets.md) | Theme API 0.2 adds bounded host-owned typography, journal-header, and Today-summary presets | Accepted |
 | [0060](0060-qualified-generations-and-indefinite-cold-history.md) | Qualified generations bound ordinary work while retaining history | Accepted; cutover gated |
+| [0061](0061-unwire-per-block-managed-layout-forward.md) | Managed Storage returns forward to a catalog plus per-page shards; per-block stores are preserved and rebuilt | Accepted; benchmark gated |

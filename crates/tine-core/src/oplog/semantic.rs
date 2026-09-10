@@ -6,7 +6,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{BlockId, DocumentId, LogseqUuid, ManagedPath, ManagedTextKind, PageId};
 
-pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 7;
+/// 8: block homes are again their creation-page shard documents; 7 added
+/// `BlockDelta::birth`. One current format only (D-1).
+pub const SEMANTIC_EFFECT_SCHEMA_VERSION: u32 = 8;
 pub const CATALOG_PAGE_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_SEMANTIC_EFFECT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SEMANTIC_DELTA_ENTRIES: usize = 100_000;

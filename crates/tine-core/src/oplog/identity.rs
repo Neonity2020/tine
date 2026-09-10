@@ -706,57 +706,23 @@ impl DocumentId {
         ))
     }
 
-    /// Derive the immutable document of one unmatched external block.
-    ///
-    /// A block's document is the block's own, never the page's: the ordered
-    /// pair of block and page documents is what addresses its membership, so
-    /// the two must be distinct documents. Deriving it from the block's own
-    /// import-stable identity keeps every replica in agreement without
-    /// consulting an index, and keeps the document stable across page moves.
-    /// A deterministic, distinct document for one block in test fixtures.
-    /// Production callers choose block documents explicitly; fixtures only
-    /// need them to be disjoint from every page and graph document.
-    #[cfg(test)]
-    pub(crate) fn for_test_block(block_id: super::BlockId) -> Self {
-        Self(derived_uuid(
-            b"tine/test/block-home-document-id/v1\0",
-            &[block_id.as_uuid().as_bytes()],
-        ))
+    /// The one authenticated-map key of a live catalog or page-shard document:
+    /// exactly its 16 UUID bytes. The run-local accepted map, the SQLite
+    /// frontier treap and SQLite point lowering all key rows by these bytes,
+    /// so they compose the same roots for the same rows. The retained
+    /// retirable-document codec keys its inert rosters by [`DocumentKey`]
+    /// instead, and wraps a `DocumentId` only at that codec boundary.
+    pub fn authenticated_map_key(self) -> AuthenticatedMapKey {
+        AuthenticatedMapKey::from(self.0.into_bytes())
     }
 
-    pub(crate) fn for_unmatched_import_block(
-        workspace_id: WorkspaceId,
-        block_id: super::BlockId,
-    ) -> Self {
-        Self(derived_uuid(
-            b"tine/import/unmatched-block-home-document-id/v1\0",
-            &[
-                workspace_id.as_uuid().as_bytes(),
-                block_id.as_uuid().as_bytes(),
-            ],
-        ))
-    }
-
-    /// Derive the immutable document of a machine-created keep-both sibling.
-    ///
-    /// The sibling block identity is deterministic so two devices can settle
-    /// the same conflict without minting competing logical blocks. Its entity
-    /// document must be just as stable, while remaining a distinct identity
-    /// from the block, page, and graph documents.
-    pub(crate) fn for_conflict_sibling(
-        original: super::BlockId,
-        min_batch: BatchId,
-        max_batch: BatchId,
-    ) -> Self {
-        debug_assert!(min_batch < max_batch);
-        Self(derived_uuid(
-            b"tine/conflict-resolution/sibling-block-home-document-id/v1\0",
-            &[
-                original.as_uuid().as_bytes(),
-                min_batch.as_uuid().as_bytes(),
-                max_batch.as_uuid().as_bytes(),
-            ],
-        ))
+    /// Recover the exact document one live authenticated-map key names.
+    /// A key that is not exactly 128 bits wide names no live document; it is
+    /// refused rather than truncated.
+    pub fn from_authenticated_map_key(key: AuthenticatedMapKey) -> Option<Self> {
+        <[u8; 16]>::try_from(key.as_slice())
+            .ok()
+            .map(|bytes| Self(Uuid::from_bytes(bytes)))
     }
 
     /// A path released by an accepted deletion cannot reuse the path-stable

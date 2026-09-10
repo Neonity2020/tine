@@ -491,12 +491,7 @@ fn lazy_genesis_full_integrity_accepts_a_sparse_frontier_overlay() {
     fixture.append_local_tail(0, 0, "alpha changed", 0x1400);
 
     let root = fixture.engine.0.database().frontier_root().unwrap();
-    assert_eq!(
-        root.document_count(),
-        7,
-        "the catalog plus, for each of the two pages, its page document, its \
-         one block's own document and their membership document"
-    );
+    assert_eq!(root.document_count(), 3, "two pages plus the catalog");
     fixture
         .engine
         .0

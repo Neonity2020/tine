@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tine_storage::DurableBatchContract;
 
 use super::{
-    BatchId, DeviceId, DocumentKey, FrontierV2, ImportId, SessionId, WorkspaceId,
+    BatchId, DeviceId, DocumentId, FrontierV2, ImportId, SessionId, WorkspaceId,
     WriterIncarnationId, MANAGED_ENTITY_SET_VERSION,
 };
 
@@ -15,12 +15,14 @@ pub use tine_storage::formats::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-/// Bumped to 9 for the retirable document layout: every manifest descriptor,
-/// object envelope and per-document frontier now names a full `DocumentKey`
-/// (entity birth UUID, or the exact block/page membership pair) instead of a
-/// bare entity UUID. Version 8 added persisted causal writer incarnations.
-/// One current format only — there is no reader for version 8 (D-1).
-pub const OPERATION_SCHEMA_VERSION: u32 = 9;
+/// Bumped to 10 when the live write path returned to one catalog document
+/// plus per-page shard documents: every manifest descriptor, object envelope
+/// and per-document frontier again names a bare page-shard or catalog
+/// `DocumentId`. Version 9 named the retired per-block/membership
+/// `DocumentKey` addresses; version 8 added persisted causal writer
+/// incarnations. One current format only — there is no reader for version 9
+/// or 8 (D-1).
+pub const OPERATION_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,15 +39,14 @@ pub struct CoreDurableBatchContract;
 
 #[doc(hidden)]
 pub struct CoreManifestValidationState {
-    crdt_documents: HashSet<DocumentKey>,
+    crdt_documents: HashSet<DocumentId>,
     semantic_count: usize,
 }
 
 impl DurableBatchContract for CoreDurableBatchContract {
     type WorkspaceId = WorkspaceId;
-    /// The FULL retirable-document address. Entity UUIDs and membership pairs
-    /// are distinct key domains; nothing hashes or truncates the pair.
-    type DocumentId = DocumentKey;
+    /// The catalog or page-shard document a descriptor or frontier entry names.
+    type DocumentId = DocumentId;
     type BatchId = BatchId;
     type DeviceId = DeviceId;
     /// One sequential authoring incarnation, independent of the enrolled
@@ -246,15 +247,14 @@ mod tests {
     use serde_json::Value;
     use uuid::Uuid;
 
-    use super::super::identity::DocumentId;
     use super::*;
 
     fn workspace(value: u128) -> WorkspaceId {
         WorkspaceId::from_uuid(Uuid::from_u128(value))
     }
 
-    fn document(value: u128) -> DocumentKey {
-        DocumentKey::Entity(DocumentId::from_uuid(Uuid::from_u128(value)))
+    fn document(value: u128) -> DocumentId {
+        DocumentId::from_uuid(Uuid::from_u128(value))
     }
 
     fn batch(value: u128) -> BatchId {

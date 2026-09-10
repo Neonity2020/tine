@@ -1571,7 +1571,6 @@ pub(crate) fn repack_cold_history(
 
 #[cfg(test)]
 mod tests {
-    use super::super::identity::DocumentKey;
     use super::*;
     use crate::oplog::{
         BatchCausalDot, BatchInspection, BatchOrigin, CausalPeerId, CrdtPeerCounter, CrdtPeerId,
@@ -1630,14 +1629,14 @@ mod tests {
         let semantic_payload = format!("semantic effect payload {seed}").into_bytes();
         let semantic = OperationObject::new(
             workspace_id,
-            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x10_0000 + seed))),
+            DocumentId::from_uuid(uuid(0x10_0000 + seed)),
             ObjectKind::SemanticEffect,
             semantic_payload.clone(),
         )
         .unwrap();
         let update = OperationObject::new(
             workspace_id,
-            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x20_0000 + seed))),
+            DocumentId::from_uuid(uuid(0x20_0000 + seed)),
             ObjectKind::CrdtUpdate,
             format!("crdt update payload {seed} {}", "x".repeat(64)).into_bytes(),
         )
@@ -1649,7 +1648,7 @@ mod tests {
             .collect();
         let device = DeviceId::from_uuid(uuid(30));
         let frontier = FrontierV2::new(vec![DocumentDependencies::new(
-            DocumentKey::Entity(DocumentId::from_uuid(uuid(0x20_0000 + seed))),
+            DocumentId::from_uuid(uuid(0x20_0000 + seed)),
             vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(8), 12)],
             Vec::new(),
         )

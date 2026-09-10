@@ -7230,6 +7230,32 @@
     "failBefore": "manager-native-root-diagnostic exits 1 with a flat four-row query reopened as nested binary groups; PageBlocks89744 returns no page for a matching nested page_prop"
    },
    "notes": "The P6 native journey persisted the right one-line tine-query and kept its sheet open, but sqlparser's binary associativity leaked into the editable IR. TQL lowering also decided Page hops from the outer anchor, so page_prop inside an @page blocks relation stayed on the block. The correction preserves explicit same-operator parentheses, flattens only unparenthesized parser chains, and resolves page targets from the current Scope. Exact manager-owned Rust and native pass-after evidence remains pending."
-  }
+  },
+{
+ "id": "REG-MANAGED-P4-WRITE-COST",
+ "title": "Managed Storage edit, move and delete became several times slower once the live write path used one Loro document per block and per membership",
+ "family": "managed-storage-write-performance",
+ "sources": {
+  "issues": [],
+  "commits": [
+   "d7c57e2b",
+   "606f774e"
+  ],
+  "internal": "Rebaselining v2 packet P1"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "fixing",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/live_write_benchmark_tests.rs::managed_live_write_pre_p5_release_benchmark"
+  ],
+  "scenario": "managed-storage.live-write-cost-tracks-page-shards",
+  "failBefore": "proven: at base 1c2707fc with only test edits applied, managed_200_block_move_changes_only_source_and_destination_shards and managed_page_shard_checkpoint_and_full_replay_agree fail with 'a new block needs its own document, distinct from the graph and its page', and managed_page_shard_layout_uses_catalog_and_creation_page_homes fails because activation binds per-block and membership documents (failbefore-p1-layout.log in the P1 lane receipt)"
+ },
+ "notes": "Stored P4 evidence (sanity reference, never a threshold): /aux/koutecky/logseq/tine-agents/evidence/rebaselining-2026-09-07/p4-final-integration/qualification-606f774/write-benchmark/REPORT.md measured foreground repeated edit 9.68 -> 17.90 ms, move 200 30.43 -> 175.62 ms, delete 200 113.97 -> 268.85 ms and settlement move 200 110.53 -> 1094.35 ms against the 3d21bcaa control; /aux/koutecky/logseq/tine-agents/evidence/rebaselining-2026-09-08-work-accounting/REPORT.md attributes it to 601 changed Loro documents and archive objects per 200-block move instead of 2. Packet P1 un-wires the per-block layout forward: one catalog document plus per-page shard documents, and a block's immutable home is its creation-page shard. The acceptance gate is the live_write_benchmark protocol within 1.2x of a freshly measured control on every row; the manager owns the control-arm reconstruction and the base/control/candidate receipts under /aux/koutecky/logseq/tine-agents/evidence/rebaselining-v2-p1/."
+}
 ]
 }
