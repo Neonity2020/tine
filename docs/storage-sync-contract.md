@@ -282,7 +282,7 @@ and manifest tail.
 block and per membership sealed their baseline with lazy-genesis manifest and
 page-capsule schema 5, operation schema 9 and semantic-effect schema 7. This
 build has no reader for any of them. A containing manifest that does not decode
-as, or does not carry, the current schema 6 is classified
+as, or does not carry, the current schema 7 is classified
 `superseded_containing_format` and refused as `MS-REF-PROTOCOL-INCOMPATIBLE`
 before any receipt or checkpoint is restored. The graph-open boundary then takes
 the blank-slate lifecycle of §3.1a: it archives the whole private root
@@ -312,7 +312,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | private enrollment `lazy-genesis.marker` | clean activation/join installation | production managed open | canonical activation marker v1, including the active authority-directory `generation` | written last; sole local managed-authority selector and join commit point |
 | private enrollment `lazy-genesis.shared` | clean share/join transition | clean runtime reopen | canonical clean descriptor digest plus local initiator/joiner role | device-local lifecycle fact; no semantic history or projection state |
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
-| `archive/lazy-genesis.<generation>/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation/join installation | clean open/join through the marker generation resolver | immutable baseline pack, manifest schema 6, page capsule v6, plus commit v1 | authoritative only when named by the marker; generation 0 is the fresh-store publication, and unreferenced generations are reclaimed on open. A sealed baseline whose manifest schema is not the current one is a recognized pre-0.7 containing format: open refuses with `MS-REF-PROTOCOL-INCOMPATIBLE`, which routes the store to preserve-and-rebuild (blank-slate), never to a retryable dead end; no earlier schema is decoded. A schema-5 baseline written by the retired per-block layout takes this same route: the whole private root is preserved as a backup and the current format is rebuilt automatically from Markdown/Org, without replaying backup-only history |
+| `archive/lazy-genesis.<generation>/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation/join installation | clean open/join through the marker generation resolver | immutable baseline pack, manifest schema 7, page capsule v6, plus commit v1 | authoritative only when named by the marker; generation 0 is the fresh-store publication, and unreferenced generations are reclaimed on open. A sealed baseline whose manifest schema is not the current one is a recognized pre-0.7 containing format: open refuses with `MS-REF-PROTOCOL-INCOMPATIBLE`, which routes the store to preserve-and-rebuild (blank-slate), never to a retryable dead end; no earlier schema is decoded. A schema-5 baseline written by the retired per-block layout takes this same route: the whole private root is preserved as a backup and the current format is rebuilt automatically from Markdown/Org, without replaying backup-only history |
 | `archive/operations.<generation>/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit and join installation | causal replay and publication through the marker generation resolver | content-addressed objects plus manifest-last batches | authoritative append-only tail paired with the same marker-named baseline generation; unreferenced generations are reconstructible join residue and are reclaimed on open |
 | `archive/operations.<generation>/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
 | `archive/operations.<generation>/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
@@ -1795,6 +1795,18 @@ Reconstruction applies those scenarios at these concrete call sites:
 | Reconstruction names the wrong block/home, is malformed, or exceeds an existing bound | `MS-REF-MALFORMED-IMPORT` / `MS-REF-BOUNDS` | Malformed imported/shared operation input attempts identity substitution or excess allocation. Reject before publication or allocation beyond the bound. |
 | Imported reconstruction update, source and declared effect disagree | `MS-REF-MALFORMED-IMPORT` | Malformed peer/import input substitutes content, identity, placement, or container operations. Reject the complete batch atomically; install no document or replacement. |
 | Restore planning state advances | `MS-REF-STALE-GENERATION` | An honest concurrent operation changed the page/frontier after validation. Re-diff through the existing bounded retry/action cursor; do not publish the stale plan. |
+
+One bound, not a refusal, applies to the same path. Editor undo resolves a
+deleted identity by walking the page shard's accepted ancestry newest-first,
+because the undo stack is not one batch deep: typing in another block and
+undoing back past a deletion puts ordinary batches between the two. The walk
+returns as soon as it finds the deletion and inspects at most
+`EDITOR_RECONSTRUCTION_ANCESTRY_BUDGET` (4096) accepted batches, so the bound
+is only ever reached by a lookup that was going to fail. Beyond it, and for an
+ancestor whose semantic effect no longer resolves, undo reports the identity as
+unknown rather than waiting. Reconstruction depends on the deletion's semantic
+effect still being retained; a deletion below the retention floor is not
+undoable, by design.
 
 Three retryable refusals are intentionally recorded outside the durable-scenario
 table:

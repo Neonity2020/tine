@@ -7526,6 +7526,112 @@ fn restore_subtree_reasserts_a_move_over_a_concurrent_delete() {
 }
 
 #[test]
+fn undo_before_a_racing_offline_edit_arrives_still_owes_that_edit_a_resolution() {
+    let ids = Ids::new();
+    let dir = TestDir::new("restore-then-offline-edit");
+    let archive = store(&dir, ids);
+    let (mut engine, baseline) = seed_engine(ids, &archive);
+
+    // The offline peer edits from the shared baseline and stays away.
+    let mut offline = ids.engine();
+    assert!(matches!(
+        offline.stage_ready(baseline.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let edited = offline
+        .prepare_fixture_transaction(
+            author(54_300, 543),
+            &tx(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: ids.block_a,
+                    home_document_id: ids.home_a,
+                },
+                content: "offline edit racing deletion".into(),
+            }]),
+        )
+        .unwrap();
+    let edited = ready(&archive, &edited);
+
+    // This device deletes the block and immediately undoes the deletion,
+    // before the offline edit has arrived.
+    let prepared = engine
+        .prepare_fixture_transaction(
+            author(54_301, 544),
+            &tx(vec![SemanticOperation::DeleteSubtree {
+                root_block_id: ids.block_a,
+                page_id: ids.page_a,
+            }]),
+        )
+        .unwrap();
+    let deletion_batch_id = prepared.manifest().batch_id();
+    let deleted = ready(&archive, &prepared);
+    assert!(matches!(
+        engine.stage_ready(deleted.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let restored = engine
+        .prepare_fixture_transaction(
+            author(54_302, 545),
+            &tx(vec![SemanticOperation::RestoreSubtree {
+                page_id: ids.page_a,
+                blocks: vec![BlockRestore {
+                    block: BlockLocation {
+                        block_id: ids.block_a,
+                        home_document_id: ids.home_a,
+                    },
+                    claim: MembershipClaim {
+                        home_document_id: ids.home_a,
+                        parent: None,
+                        order: "a".into(),
+                    },
+                    source: crate::oplog::BlockReconstructionSource::DeletedBeforeImage {
+                        deletion_batch_id,
+                    },
+                }],
+            }]),
+        )
+        .unwrap();
+    let restored = ready(&archive, &restored);
+    assert!(matches!(
+        engine.stage_ready(restored.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+
+    // The offline edit finally arrives. The undo is not a descendant of it, so
+    // the edit/delete race is still owed a resolution: without one the edit is
+    // silently lost behind the fresh container the undo attached.
+    let mut receiver = ids.engine();
+    for batch in [baseline, deleted, restored] {
+        assert!(matches!(
+            receiver.stage_ready(batch).disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+    }
+    assert!(matches!(
+        receiver.stage_ready(edited.clone()).disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let intents = receiver
+        .conflict_resolution_intents(edited.manifest().batch_id())
+        .unwrap();
+    let settled = receiver
+        .materialize_page(ids.page_a)
+        .unwrap()
+        .blocks
+        .into_iter()
+        .find(|block| block.block_id == ids.block_a)
+        .map(|block| block.content);
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            ConflictResolutionIntent::RestoreEdited { block, .. } if block.block_id == ids.block_a
+        )),
+        "the offline edit lost its race to an undo and was never offered a \
+         resolution: intents={intents:?}, block reads {settled:?}"
+    );
+}
+
+#[test]
 fn conflict_intents_detect_edit_delete_and_move_delete_races() {
     let ids = Ids::new();
     let dir = TestDir::new("intents-delete-races");

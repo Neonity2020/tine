@@ -863,10 +863,13 @@ enum EffectiveTitleTransitionSeal {
 const MAX_TRANSIENT_EFFECTIVE_VIEWS: usize = 256;
 
 /// How many accepted batches the editor reconstruction walk may inspect before
-/// it reports that a deleted identity is no longer resolvable. An undo stack is
-/// a session's worth of edits; this bound keeps a pathological history from
-/// turning one refused save into a walk of the whole shard.
-const EDITOR_RECONSTRUCTION_ANCESTRY_BUDGET: usize = 256;
+/// it answers that a deleted identity is not resolvable. The walk returns as
+/// soon as it finds the deletion, so this bound is only ever reached by a
+/// lookup that was going to fail anyway; it stops one refused save from
+/// walking a whole shard's history. Recorded in the storage contract's
+/// bounds table, because a user whose page shard carries more than this many
+/// batches since a deletion is told the block is unknown rather than waiting.
+const EDITOR_RECONSTRUCTION_ANCESTRY_BUDGET: usize = 4096;
 
 /// A nonconstructible, transient proof that one page-local exact-title
 /// post-state was selected by authenticated ownership provenance.
@@ -21576,6 +21579,22 @@ impl ShardedHotEngine {
                     "reconstruction semantic effect has no live page owner".into(),
                 ));
             };
+            // Which page the block comes back on is part of the identity the
+            // source authenticates, not the author's choice: restoring it
+            // somewhere else is a move and has to be declared as one. The
+            // local author path enforces this in `RestoreSubtree`; malformed
+            // imported input reaches the receiver instead
+            // (`MS-REF-MALFORMED-IMPORT`).
+            let expected_owner = match selected.owner {
+                BlockOwner::Tombstone if conflict => after.owner,
+                owner => owner,
+            };
+            if expected_owner != after.owner {
+                return Err(EngineError::InvalidTransaction(
+                    "reconstruction semantic effect selects a different page owner than its source"
+                        .into(),
+                ));
+            }
             let memberships = effect
                 .memberships()
                 .iter()
@@ -21697,9 +21716,27 @@ impl ShardedHotEngine {
                 0 => {}
                 1 => return Ok(matches.pop()),
                 _ => {
+                    // Two devices deleting the same block from the same base
+                    // leave two current heads that both name it. That is not
+                    // ambiguity: the before-images agree, so any of them
+                    // reconstructs the same block. Order by the deletion batch
+                    // so every device answers identically, and refuse only
+                    // when the recorded before-images genuinely disagree.
+                    let (first, rest) = matches.split_first().expect("non-empty matches");
+                    if rest.iter().all(|other| {
+                        (&other.0, &other.1, &other.2) == (&first.0, &first.1, &first.2)
+                    }) {
+                        matches.sort_by_key(|selected| match &selected.3 {
+                            super::BlockReconstructionSource::DeletedBeforeImage {
+                                deletion_batch_id,
+                            } => Some(*deletion_batch_id),
+                            _ => None,
+                        });
+                        return Ok(matches.into_iter().next());
+                    }
                     return Err(EngineError::InvalidTransaction(
                         "deleted editor identity is ambiguous in one accepted generation".into(),
-                    ))
+                    ));
                 }
             }
             frontier = next;
@@ -22140,17 +22177,24 @@ impl ShardedHotEngine {
         };
         let restore_after_tombstone =
             |page_id: PageId,
+             selected_content: Option<&str>,
              claim: Option<MembershipClaim>,
              moved: bool,
              source: super::BlockReconstructionSource,
              intents: &mut Vec<ConflictResolutionIntent>| {
-                // Physical deletion leaves no owner register. If the selected
-                // side already survives as a live page-owned block, there is
-                // nothing to reconstruct.
-                if merged_state
-                    .as_ref()
-                    .is_some_and(|state| state.owner != BlockOwner::Tombstone)
-                {
+                // Physical deletion leaves no owner register, so the block can
+                // only be live here because something authored it back. That
+                // is not by itself evidence that the SELECTED side survived:
+                // an undo authored before the racing batch arrived attaches a
+                // FRESH text container, which wins the content-map key and
+                // hides the concurrent edit's mutation of the old container.
+                // Reconstruct unless the merged state already IS the selected
+                // outcome — owned by the selected page, and for an edit race
+                // carrying the edit's text.
+                if merged_state.as_ref().is_some_and(|state| {
+                    state.owner == BlockOwner::Page(page_id)
+                        && selected_content.is_none_or(|content| state.content == content)
+                }) {
                     return;
                 }
                 let Some(mut claim) = claim else {
@@ -22198,6 +22242,7 @@ impl ShardedHotEngine {
             (Some(page), _, _, _, true, _) => {
                 restore_after_tombstone(
                     page,
+                    x_delta.after.as_ref().map(|state| state.content.as_str()),
                     membership_claim_in_effect(z_effect, page, block_id, false),
                     false,
                     super::BlockReconstructionSource::ConflictAfterImage {
@@ -22210,6 +22255,7 @@ impl ShardedHotEngine {
             (_, true, _, Some(page), _, _) => {
                 restore_after_tombstone(
                     page,
+                    z_delta.after.as_ref().map(|state| state.content.as_str()),
                     membership_claim_in_effect(x_effect, page, block_id, false),
                     false,
                     super::BlockReconstructionSource::ConflictAfterImage {
@@ -22223,6 +22269,7 @@ impl ShardedHotEngine {
             (_, _, Some(target), _, true, _) => {
                 restore_after_tombstone(
                     target,
+                    None,
                     membership_claim_in_effect(x_effect, target, block_id, true),
                     true,
                     super::BlockReconstructionSource::ConflictAfterImage {
@@ -22235,6 +22282,7 @@ impl ShardedHotEngine {
             (_, true, _, _, _, Some(target)) => {
                 restore_after_tombstone(
                     target,
+                    None,
                     membership_claim_in_effect(z_effect, target, block_id, true),
                     true,
                     super::BlockReconstructionSource::ConflictAfterImage {
