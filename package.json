@@ -11,7 +11,7 @@
     "tauri": "tauri",
     "app": "tauri dev",
     "ios:prepare-project": "node scripts/prepare-ios-project.mjs",
-    "test": "vitest run && vitest run --config vitest.render.config.ts && node scripts/test-deploy-profile.mjs",
+    "test": "vitest run && vitest run --config vitest.render.config.ts && node scripts/test-deploy-profile.mjs && npm run test:anonymize-graph",
     "test:render": "vitest run --config vitest.render.config.ts",
     "build:wasm": "node scripts/build-wasm.mjs",
     "test:fdroid-monitor": "node --test scripts/fdroid-upstream-monitor.test.mjs",
