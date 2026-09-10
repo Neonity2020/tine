@@ -3061,6 +3061,54 @@ pub(crate) fn release_projection(graph: &crate::model::Graph) {
 }
 
 #[cfg(test)]
+/// Drive projection recovery the way the app does: by retrying.
+///
+/// `direct_projection_recover_after_failed_read` is ONE attempt and is allowed
+/// to accomplish nothing -- `model.rs` says so itself where it turns "the
+/// repair did not take" into `Unavailable(ReadFailed)`. The mechanism is that
+/// recovery latches `pending.rebuild`, but the worker consumes that flag only
+/// together with a `full` or `warm` payload (`rebuild = (full|warm) &&
+/// take(rebuild)`). If the turn carrying that payload fails, the payload is
+/// gone and the rebuild stays latched with nothing left to ride in on, so the
+/// projection stays failed until something enqueues work again. In the running
+/// app that something is the user's next query, which calls recovery again.
+///
+/// A fixture that calls recovery once and then waits has assumed a convergence
+/// guarantee the contract does not make. It fails about one run in twenty on a
+/// loaded machine and passes every time on an idle one, which is how
+/// `current_snapshot_write_failure_recovers_from_authoritative_source` took
+/// down the Linux release selection on 2026-09-10 after passing all night.
+pub(crate) fn recover_until_ready(graph: &crate::model::Graph) {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(30);
+    loop {
+        graph.direct_projection_recover_after_failed_read();
+        let attempt = std::time::Instant::now();
+        while !graph.direct_projection_ready_test() {
+            if attempt.elapsed() >= std::time::Duration::from_millis(500)
+                || started.elapsed() >= budget
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if graph.direct_projection_ready_test() {
+            return;
+        }
+        assert!(
+            started.elapsed() < budget,
+            "Direct Files projection did not converge across repeated recovery attempts: \
+             cache_generation={} {}",
+            graph.cache_generation(),
+            graph
+                .direct_projection_test()
+                .map(|projection| projection.debug_state_test())
+                .unwrap_or_else(|| "no projection".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn direct_query_producer_has_no_saved_edit_or_answer_cache_protocol() {
@@ -3227,6 +3275,97 @@ mod tests {
              previous worker, so the reopen races its exclusive writer lease and fails only \
              under load: {offenders:#?}. Call release_projection(&graph) as the last statement \
              of the first session; a sleep is a guess, not a handoff."
+        );
+    }
+
+    /// Every fixture drives projection recovery through `recover_until_ready`.
+    ///
+    /// One call to `direct_projection_recover_after_failed_read` is permitted
+    /// to do nothing at all: it latches `pending.rebuild`, and the worker takes
+    /// that flag only alongside a `full` or `warm` payload, so a payload turn
+    /// that fails leaves the rebuild latched with nothing to carry it. The app
+    /// recovers because the user's NEXT query calls recovery again. A fixture
+    /// that calls it once and then waits is asserting a convergence guarantee
+    /// the contract does not make, and it fails about one run in twenty on a
+    /// loaded machine -- which is what took down the Linux release selection on
+    /// 2026-09-10.
+    ///
+    /// Crate-wide on purpose. The lease-handoff guard above learned this the
+    /// expensive way the same night: scoped to the file whose fixtures had
+    /// failed, it could not see the identical defect one module over.
+    #[test]
+    fn every_fixture_drives_projection_recovery_through_the_retrying_helper() {
+        const CALL: &str = ".direct_projection_recover_after_failed_read()";
+        const HELPER: &str = "recover_until_ready";
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the crate source tree is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rust_files(&source_root, &mut files);
+        files.sort();
+        assert!(
+            files.len() > 10,
+            "the scan found {} source files, so it is not looking at the crate",
+            files.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut helper_calls = 0usize;
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("a readable source file");
+            let mut current = String::from("<file scope>");
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed
+                    .strip_prefix("fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                {
+                    current = rest.split('(').next().unwrap_or_default().trim().to_owned();
+                }
+                if trimmed.starts_with("///") || trimmed.starts_with("//") {
+                    continue;
+                }
+                if !line.contains(CALL) {
+                    continue;
+                }
+                // Production calls it on `self` exactly once per query and
+                // turns a repair that did not take into an error the next
+                // query retries; that is the contract, not a defect.
+                if line.contains("self.direct_projection_recover_after_failed_read()") {
+                    continue;
+                }
+                if current == HELPER {
+                    helper_calls += 1;
+                    continue;
+                }
+                // This scan names the call it forbids, so it matches itself.
+                if current == "every_fixture_drives_projection_recovery_through_the_retrying_helper"
+                {
+                    continue;
+                }
+                offenders.push(format!("{}::{current}", file.display()));
+            }
+        }
+
+        assert_eq!(
+            helper_calls, 1,
+            "recover_until_ready must be the single fixture entry point that retries recovery"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these fixtures call projection recovery directly instead of \
+             recover_until_ready(&graph), so they assume one attempt converges and fail \
+             about one run in twenty under load: {offenders:#?}"
         );
     }
 
@@ -3668,8 +3807,7 @@ mod tests {
             projection.open_current_query_job(RegistrySensitivity::Insensitive),
             QueryJobOpen::NotReady
         ));
-        graph.direct_projection_recover_after_failed_read();
-        wait_ready(&graph);
+        crate::direct_projection::recover_until_ready(&graph);
         let result = graph
             .run_query_bounded("(task TODO)", 100, 1_000_000)
             .unwrap();
@@ -7108,8 +7246,7 @@ mod tests {
         let writer = rusqlite::Connection::open(&database).unwrap();
         writer.execute_batch("DROP TABLE block_text").unwrap();
         drop(writer);
-        graph.direct_projection_recover_after_failed_read();
-        wait_ready(&graph);
+        crate::direct_projection::recover_until_ready(&graph);
         assert!(
             !graph.has_parsed_cache_test(),
             "projection repair must stream source pages without retaining the parsed graph"
@@ -7153,8 +7290,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        graph.direct_projection_recover_after_failed_read();
-        wait_ready(&graph);
+        crate::direct_projection::recover_until_ready(&graph);
         assert!(!graph.has_parsed_cache_test());
         let result = graph
             .run_query_bounded("(task TODO)", 100, 1_000_000)
