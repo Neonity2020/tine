@@ -2014,9 +2014,65 @@ const PROJECTION_UPDATE_FAILURE: &str = "is stale; indexed reads are unavailable
 /// record, because a user who is not running under `TINE_DEBUG` otherwise sees
 /// only an unavailable index. The prose stays on the directed debug channel.
 fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
+    #[cfg(test)]
+    REPORTED_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
     eprintln!("[tine] Direct Files SQLite projection {family}");
     if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
         eprintln!("[tine] Direct Files SQLite projection {family}; directed detail: {detail}");
+    }
+}
+
+/// How many times the always-on failure family has been printed this process.
+///
+/// The counter exists because the ONLY difference between a reported failure and
+/// a silent handoff is which `eprintln!` runs, and a test cannot read stderr.
+/// It is what makes [`ProjectionRefusal`]'s split checkable rather than merely
+/// asserted in a comment.
+#[cfg(test)]
+static REPORTED_PROJECTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reported_projection_failures_test() -> u64 {
+    REPORTED_PROJECTION_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Why one worker turn produced no serving image.
+///
+/// The two arms leave the SAME state behind — `requires_full_rebuild` latched,
+/// `worker_failed` set, readiness withdrawn — because in both cases only a
+/// complete source inventory may publish readiness again. They differ in ONE
+/// thing: whether a user is told the index broke.
+///
+/// `AwaitingFullInventory` is not a failure and must never reach the always-on
+/// channel. It is the ordinary cold-open handoff: an edit or an external write
+/// (Syncthing, an external editor) raced the warm stream, `stream_warm_replacements`
+/// abandoned it, `abandon_warm_stream` set `needs_full`, and the next turn
+/// carried only deltas. The parser fallback is ALREADY on its way with the full
+/// snapshot that repairs this; nothing is wrong and nothing is owed by the user.
+/// Reporting it printed `PROJECTION_UPDATE_FAILURE` once per delta turn, so a
+/// cold open under sync traffic emitted the alarming line hundreds of times
+/// (Martin, 2026-09-10) while queries answered correctly throughout.
+enum ProjectionRefusal {
+    AwaitingFullInventory,
+    Failed(String),
+}
+
+impl ProjectionRefusal {
+    /// Whether this refusal is a genuine write failure the user must be told
+    /// about on the always-on channel.
+    fn is_reportable_failure(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+impl std::fmt::Display for ProjectionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AwaitingFullInventory => {
+                f.write_str("a complete source inventory is owed before deltas can lower again")
+            }
+            Self::Failed(error) => f.write_str(error),
+        }
     }
 }
 
@@ -2183,11 +2239,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             .collect::<std::collections::BTreeSet<_>>();
         #[cfg(test)]
         run_before_apply_pending_hook();
-        let applied: Result<AppliedTurn, String> = if requires_full_rebuild
+        let applied: Result<AppliedTurn, ProjectionRefusal> = if requires_full_rebuild
             && !had_full
             && !had_warm
         {
-            Err("a prior projection failure requires a complete source inventory".into())
+            // NOT necessarily a prior failure: `abandon_warm_stream` sets
+            // `needs_full` on ordinary generation drift. See `ProjectionRefusal`.
+            Err(ProjectionRefusal::AwaitingFullInventory)
         } else {
             (|| {
                 if config_changed && !(rebuild || requires_full_rebuild || writer_slot.is_none()) {
@@ -2314,6 +2372,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 drop(registry);
                 Ok(applied)
             })()
+            .map_err(ProjectionRefusal::Failed)
         };
         let applied = match applied {
             Ok(applied) => applied,
@@ -2334,7 +2393,11 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 }
                 shared.worker_busy.store(false, Ordering::Release);
                 shared.changed.notify_all();
-                report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
+                if error.is_reportable_failure() {
+                    report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
+                } else if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                    eprintln!("[tine] Direct Files SQLite projection deferred this turn: {error}");
+                }
                 continue;
             }
         };
@@ -3774,6 +3837,109 @@ mod tests {
         );
         assert_ne!(projection.query_epoch(), original);
         wait_generation(generation + 2);
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The cold-open handoff sets `needs_full`. This is the step that makes the
+    /// next delta-only turn refuse, so it is the step the alarming log line was
+    /// really reporting.
+    #[test]
+    fn abandoning_a_warm_stream_asks_for_a_complete_inventory() {
+        let _serial = serialize_projection_tests();
+        let root = r6_graph("abandon-asks-full");
+        let database = root.join("private/projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+        let generation = graph.cache_generation();
+        {
+            let mut pending = projection.shared.pending.lock().unwrap();
+            assert!(
+                !pending.needs_full,
+                "a converged projection owes no inventory before the stream is abandoned"
+            );
+            pending.warm_stream = Some(generation);
+        }
+        assert!(
+            !projection.abandon_warm_stream(generation),
+            "no full snapshot superseded this stream, so the caller still owes the fallback"
+        );
+        assert!(
+            projection.shared.pending.lock().unwrap().needs_full,
+            "an abandoned warm stream is what asks for the complete source inventory"
+        );
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A turn deferred for want of a complete inventory is NOT a failure and
+    /// must not reach the always-on channel; a real write failure still must.
+    ///
+    /// Both halves run here because the counter only proves the split when it
+    /// is shown to move for one input and not the other. Without the second
+    /// half a reporter that never printed anything would pass.
+    #[test]
+    fn a_deferred_turn_is_silent_while_a_write_failure_is_reported() {
+        let _serial = serialize_projection_tests();
+        let root = r6_graph("deferred-turn-silent");
+        let database = root.join("private/projection.sqlite");
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let projection = graph.direct_projection_test().unwrap();
+
+        // Exactly the state `abandon_warm_stream` leaves behind (pinned by
+        // `abandoning_a_warm_stream_asks_for_a_complete_inventory`).
+        projection.shared.pending.lock().unwrap().needs_full = true;
+        let before = reported_projection_failures_test();
+
+        let entry = graph.list_pages().into_iter().next().unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO the delta that races a cold open".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+
+        let started = Instant::now();
+        while !projection.shared.worker_failed.load(Ordering::Acquire)
+            && started.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            projection.shared.worker_failed.load(Ordering::Acquire),
+            "the deferred turn still withdraws readiness: only a full inventory may publish it"
+        );
+        assert_eq!(
+            reported_projection_failures_test(),
+            before,
+            "the cold-open handoff must not print the always-on failure family; \
+             it printed once per delta turn until 2026-09-10 and a cold open under \
+             sync traffic emitted it hundreds of times while queries answered fine"
+        );
+
+        // The same channel must still fire for a genuine write failure.
+        crate::direct_projection::recover_until_ready(&graph);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("DROP TABLE block_text").unwrap();
+        drop(writer);
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "TODO a delta that cannot lower".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        let started = Instant::now();
+        while reported_projection_failures_test() == before
+            && started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            reported_projection_failures_test() > before,
+            "a real materialization failure must still reach the always-on channel"
+        );
         assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
         std::fs::remove_dir_all(root).unwrap();
     }

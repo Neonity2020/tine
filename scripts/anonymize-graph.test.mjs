@@ -167,6 +167,50 @@ test("preserves repeated references and UUID identities while retaining parseabl
   assert.match(output, /#\+TITLE:/);
 });
 
+test("exports queries as queries: macro name, block type and operators survive", async (t) => {
+  const source = await fixture(t);
+  const destination = join(source, "..", "anonymized-queries");
+  await writeGraph(source, {
+    "pages/TODOs.md": [
+      "- ## Everything",
+      "\t- {{query (and (task TODO) (not (priority A)))}}",
+      "\t- {{query (and [[Client Alpha]] (between [[Jan 1st, 2026]] [[Jan 8th, 2026]]))}}",
+      "- ## Advanced",
+      "\t- #+BEGIN_QUERY",
+      '\t  {:title "Open work"',
+      "\t   :query [:find (pull ?b [*]) :where [?b :block/marker ?m]]}",
+      "\t  #+END_QUERY",
+      "- A sentence where between and property are ordinary English words.",
+      "- {{embed ((123e4567-e89b-42d3-a456-426614174000))}}",
+    ].join("\n"),
+  });
+
+  await anonymizeGraph({ source, destination });
+  const output = (await listFiles(destination)).find((file) => extname(file.path).toLowerCase() === ".md").text;
+
+  // The corpus is a query corpus again: it can be found, parsed and run.
+  assert.equal([...output.matchAll(/\{\{query /g)].length, 2);
+  assert.match(output, /#\+BEGIN_QUERY/);
+  assert.match(output, /#\+END_QUERY/);
+  assert.match(output, /\{\{embed /);
+  assert.match(output, /\(and \(task TODO\) \(not \(priority A\)\)\)/);
+  assert.match(output, /\(between /);
+  assert.match(output, /:find \(pull \?b/);
+
+  // And still anonymous: the operands did not survive with the operators.
+  assert.ok(!output.includes("Client Alpha"), "a page name inside a query must stay pseudonymous");
+  assert.ok(!output.includes("Open work"), "a query title is user text, not grammar");
+
+  // The scoping holds: outside a query body those same words are ordinary text
+  // and must still be pseudonymised.
+  const proseLine = output.split("\n").find((line) => /^- [A-Za-z]/.test(line) && !line.includes("#"));
+  assert.ok(proseLine !== undefined, "the prose line survived the export");
+  assert.ok(
+    !/\bbetween\b/.test(proseLine) && !/\bproperty\b/.test(proseLine),
+    `an English "between"/"property" outside a query body must not be preserved: ${proseLine}`,
+  );
+});
+
 test("uses one pseudonym map for filename, directory, page, and link tokens", async (t) => {
   const source = await fixture(t);
   const destination = join(source, "..", "anonymized-consistency");
