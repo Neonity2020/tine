@@ -2200,6 +2200,30 @@ fn ready_graph(dir: &Path) -> Graph {
 /// `Unavailable` and `Cancelled` fail the fixture immediately: a fixture that
 /// slept through them would hide exactly the regression RET2's typed
 /// vocabulary exists to expose.
+/// Wait until the projection has moved PAST `generation` and is ready there.
+///
+/// `when_ready` returns the first `Ok`, and readiness is not freshness: right
+/// after a save the projection can still be ready AT THE PRE-SAVE GENERATION,
+/// so the answer comes back well-formed, prompt, and stale. Waiting for the
+/// generation to transition is the only signal that the edit is in the answer.
+///
+/// Without this, `advanced_query_reexecutes_and_observes_every_edit` failed
+/// about one run in four on this machine while passing in CI, and the failure
+/// reads as a product defect ("the DONE edit was not observed") rather than as
+/// the fixture sampling too early.
+fn when_current(graph: &Graph, generation: u64) {
+    let started = Instant::now();
+    while graph.cache_generation() <= generation || !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the projection never advanced past generation {generation} (now {}, ready={})",
+            graph.cache_generation(),
+            graph.direct_projection_ready_test()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn when_ready<T>(mut attempt: impl FnMut() -> Result<T, crate::query::QueryExecutionError>) -> T {
     let started = Instant::now();
     loop {
@@ -10329,7 +10353,9 @@ fn advanced_query_reexecutes_and_observes_every_edit() {
 
     let mut dto = g.load_named("P", PageKind::Page).unwrap().unwrap();
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DONE");
+    let before_affected_edit = g.cache_generation();
     g.save_page(&dto, dto.rev.as_deref()).unwrap();
+    when_current(&g, before_affected_edit);
 
     let third_result = when_ready(|| g.run_advanced_query_cached(q, None));
     let third = advanced_query_pre_view_rows(&g, q, usize::MAX, usize::MAX);
