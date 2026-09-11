@@ -3147,7 +3147,10 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
     );
     let corpus = Corpus::open(root, false);
     let fts_ready = corpus.fts_ready();
-    eprintln!("observed_queries total={} fts_ready={fts_ready}", shapes.len());
+    eprintln!(
+        "observed_queries total={} fts_ready={fts_ready}",
+        shapes.len()
+    );
     for (index, (name, argument)) in shapes.iter().enumerate() {
         let dialect = match crate::query::macro_text::FormFamily::for_macro_name(name) {
             crate::query::macro_text::FormFamily::Tql => QueryDialect::Tql,

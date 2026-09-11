@@ -1011,3 +1011,73 @@ fn crlf_files_round_trip_without_churn() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// A block created in the editor is saved with the FRONTEND's live runtime id
+// (`src/store.ts` `freshId()`: `b<base36 time>-<counter>`), which the in-memory
+// save path deliberately keeps. The projection used to refuse the whole page
+// because that id is not a UUID, and after one such save every query in the
+// app answered "Rebuilding the query index…" until restart (observed
+// 2026-09-11 on master d61cfb3d). The user outcome pinned here: after creating
+// a block, the query answers again within a bounded time and names the new
+// block by the id the editor knows it by.
+#[test]
+fn a_block_created_in_the_editor_keeps_queries_answering() {
+    use std::time::{Duration, Instant};
+    use tine_core::model::BlockDto;
+    use tine_core::query::QueryExecutionError;
+
+    let root = mk("freshblock");
+    std::fs::write(root.join("pages").join("Seed.md"), "- TODO seeded task\n").unwrap();
+    let g = Graph::open(&root);
+    ready_query::attach_projection(&g, &root);
+    let task_ids = |groups: &[tine_core::model::RefGroup]| -> Vec<String> {
+        groups
+            .iter()
+            .flat_map(|group| group.blocks.iter())
+            .map(|block| block.id.clone())
+            .collect()
+    };
+    assert_eq!(
+        task_ids(&ready_query::run_query(&g, "(task TODO)")).len(),
+        1,
+        "the seeded task answers before the edit"
+    );
+
+    let entry = g.find_entry("Seed", PageKind::Page).unwrap();
+    let mut page = g.load_page(&entry).unwrap();
+    const EDITOR_LIVE_ID: &str = "bmtwqvwcx-1";
+    page.blocks.push(BlockDto {
+        id: EDITOR_LIVE_ID.into(),
+        raw: "TODO fresh task".into(),
+        ..Default::default()
+    });
+    g.save_page(&page, page.rev.as_deref()).unwrap();
+
+    let started = Instant::now();
+    let mut last = String::from("no attempt yet");
+    loop {
+        match g.run_query("(task TODO)") {
+            Ok(groups) => {
+                let ids = task_ids(&groups);
+                if ids.len() == 2 {
+                    assert!(
+                        ids.iter().any(|id| id == EDITOR_LIVE_ID),
+                        "the answer names the new block by the editor's live id: {ids:?}"
+                    );
+                    break;
+                }
+                last = format!("answered {} task(s): {ids:?}", ids.len());
+            }
+            Err(QueryExecutionError::NotReady(reason)) => {
+                last = format!("not ready ({})", reason.as_str());
+            }
+            Err(other) => panic!("the public query route refused after the save: {other}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "queries never answered again after a save that created a block; last: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

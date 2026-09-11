@@ -7326,6 +7326,37 @@
   "failBefore": "baseline-real-delete-*.log: the unchanged Packet 1 base retains owner/content state after deletion, restores the old text container instead of reconstructing an accepted before-image, and rejects editor replay as causal identity reuse"
  },
  "notes": "Packet P2 removes owner, membership, content and paired sparse identity keys from live page shards. Restore retains BlockId, immutable home and Logseq UUID but authors a new ordinary text container from the exact accepted deletion source; receiver admission validates source, update and semantic-effect agreement. Three mandatory map-key tombstones per deleted block are accepted residual growth; retained deleted text is not. Pre-P2 state follows the one-format backup-and-rebuild boundary."
+},
+{
+ "id": "REG-QUERY-REFRESH-DROPS-PROJECTION-001",
+ "title": "A settings change (Guide toast, default home, brackets, format, restore) keeps queries answering",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "Martin 2026-09-11: dismissing the Guide toast made every query 'unavailable' until the graph was reopened" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": [
+   "src-tauri/src/state.rs::tests::a_config_refresh_keeps_queries_answering",
+   "src-tauri/src/graph.rs::tests::every_direct_files_graph_is_attached_through_one_function"
+  ],
+  "scenario": "query.refresh-keeps-projection",
+  "failBefore": "With attach_direct_files_services removed from reopen_legacy_for_refresh the test fails: after refresh the query answers None (ProjectionUnavailable) where it answered Some(3) before"
+ },
+ "notes": "User outcome: on a Direct Files graph, dismissing the Guide toast -- and every other command that refreshes the graph after a config write (default home, time tracking, show brackets, doc-mode Enter, logical outdenting, preferred format, journal title format, restore from backup, an external config.edn rewrite) -- turned every query block into 'Query results unavailable' until the graph was reopened. Classification: blocking core operation. Mechanism: refresh_graph_for_label built a new Graph and bound it without the Direct Files projection (and Concord ledger) that prepare_direct_files_open attaches, and without a warm. Fix: one attach_direct_files_services used by both the open and the refresh; the refresh retires the old projection worker first (a second DirectProjection::start on the same path races the writer lease), reopens, attaches, and warms through warm_cache_async like the open path. Managed graphs were never affected (refresh returns early for a sparse binding)."
+},
+{
+ "id": "REG-QUERY-NEW-BLOCK-WEDGES-PROJECTION-001",
+ "title": "Creating a block in the editor no longer leaves every query 'Rebuilding the query index...' until restart",
+ "family": "query-engine",
+ "sources": { "issues": [], "commits": [], "internal": "2026-09-11 why-empty repro lane: after one save every query stayed 'recovering' for 95 s and never cleared" },
+ "platforms": ["all"], "layer": "rust-core", "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/tests/search_edit.rs::a_block_created_in_the_editor_keeps_queries_answering"
+  ],
+  "scenario": "query.new-block-keeps-projection",
+  "failBefore": "On d61cfb3d the test panics after 10 s: 'queries never answered again after a save that created a block; last: not ready (recovering)', with 495 'projection is stale; indexed reads are unavailable' lines (tine-agents/evidence/2026-09-11-query-fixes/wedge-fail-before.log)"
+ },
+ "notes": "User outcome: pressing Enter to create a block, then saving, made every query in the app say 'Rebuilding the query index...' permanently (a plain text edit did not). Classification: blocking core operation. Mechanism: a block created in the editor is saved with the frontend's live id (b<base36 time>-<n>), which the in-memory save path deliberately keeps; lower_blocks refused the WHOLE page delta because that id is not a UUID, the failed turn latched a full rebuild, and every rebuild re-lowered the same live document and failed the same way. Fix: a non-UUID live id gets a deterministic 16-byte projection key (the row's public identity is the id string, so answers still name the block by the editor's id). The walk fallback the query campaign retired used to hide this refusal."
 }
 ]
 }

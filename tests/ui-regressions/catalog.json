@@ -11127,6 +11127,29 @@
         "failBefore": "unavailable"
       },
       "notes": "Journey scripts/e2e-managed-p4-rebuild.mjs (p4_store_is_preserved_and_automatically_rebuilt_from_text) is registered in tests/ui-regressions/e2e-contracts.json with an exact-safety-interoperability contract for private-byte and source preservation and a core-operation contract for automatic recovery plus edit/save/reopen, and is selected by the run-e2e.mjs suite managed-p4-rebuild. It needs a P4-built producer (TINE_P4_APP) beside the exact candidate (TINE_APP); the journey has now run green at candidate 94db49a7 with TINE_P4_APP built from base 1c2707fc, so a genuine per-block producer was used; failBefore stays unavailable because the pre-P1 app IS the P4 writer and therefore never meets foreign P4 bytes, so no build exists in which the journey's premise can fail without deliberately disabling the blank-slate rebuild lifecycle. No new notice, prompt or decision is introduced; the existing graph-open blank-slate lifecycle archives every private byte and reactivates the one current format."
+    },
+    {
+      "id": "UI-QUERY-WHY-EMPTY-BEFORE-ANY-RUN-001",
+      "title": "'why empty?' appears only for a query that ran and matched nothing, not while the engine is still rebuilding",
+      "family": "query-results",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "Martin 2026-09-11: a fresh query showed 'why empty?', clicking it grew the box by a few px, showed nothing, and the button read 'hide'"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.ir.test.tsx::shows the readiness state and no affordance until a run has come back"
+        ],
+        "scenario": "query.why-empty-describes-an-answer",
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: with the projection rebuilding, a query block said 'No results' and offered 'why empty?', which opened an empty panel. Classification: blocking stateful UX (the readiness state was hidden behind a false answer). Mechanism: query_parse retried on readiness with no pending signal, so no reading existed, nothing ran, total() fell to 0, and the empty-answer affordance rendered with an undefined explanation request. Fix: the parse retry reports its readiness like the run does ('Rebuilding the query index…' in the status line and the empty panel), and 'No results' / 'why empty?' render only once an operation has actually come back empty."
     }
   ]
 }

@@ -199,7 +199,9 @@ describe("B1: a TQL block executes through query_run", () => {
 
     const { root, dispose } = mount(() => <Block id="query" />);
     try {
-      await vi.waitFor(() => expect(root.querySelector(".query-empty")).not.toBeNull());
+      // The affordance itself is the sign the run came back empty; `.query-empty`
+      // alone also hosts "Loading query results…" before any answer exists.
+      await vi.waitFor(() => expect(root.querySelector(".query-why-empty")).not.toBeNull());
       // Asked only once a run has actually come back empty — an ordinary query
       // still costs one command.
       expect(explainEmpty).not.toHaveBeenCalled();
@@ -211,6 +213,39 @@ describe("B1: a TQL block executes through query_run", () => {
       expect(text).toContain("page = [[Nowhere]]");
       expect(text).toContain("task = TODO");
       expect(explainEmpty).toHaveBeenCalledTimes(1);
+    } finally {
+      dispose();
+    }
+  });
+});
+
+describe("why empty? describes an answer, not the absence of one", () => {
+  // 2026-09-11: with the projection rebuilding, `query_parse` retried forever,
+  // no reading existed, nothing ran, `total()` fell to 0 — and the block said
+  // "No results" with a "why empty?" that opened a panel with nothing in it.
+  it("shows the readiness state and no affordance until a run has come back", async () => {
+    load(TQL_MACRO);
+    let ready = false;
+    vi.spyOn(backend(), "parseQuery").mockImplementation(async (text: string) => {
+      if (!ready) throw new QueryNotReadyError("recovering");
+      return parsedAs(text);
+    });
+    const run = vi.spyOn(backend(), "queryRun").mockResolvedValue(blockRunResult([]));
+    const explainEmpty = vi.spyOn(backend(), "queryExplainEmpty");
+    const { root, dispose } = mount(() => <Block id="query" />);
+    try {
+      await vi.waitFor(() => expect(root.textContent).toContain("Rebuilding the query index…"));
+      expect(root.querySelector(".query-why-empty")).toBeNull();
+      expect(root.textContent).not.toContain("No results");
+      expect(run).not.toHaveBeenCalled();
+      expect(explainEmpty).not.toHaveBeenCalled();
+
+      // The engine comes back: the retry lands, the run comes back empty, and
+      // only NOW is there an empty answer to explain.
+      ready = true;
+      await vi.waitFor(() => expect(root.querySelector(".query-why-empty")).not.toBeNull(), { timeout: 4000 });
+      expect(root.textContent).toContain("No results");
+      expect(root.textContent).not.toContain("Rebuilding the query index…");
     } finally {
       dispose();
     }
