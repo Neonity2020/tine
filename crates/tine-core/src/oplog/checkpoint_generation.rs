@@ -25,8 +25,8 @@ use super::hot_engine::{
 };
 use super::object_store::ObjectStore;
 use super::{
-    BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, DocumentDependencies,
-    DocumentId, WriterIncarnationId,
+    BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, CrdtPeerCounter,
+    DocumentDependencies, DocumentId, LineageDigest, WorkspaceId, WriterIncarnationId,
 };
 use tine_storage::sealed_accepted_index::AuthenticatedMapKey;
 
@@ -83,6 +83,96 @@ pub(crate) fn fail_checkpoint_writes_for_test(store_root: &std::path::Path, fail
     } else {
         roots.remove(&root);
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum CheckpointDamageForTest {
+    PointerTorn,
+    PointerWrongFormat,
+    GenerationTorn,
+    PayloadTorn,
+    FloorMetadataInconsistent,
+    DocumentImageTorn,
+}
+
+#[cfg(test)]
+pub(crate) fn damage_checkpoint_for_test(
+    store: &ObjectStore,
+    damage: CheckpointDamageForTest,
+) -> Result<(), String> {
+    fn overwrite(path: &std::path::Path, mut bytes: &[u8]) -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        std::io::copy(&mut bytes, &mut file)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    let path = store.root_path().join(CHECKPOINT_DIRECTORY);
+    let pointer_path = path.join(CHECKPOINT_POINTER);
+    let pointer_bytes = std::fs::read(&pointer_path).map_err(|error| error.to_string())?;
+    if matches!(damage, CheckpointDamageForTest::PointerTorn) {
+        overwrite(&pointer_path, &[0x01])?;
+        return Ok(());
+    }
+    let mut pointer: CheckpointPointerV2 = decode_canonical(&pointer_bytes)?;
+    if matches!(damage, CheckpointDamageForTest::PointerWrongFormat) {
+        pointer.schema_version = pointer.schema_version.saturating_add(1);
+        overwrite(&pointer_path, &encode_canonical(&pointer)?)?;
+        return Ok(());
+    }
+    let slot = pointer.slot as usize;
+    let generation_path = path.join(CHECKPOINT_GENERATION_NAMES[slot]);
+    if matches!(damage, CheckpointDamageForTest::GenerationTorn) {
+        overwrite(&generation_path, &[0x01])?;
+        return Ok(());
+    }
+    let generation_bytes = std::fs::read(&generation_path).map_err(|error| error.to_string())?;
+    let mut generation: CheckpointGenerationV2 = decode_canonical(&generation_bytes)?;
+    let payload_path = path.join(CHECKPOINT_PAYLOAD_NAMES[slot]);
+    if matches!(damage, CheckpointDamageForTest::PayloadTorn) {
+        overwrite(&payload_path, &[0x01])?;
+        return Ok(());
+    }
+    let payload_bytes = std::fs::read(&payload_path).map_err(|error| error.to_string())?;
+    let mut payload: CheckpointPayloadV2 = decode_canonical(&payload_bytes)?;
+    if matches!(damage, CheckpointDamageForTest::FloorMetadataInconsistent) {
+        payload.recovery_fence.eligible_through = generation.sequence.saturating_add(1);
+        let payload_bytes = encode_canonical(&payload)?;
+        generation.payload_len = payload_bytes.len() as u64;
+        generation.payload_digest = ContentDigest::of(&payload_bytes);
+        let generation_bytes = encode_canonical(&generation)?;
+        pointer.generation_digest = ContentDigest::of(&generation_bytes);
+        overwrite(&payload_path, &payload_bytes)?;
+        overwrite(&generation_path, &generation_bytes)?;
+        overwrite(&pointer_path, &encode_canonical(&pointer)?)?;
+        return Ok(());
+    }
+    if matches!(damage, CheckpointDamageForTest::DocumentImageTorn) {
+        let document = payload
+            .document_dependencies
+            .first()
+            .ok_or_else(|| "checkpoint damage fixture has no document image".to_owned())?
+            .document_id();
+        let directory = checkpoint_directory(store)?;
+        let roster = SealedDocumentRoster::from_root(map_root_from_wire(payload.document_roster)?);
+        let reader = SealedGenerationDirectory::open(&directory)?;
+        let record = roster
+            .document_record(&reader, document)?
+            .ok_or_else(|| "checkpoint damage fixture omits its document".to_owned())?;
+        overwrite(
+            &path.join(capsule_blob_name(ContentDigest::from_bytes(
+                *record.checkpoint.sha256(),
+            ))),
+            b"torn document image",
+        )?;
+        return Ok(());
+    }
+    Err("unsupported checkpoint damage fixture".into())
 }
 
 pub(crate) struct TineAcceptedEvidenceDecoder;
@@ -546,6 +636,129 @@ struct DocumentCapsuleRecord {
     schema: u32,
     dependencies: DocumentDependencies,
     checkpoint: BlobDescription,
+    policy: DocumentCheckpointPolicyV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentCheckpointPolicyV1 {
+    eligible_through: u64,
+    config: super::checkpoint_floor_policy::FloorPolicyConfig,
+    requested_k: Option<u64>,
+    actual_removed_through: u64,
+    actual_floor: Vec<CrdtPeerCounter>,
+    metrics: super::checkpoint_floor_policy::FloorMetrics,
+}
+
+impl DocumentCheckpointPolicyV1 {
+    fn uncut(checkpoint_bytes: usize) -> Result<Self, String> {
+        let image_bytes = u64::try_from(checkpoint_bytes)
+            .map_err(|_| "checkpoint image size exceeds u64".to_owned())?;
+        let config = super::checkpoint_floor_policy::FloorPolicyConfig::default();
+        Ok(Self {
+            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            config,
+            requested_k: None,
+            actual_removed_through: 0,
+            actual_floor: Vec::new(),
+            metrics: super::checkpoint_floor_policy::FloorMetrics {
+                image_bytes,
+                latest_state_bytes: image_bytes,
+                removable_bytes: 0,
+                budget_bytes: config
+                    .minimum_tail_bytes
+                    .max(config.live_size_multiplier.saturating_mul(image_bytes)),
+                post_cut_removable_bytes: 0,
+                hysteresis_shortfall_bytes: 0,
+                budget_overage_bytes: 0,
+                limiting_cause: None,
+            },
+        })
+    }
+
+    fn from_compact(
+        eligible_through: u64,
+        config: super::checkpoint_floor_policy::FloorPolicyConfig,
+        document_id: DocumentId,
+        document: &loro::LoroDoc,
+        compact: &PolicyCompactAcceptedDocument,
+    ) -> Result<Self, String> {
+        use super::checkpoint_floor_policy::LoroFloorDecision;
+        let (requested_k, actual_removed_through, actual_floor, metrics) = match compact.decision()
+        {
+            LoroFloorDecision::Keep {
+                retained, metrics, ..
+            } => (None, 0, &retained.actual_floor, *metrics),
+            LoroFloorDecision::Advance {
+                chosen, metrics, ..
+            } => (
+                Some(chosen.requested_k),
+                chosen.actual_removed_through,
+                &chosen.actual_floor,
+                *metrics,
+            ),
+        };
+        Ok(Self {
+            eligible_through,
+            config,
+            requested_k,
+            actual_removed_through,
+            actual_floor: super::hot_engine::shallow_frontier_counters(
+                document_id,
+                document,
+                actual_floor,
+            )
+            .map_err(|error| error.to_string())?,
+            metrics,
+        })
+    }
+
+    fn validate(&self, dependencies: &DocumentDependencies, fence: u64) -> Result<(), String> {
+        if self.config.revision == 0
+            || self.config.minimum_tail_bytes == 0
+            || self.config.live_size_multiplier == 0
+            || self.eligible_through > fence
+            || self
+                .requested_k
+                .is_some_and(|requested| requested > self.eligible_through)
+            || self.actual_removed_through > self.requested_k.unwrap_or(0)
+            || !self
+                .actual_floor
+                .windows(2)
+                .all(|pair| pair[0].peer_id() < pair[1].peer_id())
+            || self.actual_floor.iter().any(|floor| {
+                dependencies
+                    .peer_counters()
+                    .binary_search_by_key(&floor.peer_id(), |counter| counter.peer_id())
+                    .ok()
+                    .is_none_or(|index| {
+                        dependencies.peer_counters()[index].max_counter() < floor.max_counter()
+                    })
+            })
+        {
+            return Err("checkpoint document floor policy binding is invalid".into());
+        }
+        let expected_removable = self
+            .metrics
+            .image_bytes
+            .saturating_sub(self.metrics.latest_state_bytes);
+        let expected_budget = self.config.minimum_tail_bytes.max(
+            self.config
+                .live_size_multiplier
+                .saturating_mul(self.metrics.latest_state_bytes),
+        );
+        if self.metrics.removable_bytes != expected_removable
+            || self.metrics.budget_bytes != expected_budget
+            || self.metrics.budget_overage_bytes
+                != self
+                    .metrics
+                    .post_cut_removable_bytes
+                    .saturating_sub(expected_budget)
+        {
+            return Err("checkpoint document floor metrics are inconsistent".into());
+        }
+        Ok(())
+    }
 }
 
 impl DocumentCapsuleRecord {
@@ -594,6 +807,7 @@ impl SealedDocumentRoster {
             schema: DOCUMENT_CAPSULE_SCHEMA,
             dependencies: compact.dependencies().clone(),
             checkpoint,
+            policy: DocumentCheckpointPolicyV1::uncut(compact.checkpoint().len())?,
         };
         let record_blob = store.stage_capsule_blob(&record.encode()?)?;
         let map = self.map.upsert(
@@ -608,6 +822,9 @@ impl SealedDocumentRoster {
         self,
         store: &mut SealedGenerationStagingStore,
         cutoff_state_digest: ContentDigest,
+        eligible_through: u64,
+        config: super::checkpoint_floor_policy::FloorPolicyConfig,
+        document: &loro::LoroDoc,
         compact: &PolicyCompactAcceptedDocument,
     ) -> Result<Self, String> {
         if compact.cutoff_state_digest() != cutoff_state_digest {
@@ -618,6 +835,13 @@ impl SealedDocumentRoster {
             schema: DOCUMENT_CAPSULE_SCHEMA,
             dependencies: compact.dependencies().clone(),
             checkpoint,
+            policy: DocumentCheckpointPolicyV1::from_compact(
+                eligible_through,
+                config,
+                compact.dependencies().document_id(),
+                document,
+                compact,
+            )?,
         };
         let record_blob = store.stage_capsule_blob(&record.encode()?)?;
         let map = self.map.upsert(
@@ -869,10 +1093,30 @@ fn roots_from_wire(
     Ok(roots)
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointBindingV1 {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRecoveryFenceV1 {
+    accepted_sequence: u64,
+    accepted_state_digest: ContentDigest,
+    eligible_through: u64,
+    retained_history_ms: i64,
+    floor_policy: super::checkpoint_floor_policy::FloorPolicyConfig,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointPayloadV2 {
     schema_version: u32,
+    binding: CheckpointBindingV1,
+    recovery_fence: CheckpointRecoveryFenceV1,
     state_bytes: Vec<u8>,
     sealed_objects: BTreeMap<(u8, ContentDigest), Vec<u8>>,
     roster_roots: RosterRootsWire,
@@ -1228,6 +1472,9 @@ fn build_payload_with_images(
         match predecessor {
             Some((sequence, payload)) => {
                 if payload.schema_version != CHECKPOINT_SCHEMA_VERSION
+                    || payload.binding.workspace_id != capture.workspace_id
+                    || payload.binding.lineage_digest != capture.lineage_digest
+                    || payload.binding.catalog_document_id != capture.catalog_document_id
                     || sequence < capture.base_sequence
                     || sequence > capture.target_sequence
                 {
@@ -1320,6 +1567,18 @@ fn build_payload_with_images(
     store.retain_only(&reachable);
     let payload = CheckpointPayloadV2 {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
+        binding: CheckpointBindingV1 {
+            workspace_id: capture.workspace_id,
+            lineage_digest: capture.lineage_digest,
+            catalog_document_id: capture.catalog_document_id,
+        },
+        recovery_fence: CheckpointRecoveryFenceV1 {
+            accepted_sequence: sequence,
+            accepted_state_digest: capture.cutoff_state_digest,
+            eligible_through: capture.eligible_through,
+            retained_history_ms: super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            floor_policy: capture.floor_policy,
+        },
         state_bytes: capture.state_bytes,
         sealed_objects: store.objects,
         roster_roots: RosterRootsWire {
@@ -1420,7 +1679,135 @@ fn read_current_payload_for_extension(
     if payload.schema_version != CHECKPOINT_SCHEMA_VERSION {
         return Err("clean checkpoint predecessor payload schema differs".into());
     }
+    validate_checkpoint_payload_metadata(store, &directory, generation, &payload, None)?;
     Ok(Some((generation.sequence, payload)))
+}
+
+fn validate_checkpoint_payload_metadata(
+    store: &ObjectStore,
+    directory: &cap_std::fs::Dir,
+    generation: CheckpointGenerationV2,
+    payload: &CheckpointPayloadV2,
+    pinned_unchanged_images: Option<&BTreeSet<DocumentId>>,
+) -> Result<(), String> {
+    if payload.schema_version != CHECKPOINT_SCHEMA_VERSION
+        || payload.binding.workspace_id != store.workspace_id()
+        || payload.recovery_fence.accepted_sequence != generation.sequence
+        || payload.recovery_fence.eligible_through > generation.sequence
+        || payload.recovery_fence.retained_history_ms
+            != super::checkpoint_floor_policy::RETAINED_HISTORY_MS
+        || payload.recovery_fence.floor_policy.revision == 0
+        || payload.recovery_fence.floor_policy.minimum_tail_bytes == 0
+        || payload.recovery_fence.floor_policy.live_size_multiplier == 0
+    {
+        return Err("checkpoint payload publication binding is invalid".into());
+    }
+    if !payload
+        .document_dependencies
+        .windows(2)
+        .all(|pair| pair[0].document_id() < pair[1].document_id())
+    {
+        return Err("clean checkpoint document dependencies are not strictly ordered".into());
+    }
+    let roster =
+        SealedDocumentRoster::from_root(map_root_from_wire(payload.document_roster.clone())?);
+    let reader = SealedGenerationDirectory::open(directory)?;
+    roster.qualify_complete_keys(
+        &reader,
+        payload
+            .document_dependencies
+            .iter()
+            .map(DocumentDependencies::document_id),
+    )?;
+    if roster.document_count() != payload.document_dependencies.len() as u64 {
+        return Err("clean checkpoint document roster cardinality differs".into());
+    }
+    for expected in &payload.document_dependencies {
+        let record = roster
+            .document_record(&reader, expected.document_id())?
+            .ok_or_else(|| "clean checkpoint document descriptor is missing".to_owned())?;
+        if &record.dependencies != expected {
+            return Err("clean checkpoint document descriptor binding differs".into());
+        }
+        if !pinned_unchanged_images
+            .is_some_and(|documents| documents.contains(&expected.document_id()))
+        {
+            // Cold qualification hashes every named immutable image but does
+            // not import it into a Loro document. Candidate publication may
+            // reuse the staging/predecessor proof for pinned immutable bytes.
+            reader.read_capsule_blob(record.checkpoint)?;
+        }
+        record
+            .policy
+            .validate(expected, payload.recovery_fence.accepted_sequence)?;
+    }
+    Ok(())
+}
+
+/// Qualify the exact bytes now present in the inactive slot before `current`
+/// can name them. Document images were already verification-imported when
+/// changed; unchanged immutable images reuse that proof and only their sealed
+/// descriptor/dependency/floor bindings are checked here.
+fn validate_published_candidate(
+    store: &ObjectStore,
+    directory: &cap_std::fs::Dir,
+    slot: usize,
+    expected_generation: &[u8],
+    expected_payload: &[u8],
+    validate_state_binding: bool,
+    pinned_unchanged_images: &BTreeSet<DocumentId>,
+) -> Result<(), String> {
+    let payload_bytes = tine_storage::read_optional_regular(
+        directory,
+        CHECKPOINT_PAYLOAD_NAMES[slot],
+        MAX_CHECKPOINT_BYTES,
+        Some(expected_payload.len() as u64),
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "published checkpoint candidate payload is missing".to_owned())?;
+    if payload_bytes != expected_payload {
+        return Err("published checkpoint candidate payload differs".into());
+    }
+    let generation_bytes = tine_storage::read_optional_regular(
+        directory,
+        CHECKPOINT_GENERATION_NAMES[slot],
+        16 * 1024,
+        Some(expected_generation.len() as u64),
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "published checkpoint candidate generation is missing".to_owned())?;
+    if generation_bytes != expected_generation {
+        return Err("published checkpoint candidate generation differs".into());
+    }
+    let generation: CheckpointGenerationV2 = decode_canonical(&generation_bytes)?;
+    if generation.schema_version != CHECKPOINT_SCHEMA_VERSION
+        || generation.slot as usize != slot
+        || generation.payload_len != payload_bytes.len() as u64
+        || generation.payload_digest != ContentDigest::of(&payload_bytes)
+    {
+        return Err("published checkpoint candidate generation binding is invalid".into());
+    }
+    let payload: CheckpointPayloadV2 = decode_canonical(&payload_bytes)?;
+    validate_checkpoint_payload_metadata(
+        store,
+        directory,
+        generation,
+        &payload,
+        Some(pinned_unchanged_images),
+    )?;
+    if validate_state_binding {
+        let state = super::hot_engine::clean_checkpoint_state_binding(&payload.state_bytes)
+            .map_err(|error| error.to_string())?;
+        if state.workspace_id != payload.binding.workspace_id
+            || state.lineage_digest != payload.binding.lineage_digest
+            || state.catalog_document_id != payload.binding.catalog_document_id
+            || state.accepted_sequence != payload.recovery_fence.accepted_sequence
+            || state.accepted_state_digest != payload.recovery_fence.accepted_state_digest
+        {
+            return Err("published checkpoint state/recovery binding differs".into());
+        }
+    }
+    Ok(())
 }
 
 fn install_replaceable_exact(
@@ -1446,6 +1833,8 @@ fn publish_document_images(
     directory: &cap_std::fs::Dir,
     store: &ObjectStore,
     capture: &super::hot_engine::CleanCheckpointDocumentCapture,
+    eligible_through: u64,
+    policy: super::checkpoint_floor_policy::FloorPolicyConfig,
     accepted_rows: &[CleanCheckpointAcceptedRow],
     predecessor: Option<&(u64, CheckpointPayloadV2)>,
 ) -> Result<
@@ -1528,10 +1917,10 @@ fn publish_document_images(
             capture.cutoff_state_digest,
             dependencies.clone(),
             &materialized.document,
-            LIVE_FLOOR_ELIGIBILITY_DISABLED,
-            super::checkpoint_floor_policy::FloorPolicyConfig::default(),
-            // No candidates: with zero eligibility the policy has nothing it is
-            // permitted to advance to, so it measures the current image only.
+            eligible_through,
+            policy,
+            // The current E=0 supplies no legal candidates, so publication
+            // measures the current image without advancing its native floor.
             std::iter::empty(),
         )
         .map_err(|error| error.to_string())?;
@@ -1545,8 +1934,14 @@ fn publish_document_images(
         work.verification_imports = work
             .verification_imports
             .saturating_add(compact.work().verification_imports);
-        roster =
-            roster.with_policy_document(&mut staging, capture.cutoff_state_digest, &compact)?;
+        roster = roster.with_policy_document(
+            &mut staging,
+            capture.cutoff_state_digest,
+            eligible_through,
+            policy,
+            &materialized.document,
+            &compact,
+        )?;
     }
     if roster.document_count() != capture.dependencies.len() as u64 {
         return Err("checkpoint image roster has extra or missing documents".into());
@@ -1731,13 +2126,14 @@ fn publish_capture(
     store: &ObjectStore,
     capture: CleanCheckpointCapture,
 ) -> Result<PublishedCheckpoint, String> {
-    publish_capture_with_predecessor(store, capture, true)
+    publish_capture_with_predecessor(store, capture, true, None)
 }
 
 fn publish_capture_with_predecessor(
     store: &ObjectStore,
     capture: CleanCheckpointCapture,
     extend_predecessor: bool,
+    publication_authority: Option<&CheckpointPublicationAuthority>,
 ) -> Result<PublishedCheckpoint, String> {
     #[cfg(test)]
     if FAIL_CHECKPOINT_WRITE_ROOTS
@@ -1748,6 +2144,18 @@ fn publish_capture_with_predecessor(
         return Err("deterministic checkpoint publication failure".into());
     }
     let has_document_epoch = capture.documents.is_some();
+    let pinned_unchanged_images = capture
+        .documents
+        .as_ref()
+        .map(|documents| {
+            documents
+                .dependencies
+                .keys()
+                .filter(|document| !documents.changed_snapshots.contains_key(document))
+                .copied()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     let predecessor = if extend_predecessor {
         read_current_payload_for_extension(store)?
     } else {
@@ -1759,6 +2167,8 @@ fn publish_capture_with_predecessor(
             &directory,
             store,
             documents,
+            capture.eligible_through,
+            capture.floor_policy,
             &capture.accepted_rows,
             predecessor.as_ref(),
         )?,
@@ -1809,6 +2219,15 @@ fn publish_capture_with_predecessor(
         CHECKPOINT_GENERATION_NAMES[slot],
         &generation_bytes,
     )?;
+    validate_published_candidate(
+        store,
+        &directory,
+        slot,
+        &generation_bytes,
+        &payload_bytes,
+        has_document_epoch,
+        &pinned_unchanged_images,
+    )?;
     let pointer = CheckpointPointerV2 {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         sequence,
@@ -1816,6 +2235,11 @@ fn publish_capture_with_predecessor(
         generation_digest: ContentDigest::of(&generation_bytes),
     };
     let pointer_bytes = encode_canonical(&pointer)?;
+    if let Some(authority) = publication_authority {
+        // This is intentionally after complete candidate validation and
+        // immediately before the sole commit-point name operation.
+        authority.revalidate()?;
+    }
     match prior_pointer_bytes {
         Some(existing) if existing == pointer_bytes => {}
         Some(existing) => publication
@@ -2012,6 +2436,11 @@ fn open_checkpoint_impl(
         Ok(payload) if payload.schema_version == CHECKPOINT_SCHEMA_VERSION => payload,
         Ok(_) | Err(_) => return Ok(invalid("clean checkpoint payload is invalid")),
     };
+    if let Err(error) =
+        validate_checkpoint_payload_metadata(store, &directory, generation, &payload, None)
+    {
+        return Ok(invalid(error));
+    }
     if let Some((kind, _)) = payload
         .sealed_objects
         .keys()
@@ -2253,6 +2682,7 @@ struct PublisherState {
 
 struct PublisherInner {
     store: Arc<ObjectStore>,
+    publication_authority: Mutex<Option<CheckpointPublicationAuthority>>,
     state: Mutex<PublisherState>,
     finished: Condvar,
     durable_sequence: AtomicU64,
@@ -2260,6 +2690,35 @@ struct PublisherInner {
     current_documents: Mutex<Option<Arc<CleanCheckpointDocuments>>>,
     elevated_rewrite_observed: AtomicBool,
     rebuild_from_genesis: AtomicBool,
+}
+
+enum CheckpointPublicationAuthority {
+    Workspace(super::sqlite::WorkspaceRuntimePublicationProof),
+    #[cfg(test)]
+    Test,
+}
+
+impl CheckpointPublicationAuthority {
+    fn revalidate(&self) -> Result<(), String> {
+        match self {
+            Self::Workspace(proof) => proof
+                .revalidate_identity()
+                .map_err(|error| error.to_string()),
+            #[cfg(test)]
+            Self::Test => Ok(()),
+        }
+    }
+}
+
+fn initial_checkpoint_publication_authority() -> Option<CheckpointPublicationAuthority> {
+    #[cfg(test)]
+    {
+        Some(CheckpointPublicationAuthority::Test)
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
 }
 
 pub(crate) struct CleanCheckpointPublisher {
@@ -2313,6 +2772,7 @@ impl CleanCheckpointPublisher {
         Self {
             inner: Arc::new(PublisherInner {
                 store: Arc::new(store),
+                publication_authority: Mutex::new(initial_checkpoint_publication_authority()),
                 state: Mutex::new(PublisherState {
                     in_flight: false,
                     queued: None,
@@ -2334,12 +2794,17 @@ impl CleanCheckpointPublisher {
                 .elevated_rewrite_observed
                 .store(true, Ordering::Release);
         }
+        let authority = self
+            .inner
+            .publication_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.in_flight {
+        if state.in_flight || authority.is_none() {
             if state
                 .queued
                 .as_ref()
@@ -2351,19 +2816,37 @@ impl CleanCheckpointPublisher {
         }
         state.in_flight = true;
         drop(state);
-        let inner = Arc::clone(&self.inner);
-        let spawn = std::thread::Builder::new()
-            .name("tine-clean-checkpoint".into())
-            .spawn(move || publisher_loop(inner, capture));
-        if let Err(error) = spawn {
-            eprintln!("clean checkpoint writer could not start: {error}");
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.in_flight = false;
-            self.inner.finished.notify_all();
+        drop(authority);
+        spawn_publisher(Arc::clone(&self.inner), capture);
+    }
+
+    pub(crate) fn install_publication_authority(
+        &self,
+        proof: super::sqlite::WorkspaceRuntimePublicationProof,
+    ) {
+        self.install_publication_authority_inner(CheckpointPublicationAuthority::Workspace(proof));
+    }
+
+    fn install_publication_authority_inner(&self, authority: CheckpointPublicationAuthority) {
+        let mut installed = self
+            .inner
+            .publication_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *installed = Some(authority);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queued = (!state.in_flight).then(|| state.queued.take()).flatten();
+        if queued.is_some() {
+            state.in_flight = true;
+        }
+        drop(state);
+        drop(installed);
+        if let Some(capture) = queued {
+            spawn_publisher(Arc::clone(&self.inner), capture);
         }
     }
 
@@ -2461,7 +2944,23 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
             .as_ref()
             .map(|documents| documents.dependencies.clone());
         let rebuild_from_genesis = inner.rebuild_from_genesis.load(Ordering::Acquire);
-        match publish_capture_with_predecessor(&inner.store, capture, !rebuild_from_genesis) {
+        let authority = inner
+            .publication_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let published = match authority.as_ref() {
+            Some(authority) => authority.revalidate().and_then(|()| {
+                publish_capture_with_predecessor(
+                    &inner.store,
+                    capture,
+                    !rebuild_from_genesis,
+                    Some(authority),
+                )
+            }),
+            None => Err("checkpoint publication has no workspace lease proof".to_owned()),
+        };
+        drop(authority);
+        match published {
             Ok(published) => {
                 if rebuild_from_genesis {
                     inner.rebuild_from_genesis.store(false, Ordering::Release);
@@ -2502,6 +3001,24 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
             return;
         };
         capture = next;
+    }
+}
+
+fn spawn_publisher(inner: Arc<PublisherInner>, capture: CleanCheckpointCapture) {
+    let spawn = std::thread::Builder::new()
+        .name("tine-clean-checkpoint".into())
+        .spawn({
+            let worker = Arc::clone(&inner);
+            move || publisher_loop(worker, capture)
+        });
+    if let Err(error) = spawn {
+        eprintln!("clean checkpoint writer could not start: {error}");
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = false;
+        inner.finished.notify_all();
     }
 }
 
@@ -3052,6 +3569,7 @@ mod tests {
                     schema: DOCUMENT_CAPSULE_SCHEMA,
                     dependencies: compact.dependencies().clone(),
                     checkpoint: BlobDescription::of(compact.checkpoint()),
+                    policy: DocumentCheckpointPolicyV1::uncut(compact.checkpoint().len()).unwrap(),
                 };
                 let canonical = record.encode().unwrap();
                 assert_eq!(DocumentCapsuleRecord::decode(&canonical).unwrap(), record);
@@ -4429,6 +4947,82 @@ mod tests {
     }
 
     #[test]
+    fn p3_checkpoint_payload_names_floor_policy_recovery_fence_and_candidate_qualification() {
+        let production = include_str!("checkpoint_generation.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        for required in [
+            "binding: CheckpointBindingV1",
+            "recovery_fence: CheckpointRecoveryFenceV1",
+            "retained_history_ms: i64",
+            "policy: DocumentCheckpointPolicyV1",
+            "actual_floor: Vec<CrdtPeerCounter>",
+            "validate_published_candidate(",
+        ] {
+            assert!(
+                production.contains(required),
+                "current checkpoint publication omits required field/seam: {required}"
+            );
+        }
+        assert!(
+            production.find("validate_published_candidate(").unwrap()
+                < production
+                    .find(".replace_exact(CHECKPOINT_POINTER")
+                    .unwrap(),
+            "the complete candidate must be qualified before pointer replacement"
+        );
+        let pointer_reproof = production
+            .find("authority.revalidate()?;")
+            .expect("checkpoint pointer publication omits its live lease re-proof");
+        assert!(
+            production.find("validate_published_candidate(").unwrap() < pointer_reproof
+                && pointer_reproof
+                    < production
+                        .find(".replace_exact(CHECKPOINT_POINTER")
+                        .unwrap(),
+            "lease identity must be re-proved after qualification and before current"
+        );
+        let runtime = include_str!("local_active.rs");
+        assert_eq!(
+            runtime
+                .matches("install_clean_checkpoint_publication_authority")
+                .count(),
+            2,
+            "cold installation and full-history actor swap must bind the publisher"
+        );
+        assert_eq!(LIVE_FLOOR_ELIGIBILITY_DISABLED, 0);
+        assert!(include_str!("hot_engine.rs").contains("eligible_through: 0,"));
+        assert!(include_str!("../sync_runtime.rs")
+            .contains("const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);"));
+        assert_eq!(
+            super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            30 * 24 * 60 * 60 * 1_000
+        );
+        assert_eq!(
+            super::super::checkpoint_floor_policy::DEFAULT_MINIMUM_TAIL_BYTES,
+            256 * 1024
+        );
+        assert_eq!(
+            super::super::checkpoint_floor_policy::DEFAULT_LIVE_SIZE_MULTIPLIER,
+            4
+        );
+        for required in [
+            "`E=0`: publication records",
+            "30-day lower bound",
+            "minimum-tail bytes",
+            "multiplier. Each document-to-image record",
+            "not by the 50 ms actor tick",
+        ] {
+            assert!(
+                contract.contains(required),
+                "storage contract omits load-bearing checkpoint value: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn checkpoint_open_counter_distinguishes_checkpoint_from_full_replay() {
         let runtime = include_str!("../sync_runtime.rs");
         assert!(runtime.contains("pub checkpoint_opens: usize"));
@@ -4445,6 +5039,12 @@ mod tests {
             [0x44; 16],
         )));
         let capture = CleanCheckpointCapture {
+            workspace_id: WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x7001)),
+            lineage_digest: LineageDigest::of(b"checkpoint-payload-test"),
+            catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7002)),
+            cutoff_state_digest: digest(0xa1),
+            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: 1,
             state_bytes: b"state".to_vec(),
@@ -4485,6 +5085,12 @@ mod tests {
             [0x44; 16],
         )));
         let first_capture = CleanCheckpointCapture {
+            workspace_id: WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x7001)),
+            lineage_digest: LineageDigest::of(b"checkpoint-payload-test"),
+            catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7002)),
+            cutoff_state_digest: digest(0xa1),
+            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: 1,
             state_bytes: b"frontier-one".to_vec(),
@@ -4501,6 +5107,12 @@ mod tests {
         let (_, first_bytes) = build_payload(first_capture, None).unwrap();
         let first_payload: CheckpointPayloadV2 = decode_canonical(&first_bytes).unwrap();
         let second_capture = CleanCheckpointCapture {
+            workspace_id: WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x7001)),
+            lineage_digest: LineageDigest::of(b"checkpoint-payload-test"),
+            catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7002)),
+            cutoff_state_digest: digest(0xa2),
+            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 1,
             target_sequence: 2,
             state_bytes: b"frontier-two".to_vec(),
@@ -4555,6 +5167,12 @@ mod tests {
             canonical_causal_clock: vec![(peer, 7)],
         };
         publisher.enqueue(CleanCheckpointCapture {
+            workspace_id: workspace,
+            lineage_digest: LineageDigest::of(b"checkpoint-lag-test"),
+            catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0xa565)),
+            cutoff_state_digest: digest(0xa3),
+            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: CLEAN_CHECKPOINT_LAG_MAX + 1,
             state_bytes: Vec::new(),
@@ -4579,8 +5197,14 @@ mod tests {
         (root, store)
     }
 
-    fn empty_capture(state: &[u8]) -> CleanCheckpointCapture {
+    fn empty_capture(store: &ObjectStore, state: &[u8]) -> CleanCheckpointCapture {
         CleanCheckpointCapture {
+            workspace_id: store.workspace_id(),
+            lineage_digest: LineageDigest::of(b"checkpoint-publication-test"),
+            catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7004)),
+            cutoff_state_digest: digest(0xa4),
+            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: 0,
             state_bytes: state.to_vec(),
@@ -4604,14 +5228,14 @@ mod tests {
     #[test]
     fn every_checkpoint_publication_prefix_keeps_the_complete_predecessor() {
         let (root, store) = checkpoint_fault_fixture("publication-prefix");
-        publish_capture(&store, empty_capture(b"predecessor")).unwrap();
+        publish_capture(&store, empty_capture(&store, b"predecessor")).unwrap();
         let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
         let predecessor_pointer = std::fs::read(directory.join(CHECKPOINT_POINTER)).unwrap();
         let predecessor: CheckpointPointerV2 = decode_canonical(&predecessor_pointer).unwrap();
         assert_eq!(loaded_state(&store), b"predecessor");
 
         let slot = 1 - predecessor.slot as usize;
-        let (sequence, payload) = build_payload(empty_capture(b"successor"), None).unwrap();
+        let (sequence, payload) = build_payload(empty_capture(&store, b"successor"), None).unwrap();
         std::fs::write(directory.join(CHECKPOINT_PAYLOAD_NAMES[slot]), &payload).unwrap();
         assert_eq!(loaded_state(&store), b"predecessor");
 
@@ -4657,7 +5281,7 @@ mod tests {
             "payload-oversize",
         ] {
             let (root, store) = checkpoint_fault_fixture(damage);
-            publish_capture(&store, empty_capture(b"disposable")).unwrap();
+            publish_capture(&store, empty_capture(&store, b"disposable")).unwrap();
             let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
             let pointer_bytes = std::fs::read(directory.join(CHECKPOINT_POINTER)).unwrap();
             let pointer: CheckpointPointerV2 = decode_canonical(&pointer_bytes).unwrap();
@@ -4701,7 +5325,7 @@ mod tests {
         use crate::oplog::{DocumentId, ObjectKind, OperationObject};
 
         let (root, store) = checkpoint_fault_fixture("object-only-residue");
-        publish_capture(&store, empty_capture(b"stable checkpoint")).unwrap();
+        publish_capture(&store, empty_capture(&store, b"stable checkpoint")).unwrap();
         let object = OperationObject::new(
             store.workspace_id(),
             DocumentId::from_uuid(uuid::Uuid::new_v4()),

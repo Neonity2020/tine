@@ -6146,6 +6146,19 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    /// The number of genesis replays this runtime has actually paid.
+    #[cfg(test)]
+    fn full_history_reconstructions_for_test(&self) -> Result<usize, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::FullHistoryReconstructionProbe {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     #[cfg(test)]
     fn redeliver_recovery_input_for_test(&self) -> Result<(), SyncRuntimeRequestError> {
         let _operation = self.inner.operation.lock().unwrap();
@@ -6717,6 +6730,7 @@ enum CleanActorExternalOutcome {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryInputFault {
+    BeforeAppendDurable,
     AppendOutcomeUnknownAfterPhysicalAppend,
     AfterCustodyBeforeProviderDequeue,
     AfterReconstructionStep(u8),
@@ -8439,6 +8453,14 @@ fn open_clean_runtime_resources_with_progress(
     );
     if !restored_checkpoint {
         counters.full_replay_opens = 1;
+        // The selected predecessor was absent or unusable. Arm the publisher
+        // before replay can schedule a capture: extending `current` would
+        // otherwise reread the same damaged payload and fail forever. A fresh
+        // sequence-zero candidate may replace this disposable cache, while
+        // every authoritative original remains untouched.
+        engine
+            .rebuild_next_clean_checkpoint_from_genesis()
+            .map_err(CleanOpenError::from)?;
         replayed = engine
             .replay_clean_committed_tail(baseline_claim_source.as_ref())
             .map_err(CleanOpenError::from)?;
@@ -11449,6 +11471,8 @@ enum ActorRequest {
         reply: mpsc::Sender<Vec<RecoveryInputEnvelopeV1>>,
     },
     #[cfg(test)]
+    FullHistoryReconstructionProbe { reply: mpsc::Sender<usize> },
+    #[cfg(test)]
     RedeliverRecoveryInput {
         reply: mpsc::Sender<Result<(), String>>,
     },
@@ -12203,6 +12227,11 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
+            ActorRequest::FullHistoryReconstructionProbe { reply } => {
+                let _ = reply.send(actor.full_history_reconstructions);
+                false
+            }
+            #[cfg(test)]
             ActorRequest::RedeliverRecoveryInput { reply } => {
                 let result = actor
                     .recovery_input
@@ -12474,6 +12503,12 @@ struct LocalJournalRecoveryFence {
     segment_name: String,
     base_sequence: u64,
     durable_prefix: u64,
+}
+
+struct PendingRecoveryInput {
+    envelope: RecoveryInputEnvelopeV1,
+    prepared: PreparedBatch,
+    dependencies: BTreeSet<BatchId>,
 }
 
 impl LocalJournalRecoveryFence {
@@ -14089,6 +14124,13 @@ struct RuntimeActor {
     forced_next_move_episode_batch_id: Option<BatchId>,
     #[cfg(test)]
     recovery_input_fault: Option<RecoveryInputFault>,
+    /// How many times this actor has actually entered full-history
+    /// reconstruction.  Counted because the thing that must stay bounded is the
+    /// genesis replay plus lifetime-sized manifest walk, not the tick that
+    /// declines to start one; a test that matched the blocked message string
+    /// would pass for the wrong reason the moment that wording changed.
+    #[cfg(test)]
+    full_history_reconstructions: usize,
     /// The clean-runtime batch the request currently in flight published and
     /// left durable-pending. Only this batch may be settled and then reported
     /// as the request's own result: a retained continuation from an earlier
@@ -14755,6 +14797,8 @@ impl RuntimeActor {
             forced_next_move_episode_batch_id: None,
             #[cfg(test)]
             recovery_input_fault: None,
+            #[cfg(test)]
+            full_history_reconstructions: 0,
             clean_request_retained_batch: None,
             last_retained_publication: None,
             #[cfg(test)]
@@ -23524,6 +23568,10 @@ impl RuntimeActor {
     }
 
     fn reconstruct_full_history(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            self.full_history_reconstructions += 1;
+        }
         let request = self
             .clean_open_request
             .clone()
@@ -23708,91 +23756,46 @@ impl RuntimeActor {
         // Step 6b/7: repeatedly admit only dependency-ready pending originals.
         // A missing prerequisite leaves every remaining envelope selected and
         // therefore keeps automatic recovery runnable.
-        let mut remaining = envelopes
-            .iter()
-            .map(|envelope| {
-                let prepared = envelope.prepared_batch()?;
-                let dependencies = crate::oplog::hot_engine::clean_operation_dependency_heads(
-                    prepared.manifest(),
-                    prepared.objects(),
-                )
-                .map_err(|error| error.to_string())?;
-                Ok((
-                    envelope.batch_id,
-                    (envelope.clone(), prepared, dependencies),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, String>>()?;
-        loop {
-            let accepted = self
+        let mut remaining = Self::prepare_recovery_inputs(envelopes.clone())?;
+        let Some(admission_order) = Self::recovery_input_admission_order(
+            self.active_engine().map_err(|error| error.to_string())?,
+            &remaining,
+        )?
+        else {
+            return Err(Self::recovery_prerequisite_pending_detail(&remaining));
+        };
+        for batch_id in admission_order {
+            let input = remaining
+                .remove(&batch_id)
+                .expect("ordered recovery input remains selected");
+            if self
                 .active_engine()
                 .map_err(|error| error.to_string())?
-                .status()
-                .accepted_batch_ids()
-                .map_err(|error| error.to_string())?;
-            let duplicates = remaining
-                .keys()
-                .filter(|batch_id| accepted.contains(batch_id))
-                .copied()
-                .collect::<Vec<_>>();
-            for batch_id in duplicates {
-                let (envelope, _, _) = remaining
-                    .remove(&batch_id)
-                    .expect("duplicate was selected from remaining inputs");
+                .accepted_frontier_contains_batch_effects(batch_id)
+                .map_err(|error| error.to_string())?
+            {
                 Self::exact_recovery_input_is_archived(
                     self.active_engine().map_err(|error| error.to_string())?,
-                    &envelope,
+                    &input.envelope,
                 )?;
+                continue;
             }
-            if remaining.is_empty() {
-                break;
-            }
-            let mut ready = None;
-            for (batch_id, (_, _, dependencies)) in &remaining {
-                let mut dependencies_ready = true;
-                for dependency in dependencies {
-                    if !self
-                        .active_engine()
-                        .map_err(|error| error.to_string())?
-                        .accepted_frontier_contains_batch_effects(*dependency)
-                        .map_err(|error| error.to_string())?
-                    {
-                        dependencies_ready = false;
-                        break;
-                    }
-                }
-                if dependencies_ready {
-                    ready = Some(*batch_id);
-                    break;
-                }
-            }
-            let Some(batch_id) = ready else {
-                let names = remaining
-                    .iter()
-                    .map(|(batch_id, (_, _, dependencies))| {
-                        let dependencies = dependencies
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!("{batch_id}->[{dependencies}]")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
+            if !Self::recovery_dependencies_ready(
+                self.active_engine().map_err(|error| error.to_string())?,
+                &input.dependencies,
+                &BTreeSet::new(),
+            )? {
                 return Err(format!(
-                    "recovery prerequisite pending for retained batches: {names}"
+                    "recovery admission order disagreed before retained batch {batch_id}"
                 ));
-            };
-            let (envelope, prepared, _) = remaining
-                .remove(&batch_id)
-                .expect("ready recovery input remains selected");
+            }
             let outcome = {
                 let turns = self
                     .projection_turns
                     .as_mut()
                     .expect("recovery retained projection turns");
                 let clean = self.clean.as_mut().expect("recovery retained runtime");
-                clean.execute_recovery_input(&self.graph, &self.receipts, turns, &prepared)
+                clean.execute_recovery_input(&self.graph, &self.receipts, turns, &input.prepared)
             }
             .map_err(|error| error.detail)?;
             match outcome {
@@ -23814,9 +23817,10 @@ impl RuntimeActor {
             }
             Self::exact_recovery_input_is_archived(
                 self.active_engine().map_err(|error| error.to_string())?,
-                &envelope,
+                &input.envelope,
             )?;
         }
+        debug_assert!(remaining.is_empty());
         self.fault_after_reconstruction_step(6)?;
 
         // Finish any retained projection turns before checkpoint capture.
@@ -23923,6 +23927,11 @@ impl RuntimeActor {
                 durable_prefix,
             )?;
         }
+        // The replacement checkpoint/engine is installed and every retained
+        // fence has been re-proved, but no cleanup authority has moved yet.
+        // A crash here must reopen the new checkpoint and deduplicate the
+        // still-retained journals/input rather than authoring work twice.
+        self.fault_after_reconstruction_step(8)?;
         self.recovery_input
             .as_mut()
             .expect("recovery retained input journal")
@@ -23934,8 +23943,109 @@ impl RuntimeActor {
             .resume_full_history_admission();
         *self.application_projection_cache.borrow_mut() = Default::default();
         *self.application_hydration_cache.borrow_mut() = Default::default();
-        self.fault_after_reconstruction_step(8)?;
         Ok(())
+    }
+
+    fn prepare_recovery_inputs(
+        envelopes: Vec<RecoveryInputEnvelopeV1>,
+    ) -> Result<BTreeMap<BatchId, PendingRecoveryInput>, String> {
+        envelopes
+            .into_iter()
+            .map(|envelope| {
+                let prepared = envelope.prepared_batch()?;
+                let dependencies = crate::oplog::hot_engine::clean_operation_dependency_heads(
+                    prepared.manifest(),
+                    prepared.objects(),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((
+                    envelope.batch_id,
+                    PendingRecoveryInput {
+                        envelope,
+                        prepared,
+                        dependencies,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn recovery_dependencies_ready(
+        engine: &ShardedHotEngine,
+        dependencies: &BTreeSet<BatchId>,
+        virtually_admitted: &BTreeSet<BatchId>,
+    ) -> Result<bool, String> {
+        for dependency in dependencies {
+            if virtually_admitted.contains(dependency) {
+                continue;
+            }
+            if !engine
+                .accepted_frontier_contains_batch_effects(*dependency)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Return the exact order step 6b can admit, including dependencies that
+    /// are themselves retained envelopes.  `None` means at least one external
+    /// prerequisite is still absent (or the retained dependency graph cannot
+    /// reach a fixed point), so paying for genesis replay cannot make progress.
+    fn recovery_input_admission_order(
+        engine: &ShardedHotEngine,
+        inputs: &BTreeMap<BatchId, PendingRecoveryInput>,
+    ) -> Result<Option<Vec<BatchId>>, String> {
+        let mut remaining = inputs.keys().copied().collect::<BTreeSet<_>>();
+        let mut virtually_admitted = BTreeSet::new();
+        let mut order = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let mut ready = None;
+            for batch_id in &remaining {
+                if engine
+                    .accepted_frontier_contains_batch_effects(*batch_id)
+                    .map_err(|error| error.to_string())?
+                    || Self::recovery_dependencies_ready(
+                        engine,
+                        &inputs
+                            .get(batch_id)
+                            .expect("remaining recovery input is indexed")
+                            .dependencies,
+                        &virtually_admitted,
+                    )?
+                {
+                    ready = Some(*batch_id);
+                    break;
+                }
+            }
+            let Some(batch_id) = ready else {
+                return Ok(None);
+            };
+            remaining.remove(&batch_id);
+            virtually_admitted.insert(batch_id);
+            order.push(batch_id);
+        }
+        Ok(Some(order))
+    }
+
+    fn recovery_prerequisite_pending_detail(
+        inputs: &BTreeMap<BatchId, PendingRecoveryInput>,
+    ) -> String {
+        let names = inputs
+            .iter()
+            .map(|(batch_id, input)| {
+                let dependencies = input
+                    .dependencies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{batch_id}->[{dependencies}]")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("recovery prerequisite pending for retained batches: {names}")
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
@@ -23944,6 +24054,38 @@ impl RuntimeActor {
             .as_ref()
             .is_some_and(RecoveryInputJournal::is_pending)
         {
+            let readiness = self
+                .recovery_input
+                .as_ref()
+                .ok_or_else(|| "recovery has no recovery-input journal".to_owned())
+                .and_then(|journal| Self::prepare_recovery_inputs(journal.pending_envelopes()))
+                .and_then(|inputs| {
+                    Self::recovery_input_admission_order(
+                        self.active_engine().map_err(|error| error.to_string())?,
+                        &inputs,
+                    )
+                    .map(|order| (inputs, order))
+                });
+            let (inputs, order) = match readiness {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    return SyncRuntimeTick::RecoveryBlocked(format!(
+                        "cannot inspect retained recovery prerequisites: {error}"
+                    ));
+                }
+            };
+            if order.is_none() {
+                if self.provider_transport_has_work() {
+                    let delivery = self.tick_clean_provider();
+                    if !matches!(delivery, SyncRuntimeTick::Idle) {
+                        return delivery;
+                    }
+                }
+                return SyncRuntimeTick::RecoveryBlocked(format!(
+                    "automatic full-history reconstruction is waiting for delivery: {}",
+                    Self::recovery_prerequisite_pending_detail(&inputs)
+                ));
+            }
             return match self.reconstruct_full_history() {
                 Ok(()) => SyncRuntimeTick::Recovering,
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(format!(
@@ -24764,8 +24906,34 @@ impl RuntimeActor {
                 "clean SharedActive runtime has no provider transport".into(),
             );
         }
+        // A retained below-floor original means this device's own accepted state
+        // is knowingly incomplete: work it has taken custody of is not yet in its
+        // frontier. The paths that publish a FRONTIER HEAD are therefore fenced
+        // until reconstruction finishes, because a head published here advertises
+        // a frontier that omits originals this device is already holding. The
+        // in-scope scenario is an honest returning peer whose delivery reordered,
+        // not an attacker.
+        //
+        // Descriptor repair is deliberately NOT fenced. `publish_clean_descriptor_exact`
+        // republishes the enrollment file verbatim and computes no head, so it
+        // claims nothing about the frontier -- the same reason the sweep
+        // publication hold already exempts it ("the descriptor-only exemption
+        // carries no batch/head history"). Fencing it would mean that a file-sync
+        // tool deleting the join file while this device waits for a parent leaves
+        // peers seeing "does not yet contain sync data" for the whole wait, which
+        // is exactly when another device is most likely to be trying to join.
+        //
+        // The fence suspends; it does not cancel. `provider_publication_repair_requested`
+        // is cleared only inside the block it gates, so a repair requested during
+        // recovery runs once recovery completes -- the I-10 exit is the same tick
+        // loop, not a retry the user has to find. Inbound delivery stays live
+        // below, because delivery is what ends the wait.
+        let recovery_delivery = self
+            .recovery_input
+            .as_ref()
+            .is_some_and(RecoveryInputJournal::is_pending);
         let publication_held = self.publication_barrier_active();
-        if !publication_held {
+        if !recovery_delivery && !publication_held {
             if let Some(batch_id) = self.provider_publication_forced.front().copied() {
                 let engine = match self.active_engine() {
                     Ok(engine) => engine,
@@ -24837,7 +25005,7 @@ impl RuntimeActor {
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(error.to_string()),
             };
         }
-        if self.provider_publication_repair_requested && !publication_held {
+        if !recovery_delivery && self.provider_publication_repair_requested && !publication_held {
             let engine = match self.active_engine() {
                 Ok(engine) => engine,
                 Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
@@ -25080,22 +25248,30 @@ impl RuntimeActor {
                 .projection_turns
                 .as_mut()
                 .expect("clean provider work retains its projection-turn journal");
-            let outcome = self
-                .clean
-                .as_mut()
-                .expect("clean provider work requires clean actor")
-                .execute_provider(&self.graph, &self.receipts, turns, &prepared);
+            let outcome = if recovery_delivery {
+                self.clean
+                    .as_mut()
+                    .expect("recovery delivery requires clean actor")
+                    .execute_recovery_input(&self.graph, &self.receipts, turns, &prepared)
+            } else {
+                self.clean
+                    .as_mut()
+                    .expect("clean provider work requires clean actor")
+                    .execute_provider(&self.graph, &self.receipts, turns, &prepared)
+            };
             return match outcome {
                 Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
-                    let notification = self
-                        .clean
-                        .as_mut()
-                        .expect("clean provider work requires clean actor")
-                        .provider_change_pending_notification
-                        .take();
-                    debug_assert_eq!(notification, Some(batch_id));
+                    if !recovery_delivery {
+                        let notification = self
+                            .clean
+                            .as_mut()
+                            .expect("clean provider work requires clean actor")
+                            .provider_change_pending_notification
+                            .take();
+                        debug_assert_eq!(notification, Some(batch_id));
+                    }
                     self.note_provider_batch_needs_conflict_check(batch_id);
                     SyncRuntimeTick::ProviderMutation { batch_id }
                 }
@@ -25113,6 +25289,13 @@ impl RuntimeActor {
                 }
                 Ok(CleanActorMutationOutcome::NeedsFullHistory(need)) => {
                     debug_assert_eq!(need.batch_id, batch_id);
+                    #[cfg(test)]
+                    if self.recovery_input_fault == Some(RecoveryInputFault::BeforeAppendDurable) {
+                        self.recovery_input_fault.take();
+                        return SyncRuntimeTick::RecoveryBlocked(
+                            "injected crash before recovery-input append became durable".into(),
+                        );
+                    }
                     #[cfg(test)]
                     let inject_uncertain = matches!(
                         self.recovery_input_fault,

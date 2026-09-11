@@ -744,7 +744,7 @@ impl CleanLocalRuntime {
     pub(crate) fn from_open_parts(
         session_id: SessionId,
         endpoint: ProjectionEndpointBinding,
-        engine: ShardedHotEngine,
+        mut engine: ShardedHotEngine,
         projection: LeasedWorkspaceProjection,
     ) -> Result<Self, RuntimePromotionError> {
         if engine.projection_endpoint_binding() != Some(endpoint)
@@ -765,6 +765,12 @@ impl CleanLocalRuntime {
         projection
             .revalidate_workspace_lease_identity()
             .map_err(RuntimePromotionError::Sqlite)?;
+        let checkpoint_publication_proof = projection
+            .checkpoint_publication_proof()
+            .map_err(RuntimePromotionError::Sqlite)?;
+        engine
+            .install_clean_checkpoint_publication_authority(checkpoint_publication_proof)
+            .map_err(RuntimePromotionError::Engine)?;
         let engine_frontier = engine
             .accepted_frontier_root()
             .map_err(RuntimePromotionError::Engine)?;
@@ -901,7 +907,7 @@ impl CleanLocalRuntime {
 
     pub(crate) fn install_full_history_projection_and_engine(
         &mut self,
-        engine: ShardedHotEngine,
+        mut engine: ShardedHotEngine,
         projection: LeasedWorkspaceProjection,
     ) -> Result<(), (LeasedWorkspaceProjection, RuntimePromotionError)> {
         if self.projection.is_some()
@@ -919,6 +925,15 @@ impl CleanLocalRuntime {
         }
         if let Err(error) = projection.revalidate_workspace_lease_identity() {
             return Err((projection, RuntimePromotionError::Sqlite(error)));
+        }
+        let checkpoint_publication_proof = match projection.checkpoint_publication_proof() {
+            Ok(proof) => proof,
+            Err(error) => return Err((projection, RuntimePromotionError::Sqlite(error))),
+        };
+        if let Err(error) =
+            engine.install_clean_checkpoint_publication_authority(checkpoint_publication_proof)
+        {
+            return Err((projection, RuntimePromotionError::Engine(error)));
         }
         let frontier = match engine.accepted_frontier_root() {
             Ok(frontier) => frontier,

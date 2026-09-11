@@ -11530,6 +11530,202 @@ fn corrupt_checkpoint_pointer_and_generation_each_force_total_full_replay() {
     }
 }
 
+/// A disposable predecessor that cannot be decoded must not poison every
+/// later publication attempt. Full replay owns a fresh sequence-zero capture,
+/// which must replace `current` without extending the damaged payload.
+#[test]
+fn p3_damaged_predecessor_republishes_a_fresh_base_zero_checkpoint() {
+    let fixture =
+        ActivationFixture::nested_unicode("p3-damaged-predecessor-republish", 0xa178_b800);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let first = activated.handle.expect("damage fixture activates");
+    drive_initial_feed(&first);
+    let (page, revision) = load_application_exact(&first, "Root.md");
+    let _ = save_application_block_text(
+        &first,
+        page,
+        revision,
+        "authoritative original before checkpoint damage",
+    );
+    drain_managed_local(&first);
+    drop(first);
+
+    let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
+        .join("clean-open-checkpoint-v2");
+    for payload in ["payload-a", "payload-b"] {
+        let path = checkpoint.join(payload);
+        if path.exists() {
+            fs::write(path, b"damaged predecessor payload").unwrap();
+        }
+    }
+
+    let mut replay_counters = None;
+    let replay =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                replay_counters = Some(counters);
+            }
+        });
+    assert_eq!(replay.status, SyncRuntimeOpenStatus::Active);
+    let replay = replay.handle.expect("damaged predecessor full-replays");
+    assert_eq!(replay_counters.unwrap().full_replay_opens, 1);
+    let (page, revision) = load_application_exact(&replay, "Root.md");
+    assert_eq!(
+        page.blocks[0].raw,
+        "authoritative original before checkpoint damage"
+    );
+    let _ = save_application_block_text(
+        &replay,
+        page,
+        revision,
+        "fresh base-zero checkpoint after damage",
+    );
+    drain_managed_local(&replay);
+    drop(replay);
+
+    let mut checkpoint_counters = None;
+    let reopened =
+        SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+            if let SyncRuntimeOpenProgress::CleanOpenCounters { counters } = progress {
+                checkpoint_counters = Some(counters);
+            }
+        });
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let reopened = reopened
+        .handle
+        .expect("fresh base-zero checkpoint becomes the selected generation");
+    let counters = checkpoint_counters.expect("reopen reports checkpoint counters");
+    assert_eq!(counters.checkpoint_opens, 1, "{counters:?}");
+    assert_eq!(counters.full_replay_opens, 0, "{counters:?}");
+    let (page, _) = load_application_exact(&reopened, "Root.md");
+    assert_eq!(
+        page.blocks[0].raw,
+        "fresh base-zero checkpoint after damage"
+    );
+}
+
+#[test]
+fn p3_torn_checkpoint_full_replay() {
+    use crate::oplog::checkpoint_generation::{
+        damage_checkpoint_for_test, CheckpointDamageForTest,
+    };
+
+    fn archive_originals(fixture: &ActivationFixture) -> BTreeMap<String, Vec<u8>> {
+        let root = clean_operation_archive_directory(&fixture.request.archive_root);
+        let mut originals = BTreeMap::new();
+        for namespace in ["batches", "objects"] {
+            for entry in fs::read_dir(root.join(namespace)).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    originals.insert(
+                        format!("{namespace}/{}", entry.file_name().to_string_lossy()),
+                        fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        originals
+    }
+
+    let cases = [
+        ("pointer-absent", None),
+        ("pointer-torn", Some(CheckpointDamageForTest::PointerTorn)),
+        (
+            "pointer-wrong-format",
+            Some(CheckpointDamageForTest::PointerWrongFormat),
+        ),
+        (
+            "generation-torn",
+            Some(CheckpointDamageForTest::GenerationTorn),
+        ),
+        ("payload-torn", Some(CheckpointDamageForTest::PayloadTorn)),
+        (
+            "floor-inconsistent",
+            Some(CheckpointDamageForTest::FloorMetadataInconsistent),
+        ),
+        (
+            "document-image-torn",
+            Some(CheckpointDamageForTest::DocumentImageTorn),
+        ),
+    ];
+    for (index, (label, damage)) in cases.into_iter().enumerate() {
+        let expected = format!("original survives {label}");
+        let fixture = ActivationFixture::nested_unicode(
+            &format!("p3-torn-checkpoint-{label}"),
+            0xa178_c000 + index as u128 * 0x100,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let handle = activated.handle.expect("damage fixture activates");
+        drive_initial_feed(&handle);
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(&handle, page, revision, &expected);
+        drain_managed_local(&handle);
+        drop(handle);
+
+        let store = ObjectStore::open(
+            &clean_operation_archive_directory(&fixture.request.archive_root),
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let before = archive_originals(&fixture);
+        if let Some(damage) = damage {
+            damage_checkpoint_for_test(&store, damage).unwrap();
+        } else {
+            fs::remove_file(store.root_path().join("clean-open-checkpoint-v2/current")).unwrap();
+        }
+        drop(store);
+
+        let mut counters = None;
+        let reopened =
+            SyncRuntimeHandle::open_with_progress(reopen_request(&fixture.request), |progress| {
+                if let SyncRuntimeOpenProgress::CleanOpenCounters { counters: observed } = progress
+                {
+                    counters = Some(observed);
+                }
+            });
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active, "{label}");
+        let reopened = reopened.handle.expect("checkpoint damage full-replays");
+        let counters = counters.expect("fallback reports counters");
+        assert_eq!(counters.checkpoint_opens, 0, "{label}: {counters:?}");
+        assert_eq!(counters.full_replay_opens, 1, "{label}: {counters:?}");
+        let (page, _) = load_application_exact(&reopened, "Root.md");
+        assert_eq!(page.blocks[0].raw, expected, "{label}");
+        assert_eq!(
+            archive_originals(&fixture),
+            before,
+            "{label}: checkpoint repair changed or deleted authoritative originals"
+        );
+        drop(reopened);
+    }
+
+    let fixture = ActivationFixture::nested_unicode("p3-genuine-archive-damage", 0xa178_d000);
+    let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+    let handle = activated.handle.expect("archive-damage fixture activates");
+    drive_initial_feed(&handle);
+    let (page, revision) = load_application_exact(&handle, "Root.md");
+    let _ = save_application_block_text(
+        &handle,
+        page,
+        revision,
+        "genuine archive damage is not a checkpoint fallback",
+    );
+    drain_managed_local(&handle);
+    drop(handle);
+    let batches = clean_operation_archive_directory(&fixture.request.archive_root).join("batches");
+    let manifest = fs::read_dir(batches)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_file())
+        .unwrap();
+    fs::remove_file(manifest.path()).unwrap();
+    let refused = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+    assert!(refused.handle.is_none());
+    assert_eq!(
+        refused.status.durable_refusal_scenario(),
+        Some(ManagedStorageRefusalScenario::DiskCorrupt)
+    );
+}
+
 #[test]
 fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
     let fixture =
@@ -17557,6 +17753,63 @@ fn p3_below_floor_provider_custody_precedes_dequeue_and_resolves_uncertain_appen
 
     let (
         _author,
+        _receiver,
+        _author_handle,
+        receiver_handle,
+        move_batch,
+        source_endpoint,
+        manifest,
+        objects,
+    ) = stale_move("p3-custody-before-append", 0xc080_0000);
+    receiver_handle
+        .install_recovery_input_fault_for_test(RecoveryInputFault::BeforeAppendDurable)
+        .unwrap();
+    receiver_handle.observe_provider().unwrap();
+    let mut observed_before_append = false;
+    for _ in 0..512 {
+        let tick = receiver_handle.tick().unwrap();
+        if matches!(
+            &tick,
+            SyncRuntimeTick::RecoveryBlocked(detail)
+                if detail.contains("before recovery-input append became durable")
+        ) {
+            observed_before_append = true;
+            break;
+        }
+    }
+    assert!(
+        observed_before_append,
+        "provider never reached pre-append cut"
+    );
+    assert!(
+        receiver_handle
+            .recovery_input_probe_for_test()
+            .unwrap()
+            .is_empty(),
+        "a pre-durable-append crash must not invent custody"
+    );
+    for _ in 0..512 {
+        let _ = receiver_handle.tick().unwrap();
+        let recovered = receiver_handle.recovery_input_probe_for_test().unwrap();
+        if let Some(frame) = recovered.iter().find(|frame| frame.batch_id == move_batch) {
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(frame.source_endpoint_id, source_endpoint);
+            assert_eq!(frame.manifest, manifest);
+            assert_eq!(frame.objects, objects);
+            break;
+        }
+    }
+    assert_eq!(
+        receiver_handle
+            .recovery_input_probe_for_test()
+            .unwrap()
+            .len(),
+        1,
+        "pre-append provider item was consumed instead of retried"
+    );
+
+    let (
+        _author,
         receiver,
         _author_handle,
         receiver_handle,
@@ -17850,6 +18103,229 @@ fn p3_automatic_full_history_reconstruction_preserves_original_and_resumes() {
     assert_ne!(post_recovery, stale_batch);
 }
 
+/// A retained child with an undelivered parent must not replay immutable
+/// genesis on every 50 ms actor wake.  Delivery appends the exact parent to
+/// the same custody domain; readiness must consider that parent->child
+/// cascade and resume without a manual repair action.
+#[test]
+fn p3_missing_recovery_prerequisite_is_bounded_then_delivery_cascades() {
+    fn exact_prepared(fixture: &ActivationFixture, batch_id: BatchId) -> PreparedBatch {
+        let store = ObjectStore::open(
+            &clean_operation_archive_directory(&fixture.request.archive_root),
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let manifest_bytes = store.resolve_logical_manifest_bytes(batch_id).unwrap();
+        let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
+        let objects = manifest
+            .required_objects()
+            .iter()
+            .map(|descriptor| {
+                OperationObject::decode(
+                    &store
+                        .resolve_logical_object_bytes(descriptor.content_digest())
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        PreparedBatch::new(manifest, objects).unwrap()
+    }
+
+    fn retain_exact(fixture: &ActivationFixture, prepared: &PreparedBatch) {
+        let identities = &fixture.request.identities;
+        RecoveryInputJournal::open(
+            &fixture.request.application_runtime_root,
+            identities.workspace_id,
+            identities.lineage_digest,
+            identities.endpoint_id,
+            identities.device_id,
+        )
+        .unwrap()
+        .retain(prepared, false)
+        .unwrap();
+    }
+
+    let (author, receiver, author_handle, receiver_handle) =
+        joined_shared_pair("p3-missing-recovery-parent", 0xc380_0000);
+    let (base_batch, _page_id, block_id, document_id) = submit_shared_page(
+        &author_handle,
+        0xc380_0020,
+        "P3 Missing Recovery Parent",
+        "notes/p3-missing-recovery-parent.md",
+        "shared departure state",
+    );
+    publish_shared_batch(&author_handle, &author, base_batch);
+    settle_shared_provider(&author_handle);
+    copy_provider_tree(
+        &author.request.provider_root,
+        &receiver.request.provider_root,
+    );
+    receiver_handle.observe_provider().unwrap();
+    settle_shared_provider(&receiver_handle);
+    submit_durable(
+        &receiver_handle,
+        vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id: document_id,
+            },
+            content: "receiver advanced past the author".into(),
+        }],
+    );
+    settle_shared_provider(&receiver_handle);
+    receiver_handle
+        .force_document_floor_to_current_for_test(document_id)
+        .unwrap();
+    receiver_handle.clean_shutdown().unwrap();
+    drop(receiver_handle);
+
+    let parent_batch = submit_durable(
+        &author_handle,
+        vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id: document_id,
+            },
+            content: "parent exact bytes".into(),
+        }],
+    );
+    let child_batch = submit_durable(
+        &author_handle,
+        vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id: document_id,
+            },
+            content: "child exact bytes".into(),
+        }],
+    );
+    let parent = exact_prepared(&author, parent_batch);
+    let child = exact_prepared(&author, child_batch);
+    assert!(
+        crate::oplog::hot_engine::clean_operation_dependency_heads(
+            child.manifest(),
+            child.objects(),
+        )
+        .unwrap()
+        .contains(&parent_batch),
+        "fixture child must require the withheld parent"
+    );
+
+    retain_exact(&receiver, &child);
+    let blocked = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+    // Count the expensive thing, not the tick. A missing prerequisite must not
+    // buy a genesis replay plus a lifetime-sized manifest walk per 50 ms wake,
+    // and the only honest witness for that is how many times the actor actually
+    // entered reconstruction -- a blocked-message string would stop matching the
+    // moment someone rewords it, and pass for the wrong reason.
+    let mut observed_ticks = Vec::new();
+    for _ in 0..32 {
+        observed_ticks.push(format!("{:?}", blocked.tick().unwrap()));
+    }
+    let expensive_attempts = blocked.full_history_reconstructions_for_test().unwrap();
+    assert!(
+        expensive_attempts <= 1,
+        "missing prerequisite replayed immutable genesis {expensive_attempts} times across 32 idle ticks: {observed_ticks:?}"
+    );
+    assert!(
+        observed_ticks
+            .iter()
+            .any(|tick| tick.contains("RecoveryBlocked")),
+        "a missing prerequisite must say so rather than idle silently: {observed_ticks:?}"
+    );
+
+    // The head-publishing paths are fenced while an original sits in custody,
+    // but the enrollment descriptor claims no frontier, so its repair must still
+    // run during the wait. Otherwise a file-sync tool that removes the join file
+    // leaves peers seeing "does not yet contain sync data" for the whole
+    // recovery window -- exactly when another device is trying to reach this one.
+    let receiver_descriptor = receiver
+        .request
+        .provider_root
+        .join("outbox")
+        .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH);
+    assert!(
+        receiver_descriptor.exists(),
+        "fixture publishes a descriptor"
+    );
+    fs::remove_file(&receiver_descriptor).unwrap();
+    blocked
+        .observe_provider_paths(vec![SHARED_ENROLLMENT_DESCRIPTOR_PATH.into()], false)
+        .unwrap();
+    for _ in 0..16 {
+        blocked.tick().unwrap();
+        if receiver_descriptor.exists() {
+            break;
+        }
+    }
+    assert!(
+        receiver_descriptor.exists(),
+        "descriptor repair must not be fenced by a pending recovery input"
+    );
+    assert!(
+        !blocked.recovery_input_probe_for_test().unwrap().is_empty(),
+        "the descriptor repair ran while recovery was still genuinely pending"
+    );
+
+    publish_shared_batch(&author_handle, &author, parent_batch);
+    let delivered = copy_provider_batch(
+        &author,
+        &receiver,
+        parent_batch,
+        ProviderBatchDelivery::Complete,
+    );
+    blocked
+        .observe_provider_paths(delivered, false)
+        .expect("parent delivery is retained while recovery is paused");
+    for _ in 0..2_048 {
+        let tick = blocked.tick().unwrap();
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+                    | SyncRuntimeTick::RecoveryBlocked(_)
+            ),
+            "parent delivery did not resume the retained cascade: {tick:?}"
+        );
+        if blocked.recovery_input_probe_for_test().unwrap().is_empty() {
+            break;
+        }
+    }
+    assert!(
+        blocked.recovery_input_probe_for_test().unwrap().is_empty(),
+        "parent delivery left the retained parent->child cascade pending"
+    );
+
+    let receiver_store = ObjectStore::open(
+        &clean_operation_archive_directory(&receiver.request.archive_root),
+        receiver.request.identities.workspace_id,
+    )
+    .unwrap();
+    for prepared in [&parent, &child] {
+        let batch_id = prepared.manifest().batch_id();
+        assert_eq!(
+            receiver_store
+                .resolve_logical_manifest_bytes(batch_id)
+                .unwrap(),
+            prepared.manifest().encode().unwrap(),
+            "recovery changed exact manifest bytes for {batch_id}"
+        );
+        for object in prepared.objects() {
+            let bytes = object.encode().unwrap();
+            assert_eq!(
+                receiver_store
+                    .resolve_logical_object_bytes(ContentDigest::of(&bytes))
+                    .unwrap(),
+                bytes,
+                "recovery changed exact object bytes for {batch_id}"
+            );
+        }
+    }
+}
+
 #[test]
 fn p3_full_history_contract_names_the_ordered_boundary_count_and_automatic_exit() {
     let contract = include_str!("../../../docs/storage-sync-contract.md");
@@ -17869,7 +18345,7 @@ fn p3_full_history_contract_names_the_ordered_boundary_count_and_automatic_exit(
 /// coexist during the real actor transition.
 #[test]
 fn p3_reconstruction_interstep_crashes_preserve_exact_original_and_publisher_exclusion() {
-    for step in 1_u8..=7 {
+    for step in 1_u8..=8 {
         let seed = 0xc400_0000_u128 + u128::from(step) * 0x1_000;
         let label = format!("p3-reconstruction-cut-{step}");
         let (author, receiver, author_handle, receiver_handle) = joined_shared_pair(&label, seed);

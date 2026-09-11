@@ -314,7 +314,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis.<generation>/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation/join installation | clean open/join through the marker generation resolver | immutable baseline pack, manifest schema 7, page capsule v6, plus commit v1 | authoritative only when named by the marker; generation 0 is the fresh-store publication, and unreferenced generations are reclaimed on open. A sealed baseline whose manifest schema is not the current one is a recognized pre-0.7 containing format: open refuses with `MS-REF-PROTOCOL-INCOMPATIBLE`, which routes the store to preserve-and-rebuild (blank-slate), never to a retryable dead end; no earlier schema is decoded. A schema-5 baseline written by the retired per-block layout takes this same route: the whole private root is preserved as a backup and the current format is rebuilt automatically from Markdown/Org, without replaying backup-only history |
 | `archive/operations.<generation>/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit and join installation | causal replay and publication through the marker generation resolver | content-addressed objects plus manifest-last batches | authoritative append-only tail paired with the same marker-named baseline generation; unreferenced generations are reconstructible join residue and are reclaimed on open |
-| `archive/operations.<generation>/clean-open-checkpoint-v2/{current,payload-{a,b},generation-{a,b},capsule-v1-<digest>,sealed-v2-1-<digest>}` | clean engine actor plus one coalesced background writer | clean managed open and image-first cold page loads | current canonical checkpoint v2; two bounded replaceable slots, one durable commit pointer, and a sealed document-to-image roster | disposable acceleration only; immutable images become durable before their manifest/generation/pointer, unchanged references are reused, objects outside both retained generation roots are reclaimed, and absent/stale/torn/wrong-format/damaged state full-replays without migration or backup |
+| `archive/operations.<generation>/clean-open-checkpoint-v2/{current,payload-{a,b},generation-{a,b},capsule-v1-<digest>,sealed-v2-1-<digest>}` | clean engine actor plus one coalesced background writer | the single current-format clean managed opener and image-first cold page loads | canonical checkpoint v2; two bounded replaceable slots, one durable commit pointer, one sealed document-to-image roster, workspace/lineage/catalog binding, accepted-sequence/state-digest recovery fence, and per-document actual floor plus age/size-policy facts | disposable acceleration only; immutable images become durable before payload/generation/pointer, unchanged references are reused after manifest-binding validation without importing every document, objects outside both retained generation roots are reclaimed, and absent/torn/wrong-format/internally inconsistent state sequence-zero full-replays without migration or backup. A damaged predecessor never prevents a fresh base-zero publication, and checkpoint repair never deletes originals |
 | `archive/operations.<generation>/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
 | `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision roots | immutable generation-named summary chain v1 naming the absence-history root | disposable receiver roots acceleration; retained receipt records are truth and rebuild it |
 | `archive/operations.<generation>/sweeps/receiver-absence-rows-v1/` | the same receiver open/completion machinery under the workspace lease | point-addressable absence history by exact `(PageId, ManagedPath)` | immutable content-addressed records and authenticated map nodes v1 | disposable derived index; retained receipt records are truth and rebuild it |
@@ -322,7 +322,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | foreign receiver projector | foreign recovery/readiness checks and the receiver half of the absence-decision map; own-endpoint open performs names-only residue reporting | projection store v6 and versioned rows | live foreign receipts and diagnostics; retired own-endpoint rows are inert, reported, and not deleted |
 | `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | foreign receipt cleanup | foreign receipt cleanup | bounded cleanup queue | disposable foreign-recovery maintenance state; retired own-endpoint entries are inert and reported in place |
 | configured projection SQLite file and sidecars | clean runtime | managed queries/navigation and identity preflight | current `tine-storage` SQLite schema plus disposable `projection_baselines.projection_baseline_digest` rows | disposable; writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transaction; terminal publication leaves both FTS families unready, then bounded actor turns bulk-build from the stamped projection, drain the same-transaction live-edit outbox, and flip one readiness marker atomically; FTS consumers report building or use their exact non-FTS fallback until then; transaction commits are not authority or individual durability barriers; an explicit checkpoint plus atomic file-set publication establishes a reusable snapshot; missing/stale/corrupt state rebuilds from baseline plus manifests, and losing a baseline digest costs one render-and-bind, never a Markdown rewrite |
-| application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` | foreground authoring and projection-only producers | managed cold open and actor drain | two independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances |
+| application runtime `managed-local-journal/{clean-workspace-,projection-turns-}…` plus endpoint-scoped recovery-input storage | foreground authoring, projection-only producers, and below-floor provider custody | managed cold open, actor drain and full-history reconstruction | three independently sequenced `LocalJournalSegmentV2` domains | authoritative until each domain's independent checkpoint advances; recovery input additionally waits for successful actor reinstall |
 | application runtime `move-episodes/` | correlated multi-page operation | idempotent retry/reopen and accepted-response acknowledgement | immutable episode sidecars | retained until the frontend installs the committed source/destination pair, then retired; interrupted pre-ack evidence remains replayable |
 | device-private provider journal | clean shared publisher | interrupted provider publication | bounded publication/recovery records and lock; `completed/` bounded by live provider state, not store lifetime (§2.10c-i) | private transport recovery; never semantic authority |
 
@@ -1382,6 +1382,50 @@ evidence surfaces as `MS-REF-DISK-CORRUPT` (scenario: disk error or torn
 sync-service delivery of the archive), the same scenario the full-replay path
 would report.
 
+The payload binds workspace, lineage and catalog document; its recovery fence
+binds accepted sequence, semantic-state digest, live eligibility `E`, and the
+age/size policy revision, 30-day lower bound, minimum-tail bytes and live-size
+multiplier. Each document-to-image record binds exact accepted dependencies,
+its image descriptor, `E`, the same policy config, requested `K`, actual removed
+sequence, actual native floor, and the measured image/latest/removable/budget,
+post-cut, hysteresis, overage and limiting-cause facts. Current live eligibility is
+`E=0`: publication records that value but does not advance a live floor.
+
+Before publishing `current`, the worker rereads the complete inactive payload
+and generation, checks their exact digests and slot/sequence bindings, validates
+the workspace/lineage/catalog and recovery fence against the decoded semantic
+state, and validates roster completeness plus every descriptor/dependency/floor
+binding. A reused immutable image is already pinned and unchanged, so this
+qualification validates its manifest binding without importing that document.
+The actor re-proves its continuously held lease and capture binding at
+publication and again before installation. Exact name replacement supplies the
+crash commit point; it is **not** cross-process exclusion.
+
+An absent, torn, wrong-format or internally inconsistent pointer, generation,
+payload, floor record, roster record or document image always discards the
+derivation and takes sequence-zero replay from immutable genesis plus all exact
+accepted originals and selected journal prefixes. The replay seeds a fresh
+base-zero checkpoint instead of trying to extend the unreadable predecessor.
+No repair path deletes accepted objects, manifests, managed-local records,
+projection-turn records or recovery-input originals. If replay itself proves an
+authoritative archive object missing or damaged, it reports
+`MS-REF-DISK-CORRUPT`; a disposable checkpoint cannot mask that damage.
+
+The restart contract at every publication edge is:
+
+| Crash/publication edge | Required restart behavior |
+| --- | --- |
+| Before recovery-input append is durable | The provider item remains unconsumed and receives no custody acknowledgement. |
+| During append, or after durability before acknowledgement | The WAL distinguishes an uncommitted suffix from damaged committed data and replays one complete frame once. |
+| During reconstruction or accepted-object publication, before manifest commit | The old checkpoint remains selected, journals retain originals, and journal-covered object repair applies. |
+| After accepted manifest commit, before checkpoint capture | Full replay discovers the accepted original; a retained duplicate is harmless. |
+| During inactive payload write, sync or replacement | The prior pointed generation remains usable; partial inactive state has no authority. |
+| After payload, during generation publication | The prior pointed generation remains selected; no candidate is selected before `current`. |
+| During pointer replacement or its durability barrier | Reopen selects a complete old or new generation; absent, torn or invalid `current` takes genesis plus originals and journals. |
+| After durable pointer, before actor swap or SQLite rebuild | Reopen selects the new checkpoint, replays retained tails and rebuilds disposable projections. |
+| After actor swap, before journal/input cleanup | Reopen replays and deduplicates retained work; it never authors the operation twice. |
+| During cleanup | Durable selector/drain-anchor ordering preserves either the retained frame or proven exact accepted coverage. |
+
 The checkpoint contains every clean-runtime field that changes later
 admission, conflict, or query decisions, including the exact ephemeral
 page-name ownership state, current path/name/UUID claims and conflicts,
@@ -1465,6 +1509,16 @@ while conflicting bytes under that identity follow input-validation collision
 handling. I/O or resource failure leaves the provider item queued and all
 authoritative inputs retryable. The recovery-input segment itself is the restart trigger;
 there is no separate durable recovering flag.
+
+Before reconstructing, the actor computes a fixed point over the current
+accepted frontier **union all retained recovery-input envelopes** using the same
+admission-order routine reconstruction uses. If a genuine prerequisite is
+absent, idle ticks keep the input pending without rebuilding genesis or walking
+the lifetime manifest set. Provider delivery is still polled; arrival of the
+missing parent immediately admits it and any dependent retained-envelope
+cascade, then triggers reconstruction. Thus stuck work is bounded by delivery,
+not by the 50 ms actor tick, while every retained dependency chain keeps an
+automatic exit.
 
 Automatic full-history reconstruction follows eight ordered boundaries. The
 serialized actor first finishes or classifies any already-started append,
@@ -1880,6 +1934,10 @@ Reconstruction applies those scenarios at these concrete call sites:
 | Reconstruction names the wrong block/home, is malformed, or exceeds an existing bound | `MS-REF-MALFORMED-IMPORT` / `MS-REF-BOUNDS` | Malformed imported/shared operation input attempts identity substitution or excess allocation. Reject before publication or allocation beyond the bound. |
 | Imported reconstruction update, source and declared effect disagree | `MS-REF-MALFORMED-IMPORT` | Malformed peer/import input substitutes content, identity, placement, or container operations. Reject the complete batch atomically; install no document or replacement. |
 | Restore planning state advances | `MS-REF-STALE-GENERATION` | An honest concurrent operation changed the page/frontier after validation. Re-diff through the existing bounded retry/action cursor; do not publish the stale plan. |
+| Checkpoint binding, recovery fence, floor policy, roster or document image is absent, torn, wrong-format or inconsistent | no durable refusal; disposable recovery | Crash/power loss tore a derivative publication. Discard it, sequence-zero replay all retained originals and journals, and publish a fresh base-zero checkpoint. Never delete originals to repair the derivation. |
+| Recovery-input parent or object has not arrived | no durable refusal; retryable pending | Honest delivery reordering or interrupted sync delivery. Retain custody evidence, poll delivery cheaply without repeated full reconstruction, and retry the complete retained-envelope cascade when its prerequisite arrives. |
+| Outbound frontier-head publication while a recovery input is pending | no durable refusal; suspended until reconstruction completes | The device holds custody of an original that is not yet in its accepted frontier, so a published head would claim a frontier that omits work it already holds. The suspension latches the pending repair request rather than dropping it, so it runs on the tick after recovery finishes. Enrollment-descriptor repair is explicitly NOT suspended (it republishes the join file verbatim and asserts no head), and inbound delivery is never suspended, because delivery is what ends the wait. |
+| Recovery publication fails, or lease/binding changes before installation | `MS-REF-STALE-GENERATION` only for a proved honest authority advance; otherwise retryable pending | I/O/crash failure or an honest concurrent instance invalidates the candidate. Keep the actor paused, retain every original, abandon the stale candidate, and retry under current authority. |
 
 A page shard may transiently hold a **sparse block**: an owner register naming a
 block whose text container is absent. Physical deletion removes the owner,
@@ -2214,6 +2272,14 @@ recovers the one accepted operation or refuses recovery; retrying the edit in
 the same process could otherwise duplicate it. Replayed task-query overlays
 begin as incomplete and force the complete evaluator until their bounded sparse
 facts have been reconstructed, so stale SQLite can never hide a journaled edit.
+
+The recovery-input journal has the same WAL boundary but a distinct settlement
+meaning. Before a durable append the provider item stays queued and unacknowledged.
+After a complete durable frame, custody may be acknowledged even though semantic
+acceptance awaits full-history reconstruction. An uncertain result reopens and
+resolves the exact BatchId and bytes; it never appends an equivalent edit. Its
+selected generation cannot advance or be cleaned until successful actor
+reinstallation proves exact accepted coverage.
 
 Foreground-journal compaction publishes a complete successor generation before
 retiring its predecessor. Failure to retire the predecessor is retryable
@@ -2616,13 +2682,13 @@ turns on a permanent failure buys no chance of settling and charges the whole
 cost to the user's save. Any change of phase or detail counts as progress and
 keeps the loop running to the budget.
 
-### 3.2a Projection turns and the second local journal
+### 3.2a Projection turns, recovery input, and independent local journals
 
 A **projection turn** is one authoritative unit of graph-tree publication work.
 A durable turn is the whole authority for the names its replay may create and
 for the pages it may publish. Turns are `oplog::hot_engine::ProjectionTurn`.
 
-**Two sequence domains, two physical segments.** Managed-local append requires
+**Three sequence domains, three physical segments.** Managed-local append requires
 its physical journal sequence to equal the hot semantic overlay's next
 sequence, and only applying a *semantic* managed-local record advances that
 overlay. A projection-only record placed in the foreground journal would
@@ -2633,9 +2699,12 @@ never drain, and the next ordinary save would fail the equality check. So:
 | --- | --- | --- | --- |
 | `ManagedLocal` | the foreground journal, `managed-local-journal/clean-workspace-{workspace}-{lineage}/` | the hot overlay's sequence, physical == semantic | foreground local authoring |
 | `ProjectionTurn` | the projection-turn journal, `managed-local-journal/projection-turns-{workspace}-{lineage}/` | its own monotonic counter, which never meets the other | ingress, terminal repair, superseded repair |
+| `RecoveryInput` | the receiving-endpoint-scoped recovery-input journal under private app data | its own monotonic counter and selected durable generation/prefix | exact below-floor provider originals awaiting full-history admission |
 
-Both use the same `LocalJournalSegmentV2` type and both checkpoint
-independently. Projection-turn **anchors are keyed by endpoint** (
+All three use the same `LocalJournalSegmentV2` WAL and checkpoint independently.
+Recovery-input frames bind transport identity and exact canonical
+manifest/object bytes; unlike a managed-local frame, they are custody rather
+than locally authored semantic work. Projection-turn **anchors are keyed by endpoint** (
 `endpoint-{endpoint}-selector-{generation:020}.anchor-v2`), from store creation:
 one grammar, no dual format, because a pre-(c) private store never reaches
 journal selection — the receipt-store claim precheck refuses it first.

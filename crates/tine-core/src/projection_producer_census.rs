@@ -2234,9 +2234,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // projection-turn `selection` reads plus recovery-input `as_ref` and
     // `next_sequence`. They capture authenticated generation identity and
     // durable high-water; no writer family or write boundary is added.
+    // Packet 3 v2 §5 adds two read-only `tine_storage::read_optional_regular`
+    // calls that reread the inactive payload and generation for complete
+    // candidate qualification before `current`. Publication itself still uses
+    // the already-enumerated DurableDirectoryPublication family; no new writer
+    // family or direct write boundary is introduced.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "c51a5a3c10b3664cdcf3a153ce589a3e113af6348b1a55f6a5821dd83f530dca",
+        "1cf0ab2b7294da940a3f00a964d17e7d8cf816e6dda82ea9cb5e81c90a60db0f",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

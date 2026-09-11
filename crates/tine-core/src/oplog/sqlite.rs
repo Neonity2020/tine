@@ -7242,6 +7242,44 @@ mod applier_lease {
         applier_slot_vended: AtomicBool,
     }
 
+    /// Cloneable, non-applier proof retained by the checkpoint worker. The
+    /// duplicated locked handle keeps the same OS lock/open-file identity; it
+    /// grants no SQLite slot and exists only to re-prove the exact lease path
+    /// immediately before the checkpoint commit pointer is published.
+    pub(crate) struct WorkspaceRuntimePublicationProof {
+        file: File,
+        workspace_id: WorkspaceId,
+        lease_path: PathBuf,
+        identity: LeaseFileIdentity,
+        archive_capability: CapDir,
+    }
+
+    impl WorkspaceRuntimePublicationProof {
+        pub(crate) fn revalidate_identity(&self) -> Result<(), ProjectionError> {
+            let held = held_file_identity(&self.file, &self.lease_path)
+                .map_err(|error| ProjectionError::LeaseIdentityUnavailable(error.to_string()))?;
+            if held != self.identity {
+                return Err(ProjectionError::LeaseIdentityReplaced(format!(
+                    "the checkpoint publication lease handle {} is no longer the file it locked",
+                    self.lease_path.display()
+                )));
+            }
+            let named = resolve_lease_file_identity(
+                &self.archive_capability,
+                &self.workspace_id.to_string(),
+                &self.lease_path,
+            )
+            .map_err(LeasePathResolutionError::into_projection_error)?;
+            if named != self.identity {
+                return Err(ProjectionError::LeaseIdentityReplaced(format!(
+                    "the checkpoint publication lease {} was replaced while held",
+                    self.lease_path.display()
+                )));
+            }
+            Ok(())
+        }
+    }
+
     /// How many times an acquisition may lose the open/lock/check race to an
     /// out-of-band replacement before it fails closed.
     ///
@@ -7411,6 +7449,25 @@ mod applier_lease {
         /// open a database.
         pub(crate) const fn proof(&self) -> WorkspaceRuntimeProof<'_> {
             WorkspaceRuntimeProof { lease: self }
+        }
+
+        pub(crate) fn publication_proof(
+            &self,
+        ) -> Result<WorkspaceRuntimePublicationProof, ProjectionError> {
+            self.revalidate_identity()?;
+            Ok(WorkspaceRuntimePublicationProof {
+                file: self
+                    .file
+                    .try_clone()
+                    .map_err(|error| ProjectionError::Io(error.to_string()))?,
+                workspace_id: self.workspace_id,
+                lease_path: self.lease_path.clone(),
+                identity: self.identity,
+                archive_capability: self
+                    .archive_capability
+                    .try_clone()
+                    .map_err(|error| ProjectionError::Io(error.to_string()))?,
+            })
         }
     }
 
@@ -7854,6 +7911,12 @@ mod applier_lease {
             self.lease.revalidate_identity()
         }
 
+        pub(crate) fn checkpoint_publication_proof(
+            &self,
+        ) -> Result<WorkspaceRuntimePublicationProof, ProjectionError> {
+            self.lease.publication_proof()
+        }
+
         #[cfg(test)]
         pub(crate) const fn projection(&self) -> &OpenProjection {
             &self.projection
@@ -7958,7 +8021,7 @@ pub(crate) use applier_lease::{
 use applier_lease::{ApplierAuthorization, HeldApplierLocks};
 pub(crate) use applier_lease::{
     LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceLeaseIdentity, WorkspaceRuntimeLease,
-    WorkspaceRuntimeProof,
+    WorkspaceRuntimeProof, WorkspaceRuntimePublicationProof,
 };
 
 #[cfg(test)]
@@ -16753,6 +16816,25 @@ mod tests {
         let incoming = path.with_extension("lock.incoming");
         fs::write(&incoming, b"").unwrap();
         fs::rename(&incoming, path).unwrap();
+    }
+
+    #[test]
+    fn p3_checkpoint_publication_proof_refuses_a_replaced_lease_name() {
+        let ids = TestIds::new(9_199);
+        let dir = TestDir::new("checkpoint-publication-lease-replacement");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        let publication = lease.publication_proof().unwrap();
+        publication.revalidate_identity().unwrap();
+
+        replace_workspace_lock_file(&lease_path);
+
+        assert!(matches!(
+            publication.revalidate_identity(),
+            Err(ProjectionError::LeaseIdentityReplaced(_))
+        ));
     }
 
     /// Replacing the workspace lock file out of band used to split the local

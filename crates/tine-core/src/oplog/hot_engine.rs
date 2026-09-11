@@ -6741,6 +6741,12 @@ impl LiveGraphDocumentClosure {
 }
 
 pub(crate) struct CleanCheckpointCapture {
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) lineage_digest: LineageDigest,
+    pub(crate) catalog_document_id: DocumentId,
+    pub(crate) cutoff_state_digest: ContentDigest,
+    pub(crate) eligible_through: u64,
+    pub(crate) floor_policy: super::checkpoint_floor_policy::FloorPolicyConfig,
     pub(crate) base_sequence: u64,
     pub(crate) target_sequence: u64,
     pub(crate) state_bytes: Vec<u8>,
@@ -6853,6 +6859,40 @@ struct CleanCheckpointStateV5 {
     current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
     current_path_available: bool,
     current_path_frontier_root: AcceptedFrontierRoot,
+}
+
+pub(crate) struct CleanCheckpointStateBinding {
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) lineage_digest: LineageDigest,
+    pub(crate) catalog_document_id: DocumentId,
+    pub(crate) accepted_sequence: u64,
+    pub(crate) accepted_state_digest: ContentDigest,
+}
+
+/// Decode only the canonical identity/frontier binding needed by the worker's
+/// pre-pointer qualification. Full semantic installation remains the actor's
+/// job and independently decodes and validates the same state bytes.
+pub(crate) fn clean_checkpoint_state_binding(
+    state_bytes: &[u8],
+) -> Result<CleanCheckpointStateBinding, EngineError> {
+    let (state, trailing): (CleanCheckpointStateV5, &[u8]) = postcard::take_from_bytes(state_bytes)
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    if !trailing.is_empty()
+        || state.schema_version != CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION
+        || postcard::to_allocvec(&state).map_err(|error| EngineError::Archive(error.to_string()))?
+            != state_bytes
+    {
+        return Err(EngineError::Archive(
+            "clean checkpoint state is not current canonical data".into(),
+        ));
+    }
+    Ok(CleanCheckpointStateBinding {
+        workspace_id: state.workspace_id,
+        lineage_digest: state.lineage_digest,
+        catalog_document_id: state.catalog_document_id,
+        accepted_sequence: state.accepted_frontier_root.acceptance_sequence(),
+        accepted_state_digest: state.accepted_frontier_root.state_digest(),
+    })
 }
 
 pub struct ShardedHotEngine {
@@ -7681,6 +7721,17 @@ impl ShardedHotEngine {
     /// its worker, so return means no predecessor can still write `current`.
     pub(crate) fn stop_clean_checkpoint_publisher(&mut self) {
         drop(self.clean_checkpoint_publisher.take());
+    }
+
+    pub(crate) fn install_clean_checkpoint_publication_authority(
+        &self,
+        proof: super::sqlite::WorkspaceRuntimePublicationProof,
+    ) -> Result<(), EngineError> {
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
+            .install_publication_authority(proof);
+        Ok(())
     }
 
     pub(crate) fn rebuild_next_clean_checkpoint_from_genesis(&self) -> Result<(), EngineError> {
@@ -8823,6 +8874,12 @@ impl ShardedHotEngine {
                 .ok_or_else(|| EngineError::Archive("clean checkpoint work overflowed".into()))
         })?;
         Ok(CleanCheckpointCapture {
+            workspace_id: self.workspace_id,
+            lineage_digest: self.lineage_digest,
+            catalog_document_id: self.catalog_document_id,
+            cutoff_state_digest: self.accepted_frontier_root.state_digest(),
+            eligible_through: 0,
+            floor_policy: super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: durable_sequence,
             target_sequence: self.next_acceptance_sequence,
             state_bytes,
@@ -27746,20 +27803,27 @@ fn canonical_peer_counters(vv: &VersionVector) -> Result<Vec<CrdtPeerCounter>, E
     Ok(counters)
 }
 
-fn shallow_floor_counters(
+pub(crate) fn shallow_frontier_counters(
     document_id: DocumentId,
     document: &LoroDoc,
+    floor: &loro::Frontiers,
 ) -> Result<Vec<CrdtPeerCounter>, EngineError> {
-    let floor = document.shallow_since_frontiers();
     if floor.is_empty() {
         return Ok(Vec::new());
     }
-    let floor_vv = document.frontiers_to_vv(&floor).ok_or_else(|| {
+    let floor_vv = document.frontiers_to_vv(floor).ok_or_else(|| {
         EngineError::InvalidCrdt(format!(
             "native shallow floor for {document_id} is not in its own DAG"
         ))
     })?;
     canonical_peer_counters(&floor_vv)
+}
+
+fn shallow_floor_counters(
+    document_id: DocumentId,
+    document: &LoroDoc,
+) -> Result<Vec<CrdtPeerCounter>, EngineError> {
+    shallow_frontier_counters(document_id, document, &document.shallow_since_frontiers())
 }
 
 fn dependency_counters_cover_floor(
