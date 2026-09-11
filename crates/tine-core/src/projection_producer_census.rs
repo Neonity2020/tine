@@ -2239,9 +2239,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // candidate qualification before `current`. Publication itself still uses
     // the already-enumerated DurableDirectoryPublication family; no new writer
     // family or direct write boundary is introduced.
+    // Packet 3 v2 §7 adds one read-only sealed-index object-store adapter and
+    // reader traversal so the checkpoint worker can derive native candidate
+    // frontiers from accepted evidence through E. The adapter's publication
+    // method rejects every call; it adds no writer family or write boundary.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1cf0ab2b7294da940a3f00a964d17e7d8cf816e6dda82ea9cb5e81c90a60db0f",
+        "a2b3e7300427ab954a56d50bdab4a6b16c9fd0939bb89372a56f8e01d81bd159",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

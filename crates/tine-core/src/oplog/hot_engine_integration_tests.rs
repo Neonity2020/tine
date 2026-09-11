@@ -11390,12 +11390,23 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
             Arc::clone(&loaded.documents),
         )
         .unwrap();
+    assert_eq!(
+        restored.checkpoint_floor_policy_probe_for_test(),
+        engine.checkpoint_floor_policy_probe_for_test(),
+        "checkpoint restore must preserve T/E and clock policy metadata exactly"
+    );
     let mut replayed = open();
+    let replay_t = replayed.checkpoint_floor_policy_probe_for_test().2;
     assert_eq!(
         replayed
             .replay_clean_committed_tail(claims.as_ref())
             .unwrap(),
         9
+    );
+    assert_eq!(
+        replayed.checkpoint_floor_policy_probe_for_test().2,
+        replay_t,
+        "full replay is not a first-local-acceptance event and must not advance T"
     );
     for (label, other) in [
         ("checkpoint restore", &restored),

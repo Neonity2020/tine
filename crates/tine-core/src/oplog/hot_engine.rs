@@ -6645,10 +6645,12 @@ pub(crate) struct DeferredAbsenceObservation {
     pub(crate) path: ManagedPath,
 }
 
-// v5 replaces inline resident-document bytes with qualified immutable image
+// v6 adds canonical device-local acceptance-age policy bytes. Exactly one
+// current schema remains implemented; older disposable checkpoints rebuild.
+// v5 replaced inline resident-document bytes with qualified immutable image
 // references. Exactly one schema has an implementation (D-1): a checkpoint
 // written by any other version is discarded and rebuilt from accepted history.
-const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 5;
+const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 6;
 
 /// One accepted-roster row captured coherently by the engine actor. The
 /// checkpoint module feeds these rows through tine-storage's canonical sealed
@@ -6746,6 +6748,10 @@ pub(crate) struct CleanCheckpointCapture {
     pub(crate) catalog_document_id: DocumentId,
     pub(crate) cutoff_state_digest: ContentDigest,
     pub(crate) eligible_through: u64,
+    pub(crate) latest_acceptance_utc_ms: i64,
+    pub(crate) age_cutoff_utc_ms: i64,
+    pub(crate) clock_frozen: bool,
+    pub(crate) last_clock_reset_utc_ms: Option<i64>,
     pub(crate) floor_policy: super::checkpoint_floor_policy::FloorPolicyConfig,
     pub(crate) base_sequence: u64,
     pub(crate) target_sequence: u64,
@@ -6775,6 +6781,44 @@ pub(crate) struct CheckpointWorkerDocument {
     pub(crate) imported_handoff: bool,
     pub(crate) imported_predecessor_image: bool,
     pub(crate) reconstructed: bool,
+}
+
+/// Device-local wall/monotonic readings for the disposable floor policy.
+/// UTC is persisted only as an age observation; monotonic time exists solely
+/// to detect same-process discontinuities and has no causal authority.
+struct CheckpointFloorClock {
+    started: Instant,
+    #[cfg(test)]
+    injected: Option<(i64, u64)>,
+}
+
+impl CheckpointFloorClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            #[cfg(test)]
+            injected: None,
+        }
+    }
+
+    fn read(&self) -> (i64, u64) {
+        #[cfg(test)]
+        if let Some(reading) = self.injected {
+            return reading;
+        }
+        let utc_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+        let monotonic_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        (utc_ms, monotonic_ms)
+    }
+
+    #[cfg(test)]
+    fn inject(&mut self, utc_ms: i64, monotonic_ms: u64) {
+        self.injected = Some((utc_ms, monotonic_ms));
+    }
 }
 
 /// Fixed diagnostic outcome retained by the actor when checkpoint capture is
@@ -6822,7 +6866,7 @@ pub(crate) fn clean_checkpoint_capture_skip_detail(
 /// `sealed_accepted_index` before handing rows back to the engine.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CleanCheckpointStateV5 {
+struct CleanCheckpointStateV6 {
     schema_version: u32,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -6859,6 +6903,9 @@ struct CleanCheckpointStateV5 {
     current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
     current_path_available: bool,
     current_path_frontier_root: AcceptedFrontierRoot,
+    /// Canonical bytes force restore through `AcceptanceAgePolicy::decode_current`,
+    /// which clears the process-local monotonic reading.
+    acceptance_age_policy: Vec<u8>,
 }
 
 pub(crate) struct CleanCheckpointStateBinding {
@@ -6867,6 +6914,7 @@ pub(crate) struct CleanCheckpointStateBinding {
     pub(crate) catalog_document_id: DocumentId,
     pub(crate) accepted_sequence: u64,
     pub(crate) accepted_state_digest: ContentDigest,
+    pub(crate) eligible_through: u64,
 }
 
 /// Decode only the canonical identity/frontier binding needed by the worker's
@@ -6875,7 +6923,7 @@ pub(crate) struct CleanCheckpointStateBinding {
 pub(crate) fn clean_checkpoint_state_binding(
     state_bytes: &[u8],
 ) -> Result<CleanCheckpointStateBinding, EngineError> {
-    let (state, trailing): (CleanCheckpointStateV5, &[u8]) = postcard::take_from_bytes(state_bytes)
+    let (state, trailing): (CleanCheckpointStateV6, &[u8]) = postcard::take_from_bytes(state_bytes)
         .map_err(|error| EngineError::Archive(error.to_string()))?;
     if !trailing.is_empty()
         || state.schema_version != CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION
@@ -6892,6 +6940,12 @@ pub(crate) fn clean_checkpoint_state_binding(
         catalog_document_id: state.catalog_document_id,
         accepted_sequence: state.accepted_frontier_root.acceptance_sequence(),
         accepted_state_digest: state.accepted_frontier_root.state_digest(),
+        eligible_through: super::checkpoint_floor_policy::AcceptanceAgePolicy::decode_current(
+            &state.acceptance_age_policy,
+            i64::MAX,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .eligible_through(),
     })
 }
 
@@ -7088,6 +7142,11 @@ pub struct ShardedHotEngine {
     accepted_frontier_root: AcceptedFrontierRoot,
     accepted_sequence: BTreeMap<u64, BatchId>,
     next_acceptance_sequence: u64,
+    /// Disposable local observations controlling the oldest floor this device
+    /// may select. Accepted history remains the sole authority.
+    acceptance_age_policy: super::checkpoint_floor_policy::AcceptanceAgePolicy,
+    floor_policy_config: super::checkpoint_floor_policy::FloorPolicyConfig,
+    floor_policy_clock: CheckpointFloorClock,
     // Derived only from already authenticated accepted semantic effects. This
     // avoids catalog/receipt namespace scans when a scan epoch asks for the
     // current live PageId -> exact ManagedPath set.
@@ -7172,6 +7231,11 @@ impl ShardedHotEngine {
     ) -> Self {
         let page_name_root = PageNameOwnershipRootV1::empty();
         let logseq_claim_root = LogseqClaimIndexRoot::empty();
+        let floor_policy_clock = CheckpointFloorClock::new();
+        let (utc_ms, monotonic_ms) = floor_policy_clock.read();
+        let acceptance_age_policy =
+            super::checkpoint_floor_policy::AcceptanceAgePolicy::fresh(utc_ms, monotonic_ms)
+                .expect("production checkpoint clock is nonnegative");
         Self {
             nonlinear_watermark: std::sync::atomic::AtomicU64::new(0),
             linearity_scanned_count: std::sync::atomic::AtomicU64::new(0),
@@ -7252,6 +7316,9 @@ impl ShardedHotEngine {
             accepted_frontier_root: empty_accepted_frontier_root(),
             accepted_sequence: BTreeMap::new(),
             next_acceptance_sequence: 0,
+            acceptance_age_policy,
+            floor_policy_config: super::checkpoint_floor_policy::FloorPolicyConfig::default(),
+            floor_policy_clock,
             current_path_catalog: CurrentPathCatalog::default(),
             current_path_cursor_book: RefCell::new(CurrentPathCursorBook::default()),
             #[cfg(test)]
@@ -7997,7 +8064,8 @@ impl ShardedHotEngine {
             let validated = pending
                 .remove(&batch_id)
                 .expect("ready clean replay batch remains pending");
-            let outcome = self.stage_ready_with_claim_source(validated, baseline_claim_source);
+            let outcome =
+                self.stage_ready_with_claim_source(validated, baseline_claim_source, false);
             if !matches!(outcome.disposition(), BatchDisposition::Accepted { .. }) {
                 return Err(EngineError::Archive(format!(
                     "manifest-committed clean operation {batch_id} did not validate as accepted: {:?}",
@@ -8052,6 +8120,14 @@ impl ShardedHotEngine {
                 "clean accepted tail expected {expected} total operations but replay produced {accepted}"
             )));
         }
+        let (utc_ms, monotonic_ms) = self.floor_policy_clock.read();
+        // Replay gives an unknown suffix a fresh conservative upper bound, but
+        // it is not a first-local-acceptance event and therefore cannot move T.
+        // A full replay starts on the constructor's fresh genesis observation;
+        // a checkpoint-tail replay extends the restored observation history.
+        self.acceptance_age_policy
+            .observe_recovered_prefix(self.next_acceptance_sequence, utc_ms, monotonic_ms)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
         self.schedule_clean_checkpoint();
         Ok(batch_ids.len())
     }
@@ -8514,6 +8590,57 @@ impl ShardedHotEngine {
         })
     }
 
+    /// Derive the age-eligible native candidate frontiers on the publisher
+    /// worker from the existing accepted evidence sequence. This is the same
+    /// accepted-prefix traversal as the construction helper above; it adds no
+    /// actor-side export and no second lifetime index.
+    pub(crate) fn build_policy_compact_worker_document(
+        capture: &CleanCheckpointDocumentCapture,
+        document_id: DocumentId,
+        dependencies: DocumentDependencies,
+        document: &LoroDoc,
+        eligible_through: u64,
+        policy: super::checkpoint_floor_policy::FloorPolicyConfig,
+        accepted_evidence: &[AcceptedBatchEvidence],
+    ) -> Result<PolicyCompactAcceptedDocument, EngineError> {
+        if accepted_evidence.len() != usize::try_from(eligible_through).unwrap_or(usize::MAX) {
+            return Err(EngineError::Archive(
+                "retained-tail worker evidence does not reach E".into(),
+            ));
+        }
+        let mut candidate_dependencies = capture.lazy_genesis.frontier_document(document_id);
+        let mut candidates = Vec::new();
+        for evidence in accepted_evidence {
+            let sequence = evidence.acceptance_sequence();
+            let changed = evidence
+                .affected_documents()
+                .iter()
+                .find(|candidate| candidate.document_id() == document_id)
+                .cloned();
+            let document_changed = changed.is_some();
+            if document_changed {
+                candidate_dependencies = changed;
+            }
+            if sequence == 1 || document_changed {
+                if let Some(candidate) = &candidate_dependencies {
+                    candidates.push((
+                        sequence,
+                        document.vv_to_frontiers(&version_vector_for_dependencies(candidate)?),
+                    ));
+                }
+            }
+        }
+        Self::build_policy_compact_accepted_document(
+            capture.catalog_document_id,
+            capture.cutoff_state_digest,
+            dependencies,
+            document,
+            eligible_through,
+            policy,
+            candidates,
+        )
+    }
+
     /// Materialize one changed document on the checkpoint worker. Resident
     /// documents arrive as actor-created Snapshot handoffs; evicted and
     /// bootstrap-only documents are reconstructed directly from immutable
@@ -8798,7 +8925,7 @@ impl ShardedHotEngine {
         let lazy_genesis = self.lazy_genesis.as_ref().cloned().ok_or_else(|| {
             EngineError::Archive("clean checkpoint capture has no immutable genesis".into())
         })?;
-        let state = CleanCheckpointStateV5 {
+        let state = CleanCheckpointStateV6 {
             schema_version: CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION,
             workspace_id: self.workspace_id,
             lineage_digest: self.lineage_digest,
@@ -8853,6 +8980,10 @@ impl ShardedHotEngine {
             current_path_rows: ordered_rows(&self.current_path_catalog.rows),
             current_path_available: self.current_path_catalog.available,
             current_path_frontier_root: self.current_path_catalog.accepted_frontier_root.clone(),
+            acceptance_age_policy: self
+                .acceptance_age_policy
+                .encode_current()
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
         };
         let state_bytes = postcard::to_allocvec(&state)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -8886,8 +9017,12 @@ impl ShardedHotEngine {
             lineage_digest: self.lineage_digest,
             catalog_document_id: self.catalog_document_id,
             cutoff_state_digest: self.accepted_frontier_root.state_digest(),
-            eligible_through: 0,
-            floor_policy: super::checkpoint_floor_policy::FloorPolicyConfig::default(),
+            eligible_through: self.acceptance_age_policy.eligible_through(),
+            latest_acceptance_utc_ms: self.acceptance_age_policy.latest_acceptance_utc_ms(),
+            age_cutoff_utc_ms: self.acceptance_age_policy.age_cutoff_utc_ms(),
+            clock_frozen: self.acceptance_age_policy.clock_frozen(),
+            last_clock_reset_utc_ms: self.acceptance_age_policy.last_clock_reset_utc_ms(),
+            floor_policy: self.floor_policy_config,
             base_sequence: durable_sequence,
             target_sequence: self.next_acceptance_sequence,
             state_bytes,
@@ -8922,7 +9057,7 @@ impl ShardedHotEngine {
                 "clean checkpoint restore requires an index-free sequence-zero baseline".into(),
             ));
         }
-        let (state, trailing): (CleanCheckpointStateV5, &[u8]) =
+        let (state, trailing): (CleanCheckpointStateV6, &[u8]) =
             postcard::take_from_bytes(state_bytes)
                 .map_err(|error| EngineError::Archive(error.to_string()))?;
         if !trailing.is_empty()
@@ -8943,6 +9078,13 @@ impl ShardedHotEngine {
             &state.ephemeral_page_names,
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let (utc_now_ms, _) = self.floor_policy_clock.read();
+        let acceptance_age_policy =
+            super::checkpoint_floor_policy::AcceptanceAgePolicy::decode_current(
+                &state.acceptance_age_policy,
+                utc_now_ms,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
         let decode_documents = |encoded: &BTreeSet<DocumentId>| {
             encoded
                 .iter()
@@ -9043,7 +9185,8 @@ impl ShardedHotEngine {
         }
         let next_acceptance_sequence = u64::try_from(accepted_sequence.len())
             .map_err(|_| EngineError::Archive("checkpoint sequence exceeds u64".into()))?;
-        if previous_root != state.accepted_frontier_root
+        if acceptance_age_policy.observed_through() != next_acceptance_sequence
+            || previous_root != state.accepted_frontier_root
             || state.accepted_frontier_root.acceptance_sequence() != next_acceptance_sequence
             || accepted_batch_root.root_key()
                 != state
@@ -9136,6 +9279,7 @@ impl ShardedHotEngine {
         self.accepted_frontier_root = state.accepted_frontier_root;
         self.accepted_sequence = accepted_sequence;
         self.next_acceptance_sequence = next_acceptance_sequence;
+        self.acceptance_age_policy = acceptance_age_policy;
         self.clean_projection_heads.clear();
         self.clean_projection_head_batches = state.clean_projection_head_batches;
         self.current_path_catalog = CurrentPathCatalog {
@@ -9300,6 +9444,65 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_published_checkpoint_document_for_test(
+        &mut self,
+        document_id: DocumentId,
+    ) -> Result<(), EngineError> {
+        let (_, dependencies, document) = self
+            .clean_checkpoint_publisher
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
+            .load_current_document(self.catalog_document_id, document_id)
+            .map_err(EngineError::Archive)?
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        if self.accepted_frontier.get(&document_id) != Some(&dependencies) {
+            return Err(EngineError::FrontierVectorMismatch(document_id));
+        }
+        self.visible_documents.insert(document_id, document.clone());
+        self.spare_documents
+            .borrow_mut()
+            .insert(document_id, document);
+        self.local_overlay.documents.remove(&document_id);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_checkpoint_floor_clock_for_test(
+        &mut self,
+        utc_ms: i64,
+        monotonic_ms: u64,
+    ) -> Result<(), EngineError> {
+        self.floor_policy_clock.inject(utc_ms, monotonic_ms);
+        if self.next_acceptance_sequence == 0 {
+            self.acceptance_age_policy =
+                super::checkpoint_floor_policy::AcceptanceAgePolicy::fresh(utc_ms, monotonic_ms)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_checkpoint_floor_config_for_test(
+        &mut self,
+        config: super::checkpoint_floor_policy::FloorPolicyConfig,
+    ) {
+        self.floor_policy_config = config;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_floor_policy_probe_for_test(
+        &self,
+    ) -> (u64, u64, i64, bool, Option<i64>) {
+        (
+            self.acceptance_age_policy.observed_through(),
+            self.acceptance_age_policy.eligible_through(),
+            self.acceptance_age_policy.latest_acceptance_utc_ms(),
+            self.acceptance_age_policy.clock_frozen(),
+            self.acceptance_age_policy.last_clock_reset_utc_ms(),
+        )
+    }
+
     /// Validate one local candidate completely, then publish its manifest as
     /// the durable accepted-operation commit point.
     ///
@@ -9339,8 +9542,11 @@ impl ShardedHotEngine {
             )));
         }
 
-        let outcome =
-            self.stage_ready_with_claim_source(ValidatedBatch::new(prepared.clone()), claim_source);
+        let outcome = self.stage_ready_with_claim_source(
+            ValidatedBatch::new(prepared.clone()),
+            claim_source,
+            true,
+        );
         let accepted_exactly_once =
             matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
                 && outcome.newly_accepted().len() == 1
@@ -9445,8 +9651,11 @@ impl ShardedHotEngine {
         }
 
         let overlay = std::mem::take(&mut self.local_overlay);
-        let outcome =
-            self.stage_ready_with_claim_source(ValidatedBatch::new(prepared.clone()), claim_source);
+        let outcome = self.stage_ready_with_claim_source(
+            ValidatedBatch::new(prepared.clone()),
+            claim_source,
+            true,
+        );
         self.local_overlay = overlay;
         let accepted_exactly_once =
             matches!(outcome.disposition(), BatchDisposition::Accepted { .. })
@@ -12773,6 +12982,7 @@ impl ShardedHotEngine {
             ),
             BatchInspection::Ready(batch) => {
                 let outcome = self.stage_ready_internal(batch, None);
+                self.observe_live_acceptances(&outcome);
                 self.resolve_pending_author(batch_id, &outcome.disposition);
                 self.prune_persisted_archive_cache();
                 outcome
@@ -12829,6 +13039,7 @@ impl ShardedHotEngine {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
         let outcome = self.stage_ready_internal(batch, None);
+        self.observe_live_acceptances(&outcome);
         self.resolve_pending_author(batch_id, &outcome.disposition);
         self.prune_persisted_archive_cache();
         outcome
@@ -12838,6 +13049,7 @@ impl ShardedHotEngine {
         &mut self,
         batch: ValidatedBatch,
         claim_source: &dyn ProjectionClaimSource,
+        observe_acceptance: bool,
     ) -> StageOutcome {
         let trace_started = super::phase_trace_enabled().then(std::time::Instant::now);
         let batch_id = batch.manifest().batch_id();
@@ -12845,6 +13057,9 @@ impl ShardedHotEngine {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
         let outcome = self.stage_ready_internal(batch, Some(claim_source));
+        if observe_acceptance {
+            self.observe_live_acceptances(&outcome);
+        }
         if let Some(started) = trace_started {
             eprintln!(
                 "PHASE TIME Engine.stage_ready_with_claim_source statuses={} accepted={} {:.3}ms",
@@ -12856,6 +13071,36 @@ impl ShardedHotEngine {
         self.resolve_pending_author(batch_id, &outcome.disposition);
         self.prune_persisted_archive_cache();
         outcome
+    }
+
+    fn observe_live_acceptances(&mut self, outcome: &StageOutcome) {
+        let accepted = u64::try_from(outcome.newly_accepted().len()).unwrap_or(u64::MAX);
+        if accepted == 0 {
+            return;
+        }
+        let first = self
+            .next_acceptance_sequence
+            .saturating_sub(accepted)
+            .saturating_add(1);
+        let (utc_ms, monotonic_ms) = self.floor_policy_clock.read();
+        for sequence in first..=self.next_acceptance_sequence {
+            if self
+                .acceptance_age_policy
+                .observe_acceptance(sequence, utc_ms, monotonic_ms)
+                .is_err()
+            {
+                // Policy metadata can only make compaction less effective. A
+                // bad local clock observation must never refuse acceptance.
+                self.acceptance_age_policy =
+                    super::checkpoint_floor_policy::AcceptanceAgePolicy::recover_missing(
+                        self.next_acceptance_sequence,
+                        utc_ms,
+                        monotonic_ms,
+                    )
+                    .expect("the already-clamped production clock is valid");
+                break;
+            }
+        }
     }
 
     fn resolve_pending_author(&self, batch_id: BatchId, disposition: &BatchDisposition) {
@@ -35072,13 +35317,14 @@ pub(crate) mod validation_tests {
         // Writer-lane ownership moved this schema to 3. Returning the section
         // to one catalog plus page shards, keyed by 16-byte document ids,
         // moved it to 4. Replacing inline resident bytes with v2 image roster
-        // references moved it to 5, so neither older shape can decode as this.
+        // references moved it to 5. Device-local acceptance-age metadata moved
+        // it to 6, so none of the older shapes can decode as this.
         assert_eq!(
-            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 5,
+            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 6,
             "changing the checkpoint state representation changes its schema"
         );
         let state_start = source
-            .find("struct CleanCheckpointStateV5 {")
+            .find("struct CleanCheckpointStateV6 {")
             .expect("checkpoint state section remains present");
         let state_end = source[state_start..]
             .find("\n}\n")

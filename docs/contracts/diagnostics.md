@@ -119,16 +119,15 @@ checkpoint completed, publication edge, and preservation result. It never
 copies the free-form retry cause; the frontend applies its existing bounded
 sanitizer when that cause is shown or explicitly copied.
 
-The fixed `managed.checkpoint_publication` receipt carries the policy revision
-and byte policy, each changed document's identity/floors and I/L/R/B
+The fixed `managed.checkpoint_publication` receipt carries T, E, the age cutoff,
+clock-frozen state and last reset time, the policy revision and byte policy,
+each changed document's identity/floors and I/L/R/B
 measurements, post-cut remainder, hysteresis shortfall, budget overage and
 closed limiting cause, changed/exported/reused and worker export counts,
 hot/cold read and byte totals, phase durations, checkpoint bytes, and the
-commit-last publication edge. Acceptance-age cutoff/clock state and peak RSS
-are emitted only when the worker actually observes them; the current live
-publisher observes neither and therefore omits them rather than writing a
-placeholder. These records contain identifiers and counts, never page names,
-paths, or document bytes.
+commit-last publication edge. Peak RSS is emitted only when measured. These
+records contain identifiers and counts, never page names, paths, or document
+bytes.
 
 Parser failures cross the lsdoc-diff worker boundary only as a status plus
 `ParserDiagnostic`: a nullable numeric offset, UTF-8 input length, and opaque

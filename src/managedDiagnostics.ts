@@ -62,7 +62,7 @@ export function managedCheckpointDiagnostics(
   checkpoint: SparseV2CheckpointPublicationDiagnostics,
 ): string[] {
   const lines = [
-    `Checkpoint policy: sequence=${checkpoint.measurement_sequence}; revision=${checkpoint.policy_revision}; minimum_tail_bytes=${checkpoint.minimum_tail_bytes}; live_size_multiplier=${checkpoint.live_size_multiplier}`,
+    `Checkpoint policy: sequence=${checkpoint.measurement_sequence}; T=${checkpoint.latest_acceptance_utc_ms}; E=${checkpoint.eligible_through}; revision=${checkpoint.policy_revision}; minimum_tail_bytes=${checkpoint.minimum_tail_bytes}; live_size_multiplier=${checkpoint.live_size_multiplier}`,
     `Checkpoint documents: changed=${checkpoint.changed_documents}; exported=${checkpoint.exported_documents}; reused=${checkpoint.reused_documents}`,
     `Checkpoint worker: measurements=${checkpoint.measurement_exports}; candidates=${checkpoint.candidate_exports}; verification_imports=${checkpoint.verification_imports}`,
     `Checkpoint hot reads: manifests=${checkpoint.hot_manifest_reads}/${checkpoint.hot_manifest_bytes}B; objects=${checkpoint.hot_object_reads}/${checkpoint.hot_object_bytes}B`,
@@ -75,6 +75,9 @@ export function managedCheckpointDiagnostics(
   }
   if (checkpoint.clock_frozen !== null) {
     lines.push(`Checkpoint clock frozen: ${checkpoint.clock_frozen}`);
+  }
+  if (checkpoint.last_clock_reset_utc_ms !== null) {
+    lines.push(`Checkpoint clock reset: utc_ms=${checkpoint.last_clock_reset_utc_ms}`);
   }
   if (checkpoint.peak_rss_bytes !== null) {
     lines.push(`Checkpoint peak RSS bytes: ${checkpoint.peak_rss_bytes}`);

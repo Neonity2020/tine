@@ -1388,8 +1388,16 @@ age/size policy revision, 30-day lower bound, minimum-tail bytes and live-size
 multiplier. Each document-to-image record binds exact accepted dependencies,
 its image descriptor, `E`, the same policy config, requested `K`, actual removed
 sequence, actual native floor, and the measured image/latest/removable/budget,
-post-cut, hysteresis, overage and limiting-cause facts. Current live eligibility is
-`E=0`: publication records that value but does not advance a live floor.
+post-cut, hysteresis, overage and limiting-cause facts. Live eligibility comes
+from canonical device-local acceptance observations persisted in the same
+checkpoint. `T` is the latest first-local-acceptance observation at `S`; the
+cutoff is `T - 30 days`; `E` is the greatest whole accepted prefix whose
+observations are no newer than that cutoff. Duplicate delivery, replay,
+checkpoint export and checkpoint installation do not advance `T`. A recovered
+unknown suffix receives a conservative current upper bound without becoming an
+acceptance event. Clock rollback/discontinuity freezes advancement; a later
+stable wall/monotonic pair starts a fresh conservative epoch and records its
+reset time. Elapsed wall time without a new acceptance advances nothing.
 
 Before publishing `current`, the worker rereads the complete inactive payload
 and generation, checks their exact digests and slot/sequence bindings, validates
@@ -1481,11 +1489,16 @@ for every unchanged document. Reopen imports only the documents that were
 resident at capture; a later cache miss or same-session eviction loads the
 current published image and applies only accepted document updates after that
 image's S. It falls back to genesis/original replay only when the roster has no
-image for that document. The current live policy supplies E=0, so these v2
-images retain their existing native floor and cannot yet make an incoming
-original below-floor. Acceptance-age advancement remains a later slice; an
-explicitly installed shallow floor can nevertheless exercise the recovery
-boundary described below.
+image for that document. For every changed document the worker measures the
+current image and a latest-state-only image at the same `S`. Removable bytes
+`R = max(0, I-L)` trigger a cut only when they exceed
+`B = max(256 KiB, 4*L)`. The worker traverses the existing sealed accepted
+sequence through `E`, verifies native candidate images without assuming size
+monotonicity, and selects the oldest legal `K` reaching `R_K < B/2`. If no
+candidate reaches the hysteresis target, the greatest safe age-eligible native
+cut is retained and the shortfall/overage cause is diagnostic. Age wins over
+size: recent or uncertain history is never removed to meet a budget, and a
+within-budget document never cuts even after months of device time.
 
 Provider admission nevertheless implements the below-floor boundary before
 that policy becomes active. Preflight checks every declared affected/support

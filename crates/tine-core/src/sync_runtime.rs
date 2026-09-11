@@ -2121,8 +2121,11 @@ pub struct SyncCheckpointDocumentDiagnostics {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncCheckpointPublicationDiagnostics {
     pub measurement_sequence: u64,
+    pub latest_acceptance_utc_ms: i64,
+    pub eligible_through: u64,
     pub age_cutoff_utc_ms: Option<i64>,
     pub clock_frozen: Option<bool>,
+    pub last_clock_reset_utc_ms: Option<i64>,
     pub policy_revision: u32,
     pub minimum_tail_bytes: u64,
     pub live_size_multiplier: u64,

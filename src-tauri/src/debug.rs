@@ -580,11 +580,19 @@ pub(crate) fn record_checkpoint_publication(
         "measurementSequence".into(),
         json!(checkpoint.measurement_sequence),
     );
+    fields.insert(
+        "latestAcceptanceUtcMs".into(),
+        json!(checkpoint.latest_acceptance_utc_ms),
+    );
+    fields.insert("eligibleThrough".into(), json!(checkpoint.eligible_through));
     if let Some(age_cutoff_utc_ms) = checkpoint.age_cutoff_utc_ms {
         fields.insert("ageCutoffUtcMs".into(), json!(age_cutoff_utc_ms));
     }
     if let Some(clock_frozen) = checkpoint.clock_frozen {
         fields.insert("clockFrozen".into(), json!(clock_frozen));
+    }
+    if let Some(clock_reset_utc_ms) = checkpoint.last_clock_reset_utc_ms {
+        fields.insert("lastClockResetUtcMs".into(), json!(clock_reset_utc_ms));
     }
     fields.insert("policyRevision".into(), json!(checkpoint.policy_revision));
     fields.insert(

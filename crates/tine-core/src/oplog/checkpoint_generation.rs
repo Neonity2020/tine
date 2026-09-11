@@ -43,25 +43,6 @@ const CHECKPOINT_GENERATION_NAMES: [&str; 2] = ["generation-a", "generation-b"];
 const MAX_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
 const CHECKPOINT_CLEANUP_ENTRY_HEADROOM: usize = 1024;
 
-/// The acceptance-age eligibility the LIVE capture path hands the floor policy.
-///
-/// Zero is not a placeholder value that happens to work: it is the whole reason
-/// the policy cannot yet move a floor. `choose_floor` may only advance to a
-/// candidate at or below `eligible_through`, so with zero eligibility and an
-/// empty candidate set every live call returns `Keep`, and a v2 image keeps the
-/// native floor it was exported with. The policy is therefore WIRED but INERT.
-///
-/// `docs/storage-sync-contract.md` states this as a contract fact ("The current
-/// live policy supplies E=0"), and
-/// `the_live_floor_call_is_inert_and_says_so` pins the two together, because a
-/// load-bearing value asserted only in prose drifts silently.
-///
-/// A later Packet 3 slice makes acceptance age observable and persistent and
-/// passes a real E here. When it does, that test fails ON PURPOSE: delete it,
-/// delete this constant, and update the contract sentence in the SAME commit.
-/// Do not keep the name while passing a real value -- that is the exact shape
-/// of a comment that outlives its truth.
-const LIVE_FLOOR_ELIGIBILITY_DISABLED: u64 = 0;
 pub(crate) const CLEAN_CHECKPOINT_LAG_MAX: u64 = 64;
 
 static ACTIVE_CHECKPOINT_READERS: OnceLock<
@@ -325,6 +306,39 @@ impl CheckpointSealedStore {
             return Err("clean checkpoint sealed map count differs from its root".into());
         }
         Ok(rows)
+    }
+}
+
+struct BorrowedCheckpointSealedStore<'a> {
+    objects: &'a BTreeMap<(u8, ContentDigest), Vec<u8>>,
+}
+
+impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
+    for BorrowedCheckpointSealedStore<'_>
+{
+    fn read_sealed_accepted_object(
+        &self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+    {
+        Ok(self
+            .objects
+            .get(&(sealed_kind_code(kind), address))
+            .cloned())
+    }
+
+    fn publish_sealed_accepted_object(
+        &mut self,
+        _kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        _address: ContentDigest,
+        _bytes: &[u8],
+    ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+        Err(
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Corrupt(
+                "borrowed checkpoint history is read-only".into(),
+            ),
+        )
     }
 }
 
@@ -661,7 +675,7 @@ impl DocumentCheckpointPolicyV1 {
             .map_err(|_| "checkpoint image size exceeds u64".to_owned())?;
         let config = super::checkpoint_floor_policy::FloorPolicyConfig::default();
         Ok(Self {
-            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            eligible_through: 0,
             config,
             requested_k: None,
             actual_removed_through: 0,
@@ -1809,6 +1823,7 @@ fn validate_published_candidate(
             || state.catalog_document_id != payload.binding.catalog_document_id
             || state.accepted_sequence != payload.recovery_fence.accepted_sequence
             || state.accepted_state_digest != payload.recovery_fence.accepted_state_digest
+            || state.eligible_through != payload.recovery_fence.eligible_through
         {
             return Err("published checkpoint state/recovery binding differs".into());
         }
@@ -1835,6 +1850,70 @@ fn install_replaceable_exact(
     }
 }
 
+fn floor_candidate_evidence(
+    predecessor: Option<&(u64, CheckpointPayloadV2)>,
+    accepted_rows: &[CleanCheckpointAcceptedRow],
+    eligible_through: u64,
+) -> Result<Vec<AcceptedBatchEvidence>, String> {
+    use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
+
+    let predecessor_sequence = predecessor.map_or(0, |(sequence, _)| *sequence);
+    if eligible_through
+        > predecessor_sequence.saturating_add(
+            u64::try_from(accepted_rows.len())
+                .map_err(|_| "checkpoint accepted delta exceeds u64".to_owned())?,
+        )
+    {
+        return Err("checkpoint age eligibility exceeds available accepted history".into());
+    }
+    let predecessor_store = predecessor.map(|(_, payload)| BorrowedCheckpointSealedStore {
+        objects: &payload.sealed_objects,
+    });
+    let predecessor_roots = predecessor
+        .map(|(_, payload)| roots_from_wire(payload.roster_roots.clone()))
+        .transpose()?;
+    let delta = accepted_rows
+        .iter()
+        .map(|row| (row.evidence.acceptance_sequence(), &row.evidence))
+        .collect::<BTreeMap<_, _>>();
+    let mut evidence = Vec::with_capacity(usize::try_from(eligible_through).unwrap_or(0));
+    for sequence in 1..=eligible_through {
+        if sequence <= predecessor_sequence {
+            let store = predecessor_store
+                .as_ref()
+                .ok_or_else(|| "checkpoint eligible predecessor history is absent".to_owned())?;
+            let roots = predecessor_roots
+                .ok_or_else(|| "checkpoint eligible predecessor roots are absent".to_owned())?;
+            let reader = SealedAcceptedIndexReader::new(store);
+            let entry = reader
+                .sequence_entry(roots.sequence, sequence)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "checkpoint eligible sequence is absent".to_owned())?;
+            let proof = reader
+                .prove_membership(
+                    roots,
+                    sequence,
+                    entry.batch_id,
+                    &TineAcceptedEvidenceDecoder,
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "checkpoint eligible membership is absent".to_owned())?;
+            evidence.push(
+                AcceptedBatchEvidence::decode_canonical(&proof.status.exact_evidence_bytes)
+                    .map_err(|error| error.to_string())?,
+            );
+        } else {
+            evidence.push(
+                (*delta
+                    .get(&sequence)
+                    .ok_or_else(|| "checkpoint eligible delta row is absent".to_owned())?)
+                .clone(),
+            );
+        }
+    }
+    Ok(evidence)
+}
+
 fn publish_document_images(
     directory: &cap_std::fs::Dir,
     store: &ObjectStore,
@@ -1859,6 +1938,8 @@ fn publish_document_images(
         .transpose()?
         .unwrap_or_else(tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty);
     let predecessor_roster = SealedDocumentRoster::from_root(predecessor_root);
+    let candidate_evidence =
+        floor_candidate_evidence(predecessor, accepted_rows, eligible_through)?;
     let mut roster = predecessor_roster;
     let mut staging = SealedGenerationStagingStore::open(directory)?;
     let mut work = CheckpointImageWork::default();
@@ -1921,16 +2002,14 @@ fn publish_document_images(
         work.changed_document_reconstructions = work
             .changed_document_reconstructions
             .saturating_add(u64::from(materialized.reconstructed));
-        let compact = super::hot_engine::ShardedHotEngine::build_policy_compact_accepted_document(
-            capture.catalog_document_id,
-            capture.cutoff_state_digest,
+        let compact = super::hot_engine::ShardedHotEngine::build_policy_compact_worker_document(
+            capture,
+            *document_id,
             dependencies.clone(),
             &materialized.document,
             eligible_through,
             policy,
-            // The current E=0 supplies no legal candidates, so publication
-            // measures the current image without advancing its native floor.
-            std::iter::empty(),
+            &candidate_evidence,
         )
         .map_err(|error| error.to_string())?;
         work.exported_documents = work.exported_documents.saturating_add(1);
@@ -2175,6 +2254,11 @@ fn publish_capture_with_predecessor(
     let store_stats_before = store.instrumentation();
     let measurement_sequence = capture.target_sequence;
     let policy = capture.floor_policy;
+    let latest_acceptance_utc_ms = capture.latest_acceptance_utc_ms;
+    let eligible_through = capture.eligible_through;
+    let age_cutoff_utc_ms = capture.age_cutoff_utc_ms;
+    let clock_frozen = capture.clock_frozen;
+    let last_clock_reset_utc_ms = capture.last_clock_reset_utc_ms;
     #[cfg(test)]
     if FAIL_CHECKPOINT_WRITE_ROOTS
         .lock()
@@ -2314,11 +2398,11 @@ fn publish_capture_with_predecessor(
         documents,
         diagnostics: SyncCheckpointPublicationDiagnostics {
             measurement_sequence,
-            // The live checkpoint path does not yet carry an acceptance-age
-            // clock observation. Omit both facts rather than manufacturing a
-            // cutoff or claiming a clock state the worker did not observe.
-            age_cutoff_utc_ms: None,
-            clock_frozen: None,
+            latest_acceptance_utc_ms,
+            eligible_through,
+            age_cutoff_utc_ms: Some(age_cutoff_utc_ms),
+            clock_frozen: Some(clock_frozen),
+            last_clock_reset_utc_ms,
             policy_revision: policy.revision,
             minimum_tail_bytes: policy.minimum_tail_bytes,
             live_size_multiplier: policy.live_size_multiplier,
@@ -2558,6 +2642,22 @@ fn open_checkpoint_impl(
         validate_checkpoint_payload_metadata(store, &directory, generation, &payload, None)
     {
         return Ok(invalid(error));
+    }
+    if !payload.document_dependencies.is_empty() {
+        let state_binding =
+            match super::hot_engine::clean_checkpoint_state_binding(&payload.state_bytes) {
+                Ok(binding) => binding,
+                Err(error) => return Ok(invalid(error.to_string())),
+            };
+        if state_binding.workspace_id != payload.binding.workspace_id
+            || state_binding.lineage_digest != payload.binding.lineage_digest
+            || state_binding.catalog_document_id != payload.binding.catalog_document_id
+            || state_binding.accepted_sequence != payload.recovery_fence.accepted_sequence
+            || state_binding.accepted_state_digest != payload.recovery_fence.accepted_state_digest
+            || state_binding.eligible_through != payload.recovery_fence.eligible_through
+        {
+            return Ok(invalid("clean checkpoint state/recovery binding differs"));
+        }
     }
     if let Some((kind, _)) = payload
         .sealed_objects
@@ -4869,36 +4969,403 @@ mod tests {
             .is_some());
     }
 
-    /// The contract says the live floor policy is inert; this makes that a fact
-    /// the compiler and CI check rather than a sentence someone has to believe.
     #[test]
-    fn the_live_floor_call_is_inert_and_says_so() {
+    fn p3_round_7_live_floor_is_driven_by_acceptance_age() {
         let production = include_str!("checkpoint_generation.rs")
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("checkpoint_generation.rs has a test module boundary");
-
-        assert_eq!(
-            LIVE_FLOOR_ELIGIBILITY_DISABLED, 0,
-            "the live capture path must hand the floor policy zero eligibility \
-             while acceptance age is not yet observable in production"
-        );
-
-        // The live call passes the NAMED constant. A bare literal here would
-        // read as a live policy to the next person who greps for the seam.
-        assert!(
-            production.contains("LIVE_FLOOR_ELIGIBILITY_DISABLED,"),
-            "the live floor-policy call must pass the named inert constant, not a bare 0"
-        );
-
-        // And the contract must still say so. If a later slice makes the policy
-        // live, this fails and the contract sentence has to move with the code.
+        let engine = include_str!("hot_engine.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("hot_engine.rs has a test module boundary");
         let contract = include_str!("../../../../docs/storage-sync-contract.md");
+
         assert!(
-            contract.contains("The current live policy supplies E=0"),
-            "docs/storage-sync-contract.md no longer states the live E=0 fact that \
-             LIVE_FLOOR_ELIGIBILITY_DISABLED implements"
+            !production.contains("LIVE_FLOOR_ELIGIBILITY_DISABLED"),
+            "round 7 must remove the named inert live-floor constant"
         );
+        assert!(
+            engine.contains("acceptance_age_policy.eligible_through()"),
+            "live capture must carry the device-local accepted-prefix E"
+        );
+        assert!(
+            !contract.contains("The current live policy supplies E=0"),
+            "the living contract must move with the activated live policy"
+        );
+    }
+
+    #[test]
+    fn p3_return_after_29_and_31_days() {
+        use crate::oplog::hot_engine::{LazyGenesisCheckpointBuilder, ShardedHotEngine};
+        use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
+        use crate::oplog::{
+            AuthorBatch, BatchDisposition, BlobDescription, BlockId, BlockLocation, CrdtPeerId,
+            DocumentId, LineageDigest, LogicalPageName, ManagedPath, ManagedTextKind,
+            OperationTransaction, PageId, SemanticOperation, SessionId, ValidatedBatch,
+            WorkspaceId,
+        };
+
+        let day = 24 * 60 * 60 * 1_000_i64;
+        let root = std::env::temp_dir().join(format!(
+            "tine-p3-floor-returning-peers-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x7700));
+        let lineage = LineageDigest::of(b"p3-floor-returning-peers");
+        let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(0x7701));
+        let home = DocumentId::from_uuid(uuid::Uuid::from_u128(0x7702));
+        let page = PageId::from_uuid(uuid::Uuid::from_u128(0x7703));
+        let block = BlockLocation {
+            block_id: BlockId::from_uuid(uuid::Uuid::from_u128(0x7704)),
+            home_document_id: home,
+        };
+        let (catalog_checkpoint, catalog_dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let baseline = Arc::new(
+            LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog,
+                BlobDescription::of(b"empty source"),
+                &root,
+            )
+            .unwrap()
+            .finish(catalog_checkpoint, catalog_dependencies)
+            .unwrap(),
+        );
+        let archive = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let fresh = || {
+            let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+            engine
+                .set_checkpoint_floor_clock_for_test(1_000, 1_000)
+                .unwrap();
+            engine
+                .install_lazy_genesis_baseline(Arc::clone(&baseline))
+                .unwrap();
+            engine
+                .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+                .unwrap();
+            engine
+        };
+        let author = |batch: u128, peer: u64| AuthorBatch {
+            batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(batch)),
+            author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(peer as u128)),
+            author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(peer as u128 + 1)),
+            crdt_peer_id: CrdtPeerId::from_u64(peer),
+            causal_peer_id: fixture_incarnation(peer as u128),
+        };
+        let mut receiver = fresh();
+        receiver.set_checkpoint_floor_config_for_test(
+            super::super::checkpoint_floor_policy::FloorPolicyConfig {
+                revision: 77,
+                minimum_tail_bytes: 4 * 1024,
+                live_size_multiplier: 1,
+            },
+        );
+        let claims = receiver
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let prepare = |engine: &ShardedHotEngine, batch, peer, operations| {
+            engine
+                .prepare_fixture_transaction(
+                    author(batch, peer),
+                    &OperationTransaction::new(operations).unwrap(),
+                )
+                .unwrap()
+        };
+        let create = prepare(
+            &receiver,
+            0x7710,
+            0x77,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id: page,
+                    home_document_id: home,
+                    name: LogicalPageName::parse("Returning peers").unwrap(),
+                    path: ManagedPath::parse("pages/returning-peers.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block,
+                    page_id: page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "departure".into(),
+                },
+            ],
+        );
+        receiver
+            .commit_clean_prepared(&create, claims.as_ref())
+            .unwrap();
+        receiver.wait_for_clean_checkpoint().unwrap();
+
+        let mut peer_29 = fresh();
+        let mut peer_31 = fresh();
+        for peer in [&mut peer_29, &mut peer_31] {
+            peer.stop_clean_checkpoint_publisher();
+            assert_eq!(
+                peer.replay_clean_committed_tail(claims.as_ref()).unwrap(),
+                1
+            );
+        }
+        let stale_29 = prepare(
+            &peer_29,
+            0x7729,
+            0x29,
+            vec![SemanticOperation::EditBlockContent {
+                block,
+                content: "peer returned on day 29".into(),
+            }],
+        );
+        peer_29
+            .commit_clean_prepared(&stale_29, claims.as_ref())
+            .unwrap();
+        let stale_31 = prepare(
+            &peer_31,
+            0x7731,
+            0x31,
+            vec![SemanticOperation::EditBlockContent {
+                block,
+                content: "exact peer bytes returned on day 31".into(),
+            }],
+        );
+        peer_31
+            .commit_clean_prepared(&stale_31, claims.as_ref())
+            .unwrap();
+
+        // Age alone never creates a cut. This small graph uses the production
+        // 256 KiB/4x policy: after six months its returning peer still admits
+        // directly, and the next real checkpoint retains every native floor.
+        let within_budget_archive =
+            ObjectStore::open(&root.join("within-budget-archive"), workspace).unwrap();
+        let mut within_budget = ShardedHotEngine::new(workspace, lineage, catalog);
+        within_budget
+            .set_checkpoint_floor_clock_for_test(1_000, 1_000)
+            .unwrap();
+        within_budget
+            .install_lazy_genesis_baseline(Arc::clone(&baseline))
+            .unwrap();
+        within_budget
+            .attach_clean_archive_store(
+                within_budget_archive
+                    .duplicate_retained_capability()
+                    .unwrap(),
+            )
+            .unwrap();
+        within_budget
+            .commit_clean_prepared(&create, claims.as_ref())
+            .unwrap();
+        within_budget.wait_for_clean_checkpoint().unwrap();
+        within_budget
+            .set_checkpoint_floor_clock_for_test(1_000 + 180 * day, 1_000 + 180 * day as u64)
+            .unwrap();
+        assert!(within_budget
+            .preflight_prepared_full_history(&stale_29)
+            .unwrap()
+            .is_none());
+        within_budget
+            .commit_clean_prepared(&stale_29, claims.as_ref())
+            .unwrap();
+        within_budget.wait_for_clean_checkpoint().unwrap();
+        let six_months = within_budget.clean_checkpoint_diagnostics().unwrap();
+        assert_eq!(six_months.eligible_through, 1);
+        assert!(six_months.documents.iter().all(|document| {
+            document.removable_bytes <= document.budget_bytes
+                && document.requested_floor.is_none()
+                && document.actual_floor.is_empty()
+        }));
+
+        // A high-entropy historical value makes removable image bytes exceed
+        // this fixture's injected budget without inflating latest live state.
+        // Separate constant guards pin the production 256 KiB/4x defaults.
+        let mut random = 0x9e37_79b9_u32;
+        let historical = (0..32_000)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                char::from(b'!' + (random % 90) as u8)
+            })
+            .collect::<String>();
+        let huge = prepare(
+            &receiver,
+            0x7740,
+            0x77,
+            vec![SemanticOperation::EditBlockContent {
+                block,
+                content: historical,
+            }],
+        );
+        receiver
+            .commit_clean_prepared(&huge, claims.as_ref())
+            .unwrap();
+        let shrink = prepare(
+            &receiver,
+            0x7741,
+            0x77,
+            vec![SemanticOperation::EditBlockContent {
+                block,
+                content: "small live state".into(),
+            }],
+        );
+        receiver
+            .commit_clean_prepared(&shrink, claims.as_ref())
+            .unwrap();
+        receiver.wait_for_clean_checkpoint().unwrap();
+
+        let main_at_departure = BTreeSet::from([
+            create.manifest().batch_id(),
+            huge.manifest().batch_id(),
+            shrink.manifest().batch_id(),
+        ]);
+        let mut direct_29 = fresh();
+        direct_29.stop_clean_checkpoint_publisher();
+        direct_29
+            .replay_clean_checkpoint_tail(&main_at_departure, claims.as_ref())
+            .unwrap();
+        direct_29
+            .set_checkpoint_floor_clock_for_test(1_000 + 29 * day, 1_000 + 29 * day as u64)
+            .unwrap();
+        assert!(direct_29
+            .preflight_prepared_full_history(&stale_29)
+            .unwrap()
+            .is_none());
+        let day_29 = direct_29.stage_ready(ValidatedBatch::new(stale_29.clone()));
+        assert!(matches!(
+            day_29.disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        receiver
+            .set_checkpoint_floor_clock_for_test(1_000 + 29 * day, 1_000 + 29 * day as u64)
+            .unwrap();
+        let day_29_activity = prepare(
+            &receiver,
+            0x7743,
+            0x77,
+            vec![SemanticOperation::EditBlockContent {
+                block,
+                content: "linear activity on day 29".into(),
+            }],
+        );
+        receiver
+            .commit_clean_prepared(&day_29_activity, claims.as_ref())
+            .unwrap();
+        receiver.wait_for_clean_checkpoint().unwrap();
+        let before_cut = receiver.clean_checkpoint_diagnostics().unwrap();
+        assert_eq!(before_cut.eligible_through, 0);
+        assert!(before_cut
+            .documents
+            .iter()
+            .filter(|document| document.document_id == home)
+            .all(|document| document.requested_floor.is_none()));
+        let age_after_day_29 = receiver.checkpoint_floor_policy_probe_for_test();
+        receiver
+            .set_checkpoint_floor_clock_for_test(1_000 + 100 * day, 1_000 + 100 * day as u64)
+            .unwrap();
+        assert!(matches!(
+            receiver
+                .stage_ready(ValidatedBatch::new(day_29_activity.clone()))
+                .disposition(),
+            BatchDisposition::DuplicateAccepted { .. }
+        ));
+        let durable = receiver
+            .accepted_frontier_root()
+            .unwrap()
+            .acceptance_sequence();
+        let _export_only = receiver.capture_clean_checkpoint(durable).unwrap();
+        assert_eq!(
+            receiver.checkpoint_floor_policy_probe_for_test(),
+            age_after_day_29,
+            "duplicate delivery and checkpoint export must not advance T"
+        );
+
+        receiver
+            .set_checkpoint_floor_clock_for_test(1_000 + 31 * day, 1_000 + 31 * day as u64)
+            .unwrap();
+        let covering = prepare(
+            &receiver,
+            0x7742,
+            0x77,
+            vec![SemanticOperation::EditBlockContent {
+                block,
+                content: "covers the day-29 head".into(),
+            }],
+        );
+        receiver
+            .commit_clean_prepared(&covering, claims.as_ref())
+            .unwrap();
+        receiver.wait_for_clean_checkpoint().unwrap();
+        let cut = receiver.clean_checkpoint_diagnostics().unwrap();
+        assert_eq!(cut.eligible_through, 3);
+        let home_cut = cut
+            .documents
+            .iter()
+            .find(|document| document.document_id == home)
+            .expect("day-31 publication measured the changed busy page");
+        assert!(home_cut.requested_floor.is_some());
+        assert!(home_cut.post_cut_removable_bytes < home_cut.removable_bytes);
+        assert!(home_cut.post_cut_removable_bytes < home_cut.budget_bytes / 2);
+
+        receiver
+            .install_published_checkpoint_document_for_test(home)
+            .unwrap();
+        assert_eq!(
+            receiver.checkpoint_floor_policy_probe_for_test().2,
+            cut.latest_acceptance_utc_ms,
+            "checkpoint installation must preserve rather than advance T"
+        );
+        let need = receiver
+            .preflight_prepared_full_history(&stale_31)
+            .unwrap()
+            .expect("day-31 dependency must be below the published native floor");
+        assert_eq!(need.document_id, home);
+
+        let accepted_before_stale_31 = BTreeSet::from([
+            create.manifest().batch_id(),
+            huge.manifest().batch_id(),
+            shrink.manifest().batch_id(),
+            day_29_activity.manifest().batch_id(),
+            covering.manifest().batch_id(),
+        ]);
+        let mut recovered = fresh();
+        recovered.stop_clean_checkpoint_publisher();
+        assert_eq!(
+            recovered
+                .replay_clean_checkpoint_tail(&accepted_before_stale_31, claims.as_ref())
+                .unwrap(),
+            accepted_before_stale_31.len()
+        );
+        let recovered_outcome = recovered.stage_ready(ValidatedBatch::new(stale_31.clone()));
+        assert!(matches!(
+            recovered_outcome.disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(recovered
+            .accepted_batch_evidence(stale_31.manifest().batch_id())
+            .is_ok());
+        assert_eq!(
+            archive
+                .resolve_logical_manifest_bytes(stale_31.manifest().batch_id())
+                .unwrap(),
+            stale_31.manifest().encode().unwrap(),
+            "full-history recovery changed the original manifest bytes"
+        );
+
+        drop(receiver);
+        drop(peer_29);
+        drop(peer_31);
+        drop(within_budget);
+        drop(within_budget_archive);
+        drop(direct_29);
+        drop(recovered);
+        drop(archive);
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -4918,7 +5385,7 @@ mod tests {
             );
         }
         assert!(production.contains("publish_document_images("));
-        assert!(production.contains("ShardedHotEngine::build_policy_compact_accepted_document("));
+        assert!(production.contains("ShardedHotEngine::build_policy_compact_worker_document("));
         assert!(production.contains("DurableDirectoryPublication"));
         assert!(production.contains("publish_new_exact_single_writer"));
         assert_eq!(
@@ -5124,8 +5591,8 @@ mod tests {
             2,
             "cold installation and full-history actor swap must bind the publisher"
         );
-        assert_eq!(LIVE_FLOOR_ELIGIBILITY_DISABLED, 0);
-        assert!(include_str!("hot_engine.rs").contains("eligible_through: 0,"));
+        assert!(include_str!("hot_engine.rs")
+            .contains("eligible_through: self.acceptance_age_policy.eligible_through(),"));
         assert!(include_str!("../sync_runtime.rs")
             .contains("const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);"));
         assert_eq!(
@@ -5141,7 +5608,7 @@ mod tests {
             4
         );
         for required in [
-            "`E=0`: publication records",
+            "device-local acceptance observations",
             "30-day lower bound",
             "minimum-tail bytes",
             "multiplier. Each document-to-image record",
@@ -5175,7 +5642,11 @@ mod tests {
             lineage_digest: LineageDigest::of(b"checkpoint-payload-test"),
             catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7002)),
             cutoff_state_digest: digest(0xa1),
-            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            eligible_through: 0,
+            latest_acceptance_utc_ms: 0,
+            age_cutoff_utc_ms: -super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            clock_frozen: false,
+            last_clock_reset_utc_ms: None,
             floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: 1,
@@ -5221,7 +5692,11 @@ mod tests {
             lineage_digest: LineageDigest::of(b"checkpoint-payload-test"),
             catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7002)),
             cutoff_state_digest: digest(0xa1),
-            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            eligible_through: 0,
+            latest_acceptance_utc_ms: 0,
+            age_cutoff_utc_ms: -super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            clock_frozen: false,
+            last_clock_reset_utc_ms: None,
             floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: 1,
@@ -5243,7 +5718,11 @@ mod tests {
             lineage_digest: LineageDigest::of(b"checkpoint-payload-test"),
             catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7002)),
             cutoff_state_digest: digest(0xa2),
-            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            eligible_through: 0,
+            latest_acceptance_utc_ms: 0,
+            age_cutoff_utc_ms: -super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            clock_frozen: false,
+            last_clock_reset_utc_ms: None,
             floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 1,
             target_sequence: 2,
@@ -5303,7 +5782,11 @@ mod tests {
             lineage_digest: LineageDigest::of(b"checkpoint-lag-test"),
             catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0xa565)),
             cutoff_state_digest: digest(0xa3),
-            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            eligible_through: 0,
+            latest_acceptance_utc_ms: 0,
+            age_cutoff_utc_ms: -super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            clock_frozen: false,
+            last_clock_reset_utc_ms: None,
             floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: CLEAN_CHECKPOINT_LAG_MAX + 1,
@@ -5335,7 +5818,11 @@ mod tests {
             lineage_digest: LineageDigest::of(b"checkpoint-publication-test"),
             catalog_document_id: DocumentId::from_uuid(uuid::Uuid::from_u128(0x7004)),
             cutoff_state_digest: digest(0xa4),
-            eligible_through: LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            eligible_through: 0,
+            latest_acceptance_utc_ms: 0,
+            age_cutoff_utc_ms: -super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS,
+            clock_frozen: false,
+            last_clock_reset_utc_ms: None,
             floor_policy: super::super::checkpoint_floor_policy::FloorPolicyConfig::default(),
             base_sequence: 0,
             target_sequence: 0,
@@ -5368,7 +5855,14 @@ mod tests {
             published.diagnostics.publication_edge,
             SyncCheckpointPublicationEdge::CurrentPointerDurable,
         );
-        assert_eq!(published.diagnostics.age_cutoff_utc_ms, None);
+        assert_eq!(published.diagnostics.latest_acceptance_utc_ms, 0);
+        assert_eq!(published.diagnostics.eligible_through, 0);
+        assert_eq!(
+            published.diagnostics.age_cutoff_utc_ms,
+            Some(-super::super::checkpoint_floor_policy::RETAINED_HISTORY_MS)
+        );
+        assert_eq!(published.diagnostics.clock_frozen, Some(false));
+        assert_eq!(published.diagnostics.last_clock_reset_utc_ms, None);
         assert_eq!(published.diagnostics.peak_rss_bytes, None);
         let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
         let predecessor_pointer = std::fs::read(directory.join(CHECKPOINT_POINTER)).unwrap();

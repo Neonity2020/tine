@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const RETAINED_HISTORY_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 pub(crate) const DEFAULT_MINIMUM_TAIL_BYTES: u64 = 256 * 1024;
 pub(crate) const DEFAULT_LIVE_SIZE_MULTIPLIER: u64 = 4;
-const AGE_POLICY_SCHEMA_VERSION: u32 = 1;
+const AGE_POLICY_SCHEMA_VERSION: u32 = 2;
 const MAX_CLOCK_DELTA_SKEW_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,6 +40,7 @@ pub(crate) struct AcceptanceAgePolicy {
     /// Process monotonic time is deliberately cleared by `decode_current`.
     last_observed_monotonic_ms: Option<u64>,
     clock_frozen: bool,
+    last_clock_reset_utc_ms: Option<i64>,
 }
 
 impl AcceptanceAgePolicy {
@@ -59,6 +60,7 @@ impl AcceptanceAgePolicy {
             last_observed_utc_ms: utc_ms,
             last_observed_monotonic_ms: Some(monotonic_ms),
             clock_frozen: false,
+            last_clock_reset_utc_ms: None,
         })
     }
 
@@ -131,19 +133,52 @@ impl AcceptanceAgePolicy {
                 let monotonic_delta = monotonic_ms.saturating_sub(last);
                 utc_delta.abs_diff(monotonic_delta) > MAX_CLOCK_DELTA_SKEW_MS
             });
+        if self.clock_frozen && !discontinuity {
+            // One subsequent wall/monotonic pair with a usable delta starts a
+            // fresh conservative epoch. The uncertain prefix receives this
+            // new upper bound and must wait a complete retention window.
+            self.reestablish_clock(utc_ms, monotonic_ms)?;
+        }
         self.observed_through = sequence;
+        self.last_observed_utc_ms = utc_ms;
+        self.last_observed_monotonic_ms = Some(monotonic_ms);
+        if discontinuity {
+            self.clock_frozen = true;
+            return Ok(());
+        }
+        self.latest_acceptance_utc_ms = utc_ms;
+        self.push_observation(sequence, utc_ms);
+        self.advance_eligible();
+        Ok(())
+    }
+
+    /// Recover a replayed suffix without turning replay into an acceptance
+    /// event. Its age is conservatively no older than `utc_ms`, while T stays
+    /// at the latest actual local acceptance observation.
+    pub(crate) fn observe_recovered_prefix(
+        &mut self,
+        accepted_through: u64,
+        utc_ms: i64,
+        monotonic_ms: u64,
+    ) -> Result<(), FloorPolicyError> {
+        if accepted_through <= self.observed_through {
+            return Ok(());
+        }
+        if utc_ms < 0 {
+            return Err(FloorPolicyError::InvalidClock);
+        }
+        let discontinuity = utc_ms < self.last_observed_utc_ms
+            || self
+                .last_observed_monotonic_ms
+                .is_some_and(|last| monotonic_ms < last);
+        self.observed_through = accepted_through;
         self.last_observed_utc_ms = utc_ms;
         self.last_observed_monotonic_ms = Some(monotonic_ms);
         if self.clock_frozen || discontinuity {
             self.clock_frozen = true;
             return Ok(());
         }
-        self.latest_acceptance_utc_ms = utc_ms;
-        self.observations.push_back(AcceptanceObservation {
-            through_sequence: sequence,
-            utc_upper_bound_ms: utc_ms,
-        });
-        self.advance_eligible();
+        self.push_observation(accepted_through, utc_ms);
         Ok(())
     }
 
@@ -168,6 +203,7 @@ impl AcceptanceAgePolicy {
         self.last_observed_utc_ms = utc_ms;
         self.last_observed_monotonic_ms = Some(monotonic_ms);
         self.clock_frozen = false;
+        self.last_clock_reset_utc_ms = Some(utc_ms);
         Ok(())
     }
 
@@ -185,6 +221,28 @@ impl AcceptanceAgePolicy {
 
     pub(crate) const fn latest_acceptance_utc_ms(&self) -> i64 {
         self.latest_acceptance_utc_ms
+    }
+
+    pub(crate) const fn age_cutoff_utc_ms(&self) -> i64 {
+        self.latest_acceptance_utc_ms
+            .saturating_sub(RETAINED_HISTORY_MS)
+    }
+
+    pub(crate) const fn last_clock_reset_utc_ms(&self) -> Option<i64> {
+        self.last_clock_reset_utc_ms
+    }
+
+    fn push_observation(&mut self, sequence: u64, utc_upper_bound_ms: i64) {
+        if let Some(last) = self.observations.back_mut() {
+            if last.utc_upper_bound_ms == utc_upper_bound_ms {
+                last.through_sequence = sequence;
+                return;
+            }
+        }
+        self.observations.push_back(AcceptanceObservation {
+            through_sequence: sequence,
+            utc_upper_bound_ms,
+        });
     }
 
     fn advance_eligible(&mut self) {
@@ -213,6 +271,7 @@ impl AcceptanceAgePolicy {
         if self.eligible_through > self.observed_through
             || self.latest_acceptance_utc_ms < 0
             || self.last_observed_utc_ms < 0
+            || self.last_clock_reset_utc_ms.is_some_and(|reset| reset < 0)
         {
             return Err(FloorPolicyError::InvalidEncoding);
         }

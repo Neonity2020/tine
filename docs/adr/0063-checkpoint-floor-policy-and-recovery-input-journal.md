@@ -57,12 +57,12 @@ checkpoint is published, reopened, and all three fences are re-proved may a new
 empty recovery-input generation become current and ordinary application
 admission resume.
 
-Not yet in effect on the live capture path. The live path supplies eligibility
-E=0 (`LIVE_FLOOR_ELIGIBILITY_DISABLED`), so `choose_floor` returns `Keep` on
-every call and no image has ever been cut; `docs/storage-sync-contract.md`
-states the same fact and a doc-code test pins the two together. This ADR records
-the decision, not a running mechanism. The slice that observes acceptance age
-and supplies a real E deletes that constant and this paragraph together.
+The live actor records injected UTC and same-process monotonic observations only
+when a batch first becomes locally accepted. It persists recent observations
+plus eligible-through E in the disposable checkpoint; replay and installation
+do not create acceptance events. The publisher worker derives candidate
+frontiers by traversing the existing sealed accepted sequence through E and
+selects the oldest verified candidate satisfying the byte hysteresis target.
 
 ## Consequences
 

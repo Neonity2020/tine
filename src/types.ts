@@ -371,8 +371,11 @@ export interface SparseV2CheckpointDocumentDiagnostics {
 
 export interface SparseV2CheckpointPublicationDiagnostics {
   measurement_sequence: number;
+  latest_acceptance_utc_ms: number;
+  eligible_through: number;
   age_cutoff_utc_ms: number | null;
   clock_frozen: boolean | null;
+  last_clock_reset_utc_ms: number | null;
   policy_revision: number;
   minimum_tail_bytes: number;
   live_size_multiplier: number;
