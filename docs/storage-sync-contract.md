@@ -1442,6 +1442,31 @@ images retain their existing native floor and cannot yet make an incoming
 original below-floor; acceptance-age advancement and automatic reconstruction
 remain a later Packet 3 slice.
 
+Provider admission nevertheless implements the below-floor boundary before
+that policy becomes active. Preflight checks every declared affected/support
+document dependency and the CRDT update's own causal requirements against the
+document's actual native shallow floor. A missing causal parent remains
+ordinary pending delivery. An input proven older than a floor returns typed
+`NeedsFullHistory { batch_id, document_id, dependency, floor }`; validation
+uses disposable Snapshot clones, so neither side of a partially validated
+cross-page operation changes live state.
+
+The exact original then enters the current recovery-input envelope schema 1 in
+a graph/receiving-endpoint-scoped `LocalJournalSegmentV2` under private
+app-data. The envelope binds workspace, lineage, receiving endpoint/device,
+source endpoint and BatchId to the canonical manifest bytes and every required
+canonical object byte in manifest order. It records transport custody, not
+acceptance, and is never published into the accepted archive namespace.
+Durable append completes before provider work is dequeued or custody is
+acknowledged. An uncertain append reopens the selected WAL and resolves the
+exact BatchId and bytes before any retry; identical redelivery is idempotent,
+while conflicting bytes under that identity follow input-validation collision
+handling. I/O or resource failure leaves the provider item queued and all
+authoritative inputs retryable. The recovery-input segment itself is the restart trigger;
+there is no separate durable recovering flag. Full-history reconstruction and
+retirement of successfully consumed frames remain the following Packet 3
+slice.
+
 The background publisher folds accepted-row deltas into the same
 `clean-open-checkpoint-v2` format; no second reader or authority is introduced.
 Changed/exported/reused, handoff-import/reconstruction, and worker export/import

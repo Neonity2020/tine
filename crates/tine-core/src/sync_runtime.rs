@@ -96,9 +96,9 @@ use crate::oplog::operational_coordinator::{
     OperationalFaultPoint, TrustedLocalPreparationStageTimings,
 };
 use crate::oplog::operational_coordinator::{
-    CleanExternalMutationState, CleanLocalMutationState, CleanPublishedContinuation,
-    OperationalCoordinator, OperationalCoordinatorError, OperationalPhase,
-    PreparedLocalMutationState,
+    CleanExternalMutationState, CleanLocalMutationState, CleanProviderAdmissionState,
+    CleanPublishedContinuation, OperationalCoordinator, OperationalCoordinatorError,
+    OperationalPhase, PreparedLocalMutationState,
 };
 use crate::oplog::projection::{
     inject_policy_generated_logseq_id, render_requested_page_document, PreparedEditorProjection,
@@ -112,6 +112,9 @@ use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::projection_turn_journal::{
     open_projection_turn_journal, ProjectionTurnJournalState,
 };
+#[cfg(test)]
+use crate::oplog::recovery_input_journal::RecoveryInputEnvelopeV1;
+use crate::oplog::recovery_input_journal::RecoveryInputJournal;
 #[cfg(test)]
 use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, reset_projection_open_test_observation,
@@ -6096,6 +6099,66 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    #[cfg(test)]
+    fn install_recovery_input_fault_for_test(
+        &self,
+        fault: RecoveryInputFault,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::InstallRecoveryInputFault {
+            fault,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn force_document_floor_to_current_for_test(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceDocumentFloorToCurrent {
+            document_id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(SyncRuntimeRequestError::ActorRefused)
+    }
+
+    #[cfg(test)]
+    fn recovery_input_probe_for_test(
+        &self,
+    ) -> Result<Vec<RecoveryInputEnvelopeV1>, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::RecoveryInputProbe {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn redeliver_recovery_input_for_test(&self) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::RedeliverRecoveryInput {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(SyncRuntimeRequestError::ActorRefused)
+    }
+
     fn send(&self, request: ActorRequest) -> Result<(), SyncRuntimeRequestError> {
         self.inner
             .sender
@@ -6434,6 +6497,7 @@ struct CleanRuntimeResources {
     runtime: CleanLocalRuntime,
     managed_local: ManagedLocalRuntimeState,
     projection_turns: ProjectionTurnJournalState,
+    recovery_input: RecoveryInputJournal,
     sweeps: SweepManager,
     recovered_provider_batches: Vec<BatchId>,
 }
@@ -6638,6 +6702,7 @@ enum CleanActorMutationOutcome {
         phase: OperationalPhase,
         detail: String,
     },
+    NeedsFullHistory(crate::oplog::NeedsFullHistory),
 }
 
 enum CleanActorExternalOutcome {
@@ -6647,6 +6712,13 @@ enum CleanActorExternalOutcome {
         batch_id: BatchId,
         phase: OperationalPhase,
     },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryInputFault {
+    AppendOutcomeUnknownAfterPhysicalAppend,
+    AfterCustodyBeforeProviderDequeue,
 }
 
 /// Consecutive identical non-continuation failures of one retained
@@ -6839,13 +6911,21 @@ impl CleanRuntimeActorCore {
             )
             .map_err(CleanActorMutationFailure::from)?
         };
-        let outcome = self.retain_outcome(state);
-        self.provider_change_pending_notification = Some(match &outcome {
+        let outcome = match state {
+            CleanProviderAdmissionState::Mutation(state) => self.retain_outcome(state),
+            CleanProviderAdmissionState::NeedsFullHistory(need) => {
+                CleanActorMutationOutcome::NeedsFullHistory(need)
+            }
+        };
+        self.provider_change_pending_notification = match &outcome {
             CleanActorMutationOutcome::Durable(batch_id)
             | CleanActorMutationOutcome::DurablePending { batch_id, .. }
             | CleanActorMutationOutcome::RetainedPriorPending { batch_id, .. }
-            | CleanActorMutationOutcome::DurableStuck { batch_id, .. } => *batch_id,
-        });
+            | CleanActorMutationOutcome::DurableStuck { batch_id, .. } => Some(*batch_id),
+            // Custody is not acceptance. A recovery-input frame must never arm
+            // the live-view notification reserved for accepted provider work.
+            CleanActorMutationOutcome::NeedsFullHistory(_) => None,
+        };
         Ok(outcome)
     }
 
@@ -7847,6 +7927,13 @@ fn activate_clean_runtime_resources_retaining_archive(
         binding.device_id().as_uuid(),
     )
     .map_err(CleanOpenError::from)?;
+    let recovery_input = RecoveryInputJournal::open(
+        &request.application_runtime_root,
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.endpoint_id,
+        binding.device_id(),
+    )?;
     runtime
         .engine()
         .open_absence_decision_map(&receipts)
@@ -7857,6 +7944,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches: Vec::new(),
     })
@@ -8401,6 +8489,13 @@ fn open_clean_runtime_resources_with_progress(
         completion_guard.runtime_mut(),
         &mut projection_turns,
     )?;
+    let recovery_input = RecoveryInputJournal::open(
+        &request.application_runtime_root,
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.endpoint_id,
+        binding.device_id(),
+    )?;
     trace.phase(
         SyncRuntimeCleanOpenStage::RetainedJournalsDrain,
         stage_progress,
@@ -8450,6 +8545,7 @@ fn open_clean_runtime_resources_with_progress(
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches,
     }))
@@ -11186,6 +11282,24 @@ enum ActorRequest {
     },
     #[cfg(test)]
     InstallRepeatedProjectionFault { times: u32, reply: mpsc::Sender<()> },
+    #[cfg(test)]
+    InstallRecoveryInputFault {
+        fault: RecoveryInputFault,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
+    ForceDocumentFloorToCurrent {
+        document_id: DocumentId,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    #[cfg(test)]
+    RecoveryInputProbe {
+        reply: mpsc::Sender<Vec<RecoveryInputEnvelopeV1>>,
+    },
+    #[cfg(test)]
+    RedeliverRecoveryInput {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
     ApplicationNavigation {
         request: SyncApplicationNavigationRequest,
         cancellation: Option<ApplicationSearchCancellation>,
@@ -11896,6 +12010,50 @@ fn run_actor_loop(
                 // actor-thread call site, not on the test caller thread.
                 inject_managed_local_append_fault_for_test(fault);
                 let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::InstallRecoveryInputFault { fault, reply } => {
+                actor.recovery_input_fault = Some(fault);
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ForceDocumentFloorToCurrent { document_id, reply } => {
+                let result = actor
+                    .clean
+                    .as_mut()
+                    .ok_or_else(|| "clean actor is unavailable".to_owned())
+                    .and_then(|clean| {
+                        let mut session = clean
+                            .runtime
+                            .admit_clean_mutation(&actor.graph)
+                            .map_err(|error| error.to_string())?;
+                        let (_, engine, _) = session.parts().map_err(|error| error.to_string())?;
+                        engine
+                            .force_document_floor_to_current_for_test(document_id)
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = reply.send(result);
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::RecoveryInputProbe { reply } => {
+                let frames = actor
+                    .recovery_input
+                    .as_ref()
+                    .map_or_else(Vec::new, RecoveryInputJournal::envelopes_for_test);
+                let _ = reply.send(frames);
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::RedeliverRecoveryInput { reply } => {
+                let result = actor
+                    .recovery_input
+                    .as_mut()
+                    .ok_or_else(|| "clean actor has no recovery-input segment".to_owned())
+                    .and_then(|journal| journal.redeliver_first_for_test().map(|_| ()));
+                let _ = reply.send(result);
                 false
             }
             #[cfg(test)]
@@ -13697,6 +13855,7 @@ struct RuntimeActor {
     clean: Option<CleanRuntimeActorCore>,
     managed_local: Option<ManagedLocalRuntimeState>,
     projection_turns: Option<ProjectionTurnJournalState>,
+    recovery_input: Option<RecoveryInputJournal>,
     move_episode_directory: Dir,
     move_episode_cold_scan: Option<ReadDir>,
     move_episode_cleanup_queue: VecDeque<String>,
@@ -13707,6 +13866,8 @@ struct RuntimeActor {
     fail_next_move_episode_publication_after_write: bool,
     #[cfg(test)]
     forced_next_move_episode_batch_id: Option<BatchId>,
+    #[cfg(test)]
+    recovery_input_fault: Option<RecoveryInputFault>,
     /// The clean-runtime batch the request currently in flight published and
     /// left durable-pending. Only this batch may be settled and then reported
     /// as the request's own result: a retained continuation from an earlier
@@ -14270,6 +14431,7 @@ impl RuntimeActor {
             runtime,
             managed_local,
             projection_turns,
+            recovery_input,
             sweeps,
             recovered_provider_batches,
         } = resources;
@@ -14348,6 +14510,7 @@ impl RuntimeActor {
             clean: Some(clean),
             managed_local: Some(managed_local),
             projection_turns: Some(projection_turns),
+            recovery_input: Some(recovery_input),
             move_episode_directory,
             move_episode_cold_scan,
             move_episode_cleanup_queue: VecDeque::new(),
@@ -14358,6 +14521,8 @@ impl RuntimeActor {
             fail_next_move_episode_publication_after_write: false,
             #[cfg(test)]
             forced_next_move_episode_batch_id: None,
+            #[cfg(test)]
+            recovery_input_fault: None,
             clean_request_retained_batch: None,
             last_retained_publication: None,
             #[cfg(test)]
@@ -20938,6 +21103,11 @@ impl RuntimeActor {
                     spent = turn + 1;
                     break;
                 }
+                Some(CleanActorMutationOutcome::NeedsFullHistory(_)) => {
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "retained_local_publication_returned_below_floor",
+                    ));
+                }
             }
         }
         self.note_retained_publication(expected_batch_id, phase, detail, spent, false);
@@ -21000,6 +21170,9 @@ impl RuntimeActor {
                     previous_failure = observed;
                 }
                 Some(CleanActorMutationOutcome::DurableStuck { .. }) => {
+                    return (turn + 1, false);
+                }
+                Some(CleanActorMutationOutcome::NeedsFullHistory(_)) => {
                     return (turn + 1, false);
                 }
             }
@@ -22785,6 +22958,9 @@ impl RuntimeActor {
                     affected_page_ids,
                 })
             }
+            CleanActorMutationOutcome::NeedsFullHistory(_) => Err(
+                SyncEditorRequestError::ActorRefusedAt("local_mutation_returned_below_floor"),
+            ),
         }
     }
 
@@ -22873,6 +23049,16 @@ impl RuntimeActor {
     }
 
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
+        if self
+            .recovery_input
+            .as_ref()
+            .is_some_and(RecoveryInputJournal::is_pending)
+        {
+            // §4 will consume this segment into full-history reconstruction.
+            // Until then the segment itself is the sole restart/recovery
+            // trigger; no durable boolean is mirrored beside it.
+            return SyncRuntimeTick::Recovering;
+        }
         if let Some(reason) = self
             .clean
             .as_ref()
@@ -22978,6 +23164,12 @@ impl RuntimeActor {
                     self.refresh_watcher();
                     return SyncRuntimeTick::RecoveryBlocked(format!(
                         "retained recovery for batch {batch_id} is stuck at {phase:?}: {detail}",
+                    ));
+                }
+                CleanActorMutationOutcome::NeedsFullHistory(need) => {
+                    return SyncRuntimeTick::RecoveryBlocked(format!(
+                        "retained coordinator unexpectedly returned uncustodied below-floor batch {}",
+                        need.batch_id
                     ));
                 }
             }
@@ -24027,6 +24219,46 @@ impl RuntimeActor {
                     // provider evidence on the floor.
                     SyncRuntimeTick::Recovering
                 }
+                Ok(CleanActorMutationOutcome::NeedsFullHistory(need)) => {
+                    debug_assert_eq!(need.batch_id, batch_id);
+                    #[cfg(test)]
+                    let inject_uncertain = matches!(
+                        self.recovery_input_fault,
+                        Some(RecoveryInputFault::AppendOutcomeUnknownAfterPhysicalAppend)
+                    );
+                    #[cfg(not(test))]
+                    let inject_uncertain = false;
+                    #[cfg(test)]
+                    if inject_uncertain {
+                        self.recovery_input_fault.take();
+                    }
+                    let custody = self
+                        .recovery_input
+                        .as_mut()
+                        .expect("clean runtime retains recovery-input custody")
+                        .retain(&prepared, inject_uncertain);
+                    if let Err(error) = custody {
+                        return SyncRuntimeTick::RecoveryBlocked(format!(
+                            "below-floor original {batch_id} remains provider-owned because durable custody failed: {error}"
+                        ));
+                    }
+                    #[cfg(test)]
+                    if self.recovery_input_fault
+                        == Some(RecoveryInputFault::AfterCustodyBeforeProviderDequeue)
+                    {
+                        self.recovery_input_fault.take();
+                        return SyncRuntimeTick::RecoveryBlocked(
+                            "injected crash after recovery-input custody before provider dequeue"
+                                .into(),
+                        );
+                    }
+                    // This is the acknowledgement/dequeue boundary. No line
+                    // above it removes provider work; the durable frame now
+                    // owns the exact original independently of transport.
+                    self.provider_direct_manifests.pop_front();
+                    self.provider_direct_queued.remove(&batch_id);
+                    SyncRuntimeTick::Recovering
+                }
                 Ok(CleanActorMutationOutcome::DurableStuck {
                     batch_id: stuck_batch,
                     phase,
@@ -24088,6 +24320,13 @@ impl RuntimeActor {
                     SyncLocalMutationOutcome::RetryableRetainedRecovery {
                         batch_id: None,
                         phase: map_local_phase(phase),
+                    }
+                }
+                Ok(CleanActorMutationOutcome::NeedsFullHistory(_)) => {
+                    SyncLocalMutationOutcome::Blocked {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::Finalize,
+                        reason: SyncLocalMutationBlock::Prepublication,
                     }
                 }
                 Err(failure) => SyncLocalMutationOutcome::Blocked {
@@ -24757,6 +24996,7 @@ impl RuntimeActor {
         // both journals for the replacement runtime.
         drop(self.managed_local.take());
         drop(self.projection_turns.take());
+        drop(self.recovery_input.take());
         let resources = open_clean_runtime_resources(&request)
             .and_then(|resources| {
                 resources.ok_or_else(|| {
@@ -24775,6 +25015,7 @@ impl RuntimeActor {
             runtime,
             managed_local,
             projection_turns,
+            recovery_input,
             sweeps,
             recovered_provider_batches,
         } = resources;
@@ -24793,6 +25034,7 @@ impl RuntimeActor {
         self.clean = Some(CleanRuntimeActorCore::new(runtime, sweeps, true));
         self.managed_local = Some(managed_local);
         self.projection_turns = Some(projection_turns);
+        self.recovery_input = Some(recovery_input);
         for batch_id in recovered_provider_batches {
             self.queue_clean_provider_publication(batch_id);
         }

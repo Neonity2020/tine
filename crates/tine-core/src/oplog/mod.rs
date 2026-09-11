@@ -48,6 +48,7 @@ pub(crate) mod query_cursor;
 pub(crate) mod query_lowering;
 pub(crate) mod receipt;
 pub(crate) mod receiver_absence_summary;
+pub(crate) mod recovery_input_journal;
 pub(crate) mod reference_catalog;
 pub(crate) mod refusal;
 /// Retained retirable-document codec: dormant qualification machinery only.
@@ -105,7 +106,7 @@ pub(crate) use hot_engine::{
     append_managed_local_record, projection_turn_attempt_id, projection_turn_recovery_filename,
     projection_turn_staged_filename, projection_turn_withdrawn_filename,
     CleanTombstoneAuthorization, CleanTombstoneDeferral, CleanTombstoneSupersession,
-    ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalJournalAppend,
+    ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalJournalAppend, NeedsFullHistory,
     ProjectionTombstoneAuthorization, ProjectionTurn, ProjectionTurnError,
     ProjectionTurnPayloadKind, SequenceDomain, TurnOrigin, TurnPage, TurnPrecondition, TurnTarget,
     LIVE_PROJECTION_TURN_DERIVATION_SCHEMES, PROJECTION_TURN_DERIVATION_SCHEME_V1,

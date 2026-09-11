@@ -5687,10 +5687,12 @@ fn a_journal_that_cannot_open_refuses_activation_before_any_graph_mutation() {
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches: _,
     } = resources;
     drop(managed_local);
+    drop(recovery_input);
     drop(runtime);
     drop(receipts);
     drop(graph);
@@ -6379,10 +6381,12 @@ fn clean_actor_core_retains_one_manifested_save_until_projection_finishes() {
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches: _,
     } = resources;
     drop(managed_local);
+    drop(recovery_input);
     let mut projection_turns = projection_turns;
     let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
     let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -6423,7 +6427,8 @@ fn clean_actor_core_retains_one_manifested_save_until_projection_finishes() {
         }
         CleanActorMutationOutcome::Durable(_)
         | CleanActorMutationOutcome::RetainedPriorPending { .. }
-        | CleanActorMutationOutcome::DurableStuck { .. } => {
+        | CleanActorMutationOutcome::DurableStuck { .. }
+        | CleanActorMutationOutcome::NeedsFullHistory(_) => {
             panic!("fault must retain this submission's own durable work")
         }
     };
@@ -6489,10 +6494,12 @@ fn clean_object_only_publication_cut_reopens_without_semantic_effect() {
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches: _,
     } = resources;
     drop(managed_local);
+    drop(recovery_input);
     let mut projection_turns = projection_turns;
     let accepted_before = runtime.engine().accepted_batch_count().unwrap();
     let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
@@ -6544,10 +6551,12 @@ fn clean_object_only_publication_cut_reopens_without_semantic_effect() {
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches: _,
     } = reopened;
     drop(managed_local);
+    drop(recovery_input);
     let mut projection_turns = projection_turns;
     assert_eq!(
         runtime.engine().accepted_batch_count().unwrap(),
@@ -6648,10 +6657,12 @@ fn clean_batched_archive_publication_leaves_no_torn_immutable_name() {
             runtime,
             managed_local,
             projection_turns,
+            recovery_input,
             sweeps,
             recovered_provider_batches: _,
         } = resources;
         drop(managed_local);
+        drop(recovery_input);
         let mut projection_turns = projection_turns;
         let accepted_before = runtime.engine().accepted_batch_count().unwrap();
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
@@ -6755,10 +6766,12 @@ fn clean_batched_archive_publication_leaves_no_torn_immutable_name() {
             runtime,
             managed_local,
             projection_turns,
+            recovery_input,
             sweeps,
             recovered_provider_batches: _,
         } = reopened;
         drop(managed_local);
+        drop(recovery_input);
         let mut projection_turns = projection_turns;
         let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
         let retry = edit(&mut actor);
@@ -7077,10 +7090,12 @@ fn clean_actor_escalates_a_deterministic_retained_retry_to_a_named_stuck_state()
         runtime,
         managed_local,
         projection_turns,
+        recovery_input,
         sweeps,
         recovered_provider_batches: _,
     } = resources;
     drop(managed_local);
+    drop(recovery_input);
     let mut projection_turns = projection_turns;
     let mut actor = CleanRuntimeActorCore::new(runtime, sweeps, false);
     let root_path = ManagedPath::parse("Root.md".to_owned()).unwrap();
@@ -17415,6 +17430,243 @@ fn provider_edit_projects_markdown_beside_a_concurrent_external_admission() {
         receiver_handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+/// A below-floor cross-page batch enters durable recovery-input custody before
+/// provider dequeue, and an uncertain append is resolved by exact replay.
+#[test]
+fn p3_below_floor_provider_custody_precedes_dequeue_and_resolves_uncertain_append() {
+    fn stale_move(
+        label: &str,
+        seed: u128,
+    ) -> (
+        ActivationFixture,
+        ActivationFixture,
+        SyncRuntimeHandle,
+        SyncRuntimeHandle,
+        BatchId,
+        ProjectionEndpointId,
+        Vec<u8>,
+        Vec<Vec<u8>>,
+    ) {
+        let (author, receiver, author_handle, receiver_handle) = joined_shared_pair(label, seed);
+        let (source_batch, source_page_id, moved_block, source_document) = submit_shared_page(
+            &author_handle,
+            seed + 0x20,
+            &format!("{label} Source"),
+            &format!("notes/{label}-source.md"),
+            "carried below the receiver floor",
+        );
+        publish_shared_batch(&author_handle, &author, source_batch);
+        let (target_batch, target_page_id, ..) = submit_shared_page(
+            &author_handle,
+            seed + 0x40,
+            &format!("{label} Target"),
+            &format!("notes/{label}-target.md"),
+            "target anchor",
+        );
+        publish_shared_batch(&author_handle, &author, target_batch);
+        settle_shared_provider(&author_handle);
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        // Advance only the receiver, then install an in-memory shallow image at
+        // that exact current frontier. The author remains at the earlier shared
+        // dependency and its next cross-page move is therefore genuinely below
+        // the receiver's source-document floor without changing live E=0.
+        submit_durable(
+            &receiver_handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: moved_block,
+                    home_document_id: source_document,
+                },
+                content: "receiver-only advancement".into(),
+            }],
+        );
+        settle_shared_provider(&receiver_handle);
+        receiver_handle
+            .force_document_floor_to_current_for_test(source_document)
+            .unwrap();
+
+        let move_batch = submit_durable(
+            &author_handle,
+            vec![SemanticOperation::MoveSubtree {
+                root: BlockLocation {
+                    block_id: moved_block,
+                    home_document_id: source_document,
+                },
+                from_page_id: source_page_id,
+                to_page_id: target_page_id,
+                parent: None,
+                order: "z".into(),
+            }],
+        );
+        publish_shared_batch(&author_handle, &author, move_batch);
+        settle_shared_provider(&author_handle);
+        let manifest = fs::read(
+            author
+                .request
+                .provider_root
+                .join(format!("outbox/manifests/{move_batch}.manifest")),
+        )
+        .unwrap();
+        let decoded = OperationBatch::decode(&manifest).unwrap();
+        assert!(
+            decoded
+                .required_objects()
+                .iter()
+                .filter(|object| object.kind() == crate::oplog::ObjectKind::CrdtUpdate)
+                .count()
+                >= 2,
+            "the custody fixture must carry both sides of the cross-page move"
+        );
+        let objects = decoded
+            .required_objects()
+            .iter()
+            .map(|object| {
+                fs::read(
+                    author
+                        .request
+                        .provider_root
+                        .join(format!("outbox/objects/{}.object", object.content_digest())),
+                )
+                .unwrap()
+            })
+            .collect();
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        let source_endpoint_id = author.request.identities.endpoint_id;
+        (
+            author,
+            receiver,
+            author_handle,
+            receiver_handle,
+            move_batch,
+            source_endpoint_id,
+            manifest,
+            objects,
+        )
+    }
+
+    let (
+        _author,
+        receiver,
+        _author_handle,
+        receiver_handle,
+        move_batch,
+        source_endpoint,
+        manifest,
+        objects,
+    ) = stale_move("p3-custody-crash", 0xc100_0000);
+    receiver_handle
+        .install_recovery_input_fault_for_test(
+            RecoveryInputFault::AfterCustodyBeforeProviderDequeue,
+        )
+        .unwrap();
+    receiver_handle.observe_provider().unwrap();
+    let mut observed_boundary = false;
+    for _ in 0..512 {
+        let tick = receiver_handle.tick().unwrap();
+        if matches!(
+            &tick,
+            SyncRuntimeTick::RecoveryBlocked(detail)
+                if detail.contains("injected crash after recovery-input custody")
+        ) {
+            observed_boundary = true;
+            break;
+        }
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+            ),
+            "provider failed before the custody boundary: {tick:?}"
+        );
+    }
+    assert!(
+        observed_boundary,
+        "provider never reached the custody boundary"
+    );
+    receiver_handle.stop_without_clean_drain().unwrap();
+
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+    let recovered = reopened.recovery_input_probe_for_test().unwrap();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "restart recovered a duplicate or no frame"
+    );
+    assert_eq!(recovered[0].batch_id, move_batch);
+    assert_eq!(recovered[0].source_endpoint_id, source_endpoint);
+    assert_eq!(recovered[0].manifest, manifest);
+    assert_eq!(recovered[0].objects, objects);
+    let receiver_archive = ObjectStore::open(
+        &clean_operation_archive_directory(&receiver.request.archive_root),
+        receiver.request.identities.workspace_id,
+    )
+    .unwrap();
+    assert!(
+        receiver_archive
+            .read_manifest(move_batch)
+            .unwrap()
+            .is_none(),
+        "transport custody must not publish an unvalidated accepted manifest"
+    );
+    assert!(
+        matches!(reopened.tick().unwrap(), SyncRuntimeTick::Recovering),
+        "the durable segment itself must trigger recovery after restart"
+    );
+
+    let (
+        _author,
+        _receiver,
+        _author_handle,
+        receiver_handle,
+        move_batch,
+        source_endpoint,
+        manifest,
+        objects,
+    ) = stale_move("p3-custody-uncertain", 0xc200_0000);
+    receiver_handle
+        .install_recovery_input_fault_for_test(
+            RecoveryInputFault::AppendOutcomeUnknownAfterPhysicalAppend,
+        )
+        .unwrap();
+    receiver_handle.observe_provider().unwrap();
+    for _ in 0..512 {
+        let _ = receiver_handle.tick().unwrap();
+        let recovered = receiver_handle.recovery_input_probe_for_test().unwrap();
+        if recovered.iter().any(|frame| frame.batch_id == move_batch) {
+            assert_eq!(
+                recovered.len(),
+                1,
+                "uncertain append was retried as a duplicate"
+            );
+            assert_eq!(recovered[0].source_endpoint_id, source_endpoint);
+            assert_eq!(recovered[0].manifest, manifest);
+            assert_eq!(recovered[0].objects, objects);
+            receiver_handle.redeliver_recovery_input_for_test().unwrap();
+            assert_eq!(
+                receiver_handle
+                    .recovery_input_probe_for_test()
+                    .unwrap()
+                    .len(),
+                1,
+                "exact duplicate delivery must be idempotent"
+            );
+            return;
+        }
+    }
+    panic!("uncertain recovery-input append never resolved by exact reopened bytes");
 }
 
 /// Breadth: a peer CROSS-PAGE MOVE under the same interleaving must reach

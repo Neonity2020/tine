@@ -23,9 +23,9 @@ use super::local_active::{
 use super::writer_lane::{WriterLaneError, WriterLaneTip, WriterRole};
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
-    CausalPeerId, ContentDigest, CrdtPeerId, ImportPlanStatus, OperationTransaction, PageId,
-    PreparedBatch, ProjectionEndpointBinding, ProjectionReceiptStore, SessionId, ShardedHotEngine,
-    SqliteFrontier,
+    CausalPeerId, ContentDigest, CrdtPeerId, ImportPlanStatus, NeedsFullHistory,
+    OperationTransaction, PageId, PreparedBatch, ProjectionEndpointBinding, ProjectionReceiptStore,
+    SessionId, ShardedHotEngine, SqliteFrontier,
 };
 #[cfg(test)]
 use super::{ObjectStore, RebuildSource, TailOverlay};
@@ -277,6 +277,11 @@ fn classify_authorization_failure(error: RuntimePromotionError) -> OperationalCo
 }
 
 pub(crate) struct OperationalCoordinator;
+
+pub(crate) enum CleanProviderAdmissionState {
+    Mutation(CleanLocalMutationState),
+    NeedsFullHistory(NeedsFullHistory),
+}
 
 impl OperationalCoordinator {
     /// Prepare a bounded existing-page transaction for the durable foreground
@@ -635,7 +640,7 @@ impl OperationalCoordinator {
         receipts: &ProjectionReceiptStore,
         projection_turns: &mut ProjectionTurnJournalState,
         prepared: &PreparedBatch,
-    ) -> Result<CleanLocalMutationState, OperationalCoordinatorError> {
+    ) -> Result<CleanProviderAdmissionState, OperationalCoordinatorError> {
         let (admission, engine, database) = session.parts().map_err(|refusal| {
             OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
         })?;
@@ -657,6 +662,15 @@ impl OperationalCoordinator {
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
             })?;
+        if let Some(need) = engine
+            .preflight_prepared_full_history(prepared)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+            })?
+        {
+            handoff.cancel();
+            return Ok(CleanProviderAdmissionState::NeedsFullHistory(need));
+        }
         let identity = database
             .preflight_prepared_identity_transition(engine, prepared)
             .map_err(|error| {
@@ -683,6 +697,11 @@ impl OperationalCoordinator {
         })?;
         let outcome = match engine.commit_clean_prepared(&prepared, &commit_claim_source) {
             Ok(outcome) => outcome,
+            Err(super::EngineError::NeedsFullHistory(need)) => {
+                admission.note_writer_lane_reservation_absent(batch_id);
+                published.cancel_prepublication();
+                return Ok(CleanProviderAdmissionState::NeedsFullHistory(need));
+            }
             Err(error) => {
                 let failure = OperationalCoordinatorError::new(
                     OperationalPhase::Publication,
@@ -696,13 +715,13 @@ impl OperationalCoordinator {
                     published.cancel_prepublication();
                     return Err(failure);
                 }
-                return Ok(CleanLocalMutationState::DurablePending(
-                    CleanPublishedContinuation {
+                return Ok(CleanProviderAdmissionState::Mutation(
+                    CleanLocalMutationState::DurablePending(CleanPublishedContinuation {
                         guard: published,
                         batch_id,
                         identity,
                         failure,
-                    },
+                    }),
                 ));
             }
         };
@@ -725,7 +744,9 @@ impl OperationalCoordinator {
         #[cfg(test)]
         if let Err(error) = fault(OperationalFaultPoint::AfterManifest) {
             continuation.failure = error;
-            return Ok(CleanLocalMutationState::DurablePending(continuation));
+            return Ok(CleanProviderAdmissionState::Mutation(
+                CleanLocalMutationState::DurablePending(continuation),
+            ));
         }
         match resume_clean_published(
             &admission,
@@ -738,11 +759,15 @@ impl OperationalCoordinator {
         ) {
             Ok(()) => {
                 continuation.guard.complete();
-                Ok(CleanLocalMutationState::Complete(batch_id))
+                Ok(CleanProviderAdmissionState::Mutation(
+                    CleanLocalMutationState::Complete(batch_id),
+                ))
             }
             Err(error) => {
                 continuation.failure = error;
-                Ok(CleanLocalMutationState::DurablePending(continuation))
+                Ok(CleanProviderAdmissionState::Mutation(
+                    CleanLocalMutationState::DurablePending(continuation),
+                ))
             }
         }
     }

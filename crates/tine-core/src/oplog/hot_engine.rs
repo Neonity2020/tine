@@ -3558,6 +3558,18 @@ pub enum BatchDisposition {
     },
 }
 
+/// Typed admission result for an original whose causal base predates one
+/// affected document's shallow floor. The counters are the exact compact
+/// dependency and native floor vectors for that document.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeedsFullHistory {
+    pub batch_id: BatchId,
+    pub document_id: DocumentId,
+    pub dependency: Vec<CrdtPeerCounter>,
+    pub floor: Vec<CrdtPeerCounter>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceStatus {
     Operational,
@@ -9086,6 +9098,124 @@ impl ShardedHotEngine {
         Ok(self.next_acceptance_sequence == 0)
     }
 
+    /// Check whether provider validation needs history discarded by a shallow
+    /// image. Every document in the declared frontier is checked, including
+    /// unchanged support documents used by semantic/projection validation; the
+    /// update metadata is checked independently as an untrusted-input witness.
+    /// All document loads are disposable Snapshot clones.
+    pub(crate) fn preflight_prepared_full_history(
+        &self,
+        prepared: &PreparedBatch,
+    ) -> Result<Option<NeedsFullHistory>, EngineError> {
+        let batch_id = prepared.manifest().batch_id();
+        let declared = prepared.manifest().dependency_frontier();
+        let mut documents = BTreeMap::new();
+        for dependency in declared.documents() {
+            let document = self.clone_validation_document(dependency.document_id(), 1)?;
+            let floor = shallow_floor_counters(dependency.document_id(), &document)?;
+            if !floor.is_empty()
+                && !dependency_counters_cover_floor(dependency.peer_counters(), &floor)
+            {
+                return Ok(Some(NeedsFullHistory {
+                    batch_id,
+                    document_id: dependency.document_id(),
+                    dependency: dependency.peer_counters().to_vec(),
+                    floor,
+                }));
+            }
+            documents.insert(dependency.document_id(), document);
+        }
+
+        for object in prepared
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
+        {
+            let document_id = object.document_id();
+            let update = decode_crdt_update_payload(batch_id, document_id, object.payload())?;
+            let document = match documents.remove(&document_id) {
+                Some(document) => document,
+                None => self.clone_validation_document(document_id, 1)?,
+            };
+            let floor = shallow_floor_counters(document_id, &document)?;
+            if floor.is_empty() {
+                continue;
+            }
+            let metadata =
+                LoroDoc::decode_import_blob_meta(&update.raw_update, true).map_err(loro_error)?;
+            if metadata.mode != EncodedBlobMode::Updates {
+                return Err(EngineError::InvalidCrdt(format!(
+                    "CRDT payload for {document_id} uses {}, expected update mode",
+                    metadata.mode
+                )));
+            }
+            // A frontier unknown to the current shallow DAG can also mean an
+            // ordinary missing causal parent. Only a vector the DAG can
+            // resolve, or an explicit changed-lane start, proves "outdated".
+            if let Some(start) = document.frontiers_to_vv(&metadata.start_frontiers) {
+                let dependency = canonical_peer_counters(&start)?;
+                if !dependency_counters_cover_floor(&dependency, &floor) {
+                    return Ok(Some(NeedsFullHistory {
+                        batch_id,
+                        document_id,
+                        dependency,
+                        floor,
+                    }));
+                }
+            }
+            let changed_lane_is_outdated = floor.iter().any(|counter| {
+                metadata
+                    .partial_start_vv
+                    .get(&counter.peer_id().as_u64())
+                    .is_some_and(|start| {
+                        u64::try_from(*start).map_or(true, |start| start <= counter.max_counter())
+                    })
+            });
+            if changed_lane_is_outdated {
+                let dependency = canonical_peer_counters(&metadata.partial_start_vv)?;
+                return Ok(Some(NeedsFullHistory {
+                    batch_id,
+                    document_id,
+                    dependency,
+                    floor,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_document_floor_to_current_for_test(
+        &mut self,
+        document_id: DocumentId,
+    ) -> Result<(), EngineError> {
+        let current = self.clone_current_hot_document(document_id, 1)?;
+        let floor = current.oplog_frontiers();
+        if floor.is_empty() {
+            return Err(EngineError::InvalidCrdt(
+                "test floor requires a nonempty document frontier".into(),
+            ));
+        }
+        let bytes = current
+            .export(ExportMode::shallow_snapshot(&floor))
+            .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        let shallow = LoroDoc::new();
+        import_complete(document_id, &shallow, &[bytes])?;
+        if shallow.shallow_since_frontiers() != floor
+            || shallow.get_deep_value() != current.get_deep_value()
+        {
+            return Err(EngineError::InvalidCrdt(
+                "test shallow floor changed current document state".into(),
+            ));
+        }
+        self.visible_documents.insert(document_id, shallow.clone());
+        self.spare_documents
+            .borrow_mut()
+            .insert(document_id, shallow);
+        self.local_overlay.documents.remove(&document_id);
+        Ok(())
+    }
+
     /// Validate one local candidate completely, then publish its manifest as
     /// the durable accepted-operation commit point.
     ///
@@ -9133,6 +9263,19 @@ impl ShardedHotEngine {
                 && outcome.newly_accepted()[0].batch_id == prepared.manifest().batch_id();
         if !accepted_exactly_once {
             return match outcome.disposition() {
+                BatchDisposition::Rejected {
+                    error: EngineError::NeedsFullHistory(need),
+                } => {
+                    // Backstop classification is pending transport custody,
+                    // never an accepted/rejected archive fact. Restore the
+                    // run-local staging maps to their pre-offer shape.
+                    let batch_id = prepared.manifest().batch_id();
+                    self.archive.remove(&batch_id);
+                    self.archive_fingerprints.remove(&batch_id);
+                    self.statuses.remove(&batch_id);
+                    self.staged_batches.remove(&batch_id);
+                    Err(EngineError::NeedsFullHistory(need))
+                }
                 BatchDisposition::Rejected { error } => Err(error),
                 other => Err(EngineError::Archive(format!(
                     "clean candidate {} did not validate as one accepted operation: {other:?}",
@@ -21252,8 +21395,15 @@ impl ShardedHotEngine {
             self.record_stage_snapshot_clone(&document);
             if let Some(update) = updates.get(document_id) {
                 validate_update_base(*document_id, before_document.document(), &update.raw_update)?;
-                import_complete(
+                import_admission_complete(
+                    batch_id,
                     *document_id,
+                    frontier
+                        .documents()
+                        .iter()
+                        .find(|dependency| dependency.document_id() == *document_id)
+                        .map_or(&[][..], DocumentDependencies::peer_counters),
+                    before_document.document(),
                     &document,
                     std::slice::from_ref(&update.raw_update),
                 )?;
@@ -27572,6 +27722,33 @@ fn canonical_peer_counters(vv: &VersionVector) -> Result<Vec<CrdtPeerCounter>, E
     Ok(counters)
 }
 
+fn shallow_floor_counters(
+    document_id: DocumentId,
+    document: &LoroDoc,
+) -> Result<Vec<CrdtPeerCounter>, EngineError> {
+    let floor = document.shallow_since_frontiers();
+    if floor.is_empty() {
+        return Ok(Vec::new());
+    }
+    let floor_vv = document.frontiers_to_vv(&floor).ok_or_else(|| {
+        EngineError::InvalidCrdt(format!(
+            "native shallow floor for {document_id} is not in its own DAG"
+        ))
+    })?;
+    canonical_peer_counters(&floor_vv)
+}
+
+fn dependency_counters_cover_floor(
+    dependency: &[CrdtPeerCounter],
+    floor: &[CrdtPeerCounter],
+) -> bool {
+    floor.iter().all(|floor_counter| {
+        dependency
+            .binary_search_by_key(&floor_counter.peer_id(), |counter| counter.peer_id())
+            .is_ok_and(|index| dependency[index].max_counter() >= floor_counter.max_counter())
+    })
+}
+
 fn version_vector_for_dependencies(
     dependencies: &DocumentDependencies,
 ) -> Result<VersionVector, EngineError> {
@@ -27615,6 +27792,35 @@ fn import_complete(
         return Ok(());
     }
     let status = document.import_batch(updates).map_err(loro_error)?;
+    if status.pending.is_some() {
+        return Err(EngineError::MissingCrdtDependencies(document_id));
+    }
+    Ok(())
+}
+
+fn import_admission_complete(
+    batch_id: BatchId,
+    document_id: DocumentId,
+    dependency: &[CrdtPeerCounter],
+    before: &LoroDoc,
+    document: &LoroDoc,
+    updates: &[Vec<u8>],
+) -> Result<(), EngineError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let status = match document.import_batch(updates) {
+        Ok(status) => status,
+        Err(loro::LoroError::ImportUpdatesThatDependsOnOutdatedVersion) => {
+            return Err(EngineError::NeedsFullHistory(NeedsFullHistory {
+                batch_id,
+                document_id,
+                dependency: dependency.to_vec(),
+                floor: shallow_floor_counters(document_id, before)?,
+            }))
+        }
+        Err(error) => return Err(loro_error(error)),
+    };
     if status.pending.is_some() {
         return Err(EngineError::MissingCrdtDependencies(document_id));
     }
@@ -29493,6 +29699,7 @@ pub enum EngineError {
     },
     FrontierVectorMismatch(DocumentId),
     MissingCrdtDependencies(DocumentId),
+    NeedsFullHistory(NeedsFullHistory),
     CrdtUpdateBaseMismatch(DocumentId),
     CrdtPayloadIdentityMismatch {
         expected_batch_id: BatchId,
@@ -29637,6 +29844,11 @@ impl fmt::Display for EngineError {
             Self::MissingCrdtDependencies(document_id) => {
                 write!(f, "CRDT update for {document_id} has missing dependencies")
             }
+            Self::NeedsFullHistory(need) => write!(
+                f,
+                "batch {} needs full history for document {}: dependency {:?} predates floor {:?}",
+                need.batch_id, need.document_id, need.dependency, need.floor
+            ),
             Self::CrdtUpdateBaseMismatch(document_id) => {
                 write!(
                     f,

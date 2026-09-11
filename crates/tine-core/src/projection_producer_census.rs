@@ -1698,6 +1698,24 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
             "journal.v2.prepare",
             1,
         ),
+        // Packet 3's below-floor custody is a separate sequence domain, but it
+        // deliberately crosses the same audited v2 WAL and durable-directory
+        // publication boundaries as the existing journals.
+        (
+            "crates/tine-core/src/oplog/recovery_input_journal.rs",
+            "durable_directory.open",
+            1,
+        ),
+        (
+            "crates/tine-core/src/oplog/recovery_input_journal.rs",
+            "journal.v2.open",
+            4,
+        ),
+        (
+            "crates/tine-core/src/oplog/recovery_input_journal.rs",
+            "journal.v2.prepare",
+            1,
+        ),
         (
             // New row: the device-private CRDT writer-lane record reaches the
             // audited durable publication family through the same shared
@@ -2193,9 +2211,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // objects during bounded cleanup. AuthenticatedMapRootV1::empty remains at
     // five occurrences overall. No new writer family or direct write boundary
     // is introduced; the one cleanup unlink is pinned by g_a above.
+    // Packet 3 v2 §3 adds one recovery-input-journal import row, nine calls to
+    // the already-audited v2 selector/WAL/publication types, and six receiver
+    // calls on its retained segment/publication handles (16 rows total). The
+    // three write-crossing families are enumerated above; the four WAL opens
+    // distinguish activation, uncertain-append reopen, uncertain-anchor reopen,
+    // and first-segment confirmation. No new writer family is introduced.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "70672715cc4ca098943d0ed62d5564421cef67d129c3706236c0f9b34caf0a7c",
+        "4e94b3b96f28f6d38ab455d2c217c7247359e128c3bf49fd406e1200e470a586",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
