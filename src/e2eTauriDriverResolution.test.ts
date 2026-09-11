@@ -114,7 +114,13 @@ describe("tauri-driver resolution", () => {
   });
 
   it("resolves through TAURI_DRIVER, then CARGO_HOME, then PATH", async () => {
-    const { resolveTauriDriver } = await import("../scripts/e2e-capabilities.mjs");
+    // `scripts/e2e-capabilities.mjs` has no `.d.mts`, and writing a partial one
+    // would hide its other fourteen exports from every future TypeScript
+    // consumer. A non-literal specifier keeps this import untyped instead of
+    // lying about the module's surface; the behaviour, not the types, is what
+    // this assertion is for.
+    const helper = "../scripts/e2e-capabilities.mjs";
+    const { resolveTauriDriver } = await import(helper);
     expect(resolveTauriDriver({ TAURI_DRIVER: "/explicit/td", CARGO_HOME: "/c" }, () => true)).toBe("/explicit/td");
     expect(resolveTauriDriver({ CARGO_HOME: "/c" }, () => true)).toBe(path.join("/c", "bin", "tauri-driver"));
     expect(resolveTauriDriver({ CARGO_HOME: "/c" }, () => false)).toBe("tauri-driver");
