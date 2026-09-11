@@ -10,6 +10,9 @@
 pub(crate) mod absence_decision;
 pub(crate) mod absence_sweep;
 pub(crate) mod batch;
+pub(crate) mod checkpoint_floor_policy;
+#[cfg(test)]
+mod checkpoint_floor_policy_tests;
 pub(crate) mod checkpoint_generation;
 pub(crate) mod cold_object_store;
 pub(crate) mod conflict_history;

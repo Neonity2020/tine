@@ -2229,6 +2229,47 @@ mod tests {
                 .build_sealed_accepted_cutoff(&mut store, Some(&cutoff))
                 .unwrap();
             assert_eq!(cutoff.roots().sequence.len, n as u64);
+            let retained = engine
+                .build_policy_compact_accepted_document(
+                    &cutoff,
+                    catalog,
+                    0,
+                    crate::oplog::checkpoint_floor_policy::FloorPolicyConfig::default(),
+                )
+                .unwrap();
+            let crate::oplog::checkpoint_floor_policy::LoroFloorDecision::Keep {
+                retained: catalog_image,
+                metrics: catalog_metrics,
+                work: catalog_work,
+            } = retained.decision()
+            else {
+                panic!("a fresh default-budget catalog must retain full history")
+            };
+            assert!(!catalog_image.checkpoint.is_empty());
+            assert_eq!(catalog_image.actual_floor, loro::Frontiers::default());
+            assert!(catalog_metrics.image_bytes > 0);
+            assert_eq!(catalog_work.measurement_exports, 2);
+            assert_eq!(
+                retained.cutoff_state_digest(),
+                cutoff.frontier().state_digest()
+            );
+            assert_eq!(retained.dependencies().document_id(), catalog);
+            let page_retained = engine
+                .build_policy_compact_accepted_document(
+                    &cutoff,
+                    DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
+                    0,
+                    crate::oplog::checkpoint_floor_policy::FloorPolicyConfig::default(),
+                )
+                .unwrap();
+            let crate::oplog::checkpoint_floor_policy::LoroFloorDecision::Keep {
+                retained: page_image,
+                ..
+            } = page_retained.decision()
+            else {
+                panic!("a fresh default-budget page must retain full history")
+            };
+            assert!(!page_image.checkpoint.is_empty());
             let previous_roster = roster;
             let mut capsule_store = SealedGenerationStagingStore::open(&capsule_dir).unwrap();
             for id in [

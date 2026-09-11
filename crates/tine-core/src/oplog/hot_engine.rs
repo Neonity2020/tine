@@ -6670,6 +6670,29 @@ impl CompactAcceptedDocument {
     }
 }
 
+/// Worker-ready retained-tail image and its exact accepted-state binding.
+/// This has no persistence codec or live-install capability; the current A5
+/// writer and reader must switch to it together in one format change.
+pub(crate) struct PolicyCompactAcceptedDocument {
+    cutoff_state_digest: ContentDigest,
+    dependencies: DocumentDependencies,
+    decision: super::checkpoint_floor_policy::LoroFloorDecision,
+}
+
+impl PolicyCompactAcceptedDocument {
+    pub(crate) fn cutoff_state_digest(&self) -> ContentDigest {
+        self.cutoff_state_digest
+    }
+
+    pub(crate) fn dependencies(&self) -> &DocumentDependencies {
+        &self.dependencies
+    }
+
+    pub(crate) fn decision(&self) -> &super::checkpoint_floor_policy::LoroFloorDecision {
+        &self.decision
+    }
+}
+
 /// Exact live graph document closure at one accepted cutoff. Historical-only
 /// documents and Restore pins are separate archive obligations, not eager graph
 /// loads. This capture is a bootstrap seam, not a live actor COW implementation.
@@ -8174,6 +8197,90 @@ impl ShardedHotEngine {
             cutoff_state_digest: cutoff.frontier().state_digest(),
             dependencies,
             checkpoint,
+        })
+    }
+
+    /// Reconstruct one accepted document at S and run the retained-tail policy
+    /// over its causally closed, age-eligible accepted-prefix frontiers. This is
+    /// a staging building block for §1, not the live capture path: the atomic
+    /// writer/reader cutover must arrange to call it on worker-owned state. It
+    /// never mutates the source document or publishes a generation.
+    pub(crate) fn build_policy_compact_accepted_document(
+        &self,
+        cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
+        document_id: DocumentId,
+        eligible_through: u64,
+        policy: super::checkpoint_floor_policy::FloorPolicyConfig,
+    ) -> Result<PolicyCompactAcceptedDocument, EngineError> {
+        if cutoff.frontier() != &self.accepted_frontier_root
+            || eligible_through > cutoff.frontier().acceptance_sequence()
+        {
+            return Err(EngineError::Archive(
+                "retained-tail document cutoff is no longer current or age-eligible".into(),
+            ));
+        }
+        self.authenticate_accepted_frontier_root(cutoff.frontier())?;
+        let dependencies = self
+            .accepted_frontier_document(cutoff.frontier(), document_id)?
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        let document = self
+            .load_document_at_accepted_frontier(cutoff.frontier(), document_id)?
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        self.validate_lazy_genesis_document(document_id, &document)?;
+        if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+            return Err(EngineError::FrontierVectorMismatch(document_id));
+        }
+
+        let mut candidates = Vec::new();
+        let mut candidate_dependencies = self
+            .lazy_genesis
+            .as_ref()
+            .and_then(|baseline| baseline.frontier_document(document_id));
+        for sequence in 1..=eligible_through {
+            let row = self.clean_checkpoint_accepted_row(sequence)?;
+            let changed = row
+                .evidence
+                .affected_documents()
+                .iter()
+                .find(|candidate| candidate.document_id() == document_id)
+                .cloned();
+            let document_changed = changed.is_some();
+            if document_changed {
+                candidate_dependencies = changed;
+            }
+            // Between document changes every K has the same native frontier.
+            // Evaluate it once at the oldest whole accepted prefix carrying
+            // that frontier; repeated compression work cannot change the answer.
+            if sequence == 1 || document_changed {
+                if let Some(candidate) = &candidate_dependencies {
+                    let frontier =
+                        document.vv_to_frontiers(&version_vector_for_dependencies(candidate)?);
+                    candidates.push((sequence, frontier));
+                }
+            }
+        }
+        let decision = super::checkpoint_floor_policy::choose_loro_floor(
+            policy,
+            eligible_through,
+            &document,
+            candidates,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let checkpoint = match &decision {
+            super::checkpoint_floor_policy::LoroFloorDecision::Keep { retained, .. } => {
+                &retained.checkpoint
+            }
+            super::checkpoint_floor_policy::LoroFloorDecision::Advance { chosen, .. } => {
+                &chosen.checkpoint
+            }
+        };
+        let restored =
+            qualify_compact_document(self.catalog_document_id, &dependencies, checkpoint)?;
+        verify_compact_document_equivalence(&document, &restored)?;
+        Ok(PolicyCompactAcceptedDocument {
+            cutoff_state_digest: cutoff.frontier().state_digest(),
+            dependencies,
+            decision,
         })
     }
 
@@ -26968,6 +27075,25 @@ fn canonical_peer_counters(vv: &VersionVector) -> Result<Vec<CrdtPeerCounter>, E
     }
     counters.sort_unstable_by_key(|counter| counter.peer_id());
     Ok(counters)
+}
+
+fn version_vector_for_dependencies(
+    dependencies: &DocumentDependencies,
+) -> Result<VersionVector, EngineError> {
+    let mut vv = VersionVector::default();
+    for counter in dependencies.peer_counters() {
+        let end = counter
+            .max_counter()
+            .checked_add(1)
+            .and_then(|end| i32::try_from(end).ok())
+            .ok_or_else(|| {
+                EngineError::InvalidCrdt(
+                    "accepted document counter exceeds Loro's version-vector range".into(),
+                )
+            })?;
+        vv.insert(counter.peer_id().as_u64(), end);
+    }
+    Ok(vv)
 }
 
 fn clone_doc(document: &LoroDoc, peer: u64) -> Result<LoroDoc, EngineError> {
