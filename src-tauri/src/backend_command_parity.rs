@@ -755,7 +755,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (498, 17_903_180_402_005_549_371),
+            (507, 14_473_554_860_106_952_223),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \

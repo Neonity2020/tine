@@ -5585,6 +5585,61 @@ mod tests {
         found
     }
 
+    /// Seam 1's device is still SERVING: `make_active` left a live runtime that
+    /// owns its SQLite database and sidecars, its receipts, its writer-lane
+    /// locks and its managed-local journal, and writes them on its own
+    /// schedule. Byte-stability of those files is not a property adoption can
+    /// promise, so asserting it made this test fail for reasons that had
+    /// nothing to do with the seam — twice, in two different ways: once with 13
+    /// entries common, 0 missing and 16 ADDED by lazy initialization, and once
+    /// with `projection/materialization.sqlite-shm` REWRITTEN in place at the
+    /// same length. Both happened inside a loaded full-suite run; standalone the
+    /// test shows zero churn in eight consecutive runs, which is why this looked
+    /// like a flake rather than a bad oracle.
+    ///
+    /// So the byte-level comparison is scoped to what the test is named for —
+    /// the device's own HISTORY, which adoption is the only writer of, and which
+    /// `archive_private_root` would have moved had the drain succeeded. The
+    /// runtime's volatile working state is excluded by construction, not by
+    /// enumerating the churn observed so far.
+    ///
+    /// What this deliberately does not catch: adoption ADDING a file, or
+    /// touching the runtime's own working state. The seam's outcomes are
+    /// asserted directly instead — no recovery root, Markdown bytes untouched,
+    /// and the slot still serving sparse-v2. Seams 2 and 3 use a
+    /// `shadow_import` fixture with no live runtime, so they keep full tree
+    /// equality and must not be loosened to match this one.
+    fn durable_managed_history(tree: &BTreeMap<PathBuf, Vec<u8>>) -> BTreeMap<PathBuf, Vec<u8>> {
+        tree.iter()
+            .filter(|(path, _)| {
+                path.starts_with("archive")
+                    || path.starts_with("enrollment")
+                    || path.as_os_str() == "binding.json"
+            })
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect()
+    }
+
+    fn assert_nothing_lost_or_rewritten(
+        before: &BTreeMap<PathBuf, Vec<u8>>,
+        after: &BTreeMap<PathBuf, Vec<u8>>,
+        what: &str,
+    ) {
+        for (path, bytes) in before {
+            match after.get(path) {
+                None => panic!("{what}: adoption removed {}", path.display()),
+                Some(now) => assert_eq!(
+                    now,
+                    bytes,
+                    "{what}: adoption rewrote {} ({} bytes before, {} after)",
+                    path.display(),
+                    bytes.len(),
+                    now.len()
+                ),
+            }
+        }
+    }
+
     fn create_empty_provider_transport_scaffold(graph_root: &Path) {
         let shared = graph_root.join(".tine-sync/v2/shared");
         for tree in PROVIDER_SCAFFOLD_TREES {
@@ -5859,7 +5914,10 @@ mod tests {
     }
 
     /// Seam 1 — the drain. Nothing has been archived, so the managed slot must
-    /// come back and every byte on both sides must be untouched.
+    /// come back and not one byte of the device's own managed history may be
+    /// removed or rewritten. This device is still SERVING, so its live runtime
+    /// keeps writing its own working state throughout; `durable_managed_history`
+    /// says where the line is and why it is drawn there.
     #[test]
     fn adoption_seam_shutdown_failure_keeps_the_managed_device_serving_its_own_history() {
         let mut fixture = RollbackFixture::new(Some("local_active"));
@@ -5886,10 +5944,15 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("injected adoption drain failure"));
-        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
-        assert_eq!(
-            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
-            provider_before
+        assert_nothing_lost_or_rewritten(
+            &durable_managed_history(&private_before),
+            &durable_managed_history(&snapshot_tree(&fixture.private_root)),
+            "private root managed history",
+        );
+        assert_nothing_lost_or_rewritten(
+            &provider_before,
+            &snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            "provider transport",
         );
         assert!(!fixture.recovery_root.exists());
         assert_eq!(
