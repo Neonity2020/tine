@@ -3072,3 +3072,124 @@ fn block_narrowing_answers_exactly_what_the_walk_answers_on_a_real_corpus() {
         comparison.walked_classifications
     );
 }
+
+// ---------------------------------------------------------------------------
+// The shapes the user actually wrote
+// ---------------------------------------------------------------------------
+
+/// Every query macro body the corpus at `root` actually contains, deduped and
+/// sorted.
+///
+/// The extraction is the PRODUCTION lexer ([`macro_text::query_macro_extents`]),
+/// not a regex: a `}}` inside a string, a nested options map or a `[[page]]`
+/// ref does not end a macro early, and a lazy pattern gets exactly those wrong.
+/// It reads files directly rather than the graph so an unparsed or excluded
+/// page cannot hide a shape from the measurement.
+fn observed_query_shapes(root: &Path) -> Vec<(String, String)> {
+    fn visit(dir: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, out);
+                continue;
+            }
+            let extension = path
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if extension != "md" && extension != "org" {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for extent in crate::query::macro_text::query_macro_extents(&raw) {
+                out.push((extent.name, extent.argument));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// **What answering the user's OWN queries costs, walk versus SQL.**
+///
+/// The campaign's `MEASURE_SHAPES` are invented shapes, chosen to span the plan
+/// classes. They answer "is the lowering fast on a shape we designed for it",
+/// which is not the question that matters: the queries a graph really holds are
+/// written by a person, not by the people who wrote the compiler. This receipt
+/// times the bodies the corpus literally contains.
+///
+/// It prints an INDEX, never the query text: the corpus is Martin's graph and
+/// this repository is public.
+#[test]
+#[ignore = "measurement receipt: set TINE_QUERY_IDENTITY_GRAPH"]
+fn the_corpus_own_queries_are_timed_against_the_walk() {
+    let _serial = serialize();
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH");
+        return;
+    };
+    let root = PathBuf::from(&root);
+    let shapes = observed_query_shapes(&root);
+    assert!(
+        !shapes.is_empty(),
+        "the corpus at {} holds no query macro: a measurement over an empty \
+         shape list reports success and measures nothing, which is the exact \
+         failure this receipt exists to rule out",
+        root.display()
+    );
+    let corpus = Corpus::open(root, false);
+    let fts_ready = corpus.fts_ready();
+    eprintln!("observed_queries total={} fts_ready={fts_ready}", shapes.len());
+    for (index, (name, argument)) in shapes.iter().enumerate() {
+        let dialect = match crate::query::macro_text::FormFamily::for_macro_name(name) {
+            crate::query::macro_text::FormFamily::Tql => QueryDialect::Tql,
+            crate::query::macro_text::FormFamily::Edn => QueryDialect::Og,
+        };
+        let rows = corpus.sql_with(argument, dialect, fts_ready);
+        let walked = corpus.walk(argument, dialect);
+        let agrees = rows == walked;
+        let _ = corpus.walk(argument, dialect);
+        let walk_start = Instant::now();
+        for _ in 0..OBSERVED_REPEATS {
+            let _ = corpus.walk(argument, dialect);
+        }
+        let walk = walk_start.elapsed() / OBSERVED_REPEATS;
+        let sql_start = Instant::now();
+        for _ in 0..OBSERVED_REPEATS {
+            let _ = corpus.sql_with(argument, dialect, fts_ready);
+        }
+        let sql = sql_start.elapsed() / OBSERVED_REPEATS;
+        let (_anchor, statement) = corpus.lower(argument, dialect, fts_ready);
+        let plan = if statement.content_plans.is_empty() {
+            if statement.positively_bounded {
+                "indexed".to_string()
+            } else {
+                "unbounded".to_string()
+            }
+        } else {
+            format!("{:?}", statement.content_plans)
+        };
+        eprintln!(
+            "observed_query index={index} dialect={dialect:?} bytes={} plan={plan} \
+             bounded={} rows={} agrees={agrees} walk_us={} sql_us={} sql/walk={:.2}",
+            argument.len(),
+            statement.positively_bounded,
+            rows.len(),
+            walk.as_micros(),
+            sql.as_micros(),
+            sql.as_micros() as f64 / walk.as_micros().max(1) as f64,
+        );
+    }
+}
+
+/// Enough repeats that a sub-millisecond answer is not reported as its own
+/// timer resolution, few enough that thirteen shapes stay a minute of work.
+const OBSERVED_REPEATS: u32 = 20;
