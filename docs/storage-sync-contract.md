@@ -314,7 +314,7 @@ Managed storage selection, and no byte is written into the user's graph.
 | `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
 | `archive/lazy-genesis.<generation>/{manifest.postcard,commit.postcard,catalog.snapshot,segment-*.pack}` | clean activation/join installation | clean open/join through the marker generation resolver | immutable baseline pack, manifest schema 7, page capsule v6, plus commit v1 | authoritative only when named by the marker; generation 0 is the fresh-store publication, and unreferenced generations are reclaimed on open. A sealed baseline whose manifest schema is not the current one is a recognized pre-0.7 containing format: open refuses with `MS-REF-PROTOCOL-INCOMPATIBLE`, which routes the store to preserve-and-rebuild (blank-slate), never to a retryable dead end; no earlier schema is decoded. A schema-5 baseline written by the retired per-block layout takes this same route: the whole private root is preserved as a backup and the current format is rebuilt automatically from Markdown/Org, without replaying backup-only history |
 | `archive/operations.<generation>/{lineage.claim,archive-instance-v1.claim,objects/,batches/}` | clean local/external/provider commit and join installation | causal replay and publication through the marker generation resolver | content-addressed objects plus manifest-last batches | authoritative append-only tail paired with the same marker-named baseline generation; unreferenced generations are reconstructible join residue and are reclaimed on open |
-| `archive/operations.<generation>/clean-open-checkpoint-v1/{current,payload-{a,b},generation-{a,b}}` | clean engine actor plus one coalesced background writer | clean managed open | current canonical checkpoint v1; two bounded replaceable slots and one durable commit pointer; accepted roster encoded by `tine-storage` sealed accepted index | disposable acceleration only; absent, stale, torn, wrong-format, oversized, or internally damaged state full-replays and rewrites without refusal; no migration or backup |
+| `archive/operations.<generation>/clean-open-checkpoint-v2/{current,payload-{a,b},generation-{a,b},capsule-v1-<digest>,sealed-v2-1-<digest>}` | clean engine actor plus one coalesced background writer | clean managed open and image-first cold page loads | current canonical checkpoint v2; two bounded replaceable slots, one durable commit pointer, and a sealed document-to-image roster | disposable acceleration only; immutable images become durable before their manifest/generation/pointer, unchanged references are reused, objects outside both retained generation roots are reclaimed, and absent/stale/torn/wrong-format/damaged state full-replays without migration or backup |
 | `archive/operations.<generation>/sweeps/local-completion-index-v1/` | common own-endpoint manifested-projection executor | foreground/cold projection replay and the device-wide absence-decision map | immutable generation-named delta/compaction chain v1 | disposable local completion evidence; rebuilt from valid retained deltas when a summary is stale or invalid; removed with its enrollment era |
 | `archive/operations.<generation>/sweeps/receiver-absence-summary-v1/` | foreign receiver completion/open machinery under the workspace lease | device-wide absence-decision roots | immutable generation-named summary chain v1 naming the absence-history root | disposable receiver roots acceleration; retained receipt records are truth and rebuild it |
 | `archive/operations.<generation>/sweeps/receiver-absence-rows-v1/` | the same receiver open/completion machinery under the workspace lease | point-addressable absence history by exact `(PageId, ManagedPath)` | immutable content-addressed records and authenticated map nodes v1 | disposable derived index; retained receipt records are truth and rebuild it |
@@ -1368,7 +1368,7 @@ otherwise unrelated page creation, and projection validation reconstructs that
 larger frontier. A merely durable pre-shutdown status or an effect-equivalent
 accepted prefix cannot make an unreplayed manifest ready.
 
-Clean open first attempts the disposable `clean-open-checkpoint-v1` state. Its
+Clean open first attempts the disposable `clean-open-checkpoint-v2` state. Its
 single `current` pointer is the commit point; payload and generation bytes land
 completely in the inactive one of two bounded slots before that pointer changes.
 An interrupted write therefore leaves the prior pointed generation complete.
@@ -1385,7 +1385,7 @@ would report.
 The checkpoint contains every clean-runtime field that changes later
 admission, conflict, or query decisions, including the exact ephemeral
 page-name ownership state, current path/name/UUID claims and conflicts,
-accepted frontier and resident CRDT documents, projection-head batch locators,
+accepted frontier and resident-document identities, projection-head batch locators,
 and the accepted sequence. The accepted roster is not a parallel list: it is
 the canonical `tine-storage` sealed accepted index with exact accepted evidence,
 causal records, status map and sequence root. The checkpoint also records each
@@ -1419,11 +1419,41 @@ and full-replay paths and report roster/name work, checkpoint capture work and
 payload bytes, the actual tail replayed, and durable lag.
 
 Snapshot capture is coherent on the owning actor and is attempted after every
-accepted managed save. The actor captures canonical semantic state plus only
+accepted managed save. The actor captures canonical semantic metadata plus only
 the accepted roster and required-object additions after the publisher's durable
-frontier. The background publisher folds that delta into the preceding payload
-using the same `clean-open-checkpoint-v1` format; no second reader or authority
-is introduced. At the accepted 2026-09-02 gate, capture work at N=800 divided
+frontier. For a document whose accepted dependency binding differs from the
+last published checkpoint, a resident document crosses the thread boundary as
+an upstream Snapshot clone; an evicted document carries only its exact
+dependencies and is reconstructed by the worker from its prior image plus the
+accepted suffix. Bootstrap falls back to immutable genesis plus accepted
+archive ancestry when no image exists. Unchanged documents carry no image
+bytes.
+
+The worker imports or reconstructs only changed documents, runs the shallow
+export and fresh-document verification policy, and publishes the resulting
+content-addressed image and descriptor before the payload, generation, and
+`current` pointer. The complete sealed roster reuses the exact prior descriptor
+for every unchanged document. Reopen imports only the documents that were
+resident at capture; a later cache miss or same-session eviction loads the
+current published image and applies only accepted document updates after that
+image's S. It falls back to genesis/original replay only when the roster has no
+image for that document. The current live policy supplies E=0, so these v2
+images retain their existing native floor and cannot yet make an incoming
+original below-floor; acceptance-age advancement and automatic reconstruction
+remain a later Packet 3 slice.
+
+The background publisher folds accepted-row deltas into the same
+`clean-open-checkpoint-v2` format; no second reader or authority is introduced.
+Changed/exported/reused, handoff-import/reconstruction, and worker export/import
+counts are persisted as diagnostics. Cleanup retains both replaceable payload
+roots (so pointer rollback stays complete), pins the exact object set of every
+in-process reader until its last handle drops, and reclaims only unreferenced
+content-addressed image objects. Each pass examines at most twice the retained
+graph object count plus 1,024 directory entries, so repeated crash orphans drain
+without turning one publication into a lifetime-sized walk. A cleanup
+interruption can leave an orphan but cannot remove an image named by either
+retained generation or an active reader. At the accepted
+2026-09-02 gate, capture work at N=800 divided
 by N=50 must be at most `A5_ACCEPTED_CAPTURE_RATIO = 1.25`. Each
 capture hands immutable canonical bytes to at most one background writer; one
 newest snapshot replaces any queued snapshot. This coalescing bounds memory,
@@ -2198,10 +2228,10 @@ and authenticated map. Delta builds update only affected peer paths; older
 accepted counters cannot lower a tip. Empty-tail continuation retains exact tips.
 Damaged tip nodes or conflicting batches at one tip fail before candidate roots
 advance. The O(peers) in-process records are not yet live authoring input.
-This is an inert, in-process staging
-surface with no new on-disk format, serialized cutoff token, cache-payload
-adoption or live scheduler/cutover caller. The engine's capture reads the existing
-accepted-row seam without encoding documents. A separate inert per-document builder
+The accepted-cutoff builder remains an in-process construction surface with no
+serialized cutoff token. The live v2 checkpoint uses the engine's existing
+accepted-row seam and accepted document dependencies; it does not adopt the
+cutoff builder as a second acceptance authority. A separate construction per-document builder
 uses the existing accepted-root loader and document validators, exports a shallow
 snapshot at the exact accepted frontier, then imports it into a fresh document.
 Qualification requires exact version vectors, oplog frontiers, root and nested
@@ -2216,9 +2246,9 @@ moved to another page while retaining its original home shard. Its negative cont
 omits the post-cutoff tail and detects the resulting lost edit. This proves the
 isolated engine recipe, not durable installation, missing-history recovery, actor
 concurrency, or shared retirement.
-This is not yet a complete durable
-generation: capsules, retention facts, independent disk qualification and the COW
-actor epoch remain prerequisites to enabling cutover. The physical layer has
+That construction helper is not itself a durable generation. The v2 disposable
+checkpoint separately binds its live image roster, accepted cutoff, semantic
+state, and publication order. The physical layer has
 one current SQLite schema for both the live disposable projection and a
 separately built checkpoint candidate, plus a read-only injected sealed-history
 reader. It has no prior-schema enum, reader, compatibility fixture, or
@@ -2230,8 +2260,9 @@ node/record bytes as `sealed-v2-<kind>-<digest>` files under a caller-owned priv
 directory capability. The numeric kinds are the same five codes used by A5's
 adapter; there is no second node codec. Its point reader does not enumerate the
 directory. Reads reject non-regular/symlink entries through the shared reader and
-retain the current checkpoint's 512-MiB per-record read ceiling. This is staging
-layout, not the complete authoritative generation format.
+retain the current checkpoint's 512-MiB per-record read ceiling. The same layout
+is now the immutable-image portion of the disposable v2 checkpoint; it remains
+non-authoritative and cannot replace accepted originals.
 
 Construction reuses `ExactImmutablePublicationBatch` on Linux. Windows, macOS,
 iOS, Android and other targets use retained `DurableDirectoryPublication` with
@@ -2245,16 +2276,18 @@ Successful finish completes the shared durability protocol. Fresh canonical
 membership qualification still follows: a durability receipt is not an integrity
 proof, and merely opening a directory is not generation adoption. Collision,
 missing/corrupt record, no-follow, publication-fault and retry tests preserve
-predecessor roots. Complete generation commits and live cutover remain absent.
+predecessor roots. The v2 payload binds the finished image root only after
+staging finish; the existing generation and `current` pointer remain the sole
+selection boundary.
 
-The retained, dormant **document capsule roster** codec uses `SealedDocumentMap`
+The retained **document capsule roster** codec uses `SealedDocumentMap`
 over the shared full-key authenticated map. `DocumentKey::Entity` encodes as the `0x01` tag plus
 its UUID (17 bytes), while `DocumentKey::Membership` encodes as the `0x02` tag
 plus the complete `(block_document_id, page_document_id)` pair (33 bytes). That
 lossless encoding is `AuthenticatedMapKey`; entity and membership entries share
 one root, preserve meaningful-byte lexicographic ordering, and never hash or
-truncate an address. No live producer supplies it: the live write path
-addresses catalog and page-shard documents by their 16 UUID bytes, and a
+truncate an address. The live checkpoint producer supplies entity rows only:
+the live write path addresses catalog and page-shard documents by their 16 UUID bytes, and a
 page-document adapter wraps a UUID as `DocumentKey::Entity` only at this codec
 boundary. Logical retirement uses the certified shared `remove_map` operation, which removes only
 the addressed search path while preserving older immutable roots; it never
@@ -2274,8 +2307,9 @@ identity, exact checkpoint length/digest, CRDT import completeness, schema/shape
 and version vector through the existing catalog/shard validators. It never
 reconstructs a CRDT from projected text. A forged in-memory cutoff cannot be
 serialized through this surface; producer input remains an engine-qualified compact
-document bound to the current cutoff. This is still staging, with no active marker
-or engine installation caller.
+document bound to the current cutoff. The active v2 payload stores this roster
+root; engine restore receives it only after the payload and archive bindings
+qualify.
 
 The explicit full-roster builder enumerates the engine's complete accepted
 document set, including the catalog and retained home shards that need not appear
@@ -2283,18 +2317,19 @@ as live pages. It checks the current accepted cutoff and exact document count. A
 empty accepted set keeps the existing implicit empty catalog; a nonempty set must
 contain the catalog.
 An inherited descriptor with identical canonical dependencies avoids CRDT loading
-and republishing; changed documents update the existing roster paths. This initial
-builder still enumerates O(documents) metadata and is not the R1c bounded actor COW
-capture or the later delta-only qualification path.
+and republishing; changed documents update the existing roster paths. The older
+explicit full-roster builder remains a repair/oracle seam. Ordinary v2 capture
+uses the published dependency map to hand off only changed documents, while its
+complete manifest metadata still enumerates the current live document set.
 
 The full bootstrap/repair oracle independently derives the canonical roster root
 from the exact accepted document keys, so extra entries cannot hide behind a forged
 count. Each persisted document must then match accepted dependencies and the
 source CRDT's stable container identities, frontiers, map values and text deltas.
 Both the per-document compact producer and full-roster oracle reuse one equivalence
-checker. These are explicit construction/repair operations, with no live runtime
-caller or generation installation capability. Complete generation binding and
-retention closure remain prerequisites for adoption.
+checker. The full-roster oracle remains an explicit construction/repair
+operation; the live runtime uses point descriptor qualification and imports only
+resident or requested images.
 
 ### Additive cold whole-object history and one read resolution
 
@@ -2305,7 +2340,7 @@ their `BatchId`s are preserved verbatim, and every read re-proves them. There is
 one current representation and no migration path; an unrecognized private store is
 still backed up and rebuilt.
 
-Layout, under the retained archive capability beside `clean-open-checkpoint-v1`:
+Layout, under the retained archive capability beside `clean-open-checkpoint-v2`:
 
 ```
 <archive>/cold-history-v1/

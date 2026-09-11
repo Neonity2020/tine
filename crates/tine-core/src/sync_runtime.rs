@@ -8162,6 +8162,7 @@ fn open_clean_runtime_resources_with_progress(
                 &loaded.state_bytes,
                 loaded.accepted_rows,
                 loaded.required_objects,
+                Arc::clone(&loaded.documents),
             ) {
                 Ok(()) => {
                     engine
@@ -8317,6 +8318,9 @@ fn open_clean_runtime_resources_with_progress(
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or_else(|| "clean runtime has no projection endpoint".to_owned())?;
+    if !restored_checkpoint {
+        engine.schedule_clean_checkpoint_bootstrap();
+    }
     let runtime =
         CleanLocalRuntime::from_open_parts(identities.session_id, endpoint, engine, projection)
             .map_err(CleanOpenError::from)?;

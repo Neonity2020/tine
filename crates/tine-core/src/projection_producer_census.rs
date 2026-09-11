@@ -1023,6 +1023,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "cap.remove_file",
             2,
         ),
+        // Packet 3 v2 checkpoint cleanup removes only digest-named image/map
+        // objects absent from both retained generations and all active-reader
+        // pins. The graph-derived scan budget bounds each cleanup pass.
+        (
+            "crates/tine-core/src/oplog/checkpoint_generation.rs",
+            "cap.remove_file",
+            1,
+        ),
         (
             "crates/tine-core/src/oplog/current_action_roots.rs",
             "cap.remove_file",
@@ -2180,9 +2188,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // what (a) pinned before the merge. Nothing else in the tine-storage
     // surface moved. Row counts reconcile end to end: 471 base, +1 from (a),
     // +2 from (b), 474 here.
+    // Packet 3 v2 adds one sealed-map-node decoder/import and three
+    // read_optional_regular calls to enumerate only authenticated image-map
+    // objects during bounded cleanup. AuthenticatedMapRootV1::empty remains at
+    // five occurrences overall. No new writer family or direct write boundary
+    // is introduced; the one cleanup unlink is pinned by g_a above.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "e59cb1446f050ad29c860be5dbba4a9c7c8ab4f7bb6cb0df464dc5251dcf4839",
+        "70672715cc4ca098943d0ed62d5564421cef67d129c3706236c0f9b34caf0a7c",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

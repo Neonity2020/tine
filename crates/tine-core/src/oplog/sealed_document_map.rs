@@ -24,6 +24,14 @@ impl SealedDocumentMap {
         }
     }
 
+    pub(super) fn from_root(documents: AuthenticatedMapRootV1) -> Self {
+        Self { documents }
+    }
+
+    pub(super) fn root(self) -> AuthenticatedMapRootV1 {
+        self.documents
+    }
+
     #[cfg(test)]
     pub(super) fn entity_root(self) -> AuthenticatedMapRootV1 {
         self.documents

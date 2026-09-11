@@ -126,7 +126,7 @@ use tine_storage::sealed_accepted_index::{
 };
 
 /// The private cold-history namespace, rooted in the retained archive
-/// capability exactly like `clean-open-checkpoint-v1`.
+/// capability exactly like `clean-open-checkpoint-v2`.
 pub(crate) const COLD_HISTORY_DIRECTORY: &str = "cold-history-v1";
 /// The canonical root marker. It is installed last, after every pack and index
 /// node it names is already durable.

@@ -1107,9 +1107,9 @@ impl RunLocalAuthenticatedMap {
 /// The catalog and every page shard are rows of ONE shared authenticated map
 /// keyed by the document's 16 UUID bytes ([`DocumentId::authenticated_map_key`]),
 /// the same key bytes and node digest the SQLite frontier treap uses; readers
-/// accept a key back only at exactly 16 bytes and never truncate one. The
-/// dormant sealed document-map codec reuses this map type for its own
-/// `DocumentKey` rows, in its tests only (`run_local_document_map_root`).
+/// accept a key back only at exactly 16 bytes and never truncate one. The live
+/// checkpoint roster remains the one persisted `DocumentKey::Entity` map and
+/// qualifies its complete identity set before restore.
 type RunLocalDocumentMap = RunLocalAuthenticatedMap;
 
 /// One causal writer incarnation's tip in this engine, in ONE map.
@@ -6633,10 +6633,10 @@ pub(crate) struct DeferredAbsenceObservation {
     pub(crate) path: ManagedPath,
 }
 
-// v3 carries both CRDT lane and causal incarnation ownership. Exactly one schema has an
-// implementation (D-1): a checkpoint written by any other version is refused
-// and the engine falls back to accepted replay, which rebuilds the same map.
-const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 4;
+// v5 replaces inline resident-document bytes with qualified immutable image
+// references. Exactly one schema has an implementation (D-1): a checkpoint
+// written by any other version is discarded and rebuilt from accepted history.
+const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 5;
 
 /// One accepted-roster row captured coherently by the engine actor. The
 /// checkpoint module feeds these rows through tine-storage's canonical sealed
@@ -6671,8 +6671,8 @@ impl CompactAcceptedDocument {
 }
 
 /// Worker-ready retained-tail image and its exact accepted-state binding.
-/// This has no persistence codec or live-install capability; the current A5
-/// writer and reader must switch to it together in one format change.
+/// The checkpoint module persists its chosen image behind the sole v2 writer
+/// and restores it through that format's sole reader.
 pub(crate) struct PolicyCompactAcceptedDocument {
     cutoff_state_digest: ContentDigest,
     dependencies: DocumentDependencies,
@@ -6690,6 +6690,24 @@ impl PolicyCompactAcceptedDocument {
 
     pub(crate) fn decision(&self) -> &super::checkpoint_floor_policy::LoroFloorDecision {
         &self.decision
+    }
+
+    pub(crate) fn checkpoint(&self) -> &[u8] {
+        match &self.decision {
+            super::checkpoint_floor_policy::LoroFloorDecision::Keep { retained, .. } => {
+                &retained.checkpoint
+            }
+            super::checkpoint_floor_policy::LoroFloorDecision::Advance { chosen, .. } => {
+                &chosen.checkpoint
+            }
+        }
+    }
+
+    pub(crate) fn work(&self) -> &super::checkpoint_floor_policy::LoroFloorWork {
+        match &self.decision {
+            super::checkpoint_floor_policy::LoroFloorDecision::Keep { work, .. }
+            | super::checkpoint_floor_policy::LoroFloorDecision::Advance { work, .. } => work,
+        }
     }
 }
 
@@ -6717,6 +6735,28 @@ pub(crate) struct CleanCheckpointCapture {
     pub(crate) accepted_rows: Vec<CleanCheckpointAcceptedRow>,
     pub(crate) required_objects: BTreeSet<ContentDigest>,
     pub(crate) capture_work: u64,
+    /// `None` is reserved for sequence-zero publication primitive tests. Every
+    /// live engine capture supplies a complete document epoch.
+    pub(crate) documents: Option<CleanCheckpointDocumentCapture>,
+}
+
+/// Immutable worker input for one checkpoint image epoch. Graph-wide document
+/// dependencies are manifest metadata; only documents changed since the last
+/// published checkpoint carry an actor-side Snapshot handoff. A changed cold
+/// document carries no bytes and is reconstructed by the publisher worker.
+pub(crate) struct CleanCheckpointDocumentCapture {
+    pub(crate) cutoff_state_digest: ContentDigest,
+    pub(crate) catalog_document_id: DocumentId,
+    pub(crate) dependencies: BTreeMap<DocumentId, DocumentDependencies>,
+    pub(crate) changed_snapshots: BTreeMap<DocumentId, Option<Vec<u8>>>,
+    pub(crate) lazy_genesis: Arc<LazyGenesisCandidate>,
+}
+
+pub(crate) struct CheckpointWorkerDocument {
+    pub(crate) document: LoroDoc,
+    pub(crate) imported_handoff: bool,
+    pub(crate) imported_predecessor_image: bool,
+    pub(crate) reconstructed: bool,
 }
 
 /// Fixed diagnostic outcome retained by the actor when checkpoint capture is
@@ -6764,7 +6804,7 @@ pub(crate) fn clean_checkpoint_capture_skip_detail(
 /// `sealed_accepted_index` before handing rows back to the engine.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CleanCheckpointStateV1 {
+struct CleanCheckpointStateV5 {
     schema_version: u32,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -6788,8 +6828,11 @@ struct CleanCheckpointStateV1 {
     ephemeral_page_names: Vec<u8>,
     page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    visible_documents: BTreeMap<DocumentId, Vec<u8>>,
-    spare_documents: BTreeMap<DocumentId, Vec<u8>>,
+    /// Resident document identities only. Their immutable image bytes live in
+    /// the checkpoint payload directory and are loaded after its roster has
+    /// been qualified.
+    visible_documents: BTreeSet<DocumentId>,
+    spare_documents: BTreeSet<DocumentId>,
     visible_document_lru: VecDeque<DocumentId>,
     visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
@@ -6828,6 +6871,7 @@ pub struct ShardedHotEngine {
     transient_effective_view_order: VecDeque<BatchId>,
     archive_store: Option<Arc<ObjectStore>>,
     clean_checkpoint_publisher: Option<super::checkpoint_generation::CleanCheckpointPublisher>,
+    checkpoint_documents: Option<Arc<super::checkpoint_generation::CleanCheckpointDocuments>>,
     clean_checkpoint_capture_skip: Cell<Option<CleanCheckpointCaptureSkip>>,
     /// Device-local own-endpoint projection completion evidence. The archive
     /// chain is durable; this engine-owned value also owns the coalescing
@@ -6983,7 +7027,7 @@ pub struct ShardedHotEngine {
     clean_checkpoint_required_objects: BTreeSet<ContentDigest>,
     /// Per-accept additions to the required-object union. Checkpoint capture
     /// reads only the rows after its durable frontier; the publisher folds
-    /// them into the preceding v1 payload without introducing a second disk
+    /// them into the preceding v2 payload without introducing a second disk
     /// format.
     clean_checkpoint_required_objects_by_sequence: BTreeMap<u64, BTreeSet<ContentDigest>>,
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
@@ -7091,6 +7135,7 @@ impl ShardedHotEngine {
             transient_effective_view_order: VecDeque::new(),
             archive_store: None,
             clean_checkpoint_publisher: None,
+            checkpoint_documents: None,
             clean_checkpoint_capture_skip: Cell::new(None),
             local_completion_index: None,
             receiver_absence_summary: RefCell::new(None),
@@ -7563,9 +7608,13 @@ impl ShardedHotEngine {
         let publisher_store = store
             .duplicate_retained_capability()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.clean_checkpoint_publisher = Some(
-            super::checkpoint_generation::CleanCheckpointPublisher::new(publisher_store, 0),
-        );
+        self.clean_checkpoint_publisher =
+            Some(super::checkpoint_generation::CleanCheckpointPublisher::new(
+                publisher_store,
+                0,
+                BTreeMap::new(),
+                None,
+            ));
         self.archive_store = Some(Arc::new(store));
         Ok(())
     }
@@ -7580,10 +7629,32 @@ impl ShardedHotEngine {
         let publisher_store = store
             .duplicate_retained_capability()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let published_documents = match self.checkpoint_documents.as_ref() {
+            Some(images) => {
+                let mut ids = self
+                    .current_path_catalog
+                    .rows
+                    .values()
+                    .map(|row| row.home_document_id)
+                    .collect::<BTreeSet<_>>();
+                if self
+                    .accepted_frontier
+                    .contains_key(&self.catalog_document_id)
+                {
+                    ids.insert(self.catalog_document_id);
+                }
+                images
+                    .dependencies(ids.into_iter())
+                    .map_err(EngineError::Archive)?
+            }
+            None => BTreeMap::new(),
+        };
         self.clean_checkpoint_publisher =
             Some(super::checkpoint_generation::CleanCheckpointPublisher::new(
                 publisher_store,
                 durable_sequence,
+                published_documents,
+                self.checkpoint_documents.as_ref().cloned(),
             ));
         Ok(())
     }
@@ -7599,10 +7670,18 @@ impl ShardedHotEngine {
         }
         match self.capture_clean_checkpoint(durable_sequence) {
             Ok(capture) => publisher.enqueue(capture),
-            Err(_) => self
-                .clean_checkpoint_capture_skip
-                .set(Some(CleanCheckpointCaptureSkip::CaptureFailed)),
+            Err(_) => {
+                self.clean_checkpoint_capture_skip
+                    .set(Some(CleanCheckpointCaptureSkip::CaptureFailed));
+            }
         }
+    }
+
+    /// Publish the first complete image epoch after a blank-slate/full-replay
+    /// open. The caller invokes this only when no v2 checkpoint was restored;
+    /// ordinary accepted saves keep using the same scheduler below.
+    pub(crate) fn schedule_clean_checkpoint_bootstrap(&self) {
+        self.schedule_clean_checkpoint();
     }
 
     /// The single eligibility predicate for a disposable clean-checkpoint
@@ -7643,6 +7722,45 @@ impl ShardedHotEngine {
             .map_or(0, |publisher| {
                 publisher.durable_lag(self.next_acceptance_sequence)
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_clean_checkpoint_for_test(&self) -> Result<(), EngineError> {
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
+            .wait_for_idle()
+            .map_err(EngineError::Archive)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evict_hot_document_for_checkpoint_test(&mut self, document_id: DocumentId) {
+        assert_ne!(document_id, self.catalog_document_id);
+        self.visible_documents.remove(&document_id);
+        self.visible_document_heads.remove(&document_id);
+        self.terminal_documents.remove(&document_id);
+        self.terminal_document_heads.remove(&document_id);
+        self.spare_documents.borrow_mut().remove(&document_id);
+        self.visible_document_lru
+            .retain(|current| *current != document_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_checkpoint_image_for_test(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .clean_checkpoint_publisher
+            .as_ref()
+            .map(|publisher| {
+                publisher
+                    .load_current_document(self.catalog_document_id, document_id)
+                    .map(|loaded| loaded.is_some())
+                    .map_err(EngineError::Archive)
+            })
+            .transpose()?
+            .unwrap_or(false))
     }
 
     /// Replay the complete manifest-committed accepted tail over a clean
@@ -8200,12 +8318,10 @@ impl ShardedHotEngine {
         })
     }
 
-    /// Reconstruct one accepted document at S and run the retained-tail policy
-    /// over its causally closed, age-eligible accepted-prefix frontiers. This is
-    /// a staging building block for §1, not the live capture path: the atomic
-    /// writer/reader cutover must arrange to call it on worker-owned state. It
-    /// never mutates the source document or publishes a generation.
-    pub(crate) fn build_policy_compact_accepted_document(
+    /// Test/construction convenience around the live worker seam below. It
+    /// reconstructs one exact accepted document before handing immutable state
+    /// to the same policy function used by checkpoint publication.
+    pub(crate) fn build_policy_compact_accepted_document_at_cutoff(
         &self,
         cutoff: &super::checkpoint_generation::SealedAcceptedCutoff,
         document_id: DocumentId,
@@ -8259,10 +8375,35 @@ impl ShardedHotEngine {
                 }
             }
         }
+        Self::build_policy_compact_accepted_document(
+            self.catalog_document_id,
+            cutoff.frontier().state_digest(),
+            dependencies,
+            &document,
+            eligible_through,
+            policy,
+            candidates,
+        )
+    }
+
+    /// Live checkpoint-publisher seam: export and verify one already isolated
+    /// accepted document at S under the retained-tail policy. The actor may
+    /// provide a Snapshot clone, but all shallow exports and verification
+    /// imports happen after the handoff on the publisher worker. This function
+    /// never mutates the source document or publishes a generation.
+    pub(crate) fn build_policy_compact_accepted_document(
+        catalog_document_id: DocumentId,
+        cutoff_state_digest: ContentDigest,
+        dependencies: DocumentDependencies,
+        document: &LoroDoc,
+        eligible_through: u64,
+        policy: super::checkpoint_floor_policy::FloorPolicyConfig,
+        candidates: impl IntoIterator<Item = (u64, loro::Frontiers)>,
+    ) -> Result<PolicyCompactAcceptedDocument, EngineError> {
         let decision = super::checkpoint_floor_policy::choose_loro_floor(
             policy,
             eligible_through,
-            &document,
+            document,
             candidates,
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -8274,13 +8415,211 @@ impl ShardedHotEngine {
                 &chosen.checkpoint
             }
         };
-        let restored =
-            qualify_compact_document(self.catalog_document_id, &dependencies, checkpoint)?;
-        verify_compact_document_equivalence(&document, &restored)?;
+        let restored = qualify_compact_document(catalog_document_id, &dependencies, checkpoint)?;
+        verify_compact_document_equivalence(document, &restored)?;
         Ok(PolicyCompactAcceptedDocument {
-            cutoff_state_digest: cutoff.frontier().state_digest(),
+            cutoff_state_digest,
             dependencies,
             decision,
+        })
+    }
+
+    /// Materialize one changed document on the checkpoint worker. Resident
+    /// documents arrive as actor-created Snapshot handoffs; evicted and
+    /// bootstrap-only documents are reconstructed directly from immutable
+    /// genesis plus accepted archive ancestry. Unchanged documents never call
+    /// this function.
+    pub(crate) fn materialize_checkpoint_worker_document(
+        capture: &CleanCheckpointDocumentCapture,
+        store: &ObjectStore,
+        document_id: DocumentId,
+        predecessor: Option<(u64, DocumentDependencies, LoroDoc)>,
+        accepted_rows: &[CleanCheckpointAcceptedRow],
+    ) -> Result<CheckpointWorkerDocument, EngineError> {
+        let dependencies = capture
+            .dependencies
+            .get(&document_id)
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        if let Some(snapshot) = capture
+            .changed_snapshots
+            .get(&document_id)
+            .and_then(Option::as_ref)
+        {
+            let document = LoroDoc::new();
+            import_complete(document_id, &document, std::slice::from_ref(snapshot))?;
+            if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+                return Err(EngineError::FrontierVectorMismatch(document_id));
+            }
+            return Ok(CheckpointWorkerDocument {
+                document,
+                imported_handoff: true,
+                imported_predecessor_image: false,
+                reconstructed: false,
+            });
+        }
+
+        if let Some((predecessor_sequence, predecessor_dependencies, document)) = predecessor {
+            if predecessor_dependencies.document_id() != document_id {
+                return Err(EngineError::MissingDocument(document_id));
+            }
+            let mut updates = Vec::new();
+            for row in accepted_rows.iter().filter(|row| {
+                row.evidence.acceptance_sequence() > predecessor_sequence
+                    && row
+                        .evidence
+                        .affected_documents()
+                        .iter()
+                        .any(|affected| affected.document_id() == document_id)
+            }) {
+                let batch_id = row.evidence.batch_id();
+                let validated = match store
+                    .inspect_batch_with_cold_history(batch_id)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?
+                {
+                    BatchInspection::Ready(validated) => validated,
+                    BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                        return Err(EngineError::MissingDependency(batch_id));
+                    }
+                };
+                let manifest = validated.manifest();
+                if ContentDigest::of(
+                    &manifest
+                        .encode()
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                ) != row.evidence.manifest_fingerprint()
+                {
+                    return Err(EngineError::Archive(format!(
+                        "checkpoint suffix manifest fingerprint differs for {batch_id}"
+                    )));
+                }
+                if manifest.lineage_digest() != capture.lazy_genesis.lineage_digest() {
+                    return Err(EngineError::LineageMismatch {
+                        expected: capture.lazy_genesis.lineage_digest(),
+                        found: manifest.lineage_digest(),
+                    });
+                }
+                let object = validated
+                    .objects()
+                    .iter()
+                    .find(|object| {
+                        object.kind() == ObjectKind::CrdtUpdate
+                            && object.document_id() == document_id
+                    })
+                    .ok_or(EngineError::MissingDocument(document_id))?;
+                updates.push(
+                    decode_crdt_update_payload(batch_id, document_id, object.payload())?.raw_update,
+                );
+            }
+            import_complete(document_id, &document, &updates)?;
+            if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+                return Err(EngineError::FrontierVectorMismatch(document_id));
+            }
+            if document_id == capture.catalog_document_id {
+                validate_catalog(capture.catalog_document_id, &document)?;
+            } else {
+                validate_shard(capture.catalog_document_id, document_id, &document)?;
+            }
+            return Ok(CheckpointWorkerDocument {
+                document,
+                imported_handoff: false,
+                imported_predecessor_image: true,
+                reconstructed: true,
+            });
+        }
+
+        let direct_heads = dependencies
+            .direct_dependency_heads()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut ancestry = BTreeMap::new();
+        let mut stack = direct_heads.iter().copied().collect::<Vec<_>>();
+        while let Some(batch_id) = stack.pop() {
+            if ancestry.contains_key(&batch_id) {
+                continue;
+            }
+            let validated = match store
+                .inspect_batch_with_cold_history(batch_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+            {
+                BatchInspection::Ready(validated) => validated,
+                BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                    return Err(EngineError::MissingDependency(batch_id));
+                }
+            };
+            let manifest = validated.manifest();
+            if manifest.lineage_digest() != capture.lazy_genesis.lineage_digest() {
+                return Err(EngineError::LineageMismatch {
+                    expected: capture.lazy_genesis.lineage_digest(),
+                    found: manifest.lineage_digest(),
+                });
+            }
+            let parents = declared_batch_heads(manifest.dependency_frontier());
+            if parents.contains(&batch_id) {
+                return Err(EngineError::SelfDependency(batch_id));
+            }
+            stack.extend(parents);
+            ancestry.insert(batch_id, validated);
+        }
+        let ancestry_manifests = ancestry
+            .iter()
+            .map(|(batch_id, validated)| (*batch_id, validated.manifest().clone()))
+            .collect();
+        validate_maximal_document_heads(
+            &FrontierV2::new(vec![dependencies.clone()])?,
+            &ancestry_manifests,
+        )?;
+        let baseline = if document_id == capture.catalog_document_id {
+            Some(
+                capture
+                    .lazy_genesis
+                    .catalog_checkpoint()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            )
+        } else {
+            capture
+                .lazy_genesis
+                .document_checkpoint(document_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        };
+        let document = LoroDoc::new();
+        if let Some(baseline) = baseline {
+            import_complete(document_id, &document, &[baseline])?;
+        }
+        let mut updates = Vec::new();
+        for (batch_id, validated) in ancestry {
+            let manifest = validated.manifest();
+            if !manifest.required_objects().iter().any(|descriptor| {
+                descriptor.kind() == ObjectKind::CrdtUpdate
+                    && descriptor.document_id() == document_id
+            }) {
+                continue;
+            }
+            let object = validated
+                .objects()
+                .iter()
+                .find(|object| {
+                    object.kind() == ObjectKind::CrdtUpdate && object.document_id() == document_id
+                })
+                .ok_or(EngineError::MissingDocument(document_id))?;
+            updates.push(
+                decode_crdt_update_payload(batch_id, document_id, object.payload())?.raw_update,
+            );
+        }
+        import_complete(document_id, &document, &updates)?;
+        if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+            return Err(EngineError::FrontierVectorMismatch(document_id));
+        }
+        if document_id == capture.catalog_document_id {
+            validate_catalog(capture.catalog_document_id, &document)?;
+        } else {
+            validate_shard(capture.catalog_document_id, document_id, &document)?;
+        }
+        Ok(CheckpointWorkerDocument {
+            document,
+            imported_handoff: false,
+            imported_predecessor_image: false,
+            reconstructed: true,
         })
     }
 
@@ -8318,18 +8657,58 @@ impl ShardedHotEngine {
             );
         }
 
-        let encode_documents = |documents: &BTreeMap<DocumentId, LoroDoc>| {
-            documents
-                .iter()
-                .map(|(document_id, document)| {
+        let published_documents = self
+            .clean_checkpoint_publisher
+            .as_ref()
+            .filter(|publisher| publisher.durable_sequence() == durable_sequence)
+            .map(|publisher| publisher.published_document_dependencies())
+            .unwrap_or_default();
+        let mut checkpoint_document_ids = self
+            .current_path_catalog
+            .rows
+            .values()
+            .map(|row| row.home_document_id)
+            .collect::<BTreeSet<_>>();
+        if self
+            .accepted_frontier
+            .contains_key(&self.catalog_document_id)
+        {
+            checkpoint_document_ids.insert(self.catalog_document_id);
+        }
+        let checkpoint_dependencies = checkpoint_document_ids
+            .into_iter()
+            .map(|document_id| {
+                self.accepted_frontier
+                    .get(&document_id)
+                    .cloned()
+                    .map(|dependencies| (document_id, dependencies))
+                    .ok_or(EngineError::MissingDocument(document_id))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let spare_documents = self.spare_documents.borrow();
+        let mut changed_snapshots = BTreeMap::new();
+        for (document_id, dependencies) in &checkpoint_dependencies {
+            if published_documents.get(document_id) == Some(dependencies) {
+                continue;
+            }
+            let resident = self
+                .visible_documents
+                .get(document_id)
+                .or_else(|| spare_documents.get(document_id));
+            let snapshot = resident
+                .map(|document| {
                     document
                         .export(ExportMode::Snapshot)
-                        .map(|bytes| (*document_id, bytes))
                         .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
                 })
-                .collect::<Result<BTreeMap<_, _>, _>>()
-        };
-        let state = CleanCheckpointStateV1 {
+                .transpose()?;
+            changed_snapshots.insert(*document_id, snapshot);
+        }
+        drop(spare_documents);
+        let lazy_genesis = self.lazy_genesis.as_ref().cloned().ok_or_else(|| {
+            EngineError::Archive("clean checkpoint capture has no immutable genesis".into())
+        })?;
+        let state = CleanCheckpointStateV5 {
             schema_version: CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION,
             workspace_id: self.workspace_id,
             lineage_digest: self.lineage_digest,
@@ -8353,10 +8732,31 @@ impl ShardedHotEngine {
                 .map_err(|error| EngineError::Archive(error.to_string()))?,
             page_name_conflicts: self.page_name_conflicts.clone(),
             reference_catalog_policy: self.reference_catalog_policy.clone(),
-            visible_documents: encode_documents(&self.visible_documents)?,
-            spare_documents: encode_documents(&self.spare_documents.borrow())?,
-            visible_document_lru: self.visible_document_lru.clone(),
-            visible_document_heads: self.visible_document_heads.clone(),
+            visible_documents: self
+                .visible_documents
+                .keys()
+                .filter(|id| checkpoint_dependencies.contains_key(id))
+                .copied()
+                .collect(),
+            spare_documents: self
+                .spare_documents
+                .borrow()
+                .keys()
+                .filter(|id| checkpoint_dependencies.contains_key(id))
+                .copied()
+                .collect(),
+            visible_document_lru: self
+                .visible_document_lru
+                .iter()
+                .filter(|id| checkpoint_dependencies.contains_key(id))
+                .copied()
+                .collect(),
+            visible_document_heads: self
+                .visible_document_heads
+                .iter()
+                .filter(|(id, _)| checkpoint_dependencies.contains_key(id))
+                .map(|(id, heads)| (*id, heads.clone()))
+                .collect(),
             accepted_frontier: self.accepted_frontier.clone(),
             accepted_frontier_root: self.accepted_frontier_root.clone(),
             clean_projection_head_batches: self.clean_projection_head_batches.clone(),
@@ -8398,6 +8798,13 @@ impl ShardedHotEngine {
             accepted_rows,
             required_objects,
             capture_work,
+            documents: Some(CleanCheckpointDocumentCapture {
+                cutoff_state_digest: self.accepted_frontier_root.state_digest(),
+                catalog_document_id: self.catalog_document_id,
+                dependencies: checkpoint_dependencies,
+                changed_snapshots,
+                lazy_genesis,
+            }),
         })
     }
 
@@ -8408,6 +8815,7 @@ impl ShardedHotEngine {
         state_bytes: &[u8],
         accepted_rows: Vec<CleanCheckpointAcceptedRow>,
         required_objects: BTreeSet<ContentDigest>,
+        checkpoint_documents: Arc<super::checkpoint_generation::CleanCheckpointDocuments>,
     ) -> Result<(), EngineError> {
         if self.lazy_genesis.is_none()
             || self.archive_store.is_none()
@@ -8418,7 +8826,7 @@ impl ShardedHotEngine {
                 "clean checkpoint restore requires an index-free sequence-zero baseline".into(),
             ));
         }
-        let (state, trailing): (CleanCheckpointStateV1, &[u8]) =
+        let (state, trailing): (CleanCheckpointStateV5, &[u8]) =
             postcard::take_from_bytes(state_bytes)
                 .map_err(|error| EngineError::Archive(error.to_string()))?;
         if !trailing.is_empty()
@@ -8439,12 +8847,17 @@ impl ShardedHotEngine {
             &state.ephemeral_page_names,
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let decode_documents = |encoded: &BTreeMap<DocumentId, Vec<u8>>| {
+        let decode_documents = |encoded: &BTreeSet<DocumentId>| {
             encoded
                 .iter()
-                .map(|(document_id, bytes)| {
-                    let document = LoroDoc::new();
-                    import_complete(*document_id, &document, std::slice::from_ref(bytes))?;
+                .map(|document_id| {
+                    let (dependencies, document) = checkpoint_documents
+                        .load_document(self.catalog_document_id, *document_id)
+                        .map_err(EngineError::Archive)?
+                        .ok_or(EngineError::MissingDocument(*document_id))?;
+                    if state.accepted_frontier.get(document_id) != Some(&dependencies) {
+                        return Err(EngineError::FrontierVectorMismatch(*document_id));
+                    }
                     document.set_peer_id(1).map_err(loro_error)?;
                     self.validate_lazy_genesis_document(*document_id, &document)?;
                     Ok((*document_id, document))
@@ -8453,6 +8866,20 @@ impl ShardedHotEngine {
         };
         let visible_documents = decode_documents(&state.visible_documents)?;
         let spare_documents = decode_documents(&state.spare_documents)?;
+        let mut checkpoint_document_ids = state
+            .current_path_rows
+            .values()
+            .map(|row| row.home_document_id)
+            .collect::<BTreeSet<_>>();
+        if state
+            .accepted_frontier
+            .contains_key(&self.catalog_document_id)
+        {
+            checkpoint_document_ids.insert(self.catalog_document_id);
+        }
+        checkpoint_documents
+            .qualify_complete(checkpoint_document_ids.into_iter())
+            .map_err(EngineError::Archive)?;
         if state.current_path_frontier_root != state.accepted_frontier_root {
             return Err(EngineError::Archive(
                 "clean checkpoint current-path frontier is stale".into(),
@@ -8606,6 +9033,7 @@ impl ShardedHotEngine {
         self.clean_checkpoint_causal_dots = causal_dots;
         self.clean_checkpoint_required_objects = required_objects;
         self.clean_checkpoint_required_objects_by_sequence.clear();
+        self.checkpoint_documents = Some(checkpoint_documents);
         self.ephemeral_accepted_batch_entries = accepted_batch_entries;
         self.ephemeral_accepted_document_root = accepted_document_root;
         self.ephemeral_accepted_batch_root = accepted_batch_root;
@@ -23344,13 +23772,18 @@ impl ShardedHotEngine {
                 // direct heads from the authoritative accepted frontier so a
                 // cold point load cannot silently fall back to lazy genesis
                 // after this page has already been edited.
-                let heads = self.document_dependency_heads(document_id, false)?;
-                let document = if heads.is_empty() {
-                    self.lazy_genesis_document(document_id, peer)?
-                        .unwrap_or_else(LoroDoc::new)
-                } else {
-                    self.reconstruct_document_from_heads(document_id, false)?
-                };
+                let document =
+                    if let Some(document) = self.checkpoint_document_at_current(document_id)? {
+                        document
+                    } else {
+                        let heads = self.document_dependency_heads(document_id, false)?;
+                        if heads.is_empty() {
+                            self.lazy_genesis_document(document_id, peer)?
+                                .unwrap_or_else(LoroDoc::new)
+                        } else {
+                            self.reconstruct_document_from_heads(document_id, false)?
+                        }
+                    };
                 document.set_peer_id(peer).map_err(loro_error)?;
                 Ok(document)
             }
@@ -23707,6 +24140,68 @@ impl ShardedHotEngine {
             .unwrap_or_else(LoroDoc::new);
         import_complete(document_id, &document, &updates)?;
         Ok(document)
+    }
+
+    /// Resolve the selected checkpoint image and only the accepted suffix that
+    /// changed this document. A post-eviction load therefore has the same
+    /// image-first behavior as reopen; it never falls back to sequence-zero
+    /// replay while a valid image exists.
+    fn checkpoint_document_at_current(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Option<LoroDoc>, EngineError> {
+        let loaded = match self.clean_checkpoint_publisher.as_ref() {
+            Some(publisher) => publisher
+                .load_current_document(self.catalog_document_id, document_id)
+                .map_err(EngineError::Archive)?,
+            None => self
+                .checkpoint_documents
+                .as_ref()
+                .map(|images| {
+                    images
+                        .load_document(self.catalog_document_id, document_id)
+                        .map(|loaded| {
+                            loaded.map(|(dependencies, document)| {
+                                (images.sequence(), dependencies, document)
+                            })
+                        })
+                })
+                .transpose()
+                .map_err(EngineError::Archive)?
+                .flatten(),
+        };
+        let Some((image_sequence, image_dependencies, document)) = loaded else {
+            return Ok(None);
+        };
+        let target = self
+            .accepted_frontier_document(&self.accepted_frontier_root, document_id)?
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        if image_dependencies == target {
+            return Ok(Some(document));
+        }
+        let mut updates = Vec::new();
+        for sequence in image_sequence.saturating_add(1)..=self.next_acceptance_sequence {
+            let row = self.clean_checkpoint_accepted_row(sequence)?;
+            if !row
+                .evidence
+                .affected_documents()
+                .iter()
+                .any(|dependencies| dependencies.document_id() == document_id)
+            {
+                continue;
+            }
+            let batch_id = row.evidence.batch_id();
+            let manifest = self.load_observed_manifest(batch_id)?;
+            let object = self.load_archive_document_object(batch_id, &manifest, document_id)?;
+            updates.push(
+                decode_crdt_update_payload(batch_id, document_id, object.payload())?.raw_update,
+            );
+        }
+        import_complete(document_id, &document, &updates)?;
+        if canonical_peer_counters(&document.oplog_vv())? != target.peer_counters() {
+            return Err(EngineError::FrontierVectorMismatch(document_id));
+        }
+        Ok(Some(document))
     }
 
     fn collect_batch_ancestry(
@@ -34268,13 +34763,14 @@ pub(crate) mod validation_tests {
             .expect("the hot-engine production half remains identifiable");
         // Writer-lane ownership moved this schema to 3. Returning the section
         // to one catalog plus page shards, keyed by 16-byte document ids,
-        // moved it to 4 so a per-block (P4) state can never decode as this one.
+        // moved it to 4. Replacing inline resident bytes with v2 image roster
+        // references moved it to 5, so neither older shape can decode as this.
         assert_eq!(
-            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 4,
-            "adding writer-lane ownership to the checkpoint state changes its schema"
+            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 5,
+            "changing the checkpoint state representation changes its schema"
         );
         let state_start = source
-            .find("struct CleanCheckpointStateV1 {")
+            .find("struct CleanCheckpointStateV5 {")
             .expect("checkpoint state section remains present");
         let state_end = source[state_start..]
             .find("\n}\n")

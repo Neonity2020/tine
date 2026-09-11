@@ -11375,13 +11375,19 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
     assert_eq!(block_on_b(y1).content, "restored then edited");
     assert!(engine.crdt_lane_owner(lane).is_some());
 
-    let capture = engine.capture_clean_checkpoint(0).unwrap();
+    engine.wait_for_clean_checkpoint_for_test().unwrap();
+    let store = ObjectStore::open(&archive_path, ids.workspace).unwrap();
+    let loaded = match crate::oplog::checkpoint_generation::open_checkpoint(&store).unwrap() {
+        crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded) => loaded,
+        _ => panic!("live checkpoint was not published"),
+    };
     let mut restored = open();
     restored
         .restore_clean_checkpoint(
-            &capture.state_bytes,
-            capture.accepted_rows,
-            capture.required_objects,
+            &loaded.state_bytes,
+            loaded.accepted_rows,
+            loaded.required_objects,
+            Arc::clone(&loaded.documents),
         )
         .unwrap();
     let mut replayed = open();

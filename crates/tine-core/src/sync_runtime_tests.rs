@@ -8014,7 +8014,7 @@ fn deleted_and_visible_pages_project_only_the_visible_edit_and_replay() {
 }
 
 #[test]
-fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
+fn checkpoint_image_materialization_avoids_baseline_capsule_decode() {
     for (case, blocks) in [("small", 8_usize), ("larger", 64_usize)] {
         let fixture = ActivationFixture::empty(
             &format!("baseline-page-read-{case}"),
@@ -8041,7 +8041,7 @@ fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
             .unwrap()
             .expect("baseline read fixture reopens");
         let managed_path = ManagedPath::parse(path.to_owned()).unwrap();
-        let page_id = resources
+        let page_row = resources
             .runtime
             .database()
             .materialized_read()
@@ -8049,16 +8049,23 @@ fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
             .pages_by_path(&managed_path, 2)
             .unwrap()
             .pop()
-            .expect("reopened projection contains the baseline page")
-            .page_id;
+            .expect("reopened projection contains the baseline page");
+        let page_id = page_row.page_id;
         let engine = resources.runtime.engine();
+        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        assert!(
+            engine
+                .has_checkpoint_image_for_test(page_row.home_document_id)
+                .unwrap(),
+            "the v2 manifest must name every baseline page document"
+        );
         let before = engine.lazy_genesis_page_capsule_decodes_for_test();
         let first = engine.materialize_page(page_id).unwrap();
         let after_first = engine.lazy_genesis_page_capsule_decodes_for_test();
         assert_eq!(
             after_first - before,
-            1,
-            "one top-level materialization must decode one baseline capsule for {blocks} blocks"
+            0,
+            "image-backed materialization must not decode a baseline capsule for {blocks} blocks"
         );
         assert_eq!(first.blocks.len(), blocks);
         assert!(first.blocks.iter().enumerate().all(|(index, block)| {
@@ -8081,14 +8088,14 @@ fn lazy_genesis_materialization_decodes_one_baseline_capsule_per_scope() {
         let second = engine.materialize_page(page_id).unwrap();
         let after_second = engine.lazy_genesis_page_capsule_decodes_for_test();
         eprintln!(
-            "baseline page read case={case} blocks={blocks} first_scope_decodes={} second_scope_decodes={}",
+            "checkpoint image read case={case} blocks={blocks} first_baseline_decodes={} second_baseline_decodes={}",
             after_first - before,
             after_second - after_first
         );
         assert_eq!(
             after_second - after_first,
-            1,
-            "a subsequent top-level materialization must begin a fresh read scope"
+            0,
+            "a subsequent image-backed materialization must still avoid baseline decoding"
         );
         assert_eq!(
             second
@@ -10576,7 +10583,7 @@ fn clean_and_checkpoint_reopens_continue_one_persistent_writer_lane() {
     // and the acknowledged journal are preserved; the fixture removes only the
     // derived checkpoint directory while no runtime holds it (D-3).
     let checkpoint_directory = clean_operation_archive_directory(&fixture.request.archive_root)
-        .join("clean-open-checkpoint-v1");
+        .join("clean-open-checkpoint-v2");
     if checkpoint_directory.exists() {
         fs::remove_dir_all(&checkpoint_directory).unwrap();
     }
@@ -11332,7 +11339,7 @@ fn checkpoint_open_matches_sequence_zero_replay_over_generated_crash_histories()
         drop(checkpoint_open);
 
         let checkpoint_directory = clean_operation_archive_directory(&fixture.request.archive_root)
-            .join("clean-open-checkpoint-v1");
+            .join("clean-open-checkpoint-v2");
         fs::remove_dir_all(checkpoint_directory).unwrap();
         let mut replay_counters = None;
         let replay_open =
@@ -11425,7 +11432,7 @@ fn corrupt_checkpoint_payload_is_discarded_for_total_full_replay() {
     drop(handle);
 
     let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
-        .join("clean-open-checkpoint-v1");
+        .join("clean-open-checkpoint-v2");
     for payload in ["payload-a", "payload-b"] {
         let path = checkpoint.join(payload);
         if path.exists() {
@@ -11473,7 +11480,7 @@ fn corrupt_checkpoint_pointer_and_generation_each_force_total_full_replay() {
         drop(handle);
 
         let checkpoint = clean_operation_archive_directory(&fixture.request.archive_root)
-            .join("clean-open-checkpoint-v1");
+            .join("clean-open-checkpoint-v2");
         match damage {
             "pointer" => fs::write(checkpoint.join("current"), b"bit-flipped pointer").unwrap(),
             "generation" => {

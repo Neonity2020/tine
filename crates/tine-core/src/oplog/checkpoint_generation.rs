@@ -12,14 +12,16 @@ use sealed_document_map::SealedDocumentMap;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
 
 use super::hot_engine::{
     AcceptedBatchEvidence, AcceptedFrontierRoot, CleanCheckpointAcceptedRow,
-    CleanCheckpointCapture, CompactAcceptedDocument, ACCEPTED_EVIDENCE_SCHEMA_VERSION,
+    CleanCheckpointCapture, CompactAcceptedDocument, PolicyCompactAcceptedDocument,
+    ACCEPTED_EVIDENCE_SCHEMA_VERSION,
 };
 use super::object_store::ObjectStore;
 use super::{
@@ -28,13 +30,42 @@ use super::{
 };
 use tine_storage::sealed_accepted_index::AuthenticatedMapKey;
 
-const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
-const CHECKPOINT_DIRECTORY: &str = "clean-open-checkpoint-v1";
+const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_DIRECTORY: &str = "clean-open-checkpoint-v2";
 const CHECKPOINT_POINTER: &str = "current";
 const CHECKPOINT_PAYLOAD_NAMES: [&str; 2] = ["payload-a", "payload-b"];
 const CHECKPOINT_GENERATION_NAMES: [&str; 2] = ["generation-a", "generation-b"];
 const MAX_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
+const CHECKPOINT_CLEANUP_ENTRY_HEADROOM: usize = 1024;
+
+/// The acceptance-age eligibility the LIVE capture path hands the floor policy.
+///
+/// Zero is not a placeholder value that happens to work: it is the whole reason
+/// the policy cannot yet move a floor. `choose_floor` may only advance to a
+/// candidate at or below `eligible_through`, so with zero eligibility and an
+/// empty candidate set every live call returns `Keep`, and a v2 image keeps the
+/// native floor it was exported with. The policy is therefore WIRED but INERT.
+///
+/// `docs/storage-sync-contract.md` states this as a contract fact ("The current
+/// live policy supplies E=0"), and
+/// `the_live_floor_call_is_inert_and_says_so` pins the two together, because a
+/// load-bearing value asserted only in prose drifts silently.
+///
+/// A later Packet 3 slice makes acceptance age observable and persistent and
+/// passes a real E here. When it does, that test fails ON PURPOSE: delete it,
+/// delete this constant, and update the contract sentence in the SAME commit.
+/// Do not keep the name while passing a real value -- that is the exact shape
+/// of a comment that outlives its truth.
+const LIVE_FLOOR_ELIGIBILITY_DISABLED: u64 = 0;
 pub(crate) const CLEAN_CHECKPOINT_LAG_MAX: u64 = 64;
+
+static ACTIVE_CHECKPOINT_READERS: OnceLock<
+    Mutex<BTreeMap<PathBuf, Vec<Weak<CheckpointReaderPin>>>>,
+> = OnceLock::new();
+
+struct CheckpointReaderPin {
+    object_names: BTreeSet<String>,
+}
 
 #[cfg(test)]
 static FAIL_CHECKPOINT_WRITE_ROOTS: Mutex<BTreeSet<std::path::PathBuf>> =
@@ -573,6 +604,42 @@ impl SealedDocumentRoster {
         Ok(Self { map })
     }
 
+    fn with_policy_document(
+        self,
+        store: &mut SealedGenerationStagingStore,
+        cutoff_state_digest: ContentDigest,
+        compact: &PolicyCompactAcceptedDocument,
+    ) -> Result<Self, String> {
+        if compact.cutoff_state_digest() != cutoff_state_digest {
+            return Err("generation image belongs to another accepted cutoff".into());
+        }
+        let checkpoint = store.stage_capsule_blob(compact.checkpoint())?;
+        let record = DocumentCapsuleRecord {
+            schema: DOCUMENT_CAPSULE_SCHEMA,
+            dependencies: compact.dependencies().clone(),
+            checkpoint,
+        };
+        let record_blob = store.stage_capsule_blob(&record.encode()?)?;
+        let map = self.map.upsert(
+            store,
+            super::DocumentKey::Entity(record.dependencies.document_id()),
+            ContentDigest::from_bytes(*record_blob.sha256()),
+        )?;
+        Ok(Self { map })
+    }
+
+    fn without_document(
+        self,
+        store: &mut SealedGenerationStagingStore,
+        document: DocumentId,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            map: self
+                .map
+                .remove(store, super::DocumentKey::Entity(document))?,
+        })
+    }
+
     pub(crate) fn load_document(
         self,
         store: &SealedGenerationDirectory,
@@ -601,6 +668,24 @@ impl SealedDocumentRoster {
         self.map.count()
     }
 
+    fn from_root(root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1) -> Self {
+        Self {
+            map: SealedDocumentMap::from_root(root),
+        }
+    }
+
+    fn root(self) -> tine_storage::sealed_accepted_index::AuthenticatedMapRootV1 {
+        self.map.root()
+    }
+
+    fn document_reference(
+        self,
+        store: &SealedGenerationDirectory,
+        document: DocumentId,
+    ) -> Result<Option<ContentDigest>, String> {
+        self.map.value(store, super::DocumentKey::Entity(document))
+    }
+
     pub(crate) fn inherited_dependencies(
         self,
         store: &SealedGenerationStagingStore,
@@ -612,6 +697,18 @@ impl SealedDocumentRoster {
         Ok(self
             .document_record(&store.reader, document)?
             .map(|record| record.dependencies))
+    }
+
+    fn load_staged_document(
+        self,
+        store: &SealedGenerationStagingStore,
+        catalog: DocumentId,
+        document: DocumentId,
+    ) -> Result<Option<(DocumentDependencies, loro::LoroDoc)>, String> {
+        if store.failed {
+            return Err("sealed generation staging previously failed".into());
+        }
+        self.load_document(&store.reader, catalog, document)
     }
 
     fn document_record(
@@ -774,18 +871,37 @@ fn roots_from_wire(
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckpointPayloadV1 {
+struct CheckpointPayloadV2 {
     schema_version: u32,
     state_bytes: Vec<u8>,
     sealed_objects: BTreeMap<(u8, ContentDigest), Vec<u8>>,
     roster_roots: RosterRootsWire,
     required_objects: Vec<ContentDigest>,
     capture_work: u64,
+    document_roster: MapRootWire,
+    image_work: CheckpointImageWork,
+    document_dependencies: Vec<DocumentDependencies>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointImageWork {
+    pub(crate) changed_documents: u64,
+    pub(crate) exported_documents: u64,
+    pub(crate) reused_documents: u64,
+    pub(crate) snapshot_handoff_imports: u64,
+    pub(crate) changed_predecessor_image_imports: u64,
+    pub(crate) changed_document_reconstructions: u64,
+    pub(crate) unchanged_image_imports: u64,
+    pub(crate) unchanged_image_reconstructions: u64,
+    pub(crate) measurement_exports: u64,
+    pub(crate) candidate_exports: u64,
+    pub(crate) verification_imports: u64,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckpointGenerationV1 {
+struct CheckpointGenerationV2 {
     schema_version: u32,
     sequence: u64,
     slot: u8,
@@ -795,7 +911,7 @@ struct CheckpointGenerationV1 {
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CheckpointPointerV1 {
+struct CheckpointPointerV2 {
     schema_version: u32,
     sequence: u64,
     slot: u8,
@@ -1012,7 +1128,8 @@ impl<Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore>
 }
 
 /// One conversion from engine acceptance evidence to the shared sealed formats.
-/// Both the disposable checkpoint and inert generation builder call this writer.
+/// Both the live disposable checkpoint and the construction oracle call this
+/// writer.
 fn append_accepted_row<
     Store: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore,
 >(
@@ -1089,12 +1206,24 @@ fn append_accepted_row<
     Ok(roots)
 }
 
-fn build_payload(
+fn build_payload_with_images(
     capture: CleanCheckpointCapture,
-    predecessor: Option<(u64, CheckpointPayloadV1)>,
+    predecessor: Option<(u64, CheckpointPayloadV2)>,
+    document_roster: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+    image_work: CheckpointImageWork,
 ) -> Result<(u64, Vec<u8>), String> {
     use tine_storage::sealed_accepted_index::{AcceptedSequenceRootV2, AuthenticatedMapRootV1};
 
+    let document_dependencies = capture
+        .documents
+        .as_ref()
+        .map(|documents| documents.dependencies.values().cloned().collect())
+        .or_else(|| {
+            predecessor
+                .as_ref()
+                .map(|(_, payload)| payload.document_dependencies.clone())
+        })
+        .unwrap_or_default();
     let (mut store, mut batch_map, mut status_map, mut sequence_root, mut required_objects) =
         match predecessor {
             Some((sequence, payload)) => {
@@ -1189,7 +1318,7 @@ fn build_payload(
     drop(reader);
     drop(recorder);
     store.retain_only(&reachable);
-    let payload = CheckpointPayloadV1 {
+    let payload = CheckpointPayloadV2 {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         state_bytes: capture.state_bytes,
         sealed_objects: store.objects,
@@ -1204,8 +1333,34 @@ fn build_payload(
         },
         required_objects: required_objects.into_iter().collect(),
         capture_work: capture.capture_work,
+        document_roster: map_root_to_wire(document_roster),
+        image_work,
+        document_dependencies,
     };
     Ok((sequence, encode_canonical(&payload)?))
+}
+
+/// Payload-only construction used by the publication primitive tests. Live
+/// capture first publishes its immutable document objects and calls the inner
+/// constructor with their qualified roster root.
+fn build_payload(
+    capture: CleanCheckpointCapture,
+    predecessor: Option<(u64, CheckpointPayloadV2)>,
+) -> Result<(u64, Vec<u8>), String> {
+    if capture.documents.is_some() {
+        return Err("live checkpoint payload requires published document images".into());
+    }
+    let document_roster = predecessor
+        .as_ref()
+        .map(|(_, payload)| map_root_from_wire(payload.document_roster.clone()))
+        .transpose()?
+        .unwrap_or_else(tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty);
+    build_payload_with_images(
+        capture,
+        predecessor,
+        document_roster,
+        CheckpointImageWork::default(),
+    )
 }
 
 fn checkpoint_directory(store: &ObjectStore) -> Result<cap_std::fs::Dir, String> {
@@ -1219,7 +1374,7 @@ fn checkpoint_directory(store: &ObjectStore) -> Result<cap_std::fs::Dir, String>
 
 fn read_current_payload_for_extension(
     store: &ObjectStore,
-) -> Result<Option<(u64, CheckpointPayloadV1)>, String> {
+) -> Result<Option<(u64, CheckpointPayloadV2)>, String> {
     let directory = checkpoint_directory(store)?;
     let Some(pointer_bytes) =
         tine_storage::read_optional_regular(&directory, CHECKPOINT_POINTER, 4 * 1024, None)
@@ -1227,7 +1382,7 @@ fn read_current_payload_for_extension(
     else {
         return Ok(None);
     };
-    let pointer: CheckpointPointerV1 = decode_canonical(&pointer_bytes)?;
+    let pointer: CheckpointPointerV2 = decode_canonical(&pointer_bytes)?;
     if pointer.schema_version != CHECKPOINT_SCHEMA_VERSION || pointer.slot >= 2 {
         return Err("clean checkpoint predecessor pointer is invalid".into());
     }
@@ -1243,7 +1398,7 @@ fn read_current_payload_for_extension(
     if ContentDigest::of(&generation_bytes) != pointer.generation_digest {
         return Err("clean checkpoint predecessor generation digest differs".into());
     }
-    let generation: CheckpointGenerationV1 = decode_canonical(&generation_bytes)?;
+    let generation: CheckpointGenerationV2 = decode_canonical(&generation_bytes)?;
     if generation.schema_version != CHECKPOINT_SCHEMA_VERSION
         || generation.slot != pointer.slot
         || generation.sequence != pointer.sequence
@@ -1261,7 +1416,7 @@ fn read_current_payload_for_extension(
     if ContentDigest::of(&payload_bytes) != generation.payload_digest {
         return Err("clean checkpoint predecessor payload digest differs".into());
     }
-    let payload: CheckpointPayloadV1 = decode_canonical(&payload_bytes)?;
+    let payload: CheckpointPayloadV2 = decode_canonical(&payload_bytes)?;
     if payload.schema_version != CHECKPOINT_SCHEMA_VERSION {
         return Err("clean checkpoint predecessor payload schema differs".into());
     }
@@ -1287,7 +1442,295 @@ fn install_replaceable_exact(
     }
 }
 
-fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Result<u64, String> {
+fn publish_document_images(
+    directory: &cap_std::fs::Dir,
+    store: &ObjectStore,
+    capture: &super::hot_engine::CleanCheckpointDocumentCapture,
+    accepted_rows: &[CleanCheckpointAcceptedRow],
+    predecessor: Option<&(u64, CheckpointPayloadV2)>,
+) -> Result<
+    (
+        tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+        CheckpointImageWork,
+    ),
+    String,
+> {
+    let predecessor_sequence = predecessor.map(|(sequence, _)| *sequence);
+    let predecessor_payload = predecessor.map(|(_, payload)| payload);
+    let predecessor_root = predecessor_payload
+        .map(|payload| map_root_from_wire(payload.document_roster.clone()))
+        .transpose()?
+        .unwrap_or_else(tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty);
+    let predecessor_roster = SealedDocumentRoster::from_root(predecessor_root);
+    let mut roster = predecessor_roster;
+    let mut staging = SealedGenerationStagingStore::open(directory)?;
+    let mut work = CheckpointImageWork::default();
+    if let Some(predecessor_payload) = predecessor_payload {
+        for dependencies in &predecessor_payload.document_dependencies {
+            if !capture
+                .dependencies
+                .contains_key(&dependencies.document_id())
+            {
+                roster = roster.without_document(&mut staging, dependencies.document_id())?;
+            }
+        }
+    }
+    for (document_id, dependencies) in &capture.dependencies {
+        if predecessor_roster
+            .inherited_dependencies(&staging, *document_id)?
+            .as_ref()
+            == Some(dependencies)
+        {
+            work.reused_documents = work.reused_documents.saturating_add(1);
+            continue;
+        }
+        if !capture.changed_snapshots.contains_key(document_id) {
+            return Err(format!(
+                "changed checkpoint document {document_id} has no fenced worker input"
+            ));
+        }
+        work.changed_documents = work.changed_documents.saturating_add(1);
+        let predecessor_document = capture
+            .changed_snapshots
+            .get(document_id)
+            .is_some_and(Option::is_none)
+            .then_some(predecessor_sequence)
+            .flatten()
+            .map(|sequence| {
+                predecessor_roster
+                    .load_staged_document(&staging, capture.catalog_document_id, *document_id)
+                    .map(|loaded| {
+                        loaded.map(|(dependencies, document)| (sequence, dependencies, document))
+                    })
+            })
+            .transpose()?
+            .flatten();
+        let materialized =
+            super::hot_engine::ShardedHotEngine::materialize_checkpoint_worker_document(
+                capture,
+                store,
+                *document_id,
+                predecessor_document,
+                accepted_rows,
+            )
+            .map_err(|error| error.to_string())?;
+        work.snapshot_handoff_imports = work
+            .snapshot_handoff_imports
+            .saturating_add(u64::from(materialized.imported_handoff));
+        work.changed_predecessor_image_imports = work
+            .changed_predecessor_image_imports
+            .saturating_add(u64::from(materialized.imported_predecessor_image));
+        work.changed_document_reconstructions = work
+            .changed_document_reconstructions
+            .saturating_add(u64::from(materialized.reconstructed));
+        let compact = super::hot_engine::ShardedHotEngine::build_policy_compact_accepted_document(
+            capture.catalog_document_id,
+            capture.cutoff_state_digest,
+            dependencies.clone(),
+            &materialized.document,
+            LIVE_FLOOR_ELIGIBILITY_DISABLED,
+            super::checkpoint_floor_policy::FloorPolicyConfig::default(),
+            // No candidates: with zero eligibility the policy has nothing it is
+            // permitted to advance to, so it measures the current image only.
+            std::iter::empty(),
+        )
+        .map_err(|error| error.to_string())?;
+        work.exported_documents = work.exported_documents.saturating_add(1);
+        work.measurement_exports = work
+            .measurement_exports
+            .saturating_add(compact.work().measurement_exports);
+        work.candidate_exports = work
+            .candidate_exports
+            .saturating_add(compact.work().candidate_exports);
+        work.verification_imports = work
+            .verification_imports
+            .saturating_add(compact.work().verification_imports);
+        roster =
+            roster.with_policy_document(&mut staging, capture.cutoff_state_digest, &compact)?;
+    }
+    if roster.document_count() != capture.dependencies.len() as u64 {
+        return Err("checkpoint image roster has extra or missing documents".into());
+    }
+    let root = roster.root();
+    let reader = staging.finish()?;
+    roster.qualify_complete_keys(&reader, capture.dependencies.keys().copied())?;
+    Ok((root, work))
+}
+
+fn document_object_names_for_root(
+    directory: &cap_std::fs::Dir,
+    root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+) -> Result<BTreeSet<String>, String> {
+    use tine_storage::sealed_accepted_index::{
+        SealedAcceptedObjectKind, SealedAuthenticatedMapNodeV2,
+    };
+
+    let mut retained = BTreeSet::new();
+    let mut pending = root.root.into_iter().collect::<Vec<_>>();
+    while let Some(link) = pending.pop() {
+        let node_name = sealed_staging_name(SealedAcceptedObjectKind::MapNode, link.digest);
+        let node_bytes =
+            tine_storage::read_optional_regular(directory, &node_name, MAX_CHECKPOINT_BYTES, None)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "retained checkpoint document-map node is missing".to_owned())?;
+        let node = SealedAuthenticatedMapNodeV2::decode(link, &node_bytes)
+            .map_err(|error| error.to_string())?;
+        retained.insert(node_name);
+        let descriptor_name = capsule_blob_name(node.value_digest);
+        let descriptor_bytes = tine_storage::read_optional_regular(
+            directory,
+            &descriptor_name,
+            MAX_CHECKPOINT_BYTES,
+            None,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "retained checkpoint document descriptor is missing".to_owned())?;
+        if ContentDigest::of(&descriptor_bytes) != node.value_digest {
+            return Err("retained checkpoint document descriptor digest differs".into());
+        }
+        let record = DocumentCapsuleRecord::decode(&descriptor_bytes)?;
+        retained.insert(descriptor_name);
+        retained.insert(capsule_blob_name(ContentDigest::from_bytes(
+            *record.checkpoint.sha256(),
+        )));
+        pending.extend(node.left);
+        pending.extend(node.right);
+    }
+    Ok(retained)
+}
+
+fn retained_document_object_names(
+    directory: &cap_std::fs::Dir,
+) -> Result<BTreeSet<String>, String> {
+    let mut retained = BTreeSet::new();
+    for payload_name in CHECKPOINT_PAYLOAD_NAMES {
+        let Some(bytes) = tine_storage::read_optional_regular(
+            directory,
+            payload_name,
+            MAX_CHECKPOINT_BYTES,
+            None,
+        )
+        .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        let Ok(payload) = decode_canonical::<CheckpointPayloadV2>(&bytes) else {
+            continue;
+        };
+        let Ok(root) = map_root_from_wire(payload.document_roster) else {
+            continue;
+        };
+        retained.extend(document_object_names_for_root(directory, root)?);
+    }
+    Ok(retained)
+}
+
+fn pin_checkpoint_reader(
+    store: &ObjectStore,
+    directory: &cap_std::fs::Dir,
+    roster: SealedDocumentRoster,
+) -> Result<Arc<CheckpointReaderPin>, String> {
+    let pin = Arc::new(CheckpointReaderPin {
+        object_names: document_object_names_for_root(directory, roster.root())?,
+    });
+    ACTIVE_CHECKPOINT_READERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(store.root_path().to_path_buf())
+        .or_default()
+        .push(Arc::downgrade(&pin));
+    Ok(pin)
+}
+
+fn active_reader_document_object_names(store: &ObjectStore) -> BTreeSet<String> {
+    let Some(readers) = ACTIVE_CHECKPOINT_READERS.get() else {
+        return BTreeSet::new();
+    };
+    let mut readers = readers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = store.root_path();
+    let Some(pins) = readers.get_mut(root) else {
+        return BTreeSet::new();
+    };
+    let mut retained = BTreeSet::new();
+    pins.retain(|weak| {
+        let Some(pin) = weak.upgrade() else {
+            return false;
+        };
+        retained.extend(pin.object_names.iter().cloned());
+        true
+    });
+    if pins.is_empty() {
+        readers.remove(root);
+    }
+    retained
+}
+
+fn is_document_object_name(name: &str) -> bool {
+    let suffix = name
+        .strip_prefix(&format!(
+            "{SEALED_STAGING_FILE_PREFIX}-{}-",
+            sealed_kind_code(
+                tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::MapNode
+            )
+        ))
+        .or_else(|| name.strip_prefix(&format!("{CAPSULE_BLOB_PREFIX}-")));
+    suffix.is_some_and(|suffix| {
+        suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+/// Reclaim only unreachable disposable image objects. Both replaceable payload
+/// slots are roots, so a crash that rolls the pointer back still has every byte
+/// it needs. A crash during best-effort unlink can only leave an orphan for the
+/// next successful publication; originals and pointed generations are untouched.
+fn cleanup_unreferenced_document_objects(store: &ObjectStore) -> Result<(), String> {
+    let directory = checkpoint_directory(store)?;
+    let mut retained = retained_document_object_names(&directory)?;
+    retained.extend(active_reader_document_object_names(store));
+    let entries = directory.entries().map_err(|error| error.to_string())?;
+    // I-14: even repeated failed-candidate residue cannot turn one publication
+    // into a lifetime-sized walk. Current graph roots determine the primary
+    // budget, with fixed headroom to drain older disposable orphans over later
+    // successful publications.
+    let scan_budget = retained
+        .len()
+        .saturating_mul(2)
+        .saturating_add(CHECKPOINT_CLEANUP_ENTRY_HEADROOM);
+    for entry in entries.take(scan_budget) {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_document_object_name(name) || retained.contains(name) {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            continue;
+        }
+        directory
+            .remove_file(name)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+struct PublishedCheckpoint {
+    sequence: u64,
+    documents: Option<Arc<CleanCheckpointDocuments>>,
+}
+
+fn publish_capture(
+    store: &ObjectStore,
+    capture: CleanCheckpointCapture,
+) -> Result<PublishedCheckpoint, String> {
     #[cfg(test)]
     if FAIL_CHECKPOINT_WRITE_ROOTS
         .lock()
@@ -1296,14 +1739,33 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
     {
         return Err("deterministic checkpoint publication failure".into());
     }
+    let has_document_epoch = capture.documents.is_some();
     let predecessor = read_current_payload_for_extension(store)?;
-    let (sequence, payload_bytes) = build_payload(capture, predecessor)?;
+    let directory = checkpoint_directory(store)?;
+    let (document_roster, image_work) = match capture.documents.as_ref() {
+        Some(documents) => publish_document_images(
+            &directory,
+            store,
+            documents,
+            &capture.accepted_rows,
+            predecessor.as_ref(),
+        )?,
+        None => (
+            predecessor
+                .as_ref()
+                .map(|(_, payload)| map_root_from_wire(payload.document_roster.clone()))
+                .transpose()?
+                .unwrap_or_else(tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty),
+            CheckpointImageWork::default(),
+        ),
+    };
+    let (sequence, payload_bytes) =
+        build_payload_with_images(capture, predecessor, document_roster, image_work)?;
     let payload_len = u64::try_from(payload_bytes.len())
         .map_err(|_| "clean checkpoint payload length exceeds u64".to_owned())?;
     if payload_len > MAX_CHECKPOINT_BYTES {
         return Err("clean checkpoint payload exceeds its disposable-cache limit".into());
     }
-    let directory = checkpoint_directory(store)?;
     let publication = tine_storage::DurableDirectoryPublication::open(&directory)
         .map_err(|error| error.to_string())?;
     let prior_pointer_bytes =
@@ -1311,7 +1773,7 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
             .map_err(|error| error.to_string())?;
     let prior_slot = prior_pointer_bytes
         .as_deref()
-        .and_then(|bytes| decode_canonical::<CheckpointPointerV1>(bytes).ok())
+        .and_then(|bytes| decode_canonical::<CheckpointPointerV2>(bytes).ok())
         .filter(|pointer| pointer.schema_version == CHECKPOINT_SCHEMA_VERSION && pointer.slot < 2)
         .map(|pointer| pointer.slot as usize);
     let slot = prior_slot.map_or(0, |slot| 1 - slot);
@@ -1321,7 +1783,7 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
         CHECKPOINT_PAYLOAD_NAMES[slot],
         &payload_bytes,
     )?;
-    let generation = CheckpointGenerationV1 {
+    let generation = CheckpointGenerationV2 {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         sequence,
         slot: slot as u8,
@@ -1335,7 +1797,7 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
         CHECKPOINT_GENERATION_NAMES[slot],
         &generation_bytes,
     )?;
-    let pointer = CheckpointPointerV1 {
+    let pointer = CheckpointPointerV2 {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         sequence,
         slot: slot as u8,
@@ -1351,7 +1813,24 @@ fn publish_capture(store: &ObjectStore, capture: CleanCheckpointCapture) -> Resu
             .publish_new_exact_single_writer(CHECKPOINT_POINTER, &pointer_bytes)
             .map_err(|error| error.to_string())?,
     }
-    Ok(sequence)
+    let documents = has_document_epoch
+        .then(|| {
+            SealedGenerationDirectory::open(&directory).and_then(|directory| {
+                let roster = SealedDocumentRoster::from_root(document_roster);
+                let reader_pin = pin_checkpoint_reader(store, &directory.directory, roster)?;
+                Ok(Arc::new(CleanCheckpointDocuments {
+                    roster,
+                    directory,
+                    sequence,
+                    _reader_pin: reader_pin,
+                }))
+            })
+        })
+        .transpose()?;
+    Ok(PublishedCheckpoint {
+        sequence,
+        documents,
+    })
 }
 
 pub(crate) enum CleanCheckpointOpen {
@@ -1367,6 +1846,64 @@ pub(crate) struct CleanCheckpointLoaded {
     pub(crate) tail: BTreeSet<BatchId>,
     pub(crate) capture_work: u64,
     pub(crate) payload_bytes: usize,
+    pub(crate) image_work: CheckpointImageWork,
+    pub(crate) documents: Arc<CleanCheckpointDocuments>,
+}
+
+pub(crate) struct CleanCheckpointDocuments {
+    roster: SealedDocumentRoster,
+    directory: SealedGenerationDirectory,
+    sequence: u64,
+    _reader_pin: Arc<CheckpointReaderPin>,
+}
+
+impl CleanCheckpointLoaded {
+    pub(crate) fn document_image_reference(
+        &self,
+        document: DocumentId,
+    ) -> Result<ContentDigest, String> {
+        self.documents
+            .roster
+            .document_reference(&self.documents.directory, document)?
+            .ok_or_else(|| format!("checkpoint image roster omits document {document}"))
+    }
+}
+
+impl CleanCheckpointDocuments {
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn load_document(
+        &self,
+        catalog: DocumentId,
+        document: DocumentId,
+    ) -> Result<Option<(DocumentDependencies, loro::LoroDoc)>, String> {
+        self.roster
+            .load_document(&self.directory, catalog, document)
+    }
+
+    pub(crate) fn qualify_complete(
+        &self,
+        documents: impl Iterator<Item = DocumentId>,
+    ) -> Result<(), String> {
+        self.roster
+            .qualify_complete_keys(&self.directory, documents)
+    }
+
+    pub(crate) fn dependencies(
+        &self,
+        documents: impl Iterator<Item = DocumentId>,
+    ) -> Result<BTreeMap<DocumentId, DocumentDependencies>, String> {
+        documents
+            .map(|document| {
+                self.roster
+                    .document_record(&self.directory, document)?
+                    .map(|record| (document, record.dependencies))
+                    .ok_or_else(|| format!("checkpoint image roster omits document {document}"))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -1398,7 +1935,7 @@ pub(crate) fn open_checkpoint(
     else {
         return Ok(CleanCheckpointOpen::Absent);
     };
-    let pointer: CheckpointPointerV1 = match decode_canonical::<CheckpointPointerV1>(&pointer_bytes)
+    let pointer: CheckpointPointerV2 = match decode_canonical::<CheckpointPointerV2>(&pointer_bytes)
     {
         Ok(pointer) if pointer.schema_version == CHECKPOINT_SCHEMA_VERSION && pointer.slot < 2 => {
             pointer
@@ -1420,8 +1957,8 @@ pub(crate) fn open_checkpoint(
     if ContentDigest::of(&generation_bytes) != pointer.generation_digest {
         return Ok(invalid("clean checkpoint generation digest differs"));
     }
-    let generation: CheckpointGenerationV1 =
-        match decode_canonical::<CheckpointGenerationV1>(&generation_bytes) {
+    let generation: CheckpointGenerationV2 =
+        match decode_canonical::<CheckpointGenerationV2>(&generation_bytes) {
             Ok(generation)
                 if generation.schema_version == CHECKPOINT_SCHEMA_VERSION
                     && generation.slot == pointer.slot
@@ -1445,7 +1982,7 @@ pub(crate) fn open_checkpoint(
     if ContentDigest::of(&payload_bytes) != generation.payload_digest {
         return Ok(invalid("clean checkpoint payload digest differs"));
     }
-    let payload: CheckpointPayloadV1 = match decode_canonical::<CheckpointPayloadV1>(&payload_bytes)
+    let payload: CheckpointPayloadV2 = match decode_canonical::<CheckpointPayloadV2>(&payload_bytes)
     {
         Ok(payload) if payload.schema_version == CHECKPOINT_SCHEMA_VERSION => payload,
         Ok(_) | Err(_) => return Ok(invalid("clean checkpoint payload is invalid")),
@@ -1613,7 +2150,50 @@ pub(crate) fn open_checkpoint(
             crate::oplog::refusal::ManagedStorageRefusalScenario::DiskCorrupt.as_str()
         )));
     }
+    let document_dependencies = payload.document_dependencies;
+    if !document_dependencies
+        .windows(2)
+        .all(|pair| pair[0].document_id() < pair[1].document_id())
+    {
+        return Ok(invalid(
+            "clean checkpoint document dependencies are not strictly ordered",
+        ));
+    }
+    let document_roster = match map_root_from_wire(payload.document_roster) {
+        Ok(root) => SealedDocumentRoster::from_root(root),
+        Err(error) => return Ok(invalid(error)),
+    };
+    let document_directory = match SealedGenerationDirectory::open(&directory) {
+        Ok(directory) => directory,
+        Err(error) => return Err(CleanCheckpointOpenError::Store(error)),
+    };
+    if let Err(error) = document_roster.qualify_complete_keys(
+        &document_directory,
+        document_dependencies
+            .iter()
+            .map(DocumentDependencies::document_id),
+    ) {
+        return Ok(invalid(error));
+    }
+    for expected in &document_dependencies {
+        let actual =
+            match document_roster.document_record(&document_directory, expected.document_id()) {
+                Ok(Some(record)) => record.dependencies,
+                Ok(None) => return Ok(invalid("clean checkpoint document descriptor is missing")),
+                Err(error) => return Ok(invalid(error)),
+            };
+        if &actual != expected {
+            return Ok(invalid(
+                "clean checkpoint document descriptor binding differs",
+            ));
+        }
+    }
     let payload_size = payload_bytes.len();
+    let reader_pin =
+        match pin_checkpoint_reader(store, &document_directory.directory, document_roster) {
+            Ok(pin) => pin,
+            Err(error) => return Ok(invalid(error)),
+        };
     Ok(CleanCheckpointOpen::Loaded(CleanCheckpointLoaded {
         state_bytes: payload.state_bytes,
         accepted_rows,
@@ -1621,6 +2201,13 @@ pub(crate) fn open_checkpoint(
         tail,
         capture_work: payload.capture_work,
         payload_bytes: payload_size,
+        image_work: payload.image_work,
+        documents: Arc::new(CleanCheckpointDocuments {
+            roster: document_roster,
+            directory: document_directory,
+            sequence: generation.sequence,
+            _reader_pin: reader_pin,
+        }),
     }))
 }
 
@@ -1634,6 +2221,8 @@ struct PublisherInner {
     state: Mutex<PublisherState>,
     finished: Condvar,
     durable_sequence: AtomicU64,
+    published_documents: Mutex<BTreeMap<DocumentId, DocumentDependencies>>,
+    current_documents: Mutex<Option<Arc<CleanCheckpointDocuments>>>,
     elevated_rewrite_observed: AtomicBool,
 }
 
@@ -1642,7 +2231,12 @@ pub(crate) struct CleanCheckpointPublisher {
 }
 
 impl CleanCheckpointPublisher {
-    pub(crate) fn new(store: ObjectStore, durable_sequence: u64) -> Self {
+    pub(crate) fn new(
+        store: ObjectStore,
+        durable_sequence: u64,
+        published_documents: BTreeMap<DocumentId, DocumentDependencies>,
+        current_documents: Option<Arc<CleanCheckpointDocuments>>,
+    ) -> Self {
         Self {
             inner: Arc::new(PublisherInner {
                 store: Arc::new(store),
@@ -1652,6 +2246,8 @@ impl CleanCheckpointPublisher {
                 }),
                 finished: Condvar::new(),
                 durable_sequence: AtomicU64::new(durable_sequence),
+                published_documents: Mutex::new(published_documents),
+                current_documents: Mutex::new(current_documents),
                 elevated_rewrite_observed: AtomicBool::new(false),
             }),
         }
@@ -1701,6 +2297,55 @@ impl CleanCheckpointPublisher {
         self.inner.durable_sequence.load(Ordering::Acquire)
     }
 
+    pub(crate) fn published_document_dependencies(
+        &self,
+    ) -> BTreeMap<DocumentId, DocumentDependencies> {
+        self.inner
+            .published_documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn load_current_document(
+        &self,
+        catalog: DocumentId,
+        document: DocumentId,
+    ) -> Result<Option<(u64, DocumentDependencies, loro::LoroDoc)>, String> {
+        let current = self
+            .inner
+            .current_documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current
+            .as_ref()
+            .map(|images| {
+                images.load_document(catalog, document).map(|loaded| {
+                    loaded
+                        .map(|(dependencies, document)| (images.sequence(), dependencies, document))
+                })
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_idle(&self) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.in_flight {
+            state = self
+                .inner
+                .finished
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        Ok(())
+    }
+
     pub(crate) fn durable_lag(&self, accepted_sequence: u64) -> u64 {
         accepted_sequence.saturating_sub(self.durable_sequence())
     }
@@ -1730,8 +2375,34 @@ impl Drop for CleanCheckpointPublisher {
 
 fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCapture) {
     loop {
+        let published_documents = capture
+            .documents
+            .as_ref()
+            .map(|documents| documents.dependencies.clone());
         match publish_capture(&inner.store, capture) {
-            Ok(sequence) => inner.durable_sequence.store(sequence, Ordering::Release),
+            Ok(published) => {
+                if let Some(documents) = published_documents {
+                    *inner
+                        .published_documents
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = documents;
+                }
+                if let Some(documents) = published.documents {
+                    let mut current = inner
+                        .current_documents
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *current = Some(documents);
+                    if let Err(error) = cleanup_unreferenced_document_objects(&inner.store) {
+                        eprintln!(
+                            "clean checkpoint orphan-image cleanup will retry after a later publication: {error}"
+                        );
+                    }
+                }
+                inner
+                    .durable_sequence
+                    .store(published.sequence, Ordering::Release);
+            }
             Err(error) => {
                 eprintln!("clean checkpoint write failed; retrying at the next trigger: {error}")
             }
@@ -2230,7 +2901,7 @@ mod tests {
                 .unwrap();
             assert_eq!(cutoff.roots().sequence.len, n as u64);
             let retained = engine
-                .build_policy_compact_accepted_document(
+                .build_policy_compact_accepted_document_at_cutoff(
                     &cutoff,
                     catalog,
                     0,
@@ -2255,7 +2926,7 @@ mod tests {
             );
             assert_eq!(retained.dependencies().document_id(), catalog);
             let page_retained = engine
-                .build_policy_compact_accepted_document(
+                .build_policy_compact_accepted_document_at_cutoff(
                     &cutoff,
                     DocumentId::from_uuid(uuid::Uuid::from_u128(300 + n)),
                     0,
@@ -3463,110 +4134,65 @@ mod tests {
             .is_some());
     }
 
+    /// The contract says the live floor policy is inert; this makes that a fact
+    /// the compiler and CI check rather than a sentence someone has to believe.
     #[test]
-    fn sealed_cutoff_has_no_live_cutover_or_cache_adoption_path() {
+    fn the_live_floor_call_is_inert_and_says_so() {
+        let production = include_str!("checkpoint_generation.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("checkpoint_generation.rs has a test module boundary");
+
+        assert_eq!(
+            LIVE_FLOOR_ELIGIBILITY_DISABLED, 0,
+            "the live capture path must hand the floor policy zero eligibility \
+             while acceptance age is not yet observable in production"
+        );
+
+        // The live call passes the NAMED constant. A bare literal here would
+        // read as a live policy to the next person who greps for the seam.
+        assert!(
+            production.contains("LIVE_FLOOR_ELIGIBILITY_DISABLED,"),
+            "the live floor-policy call must pass the named inert constant, not a bare 0"
+        );
+
+        // And the contract must still say so. If a later slice makes the policy
+        // live, this fails and the contract sentence has to move with the code.
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(
+            contract.contains("The current live policy supplies E=0"),
+            "docs/storage-sync-contract.md no longer states the live E=0 fact that \
+             LIVE_FLOOR_ELIGIBILITY_DISABLED implements"
+        );
+    }
+
+    #[test]
+    fn sealed_cutoff_and_live_images_keep_one_audited_publication_path() {
         let engine = include_str!("hot_engine.rs")
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        let builder = engine
-            .split("pub(crate) fn build_sealed_accepted_cutoff<Store>(")
-            .nth(1)
-            .unwrap()
-            .split("/// Explicit full-roster construction over the current accepted document set.")
-            .next()
-            .unwrap();
-        for forbidden in [
-            "capture_clean_checkpoint(",
-            "state_bytes",
-            "ExportMode",
-            "publish_activation_marker",
-            "replace_activation_marker",
-            "schedule_clean_checkpoint(",
-        ] {
-            assert!(
-                !builder.contains(forbidden),
-                "inert cutoff builder acquired {forbidden}"
-            );
-        }
-        assert!(!engine.contains(".build_sealed_accepted_cutoff("));
-        assert_eq!(
-            engine.matches(".build_compact_accepted_document(").count(),
-            1
-        );
-        for function in [
-            "build_compact_document_roster",
-            "qualify_full_document_roster",
-            "capture_live_graph_document_closure",
-            "build_live_graph_document_roster",
-            "qualify_live_graph_document_roster",
-        ] {
-            assert!(!engine.contains(&format!(".{function}(")));
-            assert!(!include_str!("../sync_runtime.rs").contains(function));
-        }
-        assert!(!include_str!("../sync_runtime.rs").contains("build_compact_accepted_document"));
-        let compact = engine
-            .split("pub(crate) fn build_compact_accepted_document(")
-            .nth(1)
-            .unwrap()
-            .split("/// Capture the exact semantic")
-            .next()
-            .unwrap();
-        for forbidden in [
-            "LazyGenesisCheckpointBuilder",
-            "publish_activation_marker",
-            "replace_activation_marker",
-            "fs::",
-            "commit_clean_prepared",
-        ] {
-            assert!(
-                !compact.contains(forbidden),
-                "compact qualification acquired {forbidden}"
-            );
-        }
-        assert!(!include_str!("../sync_runtime.rs").contains("build_sealed_accepted_cutoff"));
         let production = include_str!("checkpoint_generation.rs")
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        let staging = production
-            .split("const SEALED_STAGING_BATCH_BYTES")
-            .nth(1)
-            .unwrap()
-            .split("struct RecordingCheckpointSealedStore")
-            .next()
-            .unwrap();
-        for forbidden in [
-            "fs::write",
-            "fs::rename",
-            "read_dir(",
-            "replace_activation_marker",
-            "publish_activation_marker",
-        ] {
-            assert!(!staging.contains(forbidden), "staging acquired {forbidden}");
+        for forbidden in ["fs::write", "fs::rename"] {
+            assert!(
+                !production.contains(forbidden),
+                "checkpoint publication acquired unaudited {forbidden}"
+            );
         }
-        for caller in [include_str!("../sync_runtime.rs")] {
-            assert!(!caller.contains("SealedGenerationStagingStore"));
-            assert!(!caller.contains("SealedDocumentRoster"));
-        }
-        assert!(staging.contains("cfg!(target_os = \"linux\")"));
-        assert!(staging.contains("Self::open_immediate(directory)"));
-        assert!(staging.contains("publish_new_exact_single_writer(name, bytes)"));
-        let contract = include_str!("../../../../docs/storage-sync-contract.md");
-        assert!(contract.contains("R1b accepted-cutoff builder"));
-        assert!(contract.contains(&format!("{}-<kind>-<digest>", SEALED_STAGING_FILE_PREFIX)));
-        assert!(contract.contains(&format!(
-            "{} MiB or {} objects",
-            SEALED_STAGING_BATCH_BYTES / (1024 * 1024),
-            SEALED_STAGING_BATCH_OBJECTS
-        )));
-        assert!(contract.contains("publish_new_exact_single_writer"));
-        assert!(contract.contains(&format!("{}-<digest>", CAPSULE_BLOB_PREFIX)));
-        assert!(contract.contains(&format!(
-            "schema={}, dependencies: DocumentDependencies",
-            DOCUMENT_CAPSULE_SCHEMA
-        )));
-        assert!(contract.contains("no new on-disk format"));
+        assert!(production.contains("publish_document_images("));
+        assert!(production.contains("ShardedHotEngine::build_policy_compact_accepted_document("));
+        assert!(production.contains("DurableDirectoryPublication"));
+        assert!(production.contains("publish_new_exact_single_writer"));
+        assert_eq!(
+            production.matches(".remove_file(").count(),
+            1,
+            "only unreachable disposable image cleanup may unlink checkpoint bytes"
+        );
+        assert!(engine.contains("changed_snapshots"));
+        assert!(engine.contains("checkpoint_document_at_current"));
     }
 
     #[test]
@@ -3700,7 +4326,7 @@ mod tests {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        for forbidden in ["write_all", "std::fs::rename", ".remove_file("] {
+        for forbidden in ["write_all", "std::fs::rename"] {
             assert!(
                 !production.contains(forbidden),
                 "checkpoint authoring bypassed the audited publication boundary: {forbidden}"
@@ -3710,6 +4336,11 @@ mod tests {
         assert!(production.contains("DurableDirectoryPublication"));
         assert!(production.contains("publish_new_exact_single_writer"));
         assert!(production.contains("replace_exact"));
+        assert_eq!(
+            production.matches(".remove_file(").count(),
+            1,
+            "only unreachable disposable image cleanup may unlink checkpoint bytes"
+        );
     }
 
     #[test]
@@ -3740,10 +4371,11 @@ mod tests {
             }],
             required_objects: BTreeSet::from([digest(0x91)]),
             capture_work: 3,
+            documents: None,
         };
         let (sequence, bytes) = build_payload(capture, None).unwrap();
         assert_eq!(sequence, 1);
-        let payload: CheckpointPayloadV1 = decode_canonical(&bytes).unwrap();
+        let payload: CheckpointPayloadV2 = decode_canonical(&bytes).unwrap();
         assert_eq!(payload.state_bytes, b"state");
         assert_eq!(payload.required_objects, vec![digest(0x91)]);
         let roots = roots_from_wire(payload.roster_roots).unwrap();
@@ -3779,9 +4411,10 @@ mod tests {
             }],
             required_objects: BTreeSet::from([digest(0x91)]),
             capture_work: 3,
+            documents: None,
         };
         let (_, first_bytes) = build_payload(first_capture, None).unwrap();
-        let first_payload: CheckpointPayloadV1 = decode_canonical(&first_bytes).unwrap();
+        let first_payload: CheckpointPayloadV2 = decode_canonical(&first_bytes).unwrap();
         let second_capture = CleanCheckpointCapture {
             base_sequence: 1,
             target_sequence: 2,
@@ -3794,11 +4427,12 @@ mod tests {
             }],
             required_objects: BTreeSet::from([digest(0x92)]),
             capture_work: 4,
+            documents: None,
         };
         let (sequence, second_bytes) =
             build_payload(second_capture, Some((1, first_payload))).unwrap();
         assert_eq!(sequence, 2);
-        let payload: CheckpointPayloadV1 = decode_canonical(&second_bytes).unwrap();
+        let payload: CheckpointPayloadV2 = decode_canonical(&second_bytes).unwrap();
         assert_eq!(payload.state_bytes, b"frontier-two");
         assert_eq!(payload.required_objects, vec![digest(0x91), digest(0x92)]);
         assert_eq!(payload.capture_work, 4);
@@ -3825,7 +4459,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let workspace = crate::oplog::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xa564));
         let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
-        let publisher = CleanCheckpointPublisher::new(store, 0);
+        let publisher = CleanCheckpointPublisher::new(store, 0, BTreeMap::new(), None);
         let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
             [0x44; 16],
         )));
@@ -3842,6 +4476,7 @@ mod tests {
             accepted_rows: vec![row; CLEAN_CHECKPOINT_LAG_MAX as usize + 1],
             required_objects: BTreeSet::new(),
             capture_work: 0,
+            documents: None,
         });
         assert!(publisher.elevated_rewrite_observed());
         drop(publisher);
@@ -3867,6 +4502,7 @@ mod tests {
             accepted_rows: Vec::new(),
             required_objects: BTreeSet::new(),
             capture_work: 0,
+            documents: None,
         }
     }
 
@@ -3886,7 +4522,7 @@ mod tests {
         publish_capture(&store, empty_capture(b"predecessor")).unwrap();
         let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
         let predecessor_pointer = std::fs::read(directory.join(CHECKPOINT_POINTER)).unwrap();
-        let predecessor: CheckpointPointerV1 = decode_canonical(&predecessor_pointer).unwrap();
+        let predecessor: CheckpointPointerV2 = decode_canonical(&predecessor_pointer).unwrap();
         assert_eq!(loaded_state(&store), b"predecessor");
 
         let slot = 1 - predecessor.slot as usize;
@@ -3894,7 +4530,7 @@ mod tests {
         std::fs::write(directory.join(CHECKPOINT_PAYLOAD_NAMES[slot]), &payload).unwrap();
         assert_eq!(loaded_state(&store), b"predecessor");
 
-        let generation = CheckpointGenerationV1 {
+        let generation = CheckpointGenerationV2 {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             sequence,
             slot: slot as u8,
@@ -3909,7 +4545,7 @@ mod tests {
         .unwrap();
         assert_eq!(loaded_state(&store), b"predecessor");
 
-        let successor_pointer = encode_canonical(&CheckpointPointerV1 {
+        let successor_pointer = encode_canonical(&CheckpointPointerV2 {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             sequence,
             slot: slot as u8,
@@ -3939,7 +4575,7 @@ mod tests {
             publish_capture(&store, empty_capture(b"disposable")).unwrap();
             let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
             let pointer_bytes = std::fs::read(directory.join(CHECKPOINT_POINTER)).unwrap();
-            let pointer: CheckpointPointerV1 = decode_canonical(&pointer_bytes).unwrap();
+            let pointer: CheckpointPointerV2 = decode_canonical(&pointer_bytes).unwrap();
             let slot = pointer.slot as usize;
             match damage {
                 "pointer-bitflip" => {
@@ -3992,6 +4628,237 @@ mod tests {
         assert_eq!(store.committed_manifest_names().unwrap().len(), 0);
         assert_eq!(store.object_names().unwrap().len(), 1);
         assert_eq!(loaded_state(&store), b"stable checkpoint");
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn p3_incremental_image_capture_core_exports_only_changed_documents() {
+        use crate::oplog::hot_engine::{LazyGenesisCheckpointBuilder, ShardedHotEngine};
+        use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
+        use crate::oplog::{
+            AuthorBatch, BatchDisposition, BlobDescription, BlockId, BlockLocation, CrdtPeerId,
+            DeviceId, LineageDigest, LogicalPageName, ManagedPath, ManagedTextKind,
+            OperationTransaction, PageId, SemanticOperation, SessionId, WorkspaceId,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "tine-p3-incremental-images-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x3001));
+        let lineage = LineageDigest::of(b"p3-incremental-images");
+        let catalog = DocumentId::from_uuid(uuid::Uuid::from_u128(0x3002));
+        let page = PageId::from_uuid(uuid::Uuid::from_u128(0x3003));
+        let home = DocumentId::from_uuid(uuid::Uuid::from_u128(0x3004));
+        let block = BlockId::from_uuid(uuid::Uuid::from_u128(0x3005));
+        let (catalog_checkpoint, catalog_dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let baseline = Arc::new(
+            LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog,
+                BlobDescription::of(b"empty source"),
+                &root,
+            )
+            .unwrap()
+            .finish(catalog_checkpoint, catalog_dependencies)
+            .unwrap(),
+        );
+        let archive = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        engine
+            .install_lazy_genesis_baseline(Arc::clone(&baseline))
+            .unwrap();
+        engine
+            .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+            .unwrap();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let author = AuthorBatch {
+            batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(0x3010)),
+            author_device_id: DeviceId::from_uuid(uuid::Uuid::from_u128(0x3011)),
+            author_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(0x3012)),
+            crdt_peer_id: CrdtPeerId::from_u64(0x3013),
+            causal_peer_id: fixture_incarnation(0x3014),
+        };
+        let create = OperationTransaction::new(vec![
+            SemanticOperation::CreatePage {
+                page_id: page,
+                home_document_id: home,
+                name: LogicalPageName::parse("Incremental Images").unwrap(),
+                path: ManagedPath::parse("pages/incremental-images.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            },
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: home,
+                },
+                page_id: page,
+                parent: None,
+                order: "a".into(),
+                content: "before".into(),
+            },
+        ])
+        .unwrap();
+        let prepared = engine.prepare_fixture_transaction(author, &create).unwrap();
+        assert!(matches!(
+            engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        let checkpoint_reader = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let first = match open_checkpoint(&checkpoint_reader).unwrap() {
+            CleanCheckpointOpen::Loaded(loaded) => loaded,
+            _ => panic!("bootstrap checkpoint was not published"),
+        };
+        assert_eq!(first.image_work.changed_documents, 2);
+        assert_eq!(first.image_work.exported_documents, 2);
+        assert_eq!(first.image_work.reused_documents, 0);
+        assert_eq!(first.image_work.unchanged_image_imports, 0);
+        assert_eq!(first.image_work.unchanged_image_reconstructions, 0);
+        let catalog_reference = first.document_image_reference(catalog).unwrap();
+        let first_home_reference = first.document_image_reference(home).unwrap();
+        engine.evict_hot_document_for_checkpoint_test(home);
+        let before_evicted_edit = crate::oplog::hot_engine::live_write_benchmark_counters();
+
+        let edit = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: block,
+                home_document_id: home,
+            },
+            content: "after".into(),
+        }])
+        .unwrap();
+        let prepared = engine
+            .prepare_fixture_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(0x3020)),
+                    ..author
+                },
+                &edit,
+            )
+            .unwrap();
+        assert!(matches!(
+            engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let mut cold_capture = engine.capture_clean_checkpoint(1).unwrap();
+        let accepted_rows = cold_capture.accepted_rows.clone();
+        let cold_documents = cold_capture.documents.as_mut().unwrap();
+        cold_documents.changed_snapshots.insert(home, None);
+        let (predecessor_dependencies, predecessor_document) = first
+            .documents
+            .load_document(catalog, home)
+            .unwrap()
+            .unwrap();
+        let worker_store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let materialized = ShardedHotEngine::materialize_checkpoint_worker_document(
+            cold_documents,
+            &worker_store,
+            home,
+            Some((
+                first.documents.sequence(),
+                predecessor_dependencies,
+                predecessor_document,
+            )),
+            &accepted_rows,
+        )
+        .unwrap();
+        assert!(materialized.reconstructed);
+        assert!(!materialized.imported_handoff);
+        assert!(materialized.imported_predecessor_image);
+        drop(worker_store);
+        let evicted_edit_work =
+            crate::oplog::hot_engine::live_write_benchmark_counters().since(before_evicted_edit);
+        assert_eq!(
+            evicted_edit_work.document_head_reconstructions, 0,
+            "a same-session post-eviction edit must load the published image, not replay ancestry"
+        );
+        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        let checkpoint_reader = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let second = match open_checkpoint(&checkpoint_reader).unwrap() {
+            CleanCheckpointOpen::Loaded(loaded) => loaded,
+            _ => panic!("incremental checkpoint was not published"),
+        };
+        assert_eq!(second.image_work.changed_documents, 1);
+        assert_eq!(second.image_work.exported_documents, 1);
+        assert_eq!(second.image_work.reused_documents, 1);
+        assert_eq!(second.image_work.unchanged_image_imports, 0);
+        assert_eq!(second.image_work.unchanged_image_reconstructions, 0);
+        assert_eq!(
+            second.document_image_reference(catalog).unwrap(),
+            catalog_reference,
+            "the unchanged catalog must retain its exact immutable image reference"
+        );
+        assert_ne!(
+            second.document_image_reference(home).unwrap(),
+            first_home_reference
+        );
+
+        let third_edit = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: block,
+                home_document_id: home,
+            },
+            content: "third".into(),
+        }])
+        .unwrap();
+        let prepared = engine
+            .prepare_fixture_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(uuid::Uuid::from_u128(0x3030)),
+                    ..author
+                },
+                &third_edit,
+            )
+            .unwrap();
+        assert!(matches!(
+            engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        let checkpoint_reader = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let third = match open_checkpoint(&checkpoint_reader).unwrap() {
+            CleanCheckpointOpen::Loaded(loaded) => loaded,
+            _ => panic!("third checkpoint was not published"),
+        };
+        assert_eq!(third.image_work.changed_documents, 1);
+        assert_eq!(third.image_work.exported_documents, 1);
+        assert_eq!(third.image_work.reused_documents, 1);
+        let first_home_path = root
+            .join("archive")
+            .join(CHECKPOINT_DIRECTORY)
+            .join(capsule_blob_name(first_home_reference));
+        assert!(
+            first_home_path.exists(),
+            "an active old reader must pin its image beyond the two generation roots"
+        );
+        drop(first);
+        cleanup_unreferenced_document_objects(&checkpoint_reader).unwrap();
+        assert!(
+            !first_home_path.exists(),
+            "an image with no retained generation or reader must be reclaimed"
+        );
+
+        drop(engine);
+        drop(archive);
+        drop(baseline);
         crate::test_support::remove_dir_all(root);
     }
 }
