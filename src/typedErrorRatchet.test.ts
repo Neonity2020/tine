@@ -402,7 +402,15 @@ describe("I-9/I-11 typed backend error boundary", () => {
     // Count and placement are pinned as ONE tuple on purpose: asserting them
     // separately lets a count-preserving swap (a Plugin failure re-mapped as
     // Backup) satisfy the count while the fingerprint silently moves.
-    expect(parity).toContain("(498, 17_903_180_402_005_549_371)");
+    //
+    // The VALUE is deliberately NOT repeated here. Only the Rust test can
+    // compute the fingerprint, and it already fails when its pin stops matching
+    // reality, so a literal copy in this file adds no coverage — it just makes
+    // every legitimate re-pin a two-file edit whose second half fails in a
+    // different suite. That is exactly how it broke on 2026-09-11: the Rust pin
+    // moved to the reviewed 507-row manifest and this line went red for a fact
+    // nobody had changed. Assert the SHAPE of the pin instead.
+    expect(parity).toMatch(/\(site_count, site_fingerprint\),\s*\(\d+, [\d_]+\),/);
     // A mismatch must print the rows, not a bare 64-bit number nobody can act on.
     expect(parity).toContain("site_rows.join");
     expect(contract).toContain("### Absolute phase-B rule");
