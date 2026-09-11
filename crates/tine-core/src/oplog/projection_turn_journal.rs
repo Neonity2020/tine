@@ -508,6 +508,19 @@ impl std::fmt::Debug for ProjectionTurnJournalState {
 }
 
 impl ProjectionTurnJournalState {
+    /// The authenticated generation and durable append prefix selected when a
+    /// full-history reconstruction fences local authority. Checkpoints may
+    /// advance while the fence is held, but this tuple must not move to a new
+    /// generation until reinstall succeeds.
+    pub(crate) fn recovery_fence(&self) -> (u64, &str, u64, u64) {
+        (
+            self.selector_generation,
+            self.journal.selection().segment_name(),
+            self.journal.selection().base_sequence(),
+            self.journal.next_sequence(),
+        )
+    }
+
     /// Decode every undrained frame into the single [`ProjectionTurn`] view.
     pub(crate) fn undrained_turns(
         &self,

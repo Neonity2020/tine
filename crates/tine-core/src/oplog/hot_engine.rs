@@ -7661,6 +7661,11 @@ impl ShardedHotEngine {
             }
             None => BTreeMap::new(),
         };
+        // Constructing the successor before assignment would leave both
+        // workers live while Rust evaluates the right-hand side. Join the
+        // predecessor first; only then may a successor capable of publishing
+        // `current` exist.
+        drop(self.clean_checkpoint_publisher.take());
         self.clean_checkpoint_publisher =
             Some(super::checkpoint_generation::CleanCheckpointPublisher::new(
                 publisher_store,
@@ -7668,6 +7673,21 @@ impl ShardedHotEngine {
                 published_documents,
                 self.checkpoint_documents.as_ref().cloned(),
             ));
+        Ok(())
+    }
+
+    /// Join and remove this engine's publisher before a full-history
+    /// replacement engine is created. `CleanCheckpointPublisher::drop` joins
+    /// its worker, so return means no predecessor can still write `current`.
+    pub(crate) fn stop_clean_checkpoint_publisher(&mut self) {
+        drop(self.clean_checkpoint_publisher.take());
+    }
+
+    pub(crate) fn rebuild_next_clean_checkpoint_from_genesis(&self) -> Result<(), EngineError> {
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
+            .rebuild_next_from_genesis();
         Ok(())
     }
 
@@ -7736,8 +7756,7 @@ impl ShardedHotEngine {
             })
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_for_clean_checkpoint_for_test(&self) -> Result<(), EngineError> {
+    pub(crate) fn wait_for_clean_checkpoint(&self) -> Result<(), EngineError> {
         self.clean_checkpoint_publisher
             .as_ref()
             .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
@@ -7795,7 +7814,7 @@ impl ShardedHotEngine {
                 EngineError::Archive("clean runtime has no operation archive".into())
             })?;
         let batch_ids = store
-            .committed_manifest_names()
+            .committed_manifest_names_with_cold_history()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         self.replay_clean_committed_batch_ids(&batch_ids, baseline_claim_source, true)
     }
@@ -19090,13 +19109,13 @@ impl ShardedHotEngine {
                 self.archive_status(*batch_id)?,
                 Some(ArchiveStatus::Accepted { .. })
             );
-            let ordinary_ready = matches!(
+            let durable_ready = matches!(
                 store
-                    .inspect_batch(*batch_id)
+                    .inspect_batch_with_cold_history(*batch_id)
                     .map_err(|error| EngineError::Archive(error.to_string()))?,
                 BatchInspection::Ready(_)
             );
-            if !accepted || !ordinary_ready {
+            if !accepted || !durable_ready {
                 return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
             }
         }
@@ -19251,13 +19270,13 @@ impl ShardedHotEngine {
                     self.archive_status(*batch_id)?,
                     Some(ArchiveStatus::Accepted { .. })
                 );
-                let ordinary_ready = matches!(
+                let durable_ready = matches!(
                     store
-                        .inspect_batch(*batch_id)
+                        .inspect_batch_with_cold_history(*batch_id)
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
                 );
-                if !accepted || !ordinary_ready {
+                if !accepted || !durable_ready {
                     return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
                 }
             }
@@ -19421,13 +19440,13 @@ impl ShardedHotEngine {
                     self.archive_status(*batch_id)?,
                     Some(ArchiveStatus::Accepted { .. })
                 );
-                let ordinary_ready = matches!(
+                let durable_ready = matches!(
                     store
-                        .inspect_batch(*batch_id)
+                        .inspect_batch_with_cold_history(*batch_id)
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
                 );
-                if !accepted || !ordinary_ready {
+                if !accepted || !durable_ready {
                     return Ok(CleanTombstoneAuthorization::Deferred(
                         CleanTombstoneDeferral::FrontierNotDurable,
                     ));
@@ -26875,12 +26894,17 @@ fn declared_batch_heads(frontier: &FrontierV2) -> BTreeSet<BatchId> {
 /// must reconstruct (for example, a delete authored after a target page was
 /// created but touching only the source page's semantic documents).
 fn clean_replay_dependency_heads(batch: &ValidatedBatch) -> Result<BTreeSet<BatchId>, EngineError> {
-    let manifest = batch.manifest();
+    clean_operation_dependency_heads(batch.manifest(), batch.objects())
+}
+
+pub(crate) fn clean_operation_dependency_heads(
+    manifest: &OperationBatch,
+    objects: &[OperationObject],
+) -> Result<BTreeSet<BatchId>, EngineError> {
     let mut heads = declared_batch_heads(manifest.dependency_frontier());
     heads.extend(manifest.causal_dependency_heads().iter().copied());
-    let projection =
-        super::projection_manifest::validate_projection_object_set(manifest, batch.objects())
-            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+    let projection = super::projection_manifest::validate_projection_object_set(manifest, objects)
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
     for intent in projection.intents() {
         heads.extend(declared_batch_heads(intent.post_frontier()));
     }

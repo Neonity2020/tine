@@ -1731,6 +1731,14 @@ fn publish_capture(
     store: &ObjectStore,
     capture: CleanCheckpointCapture,
 ) -> Result<PublishedCheckpoint, String> {
+    publish_capture_with_predecessor(store, capture, true)
+}
+
+fn publish_capture_with_predecessor(
+    store: &ObjectStore,
+    capture: CleanCheckpointCapture,
+    extend_predecessor: bool,
+) -> Result<PublishedCheckpoint, String> {
     #[cfg(test)]
     if FAIL_CHECKPOINT_WRITE_ROOTS
         .lock()
@@ -1740,7 +1748,11 @@ fn publish_capture(
         return Err("deterministic checkpoint publication failure".into());
     }
     let has_document_epoch = capture.documents.is_some();
-    let predecessor = read_current_payload_for_extension(store)?;
+    let predecessor = if extend_predecessor {
+        read_current_payload_for_extension(store)?
+    } else {
+        None
+    };
     let directory = checkpoint_directory(store)?;
     let (document_roster, image_work) = match capture.documents.as_ref() {
         Some(documents) => publish_document_images(
@@ -1918,6 +1930,19 @@ fn invalid(message: impl Into<String>) -> CleanCheckpointOpen {
 
 pub(crate) fn open_checkpoint(
     store: &ObjectStore,
+) -> Result<CleanCheckpointOpen, CleanCheckpointOpenError> {
+    open_checkpoint_impl(store, false)
+}
+
+pub(crate) fn open_checkpoint_with_cold_history(
+    store: &ObjectStore,
+) -> Result<CleanCheckpointOpen, CleanCheckpointOpenError> {
+    open_checkpoint_impl(store, true)
+}
+
+fn open_checkpoint_impl(
+    store: &ObjectStore,
+    logical_cold_history: bool,
 ) -> Result<CleanCheckpointOpen, CleanCheckpointOpenError> {
     use tine_storage::sealed_accepted_index::SealedAcceptedIndexReader;
 
@@ -2116,9 +2141,12 @@ pub(crate) fn open_checkpoint(
         .required_objects
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let (tail, missing_manifest, missing_object) = store
-        .checkpoint_namespace_delta(&roster, &required_objects)
-        .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?;
+    let (tail, missing_manifest, missing_object) = if logical_cold_history {
+        store.checkpoint_namespace_delta_with_cold_history(&roster, &required_objects)
+    } else {
+        store.checkpoint_namespace_delta(&roster, &required_objects)
+    }
+    .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?;
     // Archive damage is a refusal of the authoritative tail, not of the
     // disposable checkpoint: the accepted roster proves this manifest was
     // published, so its absence is a torn/partial delivery or media loss.
@@ -2131,13 +2159,20 @@ pub(crate) fn open_checkpoint(
             crate::oplog::refusal::ManagedStorageRefusalScenario::DiskCorrupt.as_str()
         )));
     }
-    let live_fingerprints = store
-        .validated_manifest_fingerprints()
+    let live_fingerprints = (!logical_cold_history)
+        .then(|| store.validated_manifest_fingerprints())
+        .transpose()
         .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?;
     for row in &accepted_rows {
-        if live_fingerprints.get(&row.evidence.batch_id())
-            != Some(&row.evidence.manifest_fingerprint())
-        {
+        let fingerprint = match &live_fingerprints {
+            Some(fingerprints) => fingerprints.get(&row.evidence.batch_id()).copied(),
+            None => Some(ContentDigest::of(
+                &store
+                    .resolve_logical_manifest_bytes(row.evidence.batch_id())
+                    .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?,
+            )),
+        };
+        if fingerprint != Some(row.evidence.manifest_fingerprint()) {
             return Ok(invalid(format!(
                 "accepted checkpoint roster manifest {} was mutated",
                 row.evidence.batch_id()
@@ -2224,10 +2259,46 @@ struct PublisherInner {
     published_documents: Mutex<BTreeMap<DocumentId, DocumentDependencies>>,
     current_documents: Mutex<Option<Arc<CleanCheckpointDocuments>>>,
     elevated_rewrite_observed: AtomicBool,
+    rebuild_from_genesis: AtomicBool,
 }
 
 pub(crate) struct CleanCheckpointPublisher {
     inner: Arc<PublisherInner>,
+}
+
+#[cfg(test)]
+static LIVE_PUBLISHERS_BY_ARCHIVE: OnceLock<Mutex<BTreeMap<PathBuf, (usize, usize)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_publisher_open(root: &std::path::Path) {
+    let mut publishers = LIVE_PUBLISHERS_BY_ARCHIVE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (live, high_water) = publishers.entry(root.to_path_buf()).or_default();
+    *live = live.saturating_add(1);
+    *high_water = (*high_water).max(*live);
+}
+
+#[cfg(test)]
+fn record_publisher_close(root: &std::path::Path) {
+    let mut publishers = LIVE_PUBLISHERS_BY_ARCHIVE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (live, _) = publishers.entry(root.to_path_buf()).or_default();
+    *live = live.saturating_sub(1);
+}
+
+#[cfg(test)]
+pub(crate) fn publisher_high_water_for_test(root: &std::path::Path) -> usize {
+    LIVE_PUBLISHERS_BY_ARCHIVE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(root)
+        .map_or(0, |(_, high_water)| *high_water)
 }
 
 impl CleanCheckpointPublisher {
@@ -2237,6 +2308,8 @@ impl CleanCheckpointPublisher {
         published_documents: BTreeMap<DocumentId, DocumentDependencies>,
         current_documents: Option<Arc<CleanCheckpointDocuments>>,
     ) -> Self {
+        #[cfg(test)]
+        record_publisher_open(store.root_path());
         Self {
             inner: Arc::new(PublisherInner {
                 store: Arc::new(store),
@@ -2249,6 +2322,7 @@ impl CleanCheckpointPublisher {
                 published_documents: Mutex::new(published_documents),
                 current_documents: Mutex::new(current_documents),
                 elevated_rewrite_observed: AtomicBool::new(false),
+                rebuild_from_genesis: AtomicBool::new(false),
             }),
         }
     }
@@ -2297,6 +2371,12 @@ impl CleanCheckpointPublisher {
         self.inner.durable_sequence.load(Ordering::Acquire)
     }
 
+    pub(crate) fn rebuild_next_from_genesis(&self) {
+        self.inner
+            .rebuild_from_genesis
+            .store(true, Ordering::Release);
+    }
+
     pub(crate) fn published_document_dependencies(
         &self,
     ) -> BTreeMap<DocumentId, DocumentDependencies> {
@@ -2329,7 +2409,6 @@ impl CleanCheckpointPublisher {
             .map(Option::flatten)
     }
 
-    #[cfg(test)]
     pub(crate) fn wait_for_idle(&self) -> Result<(), String> {
         let mut state = self
             .inner
@@ -2370,6 +2449,8 @@ impl Drop for CleanCheckpointPublisher {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        #[cfg(test)]
+        record_publisher_close(self.inner.store.root_path());
     }
 }
 
@@ -2379,8 +2460,12 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
             .documents
             .as_ref()
             .map(|documents| documents.dependencies.clone());
-        match publish_capture(&inner.store, capture) {
+        let rebuild_from_genesis = inner.rebuild_from_genesis.load(Ordering::Acquire);
+        match publish_capture_with_predecessor(&inner.store, capture, !rebuild_from_genesis) {
             Ok(published) => {
+                if rebuild_from_genesis {
+                    inner.rebuild_from_genesis.store(false, Ordering::Release);
+                }
                 if let Some(documents) = published_documents {
                     *inner
                         .published_documents
@@ -4715,7 +4800,7 @@ mod tests {
                 .disposition(),
             BatchDisposition::Accepted { .. }
         ));
-        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        engine.wait_for_clean_checkpoint().unwrap();
         let checkpoint_reader = ObjectStore::open(&root.join("archive"), workspace).unwrap();
         let first = match open_checkpoint(&checkpoint_reader).unwrap() {
             CleanCheckpointOpen::Loaded(loaded) => loaded,
@@ -4787,7 +4872,7 @@ mod tests {
             evicted_edit_work.document_head_reconstructions, 0,
             "a same-session post-eviction edit must load the published image, not replay ancestry"
         );
-        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        engine.wait_for_clean_checkpoint().unwrap();
         let checkpoint_reader = ObjectStore::open(&root.join("archive"), workspace).unwrap();
         let second = match open_checkpoint(&checkpoint_reader).unwrap() {
             CleanCheckpointOpen::Loaded(loaded) => loaded,
@@ -4832,7 +4917,7 @@ mod tests {
                 .disposition(),
             BatchDisposition::Accepted { .. }
         ));
-        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        engine.wait_for_clean_checkpoint().unwrap();
         let checkpoint_reader = ObjectStore::open(&root.join("archive"), workspace).unwrap();
         let third = match open_checkpoint(&checkpoint_reader).unwrap() {
             CleanCheckpointOpen::Loaded(loaded) => loaded,

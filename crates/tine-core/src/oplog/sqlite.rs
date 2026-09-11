@@ -7830,7 +7830,6 @@ mod applier_lease {
         /// another process — under any app-data or XDG root — could acquire this
         /// archive's workspace lease. This remains a test helper for validating
         /// continuous ownership across a database handoff.
-        #[cfg(test)]
         pub(crate) fn close_retaining_lease(self) -> WorkspaceRuntimeLease {
             let Self { projection, lease } = self;
             drop(projection);

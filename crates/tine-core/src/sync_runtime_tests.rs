@@ -8067,7 +8067,7 @@ fn checkpoint_image_materialization_avoids_baseline_capsule_decode() {
             .expect("reopened projection contains the baseline page");
         let page_id = page_row.page_id;
         let engine = resources.runtime.engine();
-        engine.wait_for_clean_checkpoint_for_test().unwrap();
+        engine.wait_for_clean_checkpoint().unwrap();
         assert!(
             engine
                 .has_checkpoint_image_for_test(page_row.home_document_id)
@@ -17667,6 +17667,379 @@ fn p3_below_floor_provider_custody_precedes_dequeue_and_resolves_uncertain_appen
         }
     }
     panic!("uncertain recovery-input append never resolved by exact reopened bytes");
+}
+
+/// A retained below-floor original drives the real serialized actor through
+/// full-history reconstruction, is archived byte-for-byte, and restores
+/// writable admission without a process restart or manual repair action.
+#[test]
+fn p3_automatic_full_history_reconstruction_preserves_original_and_resumes() {
+    let (author, receiver, author_handle, receiver_handle) =
+        joined_shared_pair("p3-full-history-resume", 0xc300_0000);
+    let (create_batch, _page_id, block_id, document_id) = submit_shared_page(
+        &author_handle,
+        0xc300_0020,
+        "P3 Full History Resume",
+        "notes/p3-full-history-resume.md",
+        "departure state",
+    );
+    publish_shared_batch(&author_handle, &author, create_batch);
+    settle_shared_provider(&author_handle);
+    copy_provider_tree(
+        &author.request.provider_root,
+        &receiver.request.provider_root,
+    );
+    receiver_handle.observe_provider().unwrap();
+    settle_shared_provider(&receiver_handle);
+
+    let receiver_advance = submit_durable(
+        &receiver_handle,
+        vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id: document_id,
+            },
+            content: "receiver advanced past departure".into(),
+        }],
+    );
+    settle_shared_provider(&receiver_handle);
+
+    // Packet 4 may retire these accepted hot originals after publishing their
+    // exact bytes cold. Exercise reconstruction against that future physical
+    // shape now: the authenticated cold manifest map is the only membership
+    // source and every payload comes back through the logical resolver.
+    let receiver_archive_root = clean_operation_archive_directory(&receiver.request.archive_root);
+    let receiver_archive = ObjectStore::open(
+        &receiver_archive_root,
+        receiver.request.identities.workspace_id,
+    )
+    .unwrap();
+    let cold_only = BTreeSet::from([create_batch, receiver_advance]);
+    crate::oplog::cold_object_store::publish_cold_history_for_batches(
+        &receiver_archive,
+        &cold_only,
+    )
+    .unwrap();
+    let mut cold_object_names = BTreeSet::new();
+    for batch_id in &cold_only {
+        let manifest = receiver_archive.read_manifest(*batch_id).unwrap().unwrap();
+        cold_object_names.extend(
+            manifest
+                .required_objects()
+                .iter()
+                .map(|object| object.content_digest()),
+        );
+    }
+    for batch_id in &cold_only {
+        fs::remove_file(
+            receiver_archive_root
+                .join("batches")
+                .join(format!("{batch_id}.manifest")),
+        )
+        .unwrap();
+    }
+    for digest in cold_object_names {
+        fs::remove_file(
+            receiver_archive_root
+                .join("objects")
+                .join(format!("{digest}.object")),
+        )
+        .unwrap();
+    }
+    receiver_handle
+        .force_document_floor_to_current_for_test(document_id)
+        .unwrap();
+
+    let stale_batch = submit_durable(
+        &author_handle,
+        vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id: document_id,
+            },
+            content: "exact stale original".into(),
+        }],
+    );
+    publish_shared_batch(&author_handle, &author, stale_batch);
+    settle_shared_provider(&author_handle);
+    let exact_manifest = fs::read(
+        author
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{stale_batch}.manifest")),
+    )
+    .unwrap();
+    let decoded = OperationBatch::decode(&exact_manifest).unwrap();
+    let exact_objects = decoded
+        .required_objects()
+        .iter()
+        .map(|object| {
+            (
+                object.content_digest(),
+                fs::read(
+                    author
+                        .request
+                        .provider_root
+                        .join(format!("outbox/objects/{}.object", object.content_digest())),
+                )
+                .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    copy_provider_tree(
+        &author.request.provider_root,
+        &receiver.request.provider_root,
+    );
+    receiver_handle.observe_provider().unwrap();
+
+    let mut saw_custody = false;
+    let mut resumed = false;
+    for _ in 0..1024 {
+        let tick = receiver_handle.tick().unwrap();
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+                    | SyncRuntimeTick::RecoveryBlocked(_)
+            ),
+            "automatic reconstruction failed: {tick:?}; create={create_batch}; receiver_advance={receiver_advance}; stale={stale_batch}"
+        );
+        let pending = receiver_handle.recovery_input_probe_for_test().unwrap();
+        saw_custody |= pending.iter().any(|frame| frame.batch_id == stale_batch);
+        if saw_custody && pending.is_empty() {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "recovery-input custody never reached reinstall");
+
+    let receiver_archive = ObjectStore::open(
+        &clean_operation_archive_directory(&receiver.request.archive_root),
+        receiver.request.identities.workspace_id,
+    )
+    .unwrap();
+    assert_eq!(
+        receiver_archive
+            .resolve_logical_manifest_bytes(stale_batch)
+            .unwrap(),
+        exact_manifest,
+        "reconstruction regenerated or changed the original manifest"
+    );
+    for (digest, expected) in exact_objects {
+        assert_eq!(
+            receiver_archive
+                .resolve_logical_object_bytes(digest)
+                .unwrap(),
+            expected,
+            "reconstruction regenerated or changed original object {digest}"
+        );
+    }
+
+    let post_recovery = submit_durable(
+        &receiver_handle,
+        vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id,
+                home_document_id: document_id,
+            },
+            content: "writable after automatic reinstall".into(),
+        }],
+    );
+    assert_ne!(post_recovery, stale_batch);
+}
+
+#[test]
+fn p3_full_history_contract_names_the_ordered_boundary_count_and_automatic_exit() {
+    let contract = include_str!("../../../docs/storage-sync-contract.md");
+    assert_eq!(FULL_HISTORY_RECONSTRUCTION_STEP_COUNT, 8);
+    assert!(
+        contract.contains("Automatic full-history reconstruction follows eight ordered boundaries")
+    );
+    assert!(contract.contains("Ordinary writable admission is then restored automatically"));
+    assert!(contract.contains("single logical hot-then-indexed-cold resolver"));
+    assert!(contract.contains("managed-local, projection-turn, and recovery-input"));
+    assert!(contract.contains("Journal cleanup remains\nfrozen until successful reinstall"));
+}
+
+/// Every inter-step cut leaves the exact retained operation authoritative and
+/// restartable. The publisher high-water probe is keyed by archive root, so a
+/// value of one proves the old and replacement `current` writers never
+/// coexist during the real actor transition.
+#[test]
+fn p3_reconstruction_interstep_crashes_preserve_exact_original_and_publisher_exclusion() {
+    for step in 1_u8..=7 {
+        let seed = 0xc400_0000_u128 + u128::from(step) * 0x1_000;
+        let label = format!("p3-reconstruction-cut-{step}");
+        let (author, receiver, author_handle, receiver_handle) = joined_shared_pair(&label, seed);
+        let (create_batch, _page_id, block_id, document_id) = submit_shared_page(
+            &author_handle,
+            seed + 0x20,
+            &format!("P3 Reconstruction Cut {step}"),
+            &format!("notes/p3-reconstruction-cut-{step}.md"),
+            "departure state",
+        );
+        publish_shared_batch(&author_handle, &author, create_batch);
+        settle_shared_provider(&author_handle);
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        submit_durable(
+            &receiver_handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                content: format!("receiver advancement at cut {step}"),
+            }],
+        );
+        settle_shared_provider(&receiver_handle);
+        receiver_handle
+            .force_document_floor_to_current_for_test(document_id)
+            .unwrap();
+
+        let stale_batch = submit_durable(
+            &author_handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                content: format!("exact stale original at cut {step}"),
+            }],
+        );
+        publish_shared_batch(&author_handle, &author, stale_batch);
+        settle_shared_provider(&author_handle);
+        let exact_manifest = fs::read(
+            author
+                .request
+                .provider_root
+                .join(format!("outbox/manifests/{stale_batch}.manifest")),
+        )
+        .unwrap();
+        let original = OperationBatch::decode(&exact_manifest).unwrap();
+        let exact_objects = original
+            .required_objects()
+            .iter()
+            .map(|object| {
+                fs::read(
+                    author
+                        .request
+                        .provider_root
+                        .join(format!("outbox/objects/{}.object", object.content_digest())),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle
+            .install_recovery_input_fault_for_test(RecoveryInputFault::AfterReconstructionStep(
+                step,
+            ))
+            .unwrap();
+        receiver_handle.observe_provider().unwrap();
+
+        let mut observed_cut = false;
+        for _ in 0..1024 {
+            let tick = receiver_handle.tick().unwrap();
+            if matches!(
+                &tick,
+                SyncRuntimeTick::RecoveryBlocked(detail)
+                    if detail.contains(&format!("reconstruction step {step}"))
+            ) {
+                observed_cut = true;
+                break;
+            }
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "recovery failed before injected cut {step}: {tick:?}"
+            );
+        }
+        assert!(observed_cut, "recovery never reached injected cut {step}");
+        let retained = receiver_handle.recovery_input_probe_for_test().unwrap();
+        assert_eq!(retained.len(), 1, "cut {step} changed custody cardinality");
+        assert_eq!(retained[0].batch_id, stale_batch);
+        assert_eq!(
+            retained[0].source_endpoint_id,
+            author.request.identities.endpoint_id
+        );
+        assert_eq!(retained[0].manifest, exact_manifest);
+        assert_eq!(retained[0].objects, exact_objects);
+        let archive_root = clean_operation_archive_directory(&receiver.request.archive_root);
+        assert_eq!(
+            crate::oplog::checkpoint_generation::publisher_high_water_for_test(&archive_root),
+            1,
+            "cut {step} allowed two checkpoint publishers to coexist"
+        );
+        receiver_handle.stop_without_clean_drain().unwrap();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        let mut reinstalled = false;
+        for _ in 0..2048 {
+            let tick = reopened.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                        | SyncRuntimeTick::RecoveryBlocked(_)
+                ),
+                "cut {step} did not remain restartable: {tick:?}"
+            );
+            if reopened.recovery_input_probe_for_test().unwrap().is_empty() {
+                reinstalled = true;
+                break;
+            }
+        }
+        assert!(reinstalled, "cut {step} never completed after restart");
+
+        let receiver_archive =
+            ObjectStore::open(&archive_root, receiver.request.identities.workspace_id).unwrap();
+        let archived_manifest = receiver_archive
+            .resolve_logical_manifest_bytes(stale_batch)
+            .unwrap();
+        assert_eq!(archived_manifest, exact_manifest);
+        let archived = OperationBatch::decode(&archived_manifest).unwrap();
+        assert_eq!(archived.batch_id(), original.batch_id());
+        assert_eq!(archived.causal_dot(), original.causal_dot());
+        assert_eq!(archived.author_device_id(), original.author_device_id());
+        assert_eq!(archived.author_session_id(), original.author_session_id());
+        for bytes in exact_objects {
+            let digest = ContentDigest::of(&bytes);
+            assert_eq!(
+                receiver_archive
+                    .resolve_logical_object_bytes(digest)
+                    .unwrap(),
+                bytes
+            );
+        }
+        let post_recovery = submit_durable(
+            &reopened,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                content: format!("writable after cut {step}"),
+            }],
+        );
+        assert_ne!(post_recovery, stale_batch);
+    }
 }
 
 /// Breadth: a peer CROSS-PAGE MOVE under the same interleaving must reach

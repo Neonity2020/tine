@@ -730,9 +730,14 @@ pub(crate) struct CleanLocalRuntime {
     session_id: SessionId,
     endpoint: ProjectionEndpointBinding,
     engine: Box<ShardedHotEngine>,
-    projection: LeasedWorkspaceProjection,
+    projection: Option<LeasedWorkspaceProjection>,
     writer_lanes: WriterLanes,
     revocation: RuntimeRevocationLatch,
+    /// Graph-local semantic admission is paused while a below-floor original
+    /// is reconstructed from genesis. Internal recovery sessions retain the
+    /// same workspace and writer-lane authority; ordinary application,
+    /// watcher and provider mutation sessions cannot cross this fence.
+    recovery_admission_paused: bool,
 }
 
 impl CleanLocalRuntime {
@@ -775,9 +780,10 @@ impl CleanLocalRuntime {
             session_id,
             endpoint,
             engine: Box::new(engine),
-            projection,
+            projection: Some(projection),
             writer_lanes: WriterLanes::Deferred,
             revocation: RuntimeRevocationLatch::default(),
+            recovery_admission_paused: false,
         })
     }
 
@@ -823,7 +829,20 @@ impl CleanLocalRuntime {
     }
 
     pub(crate) const fn database(&self) -> &SqliteFrontier {
-        self.projection.database()
+        self.projection
+            .as_ref()
+            .expect("clean runtime retains its leased projection")
+            .database()
+    }
+
+    pub(crate) fn database_if_installed(&self) -> Option<&SqliteFrontier> {
+        self.projection
+            .as_ref()
+            .map(LeasedWorkspaceProjection::database)
+    }
+
+    pub(crate) const fn has_projection(&self) -> bool {
+        self.projection.is_some()
     }
 
     pub(crate) const fn endpoint(&self) -> ProjectionEndpointBinding {
@@ -838,6 +857,14 @@ impl CleanLocalRuntime {
         &mut self,
         graph: &Graph,
     ) -> Result<CleanRuntimeSession<'_>, RuntimePromotionError> {
+        if self.recovery_admission_paused {
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "clean runtime application admission is paused for full-history reconstruction"
+                        .into(),
+                ),
+            ));
+        }
         self.admit_clean_session(graph, true)
     }
 
@@ -854,6 +881,62 @@ impl CleanLocalRuntime {
         self.admit_clean_session(graph, false)
     }
 
+    pub(crate) fn pause_full_history_admission(&mut self) {
+        self.recovery_admission_paused = true;
+    }
+
+    pub(crate) fn resume_full_history_admission(&mut self) {
+        self.recovery_admission_paused = false;
+    }
+
+    pub(crate) fn stop_clean_checkpoint_publisher(&mut self) {
+        self.engine.stop_clean_checkpoint_publisher();
+    }
+
+    pub(crate) fn take_projection_for_full_history(&mut self) -> LeasedWorkspaceProjection {
+        self.projection
+            .take()
+            .expect("serialized recovery takes the leased projection once")
+    }
+
+    pub(crate) fn install_full_history_projection_and_engine(
+        &mut self,
+        engine: ShardedHotEngine,
+        projection: LeasedWorkspaceProjection,
+    ) -> Result<(), (LeasedWorkspaceProjection, RuntimePromotionError)> {
+        if self.projection.is_some()
+            || engine.projection_endpoint_binding() != Some(self.endpoint)
+            || engine
+                .require_index_free_clean_projection_runtime()
+                .is_err()
+        {
+            return Err((
+                projection,
+                RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
+                    "full-history projection/engine installation is not affine".into(),
+                )),
+            ));
+        }
+        if let Err(error) = projection.revalidate_workspace_lease_identity() {
+            return Err((projection, RuntimePromotionError::Sqlite(error)));
+        }
+        let frontier = match engine.accepted_frontier_root() {
+            Ok(frontier) => frontier,
+            Err(error) => return Err((projection, RuntimePromotionError::Engine(error))),
+        };
+        if !frontier.same_accepted_authority(projection.database().required_frontier_root()) {
+            return Err((
+                projection,
+                RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
+                    "rebuilt full-history projection differs from its engine frontier".into(),
+                )),
+            ));
+        }
+        self.engine = Box::new(engine);
+        self.projection = Some(projection);
+        Ok(())
+    }
+
     fn admit_clean_session(
         &mut self,
         graph: &Graph,
@@ -862,6 +945,8 @@ impl CleanLocalRuntime {
         self.revocation
             .guard(WorkspaceAuthorityBoundary::Admission)?;
         self.projection
+            .as_ref()
+            .expect("clean runtime retains its leased projection")
             .revalidate_workspace_lease_identity()
             .map_err(RuntimePromotionError::Sqlite)?;
         let graph_resource_id = graph.canonical_resource_id().map_err(|error| {
@@ -880,8 +965,13 @@ impl CleanLocalRuntime {
                 .require_index_free_clean_projection_runtime()
                 .is_err()
             || (require_sqlite_at_manifest_frontier
-                && !engine_frontier
-                    .same_accepted_authority(self.projection.database().required_frontier_root()))
+                && !engine_frontier.same_accepted_authority(
+                    self.projection
+                        .as_ref()
+                        .expect("clean runtime retains its leased projection")
+                        .database()
+                        .required_frontier_root(),
+                ))
         {
             return Err(RuntimePromotionError::Activation(
                 LocalActivationError::RuntimeBinding(
@@ -913,8 +1003,12 @@ impl CleanLocalRuntime {
             projection,
             writer_lanes,
             revocation,
+            ..
         } = self;
-        let (database, workspace) = projection.database_and_lease_identity();
+        let (database, workspace) = projection
+            .as_mut()
+            .expect("clean runtime retains its leased projection")
+            .database_and_lease_identity();
         let admission = CleanRuntimeAdmission {
             workspace_id: engine.workspace_id(),
             session_id: *session_id,

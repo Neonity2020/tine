@@ -782,6 +782,40 @@ impl ColdHistoryReader {
             .map(Some)
             .map_err(|error| cold_manifest_error(batch_id, error))
     }
+
+    /// Enumerate the committed cold manifest membership from the authenticated
+    /// manifest map itself. Full-history reconstruction is the one consumer
+    /// allowed to pay this lifetime-sized walk; using the sealed map keeps the
+    /// root marker as the sole inventory and avoids interpreting pack or
+    /// directory order as committed membership.
+    pub(crate) fn manifest_batch_ids(&self) -> Result<BTreeSet<BatchId>, StoreError> {
+        let root = self.roots.manifest_root().map_err(cold_index_error)?;
+        let reader = SealedAcceptedIndexReader::new(&self.sealed);
+        let mut pending = root.root.into_iter().collect::<Vec<_>>();
+        let mut batches = BTreeSet::new();
+        while let Some(link) = pending.pop() {
+            let node = reader
+                .read_map_node(link)
+                .map_err(|error| cold_index_error(error.to_string()))?;
+            let key = node.key.as_slice();
+            let bytes: [u8; 16] = key
+                .try_into()
+                .map_err(|_| cold_index_error("cold manifest map contains a non-BatchId key"))?;
+            if !batches.insert(BatchId::from_uuid(Uuid::from_bytes(bytes))) {
+                return Err(cold_index_error(
+                    "cold manifest map repeats a BatchId identity",
+                ));
+            }
+            pending.extend(node.left);
+            pending.extend(node.right);
+        }
+        if u64::try_from(batches.len()).ok() != Some(root.count) {
+            return Err(cold_index_error(
+                "cold manifest map traversal differs from its authenticated count",
+            ));
+        }
+        Ok(batches)
+    }
 }
 
 // ---------------------------------------------------------------------------

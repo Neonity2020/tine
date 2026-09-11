@@ -159,6 +159,21 @@ impl RecoveryInputEnvelopeV1 {
         }
         Ok(())
     }
+
+    pub(crate) fn prepared_batch(&self) -> Result<PreparedBatch, String> {
+        let manifest = OperationBatch::decode(&self.manifest)
+            .map_err(|error| format!("recovery-input manifest is invalid: {error}"))?;
+        let objects = self
+            .objects
+            .iter()
+            .map(|bytes| {
+                OperationObject::decode(bytes)
+                    .map_err(|error| format!("recovery-input object is invalid: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        PreparedBatch::new(manifest, objects)
+            .map_err(|error| format!("recovery-input batch is invalid: {error}"))
+    }
 }
 
 fn source_endpoint(prepared: &PreparedBatch) -> Result<ProjectionEndpointId, String> {
@@ -350,6 +365,97 @@ impl RecoveryInputJournal {
 
     pub(crate) fn is_pending(&self) -> bool {
         !self.envelopes.is_empty()
+    }
+
+    pub(crate) fn pending_envelopes(&self) -> Vec<RecoveryInputEnvelopeV1> {
+        self.envelopes.values().cloned().collect()
+    }
+
+    /// The authenticated segment and durable append prefix selected by the
+    /// recovery-input anchor. Pending custody always has a selection; empty
+    /// custody deliberately has none and creates no storage.
+    pub(crate) fn recovery_fence(&self) -> Result<(&str, u64, u64), String> {
+        let selection = self
+            .selection
+            .as_ref()
+            .ok_or_else(|| "pending recovery-input has no selected segment".to_owned())?;
+        let segment = self
+            .segment
+            .as_ref()
+            .ok_or_else(|| "pending recovery-input has no open segment".to_owned())?;
+        Ok((
+            selection.segment_name(),
+            selection.base_sequence(),
+            segment.next_sequence(),
+        ))
+    }
+
+    /// Retire every currently selected input only after the caller has opened
+    /// the newly published checkpoint and proved exact archive coverage. The
+    /// replacement anchor selects a fresh empty segment first; the predecessor
+    /// segment then becomes disposable crash residue and is unlinked only as
+    /// best-effort cleanup.
+    pub(crate) fn complete_successful_reinstall(&mut self) -> Result<(), String> {
+        if !self.is_pending() {
+            return Ok(());
+        }
+        let old_selection = self
+            .selection
+            .clone()
+            .ok_or_else(|| "pending recovery-input has no selected segment".to_owned())?;
+        let expected_anchor = read_optional_regular(
+            &self.directory,
+            RECOVERY_INPUT_ANCHOR_FILE,
+            RECOVERY_INPUT_ANCHOR_MAX_BYTES,
+            None,
+        )
+        .map_err(|error| format!("cannot read installed recovery-input anchor: {error}"))?
+        .ok_or_else(|| "pending recovery-input anchor is missing".to_owned())?;
+        RecoveryInputAnchorV1::decode(
+            &expected_anchor,
+            self.workspace_id,
+            self.lineage_digest,
+            self.endpoint_id,
+            self.device_id,
+        )?;
+
+        let replacement = RecoveryInputAnchorV1::new(
+            self.workspace_id,
+            self.lineage_digest,
+            self.endpoint_id,
+            self.device_id,
+        );
+        let replacement_selection = replacement.selection()?;
+        LocalJournalSegmentV2::<RecoveryInputPayloadKind>::prepare_single_writer(
+            &self.directory,
+            &replacement_selection,
+        )
+        .map_err(|error| format!("cannot prepare empty recovery-input successor: {error}"))?;
+        let replacement_bytes = replacement.encode()?;
+        DurableDirectoryPublication::open(&self.directory)
+            .map_err(|error| format!("recovery-input retirement is unavailable: {error}"))?
+            .replace_exact(
+                RECOVERY_INPUT_ANCHOR_FILE,
+                &expected_anchor,
+                &replacement_bytes,
+            )
+            .map_err(|error| format!("cannot retire installed recovery inputs: {error}"))?;
+
+        drop(self.segment.take());
+        let (segment, recovery) =
+            LocalJournalSegmentV2::open_selected(&self.directory, &replacement_selection)
+                .map_err(|error| format!("cannot open empty recovery-input successor: {error}"))?;
+        if recovery.frames_recovered != 0 || segment.next_sequence() != 0 {
+            return Err("recovery-input successor is unexpectedly nonempty".into());
+        }
+        self.selection = Some(replacement_selection);
+        self.segment = Some(segment);
+        self.payloads.clear();
+        self.envelopes.clear();
+
+        let _ = self.directory.remove_file(old_selection.segment_name());
+        let _ = self.directory.remove_file(old_selection.frontier_name());
+        Ok(())
     }
 
     pub(crate) fn retain(

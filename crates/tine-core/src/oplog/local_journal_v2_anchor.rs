@@ -38,6 +38,10 @@ impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
         self.segment.next_sequence()
     }
 
+    pub(crate) fn segment_name(&self) -> &str {
+        self.segment.selection().segment_name()
+    }
+
     #[cfg(test)]
     pub(crate) fn committed_bytes(&self) -> u64 {
         self.segment.committed_bytes()

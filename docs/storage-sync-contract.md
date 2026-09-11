@@ -1439,8 +1439,9 @@ current published image and applies only accepted document updates after that
 image's S. It falls back to genesis/original replay only when the roster has no
 image for that document. The current live policy supplies E=0, so these v2
 images retain their existing native floor and cannot yet make an incoming
-original below-floor; acceptance-age advancement and automatic reconstruction
-remain a later Packet 3 slice.
+original below-floor. Acceptance-age advancement remains a later slice; an
+explicitly installed shallow floor can nevertheless exercise the recovery
+boundary described below.
 
 Provider admission nevertheless implements the below-floor boundary before
 that policy becomes active. Preflight checks every declared affected/support
@@ -1463,9 +1464,38 @@ exact BatchId and bytes before any retry; identical redelivery is idempotent,
 while conflicting bytes under that identity follow input-validation collision
 handling. I/O or resource failure leaves the provider item queued and all
 authoritative inputs retryable. The recovery-input segment itself is the restart trigger;
-there is no separate durable recovering flag. Full-history reconstruction and
-retirement of successfully consumed frames remain the following Packet 3
-slice.
+there is no separate durable recovering flag.
+
+Automatic full-history reconstruction follows eight ordered boundaries. The
+serialized actor first finishes or classifies any already-started append,
+revokes ordinary application admission, and takes the accepted-archive
+boundary plus each selected local-journal generation and durable prefix:
+managed-local, projection-turn, and recovery-input. Journal cleanup remains
+frozen until successful reinstall. It retains the existing workspace and
+writer-lane leases, joins the old checkpoint publisher, and only then creates
+a replacement publisher. A fresh engine starts from immutable
+genesis, deliberately bypasses `current`, and replays the deduplicated union of
+hot committed manifest names and authenticated cold manifest-map membership in
+causal dependency order. Every byte is obtained through the single logical hot-then-indexed-cold resolver.
+
+The fenced managed-local records are reapplied through the existing
+`replay_managed_local_record` transition. Recovery-input originals are admitted
+without regenerating an equivalent edit: their original BatchId, canonical
+manifest and object bytes, causal dot, author device/session, and writer
+identity remain unchanged. Existing semantic conflict rules decide visibility;
+that does not permit discarding the operation. Missing prerequisites or I/O
+leave the named inputs pending and the actor retries automatically; neither
+Markdown nor a disposable cache may replace missing authoritative history.
+
+After commit-last archive publication, SQLite and Markdown settlement, the
+runtime publishes a from-genesis checkpoint at the recovered frontier, joins
+its publisher, opens that same checkpoint through logical hot/cold
+qualification, and rebinds the disposable projection under the continuously
+held workspace lease. Only successful reinstall selects an empty
+recovery-input successor and permits best-effort cleanup of the old segment.
+Ordinary writable admission is then restored automatically. No shallow
+checkpoint advances a journal drain checkpoint or retires recovery input by
+itself.
 
 The background publisher folds accepted-row deltas into the same
 `clean-open-checkpoint-v2` format; no second reader or authority is introduced.

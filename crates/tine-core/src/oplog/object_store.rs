@@ -897,18 +897,14 @@ impl ObjectStore {
                 batch_id,
                 document_id,
             })?;
-        let objects_dir = self.open_namespace(OBJECTS_DIR)?;
-        let filename = object_filename(descriptor.content_digest());
         self.counters
             .accepted_object_reads
             .fetch_add(1, Ordering::Relaxed);
         crate::fast_commit::note_archive_object_read();
-        let bytes = read_required_regular(
-            &objects_dir,
-            &filename,
-            MAX_OBJECT_BYTES as u64,
-            Some(descriptor.encoded_byte_length()),
-        )?;
+        // Accepted-history reload is a named cold consumer: the hot original
+        // may have been retired after exact cold publication. Stay on the one
+        // logical resolver rather than opening a second inventory.
+        let bytes = self.resolve_logical_object_bytes(descriptor.content_digest())?;
         if ContentDigest::of(&bytes) != descriptor.content_digest() {
             return Err(StoreError::ObjectPathMismatch(descriptor.content_digest()));
         }
@@ -934,15 +930,16 @@ impl ObjectStore {
         batch_id: BatchId,
         expected_manifest_fingerprint: ContentDigest,
     ) -> Result<OperationBatch, StoreError> {
-        let batches = self.open_namespace(BATCHES_DIR)?;
-        let filename = manifest_filename(batch_id);
         self.counters
             .accepted_manifest_reads
             .fetch_add(1, Ordering::Relaxed);
         self.counters
             .dag_manifest_reads
             .fetch_add(1, Ordering::Relaxed);
-        let bytes = read_required_regular(&batches, &filename, MAX_MANIFEST_BYTES as u64, None)?;
+        // Full-history reconstruction can evict a prepared batch from the hot
+        // engine and reload it after Packet 4 has retired its hot manifest.
+        // Resolve the immutable original through the single hot/cold surface.
+        let bytes = self.resolve_logical_manifest_bytes(batch_id)?;
         let actual = ContentDigest::of(&bytes);
         if actual != expected_manifest_fingerprint {
             return Err(StoreError::AcceptedManifestMismatch {
@@ -1082,6 +1079,20 @@ impl ObjectStore {
             .map(|names| names.clone())
     }
 
+    /// The one committed-history discovery used by full reconstruction: hot
+    /// commit-marker names plus authenticated cold manifest membership,
+    /// deduplicated by immutable BatchId. Payload resolution remains routed
+    /// through the logical hot-then-indexed-cold resolver.
+    pub(crate) fn committed_manifest_names_with_cold_history(
+        &self,
+    ) -> Result<BTreeSet<BatchId>, StoreError> {
+        let mut names = self.committed_manifest_names()?;
+        if let Some(cold) = super::cold_object_store::ColdHistoryReader::open(self)? {
+            names.extend(cold.manifest_batch_ids()?);
+        }
+        Ok(names)
+    }
+
     /// Enumerate only canonical content-addressed object names. No object body
     /// is opened or decoded.
     pub(crate) fn object_names(&self) -> Result<BTreeSet<ContentDigest>, StoreError> {
@@ -1113,6 +1124,30 @@ impl ObjectStore {
             .iter()
             .find(|digest| !objects.contains(digest))
             .copied();
+        Ok((tail, missing_manifest, missing_object))
+    }
+
+    /// Recovery-only checkpoint qualification over the authenticated logical
+    /// archive. Ordinary open keeps its hot cached path; full reconstruction
+    /// has already authorized the lifetime-sized cold manifest-map walk.
+    pub(crate) fn checkpoint_namespace_delta_with_cold_history(
+        &self,
+        roster: &BTreeSet<BatchId>,
+        required_objects: &BTreeSet<ContentDigest>,
+    ) -> Result<(BTreeSet<BatchId>, Option<BatchId>, Option<ContentDigest>), StoreError> {
+        let manifests = self.committed_manifest_names_with_cold_history()?;
+        let missing_manifest = roster
+            .iter()
+            .find(|batch_id| !manifests.contains(batch_id))
+            .copied();
+        let tail = manifests.difference(roster).copied().collect();
+        let mut missing_object = None;
+        for digest in required_objects {
+            if !self.contains_logical_object(*digest)? {
+                missing_object = Some(*digest);
+                break;
+            }
+        }
         Ok((tail, missing_manifest, missing_object))
     }
 

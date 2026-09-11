@@ -112,7 +112,6 @@ use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::projection_turn_journal::{
     open_projection_turn_journal, ProjectionTurnJournalState,
 };
-#[cfg(test)]
 use crate::oplog::recovery_input_journal::RecoveryInputEnvelopeV1;
 use crate::oplog::recovery_input_journal::RecoveryInputJournal;
 #[cfg(test)]
@@ -176,6 +175,7 @@ const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
 const CLEAN_OPERATION_ARCHIVE_DIRECTORY: &str = "operations";
 const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
+const FULL_HISTORY_RECONSTRUCTION_STEP_COUNT: u8 = 8;
 #[cfg(not(test))]
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
 #[cfg(test)]
@@ -6719,6 +6719,7 @@ enum CleanActorExternalOutcome {
 enum RecoveryInputFault {
     AppendOutcomeUnknownAfterPhysicalAppend,
     AfterCustodyBeforeProviderDequeue,
+    AfterReconstructionStep(u8),
 }
 
 /// Consecutive identical non-continuation failures of one retained
@@ -6927,6 +6928,48 @@ impl CleanRuntimeActorCore {
             CleanActorMutationOutcome::NeedsFullHistory(_) => None,
         };
         Ok(outcome)
+    }
+
+    /// Admit one fenced recovery-input original while ordinary application
+    /// admission remains paused. This is the same coordinator and commit-last
+    /// archive path as live provider ingest; only the runtime session permits
+    /// the already-authorized reconstruction transition to cross the pause.
+    fn execute_recovery_input(
+        &mut self,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        projection_turns: &mut ProjectionTurnJournalState,
+        prepared: &PreparedBatch,
+    ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        if let Some(pending) = self.pending.as_ref() {
+            return Ok(CleanActorMutationOutcome::RetainedPriorPending {
+                batch_id: pending.batch_id(),
+                phase: pending.failure().phase(),
+            });
+        }
+        let state = {
+            let mut session =
+                self.runtime
+                    .admit_clean_derived_recovery(graph)
+                    .map_err(|error| CleanActorMutationFailure {
+                        phase: OperationalPhase::Bindings,
+                        detail: error.to_string(),
+                    })?;
+            OperationalCoordinator::ingest_clean_prepared(
+                &mut session,
+                graph,
+                receipts,
+                projection_turns,
+                prepared,
+            )
+            .map_err(CleanActorMutationFailure::from)?
+        };
+        Ok(match state {
+            CleanProviderAdmissionState::Mutation(state) => self.retain_outcome(state),
+            CleanProviderAdmissionState::NeedsFullHistory(need) => {
+                CleanActorMutationOutcome::NeedsFullHistory(need)
+            }
+        })
     }
 
     /// The retained continuation's own failure, verbatim.
@@ -7613,7 +7656,7 @@ fn drain_open_managed_local_journal(
         .accepted_frontier_root()
         .map_err(CleanOpenError::from)?;
     let mut session = runtime
-        .admit_clean_mutation(graph)
+        .admit_clean_derived_recovery(graph)
         .map_err(CleanOpenError::from)?;
     let (_, engine, _) = session.parts().map_err(CleanOpenError::from)?;
     engine
@@ -7643,7 +7686,7 @@ fn drain_open_projection_turn_journal(
         let published = handoff.into_publisher_guard().into_published_latch();
         {
             let mut session = runtime
-                .admit_clean_mutation(graph)
+                .admit_clean_derived_recovery(graph)
                 .map_err(CleanOpenError::from)?;
             let (_, engine, database) = session.parts().map_err(CleanOpenError::from)?;
             crate::oplog::projection::replay_projection_turn(
@@ -7957,6 +8000,115 @@ fn open_clean_runtime_resources(
     request: &SyncRuntimeOpenRequest,
 ) -> Result<Option<CleanRuntimeResources>, String> {
     open_clean_runtime_resources_with_progress(request, &mut |_| {}, &mut |_, _| {}, &mut |_| {})
+}
+
+/// Build one replacement engine under an already-held runtime lease. The
+/// caller owns publisher exclusion: its predecessor publisher is joined before
+/// this function attaches the archive (which creates the replacement
+/// publisher), and this engine is likewise stopped before another replacement
+/// is requested.
+fn build_full_history_replacement_engine(
+    request: &SyncRuntimeOpenRequest,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    endpoint: ProjectionEndpointBinding,
+    reopen_checkpoint: bool,
+    inject_after_genesis: bool,
+) -> Result<(ShardedHotEngine, Arc<LazyGenesisCandidate>), String> {
+    let identities = request.clean_identities.as_ref().ok_or_else(|| {
+        "full-history reconstruction has no persisted local identities".to_owned()
+    })?;
+    let directories = resolve_clean_authority_directories(
+        &request.archive_root,
+        &request.enrollment_root,
+        &request.database_path,
+    )
+    .map_err(CleanOpenError::from)?
+    .ok_or_else(|| "full-history reconstruction has no clean authority".to_owned())?;
+    let opened = open_clean_activation_authority(
+        &request.enrollment_root,
+        &directories.baseline,
+        identities.catalog_document_id,
+        ReferenceCatalogPolicyV1::default(),
+    )
+    .map_err(CleanOpenError::from)?
+    .ok_or_else(|| "full-history reconstruction has no immutable genesis".to_owned())?;
+    let (mut engine, baseline, _) = opened.into_parts();
+    let store = ObjectStore::open_structural(&directories.operations, identities.workspace_id)
+        .map_err(CleanOpenError::from)?;
+    store.validate_namespace().map_err(CleanOpenError::from)?;
+    engine
+        .attach_clean_archive_store(
+            store
+                .duplicate_retained_capability()
+                .map_err(CleanOpenError::from)?,
+        )
+        .map_err(CleanOpenError::from)?;
+    if inject_after_genesis {
+        return Err("injected crash after full-history reconstruction step 4".into());
+    }
+    let baseline_claim_source = engine
+        .clean_transient_projection_claim_snapshot()
+        .map_err(CleanOpenError::from)?
+        .ok_or_else(|| {
+            "full-history replacement has no immutable baseline claim snapshot".to_owned()
+        })?;
+    if reopen_checkpoint {
+        let loaded =
+            match crate::oplog::checkpoint_generation::open_checkpoint_with_cold_history(&store) {
+                Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded)) => {
+                    loaded
+                }
+                Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Absent) => {
+                    return Err("recovery checkpoint reinstall is absent".into())
+                }
+                Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Invalid(error)) => {
+                    return Err(format!("recovery checkpoint reinstall is invalid: {error}"))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "recovery checkpoint reinstall cannot open: {error:?}"
+                    ))
+                }
+            };
+        let durable_sequence = loaded.accepted_rows.len() as u64;
+        let tail = loaded.tail.clone();
+        engine
+            .restore_clean_checkpoint(
+                &loaded.state_bytes,
+                loaded.accepted_rows,
+                loaded.required_objects,
+                Arc::clone(&loaded.documents),
+            )
+            .map_err(CleanOpenError::from)?;
+        engine
+            .reset_clean_checkpoint_publisher(durable_sequence)
+            .map_err(CleanOpenError::from)?;
+        engine
+            .replay_clean_checkpoint_tail(&tail, baseline_claim_source.as_ref())
+            .map_err(CleanOpenError::from)?;
+    } else {
+        // Arm the publisher before replay can schedule its first capture. A
+        // post-replay flag would race that scheduling and could extend the
+        // shallow predecessor recovery is replacing.
+        engine
+            .rebuild_next_clean_checkpoint_from_genesis()
+            .map_err(CleanOpenError::from)?;
+        engine
+            .replay_clean_committed_tail(baseline_claim_source.as_ref())
+            .map_err(CleanOpenError::from)?;
+    }
+    drop(baseline_claim_source);
+    engine
+        .attach_clean_projection_endpoint(graph, receipts)
+        .map_err(CleanOpenError::from)?;
+    engine
+        .open_local_completion_index(&store)
+        .map_err(CleanOpenError::from)?;
+    engine
+        .open_absence_decision_map(receipts)
+        .map_err(CleanOpenError::from)?;
+    Ok((engine, baseline))
 }
 
 /// Own the engine and its lease together throughout cold repair. Drop flushes
@@ -11578,6 +11730,10 @@ fn run_actor_loop(
                     .managed_local
                     .as_ref()
                     .is_some_and(|managed| managed.pending_count() != 0)
+                    || actor
+                        .recovery_input
+                        .as_ref()
+                        .is_some_and(RecoveryInputJournal::is_pending)
                     || actor.move_episode_cleanup_pending
                     || actor.local_completion_flush_due(Instant::now())
                     || actor.sweep_deadline_due()
@@ -12305,6 +12461,67 @@ struct ManagedLocalRuntimeState {
     /// Cleanup is cold, bounded work.  A settled managed-local runtime must
     /// never re-enumerate its history on ordinary idle ticks or saves.
     cleanup_pending: bool,
+}
+
+/// One selected local-journal generation at the recovery boundary. The actor
+/// may advance a drain checkpoint while reconstruction is in progress, but it
+/// must retain the selected segment and every byte through `durable_prefix`
+/// until the replacement checkpoint has been reopened successfully.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalJournalRecoveryFence {
+    domain: &'static str,
+    selector_generation: Option<u64>,
+    segment_name: String,
+    base_sequence: u64,
+    durable_prefix: u64,
+}
+
+impl LocalJournalRecoveryFence {
+    fn capture(
+        domain: &'static str,
+        selector_generation: Option<u64>,
+        segment_name: &str,
+        base_sequence: u64,
+        durable_prefix: u64,
+    ) -> Result<Self, String> {
+        if durable_prefix < base_sequence {
+            return Err(format!(
+                "{domain} recovery fence is before its selected generation"
+            ));
+        }
+        Ok(Self {
+            domain,
+            selector_generation,
+            segment_name: segment_name.to_owned(),
+            base_sequence,
+            durable_prefix,
+        })
+    }
+
+    fn prove_retained(
+        &self,
+        selector_generation: Option<u64>,
+        segment_name: &str,
+        base_sequence: u64,
+        durable_prefix: u64,
+    ) -> Result<(), String> {
+        if self.selector_generation != selector_generation
+            || self.segment_name != segment_name
+            || self.base_sequence != base_sequence
+        {
+            return Err(format!(
+                "{} selected generation changed before successful reinstall",
+                self.domain
+            ));
+        }
+        if durable_prefix < self.durable_prefix {
+            return Err(format!(
+                "{} lost fenced durable journal bytes before successful reinstall",
+                self.domain
+            ));
+        }
+        Ok(())
+    }
 }
 
 const MOVE_EPISODE_SCHEMA_VERSION: u32 = 2;
@@ -13856,6 +14073,10 @@ struct RuntimeActor {
     managed_local: Option<ManagedLocalRuntimeState>,
     projection_turns: Option<ProjectionTurnJournalState>,
     recovery_input: Option<RecoveryInputJournal>,
+    /// Held continuously while the disposable SQLite projection is closed and
+    /// rebuilt for the full-history engine. A failed rebuild returns the lease
+    /// here so the next automatic attempt cannot create an ownership gap.
+    recovery_workspace_lease: Option<WorkspaceRuntimeLease>,
     move_episode_directory: Dir,
     move_episode_cold_scan: Option<ReadDir>,
     move_episode_cleanup_queue: VecDeque<String>,
@@ -14028,9 +14249,9 @@ impl RuntimeActor {
     }
 
     fn local_completion_flush_due(&self, now: Instant) -> bool {
-        self.clean
-            .as_ref()
-            .is_some_and(|clean| clean.runtime.engine().local_completion_flush_due(now))
+        self.clean.as_ref().is_some_and(|clean| {
+            clean.runtime.has_projection() && clean.runtime.engine().local_completion_flush_due(now)
+        })
     }
 
     fn sweep_deadline_remaining(&self) -> Option<Duration> {
@@ -14155,6 +14376,13 @@ impl RuntimeActor {
     }
 
     fn flush_local_completions(&mut self) -> Result<bool, String> {
+        if self
+            .clean
+            .as_ref()
+            .is_some_and(|clean| !clean.runtime.has_projection())
+        {
+            return Ok(false);
+        }
         if !self
             .clean
             .as_ref()
@@ -14190,7 +14418,10 @@ impl RuntimeActor {
 
     fn active_database(&self) -> Result<&crate::oplog::SqliteFrontier, SyncRuntimeRequestError> {
         if let Some(clean) = self.clean.as_ref() {
-            return Ok(clean.runtime.database());
+            return clean
+                .runtime
+                .database_if_installed()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable);
         }
         Err(SyncRuntimeRequestError::ActorUnavailable)
     }
@@ -14511,6 +14742,7 @@ impl RuntimeActor {
             managed_local: Some(managed_local),
             projection_turns: Some(projection_turns),
             recovery_input: Some(recovery_input),
+            recovery_workspace_lease: None,
             move_episode_directory,
             move_episode_cold_scan,
             move_episode_cleanup_queue: VecDeque::new(),
@@ -14593,6 +14825,18 @@ impl RuntimeActor {
             provider_recovery_backfill_cursor: None,
             _not_send_or_sync: PhantomData,
         };
+        if actor
+            .recovery_input
+            .as_ref()
+            .is_some_and(RecoveryInputJournal::is_pending)
+        {
+            actor
+                .clean
+                .as_mut()
+                .expect("recovery-input restart retains a clean runtime")
+                .runtime
+                .pause_full_history_admission();
+        }
         actor.admit_deferred_absence_observations()?;
         let pending_reapply = actor
             .clean
@@ -23048,16 +23292,664 @@ impl RuntimeActor {
         }
     }
 
+    fn exact_recovery_input_is_archived(
+        engine: &ShardedHotEngine,
+        envelope: &RecoveryInputEnvelopeV1,
+    ) -> Result<(), String> {
+        let store = engine
+            .archive_store_capability()
+            .ok_or_else(|| "recovery engine has no retained operation archive".to_owned())?;
+        let manifest = store
+            .resolve_logical_manifest_bytes(envelope.batch_id)
+            .map_err(CleanOpenError::from)?;
+        if manifest != envelope.manifest {
+            return Err(format!(
+                "recovery batch {} conflicts with accepted manifest bytes",
+                envelope.batch_id
+            ));
+        }
+        for bytes in &envelope.objects {
+            OperationObject::decode(bytes)
+                .map_err(|error| format!("recovery object is invalid: {error}"))?;
+            let digest = ContentDigest::of(bytes);
+            let accepted = store
+                .resolve_logical_object_bytes(digest)
+                .map_err(CleanOpenError::from)?;
+            if accepted != *bytes {
+                return Err(format!(
+                    "recovery batch {} object {} conflicts with accepted bytes",
+                    envelope.batch_id, digest
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn install_full_replay_engine_and_projection(
+        &mut self,
+        engine: ShardedHotEngine,
+        baseline: &LazyGenesisCandidate,
+        request: &SyncRuntimeOpenRequest,
+    ) -> Result<(), String> {
+        self.managed_query.jobs.cancel_all_and_drain();
+        let identities = request.clean_identities.as_ref().ok_or_else(|| {
+            "full-history projection rebuild has no persisted identities".to_owned()
+        })?;
+        let directories = resolve_clean_authority_directories(
+            &request.archive_root,
+            &request.enrollment_root,
+            &request.database_path,
+        )
+        .map_err(CleanOpenError::from)?
+        .ok_or_else(|| "full-history projection rebuild has no clean authority".to_owned())?;
+        let store = ObjectStore::open_structural(&directories.operations, identities.workspace_id)
+            .map_err(CleanOpenError::from)?;
+        let application_runtime =
+            ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+                .map_err(CleanOpenError::from)?;
+        let genesis = engine
+            .is_clean_genesis_frontier()
+            .map_err(CleanOpenError::from)?;
+        let expected = engine
+            .accepted_frontier_root()
+            .map_err(CleanOpenError::from)?;
+        let parse_config = self.graph.config.parse_config();
+        let rebuild_source = if genesis {
+            None
+        } else {
+            Some(
+                RebuildSource::new(&engine, &store)
+                    .map_err(CleanOpenError::from)?
+                    .with_parse_config(parse_config.clone()),
+            )
+        };
+        let lease = match self.recovery_workspace_lease.take() {
+            Some(lease) => lease,
+            None => self
+                .clean
+                .as_mut()
+                .ok_or_else(|| "recovery has no clean runtime".to_owned())?
+                .runtime
+                .take_projection_for_full_history()
+                .close_retaining_lease(),
+        };
+        let projection = if genesis {
+            let candidate = match open_or_rebuild_clean_genesis_projection(
+                &request.database_path,
+                ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
+                baseline,
+                ReferenceCatalogPolicyV1::default(),
+                &parse_config,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.recovery_workspace_lease = Some(lease);
+                    return Err(format!(
+                        "full-history genesis projection rebuild remains retryable: {error}"
+                    ));
+                }
+            };
+            match LeasedWorkspaceProjection::adopt_clean_genesis(
+                lease,
+                &request.database_path,
+                ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
+                &expected,
+                &store,
+                &engine,
+                candidate,
+                parse_config,
+            ) {
+                Ok(projection) => projection,
+                Err((lease, error)) => {
+                    self.recovery_workspace_lease = Some(lease);
+                    return Err(format!(
+                        "full-history genesis projection install remains retryable: {error}"
+                    ));
+                }
+            }
+        } else {
+            let source = rebuild_source.expect("non-genesis rebuild prepared its source");
+            match LeasedWorkspaceProjection::open_under(lease, |slot| {
+                let opened = crate::oplog::SqliteFrontier::open_or_rebuild_with_applier_slot(
+                    &request.database_path,
+                    &application_runtime,
+                    ProjectionClaim::current(identities.workspace_id, identities.lineage_digest),
+                    source,
+                    slot,
+                )?;
+                Ok::<_, crate::oplog::SqliteProjectionError>((opened, ()))
+            }) {
+                Ok((projection, ())) => projection,
+                Err((lease, error)) => {
+                    self.recovery_workspace_lease = Some(lease);
+                    return Err(format!(
+                        "full-history projection rebuild remains retryable: {error}"
+                    ));
+                }
+            }
+        };
+        match self
+            .clean
+            .as_mut()
+            .expect("recovery retained its clean runtime")
+            .runtime
+            .install_full_history_projection_and_engine(engine, projection)
+        {
+            Ok(()) => Ok(()),
+            Err((projection, error)) => {
+                self.recovery_workspace_lease = Some(projection.close_retaining_lease());
+                Err(format!("cannot install full-history projection: {error:?}"))
+            }
+        }
+    }
+
+    fn settle_recovery_publication(&mut self, batch_id: BatchId) -> Result<(), String> {
+        for _ in 0..10_000 {
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .ok_or_else(|| "recovery has no projection-turn journal".to_owned())?;
+            let clean = self
+                .clean
+                .as_mut()
+                .ok_or_else(|| "recovery has no clean runtime".to_owned())?;
+            let Some(outcome) = clean.retry_pending_with_turns(&self.graph, &self.receipts, turns)
+            else {
+                return Ok(());
+            };
+            match outcome {
+                CleanActorMutationOutcome::Durable(accepted) if accepted == batch_id => {
+                    return Ok(())
+                }
+                CleanActorMutationOutcome::DurablePending { .. }
+                | CleanActorMutationOutcome::RetainedPriorPending { .. } => {
+                    if !clean
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.failure().is_continuation_required())
+                    {
+                        let detail = clean
+                            .pending
+                            .as_ref()
+                            .map(|pending| pending.failure().detail())
+                            .unwrap_or("retained publication disappeared");
+                        return Err(format!(
+                            "recovery publication for {batch_id} remains retryable: {detail}"
+                        ));
+                    }
+                }
+                CleanActorMutationOutcome::DurableStuck { phase, detail, .. } => {
+                    return Err(format!(
+                        "recovery publication for {batch_id} is blocked at {phase:?}: {detail}"
+                    ))
+                }
+                CleanActorMutationOutcome::NeedsFullHistory(need) => {
+                    return Err(format!(
+                        "full-history engine still reports below-floor batch {}",
+                        need.batch_id
+                    ))
+                }
+                CleanActorMutationOutcome::Durable(other) => {
+                    return Err(format!(
+                        "recovery publication for {batch_id} completed another batch {other}"
+                    ))
+                }
+            }
+        }
+        Err(format!(
+            "recovery publication for {batch_id} exceeded its bounded continuation budget"
+        ))
+    }
+
+    fn take_reconstruction_step_fault(&mut self, step: u8) -> bool {
+        if !(1..=FULL_HISTORY_RECONSTRUCTION_STEP_COUNT).contains(&step) {
+            return false;
+        }
+        #[cfg(test)]
+        if self.recovery_input_fault == Some(RecoveryInputFault::AfterReconstructionStep(step)) {
+            self.recovery_input_fault.take();
+            return true;
+        }
+        let _ = step;
+        false
+    }
+
+    fn fault_after_reconstruction_step(&mut self, step: u8) -> Result<(), String> {
+        if self.take_reconstruction_step_fault(step) {
+            return Err(format!(
+                "injected crash after full-history reconstruction step {step}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn reconstruct_full_history(&mut self) -> Result<(), String> {
+        let request = self
+            .clean_open_request
+            .clone()
+            .ok_or_else(|| "recovery has no retained clean-open request".to_owned())?;
+        let endpoint = self
+            .clean
+            .as_ref()
+            .ok_or_else(|| "recovery has no clean runtime".to_owned())?
+            .runtime
+            .endpoint();
+        if !self
+            .recovery_input
+            .as_ref()
+            .ok_or_else(|| "recovery has no recovery-input journal".to_owned())?
+            .is_pending()
+        {
+            return Ok(());
+        }
+
+        // Step 1: actor serialization means no append can still be executing
+        // here. Resolve any already-durable local publication continuation,
+        // then close ordinary semantic admission before taking the fences.
+        if let Some(batch_id) = self.clean.as_ref().and_then(|clean| {
+            clean
+                .pending
+                .as_ref()
+                .map(CleanPublishedContinuation::batch_id)
+        }) {
+            self.settle_recovery_publication(batch_id)?;
+        }
+        self.clean
+            .as_mut()
+            .expect("recovery retained its clean runtime")
+            .runtime
+            .pause_full_history_admission();
+        self.fault_after_reconstruction_step(1)?;
+
+        // Step 2: Drop joins the old publisher. Only after it returns may the
+        // fresh engine attach the archive and create its replacement publisher.
+        self.clean
+            .as_mut()
+            .expect("recovery retained its clean runtime")
+            .runtime
+            .stop_clean_checkpoint_publisher();
+        self.fault_after_reconstruction_step(2)?;
+
+        // Step 3: fence all three sequence domains before replacing run-local
+        // state. These values are intentionally retained and checked rather
+        // than used as cleanup authority.
+        let (accepted_archive_boundary, fenced_accepted_batches) = {
+            let engine = self.active_engine().map_err(|error| error.to_string())?;
+            (
+                engine
+                    .accepted_frontier_root()
+                    .map_err(|error| error.to_string())?,
+                engine
+                    .status()
+                    .accepted_batch_ids()
+                    .map_err(|error| error.to_string())?,
+            )
+        };
+        let managed = self
+            .managed_local
+            .as_ref()
+            .ok_or_else(|| "recovery has no foreground journal".to_owned())?;
+        let foreground_checkpoint = managed.checkpoint.next_sequence();
+        let foreground_fence = LocalJournalRecoveryFence::capture(
+            "foreground",
+            Some(managed.journal.selector_generation()),
+            managed.journal.segment_name(),
+            managed.journal.base_sequence(),
+            managed.journal.next_sequence(),
+        )?;
+        let foreground_high_water = foreground_fence.durable_prefix;
+        if foreground_checkpoint > foreground_high_water {
+            return Err("foreground recovery fence is outside its durable prefix".into());
+        }
+        let projection_fence = {
+            let (generation, segment_name, base_sequence, durable_prefix) = self
+                .projection_turns
+                .as_ref()
+                .ok_or_else(|| "recovery has no projection-turn journal".to_owned())?
+                .recovery_fence();
+            LocalJournalRecoveryFence::capture(
+                "projection-turn",
+                Some(generation),
+                segment_name,
+                base_sequence,
+                durable_prefix,
+            )?
+        };
+        let (recovery_input_fence, envelopes) = {
+            let recovery_input = self
+                .recovery_input
+                .as_ref()
+                .ok_or_else(|| "recovery has no recovery-input journal".to_owned())?;
+            let (segment_name, base_sequence, durable_prefix) = recovery_input.recovery_fence()?;
+            let fence = LocalJournalRecoveryFence::capture(
+                "recovery-input",
+                None,
+                segment_name,
+                base_sequence,
+                durable_prefix,
+            )?;
+            let envelopes = recovery_input.pending_envelopes();
+            let retained_frames = fence
+                .durable_prefix
+                .checked_sub(fence.base_sequence)
+                .ok_or_else(|| "recovery-input durable prefix underflow".to_owned())?;
+            if envelopes.is_empty()
+                || usize::try_from(retained_frames)
+                    .ok()
+                    .is_none_or(|frames| envelopes.len() > frames)
+            {
+                return Err("recovery-input pending set is outside its durable high-water".into());
+            }
+            (fence, envelopes)
+        };
+        // Retain the authenticated accepted root as the archive boundary, not
+        // as a cache key. The fenced accepted membership below is proved again
+        // after the replacement checkpoint is reopened.
+        let _accepted_archive_boundary = accepted_archive_boundary;
+        self.fault_after_reconstruction_step(3)?;
+
+        // Steps 4-5: a genuinely fresh engine starts at immutable genesis and
+        // discovers the authenticated union of hot and cold committed names.
+        let inject_after_genesis = self.take_reconstruction_step_fault(4);
+        let (replacement, baseline) = build_full_history_replacement_engine(
+            &request,
+            &self.graph,
+            &self.receipts,
+            endpoint,
+            false,
+            inject_after_genesis,
+        )?;
+        self.install_full_replay_engine_and_projection(replacement, &baseline, &request)?;
+        self.fault_after_reconstruction_step(5)?;
+
+        // Step 6a: replay each still-retained local frame through the exact
+        // existing journal transition before any drain checkpoint can move.
+        let frames = self
+            .managed_local
+            .as_ref()
+            .expect("recovery retained its foreground journal")
+            .frames
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        {
+            let clean = self.clean.as_mut().expect("recovery retained runtime");
+            let mut session = clean
+                .runtime
+                .admit_clean_derived_recovery(&self.graph)
+                .map_err(|error| error.to_string())?;
+            let (_, engine, _) = session.parts().map_err(|error| error.to_string())?;
+            engine
+                .resume_checkpointed_managed_local_prefix(foreground_checkpoint)
+                .map_err(|error| error.to_string())?;
+            for frame in &frames {
+                engine
+                    .replay_managed_local_record(frame)
+                    .map_err(|error| format!("cannot replay fenced local frame: {error}"))?;
+            }
+        }
+        let recovered_local = {
+            let managed = self
+                .managed_local
+                .as_mut()
+                .expect("recovery retained foreground journal");
+            let clean = self.clean.as_mut().expect("recovery retained runtime");
+            drain_open_managed_local_journal(
+                &self.graph,
+                &self.receipts,
+                &mut clean.runtime,
+                managed,
+            )?
+        };
+        for batch_id in recovered_local {
+            self.queue_clean_provider_publication(batch_id);
+        }
+
+        // Step 6b/7: repeatedly admit only dependency-ready pending originals.
+        // A missing prerequisite leaves every remaining envelope selected and
+        // therefore keeps automatic recovery runnable.
+        let mut remaining = envelopes
+            .iter()
+            .map(|envelope| {
+                let prepared = envelope.prepared_batch()?;
+                let dependencies = crate::oplog::hot_engine::clean_operation_dependency_heads(
+                    prepared.manifest(),
+                    prepared.objects(),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((
+                    envelope.batch_id,
+                    (envelope.clone(), prepared, dependencies),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        loop {
+            let accepted = self
+                .active_engine()
+                .map_err(|error| error.to_string())?
+                .status()
+                .accepted_batch_ids()
+                .map_err(|error| error.to_string())?;
+            let duplicates = remaining
+                .keys()
+                .filter(|batch_id| accepted.contains(batch_id))
+                .copied()
+                .collect::<Vec<_>>();
+            for batch_id in duplicates {
+                let (envelope, _, _) = remaining
+                    .remove(&batch_id)
+                    .expect("duplicate was selected from remaining inputs");
+                Self::exact_recovery_input_is_archived(
+                    self.active_engine().map_err(|error| error.to_string())?,
+                    &envelope,
+                )?;
+            }
+            if remaining.is_empty() {
+                break;
+            }
+            let mut ready = None;
+            for (batch_id, (_, _, dependencies)) in &remaining {
+                let mut dependencies_ready = true;
+                for dependency in dependencies {
+                    if !self
+                        .active_engine()
+                        .map_err(|error| error.to_string())?
+                        .accepted_frontier_contains_batch_effects(*dependency)
+                        .map_err(|error| error.to_string())?
+                    {
+                        dependencies_ready = false;
+                        break;
+                    }
+                }
+                if dependencies_ready {
+                    ready = Some(*batch_id);
+                    break;
+                }
+            }
+            let Some(batch_id) = ready else {
+                let names = remaining
+                    .iter()
+                    .map(|(batch_id, (_, _, dependencies))| {
+                        let dependencies = dependencies
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("{batch_id}->[{dependencies}]")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "recovery prerequisite pending for retained batches: {names}"
+                ));
+            };
+            let (envelope, prepared, _) = remaining
+                .remove(&batch_id)
+                .expect("ready recovery input remains selected");
+            let outcome = {
+                let turns = self
+                    .projection_turns
+                    .as_mut()
+                    .expect("recovery retained projection turns");
+                let clean = self.clean.as_mut().expect("recovery retained runtime");
+                clean.execute_recovery_input(&self.graph, &self.receipts, turns, &prepared)
+            }
+            .map_err(|error| error.detail)?;
+            match outcome {
+                CleanActorMutationOutcome::Durable(accepted) if accepted == batch_id => {}
+                CleanActorMutationOutcome::DurablePending { .. } => {
+                    self.settle_recovery_publication(batch_id)?;
+                }
+                CleanActorMutationOutcome::NeedsFullHistory(need) => {
+                    return Err(format!(
+                        "full-history reconstruction still needs history for batch {}",
+                        need.batch_id
+                    ))
+                }
+                other => {
+                    return Err(format!(
+                        "recovery input {batch_id} did not settle through provider admission: {other:?}"
+                    ))
+                }
+            }
+            Self::exact_recovery_input_is_archived(
+                self.active_engine().map_err(|error| error.to_string())?,
+                &envelope,
+            )?;
+        }
+        self.fault_after_reconstruction_step(6)?;
+
+        // Finish any retained projection turns before checkpoint capture.
+        {
+            let turns = self
+                .projection_turns
+                .as_mut()
+                .expect("recovery retained projection turns");
+            let clean = self.clean.as_mut().expect("recovery retained runtime");
+            drain_open_projection_turn_journal(
+                &self.graph,
+                &self.receipts,
+                &mut clean.runtime,
+                turns,
+            )?;
+        }
+        self.fault_after_reconstruction_step(7)?;
+
+        // Step 8: publish at the existing checkpoint boundary, join that
+        // publisher, then create another fresh engine which actually reopens
+        // the selected checkpoint and reconciles its authenticated tail.
+        {
+            let engine = self
+                .clean
+                .as_ref()
+                .expect("recovery retained runtime")
+                .runtime
+                .engine();
+            engine.schedule_clean_checkpoint_bootstrap();
+            engine
+                .wait_for_clean_checkpoint()
+                .map_err(CleanOpenError::from)?;
+            if engine.clean_checkpoint_durable_lag() != 0 {
+                return Err("recovery checkpoint did not reach the settled frontier".into());
+            }
+        }
+        self.clean
+            .as_mut()
+            .expect("recovery retained runtime")
+            .runtime
+            .stop_clean_checkpoint_publisher();
+        let (reopened, reopened_baseline) = build_full_history_replacement_engine(
+            &request,
+            &self.graph,
+            &self.receipts,
+            endpoint,
+            true,
+            false,
+        )?;
+        self.install_full_replay_engine_and_projection(reopened, &reopened_baseline, &request)?;
+        let reopened_accepted = self
+            .active_engine()
+            .map_err(|error| error.to_string())?
+            .status()
+            .accepted_batch_ids()
+            .map_err(|error| error.to_string())?;
+        if !fenced_accepted_batches
+            .iter()
+            .all(|batch_id| reopened_accepted.contains(batch_id))
+        {
+            return Err("reopened full-history checkpoint lost fenced accepted history".into());
+        }
+        for envelope in &envelopes {
+            Self::exact_recovery_input_is_archived(
+                self.active_engine().map_err(|error| error.to_string())?,
+                envelope,
+            )?;
+        }
+        {
+            let managed = self
+                .managed_local
+                .as_ref()
+                .expect("recovery retained foreground journal");
+            foreground_fence.prove_retained(
+                Some(managed.journal.selector_generation()),
+                managed.journal.segment_name(),
+                managed.journal.base_sequence(),
+                managed.journal.next_sequence(),
+            )?;
+        }
+        {
+            let (generation, segment_name, base_sequence, durable_prefix) = self
+                .projection_turns
+                .as_ref()
+                .expect("recovery retained projection turns")
+                .recovery_fence();
+            projection_fence.prove_retained(
+                Some(generation),
+                segment_name,
+                base_sequence,
+                durable_prefix,
+            )?;
+        }
+        {
+            let (segment_name, base_sequence, durable_prefix) = self
+                .recovery_input
+                .as_ref()
+                .expect("recovery retained input journal")
+                .recovery_fence()?;
+            recovery_input_fence.prove_retained(
+                None,
+                segment_name,
+                base_sequence,
+                durable_prefix,
+            )?;
+        }
+        self.recovery_input
+            .as_mut()
+            .expect("recovery retained input journal")
+            .complete_successful_reinstall()?;
+        self.clean
+            .as_mut()
+            .expect("recovery retained runtime")
+            .runtime
+            .resume_full_history_admission();
+        *self.application_projection_cache.borrow_mut() = Default::default();
+        *self.application_hydration_cache.borrow_mut() = Default::default();
+        self.fault_after_reconstruction_step(8)?;
+        Ok(())
+    }
+
     fn tick_clean_runtime(&mut self) -> SyncRuntimeTick {
         if self
             .recovery_input
             .as_ref()
             .is_some_and(RecoveryInputJournal::is_pending)
         {
-            // §4 will consume this segment into full-history reconstruction.
-            // Until then the segment itself is the sole restart/recovery
-            // trigger; no durable boolean is mirrored beside it.
-            return SyncRuntimeTick::Recovering;
+            return match self.reconstruct_full_history() {
+                Ok(()) => SyncRuntimeTick::Recovering,
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(format!(
+                    "automatic full-history reconstruction remains retryable: {error}"
+                )),
+            };
         }
         if let Some(reason) = self
             .clean
@@ -24242,6 +25134,11 @@ impl RuntimeActor {
                             "below-floor original {batch_id} remains provider-owned because durable custody failed: {error}"
                         ));
                     }
+                    self.clean
+                        .as_mut()
+                        .expect("below-floor custody retains the clean runtime")
+                        .runtime
+                        .pause_full_history_admission();
                     #[cfg(test)]
                     if self.recovery_input_fault
                         == Some(RecoveryInputFault::AfterCustodyBeforeProviderDequeue)

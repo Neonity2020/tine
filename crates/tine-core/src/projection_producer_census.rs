@@ -1161,6 +1161,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "cap.remove_file",
             3,
         ),
+        // Packet 3 v2 §4 selects a fresh empty recovery-input segment only
+        // after checkpoint reinstall, then best-effort unlinks the superseded
+        // segment and frontier. The anchor replacement remains the authority.
+        (
+            "crates/tine-core/src/oplog/recovery_input_journal.rs",
+            "cap.remove_file",
+            2,
+        ),
         ("crates/tine-core/src/oplog/sqlite.rs", "cap.create_dir", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "fs.create_dir", 1),
         (
@@ -1700,21 +1708,23 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ),
         // Packet 3's below-floor custody is a separate sequence domain, but it
         // deliberately crosses the same audited v2 WAL and durable-directory
-        // publication boundaries as the existing journals.
+        // publication boundaries as the existing journals. §4 adds one
+        // prepared empty successor, its confirmation open, and the exact
+        // anchor replacement that commits successful reinstall.
         (
             "crates/tine-core/src/oplog/recovery_input_journal.rs",
             "durable_directory.open",
-            1,
+            2,
         ),
         (
             "crates/tine-core/src/oplog/recovery_input_journal.rs",
             "journal.v2.open",
-            4,
+            5,
         ),
         (
             "crates/tine-core/src/oplog/recovery_input_journal.rs",
             "journal.v2.prepare",
-            1,
+            2,
         ),
         (
             // New row: the device-private CRDT writer-lane record reaches the
@@ -2217,9 +2227,16 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // three write-crossing families are enumerated above; the four WAL opens
     // distinguish activation, uncertain-append reopen, uncertain-anchor reopen,
     // and first-segment confirmation. No new writer family is introduced.
+    // Packet 3 v2 §4 adds one successor prepare, one confirmation open, and
+    // one exact anchor replacement within those same audited families. Its two
+    // post-reinstall unlinks are separately pinned by g_a. The reconstruction
+    // fence adds five read-only receiver calls: one foreground and two
+    // projection-turn `selection` reads plus recovery-input `as_ref` and
+    // `next_sequence`. They capture authenticated generation identity and
+    // durable high-water; no writer family or write boundary is added.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "4e94b3b96f28f6d38ab455d2c217c7247359e128c3bf49fd406e1200e470a586",
+        "c51a5a3c10b3664cdcf3a153ce589a3e113af6348b1a55f6a5821dd83f530dca",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
