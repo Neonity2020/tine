@@ -39,8 +39,8 @@ use crate::query::ir::{
     Anchor, Attr, Bounds, CmpOp, Filter, Quant, Query, QueryRows, Rel, Source, Value, ViewSettings,
 };
 use crate::query::sql::{
-    lower_query, ContentPlan, LoweringInputs, QueryRegexProgram, ResultSetRule, SqlQuery,
-    RESULT_SET_RULE,
+    lower_query, ContentPlan, LoweringInputs, QueryRegexProgram, RelationRule, ResultSetRule,
+    SqlQuery, RELATION_RULE, RESULT_SET_RULE,
 };
 use crate::query::{QueryDialect, ReferenceKind};
 
@@ -296,17 +296,19 @@ impl Corpus {
         dialect: QueryDialect,
         fts_ready: bool,
     ) -> (Anchor, SqlQuery) {
-        self.lower_as(source, dialect, fts_ready, RESULT_SET_RULE)
+        self.lower_as(source, dialect, fts_ready, RESULT_SET_RULE, RELATION_RULE)
     }
 
-    /// The same lowering under one named spelling of §5.3's result-set rule, so
-    /// the two can be compared and timed against each other.
+    /// The same lowering under one named spelling of §5.3's result-set rule and
+    /// one of §5.11's relation rule, so each can be compared and timed against
+    /// its alternative.
     fn lower_as(
         &self,
         source: &str,
         dialect: QueryDialect,
         fts_ready: bool,
         result_set_rule: ResultSetRule,
+        relation_rule: RelationRule,
     ) -> (Anchor, SqlQuery) {
         let today = self.today();
         let (query, _view) = crate::query::parse_query_text(source, dialect, today);
@@ -319,6 +321,7 @@ impl Corpus {
             compiled: &compiled,
             fts_ready,
             result_set_rule,
+            relation_rule,
         };
         (query.anchor, lower_query(&query, &inputs))
     }
@@ -341,7 +344,7 @@ impl Corpus {
     }
 
     fn sql_with(&self, source: &str, dialect: QueryDialect, fts_ready: bool) -> BTreeSet<String> {
-        self.sql_as(source, dialect, fts_ready, RESULT_SET_RULE)
+        self.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, RELATION_RULE)
     }
 
     /// The SQL page answer with multiplicity preserved. This is intentionally
@@ -369,6 +372,7 @@ impl Corpus {
             compiled: &compiled,
             fts_ready: self.fts_ready(),
             result_set_rule: RESULT_SET_RULE,
+            relation_rule: RELATION_RULE,
         };
         let statement = lower_query(query, &inputs);
         self.bind_regexes(&statement.regexes);
@@ -395,8 +399,10 @@ impl Corpus {
         dialect: QueryDialect,
         fts_ready: bool,
         result_set_rule: ResultSetRule,
+        relation_rule: RelationRule,
     ) -> BTreeSet<String> {
-        let (anchor, statement) = self.lower_as(source, dialect, fts_ready, result_set_rule);
+        let (anchor, statement) =
+            self.lower_as(source, dialect, fts_ready, result_set_rule, relation_rule);
         self.bind_regexes(&statement.regexes);
         let rows = self
             .reader
@@ -443,6 +449,7 @@ impl Corpus {
             compiled: &compiled,
             fts_ready: self.fts_ready(),
             result_set_rule: RESULT_SET_RULE,
+            relation_rule: RELATION_RULE,
         };
         let statement = lower_query(&query, &inputs);
         (query, statement)
@@ -1310,6 +1317,16 @@ pub(crate) const PLAN_SHAPES: &[(&str, QueryDialect)] = &[
         "ref('Project') and content regexp 'needle'",
         QueryDialect::Tql,
     ),
+    // §5.11's own family: a root conjunction of TWO relation leaves, where the
+    // second one used to be an uncorrelated list that SQLite materialised in
+    // full. These are the shapes whose plan the driver rule changes, and the
+    // shapes the timing gate below is really about.
+    ("(and [[Project]] (not (task DONE)))", QueryDialect::Og),
+    ("(and (task TODO) (priority A))", QueryDialect::Og),
+    (
+        "@page and any(blocks, task = 'TODO') and name like 'task%'",
+        QueryDialect::Tql,
+    ),
 ];
 
 /// §5.10's plan classes and the shape that produces each. They are recorded
@@ -1626,7 +1643,7 @@ fn the_two_result_set_spellings_answer_identically() {
         let walk = corpus.walk(source, *dialect);
         let answers: Vec<_> = SPELLINGS
             .iter()
-            .map(|rule| corpus.sql_as(source, *dialect, fts_ready, *rule))
+            .map(|rule| corpus.sql_as(source, *dialect, fts_ready, *rule, RELATION_RULE))
             .collect();
         compared += 1;
         for (rule, rows) in SPELLINGS.iter().zip(&answers) {
@@ -1658,6 +1675,168 @@ fn the_two_result_set_spellings_answer_identically() {
          match whose own parent does not match"
     );
     assert!(compared * 2 >= IDENTITY_SHAPES.len());
+}
+
+/// §5.11's two relation spellings are the SAME predicate.
+///
+/// The sibling above does this for §5.3's result-set rule; this is the same
+/// obligation for the driver rule, and it is not a formality. `x NOT IN (SELECT
+/// …)` and `NOT EXISTS (SELECT … WHERE key = x …)` are NOT interchangeable in
+/// SQL — they differ whenever the list can contain a NULL — so the swap is
+/// legitimate only because every key this compiler selects is `NOT NULL` in the
+/// projection schema. That is a schema fact, and this gate is what keeps it
+/// checked against the walk on rows rather than asserted in a comment.
+#[test]
+fn the_two_relation_spellings_answer_identically() {
+    let _serial = serialize();
+    let root = scratch("relation-rule");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let fts_ready = corpus.fts_ready();
+    const SPELLINGS: [RelationRule; 2] = [RelationRule::Lists, RelationRule::DriverAndProbes];
+    let mut disagreements = Vec::new();
+    for (source, dialect) in IDENTITY_SHAPES {
+        let walk = corpus.walk(source, *dialect);
+        for rule in SPELLINGS {
+            let rows = corpus.sql_as(source, *dialect, fts_ready, RESULT_SET_RULE, rule);
+            if rows != walk {
+                disagreements.push(format!(
+                    "{source} under {rule:?}: walk={} sql={}",
+                    walk.len(),
+                    rows.len()
+                ));
+            }
+        }
+    }
+    // The negated relation leaves specifically, since they are the ones whose
+    // spelling changes from `NOT IN` to `NOT EXISTS`. Naming them here means a
+    // future edit to `IDENTITY_SHAPES` cannot quietly stop testing them.
+    for (source, dialect) in [
+        ("(and [[Project]] (not (task DONE)))", QueryDialect::Og),
+        (
+            "(and (task TODO) (not (property status open)))",
+            QueryDialect::Og,
+        ),
+        (
+            "ref('Project') and none(children, task = 'DONE')",
+            QueryDialect::Tql,
+        ),
+        ("(and (task TODO) (not (priority A)))", QueryDialect::Og),
+    ] {
+        let walk = corpus.walk(source, dialect);
+        for rule in SPELLINGS {
+            let rows = corpus.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, rule);
+            if rows != walk {
+                disagreements.push(format!(
+                    "{source} under {rule:?}: walk={} sql={}",
+                    walk.len(),
+                    rows.len()
+                ));
+            }
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "§5.11's two relation spellings are not the same predicate:\n{}",
+        disagreements.join("\n")
+    );
+}
+
+/// §5.11's plan, both halves: what the old spelling does and what the new one
+/// does instead.
+///
+/// This is the defect the rule exists for. `(and [[Project]] (not (task
+/// DONE)))` answers three blocks on this corpus and on a 30× graph, but under
+/// [`RelationRule::Lists`] SQLite builds the COMPLETE list of DONE task ids
+/// first and only then probes it, so the statement's cost tracked the graph and
+/// not the answer (measured 1.2 ms → 49 ms over ×1 → ×30 of the anonymized
+/// graph). Asserting the plan is the only way to see that: both spellings
+/// return the same three rows, so no identity gate can tell them apart.
+#[test]
+fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
+    let _serial = serialize();
+    let root = scratch("relation-plan");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let fts_ready = corpus.fts_ready();
+    let source = "(and [[Project]] (not (task DONE)))";
+    let plan_for = |rule| {
+        let (_anchor, statement) =
+            corpus.lower_as(source, QueryDialect::Og, fts_ready, RESULT_SET_RULE, rule);
+        corpus.bind_regexes(&statement.regexes);
+        corpus
+            .reader
+            .explain_query_plan(&statement.sql, &statement.params)
+            .expect("the plan is available")
+    };
+    let lists = plan_for(RelationRule::Lists);
+    let probes = plan_for(RelationRule::DriverAndProbes);
+    eprintln!("relation_rule lists   :: {}", lists.join(" | "));
+    eprintln!("relation_rule probes  :: {}", probes.join(" | "));
+    // Two lists are EXPECTED under both spellings and are not the defect: the
+    // DRIVER's own list (`[[Project]]` through the reference index, which is
+    // what bounds the anchor) and §5.3's anti-join against the materialized
+    // match set `m`. What must disappear is the third one — the whole `DONE`
+    // slice of the task facet, enumerated by marker to answer a question about
+    // three blocks.
+    let marker_slice = |plan: &[String]| plan.iter().any(|step| step.contains("tasks_marker_idx"));
+    assert!(
+        marker_slice(&lists),
+        "the old spelling must be the one that enumerates the task facet by \
+         marker, or this gate is no longer measuring the change: {}",
+        lists.join(" | ")
+    );
+    assert!(
+        !marker_slice(&probes),
+        "the driver rule must not enumerate the task facet at all: {}",
+        probes.join(" | ")
+    );
+    let list_steps = |plan: &[String]| {
+        plan.iter()
+            .filter(|step| step.contains("LIST SUBQUERY"))
+            .count()
+    };
+    assert!(
+        list_steps(&probes) < list_steps(&lists),
+        "one list must be gone, not merely respelled: lists={} probes={}",
+        lists.join(" | "),
+        probes.join(" | ")
+    );
+    assert!(
+        probes.iter().any(|step| step.contains("CORRELATED")),
+        "the non-driver conjunct must be correlated with the anchor: {}",
+        probes.join(" | ")
+    );
+    // And it reaches the facet by that facet's OWN key — one seek per candidate
+    // the driver produced, which is the whole cost claim. The index's NAME is
+    // SQLite's business; `(block_id=?)` is the claim.
+    assert!(
+        probes
+            .iter()
+            .any(|step| step.starts_with("SEARCH t") && step.contains("(block_id=?)")),
+        "the correlated probe must seek the task facet by block id: {}",
+        probes.join(" | ")
+    );
+    // And the driver still drives: the anchor is reached by the reference
+    // index, never enumerated.
+    assert!(
+        probes
+            .iter()
+            .any(|step| step.starts_with("SEARCH b ") || step.starts_with("SEARCH b2 ")),
+        "the driver must still probe an index for the anchor: {}",
+        probes.join(" | ")
+    );
+    assert_eq!(
+        corpus.sql_as(
+            source,
+            QueryDialect::Og,
+            fts_ready,
+            RESULT_SET_RULE,
+            RelationRule::Lists
+        ),
+        corpus.walk(source, QueryDialect::Og),
+        "both plans answer the walk's rows"
+    );
 }
 
 /// §3.2's nested-`refs` context, on REAL ROWS rather than on emitted text.
@@ -2264,6 +2443,123 @@ fn the_two_result_set_spellings_are_timed_against_each_other_on_a_real_corpus() 
     }
 }
 
+/// §5.11's decision table: the two relation spellings, timed against each other
+/// on a real corpus, shape by shape.
+///
+/// The rule this fixes in advance, so the number decides and not the argument:
+/// adopt the driver rule iff every `PLAN_SHAPES` entry whose plan it CHANGES is
+/// at least as fast, and no entry it leaves unchanged moves by more than noise.
+/// A single-leaf shape cannot change — there is nothing to probe against — so
+/// the interesting rows are the conjunctive ones, and they are the ones the
+/// list spelling made grow with the graph rather than with the answer.
+///
+/// Run it on the anonymized graph AND on a replicated copy: a rule about SLOPE
+/// cannot be settled at one size.
+#[test]
+#[ignore = "relation-rule decision table: set TINE_QUERY_IDENTITY_GRAPH"]
+fn the_two_relation_spellings_are_timed_against_each_other_on_a_real_corpus() {
+    let _serial = serialize();
+    let Some(root) = std::env::var_os("TINE_QUERY_IDENTITY_GRAPH") else {
+        eprintln!("skipped: set TINE_QUERY_IDENTITY_GRAPH to a corpus directory");
+        return;
+    };
+    let corpus = Corpus::open(PathBuf::from(&root), false);
+    let repeats: u32 = std::env::var("TINE_RELATION_RULE_REPEATS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(11)
+        .max(3);
+    let fts_ready = corpus.fts_ready();
+    eprintln!("relation_rule_decision corpus=real repeats={repeats}");
+    let mut regressions = Vec::new();
+    let mut improvements = 0usize;
+    for (source, dialect) in PLAN_SHAPES {
+        let Some(lists) = time_relation_rule(
+            &corpus,
+            source,
+            *dialect,
+            fts_ready,
+            repeats,
+            RelationRule::Lists,
+        ) else {
+            continue;
+        };
+        let Some(probes) = time_relation_rule(
+            &corpus,
+            source,
+            *dialect,
+            fts_ready,
+            repeats,
+            RelationRule::DriverAndProbes,
+        ) else {
+            continue;
+        };
+        assert_eq!(
+            lists.2, probes.2,
+            "{source}: the two spellings must answer the same rows"
+        );
+        let ratio = probes.1 as f64 / lists.1.max(1) as f64;
+        // Whether this shape's PLAN is one the rule touches at all, taken from
+        // the statement and not guessed from the source text.
+        let changed = lists.3 != probes.3;
+        eprintln!(
+            "relation_rule shape={source:?} rows={} changed={changed} lists_us={} \
+             probes_us={} probes/lists={ratio:.2}",
+            lists.0, lists.1, probes.1
+        );
+        if changed && ratio < 0.95 {
+            improvements += 1;
+        }
+        if ratio > 1.10 {
+            regressions.push(format!(
+                "{source} (changed={changed}): {ratio:.2}× (lists {} → probes {})",
+                lists.1, probes.1
+            ));
+        }
+    }
+    eprintln!(
+        "relation_rule improvements={improvements} regressions={} in_code={RELATION_RULE:?}",
+        regressions.len()
+    );
+    for line in &regressions {
+        eprintln!("relation_rule regression {line}");
+    }
+}
+
+/// `(rows, median µs, answer, sql)` for one shape under one relation spelling,
+/// or `None` when the statement matches nothing on this corpus.
+///
+/// The MEDIAN, not the mean: a single scheduler hiccup on a sub-millisecond
+/// shape is what made the sibling result-set gate's verdict a coin flip.
+fn time_relation_rule(
+    corpus: &Corpus,
+    source: &str,
+    dialect: QueryDialect,
+    fts_ready: bool,
+    repeats: u32,
+    rule: RelationRule,
+) -> Option<(usize, u128, BTreeSet<String>, String)> {
+    let (_anchor, statement) = corpus.lower_as(source, dialect, fts_ready, RESULT_SET_RULE, rule);
+    if statement.matches_nothing {
+        return None;
+    }
+    let answer = corpus.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, rule);
+    let mut samples = Vec::new();
+    for _ in 0..repeats {
+        let start = Instant::now();
+        let _ =
+            std::hint::black_box(corpus.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, rule));
+        samples.push(start.elapsed().as_micros());
+    }
+    samples.sort_unstable();
+    Some((
+        answer.len(),
+        samples[samples.len() / 2],
+        answer,
+        statement.sql,
+    ))
+}
+
 /// **The paired-base perf receipt, extended with §5.9's DISPATCHED path.**
 ///
 /// The sibling above times the COMPILER against the walk at the gate boundary:
@@ -2361,10 +2657,10 @@ fn time_rule(
     repeats: u32,
     rule: ResultSetRule,
 ) -> Option<(usize, u128)> {
-    let first = corpus.sql_as(source, dialect, fts_ready, rule);
+    let first = corpus.sql_as(source, dialect, fts_ready, rule, RELATION_RULE);
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = corpus.sql_as(source, dialect, fts_ready, rule);
+        let _ = corpus.sql_as(source, dialect, fts_ready, rule, RELATION_RULE);
     }
     Some((first.len(), (start.elapsed() / repeats).as_micros()))
 }
@@ -2785,6 +3081,7 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
         QueryDialect::Og,
         fts_ready,
         ResultSetRule::CorrelatedProbe,
+        RELATION_RULE,
     );
     assert!(
         probe
@@ -3170,6 +3467,30 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
             let _ = corpus.sql_with(argument, dialect, fts_ready);
         }
         let sql = sql_start.elapsed() / OBSERVED_REPEATS;
+        // The same statement under §5.11's PREVIOUS spelling, so the driver
+        // rule is measured on the queries a person actually wrote rather than
+        // only on the invented `PLAN_SHAPES`. Identical for a query with one
+        // relation leaf; the difference is the whole point for the others.
+        let lists = {
+            let _ = corpus.sql_as(
+                argument,
+                dialect,
+                fts_ready,
+                RESULT_SET_RULE,
+                RelationRule::Lists,
+            );
+            let start = Instant::now();
+            for _ in 0..OBSERVED_REPEATS {
+                let _ = corpus.sql_as(
+                    argument,
+                    dialect,
+                    fts_ready,
+                    RESULT_SET_RULE,
+                    RelationRule::Lists,
+                );
+            }
+            start.elapsed() / OBSERVED_REPEATS
+        };
         let (_anchor, statement) = corpus.lower(argument, dialect, fts_ready);
         let plan = if statement.content_plans.is_empty() {
             if statement.positively_bounded {
@@ -3182,13 +3503,16 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
         };
         eprintln!(
             "observed_query index={index} dialect={dialect:?} bytes={} plan={plan} \
-             bounded={} rows={} agrees={agrees} walk_us={} sql_us={} sql/walk={:.2}",
+             bounded={} rows={} agrees={agrees} walk_us={} sql_us={} sql/walk={:.2} \
+             lists_us={} sql/lists={:.2}",
             argument.len(),
             statement.positively_bounded,
             rows.len(),
             walk.as_micros(),
             sql.as_micros(),
             sql.as_micros() as f64 / walk.as_micros().max(1) as f64,
+            lists.as_micros(),
+            sql.as_micros() as f64 / lists.as_micros().max(1) as f64,
         );
     }
 }

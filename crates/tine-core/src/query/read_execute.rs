@@ -15,7 +15,7 @@ use super::results::{
     probe_fts_ready, read_page_results, read_results, BackendOrder, PageReadInputs, RecencyPage,
     ResultIdentity, ResultReadInputs,
 };
-use super::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+use super::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use super::{
     apply_view, block_anchored_query, resolve_for_execution, ConstructionProfile,
     QueryExecutionError,
@@ -126,6 +126,7 @@ impl<'a> SnapshotQueryReader<'a> {
                 compiled: &compiled,
                 fts_ready: self.fts_ready,
                 result_set_rule: RESULT_SET_RULE,
+                relation_rule: RELATION_RULE,
             },
         );
         let mut snapshot = self.snapshot.borrow_mut();

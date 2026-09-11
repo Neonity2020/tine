@@ -29,7 +29,7 @@ use crate::query::results::{
     read_page_results, BackendOrder, PageReadInputs, RecencyPage, ResultIdentity, ResultReadError,
     ResultReadInputs,
 };
-use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use crate::query::{ConstructionProfile, PreViewGroups};
 use crate::query_jobs::{Admission, JobSlot, QueryJobOwner};
 
@@ -329,6 +329,7 @@ fn execute_main_source(
                 compiled: &compiled,
                 fts_ready,
                 result_set_rule: RESULT_SET_RULE,
+                relation_rule: RELATION_RULE,
             },
         );
         (query.anchor, statement)

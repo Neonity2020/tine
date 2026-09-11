@@ -15,7 +15,7 @@ use crate::query::results::{
     probe_fts_ready, read_located_results, BackendOrder, RecencyPage, ResultIdentity,
     ResultLocator, ResultReadError, ResultReadInputs,
 };
-use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use crate::query::{
     block_anchored_query, parse_query_input, parse_query_text, resolve_for_execution,
     ConstructionProfile, ExportSelectionAnswer, QueryExportBatch, QueryExportResult,
@@ -183,6 +183,7 @@ fn select_subtree_roots(
             compiled: &compiled,
             fts_ready: inputs.fts_ready,
             result_set_rule: RESULT_SET_RULE,
+            relation_rule: RELATION_RULE,
         },
     );
     if statement.matches_nothing {

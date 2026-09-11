@@ -6608,7 +6608,7 @@ impl Graph {
         profile: crate::query::ConstructionProfile,
         view: Option<&crate::query::ir::ViewSettings>,
     ) -> DirectAttempt<crate::query::PreViewGroups> {
-        use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+        use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
         if query.is_invalid() {
             // A refused source never executes; this is a semantic answer,
             // independent of database readiness, not an availability failure.
@@ -6672,6 +6672,7 @@ impl Graph {
             compiled: &compiled,
             fts_ready,
             result_set_rule: RESULT_SET_RULE,
+            relation_rule: RELATION_RULE,
         };
         // §5.9: when the projection is ready, the statement answers. The
         // compiler is TOTAL — it has no "unsupported" answer to return — so
@@ -7078,7 +7079,7 @@ impl Graph {
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
     ) -> DirectAttempt<crate::query::results::PageAnswer> {
-        use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+        use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
         if query.is_invalid() {
             return DirectAttempt::Answered(crate::query::results::PageAnswer::default());
         }
@@ -7101,6 +7102,7 @@ impl Graph {
                     compiled: &compiled,
                     fts_ready,
                     result_set_rule: RESULT_SET_RULE,
+                    relation_rule: RELATION_RULE,
                 },
             );
             // Valid empty selections still fold requested empty statistics.
@@ -7144,7 +7146,7 @@ impl Graph {
         today: crate::date::JournalDate,
         bounds: crate::query::ir::Bounds,
     ) -> DirectAttempt<Vec<usize>> {
-        use crate::query::sql::{lower_query, LoweringInputs, RESULT_SET_RULE};
+        use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
         let registry_sensitivity = if probes.iter().any(|probe| probe.filter.has_props_leaf()) {
             crate::direct_projection::RegistrySensitivity::Required
         } else {
@@ -7181,6 +7183,7 @@ impl Graph {
                             compiled: &compiled,
                             fts_ready,
                             result_set_rule: RESULT_SET_RULE,
+                            relation_rule: RELATION_RULE,
                         },
                     )
                 })

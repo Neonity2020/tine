@@ -332,6 +332,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **A query with two conditions no longer reads the whole graph to answer about
+  three blocks.** Every condition in a query was asked of the index as its own
+  complete list — "all the DONE tasks", "all the blocks tagged x" — and SQLite
+  builds each list in full before it compares them. So a query scoped to one
+  page, answering three rows, still enumerated every DONE task you have, and got
+  slower as the graph grew even though its answer did not. Tine now picks the
+  one condition that names a single thing (a page, a reference, a tag, a property
+  value), asks the index for that, and checks the remaining conditions against
+  each candidate directly. On a 1,045-file graph the three slowest queries in it
+  went from 1.0 ms to 0.07 ms; on a ten-times-larger copy of the same graph they
+  stayed at 0.07 ms instead of growing to 13 ms. Results, their order and their
+  grouping are unchanged, and both spellings are checked against the old
+  whole-graph walk on every test shape.
+
 - **Linked References looks only at the blocks that link to the page.** The
   index has always known which blocks refer to a page, but the panel asked it
   only which PAGES did, and then re-examined every block on each of them. On a
