@@ -340,9 +340,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   slower as the graph grew even though its answer did not. Tine now picks the
   one condition that names a single thing (a page, a reference, a tag, a property
   value), asks the index for that, and checks the remaining conditions against
-  each candidate directly. On a 1,045-file graph the three slowest queries in it
-  went from 1.0 ms to 0.07 ms; on a ten-times-larger copy of the same graph they
-  stayed at 0.07 ms instead of growing to 13 ms. Results, their order and their
+  each candidate directly — including when your query groups its conditions,
+  which used to hide the useful one a level down. On a 1,045-file graph the
+  three slowest queries in it went from 1.0 ms to 0.07 ms; on a thirty-times-
+  larger copy of the same graph one of them went from 53 ms to 0.4 ms. Results, their order and their
   grouping are unchanged, and both spellings are checked against the old
   whole-graph walk on every test shape.
 

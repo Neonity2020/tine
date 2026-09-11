@@ -1839,6 +1839,61 @@ fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
     );
 }
 
+/// The root conjunction is a SPINE, not a node.
+///
+/// `(and A (and B C))` is what OG's own builder emits for a grouped condition,
+/// and one of the anonymized corpus's own queries has exactly that shape. Its
+/// only named conjunct sits in the nested arm, so a driver rule that looked at
+/// the root node alone saw `[task, <And>]`, found no named driver, and fell
+/// back to lists — silently, on the query that most needed the probe.
+#[test]
+fn a_nested_conjunction_is_part_of_the_root_conjunction() {
+    let _serial = serialize();
+    let root = scratch("relation-spine");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let fts_ready = corpus.fts_ready();
+    let flat = "(and [[Project]] (not (task DONE)))";
+    // The same question with its named conjunct one level down, which is what
+    // OG's grouped `and` produces.
+    let nested_ir = "(and (not (task DONE)) (and [[Project]] (task TODO)))";
+    let plan_for = |source: &str| {
+        let (_anchor, statement) = corpus.lower_as(
+            source,
+            QueryDialect::Og,
+            fts_ready,
+            RESULT_SET_RULE,
+            RELATION_RULE,
+        );
+        corpus.bind_regexes(&statement.regexes);
+        corpus
+            .reader
+            .explain_query_plan(&statement.sql, &statement.params)
+            .expect("the plan is available")
+    };
+    let flat_plan = plan_for(flat);
+    let nested_plan = plan_for(nested_ir);
+    eprintln!("spine flat   :: {}", flat_plan.join(" | "));
+    eprintln!("spine nested :: {}", nested_plan.join(" | "));
+    assert!(
+        !nested_plan
+            .iter()
+            .any(|step| step.contains("tasks_marker_idx")),
+        "a nested conjunction must not hide the named driver: {}",
+        nested_plan.join(" | ")
+    );
+    assert!(
+        nested_plan.iter().any(|step| step.contains("CORRELATED")),
+        "the nested spelling probes like the flat one: {}",
+        nested_plan.join(" | ")
+    );
+    assert_eq!(
+        corpus.sql_with(nested_ir, QueryDialect::Og, fts_ready),
+        corpus.walk(nested_ir, QueryDialect::Og),
+        "and it still answers the walk's rows"
+    );
+}
+
 /// §3.2's nested-`refs` context, on REAL ROWS rather than on emitted text.
 ///
 /// The `walk == SQL` gate above already compares both engines on every nested

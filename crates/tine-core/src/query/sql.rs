@@ -1263,9 +1263,18 @@ impl Compiler<'_> {
         if self.inputs.relation_rule == RelationRule::Lists {
             return self.filter(filter, row);
         }
-        let Filter::And { items } = filter else {
+        let Filter::And { .. } = filter else {
             return self.filter(filter, row);
         };
+        // The ROOT CONJUNCTION, not the root NODE: `and` is associative, and
+        // `(and (task TODO) (and [[P]] …))` is a shape people actually write —
+        // OG's own builder emits it, and one of the anonymized corpus's own
+        // queries is exactly that. `Query::normalized` flattens it, but nothing
+        // on the execution path calls that, so before this the nested arm hid
+        // the only named conjunct in the query and the whole statement fell
+        // back to lists.
+        let mut items: Vec<&Filter> = Vec::new();
+        flatten_and(filter, &mut items);
         if items.len() < 2 {
             return self.filter(filter, row);
         }
@@ -2837,6 +2846,22 @@ pub(crate) fn positively_bounded(
 enum BoundRow {
     Block,
     Page,
+}
+
+/// The root CONJUNCTION of a filter: `and` is associative, so a nested `And`
+/// contributes its own children rather than itself. Only the top-level spine is
+/// walked — an `And` under `Or` or `Not` is a different question and stays one
+/// operand. `Query::normalized` does the same flattening, but it is a
+/// comparison helper and nothing on the execution path calls it.
+fn flatten_and<'f>(filter: &'f Filter, out: &mut Vec<&'f Filter>) {
+    match filter {
+        Filter::And { items } => {
+            for item in items {
+                flatten_and(item, out);
+            }
+        }
+        other => out.push(other),
+    }
 }
 
 /// The worst rank that still makes a conjunct worth driving FROM. Ranks at or
