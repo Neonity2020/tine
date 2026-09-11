@@ -871,18 +871,57 @@ pub(crate) fn refresh_graph_for_label(
         poke_watcher(state);
         return Ok(RefreshOutcome::Refreshed);
     }
-    old.legacy_graph()?;
     let approved = crate::settings::approved_external_assets(app, &old.root_key);
-    let graph = Graph::open_checked_with_assets(&old.root_key, approved.as_deref())?;
+    let services = crate::graph::direct_files_service_paths(app, &old.root_key);
+    let replacement = Arc::new(reopen_legacy_for_refresh(
+        &old,
+        approved.as_deref(),
+        services,
+    )?);
+    // The reopened graph starts with a cold parsed cache, and the projection
+    // attached above takes its full payload from the warm — exactly as the
+    // open path does (`publish_prepared_direct_files`).
+    let warm_generation = crate::graph::begin_warm_cache(&replacement);
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(label.clone(), Arc::clone(&replacement))?;
+    crate::graph::warm_cache_async(app.clone(), label, replacement, warm_generation)?;
+    poke_watcher(state);
+    Ok(RefreshOutcome::Refreshed)
+}
+
+/// The app-handle-free body of a legacy (Direct Files) configuration refresh:
+/// retire the old graph's projection worker, reopen the root, attach the
+/// Direct Files services, and build the replacement slot. The caller binds
+/// the slot and starts the warm. Kept separate so the invariant — a refreshed
+/// graph carries the same services as an opened one — is testable without a
+/// Tauri app.
+pub(crate) fn reopen_legacy_for_refresh(
+    old: &GraphSlot,
+    approved_assets: Option<&Path>,
+    services: crate::graph::DirectFilesServicePaths,
+) -> Result<GraphSlot, CommandError> {
+    let old_graph = old.legacy_graph()?;
+    // The replacement attaches a projection at the SAME path; the old worker
+    // must have released the writer lease first or the new one races it.
+    if !old_graph.detach_direct_projection(Duration::from_secs(15)) {
+        crate::debug::diag(
+            "Direct Files projection worker did not stop within 15 s before a refresh; \
+             the replacement attach may find its database busy"
+                .to_string(),
+        );
+    }
+    drop(old_graph);
+    let graph = Graph::open_checked_with_assets(&old.root_key, approved_assets)?;
     // Concord invariant 4: a refresh re-reads configuration, it does not rewrite
     // the tree. Journal filename repairs are proposed and applied explicitly
     // (`apply_journal_filename_migrations`) — a settings change must not rename
     // the user's files as a side effect. (This site did not even take the
     // pre-migration snapshot the open path used to.)
-    let replacement = Arc::new(GraphSlot::refreshed(graph, &old)?);
-    state.graphs.write().unwrap().bind(label, replacement)?;
-    poke_watcher(state);
-    Ok(RefreshOutcome::Refreshed)
+    crate::graph::attach_direct_files_services(&graph, services);
+    GraphSlot::refreshed(graph, old)
 }
 
 pub(crate) fn poke_watcher(state: &AppState) {
@@ -1059,6 +1098,104 @@ mod tests {
             "a window reloading this root must not be told the old setting"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GH draft "Query Engine" (2026-09-11): dismissing the Guide toast made
+    /// every query `ProjectionUnavailable` until the next graph open, because
+    /// `set_guide_announced` → `refresh_graph` rebuilt the `Graph` without the
+    /// Direct Files projection the open path attaches. Same shape for every
+    /// settings command that refreshes, restore-from-backup, and an external
+    /// `config.edn` rewrite. The refresh body must attach what the open attaches.
+    #[test]
+    fn a_config_refresh_keeps_queries_answering() {
+        fn count(graph: &Graph) -> Result<usize, tine_core::query::QueryExecutionError> {
+            let registry = tine_core::query::registry::Registry::from_snapshot(
+                &tine_core::query::ir::RegistrySnapshot {
+                    rows: Vec::new(),
+                    generation: 0,
+                },
+            );
+            let (query, _view) = tine_core::query::parse_query_input(
+                "[[Alpha]]",
+                tine_core::query::QueryInput::Og,
+                tine_core::date::JournalDate::today(),
+                &registry,
+            );
+            let result = tine_core::query::run_query_result_ir(
+                graph,
+                &query,
+                &tine_core::query::ir::ViewSettings::default(),
+                tine_core::query::ir::Bounds::unbounded(),
+                &tine_core::query::ir::ExecutionContext::none(),
+            )?;
+            Ok(match result.rows {
+                tine_core::query::ir::QueryRows::Page { pages } => pages.len(),
+                tine_core::query::ir::QueryRows::Block { groups } => {
+                    groups.iter().map(|group| group.blocks.len()).sum()
+                }
+            })
+        }
+        fn when_ready(graph: &Graph) -> Result<usize, tine_core::query::QueryExecutionError> {
+            let started = Instant::now();
+            loop {
+                match count(graph) {
+                    Err(tine_core::query::QueryExecutionError::NotReady(_)) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(30),
+                            "the projection never became ready"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    other => return other,
+                }
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "tine-refresh-keeps-projection-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["pages", "journals", "logseq"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Alpha.md"), "- alpha root\n").unwrap();
+        std::fs::write(
+            root.join("pages/Beta.md"),
+            "- refers to [[Alpha]]\n- and [[Alpha]] again\n",
+        )
+        .unwrap();
+        let projection = root.join("private/projection.sqlite");
+        let services = || crate::graph::DirectFilesServicePaths {
+            projection: Ok(projection.clone()),
+            concord_ledger: None,
+        };
+
+        let graph = Graph::open_checked_with_assets(&root, None).unwrap();
+        crate::graph::attach_direct_files_services(&graph, services());
+        graph.warm_cache();
+        let old = Arc::new(GraphSlot::new(graph, root.clone()));
+        let before = when_ready(&old.legacy_graph().unwrap()).expect("queries answer before");
+        assert!(before > 0, "the fixture has referring blocks");
+
+        // What `set_guide_announced` does: a config write, then a refresh.
+        old.legacy_graph()
+            .unwrap()
+            .set_guide_announced(true)
+            .unwrap();
+        let replacement = reopen_legacy_for_refresh(&old, None, services()).unwrap();
+        // The open path warms through `warm_cache_async`; the refresh core hands
+        // that to its caller, so warm here exactly as the caller would.
+        let reopened = replacement.legacy_graph().unwrap();
+        reopened.warm_cache();
+        let after = when_ready(&reopened);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            after.ok(),
+            Some(before),
+            "after refresh the same query must answer"
+        );
     }
 
     #[test]

@@ -43,6 +43,20 @@
 //!    [`positively_bounded`] implements §5.7's table, which is **exhaustive**: a
 //!    leaf/operator pair absent from it is unbounded.
 //!
+//! **§5.11's driver rule, and why rule 1 is about DECOMPOSITION and not about
+//! the word `IN`.** One subquery per quantifier is a correctness rule; whether
+//! that subquery is spelled as a list or as a correlated probe is a PLAN choice,
+//! and [`RelationRule`] is where it is made. SQLite materialises an uncorrelated
+//! `IN (SELECT …)` in full before probing it, so a conjunction of relation
+//! leaves used to cost the SUM of the facet slices it mentioned even when its
+//! answer was three rows: `(and [[Page]] (not (task DONE)))` enumerated every
+//! DONE task in the graph. Under [`RELATION_RULE`] exactly one bounded root
+//! conjunct keeps the list spelling and drives the anchor, and every other root
+//! conjunct probes its facet by key, once per candidate. Both spellings are
+//! checked against the walk by
+//! `the_two_relation_spellings_answer_identically`, because the swap is only
+//! legitimate while every key selected here is `NOT NULL`.
+//!
 //! **`walk == SQL` is the contract (I-19, I-12).** Every comparison below is
 //! written against the walk's own code in [`crate::query::eval`], and the
 //! normalization applied to a literal is the SAME function the projection
@@ -330,6 +344,31 @@ pub(crate) enum ResultSetRule {
 ///    not have found that the third was the real one.
 pub(crate) const RESULT_SET_RULE: ResultSetRule = ResultSetRule::MatchSetCteMaterialized;
 
+/// How a relation membership test is SPELLED, and therefore what SQLite plans.
+///
+/// Both spellings are the same predicate (see [`Membership`]); they differ only
+/// in whether SQLite may evaluate the subquery once for the whole statement or
+/// must evaluate it per candidate row. Unlike [`ResultSetRule`], which is about
+/// §5.3's ONE anti-join, this governs EVERY relation leaf of the filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelationRule {
+    /// §5.1's original spelling: `owner IN (SELECT … FROM facet WHERE …)` for
+    /// every leaf. SQLite materialises each list in full before probing it, so
+    /// the statement's cost is the SUM of the facet slices the query mentions —
+    /// even when the answer is three rows.
+    Lists,
+    /// §5.11: exactly one positively-bounded root conjunct keeps the list
+    /// spelling and drives the anchor's index probe; every other root conjunct
+    /// is spelled `EXISTS (SELECT 1 FROM facet WHERE key = owner AND …)` and
+    /// costs one index seek per candidate the driver produced.
+    DriverAndProbes,
+}
+
+/// The production spelling, chosen by the measurement recorded in
+/// `the_two_relation_spellings_are_timed_against_each_other_on_a_real_corpus`.
+/// This single line reverts §5.11.
+pub(crate) const RELATION_RULE: RelationRule = RelationRule::DriverAndProbes;
+
 /// Everything an execution binds that is not in the IR.
 pub(crate) struct LoweringInputs<'a> {
     /// The ONE execution-day snapshot `resolve_for_execution` took.
@@ -356,6 +395,9 @@ pub(crate) struct LoweringInputs<'a> {
     /// [`RESULT_SET_RULE`]; the measurement gate passes both so the choice
     /// stays reproducible rather than remembered.
     pub(crate) result_set_rule: ResultSetRule,
+    /// Which spelling of §5.11's relation memberships to emit. Production
+    /// passes [`RELATION_RULE`]; the measurement gate passes both.
+    pub(crate) relation_rule: RelationRule,
 }
 
 /// §5.3's block answer row and the relation it reads, as ONE named pair.
@@ -397,6 +439,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         inputs,
         params: Vec::new(),
         next_alias: 0,
+        probe: false,
         regexes: Vec::new(),
         needs_child_map: false,
     };
@@ -423,7 +466,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         ),
         Anchor::Page => (Row::Page("p"), PAGE_ANCHOR_SELECT, PAGE_ANCHOR_FROM),
     };
-    let mut where_ = compiler.filter(&filter, row);
+    let mut where_ = compiler.root_filter(&filter, row);
     // §5.3: the result-set rule is applied in the SAME statement. OG's
     // `tree/filter-top-level-blocks` drops a matched block whose IMMEDIATE
     // parent also matched, and the walk implements it in
@@ -1100,10 +1143,36 @@ impl<'a> BlockScope<'a> {
     }
 }
 
+/// One relation membership test, before it is spelled: the owner column is
+/// either `IN (SELECT <select> FROM <from> WHERE <where_>)` or, when the
+/// compiler is emitting correlated probes, `EXISTS (SELECT 1 FROM <from> WHERE
+/// <select> = <owner> AND <where_>)`.
+///
+/// The two spellings are the same two-valued predicate, including under
+/// negation, because every owner column and every subquery select column used
+/// here is `NOT NULL` in the projection schema (`blocks.block_id`,
+/// `blocks.page_id`, `pages.page_id`, and each facet table's own key) — the one
+/// nullable owner, a nested `refs` arm's `parent_block_id`, is guarded
+/// `IS NOT NULL` at its site and never negated. That matters: `x NOT IN
+/// (… NULL …)` is unknown where `NOT EXISTS` is true, so the equivalence is a
+/// schema fact, not a SQL identity. Only the PLAN differs.
+struct Membership {
+    select: String,
+    from: String,
+    /// Already folded; `"1"` when there is no condition.
+    where_: String,
+}
+
 struct Compiler<'a> {
     inputs: &'a LoweringInputs<'a>,
     params: Vec<PhysicalQueryValue>,
     next_alias: usize,
+    /// §5.11: spell relation memberships as correlated probes rather than
+    /// uncorrelated lists. Set while lowering every root conjunct except the
+    /// DRIVER (see [`Compiler::root_filter`]); false everywhere else, so an
+    /// unbounded or disjunctive root keeps §5.1's list spelling, which is the
+    /// cheaper one when the anchor is enumerated anyway.
+    probe: bool,
     /// §4.3.2's compiled-regex table, in ID order, de-duplicated by effective pattern
     /// text so §5.3's second compilation pass reuses the FIRST pass's IDs
     /// rather than growing a parallel table.
@@ -1154,6 +1223,114 @@ impl Compiler<'_> {
     // The boolean skeleton
     // -----------------------------------------------------------------------
 
+    /// The ROOT conjunction, with §5.11's driver rule.
+    ///
+    /// Every relation leaf used to be spelled `owner IN (SELECT … FROM facet
+    /// WHERE …)`, and SQLite materialises each such list IN FULL before it
+    /// probes — so `(and (page [[P]]) (not (task DONE)))` enumerated every
+    /// DONE task in the graph to answer for one page's three blocks, and the
+    /// statement grew with the graph although its answer did not. Exactly ONE
+    /// positively-bounded conjunct — the one the static rank below calls most
+    /// selective — keeps the list spelling and drives the anchor's index
+    /// probe; every other conjunct is lowered with [`Compiler::probe`] set and
+    /// tests each candidate by a correlated `EXISTS` on the facet table's
+    /// primary key, so its cost is |driver| × log n instead of Σ|lists|. A
+    /// root with no bounded conjunct enumerates the anchor anyway, and there
+    /// the lists are the cheaper spelling, so it is left alone; so is a
+    /// disjunctive root, whose arms each need their own list.
+    ///
+    /// **Measured** (release, anonymized graph and a ×10 replica of it,
+    /// `the_corpus_own_queries_are_timed_against_the_walk` and
+    /// `the_two_relation_spellings_are_timed_against_each_other_on_a_real_corpus`).
+    /// The corpus's three slowest real queries — page-scoped text with an
+    /// open-task filter, three rows at every size — cost 1.03-1.08 ms as lists
+    /// and 0.066-0.068 ms as probes at ×1, and 12.7-13.0 ms as lists against a
+    /// FLAT 0.070-0.076 ms at ×10. That is the whole claim: the list spelling
+    /// tracked the graph, the probe spelling tracks the answer. Across both
+    /// scales no `PLAN_SHAPES` entry regresses past 1.10×.
+    ///
+    /// **The honest remainder.** At ×1 three of the corpus's own queries are
+    /// 1.10-1.53× SLOWER (the worst is 278 µs → 424 µs on five rows), because a
+    /// driver that produces many candidates pays a seek for each where a short
+    /// list paid one scan. The same queries are 3.4× FASTER at ×10 (2.2 ms →
+    /// 0.6 ms), which is the trade this rule is: a constant on small graphs for
+    /// a slope on large ones.
+    fn root_filter(&mut self, filter: &Filter, row: Row<'_>) -> String {
+        let bound_row = match row {
+            Row::Block(_) => BoundRow::Block,
+            Row::Page(_) => BoundRow::Page,
+        };
+        if self.inputs.relation_rule == RelationRule::Lists {
+            return self.filter(filter, row);
+        }
+        let Filter::And { .. } = filter else {
+            return self.filter(filter, row);
+        };
+        // The ROOT CONJUNCTION, not the root NODE: `and` is associative, and
+        // `(and (task TODO) (and [[P]] …))` is a shape people actually write —
+        // OG's own builder emits it, and one of the anonymized corpus's own
+        // queries is exactly that. `Query::normalized` flattens it, but nothing
+        // on the execution path calls that, so before this the nested arm hid
+        // the only named conjunct in the query and the whole statement fell
+        // back to lists.
+        let mut items: Vec<&Filter> = Vec::new();
+        flatten_and(filter, &mut items);
+        if items.len() < 2 {
+            return self.filter(filter, row);
+        }
+        let driver = items
+            .iter()
+            .enumerate()
+            .filter_map(|(at, item)| {
+                driver_rank(item, bound_row, self.inputs).map(|rank| (rank, at))
+            })
+            .min();
+        // A driver that is itself a CLASS — every TODO, every scheduled block,
+        // every page in a journal range — is not a driver worth probing from:
+        // both sides then grow with the graph, and SQLite's bloom-filtered
+        // intersection of two lists beats one seek per candidate. Measured on
+        // the anonymized graph: `(and (task TODO) (priority A))` costs 148 µs
+        // as two lists and 198 µs as 275 probes, because the `priority A` list
+        // is EMPTY and the bloom filter rejects every candidate for free.
+        let driver = match driver {
+            Some((rank, at)) if rank <= DRIVER_NAMED_MAX => at,
+            _ => return self.filter(filter, row),
+        };
+        let parts = items
+            .iter()
+            .enumerate()
+            .map(|(at, item)| {
+                self.probe = at != driver;
+                let part = self.filter(item, row);
+                self.probe = false;
+                part
+            })
+            .collect();
+        fold_and(parts)
+    }
+
+    /// Spell one membership test in the current mode (see [`Membership`]).
+    fn member(&self, owner: &str, sub: &Membership, negated: bool) -> String {
+        let Membership {
+            select,
+            from,
+            where_,
+        } = sub;
+        if self.probe {
+            let condition = fold_and(vec![format!("{select} = {owner}"), where_.clone()]);
+            let keyword = if negated { "NOT EXISTS" } else { "EXISTS" };
+            format!("{keyword} (SELECT 1 FROM {from} WHERE {condition})")
+        } else {
+            let keyword = if negated { "NOT IN" } else { "IN" };
+            let tail = if where_ == "1" {
+                String::new()
+            } else {
+                format!(" WHERE {where_}")
+            };
+            format!("{owner} {keyword} (SELECT {select} FROM {from}{tail})")
+        }
+    }
+
     /// Transcribes `hasura/ndc-postgres`
     /// `filtering.rs::translate_expression_with_joins`: `And`/`Or` fold their
     /// already-translated operands, `Not` wraps one. Every operand is
@@ -1202,22 +1379,22 @@ impl Compiler<'_> {
         &mut self,
         owner: &str,
         quant: Quant,
-        mut subquery: impl FnMut(&mut Self, bool) -> Option<String>,
+        mut subquery: impl FnMut(&mut Self, bool) -> Option<Membership>,
     ) -> String {
         match quant {
             // No row can satisfy the predicate, so no owner is `IN` it.
             Quant::Any => match subquery(self, false) {
-                Some(sub) => format!("{owner} IN ({sub})"),
+                Some(sub) => self.member(owner, &sub, false),
                 None => "0".to_string(),
             },
             // `NOT IN` an empty set is true for every owner — and for `Every`
             // the empty set is the set of VIOLATORS, so every owner passes.
             Quant::None => match subquery(self, false) {
-                Some(sub) => format!("{owner} NOT IN ({sub})"),
+                Some(sub) => self.member(owner, &sub, true),
                 None => "1".to_string(),
             },
             Quant::Every => match subquery(self, true) {
-                Some(sub) => format!("{owner} NOT IN ({sub})"),
+                Some(sub) => self.member(owner, &sub, true),
                 None => "1".to_string(),
             },
         }
@@ -1240,7 +1417,7 @@ impl Compiler<'_> {
         guards: &[String],
         predicate: String,
         invert: bool,
-    ) -> Option<String> {
+    ) -> Option<Membership> {
         let predicate = if invert {
             fold_not(predicate)
         } else {
@@ -1252,7 +1429,11 @@ impl Compiler<'_> {
         if where_ == "0" {
             return None;
         }
-        Some(format!("SELECT {select} FROM {from} WHERE {where_}"))
+        Some(Membership {
+            select: select.to_string(),
+            from: from.to_string(),
+            where_,
+        })
     }
 
     /// One relation subquery, in the relation element's own row scope.
@@ -1264,7 +1445,7 @@ impl Compiler<'_> {
         pred: &Filter,
         row: Row<'_>,
         invert: bool,
-    ) -> Option<String> {
+    ) -> Option<Membership> {
         let predicate = self.filter(pred, row);
         self.exists_subquery(select, from, guards, predicate, invert)
     }
@@ -1500,19 +1681,23 @@ impl Compiler<'_> {
     /// `eq_ignore_ascii_case` and still seeks `tasks_marker_idx`.
     fn task(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
         let alias = self.alias("t");
-        let from = format!("tasks {alias}");
-        let select = format!("{alias}.block_id");
         let owner = format!("{b}.block_id");
+        let facet = |where_: String| Membership {
+            select: format!("{alias}.block_id"),
+            from: format!("tasks {alias}"),
+            where_,
+        };
         match op {
-            CmpOp::IsSet => format!("{owner} IN (SELECT {select} FROM {from})"),
-            CmpOp::IsNotSet => format!("{owner} NOT IN (SELECT {select} FROM {from})"),
+            CmpOp::IsSet => self.member(&owner, &facet("1".to_string()), false),
+            CmpOp::IsNotSet => self.member(&owner, &facet("1".to_string()), true),
             CmpOp::Eq | CmpOp::NotEq => {
                 let Value::Text { text } = value else {
                     return "0".to_string();
                 };
                 let literal = self.bind(PhysicalQueryValue::Text(text.to_ascii_uppercase()));
                 let comparison = if op == CmpOp::Eq { "=" } else { "<>" };
-                format!("{owner} IN (SELECT {select} FROM {from} WHERE {alias}.marker {comparison} {literal})")
+                let sub = facet(format!("{alias}.marker {comparison} {literal}"));
+                self.member(&owner, &sub, false)
             }
             CmpOp::In | CmpOp::NotIn => {
                 let Value::List { items } = value else {
@@ -1524,11 +1709,12 @@ impl Compiler<'_> {
                     // "present and not equal to anything", i.e. present.
                     return match op {
                         CmpOp::In => "0".to_string(),
-                        _ => format!("{owner} IN (SELECT {select} FROM {from})"),
+                        _ => self.member(&owner, &facet("1".to_string()), false),
                     };
                 };
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
-                format!("{owner} IN (SELECT {select} FROM {from} WHERE {alias}.marker {membership} ({list}))")
+                let sub = facet(format!("{alias}.marker {membership} ({list})"));
+                self.member(&owner, &sub, false)
             }
             _ => "0".to_string(),
         }
@@ -1546,24 +1732,26 @@ impl Compiler<'_> {
     /// `upper()`, which would forfeit the seek.
     fn priority(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
         let alias = self.alias("bp");
-        let from = format!("block_planning {alias}");
-        let select = format!("{alias}.block_id");
         let owner = format!("{b}.block_id");
         let present = format!("{alias}.priority IS NOT NULL");
+        let facet = |where_: String| Membership {
+            select: format!("{alias}.block_id"),
+            from: format!("block_planning {alias}"),
+            where_,
+        };
         match op {
-            CmpOp::IsSet => format!("{owner} IN (SELECT {select} FROM {from} WHERE {present})"),
-            CmpOp::IsNotSet => {
-                format!("{owner} NOT IN (SELECT {select} FROM {from} WHERE {present})")
-            }
+            CmpOp::IsSet => self.member(&owner, &facet(present), false),
+            CmpOp::IsNotSet => self.member(&owner, &facet(present), true),
             CmpOp::Eq | CmpOp::NotEq => {
                 let Value::Text { text } = value else {
                     return "0".to_string();
                 };
                 let list = self.ascii_case_pair(text);
                 let membership = if op == CmpOp::Eq { "IN" } else { "NOT IN" };
-                format!(
-                    "{owner} IN (SELECT {select} FROM {from} WHERE {present} AND {alias}.priority {membership} ({list}))"
-                )
+                let sub = facet(format!(
+                    "({present} AND {alias}.priority {membership} ({list}))"
+                ));
+                self.member(&owner, &sub, false)
             }
             CmpOp::In | CmpOp::NotIn => {
                 let Value::List { items } = value else {
@@ -1581,7 +1769,7 @@ impl Compiler<'_> {
                 if spellings.is_empty() {
                     return match op {
                         CmpOp::In => "0".to_string(),
-                        _ => format!("{owner} IN (SELECT {select} FROM {from} WHERE {present})"),
+                        _ => self.member(&owner, &facet(present), false),
                     };
                 }
                 let list = spellings
@@ -1590,9 +1778,10 @@ impl Compiler<'_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
-                format!(
-                    "{owner} IN (SELECT {select} FROM {from} WHERE {present} AND {alias}.priority {membership} ({list}))"
-                )
+                let sub = facet(format!(
+                    "({present} AND {alias}.priority {membership} ({list}))"
+                ));
+                self.member(&owner, &sub, false)
             }
             _ => "0".to_string(),
         }
@@ -1604,24 +1793,23 @@ impl Compiler<'_> {
     /// what `eval_planning` does with `planning_day`.
     fn planning(&mut self, op: CmpOp, value: &Value, b: &str, field: &str) -> String {
         let alias = self.alias("bp");
-        let from = format!("block_planning {alias}");
-        let select = format!("{alias}.block_id");
         let owner = format!("{b}.block_id");
         let present = format!("{alias}.{field} IS NOT NULL");
+        let facet = |where_: String| Membership {
+            select: format!("{alias}.block_id"),
+            from: format!("block_planning {alias}"),
+            where_,
+        };
         match op {
-            CmpOp::IsSet => {
-                return format!("{owner} IN (SELECT {select} FROM {from} WHERE {present})")
-            }
-            CmpOp::IsNotSet => {
-                return format!("{owner} NOT IN (SELECT {select} FROM {from} WHERE {present})")
-            }
+            CmpOp::IsSet => return self.member(&owner, &facet(present), false),
+            CmpOp::IsNotSet => return self.member(&owner, &facet(present), true),
             _ => {}
         }
         let column = format!("{alias}.{field}_day");
         let Some(test) = self.day_comparison(op, value, &column) else {
             return "0".to_string();
         };
-        format!("{owner} IN (SELECT {select} FROM {from} WHERE {test})")
+        self.member(&owner, &facet(test), false)
     }
 
     /// `refs` is OG's `:block/path-refs`: the row's own normalized refs, the
@@ -1708,7 +1896,7 @@ impl Compiler<'_> {
                 predicate,
                 invert,
             ) {
-                arms.push(format!("{owner} IN ({sub})"));
+                arms.push(compiler.member(&owner, &sub, false));
             }
             // `ancestors(anchor)` ∪ `{page}` — the ANCHOR's parent's own §5.8
             // closure. J1: `parent_block_id` is nullable, and a root anchor has
@@ -1728,7 +1916,8 @@ impl Compiler<'_> {
                 predicate,
                 invert,
             ) {
-                arms.push(format!("({parent} IS NOT NULL AND {parent} IN ({sub}))"));
+                let hit = compiler.member(&parent, &sub, false);
+                arms.push(format!("({parent} IS NOT NULL AND {hit})"));
             }
             // `{page}` — named separately because a ROOT anchor has no parent
             // row to carry it. `name_key <> ''` reproduces `closure_names`' own
@@ -1748,7 +1937,7 @@ impl Compiler<'_> {
                 predicate,
                 invert,
             ) {
-                arms.push(format!("{page_owner} IN ({sub})"));
+                arms.push(compiler.member(&page_owner, &sub, false));
             }
             fold_or(arms)
         };
@@ -1835,8 +2024,8 @@ impl Compiler<'_> {
             false,
         );
         match (quant, hit) {
-            (Quant::Any | Quant::Every, Some(hit)) => format!("{owner} IN ({hit})"),
-            (Quant::None, Some(hit)) => format!("{owner} NOT IN ({hit})"),
+            (Quant::Any | Quant::Every, Some(hit)) => self.member(&owner, &hit, false),
+            (Quant::None, Some(hit)) => self.member(&owner, &hit, true),
             (Quant::Any | Quant::Every, None) => "0".to_string(),
             (Quant::None, None) => "1".to_string(),
         }
@@ -2052,11 +2241,15 @@ impl Compiler<'_> {
         let key_literal = self.bind(PhysicalQueryValue::Text(key_norm.clone()));
         let presence = {
             let alias = self.alias("pr");
-            format!(
-                "{owner} IN (SELECT {alias}.owner_id FROM properties {alias} \
-                 WHERE {alias}.normalized_name = {key_literal} \
-                 AND {alias}.owner_type = {owner_type_literal})"
-            )
+            let sub = Membership {
+                select: format!("{alias}.owner_id"),
+                from: format!("properties {alias}"),
+                where_: format!(
+                    "({alias}.normalized_name = {key_literal} \
+                     AND {alias}.owner_type = {owner_type_literal})"
+                ),
+            };
+            self.member(&owner, &sub, false)
         };
 
         let Some(test) = pred.props_atom_test() else {
@@ -2084,7 +2277,7 @@ impl Compiler<'_> {
             .registry
             .effective_type(&key_norm)
             .unwrap_or(ObservedType::Text);
-        let atom_subquery = |compiler: &mut Self, invert: bool| -> Option<String> {
+        let atom_subquery = |compiler: &mut Self, invert: bool| -> Option<Membership> {
             let alias = compiler.alias("a");
             let predicate = compiler.atom_test(&test, &alias, effective);
             compiler.exists_subquery(
@@ -2100,18 +2293,21 @@ impl Compiler<'_> {
         };
         match quant {
             Quant::Any => match atom_subquery(self, false) {
-                Some(sub) => format!("{owner} IN ({sub})"),
+                Some(sub) => self.member(&owner, &sub, false),
                 None => "0".to_string(),
             },
             Quant::None => match atom_subquery(self, false) {
-                Some(sub) => format!("{owner} NOT IN ({sub})"),
+                Some(sub) => self.member(&owner, &sub, true),
                 None => "1".to_string(),
             },
             // Presence still has to hold: the walk's `present && all(...)` is
             // vacuously true over an empty atom list only when the property is
             // there at all.
             Quant::Every => match atom_subquery(self, true) {
-                Some(sub) => format!("({presence} AND {owner} NOT IN ({sub}))"),
+                Some(sub) => {
+                    let violators = self.member(&owner, &sub, true);
+                    format!("({presence} AND {violators})")
+                }
                 None => presence,
             },
         }
@@ -2652,6 +2848,61 @@ enum BoundRow {
     Page,
 }
 
+/// The root CONJUNCTION of a filter: `and` is associative, so a nested `And`
+/// contributes its own children rather than itself. Only the top-level spine is
+/// walked — an `And` under `Or` or `Not` is a different question and stays one
+/// operand. `Query::normalized` does the same flattening, but it is a
+/// comparison helper and nothing on the execution path calls it.
+fn flatten_and<'f>(filter: &'f Filter, out: &mut Vec<&'f Filter>) {
+    match filter {
+        Filter::And { items } => {
+            for item in items {
+                flatten_and(item, out);
+            }
+        }
+        other => out.push(other),
+    }
+}
+
+/// The worst rank that still makes a conjunct worth driving FROM. Ranks at or
+/// below it name a single VALUE — one page, one reference, one tag, one
+/// property value — so the candidate set they produce is a property of the
+/// user's graph shape and not of its size. Everything above names a CLASS whose
+/// size grows with the graph.
+const DRIVER_NAMED_MAX: u8 = 2;
+
+/// §5.11's static selectivity rank of one root conjunct, `None` when it cannot
+/// drive the anchor (it is not positively bounded). Lower is more selective.
+/// A disjunction ranks as its WORST arm and only when every arm can drive,
+/// which is §5.7's own rule for it. This is a heuristic with no statistics
+/// behind it, chosen so that the driver is never the whole-graph task or
+/// planning facet when a page, reference, tag or property leaf is available;
+/// a wrong pick costs |driver| probes, never more than the old Σ|lists|.
+fn driver_rank(filter: &Filter, row: BoundRow, inputs: &LoweringInputs<'_>) -> Option<u8> {
+    match filter {
+        Filter::Leaf { leaf } if leaf_bounds(leaf, row, inputs) => Some(match leaf {
+            Leaf::Rel { rel, .. } => match rel {
+                Rel::Page => 0,
+                Rel::Refs | Rel::Tags => 1,
+                Rel::Props => 2,
+                Rel::Children | Rel::Blocks => 5,
+            },
+            Leaf::Attr { attr, .. } => match attr {
+                Attr::Name | Attr::Namespace => 0,
+                Attr::Day => 4,
+                Attr::Task | Attr::Priority | Attr::Scheduled | Attr::Deadline => 4,
+                Attr::Content => 6,
+                _ => 7,
+            },
+        }),
+        Filter::Or { items } if !items.is_empty() => items
+            .iter()
+            .map(|item| driver_rank(item, row, inputs))
+            .try_fold(0u8, |worst, rank| rank.map(|rank| worst.max(rank))),
+        _ => None,
+    }
+}
+
 fn bounded(filter: &Filter, negated: bool, row: BoundRow, inputs: &LoweringInputs<'_>) -> bool {
     match filter {
         // A conjunction needs ONE bounded conjunct; a disjunction needs ALL of
@@ -2945,6 +3196,7 @@ mod tests {
             compiled: &NO_COMPILED_LEAVES,
             fts_ready: true,
             result_set_rule: RESULT_SET_RULE,
+            relation_rule: RELATION_RULE,
         }
     }
 
@@ -3397,6 +3649,7 @@ mod tests {
             inputs: &inputs,
             params: Vec::new(),
             next_alias: 0,
+            probe: false,
             regexes: Vec::new(),
             needs_child_map: false,
         };

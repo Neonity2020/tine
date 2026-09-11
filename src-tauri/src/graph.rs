@@ -638,7 +638,42 @@ pub(crate) fn prepare_direct_files_open(
         ),
     }
     let LoadedGraph { graph, meta } = open_graph_for_load(&root, approved_assets.as_deref())?;
-    match direct_files_projection_path(app, &root_key) {
+    attach_direct_files_services(&graph, direct_files_service_paths(app, &root_key));
+    Ok(PreparedDirectFilesOpen {
+        graph,
+        meta,
+        root_key,
+    })
+}
+
+/// The app-private locations of the services a Direct Files `Graph` carries:
+/// the disposable SQLite projection and the Concord base ledger. Resolved from
+/// the `AppHandle` once, so the attach itself needs no handle and can be driven
+/// from a test.
+pub(crate) struct DirectFilesServicePaths {
+    pub(crate) projection: Result<PathBuf, crate::command_error::CommandError>,
+    pub(crate) concord_ledger: Option<PathBuf>,
+}
+
+pub(crate) fn direct_files_service_paths(
+    app: &tauri::AppHandle,
+    root_key: &Path,
+) -> DirectFilesServicePaths {
+    DirectFilesServicePaths {
+        projection: direct_files_projection_path(app, root_key),
+        concord_ledger: crate::backup::concord_ledger_dir(app, root_key),
+    }
+}
+
+/// Attach the Direct Files services to a freshly opened `Graph`. This is the
+/// ONE place that does so: the ordinary open and the configuration refresh
+/// (`state::reopen_legacy_for_refresh`) both go through it, so a `Graph` that
+/// reaches the window registry always carries its projection. A refresh that
+/// reopened without attaching left every query `ProjectionUnavailable` until
+/// the next graph open (GH draft "Query Engine", 2026-09-11: dismissing the
+/// Guide toast killed all queries).
+pub(crate) fn attach_direct_files_services(graph: &Graph, paths: DirectFilesServicePaths) {
+    match paths.projection {
         Ok(path) => {
             if let Err(error) = graph.attach_direct_projection(path) {
                 crate::debug::diag(format!(
@@ -654,17 +689,12 @@ pub(crate) fn prepare_direct_files_open(
     // the sync tree. Attach failure is impossible (the attach performs no I/O);
     // an unavailable app-data dir simply leaves the ledger off — every hook
     // no-ops and conflict diffs stay 2-way.
-    match crate::backup::concord_ledger_dir(app, &root_key) {
+    match paths.concord_ledger {
         Some(dir) => graph.attach_concord_ledger(dir),
         None => crate::debug::diag(
             "Concord ledger directory unavailable; conflict diffs stay 2-way".to_string(),
         ),
     }
-    Ok(PreparedDirectFilesOpen {
-        graph,
-        meta,
-        root_key,
-    })
 }
 
 /// The short authoritative half of a Direct Files open.  Callers must invoke
@@ -1533,6 +1563,100 @@ mod tests {
             Some(&("lookup.complete", true, Some("ok")))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `Graph` that reaches the window registry carries the Direct Files
+    /// projection. Both producers of such a graph — the open and the
+    /// configuration refresh — must attach through the ONE shared function;
+    /// a second direct `attach_direct_projection(` call site in production is
+    /// how the refresh path drifted into attaching nothing.
+    #[test]
+    fn every_direct_files_graph_is_attached_through_one_function() {
+        /// Byte offsets of every `needle` that is NOT inside a `#[cfg(test)]`
+        /// module. A module is open from its `#[cfg(test)]\nmod` header until
+        /// the next closing brace at column 0; the files here use several such
+        /// modules, not one trailing `mod tests`.
+        fn production_sites(source: &str, needle: &str) -> Vec<usize> {
+            // Spelled without a literal closing brace: `typedErrorRatchet.test.ts`
+            // brace-counts this file to skip its test modules, and a closing brace inside
+            // a string literal would end this module early for it.
+            let close = format!("\n{}\n", char::from(0x7du8));
+            let mut test_ranges = Vec::new();
+            let mut from = 0;
+            while let Some(found) = source[from..].find("\n#[cfg(test)]\nmod ") {
+                let start = from + found;
+                let end = source[start..]
+                    .find(close.as_str())
+                    .map(|at| start + at + close.len())
+                    .unwrap_or(source.len());
+                test_ranges.push(start..end);
+                from = end;
+            }
+            source
+                .match_indices(needle)
+                .map(|(at, _)| at)
+                .filter(|at| !test_ranges.iter().any(|range| range.contains(at)))
+                .collect()
+        }
+        let graph = include_str!("graph.rs");
+        assert_eq!(
+            production_sites(graph, "attach_direct_projection(").len(),
+            1,
+            "graph.rs attaches the projection in `attach_direct_files_services` only"
+        );
+        for (name, source) in [
+            ("state.rs", include_str!("state.rs")),
+            ("commands.rs", include_str!("commands.rs")),
+            ("backup.rs", include_str!("backup.rs")),
+            ("watcher.rs", include_str!("watcher.rs")),
+        ] {
+            assert_eq!(
+                production_sites(source, "attach_direct_projection(").len(),
+                0,
+                "{name} must attach through `attach_direct_files_services`"
+            );
+        }
+        fn production(source: &str) -> &str {
+            source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .expect("production source")
+        }
+        let open = &graph[graph
+            .find("pub(crate) fn prepare_direct_files_open")
+            .expect("open path")..];
+        assert!(
+            open.find("attach_direct_files_services(") < open.find("Ok(PreparedDirectFilesOpen"),
+            "the open path attaches before it publishes"
+        );
+        let state = production(include_str!("state.rs"));
+        let refresh = &state[state
+            .find("pub(crate) fn reopen_legacy_for_refresh")
+            .expect("refresh core")..];
+        let detach = refresh
+            .find("detach_direct_projection(")
+            .expect("old worker retired");
+        let reopen = refresh
+            .find("Graph::open_checked_with_assets(")
+            .expect("refresh reopens");
+        let attach = refresh
+            .find("attach_direct_files_services(")
+            .expect("refresh attaches");
+        let slot = refresh
+            .find("GraphSlot::refreshed(")
+            .expect("refresh publishes");
+        assert!(
+            detach < reopen && reopen < attach && attach < slot,
+            "refresh retires the old projection worker, reopens, attaches, then builds the slot"
+        );
+        let refresh_entry = &state[state
+            .find("pub(crate) fn refresh_graph_for_label")
+            .expect("refresh entry")..];
+        assert!(
+            refresh_entry.find("reopen_legacy_for_refresh(")
+                < refresh_entry.find("warm_cache_async("),
+            "the refreshed slot is warmed, or the projection never receives its payload"
+        );
     }
 
     #[test]

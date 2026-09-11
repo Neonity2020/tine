@@ -189,6 +189,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Queries survive a settings change.** On a Direct Files graph, dismissing
+  the Guide toast — or changing the default home, time tracking, bracket
+  display, doc-mode Enter, logical outdenting, preferred format or journal
+  title format, restoring a backup, or having `config.edn` rewritten outside
+  Tine — turned every query block into "Query results unavailable" until the
+  graph was reopened. The refresh that follows a configuration write rebuilt
+  the graph without the query index the ordinary open attaches. Both paths now
+  attach it through one function, and the refresh retires the previous index
+  worker before starting its replacement.
+- **Creating a block no longer freezes every query on "Rebuilding the query
+  index…".** A block created in the editor is saved under the editor's own id,
+  which is not a UUID; the index refused the whole page for it, and every
+  automatic rebuild refused the same page again, so after one such save no
+  query in the app answered until restart. Such a block now gets a stable index
+  key and answers still name it by the id the editor knows.
+- **"why empty?" describes an answer, not the absence of one.** While the query
+  index was still rebuilding, a query block said "No results" and offered
+  "why empty?", which opened onto an empty panel. The block now shows
+  "Rebuilding the query index…" until its query has actually run, and the
+  affordance appears only for a query that ran and matched nothing.
 - **A query and a board no longer disagree about what `group by state` means.**
   One line, `tine.group-by:: state`, meant two different things depending on
   which face was reading it: the task marker to a board, and an ordinary property
@@ -316,6 +336,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   left alone when you edit a neighbour.
 
 ### Changed
+
+- **A query with two conditions no longer reads the whole graph to answer about
+  three blocks.** Every condition in a query was asked of the index as its own
+  complete list — "all the DONE tasks", "all the blocks tagged x" — and SQLite
+  builds each list in full before it compares them. So a query scoped to one
+  page, answering three rows, still enumerated every DONE task you have, and got
+  slower as the graph grew even though its answer did not. Tine now picks the
+  one condition that names a single thing (a page, a reference, a tag, a property
+  value), asks the index for that, and checks the remaining conditions against
+  each candidate directly — including when your query groups its conditions,
+  which used to hide the useful one a level down. On a 1,045-file graph the
+  three slowest queries in it went from 1.0 ms to 0.07 ms; on a thirty-times-
+  larger copy of the same graph one of them went from 53 ms to 0.4 ms. Results, their order and their
+  grouping are unchanged, and both spellings are checked against the old
+  whole-graph walk on every test shape.
 
 - **Linked References looks only at the blocks that link to the page.** The
   index has always known which blocks refer to a page, but the panel asked it

@@ -2936,6 +2936,27 @@ fn physical_page(
     ))
 }
 
+/// The 16-byte key a block's rows are stored under.
+///
+/// A parsed page carries structural UUIDs. A page saved from the editor keeps
+/// the FRONTEND's live ids (`src/store.ts` `freshId()`: `b<base36 time>-<n>`),
+/// which `cache_upsert_inner` deliberately preserves so the editor can keep
+/// addressing the block; the public identity of a row is `query_result_id`,
+/// the id STRING, so a non-UUID live id only needs a deterministic key here.
+/// This used to be a refusal, and a refusal scoped to the whole page: one
+/// block created in the editor failed the page's delta, the failed turn
+/// latched a full rebuild, and every rebuild re-lowered the same live document
+/// and failed the same way — so after one such save every query in the app
+/// answered "Rebuilding the query index…" until restart (2026-09-11,
+/// master d61cfb3d). `a_block_created_in_the_editor_keeps_queries_answering`
+/// (`tests/search_edit.rs`) pins the user outcome.
+fn block_projection_key(runtime_id: &str) -> [u8; 16] {
+    match Uuid::parse_str(runtime_id) {
+        Ok(uuid) => uuid.into_bytes(),
+        Err(_) => crate::model::live_runtime_id_key(runtime_id).into_bytes(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_blocks(
     source: &[DocBlock],
@@ -2952,14 +2973,7 @@ fn lower_blocks(
         let position = u32::try_from(position)
             .map_err(|_| "page has more than u32::MAX sibling blocks".to_string())?;
         structural_path.push(position);
-        let block_id = Uuid::parse_str(&block.uuid)
-            .map_err(|_| {
-                format!(
-                    "block has no assigned runtime UUID in projection: {}",
-                    block.uuid
-                )
-            })?
-            .into_bytes();
+        let block_id = block_projection_key(&block.uuid);
         let projection = block.projection();
         let order = structural_path
             .iter()

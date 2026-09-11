@@ -1,5 +1,5 @@
 import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
-import { backend, QueryPrintRefusedError } from "../backend";
+import { backend, QueryPrintRefusedError, type QueryNotReadyError } from "../backend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
 import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
@@ -323,13 +323,23 @@ export function QueryMacro(props: {
   // drop the reading the display derivations read through `latest`. Nothing
   // about the result presentation, group ordering or the scroll harness is
   // involved here.
-  const [parsedSnapshot] = createResource(parseRequest, async (request) => ({
-    request,
-    reading: await runQueryWhenCurrent(
-      () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
-      () => parseRequest() === request,
-    ),
-  }));
+  //
+  // The retry's readiness state is surfaced like the run's: while the engine
+  // rebuilds there is no reading, so nothing runs and `total()` falls to 0 —
+  // which used to render "No results" plus a "why empty?" that opened onto an
+  // empty panel (2026-09-11, a fresh query while the projection recovered).
+  const [parsePending, setParsePending] = createSignal<QueryNotReadyError | null>(null);
+  const [parsedSnapshot] = createResource(parseRequest, async (request) => {
+    setParsePending(null);
+    return {
+      request,
+      reading: await runQueryWhenCurrent(
+        () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
+        () => parseRequest() === request,
+        (error) => { if (parseRequest() === request) setParsePending(error); },
+      ),
+    };
+  });
   // Keep each reading paired with the exact inputs it describes. A displayed
   // reading can intentionally lag a local edit while its replacement loads.
   const parsed = { get latest() { return parsedSnapshot.latest?.reading; } };
@@ -1256,8 +1266,14 @@ export function QueryMacro(props: {
   const matchedTotal = () => displayedOperation()?.matchedTotal ?? null;
   const searchExecution = () => displayedOperation()?.searchExecution ?? null;
   const diagnostics = () => displayedOperation()?.diagnostics ?? [];
-  const emptyResultsMessage = () => groupsPending()?.message
-    ?? (groupResource.error ? "Query results unavailable" : groupResource.loading ? "Loading query results…" : "No results");
+  /** A run that actually came back and matched nothing. "No results" and its
+   *  "why empty?" affordance describe an ANSWER; before the first operation
+   *  lands (parse pending, engine rebuilding) there is no answer to explain. */
+  const ranEmpty = () => !!displayedOperation() && !groupResource.loading && !groupResource.error && total() === 0;
+  const emptyResultsMessage = () => groupsPending()?.message ?? parsePending()?.message
+    ?? (groupResource.error || (!displayedOperation() && parsedSnapshot.error)
+      ? "Query results unavailable"
+      : groupResource.loading || !displayedOperation() ? "Loading query results…" : "No results");
   const groupsError = () => {
     const error = groupResource.error;
     if (!error) return null;
@@ -1324,7 +1340,7 @@ export function QueryMacro(props: {
     () => {
       const reading = runnable();
       const key = queryRequestKey();
-      if (!explainOpen() || !reading || !key || total() > 0) return undefined;
+      if (!explainOpen() || !reading || !key || !ranEmpty()) return undefined;
       return { reading, key };
     },
     undefined,
@@ -1726,7 +1742,7 @@ export function QueryMacro(props: {
   /** §7.5: zero results is the one moment a user most needs to know WHICH
    *  conjunct emptied the query, and the engine can already say. */
   const whyEmptyAffordance = () => (
-    <>
+    <Show when={ranEmpty()}>
       <button
         type="button"
         class="query-why-empty"
@@ -1767,7 +1783,7 @@ export function QueryMacro(props: {
           </Show>
         </div>
       </Show>
-    </>
+    </Show>
   );
   const emptyResultPanel = () => (
     <div class="query-empty">
@@ -2043,7 +2059,7 @@ export function QueryMacro(props: {
                 </div>
               )}
             </Show>
-            <Show when={groupsPending() ?? explanationPending()}>
+            <Show when={groupsPending() ?? parsePending() ?? explanationPending()}>
               {(pending) => <span class="query-readiness-status" role="status">{pending().message}</span>}
             </Show>
             {/* The run's OWN diagnostics. A query with an enabled diagnostic is
@@ -2232,7 +2248,7 @@ export function QueryMacro(props: {
                 {/* The empty ANSWER still deserves its explanation, and the two
                     section-local empty states say only that this family has no
                     rows. */}
-                <Show when={total() === 0 && !groupResource.loading && !groupsError()}>
+                <Show when={ranEmpty()}>
                   <div class="query-empty">{whyEmptyAffordance()}</div>
                 </Show>
               </Show>
