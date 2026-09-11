@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
 use tine_core::sync_runtime::{
-    SyncAbsenceSweepEvent, SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncAbsenceSweepEvent, SyncCheckpointPublicationDiagnostics, SyncHistoryRecoveryPhase,
+    SyncHistoryRecoveryStatus, SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
     SyncWatcherObservation,
 };
 use tine_core::{
@@ -132,9 +133,9 @@ fn sparse_v2_runtime_status_event(
     status: SyncRuntimeStatusSnapshot,
 ) -> SparseV2RuntimeStatusEvent {
     let application_page_admission =
-        crate::state::ApplicationPageAdmission::from_managed_runtime_lifecycle(
+        crate::state::ApplicationPageAdmission::from_managed_runtime_status(
             binding_generation,
-            &status.lifecycle,
+            &status,
         );
     SparseV2RuntimeStatusEvent {
         binding_generation,
@@ -2080,6 +2081,19 @@ fn sparse_error_condition_ended(tick: &SyncRuntimeTick, actor_has_runnable_work:
     ) && !actor_has_runnable_work
 }
 
+fn sparse_tick_is_reportable_failure(
+    tick: &SyncRuntimeTick,
+    waiting_for_recovery_delivery: bool,
+) -> bool {
+    matches!(
+        tick,
+        SyncRuntimeTick::RecoveryBlocked(_)
+            | SyncRuntimeTick::Blocked(_)
+            | SyncRuntimeTick::Terminal(_)
+            | SyncRuntimeTick::Failed(_)
+    ) && !(waiting_for_recovery_delivery && matches!(tick, SyncRuntimeTick::RecoveryBlocked(_)))
+}
+
 fn take_sparse_initial_tick(pending: &mut bool) -> bool {
     std::mem::take(pending)
 }
@@ -2201,6 +2215,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             assets: AssetWatchState,
             binding_generation: u64,
             last_error: Option<String>,
+            last_history_recovery_diagnostic: Option<SyncHistoryRecoveryStatus>,
+            last_checkpoint_diagnostic: Option<SyncCheckpointPublicationDiagnostics>,
             retry: RetrySchedule,
             initial_tick_pending: bool,
             sweep_deadline_remaining: Option<Duration>,
@@ -2275,6 +2291,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                         .unwrap_or_default(),
                                     binding_generation: slot.binding_generation,
                                     last_error: None,
+                                    last_history_recovery_diagnostic: None,
+                                    last_checkpoint_diagnostic: None,
                                     retry: RetrySchedule::default(),
                                     // Activation has already proved the exact
                                     // managed inventory. Start the mandatory
@@ -2790,6 +2808,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         let actor_has_runnable_work = status
                             .as_ref()
                             .is_some_and(SyncRuntimeStatusSnapshot::has_runnable_work);
+                        let waiting_for_delivery = status.as_ref().is_some_and(|status| {
+                            status.history_recovery.as_ref().is_some_and(|recovery| {
+                                recovery.phase == SyncHistoryRecoveryPhase::WaitingForDelivery
+                            })
+                        });
                         match &tick {
                             SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_) => {
                                 graph.retry.failed(Instant::now())
@@ -2811,13 +2834,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             }
                             _ => graph.retry.succeeded(),
                         }
-                        if matches!(
-                            tick,
-                            SyncRuntimeTick::RecoveryBlocked(_)
-                                | SyncRuntimeTick::Blocked(_)
-                                | SyncRuntimeTick::Terminal(_)
-                                | SyncRuntimeTick::Failed(_)
-                        ) {
+                        if waiting_for_delivery
+                            && matches!(tick, SyncRuntimeTick::RecoveryBlocked(_))
+                        {
+                            // Missing peer delivery is a live wait condition,
+                            // not a failed retry. The paced tick loop remains
+                            // responsible for polling; there is no inert button.
+                            graph.last_error = None;
+                        } else if sparse_tick_is_reportable_failure(&tick, waiting_for_delivery) {
                             let message = format!("{tick:?}");
                             if graph.last_error.as_deref() != Some(&message) {
                                 let _ = app.emit_to(
@@ -2845,6 +2869,22 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
                         }
                         if let Some(status) = status {
+                            if status.history_recovery_diagnostics
+                                != graph.last_history_recovery_diagnostic
+                            {
+                                if let Some(recovery) = &status.history_recovery_diagnostics {
+                                    crate::debug::record_history_recovery(recovery);
+                                }
+                                graph.last_history_recovery_diagnostic =
+                                    status.history_recovery_diagnostics.clone();
+                            }
+                            if status.checkpoint_diagnostics != graph.last_checkpoint_diagnostic {
+                                if let Some(checkpoint) = &status.checkpoint_diagnostics {
+                                    crate::debug::record_checkpoint_publication(checkpoint);
+                                }
+                                graph.last_checkpoint_diagnostic =
+                                    status.checkpoint_diagnostics.clone();
+                            }
                             let _ = app.emit_to(
                                 label,
                                 "sparse-v2-status",
@@ -3028,7 +3068,7 @@ mod tests {
 
     fn runtime_snapshot(lifecycle: SyncRuntimeLifecycle) -> SyncRuntimeStatusSnapshot {
         SyncRuntimeStatusSnapshot {
-            lifecycle,
+            lifecycle: lifecycle.clone(),
             recovery: None,
             watcher: Default::default(),
             last_tick: None,
@@ -3043,6 +3083,10 @@ mod tests {
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
             managed_local_stage: None,
+            history_recovery: None,
+            history_recovery_diagnostics: None,
+            application_pages_writable: matches!(lifecycle, SyncRuntimeLifecycle::Active),
+            checkpoint_diagnostics: None,
             sweep_deadline_remaining: None,
             sweep_deadline_due: false,
         }
@@ -3125,6 +3169,63 @@ mod tests {
             assert_eq!(wire["application_page_admission"]["binding_generation"], 73);
             assert_eq!(wire["application_page_admission"]["authority"], authority);
         }
+    }
+
+    #[test]
+    fn active_history_recovery_withdraws_admission_and_serializes_its_phase() {
+        let mut snapshot = runtime_snapshot(SyncRuntimeLifecycle::Active);
+        snapshot.application_pages_writable = false;
+        snapshot.history_recovery = Some(tine_core::sync_runtime::SyncHistoryRecoveryStatus {
+            attempt: 1,
+            reason: tine_core::sync_runtime::SyncHistoryRecoveryReason::DependencyBelowFloor,
+            phase: tine_core::sync_runtime::SyncHistoryRecoveryPhase::WaitingForDelivery,
+            triggering_batch_id: tine_core::oplog::BatchId::new(),
+            triggering_document_id: tine_core::oplog::DocumentId::new(),
+            requested_floor: Vec::new(),
+            actual_floor: Vec::new(),
+            retry_class: None,
+            retry_cause: None,
+            diagnostics: tine_core::sync_runtime::SyncHistoryRecoveryDiagnostics {
+                journal_fences: Vec::new(),
+                accepted_count: 0,
+                pending_count: 1,
+                replayed_count: 0,
+                waiting_ms: 0,
+                reconstruction_ms: 0,
+                checkpoint_bytes: None,
+                publication_edge:
+                    tine_core::sync_runtime::SyncHistoryRecoveryPublicationEdge::CustodyDurable,
+                preservation_check:
+                    tine_core::sync_runtime::SyncHistoryRecoveryPreservationCheck::Pending,
+            },
+        });
+        snapshot.last_tick = Some(SyncRuntimeTick::RecoveryBlocked(
+            "automatic full-history reconstruction is waiting for delivery".into(),
+        ));
+        let event = sparse_v2_runtime_status_event(74, snapshot);
+        let wire = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            wire["application_page_admission"]["authority"],
+            "managed_unavailable"
+        );
+        assert_eq!(
+            wire["runtime"]["history_recovery"]["phase"],
+            "waiting_for_delivery"
+        );
+        assert_eq!(
+            wire["runtime"]["history_recovery"]["reason"],
+            "dependency_below_floor"
+        );
+    }
+
+    #[test]
+    fn recovery_waiting_for_peer_delivery_is_not_reported_as_a_failure() {
+        let waiting = SyncRuntimeTick::RecoveryBlocked(
+            "automatic full-history reconstruction is waiting for delivery".into(),
+        );
+        assert!(!sparse_tick_is_reportable_failure(&waiting, true));
+        assert!(sparse_tick_is_reportable_failure(&waiting, false));
+        assert!(sparse_tick_is_blocked_without_progress(&waiting, true) == false);
     }
 
     #[test]

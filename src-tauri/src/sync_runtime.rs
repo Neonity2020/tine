@@ -27,7 +27,8 @@ use tine_core::sync_runtime::{
     inspect_shared_enrollment_for_cold_discovery, ManagedStorageRefusalScenario,
     SyncAmbiguousEvidence, SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
     SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
-    SyncApplicationPageLoadRequest, SyncApplicationPageSelector, SyncLocalActivationIdentities,
+    SyncApplicationPageLoadRequest, SyncApplicationPageSelector,
+    SyncCheckpointPublicationDiagnostics, SyncHistoryRecoveryStatus, SyncLocalActivationIdentities,
     SyncLocalActivationPhase, SyncLocalActivationProgress, SyncLocalActivationRequest,
     SyncLocalActivationResult, SyncLocalActivationStage, SyncLocalActivationStatus,
     SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle, SyncRuntimeLifecycle,
@@ -630,8 +631,18 @@ fn action_for_runtime_lifecycle(lifecycle: &SyncRuntimeLifecycle) -> SparseV2Bin
     }
 }
 
-fn runtime_lifecycle_admits_application_pages(lifecycle: &SyncRuntimeLifecycle) -> bool {
-    matches!(lifecycle, SyncRuntimeLifecycle::Active)
+fn runtime_status_admits_application_pages(status: &SyncRuntimeStatusSnapshot) -> bool {
+    runtime_observation_admits_application_pages(
+        &status.lifecycle,
+        status.application_pages_writable,
+    )
+}
+
+fn runtime_observation_admits_application_pages(
+    lifecycle: &SyncRuntimeLifecycle,
+    application_pages_writable: bool,
+) -> bool {
+    matches!(lifecycle, SyncRuntimeLifecycle::Active) && application_pages_writable
 }
 
 impl SparseV2Binding {
@@ -661,7 +672,7 @@ impl SparseV2Binding {
         self.handle
             .as_ref()
             .and_then(|handle| handle.status().ok())
-            .is_some_and(|snapshot| runtime_lifecycle_admits_application_pages(&snapshot.lifecycle))
+            .is_some_and(|snapshot| runtime_status_admits_application_pages(&snapshot))
     }
 
     /// Explain why this binding cannot be published as the application's page
@@ -671,9 +682,7 @@ impl SparseV2Binding {
     pub(crate) fn serving_failure_detail(&self) -> Option<String> {
         if let Some(handle) = &self.handle {
             return match handle.status() {
-                Ok(snapshot) if runtime_lifecycle_admits_application_pages(&snapshot.lifecycle) => {
-                    None
-                }
+                Ok(snapshot) if runtime_status_admits_application_pages(&snapshot) => None,
                 Ok(snapshot) => Some(snapshot.detail.unwrap_or_else(|| {
                     format!(
                         "managed storage runtime is not serving pages (lifecycle: {:?})",
@@ -800,6 +809,8 @@ pub(crate) struct SparseV2RuntimeStatusDto {
     managed_local_checkpointed_sequence: u64,
     managed_local_next_sequence: u64,
     managed_local_stage: Option<String>,
+    history_recovery: Option<SyncHistoryRecoveryStatus>,
+    checkpoint_diagnostics: Option<SyncCheckpointPublicationDiagnostics>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -859,6 +870,18 @@ impl SparseV2StatusDto {
 
     pub(crate) fn from_binding(binding: &SparseV2Binding, binding_generation: u64) -> Self {
         let retained_status = binding.handle().map(SyncRuntimeHandle::status);
+        let application_page_admission = retained_status
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map_or_else(
+                || crate::state::ApplicationPageAdmission::managed_unavailable(binding_generation),
+                |snapshot| {
+                    crate::state::ApplicationPageAdmission::from_managed_runtime_status(
+                        binding_generation,
+                        snapshot,
+                    )
+                },
+            );
         let runtime = retained_status
             .as_ref()
             .and_then(|result| result.as_ref().ok())
@@ -891,11 +914,7 @@ impl SparseV2StatusDto {
             can_cancel: false,
             cancel_reason: None,
             binding_generation,
-            application_page_admission: if binding.has_active_application_handle() {
-                crate::state::ApplicationPageAdmission::managed_writable(binding_generation)
-            } else {
-                crate::state::ApplicationPageAdmission::managed_unavailable(binding_generation)
-            },
+            application_page_admission,
         }
     }
 
@@ -920,9 +939,9 @@ impl SparseV2StatusDto {
         };
         let can_retry = matches!(availability, SparseV2Availability::Retryable { .. });
         let application_page_admission =
-            crate::state::ApplicationPageAdmission::from_managed_runtime_lifecycle(
+            crate::state::ApplicationPageAdmission::from_managed_runtime_status(
                 binding_generation,
-                &snapshot.lifecycle,
+                &snapshot,
             );
         Self {
             availability,
@@ -993,6 +1012,8 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
         managed_local_checkpointed_sequence: snapshot.managed_local_checkpointed_sequence,
         managed_local_next_sequence: snapshot.managed_local_next_sequence,
         managed_local_stage: snapshot.managed_local_stage,
+        history_recovery: snapshot.history_recovery,
+        checkpoint_diagnostics: snapshot.checkpoint_diagnostics,
     }
 }
 
@@ -4673,7 +4694,7 @@ mod clean_shutdown_slot_tests {
         detail: Option<&str>,
     ) -> SyncRuntimeStatusSnapshot {
         SyncRuntimeStatusSnapshot {
-            lifecycle,
+            lifecycle: lifecycle.clone(),
             recovery: None,
             watcher: Default::default(),
             last_tick: None,
@@ -4688,6 +4709,10 @@ mod clean_shutdown_slot_tests {
             managed_local_checkpointed_sequence: 0,
             managed_local_next_sequence: 0,
             managed_local_stage: None,
+            history_recovery: None,
+            history_recovery_diagnostics: None,
+            application_pages_writable: matches!(lifecycle, SyncRuntimeLifecycle::Active),
+            checkpoint_diagnostics: None,
             sweep_deadline_remaining: None,
             sweep_deadline_due: false,
         }
@@ -5211,19 +5236,24 @@ mod tests {
     }
 
     #[test]
-    fn only_an_active_runtime_lifecycle_admits_application_pages() {
-        assert!(runtime_lifecycle_admits_application_pages(
-            &SyncRuntimeLifecycle::Active
+    fn runtime_lifecycle_and_actor_capability_jointly_admit_application_pages() {
+        assert!(runtime_observation_admits_application_pages(
+            &SyncRuntimeLifecycle::Active,
+            true,
         ));
-        assert!(!runtime_lifecycle_admits_application_pages(
-            &SyncRuntimeLifecycle::StoppedSafe
+        assert!(!runtime_observation_admits_application_pages(
+            &SyncRuntimeLifecycle::Active,
+            false,
         ));
-        assert!(!runtime_lifecycle_admits_application_pages(
-            &SyncRuntimeLifecycle::StoppedCrashed
-        ));
-        assert!(!runtime_lifecycle_admits_application_pages(
-            &SyncRuntimeLifecycle::Terminal
-        ));
+        for lifecycle in [
+            SyncRuntimeLifecycle::StoppedSafe,
+            SyncRuntimeLifecycle::StoppedCrashed,
+            SyncRuntimeLifecycle::Terminal,
+        ] {
+            assert!(!runtime_observation_admits_application_pages(
+                &lifecycle, true,
+            ));
+        }
     }
 
     struct RollbackFixture {

@@ -64,17 +64,20 @@ impl ApplicationPageAdmission {
         }
     }
 
-    /// Map one already-observed managed runtime lifecycle to the matching
+    /// Map one already-observed managed runtime status to the matching
     /// frontend advisory route. Watcher callers must use this rather than
-    /// probing the actor again after obtaining their status observation.
-    pub(crate) fn from_managed_runtime_lifecycle(
+    /// probing the actor again after obtaining their status observation. The
+    /// lifecycle alone is insufficient while full-history recovery has taken
+    /// the projection and paused ordinary application admission.
+    pub(crate) fn from_managed_runtime_status(
         binding_generation: u64,
-        lifecycle: &tine_core::sync_runtime::SyncRuntimeLifecycle,
+        status: &tine_core::sync_runtime::SyncRuntimeStatusSnapshot,
     ) -> Self {
         if matches!(
-            lifecycle,
+            status.lifecycle,
             tine_core::sync_runtime::SyncRuntimeLifecycle::Active
-        ) {
+        ) && status.application_pages_writable
+        {
             Self::managed_writable(binding_generation)
         } else {
             Self::managed_unavailable(binding_generation)

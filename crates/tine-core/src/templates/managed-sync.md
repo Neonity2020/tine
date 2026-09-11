@@ -8,6 +8,11 @@ icon:: 🔄
 - ## Current scope
 	- Managed storage currently covers **page and journal text** only. Assets, PDF sidecars, and configuration remain ordinary provider-synchronized files.
 	- Setup first makes a safety backup and checks that Tine can reconstruct the same Markdown/Org tree. If that cannot be proven, it stops instead of changing graph authority.
+- ## When an older change needs local history
+	- Rebuilding local history to merge older changes. Editing will resume automatically. This can appear when a device returns after enough time away that another device's change depends on history no longer present in the current local checkpoint.
+	- Tine temporarily pauses new edits for this graph only. It keeps the coherent version already on screen, keeps your unsent edits, and leaves every other graph usable. The Storage & sync panel shows whether Tine is rebuilding, waiting, or retrying; the edit capability, rather than that label, controls when saves resume.
+	- If an earlier change has not reached this device yet, Tine waits for the missing change to arrive instead of treating the wait as a failure. There is no retry button: the sync loop keeps checking and continues by itself when delivery completes.
+	- If a temporary read, write, or reconstruction step fails, Tine keeps the recovery inputs and retries automatically. You do not need to reopen Tine, switch storage modes, or merge the history yourself.
 - ## When an older managed store is rebuilt
 	- Earlier test builds kept managed history in a storage format this version no longer reads. When you open such a graph, Tine does not ask you to migrate anything: it first sets that graph's private managed-storage data on this device aside as a backup, then rebuilds managed storage from your Markdown/Org files, which it leaves untouched.
 	- The backup keeps every original byte, including history that never reached your Markdown/Org files, such as edits that were still waiting to be written out. Tine keeps that backup for recovery; it does not replay backup-only history into the rebuilt store.

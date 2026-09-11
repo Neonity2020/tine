@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Changes from a long-absent device now merge automatically.** If an older
+  incoming change falls behind this device's compact local history, Tine
+  rebuilds that history, waits for any still-arriving prerequisite, and resumes
+  editing by itself without asking you to reopen the app or merge manually.
+
 - **All of a query's display settings, in one place.** A query block carries six
   presentation facts — the view, what the results are grouped by, the sort order,
   which columns show, what the footer totals, and a row limit — and until now the

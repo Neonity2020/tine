@@ -44,12 +44,13 @@ reddit-backup/
 /RECEIPT*.md
 /baseline-*.txt
 /necessity-*.txt
-/*-fail-before.log
-/failbefore-*.log
-/fail-before-*.log
-/baseline-*.log
-/post-*.log
-/mgr-*.log
+# Every root-level log, not an enumeration of the shapes lanes have used so far:
+# the list below had grown to nine patterns and still missed *-pass-after.log,
+# *-debug.log and *-gate.log, which is most of what a lane actually writes. No
+# root .log file has ever been tracked, so the wide rule costs nothing and a lane
+# can no longer invent a name that escapes it.
+/*.log
+/*-cargo-metadata.json
 /after-*.txt
 /measurement-*.txt
 /measurement*-*.md

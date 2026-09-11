@@ -44,10 +44,10 @@ const OWNERS = new Set([
 const CENSUS: readonly { file: string; count: number; class: "b" | "c"; why: string }[] = [
   {
     file: "App.tsx",
-    count: 3,
+    count: 4,
     class: "c",
     why: "the generation/authority memos scope the absence-sweep subscription, "
-      + "and the notice effect displays runtime feedback; none routes a write.",
+      + "and the notice effects display runtime and automatic-recovery feedback; none routes a write.",
   },
   {
     file: "components/QuickSwitcher.tsx",

@@ -174,6 +174,7 @@ import { drainPdfWork } from "./pdfOwnership";
 import { currentPdfOwnership } from "./pdfOwnership";
 import { hlsPageName } from "./pdf";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
+import { MANAGED_HISTORY_RECOVERY_MESSAGE } from "./managedDiagnostics";
 import { createStartupRecoveryController } from "./startupRecovery";
 import { storageTransitionRuntime } from "./storageTransitionRuntime";
 import { writeClipboardTextResilient } from "./clipboard";
@@ -1039,6 +1040,20 @@ export function App(): JSX.Element {
       if (notice) {
         pushToast(managedStorageRuntimeErrorMessage(notice.message), "error", { dedupe: true });
       }
+    },
+    { defer: true },
+  ));
+  // The settings panel carries live phase detail; this one per-episode notice
+  // makes the same binding-scoped state visible even when that panel is closed.
+  createEffect(on(
+    () => {
+      const recovery = managedStorageRuntime.snapshot().status?.runtime?.history_recovery;
+      return recovery
+        ? `${recovery.triggering_batch_id}:${recovery.triggering_document_id}`
+        : null;
+    },
+    (episode) => {
+      if (episode) pushToast(MANAGED_HISTORY_RECOVERY_MESSAGE, "info", { dedupe: true });
     },
     { defer: true },
   ));

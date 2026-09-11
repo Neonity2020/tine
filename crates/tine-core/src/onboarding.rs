@@ -850,6 +850,47 @@ mod tests {
     }
 
     #[test]
+    fn automatic_full_history_recovery_is_taught_in_every_managed_sync_guide_surface() {
+        const RECOVERY_SENTENCE: &str =
+            "Rebuilding local history to merge older changes. Editing will resume automatically.";
+        let managed = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Features/Managed sync")
+            .expect("managed-sync page is registered");
+        assert!(managed.markdown.contains(RECOVERY_SENTENCE));
+        assert!(managed
+            .markdown
+            .contains("waits for the missing change to arrive"));
+        assert!(managed.markdown.contains("retries automatically"));
+        assert!(managed.markdown.contains("keeps your unsent edits"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == "Features/Managed sync")
+            .expect("managed-sync page is available in the read-only Guide");
+        fn collect_outline_text(blocks: &[crate::model::BlockDto], text: &mut String) {
+            for block in blocks {
+                text.push_str(&block.raw);
+                text.push('\n');
+                collect_outline_text(&block.children, text);
+            }
+        }
+        let mut virtual_text = String::new();
+        collect_outline_text(&virtual_page.page.blocks, &mut virtual_text);
+        assert!(virtual_text.contains(RECOVERY_SENTENCE));
+
+        let dir = scratch("tine-guide-automatic-full-history-recovery");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, "Features/Managed sync").unwrap();
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("managed-sync page was copied");
+        assert!(copied_markdown.contains(RECOVERY_SENTENCE));
+        assert!(copied_markdown.contains("retries automatically"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn capture_plan_day_workflow_is_registered_linked_and_copyable() {
         let title = "Workflows/Capture and plan your day";
         let page = GUIDE_TEMPLATES

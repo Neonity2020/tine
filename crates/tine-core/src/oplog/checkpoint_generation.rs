@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,10 @@ use super::object_store::ObjectStore;
 use super::{
     BatchCausalDot, BatchId, BlobDescription, CausalPeerId, ContentDigest, CrdtPeerCounter,
     DocumentDependencies, DocumentId, LineageDigest, WorkspaceId, WriterIncarnationId,
+};
+use crate::sync_runtime::{
+    SyncCheckpointDocumentDiagnostics, SyncCheckpointLimitingCause,
+    SyncCheckpointPublicationDiagnostics, SyncCheckpointPublicationEdge,
 };
 use tine_storage::sealed_accepted_index::AuthenticatedMapKey;
 
@@ -826,22 +831,23 @@ impl SealedDocumentRoster {
         config: super::checkpoint_floor_policy::FloorPolicyConfig,
         document: &loro::LoroDoc,
         compact: &PolicyCompactAcceptedDocument,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, DocumentCheckpointPolicyV1), String> {
         if compact.cutoff_state_digest() != cutoff_state_digest {
             return Err("generation image belongs to another accepted cutoff".into());
         }
         let checkpoint = store.stage_capsule_blob(compact.checkpoint())?;
+        let policy = DocumentCheckpointPolicyV1::from_compact(
+            eligible_through,
+            config,
+            compact.dependencies().document_id(),
+            document,
+            compact,
+        )?;
         let record = DocumentCapsuleRecord {
             schema: DOCUMENT_CAPSULE_SCHEMA,
             dependencies: compact.dependencies().clone(),
             checkpoint,
-            policy: DocumentCheckpointPolicyV1::from_compact(
-                eligible_through,
-                config,
-                compact.dependencies().document_id(),
-                document,
-                compact,
-            )?,
+            policy: policy.clone(),
         };
         let record_blob = store.stage_capsule_blob(&record.encode()?)?;
         let map = self.map.upsert(
@@ -849,7 +855,7 @@ impl SealedDocumentRoster {
             super::DocumentKey::Entity(record.dependencies.document_id()),
             ContentDigest::from_bytes(*record_blob.sha256()),
         )?;
-        Ok(Self { map })
+        Ok((Self { map }, policy))
     }
 
     fn without_document(
@@ -1835,12 +1841,14 @@ fn publish_document_images(
     capture: &super::hot_engine::CleanCheckpointDocumentCapture,
     eligible_through: u64,
     policy: super::checkpoint_floor_policy::FloorPolicyConfig,
+    measurement_sequence: u64,
     accepted_rows: &[CleanCheckpointAcceptedRow],
     predecessor: Option<&(u64, CheckpointPayloadV2)>,
 ) -> Result<
     (
         tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
         CheckpointImageWork,
+        Vec<SyncCheckpointDocumentDiagnostics>,
     ),
     String,
 > {
@@ -1854,6 +1862,7 @@ fn publish_document_images(
     let mut roster = predecessor_roster;
     let mut staging = SealedGenerationStagingStore::open(directory)?;
     let mut work = CheckpointImageWork::default();
+    let mut diagnostics = Vec::new();
     if let Some(predecessor_payload) = predecessor_payload {
         for dependencies in &predecessor_payload.document_dependencies {
             if !capture
@@ -1934,7 +1943,7 @@ fn publish_document_images(
         work.verification_imports = work
             .verification_imports
             .saturating_add(compact.work().verification_imports);
-        roster = roster.with_policy_document(
+        let (next_roster, document_policy) = roster.with_policy_document(
             &mut staging,
             capture.cutoff_state_digest,
             eligible_through,
@@ -1942,6 +1951,32 @@ fn publish_document_images(
             &materialized.document,
             &compact,
         )?;
+        roster = next_roster;
+        let limiting_cause = document_policy
+            .metrics
+            .limiting_cause
+            .map(|cause| match cause {
+                super::checkpoint_floor_policy::LimitingCause::AgeLowerBound => {
+                    SyncCheckpointLimitingCause::AgeLowerBound
+                }
+                super::checkpoint_floor_policy::LimitingCause::NativeNormalization => {
+                    SyncCheckpointLimitingCause::NativeNormalization
+                }
+            });
+        diagnostics.push(SyncCheckpointDocumentDiagnostics {
+            document_id: *document_id,
+            measurement_sequence,
+            requested_floor: document_policy.requested_k,
+            actual_floor: document_policy.actual_floor,
+            image_bytes: document_policy.metrics.image_bytes,
+            latest_state_bytes: document_policy.metrics.latest_state_bytes,
+            removable_bytes: document_policy.metrics.removable_bytes,
+            budget_bytes: document_policy.metrics.budget_bytes,
+            post_cut_removable_bytes: document_policy.metrics.post_cut_removable_bytes,
+            hysteresis_shortfall_bytes: document_policy.metrics.hysteresis_shortfall_bytes,
+            budget_overage_bytes: document_policy.metrics.budget_overage_bytes,
+            limiting_cause,
+        });
     }
     if roster.document_count() != capture.dependencies.len() as u64 {
         return Err("checkpoint image roster has extra or missing documents".into());
@@ -1949,7 +1984,7 @@ fn publish_document_images(
     let root = roster.root();
     let reader = staging.finish()?;
     roster.qualify_complete_keys(&reader, capture.dependencies.keys().copied())?;
-    Ok((root, work))
+    Ok((root, work, diagnostics))
 }
 
 fn document_object_names_for_root(
@@ -2120,6 +2155,7 @@ fn cleanup_unreferenced_document_objects(store: &ObjectStore) -> Result<(), Stri
 struct PublishedCheckpoint {
     sequence: u64,
     documents: Option<Arc<CleanCheckpointDocuments>>,
+    diagnostics: SyncCheckpointPublicationDiagnostics,
 }
 
 fn publish_capture(
@@ -2135,6 +2171,10 @@ fn publish_capture_with_predecessor(
     extend_predecessor: bool,
     publication_authority: Option<&CheckpointPublicationAuthority>,
 ) -> Result<PublishedCheckpoint, String> {
+    let publication_started_at = Instant::now();
+    let store_stats_before = store.instrumentation();
+    let measurement_sequence = capture.target_sequence;
+    let policy = capture.floor_policy;
     #[cfg(test)]
     if FAIL_CHECKPOINT_WRITE_ROOTS
         .lock()
@@ -2162,13 +2202,14 @@ fn publish_capture_with_predecessor(
         None
     };
     let directory = checkpoint_directory(store)?;
-    let (document_roster, image_work) = match capture.documents.as_ref() {
+    let (document_roster, image_work, document_diagnostics) = match capture.documents.as_ref() {
         Some(documents) => publish_document_images(
             &directory,
             store,
             documents,
             capture.eligible_through,
             capture.floor_policy,
+            capture.target_sequence,
             &capture.accepted_rows,
             predecessor.as_ref(),
         )?,
@@ -2179,10 +2220,13 @@ fn publish_capture_with_predecessor(
                 .transpose()?
                 .unwrap_or_else(tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty),
             CheckpointImageWork::default(),
+            Vec::new(),
         ),
     };
+    let image_phase_done_at = Instant::now();
     let (sequence, payload_bytes) =
         build_payload_with_images(capture, predecessor, document_roster, image_work)?;
+    let payload_phase_done_at = Instant::now();
     let payload_len = u64::try_from(payload_bytes.len())
         .map_err(|_| "clean checkpoint payload length exceeds u64".to_owned())?;
     if payload_len > MAX_CHECKPOINT_BYTES {
@@ -2249,6 +2293,8 @@ fn publish_capture_with_predecessor(
             .publish_new_exact_single_writer(CHECKPOINT_POINTER, &pointer_bytes)
             .map_err(|error| error.to_string())?,
     }
+    let publication_done_at = Instant::now();
+    let store_stats_after = store.instrumentation();
     let documents = has_document_epoch
         .then(|| {
             SealedGenerationDirectory::open(&directory).and_then(|directory| {
@@ -2266,7 +2312,79 @@ fn publish_capture_with_predecessor(
     Ok(PublishedCheckpoint {
         sequence,
         documents,
+        diagnostics: SyncCheckpointPublicationDiagnostics {
+            measurement_sequence,
+            // The live checkpoint path does not yet carry an acceptance-age
+            // clock observation. Omit both facts rather than manufacturing a
+            // cutoff or claiming a clock state the worker did not observe.
+            age_cutoff_utc_ms: None,
+            clock_frozen: None,
+            policy_revision: policy.revision,
+            minimum_tail_bytes: policy.minimum_tail_bytes,
+            live_size_multiplier: policy.live_size_multiplier,
+            documents: document_diagnostics,
+            changed_documents: image_work.changed_documents,
+            exported_documents: image_work.exported_documents,
+            reused_documents: image_work.reused_documents,
+            measurement_exports: image_work.measurement_exports,
+            candidate_exports: image_work.candidate_exports,
+            verification_imports: image_work.verification_imports,
+            hot_manifest_reads: usize_delta_u64(
+                store_stats_after.accepted_manifest_reads,
+                store_stats_before.accepted_manifest_reads,
+            )
+            .saturating_sub(usize_delta_u64(
+                store_stats_after.cold_manifest_reads,
+                store_stats_before.cold_manifest_reads,
+            )),
+            hot_manifest_bytes: usize_delta_u64(
+                store_stats_after.hot_manifest_bytes,
+                store_stats_before.hot_manifest_bytes,
+            ),
+            hot_object_reads: usize_delta_u64(
+                store_stats_after.accepted_object_reads,
+                store_stats_before.accepted_object_reads,
+            )
+            .saturating_sub(usize_delta_u64(
+                store_stats_after.cold_object_reads,
+                store_stats_before.cold_object_reads,
+            )),
+            hot_object_bytes: usize_delta_u64(
+                store_stats_after.hot_object_bytes,
+                store_stats_before.hot_object_bytes,
+            ),
+            cold_manifest_reads: usize_delta_u64(
+                store_stats_after.cold_manifest_reads,
+                store_stats_before.cold_manifest_reads,
+            ),
+            cold_manifest_bytes: usize_delta_u64(
+                store_stats_after.cold_manifest_bytes,
+                store_stats_before.cold_manifest_bytes,
+            ),
+            cold_object_reads: usize_delta_u64(
+                store_stats_after.cold_object_reads,
+                store_stats_before.cold_object_reads,
+            ),
+            cold_object_bytes: usize_delta_u64(
+                store_stats_after.cold_object_bytes,
+                store_stats_before.cold_object_bytes,
+            ),
+            image_phase_ms: elapsed_millis(publication_started_at, image_phase_done_at),
+            payload_phase_ms: elapsed_millis(image_phase_done_at, payload_phase_done_at),
+            publication_phase_ms: elapsed_millis(payload_phase_done_at, publication_done_at),
+            peak_rss_bytes: None,
+            checkpoint_bytes: payload_len,
+            publication_edge: SyncCheckpointPublicationEdge::CurrentPointerDurable,
+        },
     })
+}
+
+fn usize_delta_u64(after: usize, before: usize) -> u64 {
+    u64::try_from(after.saturating_sub(before)).unwrap_or(u64::MAX)
+}
+
+fn elapsed_millis(start: Instant, end: Instant) -> u64 {
+    u64::try_from(end.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) enum CleanCheckpointOpen {
@@ -2688,6 +2806,7 @@ struct PublisherInner {
     durable_sequence: AtomicU64,
     published_documents: Mutex<BTreeMap<DocumentId, DocumentDependencies>>,
     current_documents: Mutex<Option<Arc<CleanCheckpointDocuments>>>,
+    last_diagnostics: Mutex<Option<SyncCheckpointPublicationDiagnostics>>,
     elevated_rewrite_observed: AtomicBool,
     rebuild_from_genesis: AtomicBool,
 }
@@ -2781,6 +2900,7 @@ impl CleanCheckpointPublisher {
                 durable_sequence: AtomicU64::new(durable_sequence),
                 published_documents: Mutex::new(published_documents),
                 current_documents: Mutex::new(current_documents),
+                last_diagnostics: Mutex::new(None),
                 elevated_rewrite_observed: AtomicBool::new(false),
                 rebuild_from_genesis: AtomicBool::new(false),
             }),
@@ -2852,6 +2972,14 @@ impl CleanCheckpointPublisher {
 
     pub(crate) fn durable_sequence(&self) -> u64 {
         self.inner.durable_sequence.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn last_diagnostics(&self) -> Option<SyncCheckpointPublicationDiagnostics> {
+        self.inner
+            .last_diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn rebuild_next_from_genesis(&self) {
@@ -2983,6 +3111,10 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
                         );
                     }
                 }
+                *inner
+                    .last_diagnostics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(published.diagnostics);
                 inner
                     .durable_sequence
                     .store(published.sequence, Ordering::Release);
@@ -5228,7 +5360,16 @@ mod tests {
     #[test]
     fn every_checkpoint_publication_prefix_keeps_the_complete_predecessor() {
         let (root, store) = checkpoint_fault_fixture("publication-prefix");
-        publish_capture(&store, empty_capture(&store, b"predecessor")).unwrap();
+        let published = publish_capture(&store, empty_capture(&store, b"predecessor")).unwrap();
+        assert_eq!(published.diagnostics.measurement_sequence, 0);
+        assert_eq!(published.diagnostics.policy_revision, 1);
+        assert!(published.diagnostics.checkpoint_bytes > 0);
+        assert_eq!(
+            published.diagnostics.publication_edge,
+            SyncCheckpointPublicationEdge::CurrentPointerDurable,
+        );
+        assert_eq!(published.diagnostics.age_cutoff_utc_ms, None);
+        assert_eq!(published.diagnostics.peak_rss_bytes, None);
         let directory = root.join("archive").join(CHECKPOINT_DIRECTORY);
         let predecessor_pointer = std::fs::read(directory.join(CHECKPOINT_POINTER)).unwrap();
         let predecessor: CheckpointPointerV2 = decode_canonical(&predecessor_pointer).unwrap();

@@ -88,3 +88,5 @@ see the project `CLAUDE.md`.
 | [0059](0059-bounded-theme-presentation-presets.md) | Theme API 0.2 adds bounded host-owned typography, journal-header, and Today-summary presets | Accepted |
 | [0060](0060-qualified-generations-and-indefinite-cold-history.md) | Qualified generations bound ordinary work while retaining history | Accepted; cutover gated |
 | [0061](0061-unwire-per-block-managed-layout-forward.md) | Managed Storage returns forward to a catalog plus per-page shards; per-block stores are preserved and rebuilt | Accepted; benchmark gated |
+| [0062](0062-real-deletion-and-restore-by-reconstruction.md) | Deleted blocks leave the live page document; Restore re-materializes from accepted history under the same Logseq UUID | Accepted |
+| [0063](0063-checkpoint-floor-policy-and-recovery-input-journal.md) | Checkpoint floor cuts on measured bytes with acceptance age only as an eligibility bound; a third journal domain holds unaccepted peer originals | Accepted; live eligibility still zero |

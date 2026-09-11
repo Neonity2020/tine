@@ -4,7 +4,14 @@ import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
 import { DiagnosticsTab } from "./DiagnosticsTab";
 import { writeClipboardTextResilient } from "../clipboard";
-import { managedJoinErrorDetail, safeManagedErrorDetail } from "../managedDiagnostics";
+import {
+  MANAGED_HISTORY_RECOVERY_MESSAGE,
+  managedHistoryRecoveryDiagnostics,
+  managedCheckpointDiagnostics,
+  managedHistoryRecoveryPhase,
+  managedJoinErrorDetail,
+  safeManagedErrorDetail,
+} from "../managedDiagnostics";
 import {
   settingsOpen,
   closeSettings,
@@ -2362,6 +2369,7 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
 function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const status = () => managedStorageRuntime.snapshot().status;
   const runtimeError = () => managedStorageRuntime.snapshot().error;
+  const historyRecovery = () => status()?.runtime?.history_recovery ?? null;
   const [loading, setLoading] = createSignal(true);
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
   const [sharing, setSharing] = createSignal(false);
@@ -2606,6 +2614,10 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     }
     const liveError = runtimeError();
     if (liveError) entries.push(`Runtime: ${safeManagedErrorDetail(liveError)}`);
+    const recovery = historyRecovery();
+    if (recovery) entries.push(...managedHistoryRecoveryDiagnostics(recovery));
+    const checkpoint = current?.runtime?.checkpoint_diagnostics;
+    if (checkpoint) entries.push(...managedCheckpointDiagnostics(checkpoint));
     return [...new Set(entries)];
   };
 
@@ -3125,6 +3137,17 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                   <Show when={current().runtime}>
                     {(runtime) => (
                       <>
+                        <Show when={runtime().history_recovery}>
+                          {(recovery) => (
+                            <div class="settings-hint settings-block" role="status" aria-live="polite" style={{ "margin-top": "8px" }}>
+                              <div>{MANAGED_HISTORY_RECOVERY_MESSAGE}</div>
+                              <div>{managedHistoryRecoveryPhase(recovery())}</div>
+                              <Show when={recovery().phase === "retrying" && recovery().retry_cause}>
+                                {(cause) => <div>{safeManagedErrorDetail(cause())}</div>}
+                              </Show>
+                            </div>
+                          )}
+                        </Show>
                         <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
                           <div class="settings-hint">
                             Updating external changes...

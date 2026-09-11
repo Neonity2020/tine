@@ -33,7 +33,7 @@ interface ConsoleSite {
 type ConsoleBucket = "a" | "b" | "c" | "d";
 const CONSOLE_ALLOWLIST_SIZE = 21;
 const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class: string; why: string })[] = [
-  { file: "App.tsx", line: 1071, method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
+  { file: "App.tsx", line: 1086, method: "warn", bucket: "d", class: "local-error", why: "SafeBack listener registration failed; a Tauri plugin-setup error names no graph object" },
   { file: "capture.tsx", line: 173, method: "log", bucket: "d", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
   { file: "capture.tsx", line: 600, method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
   { file: "components/Block.tsx", line: 1581, method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
@@ -135,11 +135,11 @@ describe("I-5 content-out-of-logs ratchet", () => {
   it("pins the diagnostics contract to both allowlist sizes and gates", () => {
     const contract = source("docs/contracts/diagnostics.md");
     const rustRatchet = source("crates/tine-core/tests/content_out_of_logs.rs");
-    expect(contract).toContain("75 Rust production print sites");
+    expect(contract).toContain("76 Rust production print sites");
     expect(contract).toContain("21 variable-bearing frontend console sites");
     expect(contract).toContain("debug_enabled()");
     expect(contract).toContain("runtime_debug_diagnostics_enabled()");
-    expect(rustRatchet).toContain("const RUST_PRINT_SITE_COUNT: usize = 75;");
+    expect(rustRatchet).toContain("const RUST_PRINT_SITE_COUNT: usize = 76;");
   });
 
   it("makes parser failures fixed-shape before they cross the lsdoc-diff worker boundary", () => {

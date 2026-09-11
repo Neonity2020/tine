@@ -2,7 +2,7 @@ use super::*;
 use crate::model::Format;
 use crate::oplog::absence_sweep::SweepActionState;
 use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
-use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
+use crate::oplog::{BlockLocation, CrdtPeerId, LogicalPageName, PageRename};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18132,7 +18132,11 @@ fn p3_missing_recovery_prerequisite_is_bounded_then_delivery_cascades() {
         PreparedBatch::new(manifest, objects).unwrap()
     }
 
-    fn retain_exact(fixture: &ActivationFixture, prepared: &PreparedBatch) {
+    fn retain_exact(
+        fixture: &ActivationFixture,
+        prepared: &PreparedBatch,
+        recovery: &crate::oplog::hot_engine::NeedsFullHistory,
+    ) {
         let identities = &fixture.request.identities;
         RecoveryInputJournal::open(
             &fixture.request.application_runtime_root,
@@ -18142,7 +18146,7 @@ fn p3_missing_recovery_prerequisite_is_bounded_then_delivery_cascades() {
             identities.device_id,
         )
         .unwrap()
-        .retain(prepared, false)
+        .retain(prepared, recovery, false)
         .unwrap();
     }
 
@@ -18212,7 +18216,24 @@ fn p3_missing_recovery_prerequisite_is_bounded_then_delivery_cascades() {
         "fixture child must require the withheld parent"
     );
 
-    retain_exact(&receiver, &child);
+    let retained_recovery = crate::oplog::hot_engine::NeedsFullHistory {
+        batch_id: child_batch,
+        document_id,
+        dependency: child
+            .manifest()
+            .dependency_frontier()
+            .documents()
+            .iter()
+            .find(|dependency| dependency.document_id() == document_id)
+            .map(|dependency| dependency.peer_counters().to_vec())
+            .unwrap_or_default(),
+        // This test injects directly into the custody journal after closing
+        // the actor, so it cannot ask that actor for its forced native floor.
+        // A nonempty closed test peer records the already-established premise;
+        // production custody always persists the actor's exact NeedsFullHistory.
+        floor: vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(0xc380), 1)],
+    };
+    retain_exact(&receiver, &child, &retained_recovery);
     let blocked = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
     // Count the expensive thing, not the tick. A missing prerequisite must not
     // buy a genesis replay plus a lifetime-sized manifest walk per 50 ms wake,
@@ -18233,6 +18254,22 @@ fn p3_missing_recovery_prerequisite_is_bounded_then_delivery_cascades() {
             .iter()
             .any(|tick| tick.contains("RecoveryBlocked")),
         "a missing prerequisite must say so rather than idle silently: {observed_ticks:?}"
+    );
+    let recovery_status = blocked.status().unwrap();
+    let recovery = recovery_status
+        .history_recovery
+        .as_ref()
+        .expect("the binding status must retain the active recovery");
+    assert_eq!(
+        recovery.phase,
+        SyncHistoryRecoveryPhase::WaitingForDelivery,
+        "a missing peer batch is waiting, not a failed attempt"
+    );
+    assert_eq!(recovery.triggering_batch_id, child_batch);
+    assert_eq!(recovery.triggering_document_id, document_id);
+    assert!(
+        !recovery_status.application_pages_writable,
+        "a paused recovery must withdraw application mutation admission"
     );
 
     // The head-publishing paths are fenced while an original sits in custody,
@@ -18337,6 +18374,8 @@ fn p3_full_history_contract_names_the_ordered_boundary_count_and_automatic_exit(
     assert!(contract.contains("single logical hot-then-indexed-cold resolver"));
     assert!(contract.contains("managed-local, projection-turn, and recovery-input"));
     assert!(contract.contains("Journal cleanup remains\nfrozen until successful reinstall"));
+    assert!(contract.contains("Original or journal data missing inside a proven durable prefix"));
+    assert!(contract.contains("Age alone never selects the below-floor recovery row"));
 }
 
 /// Every inter-step cut leaves the exact retained operation authoritative and
@@ -18433,6 +18472,20 @@ fn p3_reconstruction_interstep_crashes_preserve_exact_original_and_publisher_exc
                     if detail.contains(&format!("reconstruction step {step}"))
             ) {
                 observed_cut = true;
+                let retry_status = receiver_handle.status().unwrap();
+                let retry = retry_status
+                    .history_recovery
+                    .as_ref()
+                    .expect("the retryable cut must retain active recovery status");
+                assert!(
+                    retry.phase == SyncHistoryRecoveryPhase::Retrying
+                        && retry.retry_cause.as_ref().is_some_and(|cause| {
+                            cause.contains(&format!("reconstruction step {step}"))
+                        }),
+                    "a retryable reconstruction cut must stay in recovery with its cause: phase={:?}, cause_present={}",
+                    retry.phase,
+                    retry.retry_cause.is_some()
+                );
                 break;
             }
             assert!(

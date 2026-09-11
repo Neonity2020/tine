@@ -157,8 +157,8 @@ use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppen
 use crate::oplog::{
     managed_local_v2_anchor_name, parse_managed_local_v2_anchor_name, BatchId, BatchOrigin,
     BlobDescription, BlockId, BlockLocation, BlockReconstructionSource, BlockState,
-    CanonicalGraphResourceId, CanonicalSnapshot, ContentDigest, CurrentPageAtPath, DeviceId,
-    DocumentId, EngineError, FrontierReferenceHit, LineageDigest, LogicalPageName,
+    CanonicalGraphResourceId, CanonicalSnapshot, ContentDigest, CrdtPeerCounter, CurrentPageAtPath,
+    DeviceId, DocumentId, EngineError, FrontierReferenceHit, LineageDigest, LogicalPageName,
     LogseqIdentityOrigin, LogseqUuid, ManagedLocalAppendError, ManagedLocalGenerationAnchorV2,
     ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalRecord, ManagedPath,
     ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
@@ -1989,6 +1989,166 @@ pub enum SyncRuntimeTick {
     Terminal(String),
 }
 
+/// Why this binding entered the exceptional full-history recovery path.
+///
+/// This is a closed diagnostic vocabulary. The exact triggering batch and
+/// document are carried separately; no page name or page bytes can enter it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHistoryRecoveryReason {
+    DependencyBelowFloor,
+}
+
+/// The user-relevant phase of one automatic full-history recovery episode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHistoryRecoveryPhase {
+    Rebuilding,
+    WaitingForDelivery,
+    Retrying,
+}
+
+/// Fixed-shape retry attribution for the privacy-safe diagnostic recorder.
+/// The separately retained `retry_cause` is sanitized before frontend display
+/// and is never copied into the automatic recorder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHistoryRecoveryRetryClass {
+    InputInspection,
+    Reconstruction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHistoryRecoveryPublicationEdge {
+    CustodyDurable,
+    FencesCaptured,
+    ReplacementInstalled,
+    CheckpointReopened,
+    InputJournalSettled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHistoryRecoveryPreservationCheck {
+    Pending,
+    Passed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncHistoryRecoveryJournalDomain {
+    Foreground,
+    ProjectionTurn,
+    RecoveryInput,
+}
+
+/// One sequence-domain fence captured by reconstruction step 3. Segment names
+/// are deliberately omitted: domain and numeric durable bounds diagnose the
+/// protocol without putting private filesystem material into the recorder.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncHistoryRecoveryJournalFence {
+    pub domain: SyncHistoryRecoveryJournalDomain,
+    pub selector_generation: Option<u64>,
+    pub base_sequence: u64,
+    pub durable_prefix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncHistoryRecoveryDiagnostics {
+    pub journal_fences: Vec<SyncHistoryRecoveryJournalFence>,
+    pub accepted_count: usize,
+    pub pending_count: usize,
+    pub replayed_count: usize,
+    pub waiting_ms: u64,
+    pub reconstruction_ms: u64,
+    pub checkpoint_bytes: Option<u64>,
+    pub publication_edge: SyncHistoryRecoveryPublicationEdge,
+    pub preservation_check: SyncHistoryRecoveryPreservationCheck,
+}
+
+/// Binding-scoped active history recovery. This is status, not admission:
+/// `application_pages_writable` below remains the single capability answer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncHistoryRecoveryStatus {
+    pub attempt: u64,
+    pub reason: SyncHistoryRecoveryReason,
+    pub phase: SyncHistoryRecoveryPhase,
+    pub triggering_batch_id: BatchId,
+    pub triggering_document_id: DocumentId,
+    /// The incoming operation's compact dependency vector.
+    pub requested_floor: Vec<CrdtPeerCounter>,
+    /// The installed native shallow floor that the dependency did not cover.
+    pub actual_floor: Vec<CrdtPeerCounter>,
+    pub retry_class: Option<SyncHistoryRecoveryRetryClass>,
+    pub retry_cause: Option<String>,
+    pub diagnostics: SyncHistoryRecoveryDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncCheckpointLimitingCause {
+    AgeLowerBound,
+    NativeNormalization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncCheckpointPublicationEdge {
+    CurrentPointerDurable,
+}
+
+/// One changed document's worker-side floor measurement. Every value comes
+/// from the qualified native export; this carries identity and counts only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncCheckpointDocumentDiagnostics {
+    pub document_id: DocumentId,
+    pub measurement_sequence: u64,
+    pub requested_floor: Option<u64>,
+    pub actual_floor: Vec<CrdtPeerCounter>,
+    pub image_bytes: u64,
+    pub latest_state_bytes: u64,
+    pub removable_bytes: u64,
+    pub budget_bytes: u64,
+    pub post_cut_removable_bytes: u64,
+    pub hysteresis_shortfall_bytes: u64,
+    pub budget_overage_bytes: u64,
+    pub limiting_cause: Option<SyncCheckpointLimitingCause>,
+}
+
+/// Latest completed checkpoint worker publication. It is diagnostic-only and
+/// cheap to clone from the publisher; status never reopens or walks a graph.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncCheckpointPublicationDiagnostics {
+    pub measurement_sequence: u64,
+    pub age_cutoff_utc_ms: Option<i64>,
+    pub clock_frozen: Option<bool>,
+    pub policy_revision: u32,
+    pub minimum_tail_bytes: u64,
+    pub live_size_multiplier: u64,
+    pub documents: Vec<SyncCheckpointDocumentDiagnostics>,
+    pub changed_documents: u64,
+    pub exported_documents: u64,
+    pub reused_documents: u64,
+    pub measurement_exports: u64,
+    pub candidate_exports: u64,
+    pub verification_imports: u64,
+    pub hot_manifest_reads: u64,
+    pub hot_manifest_bytes: u64,
+    pub hot_object_reads: u64,
+    pub hot_object_bytes: u64,
+    pub cold_manifest_reads: u64,
+    pub cold_manifest_bytes: u64,
+    pub cold_object_reads: u64,
+    pub cold_object_bytes: u64,
+    pub image_phase_ms: u64,
+    pub payload_phase_ms: u64,
+    pub publication_phase_ms: u64,
+    pub peak_rss_bytes: Option<u64>,
+    pub checkpoint_bytes: u64,
+    pub publication_edge: SyncCheckpointPublicationEdge,
+}
+
 impl SyncRuntimeTick {
     /// Did this tick commit anything a reader could observe?
     ///
@@ -2009,10 +2169,19 @@ impl SyncRuntimeTick {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SyncRuntimeStatusSnapshot {
     pub lifecycle: SyncRuntimeLifecycle,
     pub recovery: Option<SyncRuntimeRecovery>,
+    pub history_recovery: Option<SyncHistoryRecoveryStatus>,
+    /// Latest active or completed recovery record for the native fixed-shape
+    /// diagnostic producer. Frontend recovery UI uses `history_recovery` only.
+    pub history_recovery_diagnostics: Option<SyncHistoryRecoveryStatus>,
+    /// The actor's actual application mutation capability at this observation.
+    /// Lifecycle alone is insufficient: full-history reconstruction keeps the
+    /// actor alive while it deliberately takes the projection and pauses writes.
+    pub application_pages_writable: bool,
+    pub checkpoint_diagnostics: Option<SyncCheckpointPublicationDiagnostics>,
     pub watcher: SyncWatcherStatus,
     pub last_tick: Option<SyncRuntimeTick>,
     pub detail: Option<String>,
@@ -2044,6 +2213,44 @@ pub struct SyncRuntimeStatusSnapshot {
     /// True once the earliest durable sweep transition is due. This is
     /// runnable work even on a filesystem-quiet graph.
     pub sweep_deadline_due: bool,
+}
+
+// Keep incidental `{status:?}` output on the established, content-free shape.
+// In particular, `history_recovery.retry_cause` can contain OS prose and must
+// cross only the explicitly sanitized frontend path; checkpoint/recovery
+// measurements have their own fixed-shape diagnostic events.
+impl std::fmt::Debug for SyncRuntimeStatusSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncRuntimeStatusSnapshot")
+            .field("lifecycle", &self.lifecycle)
+            .field("recovery", &self.recovery)
+            .field("watcher", &self.watcher)
+            .field("last_tick", &self.last_tick)
+            .field("detail", &self.detail)
+            .field("shared_role", &self.shared_role)
+            .field("shared_phase", &self.shared_phase)
+            .field("provider_pending", &self.provider_pending)
+            .field("provider_runnable", &self.provider_runnable)
+            .field("search_index_building", &self.search_index_building)
+            .field(
+                "move_episode_cleanup_pending",
+                &self.move_episode_cleanup_pending,
+            )
+            .field("managed_local_pending", &self.managed_local_pending)
+            .field(
+                "managed_local_checkpointed_sequence",
+                &self.managed_local_checkpointed_sequence,
+            )
+            .field(
+                "managed_local_next_sequence",
+                &self.managed_local_next_sequence,
+            )
+            .field("managed_local_stage", &self.managed_local_stage)
+            .field("sweep_deadline_remaining", &self.sweep_deadline_remaining)
+            .field("sweep_deadline_due", &self.sweep_deadline_due)
+            .finish()
+    }
 }
 
 impl SyncRuntimeStatusSnapshot {
@@ -4158,6 +4365,10 @@ impl SyncRuntimeHandle {
         let initial = SyncRuntimeStatusSnapshot {
             lifecycle: SyncRuntimeLifecycle::Active,
             recovery: None,
+            history_recovery: None,
+            history_recovery_diagnostics: None,
+            application_pages_writable: false,
+            checkpoint_diagnostics: None,
             watcher: SyncWatcherStatus::default(),
             last_tick: None,
             detail: Some("actor startup is adopting clean manifest authority".into()),
@@ -4214,6 +4425,10 @@ impl SyncRuntimeHandle {
                     *actor_status.write().unwrap() = SyncRuntimeStatusSnapshot {
                         lifecycle: SyncRuntimeLifecycle::StoppedCrashed,
                         recovery: None,
+                        history_recovery: None,
+                        history_recovery_diagnostics: None,
+                        application_pages_writable: false,
+                        checkpoint_diagnostics: None,
                         watcher: SyncWatcherStatus::default(),
                         last_tick: None,
                         detail: Some("clean sync actor panicked".into()),
@@ -14112,6 +14327,10 @@ struct RuntimeActor {
     /// rebuilt for the full-history engine. A failed rebuild returns the lease
     /// here so the next automatic attempt cannot create an ownership gap.
     recovery_workspace_lease: Option<WorkspaceRuntimeLease>,
+    history_recovery: Option<SyncHistoryRecoveryStatus>,
+    completed_history_recovery: Option<SyncHistoryRecoveryStatus>,
+    completed_checkpoint_diagnostics: Option<SyncCheckpointPublicationDiagnostics>,
+    history_recovery_phase_started: Option<Instant>,
     move_episode_directory: Dir,
     move_episode_cold_scan: Option<ReadDir>,
     move_episode_cleanup_queue: VecDeque<String>,
@@ -14785,6 +15004,10 @@ impl RuntimeActor {
             projection_turns: Some(projection_turns),
             recovery_input: Some(recovery_input),
             recovery_workspace_lease: None,
+            history_recovery: None,
+            completed_history_recovery: None,
+            completed_checkpoint_diagnostics: None,
+            history_recovery_phase_started: None,
             move_episode_directory,
             move_episode_cold_scan,
             move_episode_cleanup_queue: VecDeque::new(),
@@ -14880,6 +15103,21 @@ impl RuntimeActor {
                 .expect("recovery-input restart retains a clean runtime")
                 .runtime
                 .pause_full_history_admission();
+            if let Some(journal) = actor.recovery_input.as_ref() {
+                if let Ok(inputs) = Self::prepare_recovery_inputs(journal.pending_envelopes()) {
+                    let _ = actor.ensure_history_recovery_from_inputs(&inputs);
+                    let waiting = actor
+                        .active_engine()
+                        .ok()
+                        .and_then(|engine| {
+                            Self::recovery_input_admission_order(engine, &inputs).ok()
+                        })
+                        .is_some_and(|order| order.is_none());
+                    if waiting {
+                        actor.wait_for_history_recovery_delivery();
+                    }
+                }
+            }
         }
         actor.admit_deferred_absence_observations()?;
         let pending_reapply = actor
@@ -23336,6 +23574,148 @@ impl RuntimeActor {
         }
     }
 
+    fn history_recovery_elapsed_ms(&self) -> u64 {
+        self.history_recovery_phase_started
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    fn history_recovery_snapshot(&self) -> Option<SyncHistoryRecoveryStatus> {
+        let mut status = self.history_recovery.clone()?;
+        let elapsed = self.history_recovery_elapsed_ms();
+        match status.phase {
+            SyncHistoryRecoveryPhase::Rebuilding => {
+                status.diagnostics.reconstruction_ms =
+                    status.diagnostics.reconstruction_ms.saturating_add(elapsed);
+            }
+            SyncHistoryRecoveryPhase::WaitingForDelivery | SyncHistoryRecoveryPhase::Retrying => {
+                status.diagnostics.waiting_ms =
+                    status.diagnostics.waiting_ms.saturating_add(elapsed);
+            }
+        }
+        Some(status)
+    }
+
+    fn set_history_recovery_phase(
+        &mut self,
+        phase: SyncHistoryRecoveryPhase,
+        retry_class: Option<SyncHistoryRecoveryRetryClass>,
+        retry_cause: Option<String>,
+    ) {
+        let elapsed = self.history_recovery_elapsed_ms();
+        let Some(status) = self.history_recovery.as_mut() else {
+            return;
+        };
+        if status.phase != phase {
+            match status.phase {
+                SyncHistoryRecoveryPhase::Rebuilding => {
+                    status.diagnostics.reconstruction_ms =
+                        status.diagnostics.reconstruction_ms.saturating_add(elapsed);
+                }
+                SyncHistoryRecoveryPhase::WaitingForDelivery
+                | SyncHistoryRecoveryPhase::Retrying => {
+                    status.diagnostics.waiting_ms =
+                        status.diagnostics.waiting_ms.saturating_add(elapsed);
+                }
+            }
+            self.history_recovery_phase_started = Some(Instant::now());
+        }
+        status.phase = phase;
+        status.retry_class = retry_class;
+        status.retry_cause = retry_cause;
+    }
+
+    fn begin_history_recovery(&mut self, need: &crate::oplog::NeedsFullHistory) {
+        if self.history_recovery.as_ref().is_some_and(|current| {
+            current.triggering_batch_id == need.batch_id
+                && current.triggering_document_id == need.document_id
+        }) {
+            return;
+        }
+        let pending_count = self
+            .recovery_input
+            .as_ref()
+            .map_or(1, |journal| journal.pending_envelopes().len().max(1));
+        self.history_recovery = Some(SyncHistoryRecoveryStatus {
+            attempt: 0,
+            reason: SyncHistoryRecoveryReason::DependencyBelowFloor,
+            phase: SyncHistoryRecoveryPhase::Rebuilding,
+            triggering_batch_id: need.batch_id,
+            triggering_document_id: need.document_id,
+            requested_floor: need.dependency.clone(),
+            actual_floor: need.floor.clone(),
+            retry_class: None,
+            retry_cause: None,
+            diagnostics: SyncHistoryRecoveryDiagnostics {
+                journal_fences: Vec::new(),
+                accepted_count: 0,
+                pending_count,
+                replayed_count: 0,
+                waiting_ms: 0,
+                reconstruction_ms: 0,
+                checkpoint_bytes: None,
+                publication_edge: SyncHistoryRecoveryPublicationEdge::CustodyDurable,
+                preservation_check: SyncHistoryRecoveryPreservationCheck::Pending,
+            },
+        });
+        self.completed_history_recovery = None;
+        self.completed_checkpoint_diagnostics = None;
+        self.history_recovery_phase_started = Some(Instant::now());
+    }
+
+    fn ensure_history_recovery_from_inputs(
+        &mut self,
+        inputs: &BTreeMap<BatchId, PendingRecoveryInput>,
+    ) -> Result<(), String> {
+        if self.history_recovery.is_some() {
+            if let Some(status) = self.history_recovery.as_mut() {
+                status.diagnostics.pending_count = inputs.len();
+            }
+            return Ok(());
+        }
+        for input in inputs.values() {
+            self.begin_history_recovery(&input.envelope.recovery);
+            if let Some(status) = self.history_recovery.as_mut() {
+                status.diagnostics.pending_count = inputs.len();
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    fn begin_history_recovery_attempt(&mut self) {
+        if let Some(status) = self.history_recovery.as_mut() {
+            status.attempt = status.attempt.saturating_add(1);
+        }
+        self.set_history_recovery_phase(SyncHistoryRecoveryPhase::Rebuilding, None, None);
+    }
+
+    fn retry_history_recovery(&mut self, class: SyncHistoryRecoveryRetryClass, cause: String) {
+        self.set_history_recovery_phase(
+            SyncHistoryRecoveryPhase::Retrying,
+            Some(class),
+            Some(cause),
+        );
+    }
+
+    fn wait_for_history_recovery_delivery(&mut self) {
+        self.set_history_recovery_phase(SyncHistoryRecoveryPhase::WaitingForDelivery, None, None);
+    }
+
+    fn finish_history_recovery(&mut self) {
+        let Some(mut completed) = self.history_recovery_snapshot() else {
+            return;
+        };
+        completed.retry_class = None;
+        completed.retry_cause = None;
+        completed.diagnostics.publication_edge =
+            SyncHistoryRecoveryPublicationEdge::InputJournalSettled;
+        completed.diagnostics.preservation_check = SyncHistoryRecoveryPreservationCheck::Passed;
+        self.completed_history_recovery = Some(completed);
+        self.history_recovery = None;
+        self.history_recovery_phase_started = None;
+    }
+
     fn exact_recovery_input_is_archived(
         engine: &ShardedHotEngine,
         envelope: &RecoveryInputEnvelopeV1,
@@ -23694,6 +24074,32 @@ impl RuntimeActor {
         // as a cache key. The fenced accepted membership below is proved again
         // after the replacement checkpoint is reopened.
         let _accepted_archive_boundary = accepted_archive_boundary;
+        if let Some(status) = self.history_recovery.as_mut() {
+            status.diagnostics.accepted_count = fenced_accepted_batches.len();
+            status.diagnostics.pending_count = envelopes.len();
+            status.diagnostics.journal_fences = vec![
+                SyncHistoryRecoveryJournalFence {
+                    domain: SyncHistoryRecoveryJournalDomain::Foreground,
+                    selector_generation: foreground_fence.selector_generation,
+                    base_sequence: foreground_fence.base_sequence,
+                    durable_prefix: foreground_fence.durable_prefix,
+                },
+                SyncHistoryRecoveryJournalFence {
+                    domain: SyncHistoryRecoveryJournalDomain::ProjectionTurn,
+                    selector_generation: projection_fence.selector_generation,
+                    base_sequence: projection_fence.base_sequence,
+                    durable_prefix: projection_fence.durable_prefix,
+                },
+                SyncHistoryRecoveryJournalFence {
+                    domain: SyncHistoryRecoveryJournalDomain::RecoveryInput,
+                    selector_generation: recovery_input_fence.selector_generation,
+                    base_sequence: recovery_input_fence.base_sequence,
+                    durable_prefix: recovery_input_fence.durable_prefix,
+                },
+            ];
+            status.diagnostics.publication_edge =
+                SyncHistoryRecoveryPublicationEdge::FencesCaptured;
+        }
         self.fault_after_reconstruction_step(3)?;
 
         // Steps 4-5: a genuinely fresh engine starts at immutable genesis and
@@ -23708,6 +24114,11 @@ impl RuntimeActor {
             inject_after_genesis,
         )?;
         self.install_full_replay_engine_and_projection(replacement, &baseline, &request)?;
+        if let Some(status) = self.history_recovery.as_mut() {
+            status.diagnostics.replayed_count = fenced_accepted_batches.len();
+            status.diagnostics.publication_edge =
+                SyncHistoryRecoveryPublicationEdge::ReplacementInstalled;
+        }
         self.fault_after_reconstruction_step(5)?;
 
         // Step 6a: replay each still-retained local frame through the exact
@@ -23842,7 +24253,7 @@ impl RuntimeActor {
         // Step 8: publish at the existing checkpoint boundary, join that
         // publisher, then create another fresh engine which actually reopens
         // the selected checkpoint and reconciles its authenticated tail.
-        {
+        let recovery_checkpoint_diagnostics = {
             let engine = self
                 .clean
                 .as_ref()
@@ -23856,6 +24267,13 @@ impl RuntimeActor {
             if engine.clean_checkpoint_durable_lag() != 0 {
                 return Err("recovery checkpoint did not reach the settled frontier".into());
             }
+            engine.clean_checkpoint_diagnostics()
+        };
+        if let Some(checkpoint) = recovery_checkpoint_diagnostics {
+            if let Some(status) = self.history_recovery.as_mut() {
+                status.diagnostics.checkpoint_bytes = Some(checkpoint.checkpoint_bytes);
+            }
+            self.completed_checkpoint_diagnostics = Some(checkpoint);
         }
         self.clean
             .as_mut()
@@ -23871,6 +24289,10 @@ impl RuntimeActor {
             false,
         )?;
         self.install_full_replay_engine_and_projection(reopened, &reopened_baseline, &request)?;
+        if let Some(status) = self.history_recovery.as_mut() {
+            status.diagnostics.publication_edge =
+                SyncHistoryRecoveryPublicationEdge::CheckpointReopened;
+        }
         let reopened_accepted = self
             .active_engine()
             .map_err(|error| error.to_string())?
@@ -23943,6 +24365,7 @@ impl RuntimeActor {
             .resume_full_history_admission();
         *self.application_projection_cache.borrow_mut() = Default::default();
         *self.application_hydration_cache.borrow_mut() = Default::default();
+        self.finish_history_recovery();
         Ok(())
     }
 
@@ -24069,11 +24492,24 @@ impl RuntimeActor {
             let (inputs, order) = match readiness {
                 Ok(readiness) => readiness,
                 Err(error) => {
+                    self.retry_history_recovery(
+                        SyncHistoryRecoveryRetryClass::InputInspection,
+                        error.clone(),
+                    );
                     return SyncRuntimeTick::RecoveryBlocked(format!(
                         "cannot inspect retained recovery prerequisites: {error}"
                     ));
                 }
             };
+            if let Err(error) = self.ensure_history_recovery_from_inputs(&inputs) {
+                self.retry_history_recovery(
+                    SyncHistoryRecoveryRetryClass::InputInspection,
+                    error.clone(),
+                );
+                return SyncRuntimeTick::RecoveryBlocked(format!(
+                    "cannot classify retained recovery input: {error}"
+                ));
+            }
             if order.is_none() {
                 if self.provider_transport_has_work() {
                     let delivery = self.tick_clean_provider();
@@ -24081,16 +24517,24 @@ impl RuntimeActor {
                         return delivery;
                     }
                 }
+                self.wait_for_history_recovery_delivery();
                 return SyncRuntimeTick::RecoveryBlocked(format!(
                     "automatic full-history reconstruction is waiting for delivery: {}",
                     Self::recovery_prerequisite_pending_detail(&inputs)
                 ));
             }
+            self.begin_history_recovery_attempt();
             return match self.reconstruct_full_history() {
                 Ok(()) => SyncRuntimeTick::Recovering,
-                Err(error) => SyncRuntimeTick::RecoveryBlocked(format!(
-                    "automatic full-history reconstruction remains retryable: {error}"
-                )),
+                Err(error) => {
+                    self.retry_history_recovery(
+                        SyncHistoryRecoveryRetryClass::Reconstruction,
+                        error.clone(),
+                    );
+                    SyncRuntimeTick::RecoveryBlocked(format!(
+                        "automatic full-history reconstruction remains retryable: {error}"
+                    ))
+                }
             };
         }
         if let Some(reason) = self
@@ -25311,12 +25755,13 @@ impl RuntimeActor {
                         .recovery_input
                         .as_mut()
                         .expect("clean runtime retains recovery-input custody")
-                        .retain(&prepared, inject_uncertain);
+                        .retain(&prepared, &need, inject_uncertain);
                     if let Err(error) = custody {
                         return SyncRuntimeTick::RecoveryBlocked(format!(
                             "below-floor original {batch_id} remains provider-owned because durable custody failed: {error}"
                         ));
                     }
+                    self.begin_history_recovery(&need);
                     self.clean
                         .as_mut()
                         .expect("below-floor custody retains the clean runtime")
@@ -26282,15 +26727,30 @@ impl RuntimeActor {
     }
 
     fn snapshot(&self) -> SyncRuntimeStatusSnapshot {
+        let lifecycle = if self.stopped_safe {
+            SyncRuntimeLifecycle::StoppedSafe
+        } else if self.terminal.is_some() {
+            SyncRuntimeLifecycle::Terminal
+        } else {
+            SyncRuntimeLifecycle::Active
+        };
         SyncRuntimeStatusSnapshot {
-            lifecycle: if self.stopped_safe {
-                SyncRuntimeLifecycle::StoppedSafe
-            } else if self.terminal.is_some() {
-                SyncRuntimeLifecycle::Terminal
-            } else {
-                SyncRuntimeLifecycle::Active
-            },
+            lifecycle: lifecycle.clone(),
             recovery: Some(self.recovery),
+            history_recovery: self.history_recovery_snapshot(),
+            history_recovery_diagnostics: self
+                .history_recovery_snapshot()
+                .or_else(|| self.completed_history_recovery.clone()),
+            application_pages_writable: lifecycle == SyncRuntimeLifecycle::Active
+                && self
+                    .clean
+                    .as_ref()
+                    .is_none_or(|clean| clean.runtime.pages_writable()),
+            checkpoint_diagnostics: self
+                .clean
+                .as_ref()
+                .and_then(|clean| clean.runtime.engine().clean_checkpoint_diagnostics())
+                .or_else(|| self.completed_checkpoint_diagnostics.clone()),
             watcher: self.last_watcher,
             last_tick: self.last_tick.clone(),
             detail: self.terminal.clone().or_else(|| {

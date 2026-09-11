@@ -895,6 +895,13 @@ impl CleanLocalRuntime {
         self.recovery_admission_paused = false;
     }
 
+    /// Exact application-write capability at one actor observation. A live
+    /// actor alone is insufficient: full-history reconstruction deliberately
+    /// pauses ordinary admission and may temporarily take the projection.
+    pub(crate) fn pages_writable(&self) -> bool {
+        !self.recovery_admission_paused && self.projection.is_some()
+    }
+
     pub(crate) fn stop_clean_checkpoint_publisher(&mut self) {
         self.engine.stop_clean_checkpoint_publisher();
     }

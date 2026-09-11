@@ -3,6 +3,92 @@ import {
   type SharedFrontierMismatchCategory,
   type SharedFrontierMismatchPath,
 } from "./backend";
+import type {
+  SparseV2CheckpointPublicationDiagnostics,
+  SparseV2HistoryRecoveryStatus,
+} from "./types";
+
+export const MANAGED_HISTORY_RECOVERY_MESSAGE =
+  "Rebuilding local history to merge older changes. Editing will resume automatically.";
+
+export function managedHistoryRecoveryPhase(
+  recovery: SparseV2HistoryRecoveryStatus,
+): string {
+  switch (recovery.phase) {
+    case "waiting_for_delivery":
+      return "Waiting for an older change to arrive from another device.";
+    case "retrying":
+      return "Recovery will retry automatically.";
+    case "rebuilding":
+      return "Rebuilding accepted history now.";
+  }
+}
+
+/** Content-free, binding-scoped recovery facts for the existing Copy details surface. */
+export function managedHistoryRecoveryDiagnostics(
+  recovery: SparseV2HistoryRecoveryStatus,
+): string[] {
+  const requested = recovery.requested_floor
+    .map(({ peer_id, max_counter }) => `${peer_id}:${max_counter}`)
+    .join(",");
+  const actual = recovery.actual_floor
+    .map(({ peer_id, max_counter }) => `${peer_id}:${max_counter}`)
+    .join(",");
+  const lines = [
+    `History recovery: attempt=${recovery.attempt}; reason=${recovery.reason}; phase=${recovery.phase}`,
+    `History recovery trigger: batch=${recovery.triggering_batch_id}; document=${recovery.triggering_document_id}`,
+    `History recovery floors: requested=[${requested}]; actual=[${actual}]`,
+  ];
+  if (recovery.retry_class) lines.push(`History recovery retry class: ${recovery.retry_class}`);
+  if (recovery.retry_cause) {
+    lines.push(`History recovery retry: ${safeManagedErrorDetail(recovery.retry_cause)}`);
+  }
+  const details = recovery.diagnostics;
+  if (details) {
+    lines.push(
+      `History recovery inputs: accepted=${details.accepted_count}; pending=${details.pending_count}; replayed=${details.replayed_count}`,
+      `History recovery durations: waiting_ms=${details.waiting_ms}; reconstruction_ms=${details.reconstruction_ms}`,
+      `History recovery publication: edge=${details.publication_edge}; preservation=${details.preservation_check}`,
+    );
+    if (details.checkpoint_bytes !== null) {
+      lines.push(`History recovery checkpoint bytes: ${details.checkpoint_bytes}`);
+    }
+  }
+  return lines;
+}
+
+/** Fixed-shape checkpoint measurements for the same managed Copy details surface. */
+export function managedCheckpointDiagnostics(
+  checkpoint: SparseV2CheckpointPublicationDiagnostics,
+): string[] {
+  const lines = [
+    `Checkpoint policy: sequence=${checkpoint.measurement_sequence}; revision=${checkpoint.policy_revision}; minimum_tail_bytes=${checkpoint.minimum_tail_bytes}; live_size_multiplier=${checkpoint.live_size_multiplier}`,
+    `Checkpoint documents: changed=${checkpoint.changed_documents}; exported=${checkpoint.exported_documents}; reused=${checkpoint.reused_documents}`,
+    `Checkpoint worker: measurements=${checkpoint.measurement_exports}; candidates=${checkpoint.candidate_exports}; verification_imports=${checkpoint.verification_imports}`,
+    `Checkpoint hot reads: manifests=${checkpoint.hot_manifest_reads}/${checkpoint.hot_manifest_bytes}B; objects=${checkpoint.hot_object_reads}/${checkpoint.hot_object_bytes}B`,
+    `Checkpoint cold reads: manifests=${checkpoint.cold_manifest_reads}/${checkpoint.cold_manifest_bytes}B; objects=${checkpoint.cold_object_reads}/${checkpoint.cold_object_bytes}B`,
+    `Checkpoint phases: image_ms=${checkpoint.image_phase_ms}; payload_ms=${checkpoint.payload_phase_ms}; publication_ms=${checkpoint.publication_phase_ms}`,
+    `Checkpoint publication: bytes=${checkpoint.checkpoint_bytes}; edge=${checkpoint.publication_edge}`,
+  ];
+  if (checkpoint.age_cutoff_utc_ms !== null) {
+    lines.push(`Checkpoint age cutoff: utc_ms=${checkpoint.age_cutoff_utc_ms}`);
+  }
+  if (checkpoint.clock_frozen !== null) {
+    lines.push(`Checkpoint clock frozen: ${checkpoint.clock_frozen}`);
+  }
+  if (checkpoint.peak_rss_bytes !== null) {
+    lines.push(`Checkpoint peak RSS bytes: ${checkpoint.peak_rss_bytes}`);
+  }
+  for (const document of checkpoint.documents) {
+    const floor = document.actual_floor
+      .map(({ peer_id, max_counter }) => `${peer_id}:${max_counter}`)
+      .join(",");
+    lines.push(
+      `Checkpoint document: id=${document.document_id}; sequence=${document.measurement_sequence}; requested_floor=${document.requested_floor ?? "none"}; actual_floor=[${floor}]; image=${document.image_bytes}; latest=${document.latest_state_bytes}; removable=${document.removable_bytes}; budget=${document.budget_bytes}; post_cut=${document.post_cut_removable_bytes}; hysteresis_shortfall=${document.hysteresis_shortfall_bytes}; budget_overage=${document.budget_overage_bytes}; limiting_cause=${document.limiting_cause ?? "none"}`,
+    );
+  }
+  return lines;
+}
 
 /**
  * Reduce a native managed-storage failure to one bounded, shareable line.

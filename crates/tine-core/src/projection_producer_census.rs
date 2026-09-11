@@ -2257,6 +2257,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
 /// carries the patterns — and the manager archives them under
 /// `tine-agents/evidence/` before integration. This guard checks the tracked
 /// set, so an in-flight lane's untracked receipt does not trip it.
+///
+/// The log rule is deliberately `/*.log` and not an enumeration of the suffixes
+/// lanes have used so far. The enumeration was tried: it reached nine patterns
+/// and still missed `*-pass-after.log`, `*-debug.log`, `*-gate.log` and
+/// `*-compile.log`, which is most of what a lane actually writes — 128 such
+/// files were sitting untracked at the P3 worktree root, one `git add -A` from
+/// repeating the wave-2 leak. No root-level `.log` has ever been tracked, so the
+/// wide rule costs nothing and a lane can no longer invent a name that escapes
+/// it.
 #[test]
 fn g_h_repository_root_tracks_no_lane_evidence() {
     let repo = repository_root();
@@ -2265,7 +2274,7 @@ fn g_h_repository_root_tracks_no_lane_evidence() {
         "/RECEIPT*.md",
         "/baseline-*.txt",
         "/necessity-*.txt",
-        "/*-fail-before.log",
+        "/*.log",
     ] {
         assert!(
             ignore.lines().any(|line| line.trim() == pattern),
@@ -2281,7 +2290,9 @@ fn g_h_repository_root_tracks_no_lane_evidence() {
             "RECEIPT*.md",
             "baseline-*.txt",
             "necessity-*.txt",
-            "*-fail-before.log",
+            // `:(glob)` keeps `*` from crossing a `/`, so this is the repository
+            // root only: a genuine log fixture nested under tests/ is untouched.
+            ":(glob)*.log",
         ])
         .output()
     else {

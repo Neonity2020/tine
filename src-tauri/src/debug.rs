@@ -524,6 +524,142 @@ pub(crate) fn record_checkpoint_capture_skip(
     record_fixed_event("managed.checkpoint_capture_skipped", fields);
 }
 
+/// Record only closed vocabulary, identifiers and measurements. In particular,
+/// `retry_cause` is intentionally excluded because an OS error can contain a
+/// private path or document-derived text.
+pub(crate) fn record_history_recovery(
+    recovery: &tine_core::sync_runtime::SyncHistoryRecoveryStatus,
+) {
+    let diagnostics = &recovery.diagnostics;
+    let mut fields = Map::new();
+    fields.insert("attempt".into(), json!(recovery.attempt));
+    fields.insert("reason".into(), enum_token(recovery.reason));
+    fields.insert("phase".into(), enum_token(recovery.phase));
+    fields.insert(
+        "triggeringBatchId".into(),
+        json!(recovery.triggering_batch_id),
+    );
+    fields.insert(
+        "triggeringDocumentId".into(),
+        json!(recovery.triggering_document_id),
+    );
+    fields.insert("requestedFloor".into(), json!(recovery.requested_floor));
+    fields.insert("actualFloor".into(), json!(recovery.actual_floor));
+    fields.insert(
+        "retryClass".into(),
+        json!(recovery.retry_class.map(enum_token)),
+    );
+    fields.insert("journalFences".into(), json!(diagnostics.journal_fences));
+    fields.insert("acceptedCount".into(), json!(diagnostics.accepted_count));
+    fields.insert("pendingCount".into(), json!(diagnostics.pending_count));
+    fields.insert("replayedCount".into(), json!(diagnostics.replayed_count));
+    fields.insert("waitingMs".into(), json!(diagnostics.waiting_ms));
+    fields.insert(
+        "reconstructionMs".into(),
+        json!(diagnostics.reconstruction_ms),
+    );
+    if let Some(checkpoint_bytes) = diagnostics.checkpoint_bytes {
+        fields.insert("checkpointBytes".into(), json!(checkpoint_bytes));
+    }
+    fields.insert(
+        "publicationEdge".into(),
+        enum_token(diagnostics.publication_edge),
+    );
+    fields.insert(
+        "preservationCheck".into(),
+        enum_token(diagnostics.preservation_check),
+    );
+    record_fixed_event("managed.history_recovery", fields);
+}
+
+pub(crate) fn record_checkpoint_publication(
+    checkpoint: &tine_core::sync_runtime::SyncCheckpointPublicationDiagnostics,
+) {
+    let mut fields = Map::new();
+    fields.insert(
+        "measurementSequence".into(),
+        json!(checkpoint.measurement_sequence),
+    );
+    if let Some(age_cutoff_utc_ms) = checkpoint.age_cutoff_utc_ms {
+        fields.insert("ageCutoffUtcMs".into(), json!(age_cutoff_utc_ms));
+    }
+    if let Some(clock_frozen) = checkpoint.clock_frozen {
+        fields.insert("clockFrozen".into(), json!(clock_frozen));
+    }
+    fields.insert("policyRevision".into(), json!(checkpoint.policy_revision));
+    fields.insert(
+        "minimumTailBytes".into(),
+        json!(checkpoint.minimum_tail_bytes),
+    );
+    fields.insert(
+        "liveSizeMultiplier".into(),
+        json!(checkpoint.live_size_multiplier),
+    );
+    fields.insert("documents".into(), json!(checkpoint.documents));
+    fields.insert(
+        "changedDocuments".into(),
+        json!(checkpoint.changed_documents),
+    );
+    fields.insert(
+        "exportedDocuments".into(),
+        json!(checkpoint.exported_documents),
+    );
+    fields.insert("reusedDocuments".into(), json!(checkpoint.reused_documents));
+    fields.insert(
+        "measurementExports".into(),
+        json!(checkpoint.measurement_exports),
+    );
+    fields.insert(
+        "candidateExports".into(),
+        json!(checkpoint.candidate_exports),
+    );
+    fields.insert(
+        "verificationImports".into(),
+        json!(checkpoint.verification_imports),
+    );
+    fields.insert(
+        "hotManifestReads".into(),
+        json!(checkpoint.hot_manifest_reads),
+    );
+    fields.insert(
+        "hotManifestBytes".into(),
+        json!(checkpoint.hot_manifest_bytes),
+    );
+    fields.insert("hotObjectReads".into(), json!(checkpoint.hot_object_reads));
+    fields.insert("hotObjectBytes".into(), json!(checkpoint.hot_object_bytes));
+    fields.insert(
+        "coldManifestReads".into(),
+        json!(checkpoint.cold_manifest_reads),
+    );
+    fields.insert(
+        "coldManifestBytes".into(),
+        json!(checkpoint.cold_manifest_bytes),
+    );
+    fields.insert(
+        "coldObjectReads".into(),
+        json!(checkpoint.cold_object_reads),
+    );
+    fields.insert(
+        "coldObjectBytes".into(),
+        json!(checkpoint.cold_object_bytes),
+    );
+    fields.insert("imagePhaseMs".into(), json!(checkpoint.image_phase_ms));
+    fields.insert("payloadPhaseMs".into(), json!(checkpoint.payload_phase_ms));
+    fields.insert(
+        "publicationPhaseMs".into(),
+        json!(checkpoint.publication_phase_ms),
+    );
+    if let Some(peak_rss_bytes) = checkpoint.peak_rss_bytes {
+        fields.insert("peakRssBytes".into(), json!(peak_rss_bytes));
+    }
+    fields.insert("checkpointBytes".into(), json!(checkpoint.checkpoint_bytes));
+    fields.insert(
+        "publicationEdge".into(),
+        enum_token(checkpoint.publication_edge),
+    );
+    record_fixed_event("managed.checkpoint_publication", fields);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_direct_save(
     outcome: &'static str,
@@ -1087,12 +1223,47 @@ mod tests {
     #[test]
     fn fixed_event_shape_contains_no_free_form_message_fields() {
         let source = include_str!("debug.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production diagnostics precede their tests");
         let contract = include_str!("../../docs/contracts/diagnostics.md");
-        assert!(!source.contains("fields.insert(\"message\""));
-        assert!(!source.contains("fields.insert(\"path\""));
-        assert!(!source.contains("fields.insert(\"detail\""));
-        assert!(source.contains("verboseDebugLogIncluded\": false"));
-        assert!(source.contains("managed.checkpoint_capture_skipped"));
+        assert!(!production.contains("fields.insert(\"message\""));
+        assert!(!production.contains("fields.insert(\"path\""));
+        assert!(!production.contains("fields.insert(\"detail\""));
+        assert!(production.contains("verboseDebugLogIncluded\": false"));
+        assert!(production.contains("managed.checkpoint_capture_skipped"));
+        assert!(production.contains("managed.history_recovery"));
+        assert!(production.contains("managed.checkpoint_publication"));
+        for field in [
+            "attempt",
+            "reason",
+            "phase",
+            "triggeringBatchId",
+            "triggeringDocumentId",
+            "requestedFloor",
+            "actualFloor",
+            "journalFences",
+            "acceptedCount",
+            "pendingCount",
+            "replayedCount",
+            "preservationCheck",
+            "policyRevision",
+            "minimumTailBytes",
+            "liveSizeMultiplier",
+            "changedDocuments",
+            "exportedDocuments",
+            "reusedDocuments",
+            "measurementExports",
+            "candidateExports",
+            "checkpointBytes",
+            "publicationEdge",
+        ] {
+            assert!(
+                production.contains(field),
+                "missing fixed diagnostic field {field}"
+            );
+        }
         for reason in [
             "runtime_not_attached",
             "indexed_runtime",
@@ -1101,7 +1272,7 @@ mod tests {
             "durable_frontier_ahead",
             "capture_failed",
         ] {
-            assert!(source.contains(reason));
+            assert!(production.contains(reason));
             assert!(
                 contract.contains(reason),
                 "the bounded checkpoint-skip cause and diagnostics contract must change together"

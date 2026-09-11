@@ -111,6 +111,25 @@ The fixed `managed.checkpoint_capture_skipped` receipt carries exactly one of
 These are bounded causes, never error prose, and are pinned by
 `fixed_event_shape_contains_no_free_form_message_fields`.
 
+The fixed `managed.history_recovery` receipt carries the recovery attempt,
+closed reason and phase, BatchId and DocumentId, requested and actual CRDT
+floors, closed retry class, numeric fences for all three journal domains,
+accepted/pending/replayed counts, phase durations, checkpoint bytes when a
+checkpoint completed, publication edge, and preservation result. It never
+copies the free-form retry cause; the frontend applies its existing bounded
+sanitizer when that cause is shown or explicitly copied.
+
+The fixed `managed.checkpoint_publication` receipt carries the policy revision
+and byte policy, each changed document's identity/floors and I/L/R/B
+measurements, post-cut remainder, hysteresis shortfall, budget overage and
+closed limiting cause, changed/exported/reused and worker export counts,
+hot/cold read and byte totals, phase durations, checkpoint bytes, and the
+commit-last publication edge. Acceptance-age cutoff/clock state and peak RSS
+are emitted only when the worker actually observes them; the current live
+publisher observes neither and therefore omits them rather than writing a
+placeholder. These records contain identifiers and counts, never page names,
+paths, or document bytes.
+
 Parser failures cross the lsdoc-diff worker boundary only as a status plus
 `ParserDiagnostic`: a nullable numeric offset, UTF-8 input length, and opaque
 input hash. An exception object or free-form parser detail cannot inhabit that
@@ -120,7 +139,7 @@ type.
 
 `crates/tine-core/tests/content_out_of_logs.rs` walks production Rust library
 sources, excluding standalone CLI output and cfg(test) regions. Its exact
-allowlist currently contains 75 Rust production print sites, each with a class,
+allowlist currently contains 76 Rust production print sites, each with a class,
 reason, and gate. A deletion changes the census just as an addition does.
 
 `src/contentOutOfLogs.ratchet.test.ts` walks production TypeScript and TSX and

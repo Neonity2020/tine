@@ -130,6 +130,62 @@ describe("Settings storage transitions", () => {
     application_page_admission: { binding_generation: 11, authority: "managed_unavailable" },
   });
 
+  const localHistoryRecovery = (
+    phase: "rebuilding" | "waiting_for_delivery" | "retrying",
+    retryCause: string | null = null,
+  ): SparseV2Status => {
+    const active = localActive();
+    return {
+      ...active,
+      runtime: {
+        ...active.runtime!,
+        history_recovery: {
+          attempt: 3,
+          reason: "dependency_below_floor",
+          phase,
+          triggering_batch_id: "00000000-0000-0000-0000-000000000123",
+          triggering_document_id: "00000000-0000-0000-0000-000000000456",
+          requested_floor: [{ peer_id: 7, max_counter: 3 }],
+          actual_floor: [{ peer_id: 7, max_counter: 9 }],
+          retry_cause: retryCause,
+        },
+      },
+      application_page_admission: {
+        binding_generation: active.binding_generation,
+        authority: "managed_unavailable",
+      },
+    } as SparseV2Status;
+  };
+
+  it("shows automatic history recovery and distinguishes waiting from a failed retry", async () => {
+    const recovering = localHistoryRecovery("waiting_for_delivery");
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(recovering);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    expect(root.textContent).toContain(
+      "Rebuilding local history to merge older changes. Editing will resume automatically.",
+    );
+    expect(root.textContent).toContain("Waiting for an older change to arrive from another device.");
+    expect(root.textContent).not.toContain("Retry recovery");
+    expect(managedStorageRuntime.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 11,
+      authority: "managed_unavailable",
+    });
+
+    expect(managedStorageRuntime.receiveStatus(localHistoryRecovery(
+      "retrying",
+      "full-history projection rebuild remains retryable: permission denied",
+    ))).toBe(true);
+    await tick();
+    expect(root.textContent).toContain("Recovery will retry automatically.");
+    expect(root.textContent).toContain("projection rebuild remains retryable: permission denied");
+    expect(root.textContent).not.toContain("Retry recovery");
+    dispose();
+  });
+
   it("discloses managed storage as known-buggy and keeps Direct files available", async () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     const root = document.createElement("div");

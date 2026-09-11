@@ -21,8 +21,8 @@ use uuid::Uuid;
 use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, read_optional_regular};
 use super::sync_layout::MANAGED_LOCAL_JOURNAL_DIR;
 use super::{
-    BatchId, DeviceId, LineageDigest, ManifestedProjectionIntent, ObjectKind, OperationBatch,
-    OperationObject, PreparedBatch, ProjectionEndpointId, WorkspaceId,
+    hot_engine::NeedsFullHistory, BatchId, DeviceId, LineageDigest, ManifestedProjectionIntent,
+    ObjectKind, OperationBatch, OperationObject, PreparedBatch, ProjectionEndpointId, WorkspaceId,
 };
 
 const RECOVERY_INPUT_SCHEMA_VERSION: u32 = 1;
@@ -51,6 +51,7 @@ pub(crate) struct RecoveryInputEnvelopeV1 {
     pub(crate) batch_id: BatchId,
     pub(crate) manifest: Vec<u8>,
     pub(crate) objects: Vec<Vec<u8>>,
+    pub(crate) recovery: NeedsFullHistory,
 }
 
 impl RecoveryInputEnvelopeV1 {
@@ -60,6 +61,7 @@ impl RecoveryInputEnvelopeV1 {
         receiving_endpoint_id: ProjectionEndpointId,
         receiving_device_id: DeviceId,
         prepared: &PreparedBatch,
+        recovery: &NeedsFullHistory,
     ) -> Result<Self, String> {
         let manifest = prepared
             .manifest()
@@ -85,6 +87,7 @@ impl RecoveryInputEnvelopeV1 {
             batch_id: prepared.manifest().batch_id(),
             manifest,
             objects,
+            recovery: recovery.clone(),
         };
         envelope.validate(
             workspace_id,
@@ -133,6 +136,7 @@ impl RecoveryInputEnvelopeV1 {
             || self.lineage_digest != lineage_digest
             || self.receiving_endpoint_id != receiving_endpoint_id
             || self.receiving_device_id != receiving_device_id
+            || self.recovery.batch_id != self.batch_id
         {
             return Err("recovery-input envelope binding is invalid".into());
         }
@@ -461,6 +465,7 @@ impl RecoveryInputJournal {
     pub(crate) fn retain(
         &mut self,
         prepared: &PreparedBatch,
+        recovery: &NeedsFullHistory,
         inject_uncertain_after_append: bool,
     ) -> Result<RecoveryInputCustody, String> {
         let envelope = RecoveryInputEnvelopeV1::from_prepared(
@@ -469,6 +474,7 @@ impl RecoveryInputJournal {
             self.endpoint_id,
             self.device_id,
             prepared,
+            recovery,
         )?;
         let payload = envelope.encode()?;
         if let Some(existing) = self.payloads.get(&envelope.batch_id) {
@@ -571,7 +577,8 @@ impl RecoveryInputJournal {
             .map(|bytes| OperationObject::decode(bytes).map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
         let prepared = PreparedBatch::new(manifest, objects).map_err(|error| error.to_string())?;
-        self.retain(&prepared, false)
+        let recovery = envelope.recovery.clone();
+        self.retain(&prepared, &recovery, false)
     }
 
     fn reopen_and_reindex(&mut self) -> Result<(), String> {

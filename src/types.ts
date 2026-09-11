@@ -346,6 +346,80 @@ export interface SparseV2RuntimeStatus {
   /** Both FTS families are catching up in bounded background turns. Search
    * remains exact through the non-indexed fallback until this clears. */
   search_index_building: boolean;
+  /** Automatic recovery of an incoming dependency older than this device's
+   * compact checkpoint. Admission remains authoritative and is unavailable
+   * for the same binding until this clears. */
+  history_recovery?: SparseV2HistoryRecoveryStatus | null;
+  /** Latest fixed-shape checkpoint publication measurements. */
+  checkpoint_diagnostics?: SparseV2CheckpointPublicationDiagnostics | null;
+}
+
+export interface SparseV2CheckpointDocumentDiagnostics {
+  document_id: string;
+  measurement_sequence: number;
+  requested_floor: number | null;
+  actual_floor: Array<{ peer_id: number; max_counter: number }>;
+  image_bytes: number;
+  latest_state_bytes: number;
+  removable_bytes: number;
+  budget_bytes: number;
+  post_cut_removable_bytes: number;
+  hysteresis_shortfall_bytes: number;
+  budget_overage_bytes: number;
+  limiting_cause: "age_lower_bound" | "native_normalization" | null;
+}
+
+export interface SparseV2CheckpointPublicationDiagnostics {
+  measurement_sequence: number;
+  age_cutoff_utc_ms: number | null;
+  clock_frozen: boolean | null;
+  policy_revision: number;
+  minimum_tail_bytes: number;
+  live_size_multiplier: number;
+  documents: SparseV2CheckpointDocumentDiagnostics[];
+  changed_documents: number;
+  exported_documents: number;
+  reused_documents: number;
+  measurement_exports: number;
+  candidate_exports: number;
+  verification_imports: number;
+  hot_manifest_reads: number;
+  hot_manifest_bytes: number;
+  hot_object_reads: number;
+  hot_object_bytes: number;
+  cold_manifest_reads: number;
+  cold_manifest_bytes: number;
+  cold_object_reads: number;
+  cold_object_bytes: number;
+  image_phase_ms: number;
+  payload_phase_ms: number;
+  publication_phase_ms: number;
+  peak_rss_bytes: number | null;
+  checkpoint_bytes: number;
+  publication_edge: "current_pointer_durable";
+}
+
+export interface SparseV2HistoryRecoveryStatus {
+  attempt: number;
+  reason: "dependency_below_floor";
+  phase: "rebuilding" | "waiting_for_delivery" | "retrying";
+  triggering_batch_id: string;
+  triggering_document_id: string;
+  requested_floor: Array<{ peer_id: number; max_counter: number }>;
+  actual_floor: Array<{ peer_id: number; max_counter: number }>;
+  retry_class?: "input_inspection" | "reconstruction" | null;
+  retry_cause: string | null;
+  diagnostics?: {
+    journal_fences: Array<Record<string, unknown>>;
+    accepted_count: number;
+    pending_count: number;
+    replayed_count: number;
+    waiting_ms: number;
+    reconstruction_ms: number;
+    checkpoint_bytes: number | null;
+    publication_edge: string;
+    preservation_check: string;
+  };
 }
 
 export type SparseV2Availability =

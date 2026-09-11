@@ -213,6 +213,10 @@ pub struct ObjectStoreStats {
     /// hot-only / indexed-cold classification.
     pub cold_object_reads: usize,
     pub cold_manifest_reads: usize,
+    pub hot_object_bytes: usize,
+    pub hot_manifest_bytes: usize,
+    pub cold_object_bytes: usize,
+    pub cold_manifest_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -227,6 +231,10 @@ struct StoreCounters {
     inspected_object_bytes: AtomicUsize,
     cold_object_reads: AtomicUsize,
     cold_manifest_reads: AtomicUsize,
+    hot_object_bytes: AtomicUsize,
+    hot_manifest_bytes: AtomicUsize,
+    cold_object_bytes: AtomicUsize,
+    cold_manifest_bytes: AtomicUsize,
 }
 
 /// How one logical read is permitted to resolve its bytes.
@@ -1653,6 +1661,9 @@ impl ObjectStore {
         self.counters
             .cold_object_reads
             .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .cold_object_bytes
+            .fetch_add(bytes.len(), Ordering::Relaxed);
         Ok(Some(bytes))
     }
 
@@ -1679,6 +1690,9 @@ impl ObjectStore {
         self.counters
             .cold_manifest_reads
             .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .cold_manifest_bytes
+            .fetch_add(bytes.len(), Ordering::Relaxed);
         Ok(Some(bytes))
     }
 
@@ -1697,6 +1711,9 @@ impl ObjectStore {
                 .fetch_add(1, Ordering::Relaxed);
             self.counters
                 .inspected_object_bytes
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+            self.counters
+                .hot_object_bytes
                 .fetch_add(bytes.len(), Ordering::Relaxed);
             return Ok(bytes);
         }
@@ -1736,6 +1753,9 @@ impl ObjectStore {
                     found: manifest.workspace_id(),
                 });
             }
+            self.counters
+                .hot_manifest_bytes
+                .fetch_add(bytes.len(), Ordering::Relaxed);
             return Ok(bytes);
         }
         self.cold_manifest_bytes(batch_id)?
@@ -1822,6 +1842,10 @@ impl StoreCounters {
             inspected_object_bytes: self.inspected_object_bytes.load(Ordering::Relaxed),
             cold_object_reads: self.cold_object_reads.load(Ordering::Relaxed),
             cold_manifest_reads: self.cold_manifest_reads.load(Ordering::Relaxed),
+            hot_object_bytes: self.hot_object_bytes.load(Ordering::Relaxed),
+            hot_manifest_bytes: self.hot_manifest_bytes.load(Ordering::Relaxed),
+            cold_object_bytes: self.cold_object_bytes.load(Ordering::Relaxed),
+            cold_manifest_bytes: self.cold_manifest_bytes.load(Ordering::Relaxed),
         }
     }
 }

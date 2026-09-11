@@ -7807,6 +7807,14 @@ impl ShardedHotEngine {
             })
     }
 
+    pub(crate) fn clean_checkpoint_diagnostics(
+        &self,
+    ) -> Option<crate::sync_runtime::SyncCheckpointPublicationDiagnostics> {
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .and_then(|publisher| publisher.last_diagnostics())
+    }
+
     pub(crate) fn wait_for_clean_checkpoint(&self) -> Result<(), EngineError> {
         self.clean_checkpoint_publisher
             .as_ref()

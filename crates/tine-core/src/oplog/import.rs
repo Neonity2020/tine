@@ -6290,6 +6290,46 @@ mod tests {
         runtime: CleanLocalRuntime,
         page_ids: Vec<PageId>,
         database: PathBuf,
+        workspace: WorkspaceId,
+    }
+
+    /// One workspace id per fixture, never a shared constant. The projection-open
+    /// evidence slot these fixtures read through
+    /// `take_projection_open_test_observation` is a process-global map keyed ONLY
+    /// by workspace, and the harness runs these tests concurrently in one process,
+    /// so two fixtures sharing an id race for that slot and one of them consumes
+    /// the other's observation. That is the mechanism behind the single
+    /// `a_parse_config_change_rebuilds_the_clean_genesis_projection` failure that
+    /// never reproduced standalone.
+    fn next_clean_snapshot_workspace() -> WorkspaceId {
+        if let Some(shared) = SHARED_CLEAN_SNAPSHOT_WORKSPACE.with(std::cell::Cell::get) {
+            return shared;
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WorkspaceId::from_uuid(Uuid::from_u128((1u128 << 96) | u128::from(ordinal)))
+    }
+
+    thread_local! {
+        /// Set only inside `sharing_one_clean_snapshot_workspace`.
+        static SHARED_CLEAN_SNAPSHOT_WORKSPACE: std::cell::Cell<Option<WorkspaceId>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Build several fixtures that deliberately agree on one workspace id, for the
+    /// byte-identity tests where the workspace is an INPUT to the derivation under
+    /// test (`ImportIdDerivation::new(workspace_id, …)`) and two fixtures that
+    /// disagreed about it would derive different import ids for identical work.
+    ///
+    /// Nothing built in here may read the projection-open observation slot: that
+    /// slot is keyed by workspace alone, which is the whole reason every other
+    /// fixture gets its own id. Thread-local because libtest gives each test its
+    /// own thread, so a concurrent test never sees this override.
+    fn sharing_one_clean_snapshot_workspace<R>(body: impl FnOnce() -> R) -> R {
+        SHARED_CLEAN_SNAPSHOT_WORKSPACE.set(Some(next_clean_snapshot_workspace()));
+        let built = body();
+        SHARED_CLEAN_SNAPSHOT_WORKSPACE.set(None);
+        built
     }
 
     impl CleanSnapshotFixture {
@@ -6426,7 +6466,7 @@ mod tests {
                 }
             }
 
-            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+            let workspace = next_clean_snapshot_workspace();
             let lineage = LineageDigest::of(b"snapshot-test");
             let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
             let database = root.path().join("clean-projection.sqlite");
@@ -6536,6 +6576,7 @@ mod tests {
                 runtime,
                 page_ids,
                 database,
+                workspace,
             }
         }
 
@@ -6594,11 +6635,11 @@ mod tests {
                 runtime,
                 page_ids,
                 database,
+                workspace,
             } = self;
             drop(graph);
             drop(runtime);
             let graph = Graph::open(&graph_root);
-            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
             let lineage = LineageDigest::of(b"snapshot-test");
             let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
             let archive = _root.path().join("clean-archive");
@@ -6689,6 +6730,7 @@ mod tests {
                 runtime,
                 page_ids,
                 database,
+                workspace,
             }
         }
     }
@@ -6747,7 +6789,7 @@ mod tests {
     #[test]
     fn a_parse_config_change_rebuilds_the_clean_genesis_projection() {
         let fixture = CleanSnapshotFixture::new("parse-config", &["pages/a.md"]);
-        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+        let workspace = fixture.workspace;
         let baseline_directory = fixture
             ._root
             .path()
@@ -7004,10 +7046,54 @@ mod tests {
             .any(|block| block.detail.contains("diagnostic inputs")));
     }
 
+    /// Every fixture owns its workspace id, because the projection-open evidence
+    /// these tests read through `take_projection_open_test_observation` lives in a
+    /// process-global map keyed by workspace alone
+    /// (`PROJECTION_OPEN_TEST_OBSERVATIONS`, `oplog/sqlite.rs`), and tine-core's
+    /// unit tests are one binary running concurrently. When every fixture shared
+    /// `Uuid::from_u128(1)`, two tests opening a projection at the same time raced
+    /// for that one slot and one consumed the other's evidence:
+    /// `a_parse_config_change_rebuilds_the_clean_genesis_projection` failed once
+    /// with `opened-existing` and all rebuild counters at zero, then passed
+    /// standalone and never reproduced — the shape that gets written off as flaky.
+    ///
+    /// A test that genuinely needs two fixtures to agree on a workspace says so
+    /// through `sharing_one_clean_snapshot_workspace`, and must not read that slot.
+    #[test]
+    fn each_clean_snapshot_fixture_owns_its_workspace_id() {
+        let first = CleanSnapshotFixture::new("workspace-identity-first", &["pages/a.md"]);
+        let second = CleanSnapshotFixture::new("workspace-identity-second", &["pages/a.md"]);
+        assert_ne!(
+            first.workspace, second.workspace,
+            "two fixtures sharing a workspace id race for the single process-global \
+             projection-open observation slot"
+        );
+
+        let (left, right) = sharing_one_clean_snapshot_workspace(|| {
+            (
+                CleanSnapshotFixture::new("workspace-identity-shared-left", &["pages/a.md"]),
+                CleanSnapshotFixture::new("workspace-identity-shared-right", &["pages/a.md"]),
+            )
+        });
+        assert_eq!(
+            left.workspace, right.workspace,
+            "the deliberate-sharing scope must actually share"
+        );
+        assert_ne!(
+            left.workspace,
+            CleanSnapshotFixture::new("workspace-identity-after", &["pages/a.md"]).workspace,
+            "the sharing scope must end when its body does"
+        );
+    }
+
     #[test]
     fn identical_sealed_reconciliations_produce_identical_execution_and_observation_bytes_clean() {
-        let left = CleanSnapshotFixture::new("execution-identical-left", &["pages/a.md"]);
-        let right = CleanSnapshotFixture::new("execution-identical-right", &["pages/a.md"]);
+        let (left, right) = sharing_one_clean_snapshot_workspace(|| {
+            (
+                CleanSnapshotFixture::new("execution-identical-left", &["pages/a.md"]),
+                CleanSnapshotFixture::new("execution-identical-right", &["pages/a.md"]),
+            )
+        });
         fs::write(left.graph_root.join("pages/a.md"), b"- changed\n").unwrap();
         fs::write(right.graph_root.join("pages/a.md"), b"- changed\n").unwrap();
 
@@ -7578,7 +7664,7 @@ mod tests {
         let first_path = fixture.graph_root.join("pages/first.md");
         let archive = crate::oplog::ObjectStore::open(
             &fixture._root.path().join("clean-archive/operations"),
-            WorkspaceId::from_uuid(Uuid::from_u128(1)),
+            fixture.workspace,
         )
         .unwrap();
         let changed = |batch_id: BatchId| {
