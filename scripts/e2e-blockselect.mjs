@@ -14,27 +14,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
-import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { resolveTauriDriver, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const G = "/tmp/txdg-bsel-g";
 const LOCAL_APP = path.join(ROOT, "target/release/tine");
-const LOCAL_TAURI_DRIVER = path.resolve(ROOT, "..", ".toolchain", "cargo", "bin", "tauri-driver");
-const CARGO_TAURI_DRIVER = process.env.CARGO_HOME
-  ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver")
-  : null;
 const APP =
   process.env.TINE_APP ||
   (fs.existsSync(LOCAL_APP) ? LOCAL_APP : `${process.env.HOME}/research/tine`);
-const TD =
-  process.env.TAURI_DRIVER ||
-  (CARGO_TAURI_DRIVER && fs.existsSync(CARGO_TAURI_DRIVER)
-    ? CARGO_TAURI_DRIVER
-    : fs.existsSync(LOCAL_TAURI_DRIVER)
-      ? LOCAL_TAURI_DRIVER
-      : "tauri-driver");
+const TD = resolveTauriDriver();
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4444);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4445);
 

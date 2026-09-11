@@ -18,6 +18,34 @@ export async function freeLoopbackPort(excluded = new Set()) {
   }
 }
 
+/**
+ * The one answer to "where is tauri-driver".
+ *
+ * Six journeys had grown five different answers, and three of the five are
+ * wrong in the place all batch work actually happens. Two derived
+ * `<repo>/../.toolchain/cargo/bin/tauri-driver`, which resolves only when the
+ * checkout sits directly under the workspace root -- in an agent worktree it
+ * points at a directory that has never existed, and the journey dies on a bare
+ * `spawn ... ENOENT` that reads like a missing toolchain rather than a wrong
+ * guess. Two more hardcoded one machine's absolute path, which cannot survive
+ * CI or any other host. `scripts/env.sh` already exports `CARGO_HOME` and puts
+ * the binary on `PATH`; nothing needs to reconstruct the location from the
+ * repository's position on disk.
+ *
+ * Resolution order: an explicit `TAURI_DRIVER` override, then the toolchain
+ * `CARGO_HOME` when it really holds the binary, then plain `tauri-driver` for
+ * `PATH`. `src/e2eTauriDriverResolution.test.ts` keeps the count of
+ * journey-local answers at zero.
+ */
+export function resolveTauriDriver(env = process.env, exists = fs.existsSync) {
+  if (env.TAURI_DRIVER) return env.TAURI_DRIVER;
+  if (env.CARGO_HOME) {
+    const fromCargoHome = path.join(env.CARGO_HOME, "bin", "tauri-driver");
+    if (exists(fromCargoHome)) return fromCargoHome;
+  }
+  return "tauri-driver";
+}
+
 export function tauriCapabilities(
   application,
   session = "default",

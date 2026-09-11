@@ -6,13 +6,13 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
-import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { resolveTauriDriver, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP = process.env.TINE_APP || path.join(ROOT, "target/release/tine");
-const TD = process.env.TAURI_DRIVER || path.join(process.env.CARGO_HOME || "/aux/koutecky/logseq/.toolchain/cargo", "bin", "tauri-driver");
+const TD = resolveTauriDriver();
 const WD = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4494);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4495);

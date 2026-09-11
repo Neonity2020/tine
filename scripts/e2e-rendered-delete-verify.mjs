@@ -11,14 +11,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
-import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { resolveTauriDriver, tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const G = "/tmp/txdg-rdv-g";
 const APP = process.env.TINE_APP || path.join(ROOT, "target/release/tine");
-const TD = process.env.TAURI_DRIVER || path.resolve(ROOT, "..", ".toolchain", "cargo", "bin", "tauri-driver");
+const TD = resolveTauriDriver();
 const WEBKIT_DRIVER = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
 
 const FIXTURE = "- 0123456789 abcdefghij\n- bold **marker** and [[Page Link]] end\n";
