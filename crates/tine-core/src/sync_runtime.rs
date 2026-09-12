@@ -26365,6 +26365,27 @@ impl RuntimeActor {
                             "clean shutdown could not flush local projection completions: {error}"
                         ))
                     })?;
+                    // P4a turned the clean-checkpoint worker into an ARCHIVE
+                    // writer: it publishes accepted history cold and then
+                    // unlinks the covered hot names. Before that it only wrote
+                    // disposable checkpoint state, so nothing here had to wait
+                    // for it. Returning Safe while that publication is in
+                    // flight leaves a writer inside the archive after the
+                    // caller believes the runtime is quiescent.
+                    //
+                    // Marker-last ordering keeps every crash prefix
+                    // recoverable, so this is not corruption -- but Safe must
+                    // mean the archive writer stopped too, which is what the
+                    // name promises and what callers act on.
+                    //
+                    // This cannot wedge shutdown. One publication is bounded
+                    // work, and a runtime with no clean-checkpoint publisher
+                    // (Direct mode, or before activation) simply has nothing to
+                    // wait for -- never a refusal, which would have no in-scope
+                    // threat scenario to name.
+                    if let Some(clean) = self.clean.as_mut() {
+                        let _ = clean.runtime.engine_mut().wait_for_clean_checkpoint();
+                    }
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
                 }

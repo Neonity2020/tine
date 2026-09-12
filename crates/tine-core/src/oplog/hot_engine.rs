@@ -7031,7 +7031,7 @@ pub(crate) fn clean_checkpoint_capture_skip_detail(
 /// `sealed_accepted_index` before handing rows back to the engine.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CleanCheckpointStateV6 {
+struct CleanCheckpointState {
     schema_version: u32,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -7084,8 +7084,9 @@ pub(crate) struct CleanCheckpointStateBinding {
 pub(crate) fn clean_checkpoint_state_binding(
     state_bytes: &[u8],
 ) -> Result<CleanCheckpointStateBinding, EngineError> {
-    let (state, trailing): (CleanCheckpointStateV6, &[u8]) = postcard::take_from_bytes(state_bytes)
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    let (state, trailing): (CleanCheckpointState, &[u8]) =
+        postcard::take_from_bytes(state_bytes)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
     if !trailing.is_empty()
         || state.schema_version != CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION
         || postcard::to_allocvec(&state).map_err(|error| EngineError::Archive(error.to_string()))?
@@ -7113,8 +7114,9 @@ pub(crate) fn clean_checkpoint_state_binding(
 pub(crate) fn clean_checkpoint_hot_pin_batches(
     state_bytes: &[u8],
 ) -> Result<BTreeSet<BatchId>, EngineError> {
-    let (state, trailing): (CleanCheckpointStateV6, &[u8]) = postcard::take_from_bytes(state_bytes)
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    let (state, trailing): (CleanCheckpointState, &[u8]) =
+        postcard::take_from_bytes(state_bytes)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
     if !trailing.is_empty()
         || state.schema_version != CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION
         || postcard::to_allocvec(&state).map_err(|error| EngineError::Archive(error.to_string()))?
@@ -9679,7 +9681,7 @@ impl ShardedHotEngine {
         let lazy_genesis = self.lazy_genesis.as_ref().cloned().ok_or_else(|| {
             EngineError::Archive("clean checkpoint capture has no immutable genesis".into())
         })?;
-        let state = CleanCheckpointStateV6 {
+        let state = CleanCheckpointState {
             schema_version: CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION,
             workspace_id: self.workspace_id,
             lineage_digest: self.lineage_digest,
@@ -9793,7 +9795,7 @@ impl ShardedHotEngine {
                 "clean checkpoint restore requires an index-free sequence-zero baseline".into(),
             ));
         }
-        let (state, trailing): (CleanCheckpointStateV6, &[u8]) =
+        let (state, trailing): (CleanCheckpointState, &[u8]) =
             postcard::take_from_bytes(state_bytes)
                 .map_err(|error| EngineError::Archive(error.to_string()))?;
         if !trailing.is_empty()
@@ -32124,7 +32126,7 @@ pub(crate) mod validation_tests {
         );
 
         let source = include_str!("hot_engine.rs");
-        let state = &source[source.find("struct CleanCheckpointStateV6 {").unwrap()
+        let state = &source[source.find("struct CleanCheckpointState {").unwrap()
             ..source
                 .find("pub(crate) struct CleanCheckpointStateBinding")
                 .unwrap()];
@@ -36636,8 +36638,23 @@ pub(crate) mod validation_tests {
             CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 8,
             "changing the checkpoint state representation changes its schema"
         );
+        // The type carries NO version suffix, deliberately. It was named
+        // `CleanCheckpointState` while the constant above said 7 and then 8:
+        // a name that restates a number drifts from it, and the stale name is
+        // what the next reader believes. D-1 gives Managed Storage exactly one
+        // current format, so there is never a second state type to tell apart
+        // and the suffix bought nothing. The version lives in
+        // CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, in one place, where the
+        // assertion above pins it.
+        assert!(
+            !source.contains("struct CleanCheckpointStateV"),
+            "the clean checkpoint state type must not carry a version suffix: D-1 gives \
+             Managed Storage one current format, so the version belongs only to \
+             CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, and a suffixed name drifts from it \
+             (it read V6 at schema 8). Name it `CleanCheckpointState`."
+        );
         let state_start = source
-            .find("struct CleanCheckpointStateV6 {")
+            .find("struct CleanCheckpointState {")
             .expect("checkpoint state section remains present");
         let state_end = source[state_start..]
             .find("\n}\n")

@@ -2243,15 +2243,30 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // reader traversal so the checkpoint worker can derive native candidate
     // frontiers from accepted evidence through E. The adapter's publication
     // method rejects every call; it adds no writer family or write boundary.
-    // Rebaselining v2 P4b adds 25 tuples (509 -> 534), all in
-    // checkpoint_generation.rs: the four identity domains extend the existing
-    // authenticated maps through the disposable checkpoint publisher, and
-    // admission/reopen reads them through a read-only object-store adapter.
-    // The additions are empty roots, shared map reader/writer constructors,
-    // object-store dispatches and their existing error/type paths. The full
-    // multiset was dumped at this head; hot_engine.rs is unchanged, the three
-    // write-crossing families enumerated above are unchanged, and no raw file
-    // mutation or physical projection database boundary is added.
+    // Rebaselining v2 P4b. The manager re-derived both multisets rather than
+    // blessing the delta: 520 tuples at bd75efce, 534 here, so +14 NET --
+    // 18 rows added and 4 removed, the removals being count bumps of the same
+    // call families (`SealedAcceptedIndexWriter::new(` 4 -> 5, and so on).
+    // (The lane's own comment said "25 additions (509 -> 534)"; the substance
+    // was right and the arithmetic was not, which matters because this comment
+    // is what the NEXT reviewer compares against.)
+    //
+    // Every changed row is in checkpoint_generation.rs: the four identity
+    // domains extend the existing authenticated maps through the disposable
+    // checkpoint publisher, and admission/reopen read them through a
+    // read-only object-store adapter. hot_engine.rs is unchanged despite
+    // gaining ~1250 lines, no file enters the surface, and the three
+    // write-crossing families enumerated above are untouched.
+    //
+    // One row deserves naming because a census exists to catch exactly this:
+    // `SealedAcceptedIndexObjectStore::publish_sealed_accepted_object(` enters
+    // the surface for the FIRST time anywhere. It is a publish, so it was
+    // checked rather than waved through. Its two production call sites are the
+    // counting wrapper and the generation publisher writing a content-addressed
+    // StatusRecord into the sealed generation directory before the marker moves
+    // -- disposable checkpoint state inside a write boundary that already
+    // existed, not accepted history, raw files, or the physical projection
+    // database. New call-site family, no new write boundary.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "c67041dfc50dc5bf2c3822ac5a7169c681ee68e6bb0d81e46409f8fbe4b0aaa1",
