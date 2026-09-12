@@ -24356,10 +24356,10 @@ impl RuntimeActor {
         let recovery_checkpoint_diagnostics = {
             let engine = self
                 .clean
-                .as_ref()
+                .as_mut()
                 .expect("recovery retained runtime")
                 .runtime
-                .engine();
+                .engine_mut();
             engine.schedule_clean_checkpoint_bootstrap();
             engine
                 .wait_for_clean_checkpoint()
@@ -24819,10 +24819,10 @@ impl RuntimeActor {
                     self.tick_clean_search_index_build()
                 } else if self
                     .clean
-                    .as_ref()
+                    .as_mut()
                     .expect("clean actor remains installed")
                     .runtime
-                    .engine()
+                    .engine_mut()
                     .schedule_clean_checkpoint_idle()
                 {
                     SyncRuntimeTick::Recovering

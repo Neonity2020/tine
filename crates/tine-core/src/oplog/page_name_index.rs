@@ -17,7 +17,7 @@ use super::{
 pub const EXACT_LOGICAL_PAGE_NAME_BLOB_SCHEMA_VERSION: u32 = 1;
 pub const EXACT_LOGICAL_PAGE_NAME_REF_SCHEMA_VERSION: u32 = 2;
 pub const PAGE_NAME_OWNERSHIP_STORE_SCHEMA_VERSION: u32 = 2;
-pub const PAGE_NAME_OWNERSHIP_RECORD_SCHEMA_VERSION: u32 = 2;
+pub const PAGE_NAME_OWNERSHIP_RECORD_SCHEMA_VERSION: u32 = 3;
 pub const PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION: u32 = 2;
 pub const PAGE_NAME_CATALOG_FRONTIER_SCHEMA_VERSION: u32 = 1;
 pub const PAGE_NAME_CONFLICT_EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -369,6 +369,14 @@ struct EphemeralPageNameOwnershipCheckpointSectionV1 {
     exact_names: BTreeMap<(PageNameKeyDigest, ExactLogicalPageNameRefV1), LogicalPageName>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageNameOwnershipCheckpointPointV1 {
+    key: PageNameKeyDigest,
+    record: PageNameOwnershipRecordV1,
+    exact_names: BTreeMap<ExactLogicalPageNameRefV1, LogicalPageName>,
+}
+
 #[derive(Debug)]
 struct EphemeralPageNameOwnershipCandidateV1 {
     records: BTreeMap<PageNameKeyDigest, PageNameOwnershipRecordV1>,
@@ -456,6 +464,82 @@ impl AuthenticatedPageNameExactStateV1 {
 }
 
 impl EphemeralPageNameOwnershipStateV1 {
+    pub(crate) fn encode_checkpoint_point(
+        &self,
+        key: PageNameKeyDigest,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.checkpoint_point(key)?
+            .map(|point| encode_canonical(&point))
+            .transpose()
+    }
+
+    pub(crate) fn checkpoint_point(
+        &self,
+        key: PageNameKeyDigest,
+    ) -> Result<Option<PageNameOwnershipCheckpointPointV1>, StoreError> {
+        let Some(record) = self.records.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let exact_names = self
+            .exact_names
+            .iter()
+            .filter_map(|((candidate, name_ref), name)| {
+                (*candidate == key).then(|| (name_ref.clone(), name.clone()))
+            })
+            .collect();
+        let point = PageNameOwnershipCheckpointPointV1 {
+            key,
+            record,
+            exact_names,
+        };
+        let mut isolated = Self::default();
+        isolated.install_checkpoint_point(point.clone())?;
+        isolated.validate_checkpoint_shape()?;
+        Ok(Some(point))
+    }
+
+    pub(crate) fn install_encoded_checkpoint_point(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<PageNameKeyDigest, StoreError> {
+        let point: PageNameOwnershipCheckpointPointV1 = decode_canonical(bytes)?;
+        let key = point.key;
+        self.install_checkpoint_point(point)?;
+        Ok(key)
+    }
+
+    pub(crate) fn install_checkpoint_point(
+        &mut self,
+        point: PageNameOwnershipCheckpointPointV1,
+    ) -> Result<(), StoreError> {
+        point.record.validate_shape(point.key)?;
+        if let Some(prior) = self.records.insert(point.key, point.record) {
+            if let Some(occupied) = prior.occupied {
+                self.exact_names.remove(&(point.key, occupied.exact_name));
+            }
+            if let Some(released) = prior.latest_release {
+                self.exact_names
+                    .remove(&(point.key, released.prior_exact_name));
+            }
+        }
+        for (name_ref, name) in point.exact_names {
+            validate_exact_name_ref(point.key, &name_ref, &name)?;
+            self.exact_names.insert((point.key, name_ref), name);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_current(&mut self) {
+        self.records.retain(|_, record| record.occupied().is_some());
+        self.exact_names.retain(|(key, name_ref), _| {
+            self.records.get(key).is_some_and(|record| {
+                record
+                    .occupied()
+                    .is_some_and(|occupied| occupied.exact_name() == name_ref)
+            })
+        });
+    }
+
     /// Encode the exact run-local ownership state as one section of the clean
     /// engine checkpoint. The enclosing checkpoint owns format/versioning;
     /// this seam deliberately reuses the page-name index's canonical codec.
@@ -679,7 +763,7 @@ fn prepare_page_name_transition_core(
     current_pages: &BTreeMap<PageId, Option<PageState>>,
     prospective_pages: &BTreeMap<PageId, Option<PageState>>,
     contains: impl Fn(BatchCausalDot, BatchId) -> bool,
-    frontier_for_batch: impl Fn(BatchId) -> Option<FrontierV2>,
+    _frontier_for_batch: impl Fn(BatchId) -> Option<FrontierV2>,
 ) -> Result<PageNameTransitionCoreCandidateV1, PageNameTransitionError> {
     if deltas.len() > MAX_PAGE_NAME_POINT_BATCH {
         return Err(StoreError::PageNamePointBatchTooLarge {
@@ -748,8 +832,7 @@ fn prepare_page_name_transition_core(
             exact_state_batch: occupied.exact_state_batch,
             exact_state_dot: occupied.exact_state_dot,
             release_fence: None,
-            declared_frontier: frontier_for_batch(occupied.acquisition_batch)
-                .ok_or(StoreError::MalformedPageNameIndex)?,
+            declared_frontier: occupied.declared_frontier.clone(),
         })
     };
     let participant_for_release = |key: PageNameKeyDigest,
@@ -767,8 +850,7 @@ fn prepare_page_name_transition_core(
                 release_batch: released.release_batch,
                 release_dot: released.release_dot,
             }),
-            declared_frontier: frontier_for_batch(released.prior_acquisition_batch)
-                .ok_or(StoreError::MalformedPageNameIndex)?,
+            declared_frontier: released.prior_declared_frontier.clone(),
         })
     };
     let proposed_participant =
@@ -859,6 +941,7 @@ fn prepare_page_name_transition_core(
             occupied.acquisition_dot,
             occupied.exact_state_batch,
             occupied.exact_state_dot,
+            occupied.declared_frontier,
             batch_id,
             causal_dot,
         );
@@ -926,6 +1009,7 @@ fn prepare_page_name_transition_core(
                         existing.acquisition_dot,
                         batch_id,
                         causal_dot,
+                        existing.declared_frontier.clone(),
                     )),
                     records
                         .get(&key)
@@ -980,6 +1064,7 @@ fn prepare_page_name_transition_core(
                 causal_dot,
                 batch_id,
                 causal_dot,
+                declared_frontier.clone(),
             )),
             latest_release,
         )?;
@@ -1201,7 +1286,7 @@ fn validate_exact_name_ref(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PageNameOwnershipOccupiedV1 {
     page_id: PageId,
@@ -1210,6 +1295,7 @@ pub struct PageNameOwnershipOccupiedV1 {
     acquisition_dot: BatchCausalDot,
     exact_state_batch: BatchId,
     exact_state_dot: BatchCausalDot,
+    declared_frontier: FrontierV2,
 }
 
 impl PageNameOwnershipOccupiedV1 {
@@ -1220,6 +1306,7 @@ impl PageNameOwnershipOccupiedV1 {
         acquisition_dot: BatchCausalDot,
         exact_state_batch: BatchId,
         exact_state_dot: BatchCausalDot,
+        declared_frontier: FrontierV2,
     ) -> Self {
         Self {
             page_id,
@@ -1228,6 +1315,7 @@ impl PageNameOwnershipOccupiedV1 {
             acquisition_dot,
             exact_state_batch,
             exact_state_dot,
+            declared_frontier,
         }
     }
 
@@ -1254,9 +1342,13 @@ impl PageNameOwnershipOccupiedV1 {
     pub const fn exact_state_dot(&self) -> BatchCausalDot {
         self.exact_state_dot
     }
+
+    pub const fn declared_frontier(&self) -> &FrontierV2 {
+        &self.declared_frontier
+    }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PageNameOwnershipReleasedV1 {
     prior_page_id: PageId,
@@ -1265,6 +1357,7 @@ pub struct PageNameOwnershipReleasedV1 {
     prior_acquisition_dot: BatchCausalDot,
     prior_exact_state_batch: BatchId,
     prior_exact_state_dot: BatchCausalDot,
+    prior_declared_frontier: FrontierV2,
     release_batch: BatchId,
     release_dot: BatchCausalDot,
 }
@@ -1278,6 +1371,7 @@ impl PageNameOwnershipReleasedV1 {
         prior_acquisition_dot: BatchCausalDot,
         prior_exact_state_batch: BatchId,
         prior_exact_state_dot: BatchCausalDot,
+        prior_declared_frontier: FrontierV2,
         release_batch: BatchId,
         release_dot: BatchCausalDot,
     ) -> Self {
@@ -1288,6 +1382,7 @@ impl PageNameOwnershipReleasedV1 {
             prior_acquisition_dot,
             prior_exact_state_batch,
             prior_exact_state_dot,
+            prior_declared_frontier,
             release_batch,
             release_dot,
         }
@@ -1323,6 +1418,10 @@ impl PageNameOwnershipReleasedV1 {
 
     pub const fn release_dot(&self) -> BatchCausalDot {
         self.release_dot
+    }
+
+    pub const fn prior_declared_frontier(&self) -> &FrontierV2 {
+        &self.prior_declared_frontier
     }
 }
 
@@ -1526,6 +1625,7 @@ mod tests {
                 dot,
                 batch,
                 dot,
+                FrontierV2::new(Vec::new()).unwrap(),
             )),
             None,
         )

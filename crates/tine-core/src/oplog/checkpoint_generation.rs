@@ -35,7 +35,7 @@ use crate::sync_runtime::{
 };
 use tine_storage::sealed_accepted_index::AuthenticatedMapKey;
 
-const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 const CHECKPOINT_DIRECTORY: &str = "clean-open-checkpoint-v2";
 const CHECKPOINT_POINTER: &str = "current";
 const CHECKPOINT_PAYLOAD_NAMES: [&str; 2] = ["payload-a", "payload-b"];
@@ -1064,6 +1064,85 @@ struct RosterRootsWire {
     sequence: SequenceRootWire,
 }
 
+/// The four existing identity-admission domains. The discriminants are part
+/// of the one current checkpoint format and deliberately match no ownership
+/// decision: values are the existing admission evidence encoded by
+/// `hot_engine`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum CheckpointIdentityKind {
+    BlockHome,
+    LogseqUuid,
+    PortablePath,
+    PageName,
+}
+
+impl CheckpointIdentityKind {
+    const ALL: [Self; 4] = [
+        Self::BlockHome,
+        Self::LogseqUuid,
+        Self::PortablePath,
+        Self::PageName,
+    ];
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointIdentityChange {
+    pub(crate) sequence: u64,
+    pub(crate) kind: CheckpointIdentityKind,
+    pub(crate) key: Vec<u8>,
+    pub(crate) value: super::hot_engine::CheckpointIdentityValue,
+    pub(crate) current: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityRootsWire {
+    block_home: IdentityDomainRootsWire,
+    logseq_uuid: IdentityDomainRootsWire,
+    portable_path: IdentityDomainRootsWire,
+    page_name: IdentityDomainRootsWire,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityDomainRootsWire {
+    complete: MapRootWire,
+    current: MapRootWire,
+}
+
+impl Default for IdentityDomainRootsWire {
+    fn default() -> Self {
+        Self {
+            complete: map_root_to_wire(
+                tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty(),
+            ),
+            current: map_root_to_wire(
+                tine_storage::sealed_accepted_index::AuthenticatedMapRootV1::empty(),
+            ),
+        }
+    }
+}
+
+impl IdentityRootsWire {
+    fn domain(&self, kind: CheckpointIdentityKind) -> &IdentityDomainRootsWire {
+        match kind {
+            CheckpointIdentityKind::BlockHome => &self.block_home,
+            CheckpointIdentityKind::LogseqUuid => &self.logseq_uuid,
+            CheckpointIdentityKind::PortablePath => &self.portable_path,
+            CheckpointIdentityKind::PageName => &self.page_name,
+        }
+    }
+
+    fn domain_mut(&mut self, kind: CheckpointIdentityKind) -> &mut IdentityDomainRootsWire {
+        match kind {
+            CheckpointIdentityKind::BlockHome => &mut self.block_home,
+            CheckpointIdentityKind::LogseqUuid => &mut self.logseq_uuid,
+            CheckpointIdentityKind::PortablePath => &mut self.portable_path,
+            CheckpointIdentityKind::PageName => &mut self.page_name,
+        }
+    }
+}
+
 fn map_root_to_wire(
     root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
 ) -> MapRootWire {
@@ -1148,10 +1227,73 @@ struct CheckpointPayloadV2 {
     roster_roots: RosterRootsWire,
     covered_object_root: MapRootWire,
     document_change_root: MapRootWire,
+    identity_roots: IdentityRootsWire,
+    identity_publish_work: IdentityPublishWork,
     capture_work: u64,
     document_roster: MapRootWire,
     image_work: CheckpointImageWork,
     document_dependencies: Vec<DocumentDependencies>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdentityPublishWork {
+    pub(crate) changed_records: u64,
+    pub(crate) map_node_reads: u64,
+    pub(crate) map_node_writes: u64,
+    pub(crate) value_writes: u64,
+}
+
+struct IdentityPublishCountingStore<'a, S> {
+    inner: &'a mut S,
+    map_node_reads: AtomicUsize,
+    map_node_writes: u64,
+    value_writes: u64,
+}
+
+impl<S> tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
+    for IdentityPublishCountingStore<'_, S>
+where
+    S: tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore,
+{
+    fn read_sealed_accepted_object(
+        &self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+    {
+        if kind == tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::MapNode {
+            self.map_node_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore::read_sealed_accepted_object(
+            &*self.inner,
+            kind,
+            address,
+        )
+    }
+
+    fn publish_sealed_accepted_object(
+        &mut self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+        bytes: &[u8],
+    ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+        match kind {
+            tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::MapNode => {
+                self.map_node_writes = self.map_node_writes.saturating_add(1);
+            }
+            tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::StatusRecord => {
+                self.value_writes = self.value_writes.saturating_add(1);
+            }
+            _ => {}
+        }
+        tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore::publish_sealed_accepted_object(
+            &mut *self.inner,
+            kind,
+            address,
+            bytes,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1505,6 +1647,7 @@ where
         mut sequence_root,
         mut covered_object_root,
         mut document_change_root,
+        mut identity_roots,
     ) = match predecessor {
         Some((sequence, payload)) => {
             if payload.schema_version != CHECKPOINT_SCHEMA_VERSION
@@ -1526,6 +1669,7 @@ where
                 roots.sequence,
                 map_root_from_wire(payload.covered_object_root)?,
                 map_root_from_wire(payload.document_change_root)?,
+                payload.identity_roots,
             )
         }
         None => {
@@ -1538,6 +1682,7 @@ where
                 AcceptedSequenceRootV2::empty(),
                 AuthenticatedMapRootV1::empty(),
                 AuthenticatedMapRootV1::empty(),
+                IdentityRootsWire::default(),
             )
         }
     };
@@ -1592,6 +1737,65 @@ where
                 .map_err(|error| error.to_string())?;
         }
     }
+    let changed_records = u64::try_from(capture.identity_changes.len())
+        .map_err(|_| "identity change count exceeds u64")?;
+    let mut identity_store = IdentityPublishCountingStore {
+        inner: &mut *store,
+        map_node_reads: AtomicUsize::new(0),
+        map_node_writes: 0,
+        value_writes: 0,
+    };
+    let mut previous_change = None;
+    for change in &capture.identity_changes {
+        if (change.sequence <= capture.base_sequence
+            && !(capture.base_sequence == 0 && change.sequence == 0))
+            || change.sequence > sequence
+            || previous_change.is_some_and(|previous| previous > change.sequence)
+        {
+            return Err("clean checkpoint identity delta is outside its accepted tail".into());
+        }
+        previous_change = Some(change.sequence);
+        let key = AuthenticatedMapKey::new(&change.key).map_err(|error| error.to_string())?;
+        // Encoding belongs to the disposable publisher, not the actor that
+        // accepted the change. Capture carries only a bounded typed delta.
+        let value_bytes = change.value.encode_canonical()?;
+        let value = ContentDigest::of(&value_bytes);
+        tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore::publish_sealed_accepted_object(
+            &mut identity_store,
+            tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::StatusRecord,
+            value,
+            &value_bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        let domain = identity_roots.domain_mut(change.kind);
+        let complete = map_root_from_wire(domain.complete.clone())?;
+        let current = map_root_from_wire(domain.current.clone())?;
+        let mut writer = tine_storage::sealed_accepted_index::SealedAcceptedIndexWriter::new(
+            &mut identity_store,
+        );
+        let complete = writer
+            .upsert_map(complete, key, value)
+            .map_err(|error| error.to_string())?;
+        let current = if change.current {
+            writer
+                .upsert_map(current, key, value)
+                .map_err(|error| error.to_string())?
+        } else {
+            writer
+                .remove_map(current, key)
+                .map_err(|error| error.to_string())?
+        };
+        domain.complete = map_root_to_wire(complete);
+        domain.current = map_root_to_wire(current);
+    }
+    let identity_publish_work = IdentityPublishWork {
+        changed_records,
+        map_node_reads: u64::try_from(identity_store.map_node_reads.load(Ordering::Relaxed))
+            .map_err(|_| "identity map read count exceeds u64")?,
+        map_node_writes: identity_store.map_node_writes,
+        value_writes: identity_store.value_writes,
+    };
+    drop(identity_store);
     let roots = tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2 {
         batch_map,
         status_map,
@@ -1647,6 +1851,8 @@ where
         },
         covered_object_root: map_root_to_wire(covered_object_root),
         document_change_root: map_root_to_wire(document_change_root),
+        identity_roots,
+        identity_publish_work,
         capture_work: capture.capture_work,
         document_roster: map_root_to_wire(document_roster),
         image_work,
@@ -1762,6 +1968,11 @@ fn validate_checkpoint_payload_metadata(
         || payload.recovery_fence.floor_policy.live_size_multiplier == 0
     {
         return Err("checkpoint payload publication binding is invalid".into());
+    }
+    for kind in CheckpointIdentityKind::ALL {
+        let domain = payload.identity_roots.domain(kind);
+        map_root_from_wire(domain.complete.clone())?;
+        map_root_from_wire(domain.current.clone())?;
     }
     if !payload
         .document_dependencies
@@ -1932,6 +2143,10 @@ fn floor_candidate_for_document(
             roots: roots_from_wire(payload.roster_roots.clone())?,
             covered_object_root: map_root_from_wire(payload.covered_object_root.clone())?,
             document_change_root: map_root_from_wire(payload.document_change_root.clone())?,
+            identity_history: Arc::new(SealedIdentityHistory::new(
+                SealedGenerationDirectory::open(directory)?,
+                payload.identity_roots.clone(),
+            )),
             sequence_enumerations: AtomicUsize::new(0),
         };
         if let Some(candidate) = history.document_dependencies_at_or_before(
@@ -2268,6 +2483,8 @@ fn cleanup_unreferenced_document_objects(store: &ObjectStore) -> Result<(), Stri
 struct PublishedCheckpoint {
     sequence: u64,
     documents: Option<Arc<CleanCheckpointDocuments>>,
+    identities: Arc<SealedIdentityHistory>,
+    identity_publish_work: IdentityPublishWork,
     diagnostics: SyncCheckpointPublicationDiagnostics,
 }
 
@@ -2476,9 +2693,16 @@ fn publish_capture_with_predecessor(
             })
         })
         .transpose()?;
+    let published_payload: CheckpointPayloadV2 = decode_canonical(&payload_bytes)?;
+    let identities = Arc::new(SealedIdentityHistory::new(
+        SealedGenerationDirectory::open(&directory)?,
+        published_payload.identity_roots,
+    ));
     Ok(PublishedCheckpoint {
         sequence,
         documents,
+        identities,
+        identity_publish_work: published_payload.identity_publish_work,
         diagnostics: SyncCheckpointPublicationDiagnostics {
             measurement_sequence,
             latest_acceptance_utc_ms,
@@ -2609,6 +2833,195 @@ pub(crate) struct GenerationOpenWork {
     pub(crate) covered_sequence_enumerations: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IdentityIndexWork {
+    pub(crate) point_lookups: usize,
+    pub(crate) map_node_reads: usize,
+    pub(crate) value_reads: usize,
+    pub(crate) bytes_read: usize,
+    pub(crate) current_root_enumerations: usize,
+    pub(crate) current_rows_enumerated: usize,
+}
+
+#[derive(Default)]
+struct IdentityIndexCounters {
+    point_lookups: AtomicUsize,
+    map_node_reads: AtomicUsize,
+    value_reads: AtomicUsize,
+    bytes_read: AtomicUsize,
+    current_root_enumerations: AtomicUsize,
+    current_rows_enumerated: AtomicUsize,
+}
+
+struct IdentityCountingStore<'a> {
+    directory: &'a SealedGenerationDirectory,
+    counters: &'a IdentityIndexCounters,
+}
+
+impl tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore
+    for IdentityCountingStore<'_>
+{
+    fn read_sealed_accepted_object(
+        &self,
+        kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        address: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+    {
+        let bytes = self.directory.read_sealed_accepted_object(kind, address)?;
+        if let Some(bytes) = bytes.as_ref() {
+            self.counters
+                .bytes_read
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+            match kind {
+                tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::MapNode => {
+                    self.counters.map_node_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::StatusRecord => {
+                    self.counters.value_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn publish_sealed_accepted_object(
+        &mut self,
+        _kind: tine_storage::sealed_accepted_index::SealedAcceptedObjectKind,
+        _address: ContentDigest,
+        _bytes: &[u8],
+    ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+        Err(
+            tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Store(
+                "sealed identity generation is read-only".into(),
+            ),
+        )
+    }
+}
+
+/// Four typed roots over the shared sealed authenticated-map implementation.
+/// The complete roots answer released/history points; the current roots alone
+/// may be enumerated to rebuild O(G+O) resident claims.
+pub(crate) struct SealedIdentityHistory {
+    directory: SealedGenerationDirectory,
+    roots: IdentityRootsWire,
+    counters: IdentityIndexCounters,
+}
+
+impl SealedIdentityHistory {
+    fn new(directory: SealedGenerationDirectory, roots: IdentityRootsWire) -> Self {
+        Self {
+            directory,
+            roots,
+            counters: IdentityIndexCounters::default(),
+        }
+    }
+
+    fn root(
+        &self,
+        kind: CheckpointIdentityKind,
+        current: bool,
+    ) -> Result<tine_storage::sealed_accepted_index::AuthenticatedMapRootV1, String> {
+        let roots = self.roots.domain(kind);
+        map_root_from_wire(if current {
+            roots.current.clone()
+        } else {
+            roots.complete.clone()
+        })
+    }
+
+    fn value_bytes(&self, address: ContentDigest) -> Result<Vec<u8>, String> {
+        let store = IdentityCountingStore {
+            directory: &self.directory,
+            counters: &self.counters,
+        };
+        let bytes = tine_storage::sealed_accepted_index::SealedAcceptedIndexObjectStore::read_sealed_accepted_object(
+            &store,
+                tine_storage::sealed_accepted_index::SealedAcceptedObjectKind::StatusRecord,
+                address,
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "sealed identity value is missing".to_owned())?;
+        if ContentDigest::of(&bytes) != address {
+            return Err("sealed identity value address differs".into());
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn point(
+        &self,
+        kind: CheckpointIdentityKind,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.counters.point_lookups.fetch_add(1, Ordering::Relaxed);
+        let key = AuthenticatedMapKey::new(key).map_err(|error| error.to_string())?;
+        let store = IdentityCountingStore {
+            directory: &self.directory,
+            counters: &self.counters,
+        };
+        let address = tine_storage::sealed_accepted_index::SealedAcceptedIndexReader::new(&store)
+            .map_value(self.root(kind, false)?, key)
+            .map_err(|error| error.to_string())?;
+        address.map(|address| self.value_bytes(address)).transpose()
+    }
+
+    pub(crate) fn current_rows(
+        &self,
+        kind: CheckpointIdentityKind,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        self.counters
+            .current_root_enumerations
+            .fetch_add(1, Ordering::Relaxed);
+        let root = self.root(kind, true)?;
+        let store = IdentityCountingStore {
+            directory: &self.directory,
+            counters: &self.counters,
+        };
+        let reader = tine_storage::sealed_accepted_index::SealedAcceptedIndexReader::new(&store);
+        let mut pending = root.root.into_iter().collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(usize::try_from(root.count).unwrap_or(0));
+        while let Some(link) = pending.pop() {
+            let node = reader
+                .read_map_node(link)
+                .map_err(|error| error.to_string())?;
+            pending.extend(node.left);
+            pending.extend(node.right);
+            rows.push((
+                node.key.as_slice().to_vec(),
+                self.value_bytes(node.value_digest)?,
+            ));
+            if rows.len() > usize::try_from(root.count).unwrap_or(usize::MAX) {
+                return Err("sealed identity current root exceeds its count".into());
+            }
+        }
+        if rows.len() != usize::try_from(root.count).map_err(|_| "identity count exceeds usize")? {
+            return Err("sealed identity current root count differs".into());
+        }
+        rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        self.counters
+            .current_rows_enumerated
+            .fetch_add(rows.len(), Ordering::Relaxed);
+        Ok(rows)
+    }
+
+    pub(crate) fn work(&self) -> IdentityIndexWork {
+        IdentityIndexWork {
+            point_lookups: self.counters.point_lookups.load(Ordering::Relaxed),
+            map_node_reads: self.counters.map_node_reads.load(Ordering::Relaxed),
+            value_reads: self.counters.value_reads.load(Ordering::Relaxed),
+            bytes_read: self.counters.bytes_read.load(Ordering::Relaxed),
+            current_root_enumerations: self
+                .counters
+                .current_root_enumerations
+                .load(Ordering::Relaxed),
+            current_rows_enumerated: self
+                .counters
+                .current_rows_enumerated
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Point-addressable covered accepted history.  The roots are qualified by the
 /// marker-selected generation; ordinary consumers never enumerate the covered
 /// sequence or retain one row per lifetime batch.
@@ -2617,6 +3030,7 @@ pub(crate) struct SealedAcceptedHistory {
     roots: tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2,
     covered_object_root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
     document_change_root: tine_storage::sealed_accepted_index::AuthenticatedMapRootV1,
+    identity_history: Arc<SealedIdentityHistory>,
     sequence_enumerations: AtomicUsize,
 }
 
@@ -2857,6 +3271,10 @@ impl SealedAcceptedHistory {
     pub(crate) fn roots(&self) -> tine_storage::sealed_accepted_index::SealedAcceptedIndexRootsV2 {
         self.roots
     }
+
+    pub(crate) fn identity_history(&self) -> Arc<SealedIdentityHistory> {
+        Arc::clone(&self.identity_history)
+    }
 }
 
 pub(crate) struct CleanCheckpointDocuments {
@@ -3051,6 +3469,13 @@ fn open_checkpoint_impl(
             Err(error) => return Ok(invalid(error)),
         },
         document_change_root,
+        identity_history: Arc::new(SealedIdentityHistory::new(
+            match SealedGenerationDirectory::open(&directory) {
+                Ok(directory) => directory,
+                Err(error) => return Err(CleanCheckpointOpenError::Store(error)),
+            },
+            payload.identity_roots.clone(),
+        )),
         sequence_enumerations: AtomicUsize::new(0),
     });
     if generation.sequence != 0 {
@@ -3184,6 +3609,8 @@ struct PublisherInner {
     durable_sequence: AtomicU64,
     published_documents: Mutex<BTreeMap<DocumentId, DocumentDependencies>>,
     current_documents: Mutex<Option<Arc<CleanCheckpointDocuments>>>,
+    current_identities: Mutex<Option<Arc<SealedIdentityHistory>>>,
+    last_identity_publish_work: Mutex<IdentityPublishWork>,
     last_diagnostics: Mutex<Option<SyncCheckpointPublicationDiagnostics>>,
     elevated_rewrite_observed: AtomicBool,
     rebuild_from_genesis: AtomicBool,
@@ -3263,6 +3690,7 @@ impl CleanCheckpointPublisher {
         durable_sequence: u64,
         published_documents: BTreeMap<DocumentId, DocumentDependencies>,
         current_documents: Option<Arc<CleanCheckpointDocuments>>,
+        current_identities: Option<Arc<SealedIdentityHistory>>,
     ) -> Self {
         #[cfg(test)]
         record_publisher_open(store.root_path());
@@ -3279,6 +3707,8 @@ impl CleanCheckpointPublisher {
                 durable_sequence: AtomicU64::new(durable_sequence),
                 published_documents: Mutex::new(published_documents),
                 current_documents: Mutex::new(current_documents),
+                current_identities: Mutex::new(current_identities),
+                last_identity_publish_work: Mutex::new(IdentityPublishWork::default()),
                 last_diagnostics: Mutex::new(None),
                 elevated_rewrite_observed: AtomicBool::new(false),
                 rebuild_from_genesis: AtomicBool::new(false),
@@ -3419,6 +3849,23 @@ impl CleanCheckpointPublisher {
             .map(Option::flatten)
     }
 
+    pub(crate) fn current_identity_history(&self) -> Option<Arc<SealedIdentityHistory>> {
+        self.inner
+            .current_identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+    }
+
+    pub(crate) fn last_identity_publish_work(&self) -> IdentityPublishWork {
+        *self
+            .inner
+            .last_identity_publish_work
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn wait_for_idle(&self) -> Result<(), String> {
         let mut state = self
             .inner
@@ -3510,6 +3957,15 @@ fn publisher_loop(inner: Arc<PublisherInner>, mut capture: CleanCheckpointCaptur
                         );
                     }
                 }
+                *inner
+                    .current_identities
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(published.identities);
+                *inner
+                    .last_identity_publish_work
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    published.identity_publish_work;
                 *inner
                     .last_diagnostics
                     .lock()
@@ -3619,6 +4075,248 @@ mod tests {
             }
             self.objects.push((kind, address, bytes.to_vec()));
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct IdentityMeasureStore {
+        objects: BTreeMap<(u8, ContentDigest), Vec<u8>>,
+        map_reads: std::cell::Cell<usize>,
+        value_reads: std::cell::Cell<usize>,
+        bytes_read: std::cell::Cell<usize>,
+    }
+
+    impl IdentityMeasureStore {
+        fn snapshot(&self) -> (usize, usize, usize) {
+            (
+                self.map_reads.get(),
+                self.value_reads.get(),
+                self.bytes_read.get(),
+            )
+        }
+    }
+
+    impl SealedAcceptedIndexObjectStore for IdentityMeasureStore {
+        fn read_sealed_accepted_object(
+            &self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+        ) -> Result<Option<Vec<u8>>, tine_storage::sealed_accepted_index::SealedAcceptedIndexError>
+        {
+            let bytes = self
+                .objects
+                .get(&(sealed_kind_code(kind), address))
+                .cloned();
+            if let Some(bytes) = bytes.as_ref() {
+                self.bytes_read
+                    .set(self.bytes_read.get().saturating_add(bytes.len()));
+                match kind {
+                    SealedAcceptedObjectKind::MapNode => {
+                        self.map_reads.set(self.map_reads.get().saturating_add(1));
+                    }
+                    SealedAcceptedObjectKind::StatusRecord => {
+                        self.value_reads
+                            .set(self.value_reads.get().saturating_add(1));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(bytes)
+        }
+
+        fn publish_sealed_accepted_object(
+            &mut self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+            bytes: &[u8],
+        ) -> Result<(), tine_storage::sealed_accepted_index::SealedAcceptedIndexError> {
+            let key = (sealed_kind_code(kind), address);
+            if let Some(existing) = self.objects.get(&key) {
+                if existing != bytes {
+                    return Err(
+                        tine_storage::sealed_accepted_index::SealedAcceptedIndexError::Corrupt(
+                            "same identity measurement address has different bytes".into(),
+                        ),
+                    );
+                }
+            } else {
+                self.objects.insert(key, bytes.to_vec());
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct IdentityPointSample {
+        micros: u128,
+        map_reads: usize,
+        value_reads: usize,
+        bytes_read: usize,
+        allocation_calls: usize,
+        allocation_bytes: usize,
+    }
+
+    fn identity_percentile(mut values: Vec<u128>, percentile: f64) -> u128 {
+        values.sort_unstable();
+        let index = ((values.len() as f64 - 1.0) * percentile).round() as usize;
+        values[index]
+    }
+
+    fn measure_identity_point(
+        store: &IdentityMeasureStore,
+        root: AuthenticatedMapRootV1,
+        key: AuthenticatedMapKey,
+    ) -> IdentityPointSample {
+        let before = store.snapshot();
+        let started = Instant::now();
+        let (value, (allocation_calls, allocation_bytes)) =
+            crate::sync_runtime::tests::c7b_alloc::measure_thread(|| {
+                let reader = SealedAcceptedIndexReader::new(store);
+                let address = reader.map_value(root, key).unwrap();
+                address.map(|address| {
+                    store
+                        .read_sealed_accepted_object(
+                            SealedAcceptedObjectKind::StatusRecord,
+                            address,
+                        )
+                        .unwrap()
+                        .expect("present identity value")
+                })
+            });
+        std::hint::black_box(value);
+        let micros = started.elapsed().as_micros();
+        let after = store.snapshot();
+        IdentityPointSample {
+            micros,
+            map_reads: after.0 - before.0,
+            value_reads: after.1 - before.1,
+            bytes_read: after.2 - before.2,
+            allocation_calls,
+            allocation_bytes,
+        }
+    }
+
+    /// P4b's explicit synthetic qualification matrix. It uses the exact shared
+    /// authenticated-map reader and production-shaped value sizes, but no test
+    /// corpus. The identity layer deliberately has no resident value cache:
+    /// every cold/warm lookup is one cache miss and remains bounded by the
+    /// authenticated path. Run in release mode and preserve the report.
+    #[test]
+    #[ignore = "P4b 1k/10k/50k identity point-read measurement; run explicitly in release"]
+    fn generation_identity_point_measurement() {
+        const SIZES: [usize; 3] = [1_000, 10_000, 50_000];
+        const WARM_ROUNDS: usize = 31;
+        const MAPS: [(&str, usize); 4] = [
+            ("block_home", 160),
+            ("logseq_uuid", 192),
+            ("portable_path", 320),
+            ("page_name", 512),
+        ];
+
+        for (map_name, value_len) in MAPS {
+            let mut store = IdentityMeasureStore::default();
+            let mut complete = AuthenticatedMapRootV1::empty();
+            let mut current = AuthenticatedMapRootV1::empty();
+            let mut points = BTreeMap::new();
+            let mut current_key = None;
+            let mut released_key = None;
+            for ordinal in 0..SIZES[SIZES.len() - 1] {
+                let mut key_material = format!("p4b/{map_name}/{ordinal}").into_bytes();
+                let key_digest = ContentDigest::of(&key_material);
+                let key = AuthenticatedMapKey::new(&key_digest.as_bytes()[..16]).unwrap();
+                key_material.resize(value_len, (ordinal % 251) as u8);
+                let value_digest = ContentDigest::of(&key_material);
+                store
+                    .publish_sealed_accepted_object(
+                        SealedAcceptedObjectKind::StatusRecord,
+                        value_digest,
+                        &key_material,
+                    )
+                    .unwrap();
+                let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+                complete = writer.upsert_map(complete, key, value_digest).unwrap();
+                if ordinal % 2 == 0 {
+                    current = writer.upsert_map(current, key, value_digest).unwrap();
+                    current_key = Some(key);
+                } else {
+                    released_key = Some(key);
+                }
+                let count = ordinal + 1;
+                if SIZES.contains(&count) {
+                    points.insert(
+                        count,
+                        (
+                            complete,
+                            current,
+                            current_key.unwrap(),
+                            released_key.unwrap(),
+                        ),
+                    );
+                }
+            }
+
+            for size in SIZES {
+                let (complete, current, current_key, released_key) = points[&size];
+                let absent_digest =
+                    ContentDigest::of(format!("p4b/{map_name}/{size}/absent").as_bytes());
+                let absent_key = AuthenticatedMapKey::new(&absent_digest.as_bytes()[..16]).unwrap();
+                for (class, root, key, expected_value_reads) in [
+                    ("current", current, current_key, 1),
+                    ("released", complete, released_key, 1),
+                    ("absent", complete, absent_key, 0),
+                ] {
+                    let cold = measure_identity_point(&store, root, key);
+                    let warm = (0..WARM_ROUNDS)
+                        .map(|_| measure_identity_point(&store, root, key))
+                        .collect::<Vec<_>>();
+                    assert_eq!(cold.value_reads, expected_value_reads);
+                    assert!(cold.map_reads > 0 && cold.map_reads <= 64);
+                    assert!(warm.iter().all(|sample| {
+                        sample.value_reads == expected_value_reads
+                            && sample.map_reads > 0
+                            && sample.map_reads <= 64
+                    }));
+                    let warm_p50_micros = identity_percentile(
+                        warm.iter().map(|sample| sample.micros).collect(),
+                        0.50,
+                    );
+                    let warm_p99_micros = identity_percentile(
+                        warm.iter().map(|sample| sample.micros).collect(),
+                        0.99,
+                    );
+                    let warm_p99_reads = identity_percentile(
+                        warm.iter().map(|sample| sample.map_reads as u128).collect(),
+                        0.99,
+                    );
+                    let warm_p99_bytes = identity_percentile(
+                        warm.iter()
+                            .map(|sample| sample.bytes_read as u128)
+                            .collect(),
+                        0.99,
+                    );
+                    let warm_p99_allocations = identity_percentile(
+                        warm.iter()
+                            .map(|sample| sample.allocation_calls as u128)
+                            .collect(),
+                        0.99,
+                    );
+                    let warm_p99_allocation_bytes = identity_percentile(
+                        warm.iter()
+                            .map(|sample| sample.allocation_bytes as u128)
+                            .collect(),
+                        0.99,
+                    );
+                    println!(
+                        "P4BMEASURE\tmap={map_name}\tkeys={size}\tclass={class}\tcache_entries=0\tcold_cache_misses=1\tcold_map_reads={}\tcold_value_reads={}\tcold_bytes={}\tcold_allocations={}\tcold_allocation_bytes={}\tcold_micros={}\twarm_cache_misses=1\twarm_p50_micros={warm_p50_micros}\twarm_p99_micros={warm_p99_micros}\twarm_p99_map_reads={warm_p99_reads}\twarm_p99_bytes={warm_p99_bytes}\twarm_p99_allocations={warm_p99_allocations}\twarm_p99_allocation_bytes={warm_p99_allocation_bytes}\trounds={WARM_ROUNDS}",
+                        cold.map_reads,
+                        cold.value_reads,
+                        cold.bytes_read,
+                        cold.allocation_calls,
+                        cold.allocation_bytes,
+                        cold.micros,
+                    );
+                }
+            }
         }
     }
 
@@ -5963,6 +6661,7 @@ mod tests {
                 canonical_causal_clock: vec![(peer, 7)],
             }],
             required_objects: BTreeSet::from([digest(0x91)]),
+            identity_changes: Vec::new(),
             capture_work: 3,
             documents: None,
         };
@@ -6012,6 +6711,7 @@ mod tests {
             state_bytes: b"bounded generation".to_vec(),
             accepted_rows: rows,
             required_objects: BTreeSet::new(),
+            identity_changes: Vec::new(),
             capture_work: 0,
             documents: None,
         };
@@ -6057,6 +6757,7 @@ mod tests {
                 canonical_causal_clock: vec![(peer, 7)],
             }],
             required_objects: BTreeSet::from([digest(0x91)]),
+            identity_changes: Vec::new(),
             capture_work: 3,
             documents: None,
         };
@@ -6084,6 +6785,7 @@ mod tests {
                 canonical_causal_clock: vec![(peer, 8)],
             }],
             required_objects: BTreeSet::from([digest(0x92)]),
+            identity_changes: Vec::new(),
             capture_work: 4,
             documents: None,
         };
@@ -6119,7 +6821,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let workspace = crate::oplog::WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xa564));
         let store = ObjectStore::open(&root.join("archive"), workspace).unwrap();
-        let publisher = CleanCheckpointPublisher::new(store, 0, BTreeMap::new(), None);
+        let publisher = CleanCheckpointPublisher::new(store, 0, BTreeMap::new(), None, None);
         let peer = CausalPeerId::from_key(WriterIncarnationId::from_uuid(uuid::Uuid::from_bytes(
             [0x44; 16],
         )));
@@ -6145,6 +6847,7 @@ mod tests {
             state_bytes: Vec::new(),
             accepted_rows: vec![row; CLEAN_CHECKPOINT_LAG_MAX as usize + 1],
             required_objects: BTreeSet::new(),
+            identity_changes: Vec::new(),
             capture_work: 0,
             documents: None,
         });
@@ -6181,6 +6884,7 @@ mod tests {
             state_bytes: state.to_vec(),
             accepted_rows: Vec::new(),
             required_objects: BTreeSet::new(),
+            identity_changes: Vec::new(),
             capture_work: 0,
             documents: None,
         }

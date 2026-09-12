@@ -8053,7 +8053,7 @@ fn checkpoint_image_materialization_avoids_baseline_capsule_decode() {
         drop(handle);
 
         let open_request = reopen_request(&fixture.request);
-        let resources = open_clean_runtime_resources(&open_request)
+        let mut resources = open_clean_runtime_resources(&open_request)
             .unwrap()
             .expect("baseline read fixture reopens");
         let managed_path = ManagedPath::parse(path.to_owned()).unwrap();
@@ -8067,7 +8067,7 @@ fn checkpoint_image_materialization_avoids_baseline_capsule_decode() {
             .pop()
             .expect("reopened projection contains the baseline page");
         let page_id = page_row.page_id;
-        let engine = resources.runtime.engine();
+        let engine = resources.runtime.engine_mut();
         engine.wait_for_clean_checkpoint().unwrap();
         assert!(
             engine
@@ -31994,10 +31994,11 @@ fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equi
 // These are observational RECEIPTS (release-only, env-bounded, `#[ignore]`d),
 // written for the repro phase and kept as probes. The capacity they originally
 // demonstrated was REMOVED by the A4 fix (see A4-fix-dossier.md and
-// RECEIPT-repro.md): the four run-local identity maps (page names, portable
-// paths, block claims, Logseq claims) now simply grow with lifetime-distinct
-// identities, bounded by archive rebaselining (SPEC-A A5 decision block). The
-// fast guards for the fixed behavior live in
+// RECEIPT-repro.md): before a clean generation, the four run-local identity
+// domains hold current claims plus their accepted recent overlay. Landing P4b
+// moves complete/released evidence into sealed generation point roots and
+// retires the covered overlay after marker-last publication, so resident state
+// no longer grows with lifetime-distinct identities. The fast guards live in
 // `crates/tine-core/src/oplog/hot_engine_integration_tests.rs`.
 // ---------------------------------------------------------------------------
 

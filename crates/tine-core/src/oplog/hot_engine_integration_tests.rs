@@ -8873,9 +8873,11 @@ fn conflict_backlog_reseed_does_not_rebuild_the_conflict_history_index() {
 // block-claim member refused only at ACCEPTANCE — after the drain had
 // published the manifest — turning a reported save into a permanently
 // unopenable store. No refusal in the family ever named an in-scope threat
-// scenario (I-8), so the fix REMOVED all four caps; the maps grow with
-// lifetime-distinct identities, bounded by archive rebaselining (SPEC-A A5
-// decision block). See A4-fix-dossier.md and RECEIPT-repro.md.
+// scenario (I-8), so the fix REMOVED all four caps. Before a generation, the
+// recent overlay may exceed the former cap; after a generation, current claims
+// plus the recent overlay remain resident while lifetime-distinct evidence is
+// point-addressable in sealed roots. See A4-fix-dossier.md and
+// RECEIPT-repro.md.
 //
 // The tests below guard the FIXED behavior by driving every path past the
 // removed capacity value.

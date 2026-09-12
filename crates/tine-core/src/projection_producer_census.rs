@@ -2243,9 +2243,18 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // reader traversal so the checkpoint worker can derive native candidate
     // frontiers from accepted evidence through E. The adapter's publication
     // method rejects every call; it adds no writer family or write boundary.
+    // Rebaselining v2 P4b adds 25 tuples (509 -> 534), all in
+    // checkpoint_generation.rs: the four identity domains extend the existing
+    // authenticated maps through the disposable checkpoint publisher, and
+    // admission/reopen reads them through a read-only object-store adapter.
+    // The additions are empty roots, shared map reader/writer constructors,
+    // object-store dispatches and their existing error/type paths. The full
+    // multiset was dumped at this head; hot_engine.rs is unchanged, the three
+    // write-crossing families enumerated above are unchanged, and no raw file
+    // mutation or physical projection database boundary is added.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "be4f0b4411e9f53cff752511f9645c54c3f9a9cf83a803db4beb6c4f0a326352",
+        "c67041dfc50dc5bf2c3822ac5a7169c681ee68e6bb0d81e46409f8fbe4b0aaa1",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

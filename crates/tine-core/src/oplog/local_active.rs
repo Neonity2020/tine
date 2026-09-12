@@ -826,6 +826,10 @@ impl CleanLocalRuntime {
         &self.engine
     }
 
+    pub(crate) fn engine_mut(&mut self) -> &mut ShardedHotEngine {
+        &mut self.engine
+    }
+
     pub(crate) fn flush_local_projection_completions(
         &mut self,
         retained_intents: BTreeSet<ProjectionIntentId>,

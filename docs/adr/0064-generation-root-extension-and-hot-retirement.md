@@ -50,3 +50,23 @@ missing or invalid disposable generation still takes the sequence-zero full
 audit and replay. Marker-last ordering means a crash can leave both hot and cold
 copies, but never authorizes deletion before an exact cold copy and the new
 generation are durable.
+
+Landing 4b extends that same marker and object pool with four typed identity
+domains: block/home claims, Logseq UUID provenance, portable paths, and page
+names. Each domain has a complete point root and a current-claim root. A cut
+path-copies only changed leaves in the background publisher; the actor hands
+off typed delta records and never clones or encodes the complete maps.
+Current-root enumeration is confined to generation installation and rebuilds
+only live claims and current path/head memos. Release-only evidence remains in
+the complete roots and ordinary admission reads it by exact key. Page-name
+acquisitions persist their declared frontier so reclaim admission does not
+recover a covered manifest merely to classify the release.
+
+The four adapters preserve their existing precedence: speculative local
+overlay, accepted recent overlay/current claims, then sealed generation point.
+An absent authenticated leaf is distinct from a missing or unreadable value.
+The sealed values remain evidence for the established semantic admission
+algorithms; they do not become a second ownership authority. Current path
+memos bind the exact catalog row and current projection-head batch, allowing a
+cut to discard released paths from the resident head map while retaining their
+release facts on disk.

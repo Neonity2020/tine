@@ -64,8 +64,9 @@ use super::page_name_index::{
     extract_authoritative_catalog_page_names, extract_semantic_page_name_observations,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
     AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
-    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
-    PageNamePublicationCandidateV1, PageNameTransitionError,
+    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1,
+    PageNameOwnershipCheckpointPointV1, PageNameOwnershipRootV1, PageNamePublicationCandidateV1,
+    PageNameTransitionError,
 };
 use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
@@ -1354,6 +1355,39 @@ fn semantic_portable_path_root_after_changes(
     ))
 }
 
+fn semantic_logseq_claim_leaf_digest(
+    record: &LogseqClaimRecord,
+) -> Result<ContentDigest, EngineError> {
+    let encoded =
+        postcard::to_allocvec(record).map_err(|error| EngineError::Archive(error.to_string()))?;
+    let mut material = b"tine/semantic-logseq-claim-leaf/v2\0".to_vec();
+    material.extend_from_slice(&encoded);
+    Ok(ContentDigest::of(&material))
+}
+
+fn semantic_logseq_claim_root_after_changes(
+    base: LogseqClaimIndexRoot,
+    before: &BTreeMap<LogseqUuid, LogseqClaimRecord>,
+    changed: &BTreeMap<LogseqUuid, LogseqClaimRecord>,
+) -> Result<LogseqClaimIndexRoot, EngineError> {
+    let mut digest = *base.digest().as_bytes();
+    for (logseq_uuid, replacement) in changed {
+        if let Some(previous) = before.get(logseq_uuid) {
+            let leaf = semantic_logseq_claim_leaf_digest(previous)?;
+            for (target, source) in digest.iter_mut().zip(leaf.as_bytes()) {
+                *target ^= source;
+            }
+        }
+        let leaf = semantic_logseq_claim_leaf_digest(replacement)?;
+        for (target, source) in digest.iter_mut().zip(leaf.as_bytes()) {
+            *target ^= source;
+        }
+    }
+    Ok(LogseqClaimIndexRoot::from_digest(
+        ContentDigest::from_bytes(digest),
+    ))
+}
+
 struct TerminalPublicationCandidate {
     portable_path_conflicts: BTreeMap<PortablePathKeyDigest, PortablePathConflict>,
     fatal_handle: Option<FatalEvidenceHandle>,
@@ -1425,7 +1459,7 @@ impl PortablePathConflict {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-struct LogseqClaimIntroduction {
+pub(crate) struct LogseqClaimIntroduction {
     block_id: BlockId,
     home_document_id: DocumentId,
     batch_id: BatchId,
@@ -1433,11 +1467,58 @@ struct LogseqClaimIntroduction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct LogseqClaimRecord {
+pub(crate) struct LogseqClaimRecord {
     schema_version: u32,
     logseq_uuid: LogseqUuid,
     introductions: Vec<LogseqClaimIntroduction>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointBlockHomePointV1 {
+    schema_version: u32,
+    block_id: BlockId,
+    claims: BTreeSet<ImmutableHomeClaim>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointPortablePathPointV1 {
+    schema_version: u32,
+    key: PortablePathKeyDigest,
+    record: Option<PortablePathRecord>,
+    current_path: Option<(PageId, CurrentPathCatalogStoredRow, Option<BatchId>)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointPageNamePointV1 {
+    schema_version: u32,
+    key: super::PageNameKeyDigest,
+    state: PageNameOwnershipCheckpointPointV1,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CheckpointIdentityValue {
+    BlockHome(CheckpointBlockHomePointV1),
+    LogseqUuid(LogseqClaimRecord),
+    PortablePath(CheckpointPortablePathPointV1),
+    PageName(CheckpointPageNamePointV1),
+}
+
+impl CheckpointIdentityValue {
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::BlockHome(value) => postcard::to_allocvec(value),
+            Self::LogseqUuid(value) => postcard::to_allocvec(value),
+            Self::PortablePath(value) => postcard::to_allocvec(value),
+            Self::PageName(value) => postcard::to_allocvec(value),
+        }
+        .map_err(|error| error.to_string())
+    }
+}
+
+const CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6731,7 +6812,7 @@ pub(crate) struct DeferredAbsenceObservation {
 // v5 replaced inline resident-document bytes with qualified immutable image
 // references. Exactly one schema has an implementation (D-1): a checkpoint
 // written by any other version is discarded and rebuilt from accepted history.
-const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 7;
+const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 8;
 const CHECKPOINT_SOFT_TAIL_BATCHES: u64 = 128;
 const CHECKPOINT_HARD_TAIL_BATCHES: u64 = 512;
 
@@ -6841,6 +6922,7 @@ pub(crate) struct CleanCheckpointCapture {
     pub(crate) state_bytes: Vec<u8>,
     pub(crate) accepted_rows: Vec<CleanCheckpointAcceptedRow>,
     pub(crate) required_objects: BTreeSet<ContentDigest>,
+    pub(crate) identity_changes: Vec<super::checkpoint_generation::CheckpointIdentityChange>,
     pub(crate) capture_work: u64,
     /// `None` is reserved for sequence-zero publication primitive tests. Every
     /// live engine capture supplies a complete document epoch.
@@ -6954,7 +7036,6 @@ struct CleanCheckpointStateV6 {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
-    ephemeral_block_claims: BTreeMap<u128, BTreeSet<ImmutableHomeClaim>>,
     /// Accepted writer-lane ownership. Restoring it is what lets a
     /// checkpoint-opened runtime still refuse a foreign lane without replaying
     /// accepted history; a full replay rebuilds exactly the same map.
@@ -6968,13 +7049,8 @@ struct CleanCheckpointStateV6 {
     /// admission state, not a retained row per accepted batch.
     causal_chain: BTreeMap<CausalPeerId, CausalChainTip>,
     logseq_claim_root: LogseqClaimIndexRoot,
-    ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
     portable_path_root: PortablePathIndexRoot,
-    ephemeral_portable_paths: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
-    portable_path_conflicts: BTreeMap<PortablePathKeyDigest, PortablePathConflict>,
     page_name_root: PageNameOwnershipRootV1,
-    ephemeral_page_names: Vec<u8>,
-    page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
     /// Resident document identities only. Their immutable image bytes live in
     /// the checkpoint payload directory and are loaded after its roster has
@@ -6985,9 +7061,7 @@ struct CleanCheckpointStateV6 {
     visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
     accepted_frontier_root: AcceptedFrontierRoot,
-    clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
     current_action_hot_pin_batches: BTreeSet<BatchId>,
-    current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
     current_path_available: bool,
     current_path_frontier_root: AcceptedFrontierRoot,
     /// Canonical bytes force restore through `AcceptanceAgePolicy::decode_current`,
@@ -7055,7 +7129,6 @@ pub(crate) fn clean_checkpoint_hot_pin_batches(
         .values()
         .flat_map(|document| document.direct_dependency_heads().iter().copied())
         .collect::<BTreeSet<_>>();
-    pins.extend(state.clean_projection_head_batches.values().copied());
     pins.extend(state.current_action_hot_pin_batches);
     Ok(pins)
 }
@@ -7093,6 +7166,8 @@ pub struct ShardedHotEngine {
     /// on disk; only the post-generation tail is represented in the inline
     /// status/sequence/causal maps below.
     sealed_accepted_history: Option<Arc<super::checkpoint_generation::SealedAcceptedHistory>>,
+    sealed_identity_history: Option<Arc<super::checkpoint_generation::SealedIdentityHistory>>,
+    clean_checkpoint_identity_installed_sequence: u64,
     /// Sweep roots are installed by the runtime owner. Until the receiver
     /// summary opens, restored action pins remain a conservative bridge.
     checkpoint_sweep_hot_pin_batches: RefCell<BTreeSet<BatchId>>,
@@ -7257,6 +7332,10 @@ pub struct ShardedHotEngine {
     /// them into the preceding v2 payload without introducing a second disk
     /// format.
     clean_checkpoint_required_objects_by_sequence: BTreeMap<u64, BTreeSet<ContentDigest>>,
+    clean_checkpoint_identity_changes_by_sequence:
+        BTreeMap<u64, Vec<super::checkpoint_generation::CheckpointIdentityChange>>,
+    clean_checkpoint_identity_bootstrap:
+        Vec<super::checkpoint_generation::CheckpointIdentityChange>,
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
     ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
     ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
@@ -7375,6 +7454,8 @@ impl ShardedHotEngine {
             clean_checkpoint_publisher: None,
             checkpoint_documents: None,
             sealed_accepted_history: None,
+            sealed_identity_history: None,
+            clean_checkpoint_identity_installed_sequence: 0,
             checkpoint_sweep_hot_pin_batches: RefCell::new(BTreeSet::new()),
             checkpoint_durable_action_hot_pin_batches: RefCell::new(BTreeSet::new()),
             restored_action_hot_pin_batches: RefCell::new(BTreeSet::new()),
@@ -7437,6 +7518,8 @@ impl ShardedHotEngine {
             clean_checkpoint_causal_dots: BTreeMap::new(),
             clean_checkpoint_required_objects: BTreeSet::new(),
             clean_checkpoint_required_objects_by_sequence: BTreeMap::new(),
+            clean_checkpoint_identity_changes_by_sequence: BTreeMap::new(),
+            clean_checkpoint_identity_bootstrap: Vec::new(),
             ephemeral_accepted_batch_entries: BTreeMap::new(),
             ephemeral_accepted_document_root: RunLocalAuthenticatedMap::default(),
             ephemeral_accepted_batch_root: RunLocalAuthenticatedMap::default(),
@@ -7495,12 +7578,31 @@ impl ShardedHotEngine {
         import_complete(self.catalog_document_id, &catalog, &[catalog_snapshot])?;
         catalog.set_peer_id(1).map_err(loro_error)?;
         validate_catalog(self.catalog_document_id, &catalog)?;
-        let current_path_rows = read_all_pages(&catalog)?
-            .into_iter()
-            .filter_map(|(page_id, state)| {
-                current_path_catalog_row_from_page_state(&state).map(|row| (page_id, row))
+        let current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow> =
+            read_all_pages(&catalog)?
+                .into_iter()
+                .filter_map(|(page_id, state)| {
+                    current_path_catalog_row_from_page_state(&state).map(|row| (page_id, row))
+                })
+                .collect();
+        self.clean_checkpoint_identity_bootstrap = current_path_rows
+            .iter()
+            .map(|(page_id, row): (&PageId, &CurrentPathCatalogStoredRow)| {
+                let key = row.path.portable_key().digest();
+                Ok(super::checkpoint_generation::CheckpointIdentityChange {
+                    sequence: 0,
+                    kind: super::checkpoint_generation::CheckpointIdentityKind::PortablePath,
+                    key: key.as_bytes().to_vec(),
+                    value: CheckpointIdentityValue::PortablePath(CheckpointPortablePathPointV1 {
+                        schema_version: CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION,
+                        key,
+                        record: None,
+                        current_path: Some((*page_id, row.clone(), None)),
+                    }),
+                    current: true,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, EngineError>>()?;
         let documents = candidate.frontier_documents();
         let accepted_frontier_root = accepted_frontier_root_for_lazy_genesis(&candidate)?;
         self.accepted_frontier = documents
@@ -7509,7 +7611,7 @@ impl ShardedHotEngine {
             .collect();
         self.accepted_frontier_root = accepted_frontier_root.clone();
         self.current_path_catalog = CurrentPathCatalog {
-            rows: current_path_rows,
+            rows: current_path_rows.into(),
             available: true,
             accepted_frontier_root,
         };
@@ -7861,6 +7963,7 @@ impl ShardedHotEngine {
                 0,
                 BTreeMap::new(),
                 None,
+                None,
             ));
         self.archive_store = Some(Arc::new(store));
         Ok(())
@@ -7907,6 +8010,7 @@ impl ShardedHotEngine {
                 durable_sequence,
                 published_documents,
                 self.checkpoint_documents.as_ref().cloned(),
+                self.sealed_identity_history.as_ref().cloned(),
             ));
         Ok(())
     }
@@ -7937,7 +8041,39 @@ impl ShardedHotEngine {
         Ok(())
     }
 
-    fn schedule_clean_checkpoint_now(&self) -> bool {
+    fn adopt_published_identity_generation(&mut self) -> Result<(), EngineError> {
+        let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
+            return Ok(());
+        };
+        let durable = publisher.durable_sequence();
+        if durable <= self.clean_checkpoint_identity_installed_sequence {
+            return Ok(());
+        }
+        let Some(identities) = publisher.current_identity_history() else {
+            return Ok(());
+        };
+        let recent = self
+            .clean_checkpoint_identity_changes_by_sequence
+            .range(durable.saturating_add(1)..)
+            .flat_map(|(_, changes)| changes.iter().cloned())
+            .collect::<Vec<_>>();
+        self.install_current_identity_roots(identities)?;
+        self.install_recent_identity_overlay(&recent)?;
+        self.clean_checkpoint_identity_changes_by_sequence
+            .retain(|sequence, _| *sequence > durable);
+        if durable > 0 {
+            self.clean_checkpoint_identity_bootstrap.clear();
+        }
+        self.clean_checkpoint_identity_installed_sequence = durable;
+        Ok(())
+    }
+
+    fn schedule_clean_checkpoint_now(&mut self) -> bool {
+        if self.adopt_published_identity_generation().is_err() {
+            self.clean_checkpoint_capture_skip
+                .set(Some(CleanCheckpointCaptureSkip::CaptureFailed));
+            return false;
+        }
         let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
             return false;
         };
@@ -7965,7 +8101,7 @@ impl ShardedHotEngine {
         }
     }
 
-    fn schedule_clean_checkpoint(&self) {
+    fn schedule_clean_checkpoint(&mut self) {
         let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
             return;
         };
@@ -7979,14 +8115,19 @@ impl ShardedHotEngine {
         }
     }
 
-    pub(crate) fn schedule_clean_checkpoint_idle(&self) -> bool {
+    pub(crate) fn schedule_clean_checkpoint_idle(&mut self) -> bool {
+        if self.adopt_published_identity_generation().is_err() {
+            self.clean_checkpoint_capture_skip
+                .set(Some(CleanCheckpointCaptureSkip::CaptureFailed));
+            return false;
+        }
         self.checkpoint_soft_pending.get() && self.schedule_clean_checkpoint_now()
     }
 
     /// Publish the first complete image epoch after a blank-slate/full-replay
     /// open. The caller invokes this only when no v2 checkpoint was restored;
     /// ordinary accepted saves keep using the same scheduler below.
-    pub(crate) fn schedule_clean_checkpoint_bootstrap(&self) {
+    pub(crate) fn schedule_clean_checkpoint_bootstrap(&mut self) {
         self.schedule_clean_checkpoint_now();
     }
 
@@ -8038,17 +8179,28 @@ impl ShardedHotEngine {
             .and_then(|publisher| publisher.last_diagnostics())
     }
 
-    pub(crate) fn wait_for_clean_checkpoint(&self) -> Result<(), EngineError> {
-        let publisher = self
+    pub(crate) fn wait_for_clean_checkpoint(&mut self) -> Result<(), EngineError> {
+        self.clean_checkpoint_publisher
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
+            .wait_for_idle()
+            .map_err(EngineError::Archive)?;
+        #[cfg(test)]
+        if self
             .clean_checkpoint_publisher
             .as_ref()
-            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?;
-        publisher.wait_for_idle().map_err(EngineError::Archive)?;
-        #[cfg(test)]
-        if publisher.durable_sequence() != self.next_acceptance_sequence {
+            .expect("publisher checked above")
+            .durable_sequence()
+            != self.next_acceptance_sequence
+        {
             self.schedule_clean_checkpoint_now();
-            publisher.wait_for_idle().map_err(EngineError::Archive)?;
+            self.clean_checkpoint_publisher
+                .as_ref()
+                .expect("publisher checked above")
+                .wait_for_idle()
+                .map_err(EngineError::Archive)?;
         }
+        self.adopt_published_identity_generation()?;
         Ok(())
     }
 
@@ -9002,6 +9154,7 @@ impl ShardedHotEngine {
 
     fn checkpoint_current_action_hot_pin_batches(&self) -> BTreeSet<BatchId> {
         let mut pins = self.checkpoint_sweep_hot_pin_batches.borrow().clone();
+        pins.extend(self.clean_projection_head_batches.values().copied());
         pins.extend(
             self.checkpoint_durable_action_hot_pin_batches
                 .borrow()
@@ -9027,6 +9180,405 @@ impl ShardedHotEngine {
         pins
     }
 
+    fn sealed_identity_point(
+        &self,
+        kind: super::checkpoint_generation::CheckpointIdentityKind,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        self.sealed_identity_history
+            .as_ref()
+            .map(|history| history.point(kind, key).map_err(EngineError::Archive))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn checkpoint_page_name_state_for_keys(
+        &self,
+        keys: impl IntoIterator<Item = super::PageNameKeyDigest>,
+    ) -> Result<EphemeralPageNameOwnershipStateV1, EngineError> {
+        let mut state = EphemeralPageNameOwnershipStateV1::default();
+        for key in keys {
+            if let Some(bytes) = self.sealed_identity_point(
+                super::checkpoint_generation::CheckpointIdentityKind::PageName,
+                key.as_bytes(),
+            )? {
+                let point: CheckpointPageNamePointV1 = postcard::from_bytes(&bytes)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                if point.schema_version != CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION
+                    || point.key != key
+                {
+                    return Err(EngineError::Archive(
+                        "sealed page-name identity point is misbound".into(),
+                    ));
+                }
+                state
+                    .install_checkpoint_point(point.state)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+            }
+            if let Some(point) = self
+                .ephemeral_page_names
+                .checkpoint_point(key)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+            {
+                state
+                    .install_checkpoint_point(point)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+            }
+        }
+        Ok(state)
+    }
+
+    fn record_clean_checkpoint_identity_changes(
+        &mut self,
+        sequence: u64,
+        effect: &SemanticEffect,
+        changed_projection_paths: &[ManagedPath],
+    ) -> Result<(), EngineError> {
+        use super::checkpoint_generation::{CheckpointIdentityChange, CheckpointIdentityKind};
+
+        let mut changes = Vec::new();
+        let mut block_ids = effect
+            .blocks()
+            .iter()
+            .map(|delta| delta.block_id)
+            .collect::<BTreeSet<_>>();
+        for block_id in block_ids.iter().copied() {
+            let claims = self
+                .block_home_claims_many(&[block_id])?
+                .remove(&block_id.as_uuid().as_u128())
+                .unwrap_or_default();
+            if claims.is_empty() {
+                continue;
+            }
+            let current = effect
+                .blocks()
+                .iter()
+                .find(|delta| delta.block_id == block_id)
+                .and_then(|delta| delta.after.as_ref())
+                .is_some_and(|state| matches!(state.owner, BlockOwner::Page(_)));
+            changes.push(CheckpointIdentityChange {
+                sequence,
+                kind: CheckpointIdentityKind::BlockHome,
+                key: block_id.as_uuid().as_bytes().to_vec(),
+                value: CheckpointIdentityValue::BlockHome(CheckpointBlockHomePointV1 {
+                    schema_version: CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION,
+                    block_id,
+                    claims,
+                }),
+                current,
+            });
+        }
+        block_ids.clear();
+
+        let logseq_uuids = effect
+            .blocks()
+            .iter()
+            .flat_map(|delta| {
+                [
+                    delta.before.as_ref().and_then(|state| state.logseq_uuid),
+                    delta.after.as_ref().and_then(|state| state.logseq_uuid),
+                ]
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        for logseq_uuid in logseq_uuids {
+            let record = self.logseq_claim_record(self.logseq_claim_root, logseq_uuid)?;
+            let current = !matches!(
+                self.resolve_logseq_uuid_current(logseq_uuid)?.0,
+                LogseqUuidResolution::Unclaimed
+            );
+            changes.push(CheckpointIdentityChange {
+                sequence,
+                kind: CheckpointIdentityKind::LogseqUuid,
+                key: logseq_uuid.as_uuid().as_bytes().to_vec(),
+                value: CheckpointIdentityValue::LogseqUuid(record),
+                current,
+            });
+        }
+
+        let mut path_keys = effect
+            .pages()
+            .iter()
+            .flat_map(|delta| {
+                [
+                    delta.before.as_ref().and_then(PageState::path),
+                    delta.after.as_ref().and_then(PageState::path),
+                ]
+            })
+            .flatten()
+            .map(|path| path.portable_key().digest())
+            .collect::<BTreeSet<_>>();
+        path_keys.extend(
+            changed_projection_paths
+                .iter()
+                .map(|path| path.portable_key().digest()),
+        );
+        for key in path_keys {
+            let record = self.portable_path_records_many(&[key])?.remove(&key);
+            let current_path = record
+                .as_ref()
+                .and_then(PortablePathRecord::occupied)
+                .and_then(|occupied| {
+                    self.current_path_catalog
+                        .rows
+                        .get(&occupied.page_id())
+                        .map(|row| (occupied.page_id(), row))
+                })
+                .or_else(|| {
+                    self.current_path_catalog
+                        .rows
+                        .iter()
+                        .find(|(_, row)| row.path.portable_key().digest() == key)
+                        .map(|(page_id, row)| (*page_id, row))
+                })
+                .map(|(page_id, row)| {
+                    (
+                        page_id,
+                        row.clone(),
+                        self.clean_projection_head_batches.get(&row.path).copied(),
+                    )
+                });
+            let current = record
+                .as_ref()
+                .is_some_and(|record| record.occupied().is_some())
+                || current_path.is_some();
+            changes.push(CheckpointIdentityChange {
+                sequence,
+                kind: CheckpointIdentityKind::PortablePath,
+                key: key.as_bytes().to_vec(),
+                value: CheckpointIdentityValue::PortablePath(CheckpointPortablePathPointV1 {
+                    schema_version: CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION,
+                    key,
+                    record,
+                    current_path,
+                }),
+                current,
+            });
+        }
+
+        let name_keys = effect
+            .pages()
+            .iter()
+            .flat_map(|delta| {
+                [
+                    delta.before.as_ref().and_then(|state| match state {
+                        PageState::Live { name, .. } => Some(name),
+                        PageState::Tombstone { .. } => None,
+                    }),
+                    delta.after.as_ref().and_then(|state| match state {
+                        PageState::Live { name, .. } => Some(name),
+                        PageState::Tombstone { .. } => None,
+                    }),
+                ]
+            })
+            .flatten()
+            .map(LogicalPageName::key_digest)
+            .collect::<BTreeSet<_>>();
+        for key in name_keys {
+            let state = self.checkpoint_page_name_state_for_keys([key])?;
+            let Some(point) = state
+                .checkpoint_point(key)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+            else {
+                continue;
+            };
+            let current = state.resolve_current(key).is_some();
+            changes.push(CheckpointIdentityChange {
+                sequence,
+                kind: CheckpointIdentityKind::PageName,
+                key: key.as_bytes().to_vec(),
+                value: CheckpointIdentityValue::PageName(CheckpointPageNamePointV1 {
+                    schema_version: CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION,
+                    key,
+                    state: point,
+                }),
+                current,
+            });
+        }
+        changes.sort_unstable_by(|left, right| {
+            (left.kind, left.key.as_slice()).cmp(&(right.kind, right.key.as_slice()))
+        });
+        self.clean_checkpoint_identity_changes_by_sequence
+            .insert(sequence, changes);
+        Ok(())
+    }
+
+    fn install_current_identity_roots(
+        &mut self,
+        history: Arc<super::checkpoint_generation::SealedIdentityHistory>,
+    ) -> Result<(), EngineError> {
+        use super::checkpoint_generation::CheckpointIdentityKind;
+
+        let mut block_claims = AHashMap::new();
+        for (key, bytes) in history
+            .current_rows(CheckpointIdentityKind::BlockHome)
+            .map_err(EngineError::Archive)?
+        {
+            let point: CheckpointBlockHomePointV1 = postcard::from_bytes(&bytes)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if point.schema_version != CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION
+                || key != point.block_id.as_uuid().as_bytes()
+                || point.claims.is_empty()
+            {
+                return Err(EngineError::Archive(
+                    "sealed current block-home identity point is misbound".into(),
+                ));
+            }
+            block_claims.insert(point.block_id.as_uuid().as_u128(), point.claims);
+        }
+
+        let mut logseq_claims = BTreeMap::new();
+        for (key, bytes) in history
+            .current_rows(CheckpointIdentityKind::LogseqUuid)
+            .map_err(EngineError::Archive)?
+        {
+            let record: LogseqClaimRecord = postcard::from_bytes(&bytes)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if record.schema_version != LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION
+                || key != record.logseq_uuid.as_uuid().as_bytes()
+            {
+                return Err(EngineError::Archive(
+                    "sealed current Logseq UUID identity point is misbound".into(),
+                ));
+            }
+            logseq_claims.insert(record.logseq_uuid, record);
+        }
+
+        let mut portable_paths = BTreeMap::new();
+        let mut current_path_rows = BTreeMap::new();
+        let mut projection_heads = BTreeMap::new();
+        for (key, bytes) in history
+            .current_rows(CheckpointIdentityKind::PortablePath)
+            .map_err(EngineError::Archive)?
+        {
+            let point: CheckpointPortablePathPointV1 = postcard::from_bytes(&bytes)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if point.schema_version != CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION
+                || key != point.key.as_bytes()
+            {
+                return Err(EngineError::Archive(
+                    "sealed current portable-path identity point is misbound".into(),
+                ));
+            }
+            if let Some(record) = point.record {
+                if record.occupied().is_none() || record.key_digest() != point.key {
+                    return Err(EngineError::Archive(
+                        "sealed current portable-path record is not occupied".into(),
+                    ));
+                }
+                portable_paths.insert(point.key, record);
+            }
+            if let Some((page_id, row, head)) = point.current_path {
+                if row.path.portable_key().digest() != point.key {
+                    return Err(EngineError::Archive(
+                        "sealed current path memo is misbound".into(),
+                    ));
+                }
+                if let Some(head) = head {
+                    projection_heads.insert(row.path.clone(), head);
+                }
+                current_path_rows.insert(page_id, row);
+            }
+        }
+
+        let mut page_names = EphemeralPageNameOwnershipStateV1::default();
+        for (key, bytes) in history
+            .current_rows(CheckpointIdentityKind::PageName)
+            .map_err(EngineError::Archive)?
+        {
+            let point: CheckpointPageNamePointV1 = postcard::from_bytes(&bytes)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if point.schema_version != CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION
+                || key != point.key.as_bytes()
+            {
+                return Err(EngineError::Archive(
+                    "sealed current page-name identity point is misbound".into(),
+                ));
+            }
+            let installed = page_names
+                .install_checkpoint_point(point.state)
+                .map(|_| point.key)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if installed != point.key || page_names.resolve_current(point.key).is_none() {
+                return Err(EngineError::Archive(
+                    "sealed current page-name record is not occupied".into(),
+                ));
+            }
+        }
+
+        self.ephemeral_block_claims = block_claims;
+        self.ephemeral_logseq_claims = logseq_claims;
+        self.ephemeral_portable_paths = portable_paths;
+        self.ephemeral_page_names = page_names;
+        self.clean_projection_head_batches = projection_heads;
+        self.current_path_catalog.rows = current_path_rows.into_iter().collect();
+        self.sealed_identity_history = Some(history);
+        Ok(())
+    }
+
+    fn install_recent_identity_overlay(
+        &mut self,
+        changes: &[super::checkpoint_generation::CheckpointIdentityChange],
+    ) -> Result<(), EngineError> {
+        use super::checkpoint_generation::CheckpointIdentityKind;
+
+        for change in changes {
+            match (change.kind, &change.value) {
+                (CheckpointIdentityKind::BlockHome, CheckpointIdentityValue::BlockHome(point)) => {
+                    self.ephemeral_block_claims
+                        .insert(point.block_id.as_uuid().as_u128(), point.claims.clone());
+                }
+                (
+                    CheckpointIdentityKind::LogseqUuid,
+                    CheckpointIdentityValue::LogseqUuid(record),
+                ) => {
+                    self.ephemeral_logseq_claims
+                        .insert(record.logseq_uuid, record.clone());
+                }
+                (
+                    CheckpointIdentityKind::PortablePath,
+                    CheckpointIdentityValue::PortablePath(point),
+                ) => {
+                    if let Some(record) = point.record.as_ref() {
+                        self.ephemeral_portable_paths
+                            .insert(point.key, record.clone());
+                    }
+                    if !change.current {
+                        let removed_paths = self
+                            .current_path_catalog
+                            .rows
+                            .iter()
+                            .filter(|(_, row)| row.path.portable_key().digest() == point.key)
+                            .map(|(page_id, row)| (*page_id, row.path.clone()))
+                            .collect::<Vec<_>>();
+                        for (page_id, path) in removed_paths {
+                            self.current_path_catalog.rows.remove(&page_id);
+                            self.clean_projection_head_batches.remove(&path);
+                        }
+                    }
+                    if let Some((page_id, row, head)) = point.current_path.as_ref() {
+                        self.current_path_catalog.rows.insert(*page_id, row.clone());
+                        if let Some(head) = head {
+                            self.clean_projection_head_batches
+                                .insert(row.path.clone(), *head);
+                        }
+                    }
+                }
+                (CheckpointIdentityKind::PageName, CheckpointIdentityValue::PageName(point)) => {
+                    self.ephemeral_page_names
+                        .install_checkpoint_point(point.state.clone())
+                        .map_err(|error| EngineError::Archive(error.to_string()))?;
+                }
+                _ => {
+                    return Err(EngineError::Archive(
+                        "checkpoint identity kind and typed value differ".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Capture the exact semantic clean-runtime state at the current accepted
     /// frontier. Serialization happens here, on the owning actor, so the
     /// background publisher never observes concurrently mutating engine data.
@@ -9046,6 +9598,11 @@ impl ShardedHotEngine {
         let delta_len = self.next_acceptance_sequence - durable_sequence;
         let mut accepted_rows = Vec::with_capacity(usize::try_from(delta_len).unwrap_or(0));
         let mut required_objects = BTreeSet::new();
+        let mut identity_changes = if durable_sequence == 0 {
+            self.clean_checkpoint_identity_bootstrap.clone()
+        } else {
+            Vec::new()
+        };
         for sequence in durable_sequence.saturating_add(1)..=self.next_acceptance_sequence {
             accepted_rows.push(self.clean_checkpoint_accepted_row(sequence)?);
             required_objects.extend(
@@ -9059,8 +9616,18 @@ impl ShardedHotEngine {
                     .iter()
                     .copied(),
             );
+            identity_changes.extend(
+                self.clean_checkpoint_identity_changes_by_sequence
+                    .get(&sequence)
+                    .ok_or_else(|| {
+                        EngineError::Archive(format!(
+                            "clean checkpoint sequence {sequence} has no identity delta"
+                        ))
+                    })?
+                    .iter()
+                    .cloned(),
+            );
         }
-
         let published_documents = self
             .clean_checkpoint_publisher
             .as_ref()
@@ -9117,25 +9684,12 @@ impl ShardedHotEngine {
             workspace_id: self.workspace_id,
             lineage_digest: self.lineage_digest,
             catalog_document_id: self.catalog_document_id,
-            ephemeral_block_claims: self
-                .ephemeral_block_claims
-                .iter()
-                .map(|(key, claims)| (*key, claims.clone()))
-                .collect(),
             crdt_lane_owners: self.crdt_lane_owners.clone(),
             causal_peer_owners: self.causal_peer_owners.clone(),
             causal_chain: self.ephemeral_causal_chain.borrow().clone(),
             logseq_claim_root: self.logseq_claim_root,
-            ephemeral_logseq_claims: self.ephemeral_logseq_claims.clone(),
             portable_path_root: self.portable_path_root,
-            ephemeral_portable_paths: self.ephemeral_portable_paths.clone(),
-            portable_path_conflicts: self.portable_path_conflicts.clone(),
             page_name_root: self.page_name_root.clone(),
-            ephemeral_page_names: self
-                .ephemeral_page_names
-                .encode_checkpoint_canonical()
-                .map_err(|error| EngineError::Archive(error.to_string()))?,
-            page_name_conflicts: self.page_name_conflicts.clone(),
             reference_catalog_policy: self.reference_catalog_policy.clone(),
             visible_documents: self
                 .visible_documents
@@ -9164,9 +9718,7 @@ impl ShardedHotEngine {
                 .collect(),
             accepted_frontier: self.accepted_frontier.clone(),
             accepted_frontier_root: self.accepted_frontier_root.clone(),
-            clean_projection_head_batches: self.clean_projection_head_batches.clone(),
             current_action_hot_pin_batches: self.checkpoint_current_action_hot_pin_batches(),
-            current_path_rows: ordered_rows(&self.current_path_catalog.rows),
             current_path_available: self.current_path_catalog.available,
             current_path_frontier_root: self.current_path_catalog.accepted_frontier_root.clone(),
             acceptance_age_policy: self
@@ -9177,21 +9729,14 @@ impl ShardedHotEngine {
         let state_bytes = postcard::to_allocvec(&state)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         let capture_work = [
-            state.ephemeral_block_claims.len(),
             state.crdt_lane_owners.len(),
             state.causal_peer_owners.len(),
             state.causal_chain.len(),
-            state.ephemeral_logseq_claims.len(),
-            state.ephemeral_portable_paths.len(),
-            state.portable_path_conflicts.len(),
-            state.page_name_conflicts.len(),
             state.visible_documents.len(),
             state.spare_documents.len(),
             state.visible_document_heads.len(),
             state.accepted_frontier.len(),
-            state.clean_projection_head_batches.len(),
             state.current_action_hot_pin_batches.len(),
-            state.current_path_rows.len(),
             accepted_rows.len(),
             required_objects.len(),
         ]
@@ -9219,6 +9764,7 @@ impl ShardedHotEngine {
             state_bytes,
             accepted_rows,
             required_objects,
+            identity_changes,
             capture_work,
             documents: Some(CleanCheckpointDocumentCapture {
                 cutoff_state_digest: self.accepted_frontier_root.state_digest(),
@@ -9264,10 +9810,6 @@ impl ShardedHotEngine {
                 "clean checkpoint state is noncanonical, stale, or misbound".into(),
             ));
         }
-        let ephemeral_page_names = EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(
-            &state.ephemeral_page_names,
-        )
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
         let (utc_now_ms, _) = self.floor_policy_clock.read();
         let acceptance_age_policy =
             super::checkpoint_floor_policy::AcceptanceAgePolicy::decode_current(
@@ -9294,20 +9836,6 @@ impl ShardedHotEngine {
         };
         let visible_documents = decode_documents(&state.visible_documents)?;
         let spare_documents = decode_documents(&state.spare_documents)?;
-        let mut checkpoint_document_ids = state
-            .current_path_rows
-            .values()
-            .map(|row| row.home_document_id)
-            .collect::<BTreeSet<_>>();
-        if state
-            .accepted_frontier
-            .contains_key(&self.catalog_document_id)
-        {
-            checkpoint_document_ids.insert(self.catalog_document_id);
-        }
-        checkpoint_documents
-            .qualify_complete(checkpoint_document_ids.into_iter())
-            .map_err(EngineError::Archive)?;
         if state.current_path_frontier_root != state.accepted_frontier_root {
             return Err(EngineError::Archive(
                 "clean checkpoint current-path frontier is stale".into(),
@@ -9361,6 +9889,23 @@ impl ShardedHotEngine {
         {
             *accepted_tip_refcounts.entry(batch_id).or_insert(0_usize) += 1;
         }
+        let identity_history = accepted_history.identity_history();
+        self.install_current_identity_roots(Arc::clone(&identity_history))?;
+        let mut checkpoint_document_ids = self
+            .current_path_catalog
+            .rows
+            .values()
+            .map(|row| row.home_document_id)
+            .collect::<BTreeSet<_>>();
+        if state
+            .accepted_frontier
+            .contains_key(&self.catalog_document_id)
+        {
+            checkpoint_document_ids.insert(self.catalog_document_id);
+        }
+        checkpoint_documents
+            .qualify_complete(checkpoint_document_ids.into_iter())
+            .map_err(EngineError::Archive)?;
 
         self.archive.clear();
         self.bounded_staging_cache.clear();
@@ -9371,17 +9916,13 @@ impl ShardedHotEngine {
         self.persisted_staged.clear();
         self.statuses.clear();
         self.staged_batches.clear();
-        self.ephemeral_block_claims = state.ephemeral_block_claims.into_iter().collect();
         self.crdt_lane_owners = state.crdt_lane_owners;
         self.causal_peer_owners = state.causal_peer_owners;
         self.logseq_claim_root = state.logseq_claim_root;
-        self.ephemeral_logseq_claims = state.ephemeral_logseq_claims;
         self.portable_path_root = state.portable_path_root;
-        self.ephemeral_portable_paths = state.ephemeral_portable_paths;
-        self.portable_path_conflicts = state.portable_path_conflicts;
+        self.portable_path_conflicts.clear();
         self.page_name_root = state.page_name_root;
-        self.ephemeral_page_names = ephemeral_page_names;
-        self.page_name_conflicts = state.page_name_conflicts;
+        self.page_name_conflicts.clear();
         self.reference_catalog_policy = state.reference_catalog_policy;
         self.fatal_evidence = None;
         self.fatal_handle = None;
@@ -9401,8 +9942,12 @@ impl ShardedHotEngine {
         self.clean_checkpoint_causal_dots.clear();
         self.clean_checkpoint_required_objects.clear();
         self.clean_checkpoint_required_objects_by_sequence.clear();
+        self.clean_checkpoint_identity_changes_by_sequence.clear();
+        self.clean_checkpoint_identity_bootstrap.clear();
+        self.clean_checkpoint_identity_installed_sequence = next_acceptance_sequence;
         self.checkpoint_documents = Some(checkpoint_documents);
         self.sealed_accepted_history = Some(Arc::clone(&accepted_history));
+        self.sealed_identity_history = Some(identity_history);
         self.ephemeral_accepted_batch_entries.clear();
         self.ephemeral_accepted_document_root = accepted_document_root;
         self.ephemeral_accepted_batch_root = RunLocalAuthenticatedMap::default();
@@ -9413,13 +9958,9 @@ impl ShardedHotEngine {
         self.next_acceptance_sequence = next_acceptance_sequence;
         self.acceptance_age_policy = acceptance_age_policy;
         self.clean_projection_heads.clear();
-        self.clean_projection_head_batches = state.clean_projection_head_batches;
         *self.restored_action_hot_pin_batches.borrow_mut() = state.current_action_hot_pin_batches;
-        self.current_path_catalog = CurrentPathCatalog {
-            rows: state.current_path_rows.into_iter().collect(),
-            available: state.current_path_available,
-            accepted_frontier_root: state.current_path_frontier_root,
-        };
+        self.current_path_catalog.available = state.current_path_available;
+        self.current_path_catalog.accepted_frontier_root = state.current_path_frontier_root;
         self.current_path_cursor_book.borrow_mut().active.clear();
         self.advance_author_mutation_generation();
         Ok(())
@@ -12989,7 +13530,13 @@ impl ShardedHotEngine {
         self.ensure_not_blocked()?;
         let key = name.key_digest();
         Ok(self.local_overlay.page_names.contains_key(key)
-            || self.ephemeral_page_names.contains_key(key))
+            || self.ephemeral_page_names.contains_key(key)
+            || self
+                .sealed_identity_point(
+                    super::checkpoint_generation::CheckpointIdentityKind::PageName,
+                    key.as_bytes(),
+                )?
+                .is_some())
     }
 
     pub fn page_name_conflicts(&self) -> Vec<PageNameConflictEvidenceV1> {
@@ -20193,11 +20740,35 @@ impl ShardedHotEngine {
     ) -> Result<LogseqClaimRecord, EngineError> {
         let _ = root;
         let mut introductions = self
-            .ephemeral_logseq_claims
-            .get(&logseq_uuid)
-            .map(|record| record.introductions.clone())
+            .sealed_identity_point(
+                super::checkpoint_generation::CheckpointIdentityKind::LogseqUuid,
+                logseq_uuid.as_uuid().as_bytes(),
+            )?
+            .map(|bytes| {
+                postcard::from_bytes::<LogseqClaimRecord>(&bytes)
+                    .map_err(|error| EngineError::Archive(error.to_string()))
+            })
+            .transpose()?
+            .map(|record| {
+                if record.schema_version != LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION
+                    || record.logseq_uuid != logseq_uuid
+                {
+                    return Err(EngineError::Archive(
+                        "sealed Logseq UUID identity point is misbound".into(),
+                    ));
+                }
+                Ok(record.introductions)
+            })
+            .transpose()?
             .unwrap_or_default();
+        introductions.extend(
+            self.ephemeral_logseq_claims
+                .get(&logseq_uuid)
+                .map(|record| record.introductions.clone())
+                .unwrap_or_default(),
+        );
         introductions.sort_unstable();
+        introductions.dedup();
         if !strictly_sorted(&introductions) {
             return Err(EngineError::Archive(
                 "duplicate or non-canonical Logseq claim introductions".into(),
@@ -22396,6 +22967,13 @@ impl ShardedHotEngine {
                 clock,
             )?
         };
+        let checkpoint_identity_effect = effective_view
+            .as_ref()
+            .expect("accepted batch has an effective semantic view")
+            .effect()
+            .clone();
+        let checkpoint_identity_sequence = status_evidence.acceptance_sequence();
+        let checkpoint_projection_paths = tip_transition.clean_projection_paths.clone();
         self.commit_identity_publication(identity);
         self.commit_crdt_lane_ownership(lane_bindings);
         self.commit_logseq_claim_updates(
@@ -22423,6 +23001,11 @@ impl ShardedHotEngine {
             // foreground operation.
             self.retain_hot_document(document_id);
         }
+        self.record_clean_checkpoint_identity_changes(
+            checkpoint_identity_sequence,
+            &checkpoint_identity_effect,
+            &checkpoint_projection_paths,
+        )?;
         self.remember_effective_semantic_view(
             batch_id,
             effective_view
@@ -22473,7 +23056,19 @@ impl ShardedHotEngine {
             return Ok((self.logseq_claim_root, Vec::new()));
         }
 
-        let mut records = self.ephemeral_logseq_claims.clone();
+        let changed_uuids = additions
+            .iter()
+            .map(|(logseq_uuid, _)| *logseq_uuid)
+            .collect::<BTreeSet<_>>();
+        let mut before = BTreeMap::new();
+        let mut records = BTreeMap::new();
+        for logseq_uuid in changed_uuids {
+            let record = self.logseq_claim_record(self.logseq_claim_root, logseq_uuid)?;
+            if !record.introductions.is_empty() {
+                before.insert(logseq_uuid, record.clone());
+                records.insert(logseq_uuid, record);
+            }
+        }
         for (logseq_uuid, introduction) in &additions {
             let record = records
                 .entry(*logseq_uuid)
@@ -22487,12 +23082,8 @@ impl ShardedHotEngine {
                 Err(index) => record.introductions.insert(index, *introduction),
             }
         }
-        let encoded = postcard::to_allocvec(&records)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut root_material = b"tine/semantic-logseq-claims/v1\0".to_vec();
-        root_material.extend_from_slice(&encoded);
         Ok((
-            LogseqClaimIndexRoot::from_digest(ContentDigest::of(&root_material)),
+            semantic_logseq_claim_root_after_changes(self.logseq_claim_root, &before, &records)?,
             additions,
         ))
     }
@@ -22521,17 +23112,27 @@ impl ShardedHotEngine {
                 .is_some_and(|index| candidate_clock[index].1 >= dot.counter())
                 || introducing_batch == batch_id
         };
-        let frontier_for_batch = |introducing_batch: BatchId| {
-            if introducing_batch == batch_id {
-                Some(frontier.clone())
-            } else {
-                self.load_observed_manifest(introducing_batch)
-                    .ok()
-                    .map(|manifest| manifest.dependency_frontier().clone())
-            }
-        };
+        let requested_keys = effect
+            .pages()
+            .iter()
+            .flat_map(|delta| {
+                [
+                    delta.before.as_ref().and_then(|state| match state {
+                        PageState::Live { name, .. } => Some(name),
+                        PageState::Tombstone { .. } => None,
+                    }),
+                    delta.after.as_ref().and_then(|state| match state {
+                        PageState::Live { name, .. } => Some(name),
+                        PageState::Tombstone { .. } => None,
+                    }),
+                ]
+            })
+            .flatten()
+            .map(LogicalPageName::key_digest)
+            .collect::<BTreeSet<_>>();
+        let accepted_points = self.checkpoint_page_name_state_for_keys(requested_keys)?;
         let candidate = prepare_ephemeral_page_name_transition(
-            &self.ephemeral_page_names,
+            &accepted_points,
             &self.local_overlay.page_names,
             batch_id,
             causal_dot,
@@ -22541,7 +23142,7 @@ impl ShardedHotEngine {
             current_pages.entries(),
             prospective_pages.entries(),
             contains,
-            frontier_for_batch,
+            |_| None,
         );
         candidate.map(Some).map_err(|error| match error {
             PageNameTransitionError::Store(error) => EngineError::Archive(error.to_string()),
@@ -22566,7 +23167,7 @@ impl ShardedHotEngine {
         key: super::PageNameKeyDigest,
     ) -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError> {
         let _ = root;
-        self.ephemeral_page_names
+        self.checkpoint_page_name_state_for_keys([key])?
             .authenticated_exact_state(key)
             .map_err(|error| EngineError::Archive(error.to_string()))
     }
@@ -24347,17 +24948,33 @@ impl ShardedHotEngine {
         &self,
         keys: &[PortablePathKeyDigest],
     ) -> Result<BTreeMap<PortablePathKeyDigest, PortablePathRecord>, EngineError> {
-        Ok(keys
-            .iter()
-            .filter_map(|key| {
-                self.local_overlay
-                    .portable_paths
-                    .get(key)
-                    .or_else(|| self.ephemeral_portable_paths.get(key))
-                    .cloned()
-                    .map(|record| (*key, record))
-            })
-            .collect())
+        let mut records = BTreeMap::new();
+        for key in keys {
+            if let Some(bytes) = self.sealed_identity_point(
+                super::checkpoint_generation::CheckpointIdentityKind::PortablePath,
+                key.as_bytes(),
+            )? {
+                let point: CheckpointPortablePathPointV1 = postcard::from_bytes(&bytes)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                if point.schema_version != CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION
+                    || point.key != *key
+                {
+                    return Err(EngineError::Archive(
+                        "sealed portable-path identity point is misbound".into(),
+                    ));
+                }
+                if let Some(record) = point.record {
+                    records.insert(*key, record);
+                }
+            }
+            if let Some(record) = self.ephemeral_portable_paths.get(key).cloned() {
+                records.insert(*key, record);
+            }
+            if let Some(record) = self.local_overlay.portable_paths.get(key).cloned() {
+                records.insert(*key, record);
+            }
+        }
+        Ok(records)
     }
 
     fn current_portable_path_root(&self) -> PortablePathIndexRoot {
@@ -25561,16 +26178,43 @@ impl ShardedHotEngine {
         if block_ids.is_empty() {
             return Ok(AHashMap::new());
         }
-        Ok(block_ids
-            .iter()
-            .filter_map(|block_id| {
-                let key = block_id.as_uuid().as_u128();
+        let mut records = AHashMap::new();
+        for block_id in block_ids {
+            let key = block_id.as_uuid().as_u128();
+            let mut claims = self
+                .sealed_identity_point(
+                    super::checkpoint_generation::CheckpointIdentityKind::BlockHome,
+                    block_id.as_uuid().as_bytes(),
+                )?
+                .map(|bytes| {
+                    postcard::from_bytes::<CheckpointBlockHomePointV1>(&bytes)
+                        .map_err(|error| EngineError::Archive(error.to_string()))
+                })
+                .transpose()?
+                .map(|point| {
+                    if point.schema_version != CHECKPOINT_IDENTITY_POINT_SCHEMA_VERSION
+                        || point.block_id != *block_id
+                    {
+                        return Err(EngineError::Archive(
+                            "sealed block-home identity point is misbound".into(),
+                        ));
+                    }
+                    Ok(point.claims)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            claims.extend(
                 self.ephemeral_block_claims
                     .get(&key)
-                    .cloned()
-                    .map(|claims| (key, claims))
-            })
-            .collect())
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+            if !claims.is_empty() {
+                records.insert(key, claims);
+            }
+        }
+        Ok(records)
     }
 
     fn apply_author_operation(
@@ -31154,6 +31798,357 @@ pub(crate) mod validation_tests {
     }
 
     #[test]
+    fn generation_long_session_identity_bound() {
+        use crate::oplog::lazy_genesis::LazyGenesisPackBuilder;
+
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x4b00));
+        let lineage = LineageDigest::of(b"p4b-long-session-identity-bound");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x4b01));
+        let page = PageId::from_uuid(Uuid::from_u128(0x4b02));
+        let home = DocumentId::from_uuid(Uuid::from_u128(0x4b03));
+        let block = BlockId::from_uuid(Uuid::from_u128(0x4b04));
+        let logseq_uuid = LogseqUuid::from_uuid(Uuid::from_u128(0x4b05));
+        let root = std::env::temp_dir().join(format!(
+            "tine-p4b-long-session-identity-bound-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let (checkpoint, dependencies) = LazyGenesisCheckpointBuilder::new(catalog)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let baseline = Arc::new(
+            LazyGenesisPackBuilder::new(
+                workspace,
+                lineage,
+                catalog,
+                BlobDescription::of(b"empty source"),
+                &root,
+            )
+            .unwrap()
+            .finish(checkpoint, dependencies)
+            .unwrap(),
+        );
+        let archive = ObjectStore::open(&root.join("archive"), workspace).unwrap();
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        engine
+            .install_lazy_genesis_baseline(Arc::clone(&baseline))
+            .unwrap();
+        engine
+            .attach_clean_archive_store(archive.duplicate_retained_capability().unwrap())
+            .unwrap();
+        let mut replay = ShardedHotEngine::new(workspace, lineage, catalog);
+        replay.install_lazy_genesis_baseline(baseline).unwrap();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let transaction = OperationTransaction::new(vec![
+            SemanticOperation::CreatePage {
+                page_id: page,
+                home_document_id: home,
+                name: LogicalPageName::parse("P4b Identity").unwrap(),
+                path: ManagedPath::parse("pages/p4b-identity.md").unwrap(),
+                kind: ManagedTextKind::Page,
+            },
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: home,
+                },
+                page_id: page,
+                parent: None,
+                order: "a".into(),
+                content: "identity point".into(),
+            },
+            SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: home,
+                },
+                mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
+            },
+        ])
+        .unwrap();
+        let prepared = engine
+            .prepare_fixture_transaction(test_author(0x4b10, 0x4b10), &transaction)
+            .unwrap();
+        assert!(matches!(
+            engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            replay
+                .stage_ready(ValidatedBatch::new(prepared.clone()))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let renamed_name = LogicalPageName::parse("P4b Renamed").unwrap();
+        let renamed_path = ManagedPath::parse("pages/p4b-renamed.md").unwrap();
+        let old_name_key = LogicalPageName::parse("P4b Identity").unwrap().key_digest();
+        let old_path_key = ManagedPath::parse("pages/p4b-identity.md")
+            .unwrap()
+            .portable_key()
+            .digest();
+        let rename = OperationTransaction::new(vec![
+            SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: home,
+                },
+                mutation: LogseqIdentityMutation::RemoveExternal,
+            },
+            SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id: page,
+                    new_name: renamed_name.clone(),
+                    new_path: renamed_path.clone(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            },
+        ])
+        .unwrap();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let prepared = engine
+            .prepare_fixture_transaction(test_author(0x4b11, 0x4b11), &rename)
+            .unwrap();
+        assert!(matches!(
+            engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            replay
+                .stage_ready(ValidatedBatch::new(prepared.clone()))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let absent_block = BlockId::from_uuid(Uuid::from_u128(0x4b06));
+        let absent_uuid = LogseqUuid::from_uuid(Uuid::from_u128(0x4b07));
+        let current_path_key = renamed_path.portable_key().digest();
+        let absent_path_key = ManagedPath::parse("pages/p4b-absent.md")
+            .unwrap()
+            .portable_key()
+            .digest();
+        let current_name_key = renamed_name.key_digest();
+        let absent_name_key = LogicalPageName::parse("P4b Absent").unwrap().key_digest();
+        let block_keys = [block, absent_block];
+        let path_keys = [old_path_key, current_path_key, absent_path_key];
+        let name_keys = [old_name_key, current_name_key, absent_name_key];
+        let expected_blocks = replay.block_home_claims_many(&block_keys).unwrap();
+        let expected_uuid = replay
+            .logseq_claim_record(replay.logseq_claim_root, logseq_uuid)
+            .unwrap();
+        let expected_absent_uuid = replay
+            .logseq_claim_record(replay.logseq_claim_root, absent_uuid)
+            .unwrap();
+        let expected_paths = replay.portable_path_records_many(&path_keys).unwrap();
+        let expected_names = replay
+            .checkpoint_page_name_state_for_keys(name_keys)
+            .unwrap();
+        engine
+            .clean_checkpoint_publisher
+            .as_ref()
+            .unwrap()
+            .wait_for_idle()
+            .unwrap();
+        engine.schedule_clean_checkpoint_bootstrap();
+        engine
+            .clean_checkpoint_publisher
+            .as_ref()
+            .unwrap()
+            .wait_for_idle()
+            .unwrap();
+        let _ = engine.schedule_clean_checkpoint_idle();
+        assert_eq!(engine.clean_checkpoint_identity_installed_sequence, 2);
+        assert!(engine
+            .clean_checkpoint_identity_changes_by_sequence
+            .is_empty());
+
+        assert_eq!(engine.ephemeral_block_claims.len(), 1);
+        assert!(engine.ephemeral_logseq_claims.is_empty());
+        assert_eq!(engine.ephemeral_portable_paths.len(), 1);
+        assert_eq!(engine.ephemeral_page_names.record_count(), 1);
+        assert_eq!(
+            engine.clean_projection_head_batches,
+            replay.clean_projection_head_batches
+        );
+        assert!(engine
+            .clean_checkpoint_identity_changes_by_sequence
+            .is_empty());
+
+        let identity_history = engine.sealed_identity_history.as_ref().unwrap();
+        let point_work_before = identity_history.work();
+        let archive_reads_before = engine.archive_read_stats();
+        assert_eq!(
+            engine.block_home_claims_many(&block_keys).unwrap(),
+            expected_blocks
+        );
+        assert_eq!(
+            engine
+                .logseq_claim_record(engine.logseq_claim_root, logseq_uuid)
+                .unwrap(),
+            expected_uuid
+        );
+        assert_eq!(
+            engine
+                .logseq_claim_record(engine.logseq_claim_root, absent_uuid)
+                .unwrap(),
+            expected_absent_uuid
+        );
+        assert_eq!(
+            engine.portable_path_records_many(&path_keys).unwrap(),
+            expected_paths
+        );
+        assert_eq!(
+            engine
+                .checkpoint_page_name_state_for_keys(name_keys)
+                .unwrap(),
+            expected_names
+        );
+        let archive_reads_after = engine.archive_read_stats();
+        assert_eq!(archive_reads_after, archive_reads_before);
+        let point_work_after = identity_history.work();
+        let point_lookups = point_work_after.point_lookups - point_work_before.point_lookups;
+        let map_node_reads = point_work_after.map_node_reads - point_work_before.map_node_reads;
+        let value_reads = point_work_after.value_reads - point_work_before.value_reads;
+        let bytes_read = point_work_after.bytes_read - point_work_before.bytes_read;
+        let current_root_enumerations = point_work_after.current_root_enumerations
+            - point_work_before.current_root_enumerations;
+        let current_rows_enumerated =
+            point_work_after.current_rows_enumerated - point_work_before.current_rows_enumerated;
+        assert_eq!(point_lookups, 10);
+        assert!(map_node_reads > 0);
+        assert_eq!(value_reads, 6);
+        assert!(bytes_read > 0);
+        assert_eq!(
+            (current_root_enumerations, current_rows_enumerated),
+            (0, 0),
+            "ordinary identity admission enumerated (roots, rows)"
+        );
+
+        // Reusing a released UUID after the cut must produce exactly the same
+        // semantic root and resolution as replay. This is Packet 2's restore
+        // shape and catches a point adapter that accidentally drops the sealed
+        // introduction when advancing the recent overlay.
+        let reassign = OperationTransaction::new(vec![
+            SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: home,
+                },
+                mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
+            },
+            SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: block,
+                    home_document_id: home,
+                },
+                content: "identity point after cut".into(),
+            },
+        ])
+        .unwrap();
+        let claims = engine
+            .clean_transient_projection_claim_snapshot()
+            .unwrap()
+            .unwrap();
+        let prepared = engine
+            .prepare_fixture_transaction(test_author(0x4b12, 0x4b12), &reassign)
+            .unwrap();
+        assert!(matches!(
+            engine
+                .commit_clean_prepared(&prepared, claims.as_ref())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            replay
+                .stage_ready(ValidatedBatch::new(prepared))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert_eq!(engine.logseq_claim_root, replay.logseq_claim_root);
+        assert_eq!(
+            engine.resolve_logseq_uuid(logseq_uuid).unwrap(),
+            replay.resolve_logseq_uuid(logseq_uuid).unwrap()
+        );
+        engine.wait_for_clean_checkpoint().unwrap();
+
+        // The durable generation already covers every accepted batch. A
+        // recurring capture therefore has no identity delta to visit. The
+        // predecessor implementation cloned and serialized all four lifetime
+        // maps here, which is the R3/R4 defect this gate retires.
+        let durable_sequence = engine
+            .clean_checkpoint_publisher
+            .as_ref()
+            .unwrap()
+            .durable_sequence();
+        assert_eq!(durable_sequence, 3);
+        let changed_publish_work = engine
+            .clean_checkpoint_publisher
+            .as_ref()
+            .unwrap()
+            .last_identity_publish_work();
+        assert!(changed_publish_work.changed_records >= 2);
+        assert_eq!(
+            changed_publish_work.value_writes,
+            changed_publish_work.changed_records
+        );
+        assert!(changed_publish_work.map_node_reads > 0);
+        assert!(changed_publish_work.map_node_writes > 0);
+        assert!(
+            changed_publish_work.map_node_reads
+                <= changed_publish_work.changed_records.saturating_mul(512)
+        );
+        assert!(
+            changed_publish_work.map_node_writes
+                <= changed_publish_work.changed_records.saturating_mul(1_024)
+        );
+        let capture = engine.capture_clean_checkpoint(durable_sequence).unwrap();
+        assert_eq!(
+            capture.identity_changes.len(),
+            0,
+            "a zero-tail recurring cut captured identity rows"
+        );
+
+        let source = include_str!("hot_engine.rs");
+        let state = &source[source.find("struct CleanCheckpointStateV6 {").unwrap()
+            ..source
+                .find("pub(crate) struct CleanCheckpointStateBinding")
+                .unwrap()];
+        for retired in [
+            "ephemeral_block_claims:",
+            "ephemeral_logseq_claims:",
+            "ephemeral_portable_paths:",
+            "ephemeral_page_names:",
+            "current_path_rows:",
+            "clean_projection_head_batches:",
+        ] {
+            assert!(
+                !state.contains(retired),
+                "actor checkpoint state still embeds {retired}"
+            );
+        }
+
+        drop(replay);
+        drop(engine);
+        drop(archive);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_authority_is_unique_per_engine() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(89_470));
         let lineage = LineageDigest::of(b"runtime-engine-authority");
@@ -35633,10 +36628,12 @@ pub(crate) mod validation_tests {
         // to one catalog plus page shards, keyed by 16-byte document ids,
         // moved it to 4. Replacing inline resident bytes with v2 image roster
         // references moved it to 5. Device-local acceptance-age metadata moved
-        // it to 6. Current-action hot retention moved it to 7, so none of the
-        // older shapes can decode as this.
+        // it to 6. Current-action hot retention moved it to 7. Sealed identity
+        // roots removed the whole identity maps and current-path roster from
+        // this actor-captured section at 8, so none of the older shapes can
+        // decode as this.
         assert_eq!(
-            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 7,
+            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 8,
             "changing the checkpoint state representation changes its schema"
         );
         let state_start = source

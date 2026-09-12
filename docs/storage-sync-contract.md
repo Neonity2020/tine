@@ -374,13 +374,19 @@ The final MS-14b closure also removes the former scratch-backed document,
 dependency, causal, evidence, and Loro stores and the separate physical
 engine-history control. Store-backed engines retain only nonterminal staged
 payloads in hot memory; terminal payloads are reloaded exactly from the
-immutable operation archive when needed. Compact accepted statuses, event
-evidence, semantic identity/path/name maps, and their digest roots remain
-inline. Exact historical frontier questions reconstruct from that retained
-semantic accepted evidence; current-point reads remain direct. The dependency
-is certified `tine-storage v0.12.0`. Its supported-target guards include Linux,
-Windows, macOS, iOS, and Android for both exact-file and whole-directory
-no-clobber publication.
+immutable operation archive when needed. Compact accepted statuses and event
+evidence remain inline. After a marker-selected generation, complete
+block/home, Logseq UUID, portable-path, and page-name acquisition/release
+evidence is held in four canonical point maps over the shared sealed
+authenticated-map store. Only current claims and the accepted tail are rebuilt
+resident; release-only rows remain point-addressable on disk. Admission
+composes the speculative local overlay, accepted tail, current claims, and a
+sealed point answer without enumerating a complete map or reading an accepted
+archive manifest/object. Exact historical frontier questions reconstruct from
+retained semantic accepted evidence. The dependency is certified
+`tine-storage v0.12.0`. Its supported-target guards include Linux, Windows,
+macOS, iOS, and Android for both exact-file and whole-directory no-clobber
+publication.
 
 ### 1.2a App-private immutable plugin packages
 
@@ -1434,11 +1440,15 @@ The restart contract at every publication edge is:
 | After actor swap, before journal/input cleanup | Reopen replays and deduplicates retained work; it never authors the operation twice. |
 | During cleanup | Durable selector/drain-anchor ordering preserves either the retained frame or proven exact accepted coverage. |
 
-The checkpoint contains every clean-runtime field that changes later
-admission, conflict, or query decisions, including the exact ephemeral
-page-name ownership state, current path/name/UUID claims and conflicts,
-accepted frontier and resident-document identities, projection-head batch locators,
-the bounded current-action hot-retention closure, and the accepted sequence.
+The checkpoint names every clean-runtime authority needed to reproduce later
+admission, conflict, or query decisions: accepted/frontier semantic roots,
+resident-document identities, the bounded current-action hot-retention closure,
+and the accepted sequence. Complete identity evidence for page names, portable
+paths, block homes and Logseq UUIDs lives in sealed point roots; companion
+current roots carry only current claims, current-path rows and their covered
+projection-head facts. Reopen enumerates those current roots once and then
+composes them with the accepted recent overlay. Released evidence remains
+point-addressable without becoming resident actor state.
 The accepted roster is not a parallel list: it is
 the canonical `tine-storage` sealed accepted index with exact accepted evidence,
 causal records, status map and sequence root. The checkpoint also records each
