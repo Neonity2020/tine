@@ -149,5 +149,14 @@ census require an explicit contract review.
 Both ratchets additionally assert that no row is class (c). That assertion, not
 a reviewer's memory, is what keeps the class empty.
 
+Neither census is anchored to line numbers. The Rust rows name a **function and
+an occurrence within it**; the frontend rows name a **content digest of the
+call's arguments**. Both anchors move with their call, so an edit above a print
+or console site changes nothing, and neither census has a mechanical
+re-anchoring step. They go red only when a site is added, removed, moved between
+functions, or has its payload changed — each of which is a real change to what a
+shipped binary can emit and needs a human classification, which is the review
+this section requires.
+
 The required repair for an unreviewed Rust site is: use a fixed-shape event
 (src-tauri) or a content-free flag-gated line (core).

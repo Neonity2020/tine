@@ -5,6 +5,7 @@ use production_source::{
     compiled_source, line_of, production_source_files, relative_path, repo_root, test_only_include,
 };
 use regex::Regex;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -53,18 +54,33 @@ fn the_source_census_excludes_test_only_modules_declared_from_anywhere() {
     );
 }
 
+/// A print site's IDENTITY: which function it lives in, and which of that
+/// function's prints it is. Deliberately NOT the line number — see the note on
+/// `ALLOWLIST`.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PrintSite {
     file: String,
-    line: usize,
+    function: String,
     macro_name: String,
+    occurrence: usize,
+}
+
+impl PrintSite {
+    fn identity(&self) -> String {
+        format!(
+            "{}::{}#{} {}!",
+            self.file, self.function, self.occurrence, self.macro_name
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
 struct AllowedSite {
     file: &'static str,
-    lines: &'static [usize],
+    function: &'static str,
     macro_name: &'static str,
+    /// Which of this function's prints, in source order, this row classifies.
+    occurrences: &'static [usize],
     /// One of four buckets, the same four `src/contentOutOfLogs.ratchet.test.ts`
     /// uses, so one classification answers "is this line safe?" on both sides:
     ///
@@ -83,48 +99,84 @@ struct AllowedSite {
 
 // Production app output only. Standalone CLI binaries own their terminal
 // output and are outside the application diagnostics contract.
+//
+// Rows are anchored to a FUNCTION and an occurrence within it, not to a line
+// number, and that is the whole point of the `function` column.
+//
+// This census used to pin `{ file, lines }` — 76 absolute line numbers, half of
+// them in `model.rs`, `hot_engine.rs` and `sqlite.rs`, the three files every
+// lane edits. Inserting a line anywhere above one of them turned the census red
+// for work that never touched logging, and the repair was a script that
+// re-anchored the numbers mechanically. A guard whose normal failure mode is
+// "run the fixer" is a guard nobody reads: the I-12 test thirty lines below
+// already says exactly this in its own comment, and already anchors on the
+// function. This now does the same, and `scripts/reanchor-print-census.mjs` is
+// deleted rather than kept as a tempting shortcut.
+//
+// A function name is also a better classification unit than a line: `why` can be
+// checked against the function it names, which a line number cannot support.
+// The census still moves when a print is ADDED to, REMOVED from, or MOVED
+// BETWEEN functions — each of which is a real change to what a shipped binary
+// can emit, and each of which deserves a human classification.
 const RUST_PRINT_SITE_COUNT: usize = 76;
 const ALLOWLIST: &[AllowedSite] = &[
-    AllowedSite { file: "crates/tine-core/src/concord_ledger.rs", lines: &[238], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "best-effort ledger update failure carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", lines: &[2080], macro_name: "eprintln", bucket: "d", class: "fixed-family-report", why: "report_projection_failure's always-on line is the fixed failure family and no error value", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", lines: &[2082], macro_name: "eprintln", bucket: "b", class: "directed-core-detail", why: "report_projection_failure's detail line repeats the family with the raw error, for a directed investigation", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", lines: &[2150], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "projection directory creation carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", lines: &[2168], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "projection lease acquisition carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", lines: &[2460], macro_name: "eprintln", bucket: "a", class: "fixed-debug", why: "the deferred-turn line is the ELSE arm of is_reportable_failure, so the only ProjectionRefusal that reaches it is AwaitingFullInventory, whose Display is a fixed literal; Failed(_) takes the reviewed report_projection_failure path instead", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/model.rs", lines: &[15717], macro_name: "eprintln", bucket: "d", class: "numeric-shape", why: "isolated search worker panic reports only a worker number", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/model.rs", lines: &[21695, 24663], macro_name: "eprintln", bucket: "a", class: "content-free-debug", why: "reconcile and isolated-parse failures contain no path, title, content, or raw error", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/model.rs", lines: &[23454, 23643], macro_name: "eprintln", bucket: "a", class: "fixed-debug", why: "Guide-page refusal messages are fixed literals", gate: "cfg(debug_assertions)" },
-    AllowedSite { file: "crates/tine-core/src/oplog/batch.rs", lines: &[213], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "batch composition contains public enum kinds and numeric sizes only", gate: "TINE_BATCH_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", lines: &[3955], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "checkpoint writer thread spawn carries only a std::io::Error", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", lines: &[3978], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "orphan-image cleanup errors are bounded literals or capability errors over digest-named private checkpoint objects", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", lines: &[4003], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "publish_capture's error is a bounded literal or an object-store error over digest-named private blobs", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", lines: &[11441], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "validate_and_apply phase timing contains a phase index and a duration", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", lines: &[13846, 17627, 18654, 18682, 18861, 21623, 21652, 21686, 21718, 22641, 22667, 22814, 22833, 25896], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/import.rs", lines: &[1727, 1739], macro_name: "eprintln", bucket: "a", class: "fixed-debug", why: "clean-genesis recovery reports one of two fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/oplog/local_journal_drain.rs", lines: &[846, 873, 889, 914], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "managed-local drain timings contain fixed labels and durations", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/object_store.rs", lines: &[2506], macro_name: "eprintln", bucket: "b", class: "enum-trace", why: "immutable publication reports only a fixed artifact class", gate: "TINE_PUBLISH_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2872, 3167, 3211], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", lines: &[2977], macro_name: "eprintln", bucket: "b", class: "directed-core-content", why: "this one DOES render target bytes as lossy UTF-8; it is graph content and stays behind the directed trace", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/semantic.rs", lines: &[1006], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "semantic snapshot diagnostic contains counts and encoded byte sizes", gate: "TINE_SEMANTIC_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", lines: &[1995, 4742, 4746, 4753, 4766, 4778, 4786, 4818, 5611], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/publish.rs", lines: &[4834, 4863], macro_name: "eprintln", bucket: "a", class: "content-free-debug", why: "publication refusals report only a fixed shape or collision count", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[7572], macro_name: "eprintln", bucket: "b", class: "directed-core-trace", why: "watcher trace is explicitly enabled for a directed investigation", gate: "TINE_CLEAN_WATCHER_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[8475, 8493], macro_name: "eprintln", bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[8685, 8689, 8714, 8726], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "disposable checkpoint fallbacks carry typed store/decode errors describing batch ids, sealed kinds and sequences", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[8898, 23019, 23257, 25104, 25148, 25180], macro_name: "eprintln", bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[13607], macro_name: "eprintln", bucket: "a", class: "content-free-debug", why: "CRDT writer-lane qualification reports a fixed disposition, an incarnation number and id, and a causal counter", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[22699, 22790, 22856], macro_name: "eprintln", bucket: "b", class: "directed-core-detail", why: "foreground mutation detail is available only for explicitly enabled runtime debugging", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", lines: &[23653], macro_name: "eprintln", bucket: "b", class: "numeric-trace", why: "actor tick report contains a fixed branch label, duration, and pending count", gate: "TINE_TICK_TRACE" },
-    AllowedSite { file: "src-tauri/src/data_home.rs", lines: &[128], macro_name: "eprintln", bucket: "d", class: "fixed-terminal-failure", why: "fatal startup guidance is a fixed sentence plus the bounded ErrorKind token (I-9); the path and OS prose stay on diag", gate: "always-on fatal startup" },
-    AllowedSite { file: "src-tauri/src/debug.rs", lines: &[86, 90, 104], macro_name: "eprintln", bucket: "b", class: "directed-native-debug", why: "detailed native stderr, including the log path, is available only under the existing debug opt-in", gate: "debug_enabled" },
-    AllowedSite { file: "src-tauri/src/debug.rs", lines: &[383], macro_name: "eprintln", bucket: "d", class: "content-free-error", why: "flight-recorder setup failure carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/concord_ledger.rs", function: "run", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "best-effort ledger update failure carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "projection directory creation carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[1], bucket: "d", class: "content-free-error", why: "projection lease acquisition carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[2], bucket: "a", class: "fixed-debug", why: "the deferred-turn line is the ELSE arm of is_reportable_failure, so the only ProjectionRefusal that reaches it is AwaitingFullInventory, whose Display is a fixed literal; Failed(_) takes the reviewed report_projection_failure path instead", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "report_projection_failure", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "fixed-family-report", why: "report_projection_failure's always-on line is the fixed failure family and no error value", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "report_projection_failure", macro_name: "eprintln", occurrences: &[1], bucket: "b", class: "directed-core-detail", why: "report_projection_failure's detail line repeats the family with the raw error, for a directed investigation", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/model.rs", function: "force_save_page_at_revision", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "fixed-debug", why: "Guide-page refusal messages are fixed literals", gate: "cfg(debug_assertions)" },
+    AllowedSite { file: "crates/tine-core/src/model.rs", function: "isolate_page_parse", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "reconcile and isolated-parse failures contain no path, title, content, or raw error", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/model.rs", function: "load_all_pages_with_permit", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "numeric-shape", why: "isolated search worker panic reports only a worker number", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/model.rs", function: "save_page", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "fixed-debug", why: "Guide-page refusal messages are fixed literals", gate: "cfg(debug_assertions)" },
+    AllowedSite { file: "crates/tine-core/src/model.rs", function: "sync_file", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "reconcile and isolated-parse failures contain no path, title, content, or raw error", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/oplog/batch.rs", function: "retained_bytes", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "batch composition contains public enum kinds and numeric sizes only", gate: "TINE_BATCH_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", function: "publisher_loop", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "checkpoint writer thread spawn carries only a std::io::Error", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", function: "publisher_loop", macro_name: "eprintln", occurrences: &[1], bucket: "d", class: "content-free-error", why: "orphan-image cleanup errors are bounded literals or capability errors over digest-named private checkpoint objects", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", function: "spawn_publisher", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "publish_capture's error is a bounded literal or an object-store error over digest-named private blobs", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "drain_staged", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "prepare_transaction_core", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "record_validation_phase", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "validate_and_apply phase timing contains a phase index and a duration", gate: "TINE_PHASE_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "stage_ready_with_claim_source", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "validate_and_apply", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "validate_manifested_projection_transition", macro_name: "eprintln", occurrences: &[0, 1, 2], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "validate_prospective_references", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/import.rs", function: "open_or_rebuild_clean_genesis_projection", macro_name: "eprintln", occurrences: &[0, 1], bucket: "a", class: "fixed-debug", why: "clean-genesis recovery reports one of two fixed states", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/oplog/local_journal_drain.rs", function: "resume_managed_local_journal_drain_with_parts_and_superseding_projection", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "b", class: "numeric-trace", why: "managed-local drain timings contain fixed labels and durations", gate: "TINE_PHASE_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/object_store.rs", function: "publish_immutable", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "enum-trace", why: "immutable publication reports only a fixed artifact class", gate: "TINE_PUBLISH_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", function: "execute_manifested_projection_work_located", macro_name: "eprintln", occurrences: &[0, 2, 3], bucket: "b", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", function: "execute_manifested_projection_work_located", macro_name: "eprintln", occurrences: &[1], bucket: "b", class: "directed-core-content", why: "this one DOES render target bytes as lossy UTF-8; it is graph content and stays behind the directed trace", gate: "TINE_PHASE_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/semantic.rs", function: "encode_validated", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "semantic snapshot diagnostic contains counts and encoded byte sizes", gate: "TINE_SEMANTIC_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", function: "apply_engine_owned_accepted_with_stats", macro_name: "eprintln", occurrences: &[0, 1, 2, 3, 4, 5, 6], bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", function: "rebuild_stream", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", function: "trace_terminal_phase", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/publish.rs", function: "publish_graph_documents_inner", macro_name: "eprintln", occurrences: &[0, 1], bucket: "a", class: "content-free-debug", why: "publication refusals report only a fixed shape or collision count", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "advance_clean_foreground_pending_commit", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "advance_full_scan", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "watcher trace is explicitly enabled for a directed investigation", gate: "TINE_CLEAN_WATCHER_TRACE" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "execute_editor_transaction", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-detail", why: "foreground mutation detail is available only for explicitly enabled runtime debugging", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "execute_foreground_new_editor_transaction", macro_name: "eprintln", occurrences: &[0, 1], bucket: "b", class: "directed-core-detail", why: "foreground mutation detail is available only for explicitly enabled runtime debugging", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "finish_clean_foreground_editor_outcome", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "open_clean_runtime_resources_with_progress", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "d", class: "content-free-error", why: "disposable checkpoint fallbacks carry typed store/decode errors describing batch ids, sealed kinds and sequences", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "open_clean_runtime_resources_with_progress", macro_name: "eprintln", occurrences: &[4], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "phase", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "qualify_clean_writer_lanes", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "CRDT writer-lane qualification reports a fixed disposition, an incarnation number and id, and a causal counter", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "report_counters", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "resolve_pending_conflict", macro_name: "eprintln", occurrences: &[0, 1, 2], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
+    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "tick", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "actor tick report contains a fixed branch label, duration, and pending count", gate: "TINE_TICK_TRACE" },
+    AllowedSite { file: "src-tauri/src/data_home.rs", function: "ensure_usable", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "fixed-terminal-failure", why: "fatal startup guidance is a fixed sentence plus the bounded ErrorKind token (I-9); the path and OS prose stay on diag", gate: "always-on fatal startup" },
+    AllowedSite { file: "src-tauri/src/debug.rs", function: "debug_init", macro_name: "eprintln", occurrences: &[0, 1], bucket: "b", class: "directed-native-debug", why: "detailed native stderr, including the log path, is available only under the existing debug opt-in", gate: "debug_enabled" },
+    AllowedSite { file: "src-tauri/src/debug.rs", function: "diag", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-native-debug", why: "detailed native stderr, including the log path, is available only under the existing debug opt-in", gate: "debug_enabled" },
+    AllowedSite { file: "src-tauri/src/debug.rs", function: "flight_init", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "flight-recorder setup failure carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
 ];
-
-fn print_sites() -> Vec<PrintSite> {
+/// Every print site with the line it currently sits on. The line is for the
+/// failure message only — it is never compared, so it cannot make this test red.
+fn print_sites() -> Vec<(PrintSite, usize)> {
     let root = repo_root();
     let files = production_source_files();
     let print_macro = Regex::new(r"\b(eprintln|println|dbg)!\s*[({\[]").unwrap();
     let mut sites = Vec::new();
+    let mut counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     for file in files {
         let source = compiled_source(&file);
         let relative = relative_path(&root, &file);
@@ -138,11 +190,21 @@ fn print_sites() -> Vec<PrintSite> {
             {
                 continue;
             }
-            sites.push(PrintSite {
-                file: relative.clone(),
-                line: line_of(&source, whole.start()),
-                macro_name: found[1].to_string(),
-            });
+            let function = enclosing_fn(&source, whole.start());
+            let macro_name = found[1].to_string();
+            let occurrence = *counts
+                .entry((relative.clone(), function.clone(), macro_name.clone()))
+                .and_modify(|seen| *seen += 1)
+                .or_insert(0);
+            sites.push((
+                PrintSite {
+                    file: relative.clone(),
+                    function,
+                    macro_name,
+                    occurrence,
+                },
+                line_of(&source, whole.start()),
+            ));
         }
     }
     sites.sort();
@@ -170,29 +232,57 @@ fn production_print_sites_equal_the_reviewed_content_free_census() {
             entry.bucket
         );
     }
-    let actual = print_sites();
     let mut expected = ALLOWLIST
         .iter()
         .flat_map(|entry| {
-            entry.lines.iter().map(|line| PrintSite {
+            entry.occurrences.iter().map(|occurrence| PrintSite {
                 file: entry.file.to_string(),
-                line: *line,
+                function: entry.function.to_string(),
                 macro_name: entry.macro_name.to_string(),
+                occurrence: *occurrence,
             })
         })
         .collect::<Vec<_>>();
     expected.sort();
-    assert_eq!(expected.len(), RUST_PRINT_SITE_COUNT);
+    // A row must name ONE site. Two rows claiming the same occurrence of the
+    // same function would let either of them supply the classification, which
+    // is the ambiguity the line pin had.
+    let mut unique = expected.clone();
+    unique.dedup();
     assert_eq!(
-        actual, expected,
-        "I-5: production print-site census changed. \
-         If a print site was ADDED or REMOVED: remove user content and use a fixed-shape event \
-         (src-tauri — `debug.rs::record_fixed_event` and its typed callers such as \
+        unique.len(),
+        expected.len(),
+        "I-5: two ALLOWLIST rows classify the same print site"
+    );
+    assert_eq!(expected.len(), RUST_PRINT_SITE_COUNT);
+
+    let actual = print_sites();
+    let repair = "I-5: the production print-site census changed. \
+         A print site was ADDED to, REMOVED from, or MOVED BETWEEN functions — each is a real \
+         change to what a shipped binary can emit. Remove user content and use a fixed-shape \
+         event (src-tauri — `debug.rs::record_fixed_event` and its typed callers such as \
          `record_storage_transition` are the exemplar) or a content-free flag-gated line (core), \
-         then classify the exact site by hand in ALLOWLIST. \
-         If the (file, macro) multiset is UNCHANGED and only line numbers moved, this is pure \
-         drift from an edit above a print site: run `node scripts/reanchor-print-census.mjs`, \
-         which re-anchors line numbers only and refuses to bless an added or removed site."
+         then classify the exact site by hand in ALLOWLIST and adjust RUST_PRINT_SITE_COUNT. \
+         Rows are anchored to a function and an occurrence within it, NOT to a line number, so \
+         this does not fire merely because lines moved — there is nothing to re-anchor.";
+    let added = actual
+        .iter()
+        .filter(|(site, _)| !expected.contains(site))
+        .map(|(site, line)| format!("{} (now at {}:{line})", site.identity(), site.file))
+        .collect::<Vec<_>>();
+    assert!(added.is_empty(), "{repair}\nnot in the census: {added:#?}");
+    let present = actual
+        .iter()
+        .map(|(site, _)| site.clone())
+        .collect::<Vec<_>>();
+    let removed = expected
+        .iter()
+        .filter(|site| !present.contains(site))
+        .map(PrintSite::identity)
+        .collect::<Vec<_>>();
+    assert!(
+        removed.is_empty(),
+        "{repair}\ncensused but no longer present: {removed:#?}"
     );
 }
 
