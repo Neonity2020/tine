@@ -16985,6 +16985,34 @@ fn oversized_provider_paths() -> Vec<String> {
         .collect()
 }
 
+/// Byte span of the shutdown drain itself in `sync_runtime.rs`.
+///
+/// The anchor is the `&mut self` actor method, NOT the bare name: `clean_shutdown`
+/// is ALSO a public handle method 20,000 lines earlier, and anchoring on
+/// `"fn clean_shutdown("` silently selected the handle, making both drain guards
+/// scan — or exclude — nearly the whole file. That is not a hypothetical: it made
+/// `the_clean_shutdown_drain_has_no_blocked_tick_producer` pass a neuter that
+/// planted a `Revoked` producer squarely inside the over-wide exclusion. Assert
+/// the anchor is unique so a third `clean_shutdown` cannot quietly repeat it.
+fn clean_shutdown_drain_span() -> (usize, usize) {
+    const ANCHOR: &str = "    fn clean_shutdown(&mut self)";
+    let source = include_str!("sync_runtime.rs");
+    assert_eq!(
+        source.matches(ANCHOR).count(),
+        1,
+        "the drain anchor {ANCHOR:?} is no longer unique; the drain guards would scan the wrong \
+         region. Give the drain an unambiguous anchor before changing its neighbours."
+    );
+    let start = source
+        .find(ANCHOR)
+        .expect("the shutdown drain still exists");
+    let end = start
+        + source[start..]
+            .find("\n    fn prepare_shared(")
+            .expect("the function after the drain still follows it");
+    (start, end)
+}
+
 /// Shut down cleanly, insist on `Safe`, and say what happened when it is not.
 ///
 /// `assert!(matches!(handle.clean_shutdown(), Ok(Safe(s)) if <guard>))` reports
@@ -16997,6 +17025,85 @@ fn oversized_provider_paths() -> Vec<String> {
 /// names itself. `oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it`
 /// is the converted exemplar;
 /// `opaque_clean_shutdown_oracles_do_not_grow` counts the ones still to convert.
+/// The shutdown drain classifies every tick, with no catch-all.
+///
+/// A catch-all arm here refused `clean_shutdown` for every `SyncRuntimeTick`
+/// variant nobody remembered to enumerate. It had collected four ordinary
+/// progress variants, and one of them -- `ProviderMutation`, a peer's batch
+/// landing while the user quits -- was live: shutdown returned an error instead
+/// of `Safe`. A refusal that names no in-scope threat scenario is a future
+/// availability bug (invariant I-8), and a catch-all cannot name one by
+/// construction, because it does not know what it caught.
+///
+/// The match is exhaustive so that adding a tick variant fails to COMPILE here.
+/// This test guards the only thing the compiler cannot: that nobody restores a
+/// catch-all to silence that failure.
+#[test]
+fn the_clean_shutdown_drain_classifies_every_tick() {
+    let (start, end) = clean_shutdown_drain_span();
+    let source = include_str!("sync_runtime.rs");
+    let drain = &source[start..end];
+    for catch_all in [
+        "\n                    other =>",
+        "\n                    _ =>",
+    ] {
+        assert!(
+            !drain.contains(catch_all),
+            "the shutdown drain grew a catch-all arm again. Classify the new `SyncRuntimeTick` \
+             variant deliberately: ordinary progress joins the counted arm, and a refusal needs \
+             an in-scope threat scenario and a row in the contract's refusal table \
+             (docs/storage-sync-contract.md). A catch-all refuses for reasons it cannot name."
+        );
+    }
+    assert!(
+        drain.contains("SyncRuntimeTick::ProviderMutation { .. }"),
+        "a peer batch admitted during the drain is ordinary progress, not a reason to refuse \
+         Safe. See `oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it`."
+    );
+}
+
+/// No producer builds a `LocalMutation` tick from a blocked or revoked outcome.
+///
+/// This is what makes the drain's two refusal arms DEAD arms rather than live
+/// refusals, and it is why they carry no scenario row in the contract: a refusal
+/// that cannot fire defends against nothing, and writing it into the §3.1 table
+/// would be false precision about a threat this path does not face. Every
+/// production site that mints `SyncRuntimeTick::LocalMutation` carries `Durable`
+/// or `RetryableRetainedRecovery`; the one path that could forward a blocked or
+/// revoked outcome -- the provider conflict resolution in
+/// `resolve_provider_conflict_batch` -- repairs the superseded projection and
+/// returns `None` instead.
+///
+/// The fact has to live in a test, not in that comment, because the comment is
+/// exactly the kind of architectural claim that rots silently: the catch-all
+/// this replaced had been quietly wrong for four variants. If a producer starts
+/// emitting one of these, the drain's classification stops being bookkeeping and
+/// becomes a real decision -- the user's own edit did not land -- so this test
+/// fails and says so.
+#[test]
+fn the_clean_shutdown_drain_has_no_blocked_tick_producer() {
+    const MINT: &str = "SyncRuntimeTick::LocalMutation(";
+    let source = include_str!("sync_runtime.rs");
+    let (start, end) = clean_shutdown_drain_span();
+    // The drain's own arms are the only place these two outcomes may be NAMED.
+    let outside = format!("{}{}", &source[..start], &source[end..]);
+
+    let mut offenders = Vec::new();
+    for (index, _) in outside.match_indices(MINT) {
+        let site = &outside[index + MINT.len()..];
+        let site = &site[..site.len().min(120)];
+        for outcome in ["Blocked", "Revoked"] {
+            if site.contains(outcome) {
+                offenders.push(outcome);
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a runtime tick now carries a {offenders:?} local-mutation outcome. The clean shutdown          drain treats that as a refusal (I-8): the user's own edit did not land and its evidence          is retained, so publishing `Safe` over it would report success for work that failed.          Decide deliberately -- if the refusal is right, give it a scenario row in          docs/storage-sync-contract.md §3.1 alongside `clean shutdown could not drain the          checkpoint publisher` and pin it in          `clean_generation_refusal_stems_are_pinned_to_in_scope_scenarios`; if the outcome is          ordinary progress, move it to the counted arm. Do not delete this test to make the          choice go away."
+    );
+}
+
 /// The opaque shutdown oracle does not grow, and the remaining ones are named.
 ///
 /// Twelve sites still collapse three different defects into one panic message.

@@ -26463,9 +26463,23 @@ impl RuntimeActor {
                 {
                     break;
                 }
+                // EXHAUSTIVE deliberately: no catch-all arm. A catch-all here
+                // refused shutdown for every tick variant nobody remembered to
+                // enumerate, and it had quietly collected four of them --
+                // `ProviderMutation`, `CheckpointCaptureSkipped`, `RetryFull`
+                // and the two non-terminal `LocalMutation` outcomes are all
+                // ORDINARY PROGRESS. A refusal that names no in-scope threat
+                // scenario is not hardening, it is a future availability bug,
+                // and this one was live: a peer's batch landing while the user
+                // quit returned an error instead of `Safe`. Adding a variant to
+                // `SyncRuntimeTick` must now fail to compile here so the next
+                // author classifies it on purpose.
                 match self.tick_clean_runtime() {
                     SyncRuntimeTick::Idle
                     | SyncRuntimeTick::Recovering
+                    | SyncRuntimeTick::RetryFull
+                    | SyncRuntimeTick::CheckpointCaptureSkipped { .. }
+                    | SyncRuntimeTick::ProviderMutation { .. }
                     | SyncRuntimeTick::AdmittedNoop { .. }
                     | SyncRuntimeTick::AdmittedComplete { .. }
                     | SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable {
@@ -26487,9 +26501,37 @@ impl RuntimeActor {
                     | SyncRuntimeTick::Terminal(detail) => {
                         return Err(SyncRuntimeRequestError::ActorRefused(detail));
                     }
-                    other => {
+                    // UNREACHABLE BY CONSTRUCTION, and deliberately loud if
+                    // that ever stops being true. No production site builds a
+                    // `LocalMutation` tick from these two outcomes: every
+                    // producer carries `Durable` or `RetryableRetainedRecovery`,
+                    // and the one path that could forward a blocked or revoked
+                    // outcome instead repairs the superseded projection and
+                    // yields `None`. So these arms are not a live refusal and
+                    // own no scenario row -- they exist because the match is
+                    // exhaustive on purpose. `the_clean_shutdown_drain_has_no_blocked_tick_producer`
+                    // fails the moment a producer changes, because the
+                    // classification would then be a real decision: the user's
+                    // own edit did not land, its evidence is retained, and
+                    // publishing `Safe` over it would report success for work
+                    // that failed. Refusing is the safe default to be wrong in
+                    // -- loud, not silent -- so name the phase and reason, both
+                    // closed vocabularies carrying no page content.
+                    SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Blocked {
+                        phase,
+                        reason,
+                        ..
+                    }) => {
                         return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                            "clean shutdown received unexpected runtime progress: {other:?}"
+                            "clean shutdown found a blocked local mutation at {phase:?}: {reason:?}"
+                        )));
+                    }
+                    SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Revoked {
+                        phase,
+                        ..
+                    }) => {
+                        return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                            "clean shutdown found a revoked local mutation at {phase:?}"
                         )));
                     }
                 }

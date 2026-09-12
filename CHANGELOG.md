@@ -189,6 +189,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Quitting while a change arrives from another device now shuts down cleanly.**
+  If a synced change landed in the moment you closed Tine, the shutdown reported
+  an error instead of finishing normally. Nothing was lost either way — the
+  change was already saved — but the error was wrong and alarming. Ordinary
+  progress during shutdown is now treated as ordinary progress.
+
 - **Two devices renaming the same page no longer stall syncing.** If two devices
   each gave one page a different title while apart, and either had been running
   long enough to compact its history, reconnecting could stop syncing with a
