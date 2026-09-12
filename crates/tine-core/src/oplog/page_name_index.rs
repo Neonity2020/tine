@@ -753,6 +753,59 @@ struct PageNameTransitionCoreCandidateV1 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Every canonical page-name key a transition over `deltas` can touch.
+///
+/// There is one answer to this question and this is it.
+/// [`prepare_page_name_transition_core`] resolves its records through
+/// [`PageNameTransitionAccess::lookup_many`], and the only implementation of
+/// that trait answers out of a bounded point view the CALLER pre-fetched. So a
+/// caller that derives a narrower key set does not merely fetch less: it turns
+/// a record that exists into a record the core proves absent, and the two
+/// absences fail in opposite directions.
+///
+/// - A missing `current` key fails loudly, as `MalformedPageNameIndex`: the
+///   authoritative catalog and the ownership index then disagree about who
+///   holds a name, and the core is right to reject that.
+/// - A missing `prospective` key fails silently. The acquisition loop reads no
+///   occupant, so it takes a canonical name another page already owns --
+///   exactly the collision this index exists to prevent.
+///
+/// Derive every caller's keys here. Two details a hand-written caller keeps
+/// getting wrong, and both were live: all FOUR observation sources count, not
+/// just the delta's own `before`/`after`; and the key comes from
+/// [`PageState::name`], not from the live name, because a tombstoned page
+/// still holds its canonical key.
+pub(crate) fn page_name_transition_keys(
+    deltas: &[PageDelta],
+    current_pages: &BTreeMap<PageId, Option<PageState>>,
+    prospective_pages: &BTreeMap<PageId, Option<PageState>>,
+) -> Result<BTreeSet<PageNameKeyDigest>, StoreError> {
+    let mut keys = BTreeSet::new();
+    for delta in deltas {
+        for state in [
+            delta.before.as_ref(),
+            delta.after.as_ref(),
+            current_pages.get(&delta.page_id).and_then(Option::as_ref),
+            prospective_pages
+                .get(&delta.page_id)
+                .and_then(Option::as_ref),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let key = state.name().key_digest();
+            if keys.len() == MAX_PAGE_NAME_POINT_BATCH && !keys.contains(&key) {
+                return Err(StoreError::PageNamePointBatchTooLarge {
+                    actual: MAX_PAGE_NAME_POINT_BATCH + 1,
+                    limit: MAX_PAGE_NAME_POINT_BATCH,
+                });
+            }
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
+}
+
 fn prepare_page_name_transition_core(
     access: &impl PageNameTransitionAccess,
     batch_id: BatchId,
@@ -795,29 +848,9 @@ fn prepare_page_name_transition_core(
         }
     }
 
-    let mut keys = BTreeSet::new();
-    for delta in deltas {
-        for state in [
-            delta.before.as_ref(),
-            delta.after.as_ref(),
-            current_pages[&delta.page_id].as_ref(),
-            prospective_pages[&delta.page_id].as_ref(),
-        ]
+    let requested = page_name_transition_keys(deltas, current_pages, prospective_pages)?
         .into_iter()
-        .flatten()
-        {
-            let key = state.name().key_digest();
-            if keys.len() == MAX_PAGE_NAME_POINT_BATCH && !keys.contains(&key) {
-                return Err(StoreError::PageNamePointBatchTooLarge {
-                    actual: MAX_PAGE_NAME_POINT_BATCH + 1,
-                    limit: MAX_PAGE_NAME_POINT_BATCH,
-                }
-                .into());
-            }
-            keys.insert(key);
-        }
-    }
-    let requested = keys.into_iter().collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     let mut records = access.lookup_many(&requested)?;
 
     let participant_for_occupied = |key: PageNameKeyDigest,
@@ -1654,6 +1687,68 @@ mod tests {
         assert!(
             EphemeralPageNameOwnershipStateV1::decode_checkpoint_canonical(b"not-postcard")
                 .is_err()
+        );
+    }
+
+    /// Every caller must fetch the keys the core will ask for.
+    ///
+    /// The core resolves its records against a point view the caller
+    /// pre-fetched, so a key the caller omits reads back as a proven absence.
+    /// Two omissions were live in `ShardedHotEngine::prepare_page_name_updates`
+    /// and neither was visible from the caller: it never consulted
+    /// `prospective_pages` at all, and it matched `PageState::Live` only, so a
+    /// tombstoned page's canonical key was dropped. The `prospective` omission
+    /// is the dangerous one -- it is silent, and it lets an acquisition take a
+    /// name another page already holds.
+    #[test]
+    fn transition_keys_cover_prospective_and_tombstoned_observations() {
+        let page_id = PageId::from_uuid(Uuid::from_u128(0xa600));
+        let tombstone = |name: &str| {
+            Some(PageState::Tombstone {
+                name: LogicalPageName::parse(name).unwrap(),
+                home_document_id: crate::oplog::DocumentId::from_uuid(Uuid::from_u128(0xa601)),
+                kind: crate::oplog::ManagedTextKind::Page,
+            })
+        };
+        let key = |name: &str| LogicalPageName::parse(name).unwrap().key_digest();
+
+        let deltas = [PageDelta::ordinary(page_id, None, None)];
+        let current = BTreeMap::from([(page_id, tombstone("Current Name"))]);
+        let prospective = BTreeMap::from([(page_id, tombstone("Prospective Name"))]);
+
+        let keys = page_name_transition_keys(&deltas, &current, &prospective).unwrap();
+
+        assert!(
+            keys.contains(&key("Current Name")),
+            "a tombstoned page still holds its canonical key; dropping it makes the \
+             ownership index disagree with the authoritative catalog, which the transition \
+             core reports as MalformedPageNameIndex"
+        );
+        assert!(
+            keys.contains(&key("Prospective Name")),
+            "the prospective observation must be fetched. Omitting it fails SILENTLY: the \
+             acquisition loop sees no occupant and takes a canonical name another page \
+             already owns"
+        );
+    }
+
+    /// One function answers "which page-name keys does this transition touch".
+    ///
+    /// The core and `ShardedHotEngine::prepare_page_name_updates` derived that
+    /// set independently and drifted apart in three ways at once. Collapsing
+    /// them is the fix; this is the guard that keeps them collapsed.
+    #[test]
+    fn page_name_transition_keys_has_exactly_two_production_callers() {
+        let production = production_rust();
+        assert_eq!(
+            call_count(production, "page_name_transition_keys"),
+            2,
+            "the transition core and its one pre-fetching caller must both derive their \
+             keys from `page_name_transition_keys`. A third caller is fine -- update this \
+             count -- but a caller that derives its OWN key set is not: the core resolves \
+             records against exactly what the caller fetched, so a narrower set turns a \
+             present record into a proven absence. Imitate \
+             `ShardedHotEngine::prepare_page_name_updates`."
         );
     }
 

@@ -62,11 +62,11 @@ use super::local_completion_index::{
 };
 use super::page_name_index::{
     extract_authoritative_catalog_page_names, extract_semantic_page_name_observations,
-    extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
-    AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
-    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1,
-    PageNameOwnershipCheckpointPointV1, PageNameOwnershipRootV1, PageNamePublicationCandidateV1,
-    PageNameTransitionError,
+    extract_validated_catalog_page_names, page_name_transition_keys,
+    prepare_ephemeral_page_name_transition, AuthenticatedPageNameExactStateV1,
+    AuthoritativeCatalogPageNameObservationsV1, EphemeralPageNameOwnershipStateV1,
+    PageNameConflictEvidenceV1, PageNameOwnershipCheckpointPointV1, PageNameOwnershipRootV1,
+    PageNamePublicationCandidateV1, PageNameTransitionError,
 };
 use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathOccupied, PortablePathRecord, PortablePathReleased,
@@ -23150,32 +23150,16 @@ impl ShardedHotEngine {
                 .is_some_and(|index| candidate_clock[index].1 >= dot.counter())
                 || introducing_batch == batch_id
         };
-        let requested_keys = effect
-            .pages()
-            .iter()
-            .flat_map(|delta| {
-                [
-                    delta.before.as_ref().and_then(|state| match state {
-                        PageState::Live { name, .. } => Some(name),
-                        PageState::Tombstone { .. } => None,
-                    }),
-                    delta.after.as_ref().and_then(|state| match state {
-                        PageState::Live { name, .. } => Some(name),
-                        PageState::Tombstone { .. } => None,
-                    }),
-                    current_pages
-                        .entries()
-                        .get(&delta.page_id)
-                        .and_then(Option::as_ref)
-                        .and_then(|state| match state {
-                            PageState::Live { name, .. } => Some(name),
-                            PageState::Tombstone { .. } => None,
-                        }),
-                ]
-            })
-            .flatten()
-            .map(LogicalPageName::key_digest)
-            .collect::<BTreeSet<_>>();
+        // Derived by `page_name_transition_keys`, never here: the core looks
+        // its records up against exactly this pre-fetched view, so a key this
+        // set omits reads back as a proven absence. See that function for what
+        // each omission costs.
+        let requested_keys = page_name_transition_keys(
+            effect.pages(),
+            current_pages.entries(),
+            prospective_pages.entries(),
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
         let accepted_points = self.checkpoint_page_name_state_for_keys(requested_keys)?;
         let candidate = prepare_ephemeral_page_name_transition(
             &accepted_points,

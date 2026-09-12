@@ -189,6 +189,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Two devices renaming the same page no longer stall syncing.** If two devices
+  each gave one page a different title while apart, and either had been running
+  long enough to compact its history, reconnecting could stop syncing with a
+  message about damaged internal state — and reopening Tine reported the same
+  thing again, because nothing was actually damaged. Tine now recognises this
+  for what it is: an ordinary editing conflict between two titles, handled the
+  way every other one is. Your pages and both titles were never at risk.
+
 - **Queries survive a settings change.** On a Direct Files graph, dismissing
   the Guide toast — or changing the default home, time tracking, bracket
   display, doc-mode Enter, logical outdenting, preferred format or journal
