@@ -20366,6 +20366,88 @@ fn concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantic
     ));
 }
 
+/// A generation restore must preserve agreement between the authoritative
+/// catalog and the point-addressed page-name ownership index.
+///
+/// The two offline titles are a genuine divergent rename, so quarantine is the
+/// documented result. Before the current catalog key was included in the
+/// bounded ownership lookup, this same journey instead rejected qualified
+/// state as `MalformedPageNameIndex` after restore.
+#[test]
+fn restored_checkpoint_title_race_preserves_catalog_index_agreement() {
+    let (first, second, first_handle, second_handle) =
+        joined_empty_shared_pair("restored-checkpoint-exact-title", 0xe760);
+    let target_path = "notes/restored-title-target.markdown";
+    let target_page_id = admit_shared_page(&first_handle, &first, target_path, b"- target body\n");
+    copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+    second_handle.observe_provider().unwrap();
+    settle_shared_provider(&second_handle);
+
+    for (handle, title) in [
+        (&first_handle, "Restored Plan"),
+        (&second_handle, "Restored Plan Two"),
+    ] {
+        let target = load_editor_id(handle, target_page_id);
+        assert_eq!(
+            retain_editor_save(
+                handle,
+                SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: target.page_id,
+                        revision: target.revision,
+                    },
+                    preamble: Some(format!("title:: {title}")),
+                    blocks: target.blocks,
+                },
+            ),
+            target_page_id
+        );
+        settle_shared_provider(handle);
+    }
+
+    first_handle.force_clean_checkpoint_for_test().unwrap();
+    second_handle.force_clean_checkpoint_for_test().unwrap();
+    assert!(matches!(
+        first_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    assert!(matches!(
+        second_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(first_handle);
+    drop(second_handle);
+
+    copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+    copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+    let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+    let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+    let assert_quarantined_conflict = |handle: &SyncRuntimeHandle| {
+        for _ in 0..1_024 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    assert!(
+                        detail.contains("did not validate as one accepted operation: Quarantined"),
+                        "a restored catalog/index pair must classify the divergent rename as the \
+                         documented conflict, not as malformed authenticated state: {detail}"
+                    );
+                    assert!(!detail.contains("page-name ownership index is malformed"));
+                    return;
+                }
+                SyncRuntimeTick::Blocked(detail)
+                | SyncRuntimeTick::Failed(detail)
+                | SyncRuntimeTick::Terminal(detail) => {
+                    panic!("title race reached the wrong terminal outcome: {detail}")
+                }
+                _ => {}
+            }
+        }
+        panic!("restored title race did not reach its bounded conflict decision");
+    };
+    assert_quarantined_conflict(&first_merged);
+    assert_quarantined_conflict(&second_merged);
+}
+
 #[test]
 fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions() {
     fn run_case(label: &str, seed: u128, explicit_should_win: bool) -> bool {

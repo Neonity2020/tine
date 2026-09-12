@@ -23163,6 +23163,14 @@ impl ShardedHotEngine {
                         PageState::Live { name, .. } => Some(name),
                         PageState::Tombstone { .. } => None,
                     }),
+                    current_pages
+                        .entries()
+                        .get(&delta.page_id)
+                        .and_then(Option::as_ref)
+                        .and_then(|state| match state {
+                            PageState::Live { name, .. } => Some(name),
+                            PageState::Tombstone { .. } => None,
+                        }),
                 ]
             })
             .flatten()

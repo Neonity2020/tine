@@ -6373,6 +6373,24 @@ impl SyncRuntimeHandle {
             .map_err(SyncRuntimeRequestError::ActorRefused)
     }
 
+    /// Publish a complete clean generation before the caller shuts down.
+    ///
+    /// Ordinary shutdown only joins an already-running publication. Tests
+    /// that exercise generation-relative reopen therefore need an explicit
+    /// bootstrap boundary rather than relying on scheduler timing.
+    #[cfg(test)]
+    fn force_clean_checkpoint_for_test(&self) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceCleanCheckpoint {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+            .map_err(SyncRuntimeRequestError::ActorRefused)
+    }
+
     #[cfg(test)]
     fn recovery_input_probe_for_test(
         &self,
@@ -11729,6 +11747,10 @@ enum ActorRequest {
         reply: mpsc::Sender<Result<(), String>>,
     },
     #[cfg(test)]
+    ForceCleanCheckpoint {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    #[cfg(test)]
     RecoveryInputProbe {
         reply: mpsc::Sender<Vec<RecoveryInputEnvelopeV1>>,
     },
@@ -12480,6 +12502,22 @@ fn run_actor_loop(
                         let (_, engine, _) = session.parts().map_err(|error| error.to_string())?;
                         engine
                             .force_document_floor_to_current_for_test(document_id)
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = reply.send(result);
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ForceCleanCheckpoint { reply } => {
+                let result = actor
+                    .clean
+                    .as_mut()
+                    .ok_or_else(|| "clean actor is unavailable".to_owned())
+                    .and_then(|clean| {
+                        let engine = clean.runtime.engine_mut();
+                        engine.schedule_clean_checkpoint_bootstrap();
+                        engine
+                            .wait_for_clean_checkpoint()
                             .map_err(|error| error.to_string())
                     });
                 let _ = reply.send(result);
