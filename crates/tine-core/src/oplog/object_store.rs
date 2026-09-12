@@ -205,8 +205,6 @@ pub struct ObjectStoreStats {
     pub namespace_object_decodes: usize,
     /// These stay zero on a generation-aware open. They are explicit so the
     /// bounded-open ratchet observes work rather than inferring it from time.
-    pub covered_namespace_manifest_decodes: usize,
-    pub covered_namespace_object_decodes: usize,
     pub accepted_manifest_reads: usize,
     pub accepted_object_reads: usize,
     pub dag_manifest_reads: usize,
@@ -235,8 +233,6 @@ struct StoreCounters {
     directory_enumerations: AtomicUsize,
     namespace_manifest_decodes: AtomicUsize,
     namespace_object_decodes: AtomicUsize,
-    covered_namespace_manifest_decodes: AtomicUsize,
-    covered_namespace_object_decodes: AtomicUsize,
     accepted_manifest_reads: AtomicUsize,
     accepted_object_reads: AtomicUsize,
     dag_manifest_reads: AtomicUsize,
@@ -2025,12 +2021,6 @@ impl StoreCounters {
             directory_enumerations: self.directory_enumerations.load(Ordering::Relaxed),
             namespace_manifest_decodes: self.namespace_manifest_decodes.load(Ordering::Relaxed),
             namespace_object_decodes: self.namespace_object_decodes.load(Ordering::Relaxed),
-            covered_namespace_manifest_decodes: self
-                .covered_namespace_manifest_decodes
-                .load(Ordering::Relaxed),
-            covered_namespace_object_decodes: self
-                .covered_namespace_object_decodes
-                .load(Ordering::Relaxed),
             accepted_manifest_reads: self.accepted_manifest_reads.load(Ordering::Relaxed),
             accepted_object_reads: self.accepted_object_reads.load(Ordering::Relaxed),
             dag_manifest_reads: self.dag_manifest_reads.load(Ordering::Relaxed),

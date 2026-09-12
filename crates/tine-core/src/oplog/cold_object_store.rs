@@ -1269,9 +1269,10 @@ pub(crate) fn publish_cold_history(
 ///
 /// This is the production maintenance entry point: it reads each batch's
 /// manifest and every object the manifest requires from the hot namespace and
-/// republishes those exact bytes cold. It performs no deletion. R4 owns the
-/// bounded resumable schedule that calls it; P5 owns enabling hot retirement
-/// afterwards.
+/// republishes those exact bytes cold. It performs no deletion itself; P4a's
+/// generation open calls it and then, marker-last, calls
+/// [`ObjectStore::retire_hot_history_for_batches`] for the same covered
+/// batches. P5 owns the never-idle schedule that drives those opens.
 pub(crate) fn publish_cold_history_for_batches(
     store: &ObjectStore,
     batches: &BTreeSet<BatchId>,

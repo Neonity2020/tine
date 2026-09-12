@@ -38,9 +38,12 @@ from covered hot names after interruption.
 ## Consequences
 
 Healthy publication and open work are functions of delta/live/action state,
-not accepted lifetime. Observable counters ratchet zero covered namespace
-decodes, zero loaded covered roster rows, zero covered-sequence enumeration and
-delta-only relocation visits.
+not accepted lifetime. The observable counters ratchet zero covered-sequence
+enumeration and delta-only relocation visits; covered namespace decodes are
+ratcheted by the real `namespace_{manifest,object}_decodes` instrumentation and
+made unwritable by the `is_covered` early `continue`. A counter is only kept
+here when some code path can actually raise it — a field nothing increments
+reads zero whether or not the property holds.
 
 The accepted index and cold archive remain immutable recovery authority. A
 missing or invalid disposable generation still takes the sequence-zero full

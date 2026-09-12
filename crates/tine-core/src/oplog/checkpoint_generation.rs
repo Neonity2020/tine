@@ -2584,11 +2584,28 @@ pub(crate) struct CleanCheckpointLoaded {
     pub(crate) open_work: GenerationOpenWork,
 }
 
+/// Lifetime-scaling work performed by one healthy generation open. Every field
+/// here MUST be a number something actually increments: a counter that no code
+/// path can raise reads zero whether or not the property holds, so asserting it
+/// proves nothing while looking like proof.
+///
+/// That is why this struct carries one field and not four. The covered
+/// namespace decode counters it used to carry were never incremented anywhere,
+/// and `covered_roster_rows_loaded` was the literal `0` — so the regression
+/// they named (a covered name being decoded during open) would have left all
+/// three reading zero. What actually enforces that property is, in order of
+/// strength: the `is_covered` early `continue` in `ObjectStore`'s namespace
+/// walk, which makes a covered object decode unwritable; and
+/// `generation_hot_retirement_bounded_open`'s assertions on the REAL
+/// `ObjectStoreStats::namespace_{manifest,object}_decodes`, which do grow when
+/// a covered name is read.
+///
+/// `covered_sequence_enumerations` is real: `note_sequence_enumeration` is
+/// called by both paths that can walk `1..=sequence`
+/// (`StatusHistorySource::materialize` and `accepted_batch_cursor`), and
+/// reintroducing that walk on the open path fails the gate — verified.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GenerationOpenWork {
-    pub(crate) covered_namespace_manifest_decodes: usize,
-    pub(crate) covered_namespace_object_decodes: usize,
-    pub(crate) covered_roster_rows_loaded: usize,
     pub(crate) covered_sequence_enumerations: usize,
 }
 
@@ -2924,8 +2941,6 @@ fn open_checkpoint_impl(
     store: &ObjectStore,
     logical_cold_history: bool,
 ) -> Result<CleanCheckpointOpen, CleanCheckpointOpenError> {
-    let store_stats_before = store.instrumentation();
-
     let root = store
         .private_derived_root_capability()
         .map_err(|error| CleanCheckpointOpenError::Store(error.to_string()))?;
@@ -3134,15 +3149,7 @@ fn open_checkpoint_impl(
             Ok(pin) => pin,
             Err(error) => return Ok(invalid(error)),
         };
-    let store_stats_after = store.instrumentation();
     let open_work = GenerationOpenWork {
-        covered_namespace_manifest_decodes: store_stats_after
-            .covered_namespace_manifest_decodes
-            .saturating_sub(store_stats_before.covered_namespace_manifest_decodes),
-        covered_namespace_object_decodes: store_stats_after
-            .covered_namespace_object_decodes
-            .saturating_sub(store_stats_before.covered_namespace_object_decodes),
-        covered_roster_rows_loaded: 0,
         covered_sequence_enumerations: accepted_history.sequence_enumerations(),
     };
     Ok(CleanCheckpointOpen::Loaded(CleanCheckpointLoaded {

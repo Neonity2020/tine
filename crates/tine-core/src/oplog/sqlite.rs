@@ -12621,10 +12621,12 @@ mod tests {
     /// Projection rebuild is the full replay of accepted history, so it is one
     /// of MS-02's indexed-cold consumers: after R2 relocates a batch's exact
     /// originals into cold packs and the hot originals are gone, replay must
-    /// still reconstruct the identical event. Nothing here retires anything in
-    /// production -- the fixture removes the hot files itself, the way a
-    /// completed retirement eventually will -- so this is a qualification of the
-    /// read path, not a claim that R2 retirement is enabled.
+    /// still reconstruct the identical event. Since P4a wired R2, a healthy
+    /// generation open relocates covered history itself, so this batch may
+    /// already be cold before the explicit call below; what this fixture needs
+    /// is that the exact originals ARE cold when the hot names go away, not
+    /// that this call is what put them there. The fixture still removes the hot
+    /// files itself rather than waiting for retirement to choose this batch.
     #[test]
     fn projection_replay_resolves_a_rebaselined_batch_through_the_single_resolver() {
         let ids = TestIds::new(2_262);
@@ -12646,8 +12648,11 @@ mod tests {
         let outcome = store
             .publish_cold_history_for_batches(&BTreeSet::from([batch_id]))
             .unwrap();
-        assert_eq!(outcome.manifests_published, 1);
-        assert!(outcome.objects_published > 0);
+        assert_eq!(
+            outcome.manifests_published + outcome.manifests_already_present,
+            1
+        );
+        assert!(outcome.objects_published + outcome.objects_already_present > 0);
         let before = store.instrumentation();
 
         // Remove the hot originals, exactly as a completed retirement will.

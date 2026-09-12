@@ -1457,9 +1457,15 @@ history is resolved through its sealed point indexes and exact cold originals.
 An absent or invalid generation takes the unchanged sequence-zero full audit.
 An interrupted post-marker retirement is discovered from covered hot names and
 resumes idempotently: cold manifest and object bytes are point-verified before
-any repeated unlink. Observable open-work counters require zero covered
-namespace manifest/object decodes, zero covered roster rows loaded, and zero
-covered-sequence enumeration on the healthy generation path.
+any repeated unlink. On the healthy generation path the open-work counter
+requires zero covered-sequence enumeration. Covered namespace manifest and
+object decodes are held at zero by a stronger channel than a counter: the
+`is_covered` early `continue` in the namespace walk, which makes a covered
+object decode unwritable, plus assertions on the real
+`namespace_{manifest,object}_decodes` instrumentation, which does grow when a
+covered name is read. There is deliberately no covered-decode or
+covered-roster-rows counter: both were previously reported as zero by code that
+never incremented them, which reads as proof and is not.
 
 After checkpoint restore, only archive manifest names outside its roster enter
 the same dependency-staged fixed point described above. A failure to admit that
