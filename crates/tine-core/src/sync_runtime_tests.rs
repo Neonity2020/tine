@@ -16985,6 +16985,77 @@ fn oversized_provider_paths() -> Vec<String> {
         .collect()
 }
 
+/// Shut down cleanly, insist on `Safe`, and say what happened when it is not.
+///
+/// `assert!(matches!(handle.clean_shutdown(), Ok(Safe(s)) if <guard>))` reports
+/// ONE panic message for three different defects: the shutdown refused, it
+/// reached `Terminal`, or it reached `Safe` carrying work the guard rejects.
+/// When such an assertion is red -- and one of them has been red on master for
+/// weeks -- a baseline comparison of it carries no information at all.
+///
+/// Take the snapshot from here and assert the guard against it, so each failure
+/// names itself. `oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it`
+/// is the converted exemplar;
+/// `opaque_clean_shutdown_oracles_do_not_grow` counts the ones still to convert.
+/// The opaque shutdown oracle does not grow, and the remaining ones are named.
+///
+/// Twelve sites still collapse three different defects into one panic message.
+/// They are green today, which is the only reason they were not all converted at
+/// once: a green opaque oracle costs nothing until the day it goes red, and a
+/// twelve-site mechanical sweep of green tests is churn. This ratchet stops the
+/// class GROWING, and every new or materially changed shutdown assertion must
+/// take its snapshot from `shutdown_safely` instead.
+#[test]
+fn opaque_clean_shutdown_oracles_do_not_grow() {
+    let source = include_str!("sync_runtime_tests.rs");
+    let code = source
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut opaque = 0;
+    for (index, line) in code.iter().enumerate() {
+        if !line.contains("assert!(matches!(") {
+            continue;
+        }
+        let block = code[index..code.len().min(index + 8)].join("\n");
+        let block = block
+            .split_once("));")
+            .map_or(block.clone(), |(head, _)| head.to_owned());
+        if block.contains("clean_shutdown()")
+            && !block.contains(".clean_shutdown().unwrap()")
+            && block.contains(" if ")
+        {
+            opaque += 1;
+        }
+    }
+    assert!(
+        opaque <= 12,
+        "{opaque} shutdown assertions report one panic message for a refusal, a Terminal \
+         outcome and a Safe snapshot that fails the guard. The budget is 12 and it only \
+         falls. Take the snapshot from `shutdown_safely` and assert the guard on it; \
+         `oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it` is the \
+         converted exemplar. Lower this number when you convert one."
+    );
+}
+
+#[track_caller]
+fn shutdown_safely(handle: &SyncRuntimeHandle) -> SyncRuntimeStatusSnapshot {
+    match handle.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(snapshot)) => snapshot,
+        Ok(SyncShutdownOutcome::Terminal(snapshot)) => {
+            panic!("clean shutdown reached Terminal rather than Safe: {snapshot:?}")
+        }
+        Err(error) => panic!("clean shutdown refused: {error}"),
+    }
+}
+
 #[test]
 fn oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it() {
     let (initiator, receiver, initiator_handle, receiver_handle) =
@@ -17041,11 +17112,15 @@ fn oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it() {
         receiver_handle.observe_provider_paths(oversized, false),
         Err(SyncRuntimeRequestError::RequestTooLarge { .. })
     ));
-    assert!(matches!(
-        receiver_handle.clean_shutdown(),
-        Ok(SyncShutdownOutcome::Safe(snapshot))
-            if snapshot.provider_pending == 0 && !snapshot.watcher.pending
-    ));
+    let snapshot = shutdown_safely(&receiver_handle);
+    assert!(
+        snapshot.provider_pending == 0 && !snapshot.watcher.pending,
+        "clean shutdown published Safe while rejected provider work was still \
+         outstanding: provider_pending={}, watcher.pending={}, watcher={:?}",
+        snapshot.provider_pending,
+        snapshot.watcher.pending,
+        snapshot.watcher
+    );
     assert!(
         receiver
             .graph_root
