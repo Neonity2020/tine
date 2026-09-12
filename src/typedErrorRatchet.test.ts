@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,7 +70,14 @@ function withoutRustTestModules(text: string): string {
 
 interface ClassifierSite {
   file: string;
-  line: number;
+  /// A digest of the matched line's normalized text, NOT its line number.
+  /// `Macro.tsx` is edited constantly, and a line pin here would redden this
+  /// ratchet for every patch above line 1281 — the failure mode that made the
+  /// content-out-of-logs censuses unreadable (see the note on CONSOLE_ALLOWLIST
+  /// in src/contentOutOfLogs.ratchet.test.ts, and ALLOWLIST in
+  /// crates/tine-core/tests/content_out_of_logs.rs). The anchor moves with the
+  /// line it classifies, and changes when the classification would need to.
+  anchor: string;
   class: string;
   why: string;
 }
@@ -77,13 +85,13 @@ interface ClassifierSite {
 const ERROR_STRING_CLASSIFIER_ALLOWLIST: readonly ClassifierSite[] = [
   {
     file: "components/Macro.tsx",
-    line: 1281,
+    anchor: "0009538214aa",
     class: "bounded-result-code",
     why: "the query boundary's result-too-large prefix is a bounded wire code, not prose",
   },
   {
     file: "lib/referenceLoadError.ts",
-    line: 26,
+    anchor: "8aedb709e22a",
     class: "bounded-result-code",
     why: "the references boundary's result-too-large prefix is a bounded wire code, not prose",
   },
@@ -102,8 +110,12 @@ function sourceFiles(dir: string, files: string[] = []): string[] {
   return files;
 }
 
-function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
-  const sites: Omit<ClassifierSite, "class" | "why">[] = [];
+function classifierAnchor(line: string): string {
+  return createHash("sha256").update(line.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 12);
+}
+
+function errorStringClassifierSites(): (Omit<ClassifierSite, "class" | "why"> & { line: number })[] {
+  const sites: (Omit<ClassifierSite, "class" | "why"> & { line: number })[] = [];
   for (const file of sourceFiles(ROOT)) {
     const text = readFileSync(file, "utf8");
     for (const [index, line] of text.split("\n").entries()) {
@@ -112,7 +124,11 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         || /\b(?:detail|message)\.(?:includes|match|startsWith)\(/.test(line)
         || /\.(?:exec|test)\((?:message|detail)\)/.test(line)
       ) {
-        sites.push({ file: relative(ROOT, file).replaceAll("\\", "/"), line: index + 1 });
+        sites.push({
+          file: relative(ROOT, file).replaceAll("\\", "/"),
+          anchor: classifierAnchor(line),
+          line: index + 1,
+        });
       }
     }
 
@@ -161,6 +177,7 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         helperNames.add(fn.name);
         sites.push({
           file: relative(ROOT, file).replaceAll("\\", "/"),
+          anchor: classifierAnchor(lines[classifierLine]),
           line: classifierLine + 1,
         });
       }
@@ -174,7 +191,11 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
         new RegExp(`\\b${name}\\((?:message|text)\\)`).test(body),
       );
       if (convertsErrorToText && delegatesToHelper) {
-        sites.push({ file: relative(ROOT, file).replaceAll("\\", "/"), line: fn.start + 1 });
+        sites.push({
+          file: relative(ROOT, file).replaceAll("\\", "/"),
+          anchor: classifierAnchor(lines[fn.start]),
+          line: fn.start + 1,
+        });
       }
     }
   }
@@ -182,7 +203,7 @@ function errorStringClassifierSites(): Omit<ClassifierSite, "class" | "why">[] {
     .filter((site, index, all) =>
       all.findIndex((candidate) => candidate.file === site.file && candidate.line === site.line) === index,
     )
-    .sort((left, right) => left.file.localeCompare(right.file) || left.line - right.line);
+    .sort((left, right) => left.file.localeCompare(right.file) || left.anchor.localeCompare(right.anchor));
 }
 
 describe("I-9/I-11 typed backend error boundary", () => {
@@ -254,12 +275,30 @@ describe("I-9/I-11 typed backend error boundary", () => {
   });
 
   it("has no prose-parsing classifier outside the one funnel", () => {
+    const repair = "I-9: error classification must use src/backend.ts "
+      + "SaveConflictError/classifyTaggedBackendError; helper indirection may not restore prose "
+      + "parsing. Sites are anchored to the text of the line, not to its number, so this does not "
+      + "fire merely because lines moved";
+    const sites = errorStringClassifierSites();
+    // One row must name one site, and one site must be named by one row.
+    // Otherwise a second identical line hides behind the first row's blessing.
     expect(
-      errorStringClassifierSites(),
-      "I-9: error classification must use src/backend.ts SaveConflictError/classifyTaggedBackendError; helper indirection may not restore prose parsing",
-    ).toEqual(
-      ERROR_STRING_CLASSIFIER_ALLOWLIST.map(({ file, line }) => ({ file, line })),
-    );
+      new Set(sites.map((site) => `${site.file} ${site.anchor}`)).size,
+      "two identical prose-parsing lines in one file: give one distinct text",
+    ).toBe(sites.length);
+    const allowed = new Set(ERROR_STRING_CLASSIFIER_ALLOWLIST.map((entry) => `${entry.file} ${entry.anchor}`));
+    expect(
+      sites.filter((site) => !allowed.has(`${site.file} ${site.anchor}`))
+        .map((site) => `${site.file}:${site.line} ${site.anchor}`),
+      repair,
+    ).toEqual([]);
+    const present = new Set(sites.map((site) => `${site.file} ${site.anchor}`));
+    expect(
+      ERROR_STRING_CLASSIFIER_ALLOWLIST.filter((entry) => !present.has(`${entry.file} ${entry.anchor}`))
+        .map((entry) => `${entry.file} ${entry.anchor}`),
+      `${repair}. A censused classifier no longer exists with that text: if you changed it, `
+        + "reclassify it and update its anchor; if you removed it, drop the row",
+    ).toEqual([]);
   });
 
   it("keeps phase-B legacy literals compatible with the frontend funnel", () => {
