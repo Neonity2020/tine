@@ -1125,7 +1125,7 @@ type RunLocalDocumentMap = RunLocalAuthenticatedMap;
 ///   a published original, which is what the same-dot fork refusal needs: the
 ///   journal prefix is this device's own work on its way to acceptance and must
 ///   not be mistaken for a competing claim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CausalChainTip {
     counter: u64,
     batch_id: BatchId,
@@ -3633,16 +3633,66 @@ struct StatusHistory {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum StatusHistorySource {
     Inline(StatusHistory),
+    Indexed {
+        covered: Arc<super::checkpoint_generation::SealedAcceptedHistory>,
+        inline: StatusHistory,
+    },
     Failed(EngineError),
+}
+
+impl fmt::Debug for StatusHistorySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline(history) => formatter.debug_tuple("Inline").field(history).finish(),
+            Self::Indexed { covered, inline } => formatter
+                .debug_struct("Indexed")
+                .field("covered_sequence", &covered.sequence())
+                .field("inline", inline)
+                .finish(),
+            Self::Failed(error) => formatter.debug_tuple("Failed").field(error).finish(),
+        }
+    }
 }
 
 impl StatusHistorySource {
     fn materialize(&self) -> Result<StatusHistory, EngineError> {
         match self {
             Self::Inline(history) => return Ok(history.clone()),
+            Self::Indexed { covered, inline } => {
+                covered.note_sequence_enumeration();
+                let mut history = StatusHistory::default();
+                for sequence in 1..=covered.sequence() {
+                    let row = covered
+                        .row_by_sequence(sequence)
+                        .map_err(EngineError::Archive)?
+                        .ok_or_else(|| {
+                            EngineError::Archive(format!(
+                                "sealed accepted status sequence {sequence} is absent"
+                            ))
+                        })?;
+                    let batch_id = row.evidence.batch_id();
+                    history.accepted_batches.push(AcceptedBatch {
+                        batch_id,
+                        no_op: row.no_op,
+                    });
+                    history.offered_batches.push(batch_id);
+                }
+                history
+                    .accepted_batches
+                    .extend(inline.accepted_batches.iter().cloned());
+                history
+                    .validated_unpublished_batches
+                    .extend(inline.validated_unpublished_batches.iter().copied());
+                history
+                    .offered_batches
+                    .extend(inline.offered_batches.iter().copied());
+                history.offered_batches.sort_unstable();
+                history.offered_batches.dedup();
+                return Ok(history);
+            }
             Self::Failed(error) => return Err(error.clone()),
         }
     }
@@ -5178,6 +5228,11 @@ pub(crate) fn take_enrolled_projection_open_instrumentation(
 
 pub(crate) enum AcceptedBatchCursor<'a> {
     Inline(std::collections::btree_map::Iter<'a, u64, BatchId>),
+    Sealed {
+        history: Arc<super::checkpoint_generation::SealedAcceptedHistory>,
+        next_sequence: u64,
+        tail: std::collections::btree_map::Iter<'a, u64, BatchId>,
+    },
 }
 
 impl AcceptedBatchCursor<'_> {
@@ -5188,12 +5243,38 @@ impl AcceptedBatchCursor<'_> {
             Self::Inline(iter) => Ok(iter
                 .next()
                 .map(|(sequence, batch_id)| (*sequence, *batch_id, None))),
+            Self::Sealed {
+                history,
+                next_sequence,
+                tail,
+            } => {
+                if *next_sequence <= history.sequence() {
+                    let sequence = *next_sequence;
+                    *next_sequence = next_sequence.saturating_add(1);
+                    let row = history
+                        .row_by_sequence(sequence)
+                        .map_err(EngineError::Archive)?
+                        .ok_or_else(|| {
+                            EngineError::Archive(format!(
+                                "sealed accepted sequence {sequence} is absent"
+                            ))
+                        })?;
+                    return Ok(Some((
+                        sequence,
+                        row.evidence.batch_id(),
+                        Some(row.evidence),
+                    )));
+                }
+                Ok(tail
+                    .next()
+                    .map(|(sequence, batch_id)| (*sequence, *batch_id, None)))
+            }
         }
     }
 
     pub(crate) fn page_stats(&self) -> (usize, usize, usize) {
         match self {
-            Self::Inline(_) => (0, 0, 0),
+            Self::Inline(_) | Self::Sealed { .. } => (0, 0, 0),
         }
     }
 }
@@ -6645,12 +6726,14 @@ pub(crate) struct DeferredAbsenceObservation {
     pub(crate) path: ManagedPath,
 }
 
-// v6 adds canonical device-local acceptance-age policy bytes. Exactly one
+// v7 adds the bounded current-action hot-retention closure. Exactly one
 // current schema remains implemented; older disposable checkpoints rebuild.
 // v5 replaced inline resident-document bytes with qualified immutable image
 // references. Exactly one schema has an implementation (D-1): a checkpoint
 // written by any other version is discarded and rebuilt from accepted history.
-const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 6;
+const CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION: u32 = 7;
+const CHECKPOINT_SOFT_TAIL_BATCHES: u64 = 128;
+const CHECKPOINT_HARD_TAIL_BATCHES: u64 = 512;
 
 /// One accepted-roster row captured coherently by the engine actor. The
 /// checkpoint module feeds these rows through tine-storage's canonical sealed
@@ -6881,6 +6964,9 @@ struct CleanCheckpointStateV6 {
     /// still refuse a foreign device authoring under an incarnation this graph
     /// already bound, and a full replay rebuilds exactly the same map.
     causal_peer_owners: BTreeMap<CausalPeerId, DeviceId>,
+    /// One terminal tip per participating writer incarnation.  This is P-sized
+    /// admission state, not a retained row per accepted batch.
+    causal_chain: BTreeMap<CausalPeerId, CausalChainTip>,
     logseq_claim_root: LogseqClaimIndexRoot,
     ephemeral_logseq_claims: BTreeMap<LogseqUuid, LogseqClaimRecord>,
     portable_path_root: PortablePathIndexRoot,
@@ -6900,6 +6986,7 @@ struct CleanCheckpointStateV6 {
     accepted_frontier: BTreeMap<DocumentId, DocumentDependencies>,
     accepted_frontier_root: AcceptedFrontierRoot,
     clean_projection_head_batches: BTreeMap<ManagedPath, BatchId>,
+    current_action_hot_pin_batches: BTreeSet<BatchId>,
     current_path_rows: BTreeMap<PageId, CurrentPathCatalogStoredRow>,
     current_path_available: bool,
     current_path_frontier_root: AcceptedFrontierRoot,
@@ -6949,6 +7036,30 @@ pub(crate) fn clean_checkpoint_state_binding(
     })
 }
 
+pub(crate) fn clean_checkpoint_hot_pin_batches(
+    state_bytes: &[u8],
+) -> Result<BTreeSet<BatchId>, EngineError> {
+    let (state, trailing): (CleanCheckpointStateV6, &[u8]) = postcard::take_from_bytes(state_bytes)
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    if !trailing.is_empty()
+        || state.schema_version != CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION
+        || postcard::to_allocvec(&state).map_err(|error| EngineError::Archive(error.to_string()))?
+            != state_bytes
+    {
+        return Err(EngineError::Archive(
+            "clean checkpoint hot-pin state is not current canonical data".into(),
+        ));
+    }
+    let mut pins = state
+        .accepted_frontier
+        .values()
+        .flat_map(|document| document.direct_dependency_heads().iter().copied())
+        .collect::<BTreeSet<_>>();
+    pins.extend(state.clean_projection_head_batches.values().copied());
+    pins.extend(state.current_action_hot_pin_batches);
+    Ok(pins)
+}
+
 pub struct ShardedHotEngine {
     /// Lazy cache for `nonlinear_accepted_since` (audit 4, P2). `nonlinear_watermark`
     /// holds the highest acceptance sequence whose batch is known causally
@@ -6978,7 +7089,17 @@ pub struct ShardedHotEngine {
     archive_store: Option<Arc<ObjectStore>>,
     clean_checkpoint_publisher: Option<super::checkpoint_generation::CleanCheckpointPublisher>,
     checkpoint_documents: Option<Arc<super::checkpoint_generation::CleanCheckpointDocuments>>,
+    /// Qualified covered accepted history.  Covered rows stay point-addressable
+    /// on disk; only the post-generation tail is represented in the inline
+    /// status/sequence/causal maps below.
+    sealed_accepted_history: Option<Arc<super::checkpoint_generation::SealedAcceptedHistory>>,
+    /// Sweep roots are installed by the runtime owner. Until the receiver
+    /// summary opens, restored action pins remain a conservative bridge.
+    checkpoint_sweep_hot_pin_batches: RefCell<BTreeSet<BatchId>>,
+    checkpoint_durable_action_hot_pin_batches: RefCell<BTreeSet<BatchId>>,
+    restored_action_hot_pin_batches: RefCell<BTreeSet<BatchId>>,
     clean_checkpoint_capture_skip: Cell<Option<CleanCheckpointCaptureSkip>>,
+    checkpoint_soft_pending: Cell<bool>,
     /// Device-local own-endpoint projection completion evidence. The archive
     /// chain is durable; this engine-owned value also owns the coalescing
     /// buffer from cold repair through actor shutdown.
@@ -7139,6 +7260,7 @@ pub struct ShardedHotEngine {
     ephemeral_accepted_batch_entries: BTreeMap<BatchId, ContentDigest>,
     ephemeral_accepted_document_root: RunLocalAuthenticatedMap,
     ephemeral_accepted_batch_root: RunLocalAuthenticatedMap,
+    sealed_accepted_batch_overlay: Option<super::checkpoint_generation::SealedAcceptedBatchOverlay>,
     accepted_frontier_root: AcceptedFrontierRoot,
     accepted_sequence: BTreeMap<u64, BatchId>,
     next_acceptance_sequence: u64,
@@ -7252,7 +7374,12 @@ impl ShardedHotEngine {
             archive_store: None,
             clean_checkpoint_publisher: None,
             checkpoint_documents: None,
+            sealed_accepted_history: None,
+            checkpoint_sweep_hot_pin_batches: RefCell::new(BTreeSet::new()),
+            checkpoint_durable_action_hot_pin_batches: RefCell::new(BTreeSet::new()),
+            restored_action_hot_pin_batches: RefCell::new(BTreeSet::new()),
             clean_checkpoint_capture_skip: Cell::new(None),
+            checkpoint_soft_pending: Cell::new(false),
             local_completion_index: None,
             receiver_absence_summary: RefCell::new(None),
             receiver_absence_summary_open_stats: RefCell::new(None),
@@ -7313,6 +7440,7 @@ impl ShardedHotEngine {
             ephemeral_accepted_batch_entries: BTreeMap::new(),
             ephemeral_accepted_document_root: RunLocalAuthenticatedMap::default(),
             ephemeral_accepted_batch_root: RunLocalAuthenticatedMap::default(),
+            sealed_accepted_batch_overlay: None,
             accepted_frontier_root: empty_accepted_frontier_root(),
             accepted_sequence: BTreeMap::new(),
             next_acceptance_sequence: 0,
@@ -7809,29 +7937,57 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    fn schedule_clean_checkpoint_now(&self) -> bool {
+        let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
+            return false;
+        };
+        if self.next_acceptance_sequence != 0
+            && publisher.scheduled_sequence() >= self.next_acceptance_sequence
+        {
+            return false;
+        }
+        let durable_sequence = publisher.durable_sequence();
+        if let Some(reason) = self.clean_checkpoint_capture_skip_reason(durable_sequence) {
+            self.clean_checkpoint_capture_skip.set(Some(reason));
+            return false;
+        }
+        match self.capture_clean_checkpoint(durable_sequence) {
+            Ok(capture) => {
+                publisher.enqueue(capture);
+                self.checkpoint_soft_pending.set(false);
+                true
+            }
+            Err(_) => {
+                self.clean_checkpoint_capture_skip
+                    .set(Some(CleanCheckpointCaptureSkip::CaptureFailed));
+                false
+            }
+        }
+    }
+
     fn schedule_clean_checkpoint(&self) {
         let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
             return;
         };
-        let durable_sequence = publisher.durable_sequence();
-        if let Some(reason) = self.clean_checkpoint_capture_skip_reason(durable_sequence) {
-            self.clean_checkpoint_capture_skip.set(Some(reason));
-            return;
+        let durable = publisher.durable_sequence();
+        let scheduled = publisher.scheduled_sequence();
+        let unscheduled_tail = self.next_acceptance_sequence.saturating_sub(scheduled);
+        if (durable == 0 && scheduled == 0) || unscheduled_tail >= CHECKPOINT_HARD_TAIL_BATCHES {
+            self.schedule_clean_checkpoint_now();
+        } else if unscheduled_tail >= CHECKPOINT_SOFT_TAIL_BATCHES {
+            self.checkpoint_soft_pending.set(true);
         }
-        match self.capture_clean_checkpoint(durable_sequence) {
-            Ok(capture) => publisher.enqueue(capture),
-            Err(_) => {
-                self.clean_checkpoint_capture_skip
-                    .set(Some(CleanCheckpointCaptureSkip::CaptureFailed));
-            }
-        }
+    }
+
+    pub(crate) fn schedule_clean_checkpoint_idle(&self) -> bool {
+        self.checkpoint_soft_pending.get() && self.schedule_clean_checkpoint_now()
     }
 
     /// Publish the first complete image epoch after a blank-slate/full-replay
     /// open. The caller invokes this only when no v2 checkpoint was restored;
     /// ordinary accepted saves keep using the same scheduler below.
     pub(crate) fn schedule_clean_checkpoint_bootstrap(&self) {
-        self.schedule_clean_checkpoint();
+        self.schedule_clean_checkpoint_now();
     }
 
     /// The single eligibility predicate for a disposable clean-checkpoint
@@ -7883,11 +8039,17 @@ impl ShardedHotEngine {
     }
 
     pub(crate) fn wait_for_clean_checkpoint(&self) -> Result<(), EngineError> {
-        self.clean_checkpoint_publisher
+        let publisher = self
+            .clean_checkpoint_publisher
             .as_ref()
-            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?
-            .wait_for_idle()
-            .map_err(EngineError::Archive)
+            .ok_or_else(|| EngineError::Archive("clean checkpoint publisher is absent".into()))?;
+        publisher.wait_for_idle().map_err(EngineError::Archive)?;
+        #[cfg(test)]
+        if publisher.durable_sequence() != self.next_acceptance_sequence {
+            self.schedule_clean_checkpoint_now();
+            publisher.wait_for_idle().map_err(EngineError::Archive)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -8601,35 +8763,22 @@ impl ShardedHotEngine {
         document: &LoroDoc,
         eligible_through: u64,
         policy: super::checkpoint_floor_policy::FloorPolicyConfig,
-        accepted_evidence: &[AcceptedBatchEvidence],
+        candidate: Option<(u64, DocumentDependencies)>,
     ) -> Result<PolicyCompactAcceptedDocument, EngineError> {
-        if accepted_evidence.len() != usize::try_from(eligible_through).unwrap_or(usize::MAX) {
-            return Err(EngineError::Archive(
-                "retained-tail worker evidence does not reach E".into(),
-            ));
-        }
-        let mut candidate_dependencies = capture.lazy_genesis.frontier_document(document_id);
-        let mut candidates = Vec::new();
-        for evidence in accepted_evidence {
-            let sequence = evidence.acceptance_sequence();
-            let changed = evidence
-                .affected_documents()
-                .iter()
-                .find(|candidate| candidate.document_id() == document_id)
-                .cloned();
-            let document_changed = changed.is_some();
-            if document_changed {
-                candidate_dependencies = changed;
-            }
-            if sequence == 1 || document_changed {
-                if let Some(candidate) = &candidate_dependencies {
-                    candidates.push((
-                        sequence,
-                        document.vv_to_frontiers(&version_vector_for_dependencies(candidate)?),
+        let candidates = candidate
+            .map(|(sequence, dependencies)| {
+                if sequence == 0 || sequence > eligible_through {
+                    return Err(EngineError::Archive(
+                        "retained-tail worker candidate crosses E".into(),
                     ));
                 }
-            }
-        }
+                Ok((
+                    sequence,
+                    document.vv_to_frontiers(&version_vector_for_dependencies(&dependencies)?),
+                ))
+            })
+            .transpose()?
+            .into_iter();
         Self::build_policy_compact_accepted_document(
             capture.catalog_document_id,
             capture.cutoff_state_digest,
@@ -8840,6 +8989,44 @@ impl ShardedHotEngine {
         })
     }
 
+    pub(crate) fn install_checkpoint_sweep_retention(
+        &self,
+        closure: &super::current_action_roots::RetentionClosure,
+    ) {
+        *self.checkpoint_sweep_hot_pin_batches.borrow_mut() = closure.batches.clone();
+    }
+
+    pub(crate) fn install_checkpoint_durable_action_retention(&self, batches: BTreeSet<BatchId>) {
+        *self.checkpoint_durable_action_hot_pin_batches.borrow_mut() = batches;
+    }
+
+    fn checkpoint_current_action_hot_pin_batches(&self) -> BTreeSet<BatchId> {
+        let mut pins = self.checkpoint_sweep_hot_pin_batches.borrow().clone();
+        pins.extend(
+            self.checkpoint_durable_action_hot_pin_batches
+                .borrow()
+                .iter()
+                .copied(),
+        );
+        // Journal-durable foreground payloads can remain queued after their
+        // semantic batches have entered accepted history. A later queued
+        // batch may supersede an earlier one as the document head, but cold
+        // open still drains those records in order. Keep every queued batch
+        // hot until the managed-local overlay collapses that exact prefix.
+        pins.extend(self.local_overlay.entry_by_batch.keys().copied());
+        if let Some(summary) = self.receiver_absence_summary.borrow().as_ref() {
+            pins.extend(summary.current_action_roots().retention_closure().batches);
+        } else {
+            pins.extend(
+                self.restored_action_hot_pin_batches
+                    .borrow()
+                    .iter()
+                    .copied(),
+            );
+        }
+        pins
+    }
+
     /// Capture the exact semantic clean-runtime state at the current accepted
     /// frontier. Serialization happens here, on the owning actor, so the
     /// background publisher never observes concurrently mutating engine data.
@@ -8937,6 +9124,7 @@ impl ShardedHotEngine {
                 .collect(),
             crdt_lane_owners: self.crdt_lane_owners.clone(),
             causal_peer_owners: self.causal_peer_owners.clone(),
+            causal_chain: self.ephemeral_causal_chain.borrow().clone(),
             logseq_claim_root: self.logseq_claim_root,
             ephemeral_logseq_claims: self.ephemeral_logseq_claims.clone(),
             portable_path_root: self.portable_path_root,
@@ -8977,6 +9165,7 @@ impl ShardedHotEngine {
             accepted_frontier: self.accepted_frontier.clone(),
             accepted_frontier_root: self.accepted_frontier_root.clone(),
             clean_projection_head_batches: self.clean_projection_head_batches.clone(),
+            current_action_hot_pin_batches: self.checkpoint_current_action_hot_pin_batches(),
             current_path_rows: ordered_rows(&self.current_path_catalog.rows),
             current_path_available: self.current_path_catalog.available,
             current_path_frontier_root: self.current_path_catalog.accepted_frontier_root.clone(),
@@ -8991,6 +9180,7 @@ impl ShardedHotEngine {
             state.ephemeral_block_claims.len(),
             state.crdt_lane_owners.len(),
             state.causal_peer_owners.len(),
+            state.causal_chain.len(),
             state.ephemeral_logseq_claims.len(),
             state.ephemeral_portable_paths.len(),
             state.portable_path_conflicts.len(),
@@ -9000,6 +9190,7 @@ impl ShardedHotEngine {
             state.visible_document_heads.len(),
             state.accepted_frontier.len(),
             state.clean_projection_head_batches.len(),
+            state.current_action_hot_pin_batches.len(),
             state.current_path_rows.len(),
             accepted_rows.len(),
             required_objects.len(),
@@ -9044,8 +9235,7 @@ impl ShardedHotEngine {
     pub(crate) fn restore_clean_checkpoint(
         &mut self,
         state_bytes: &[u8],
-        accepted_rows: Vec<CleanCheckpointAcceptedRow>,
-        required_objects: BTreeSet<ContentDigest>,
+        accepted_history: Arc<super::checkpoint_generation::SealedAcceptedHistory>,
         checkpoint_documents: Arc<super::checkpoint_generation::CleanCheckpointDocuments>,
     ) -> Result<(), EngineError> {
         if self.lazy_genesis.is_none()
@@ -9124,76 +9314,15 @@ impl ShardedHotEngine {
             ));
         }
 
-        let baseline_root = self.accepted_frontier_root.clone();
-        let mut previous_root = baseline_root;
-        let mut statuses = BTreeMap::new();
-        let mut archive_fingerprints = BTreeMap::new();
-        let mut accepted_sequence = BTreeMap::new();
-        let mut causal_clocks = BTreeMap::new();
-        let mut causal_dots = BTreeMap::new();
-        let mut causal_chain = BTreeMap::new();
-        let mut accepted_batch_entries = BTreeMap::new();
-        let mut accepted_batch_root = RunLocalAuthenticatedMap::default();
-        for (index, row) in accepted_rows.into_iter().enumerate() {
-            let sequence = u64::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_add(1))
-                .ok_or_else(|| EngineError::Archive("checkpoint sequence overflowed".into()))?;
-            row.evidence.validate()?;
-            if row.evidence.acceptance_sequence() != sequence
-                || row.evidence.prior_frontier_root() != &previous_root
-                || row.causal_dot.counter() == 0
-            {
-                return Err(EngineError::Archive(
-                    "clean checkpoint accepted roster is noncontiguous".into(),
-                ));
-            }
-            let batch_id = row.evidence.batch_id();
-            let (clock_root_key, clock_root_digest) =
-                authenticated_causal_clock_root(&row.canonical_causal_clock)?;
-            let causal_record_digest = accepted_causal_record_digest(
-                batch_id,
-                row.evidence.manifest_fingerprint(),
-                row.evidence.event_binding_digest(),
-                row.causal_dot,
-                clock_root_key,
-                clock_root_digest,
-            );
-            accepted_batch_root.upsert(
-                AuthenticatedMapKey::from(batch_id.as_uuid().into_bytes()),
-                causal_record_digest,
-            );
-            accepted_batch_entries.insert(batch_id, causal_record_digest);
-            causal_clocks.insert(batch_id, row.canonical_causal_clock);
-            causal_dots.insert(batch_id, row.causal_dot);
-            causal_chain
-                .entry(row.causal_dot.peer_id())
-                .and_modify(|tip: &mut CausalChainTip| {
-                    tip.observe(row.causal_dot.counter(), batch_id, true);
-                })
-                .or_insert_with(|| CausalChainTip::first(row.causal_dot.counter(), batch_id, true));
-            archive_fingerprints.insert(batch_id, row.evidence.manifest_fingerprint());
-            accepted_sequence.insert(sequence, batch_id);
-            previous_root = row.evidence.post_frontier_root().clone();
-            statuses.insert(
-                batch_id,
-                ArchiveStatus::Accepted {
-                    no_op: row.no_op,
-                    evidence: row.evidence,
-                },
-            );
-        }
-        let next_acceptance_sequence = u64::try_from(accepted_sequence.len())
-            .map_err(|_| EngineError::Archive("checkpoint sequence exceeds u64".into()))?;
+        let next_acceptance_sequence = accepted_history.sequence();
         if acceptance_age_policy.observed_through() != next_acceptance_sequence
-            || previous_root != state.accepted_frontier_root
             || state.accepted_frontier_root.acceptance_sequence() != next_acceptance_sequence
-            || accepted_batch_root.root_key()
+            || accepted_history.roots().batch_map.root.map(|link| link.key)
                 != state
                     .accepted_frontier_root
                     .batch_map_root_key
                     .map(AuthenticatedMapKey::from)
-            || accepted_batch_root.root_digest()
+            || accepted_history.roots().batch_map.root_digest()
                 != state.accepted_frontier_root.batch_map_root_digest
         {
             return Err(EngineError::Archive(
@@ -9238,9 +9367,9 @@ impl ShardedHotEngine {
         self.transient_effective_views.clear();
         self.transient_effective_view_order.clear();
         self.history_failure = None;
-        self.archive_fingerprints = archive_fingerprints;
+        self.archive_fingerprints.clear();
         self.persisted_staged.clear();
-        self.statuses = statuses;
+        self.statuses.clear();
         self.staged_batches.clear();
         self.ephemeral_block_claims = state.ephemeral_block_claims.into_iter().collect();
         self.crdt_lane_owners = state.crdt_lane_owners;
@@ -9267,21 +9396,25 @@ impl ShardedHotEngine {
         self.terminal_document_heads.clear();
         self.accepted_frontier = state.accepted_frontier;
         self.accepted_tip_refcounts = accepted_tip_refcounts;
-        *self.ephemeral_causal_chain.borrow_mut() = causal_chain;
-        self.ephemeral_causal_clocks = causal_clocks;
-        self.clean_checkpoint_causal_dots = causal_dots;
-        self.clean_checkpoint_required_objects = required_objects;
+        *self.ephemeral_causal_chain.borrow_mut() = state.causal_chain;
+        self.ephemeral_causal_clocks.clear();
+        self.clean_checkpoint_causal_dots.clear();
+        self.clean_checkpoint_required_objects.clear();
         self.clean_checkpoint_required_objects_by_sequence.clear();
         self.checkpoint_documents = Some(checkpoint_documents);
-        self.ephemeral_accepted_batch_entries = accepted_batch_entries;
+        self.sealed_accepted_history = Some(Arc::clone(&accepted_history));
+        self.ephemeral_accepted_batch_entries.clear();
         self.ephemeral_accepted_document_root = accepted_document_root;
-        self.ephemeral_accepted_batch_root = accepted_batch_root;
+        self.ephemeral_accepted_batch_root = RunLocalAuthenticatedMap::default();
+        self.sealed_accepted_batch_overlay =
+            Some(super::checkpoint_generation::SealedAcceptedBatchOverlay::new(accepted_history));
         self.accepted_frontier_root = state.accepted_frontier_root;
-        self.accepted_sequence = accepted_sequence;
+        self.accepted_sequence.clear();
         self.next_acceptance_sequence = next_acceptance_sequence;
         self.acceptance_age_policy = acceptance_age_policy;
         self.clean_projection_heads.clear();
         self.clean_projection_head_batches = state.clean_projection_head_batches;
+        *self.restored_action_hot_pin_batches.borrow_mut() = state.current_action_hot_pin_batches;
         self.current_path_catalog = CurrentPathCatalog {
             rows: state.current_path_rows.into_iter().collect(),
             available: state.current_path_available,
@@ -10108,6 +10241,10 @@ impl ShardedHotEngine {
                 .map_err(|error| absence_repair_error(&map, error))?;
         }
         *self.absence_decision_map.borrow_mut() = Some(map);
+        // The durable receiver summary is now the exact live producer; the
+        // restored bridge must not retain obligations that have completed
+        // since the generation was captured.
+        self.restored_action_hot_pin_batches.borrow_mut().clear();
         Ok(())
     }
 
@@ -10921,7 +11058,16 @@ impl ShardedHotEngine {
     pub fn status(&self) -> EngineStatus {
         let history_source = match &self.history_failure {
             Some(error) => StatusHistorySource::Failed(error.clone()),
-            None => StatusHistorySource::Inline(status_history_from_inline(&self.statuses)),
+            None => {
+                let inline = status_history_from_inline(&self.statuses);
+                match self.sealed_accepted_history.as_ref() {
+                    Some(covered) => StatusHistorySource::Indexed {
+                        covered: Arc::clone(covered),
+                        inline,
+                    },
+                    None => StatusHistorySource::Inline(inline),
+                }
+            }
         };
         EngineStatus {
             history_source,
@@ -11560,7 +11706,18 @@ impl ShardedHotEngine {
             return Ok(None);
         }
         let Some(batch_id) = self.accepted_sequence.get(&sequence).copied() else {
-            return Ok(None);
+            return self
+                .sealed_accepted_history
+                .as_ref()
+                .filter(|history| sequence <= history.sequence())
+                .map(|history| {
+                    history
+                        .row_by_sequence(sequence)
+                        .map_err(EngineError::Archive)
+                        .map(|row| row.map(|row| (row.evidence.batch_id(), Some(row.evidence))))
+                })
+                .transpose()
+                .map(Option::flatten);
         };
         let evidence = match self.statuses.get(&batch_id) {
             Some(ArchiveStatus::Accepted { evidence, .. }) => Some(evidence.clone()),
@@ -11571,7 +11728,17 @@ impl ShardedHotEngine {
 
     pub(crate) fn accepted_batch_cursor(&self) -> Result<AcceptedBatchCursor<'_>, EngineError> {
         self.ensure_not_blocked()?;
-        Ok(AcceptedBatchCursor::Inline(self.accepted_sequence.iter()))
+        Ok(match &self.sealed_accepted_history {
+            Some(history) => {
+                history.note_sequence_enumeration();
+                AcceptedBatchCursor::Sealed {
+                    history: Arc::clone(history),
+                    next_sequence: 1,
+                    tail: self.accepted_sequence.iter(),
+                }
+            }
+            None => AcceptedBatchCursor::Inline(self.accepted_sequence.iter()),
+        })
     }
 
     pub fn accepted_frontier_document(
@@ -11906,6 +12073,12 @@ impl ShardedHotEngine {
             .archive_fingerprints
             .get(&batch_id)
             .copied()
+            .or_else(|| {
+                self.sealed_accepted_history
+                    .as_ref()
+                    .and_then(|history| history.row_by_batch(batch_id).ok().flatten())
+                    .map(|row| row.evidence.manifest_fingerprint())
+            })
             .ok_or(EngineError::MissingDependency(batch_id))?;
         if evidence.manifest_fingerprint != expected_fingerprint {
             return Err(EngineError::Archive(format!(
@@ -12045,12 +12218,27 @@ impl ShardedHotEngine {
             clock_root_key,
             clock_root_digest,
         );
-        let candidate_batch_root = self.ephemeral_accepted_batch_root.with_upserts([(
-            AuthenticatedMapKey::from(batch_id.as_uuid().into_bytes()),
-            causal_record_digest,
-        )]);
-        let batch_map_root_key = uuid_domain_map_root_key(candidate_batch_root.root_key())?;
-        let batch_map_root_digest = candidate_batch_root.root_digest();
+        let (batch_map_root_key, batch_map_root_digest) =
+            if let Some(sealed) = &self.sealed_accepted_batch_overlay {
+                let mut candidate = sealed.clone();
+                candidate
+                    .upsert(batch_id, causal_record_digest)
+                    .map_err(EngineError::Archive)?;
+                let root = candidate.root();
+                (
+                    uuid_domain_map_root_key(root.root.map(|link| link.key))?,
+                    root.root_digest(),
+                )
+            } else {
+                let candidate = self.ephemeral_accepted_batch_root.with_upserts([(
+                    AuthenticatedMapKey::from(batch_id.as_uuid().into_bytes()),
+                    causal_record_digest,
+                )]);
+                (
+                    uuid_domain_map_root_key(candidate.root_key())?,
+                    candidate.root_digest(),
+                )
+            };
         let affected_documents = changed_documents.values().cloned().collect::<Vec<_>>();
         let retained_bytes = accepted_batch_retained_bytes(&self.archive[&batch_id])?;
         let post_frontier_root = next_accepted_frontier_root(
@@ -12139,10 +12327,16 @@ impl ShardedHotEngine {
             .insert(evidence.acceptance_sequence, checkpoint_required_objects);
         self.ephemeral_accepted_batch_entries
             .insert(evidence.batch_id, record_digest);
-        self.ephemeral_accepted_batch_root.upsert(
-            AuthenticatedMapKey::from(evidence.batch_id.as_uuid().into_bytes()),
-            record_digest,
-        );
+        if let Some(sealed) = self.sealed_accepted_batch_overlay.as_mut() {
+            sealed
+                .upsert(evidence.batch_id, record_digest)
+                .expect("accepted sealed-tail root was validated during preparation");
+        } else {
+            self.ephemeral_accepted_batch_root.upsert(
+                AuthenticatedMapKey::from(evidence.batch_id.as_uuid().into_bytes()),
+                record_digest,
+            );
+        }
         for document in post_documents.values() {
             let encoded = encode_accepted_document(document)
                 .expect("accepted inline document was encoded during preparation");
@@ -12159,12 +12353,22 @@ impl ShardedHotEngine {
             self.ephemeral_accepted_document_root.root_digest(),
             evidence.post_frontier_root.document_map_root_digest
         );
+        let (batch_root_key, batch_root_digest) = match &self.sealed_accepted_batch_overlay {
+            Some(sealed) => (
+                sealed.root().root.map(|link| link.key),
+                sealed.root().root_digest(),
+            ),
+            None => (
+                self.ephemeral_accepted_batch_root.root_key(),
+                self.ephemeral_accepted_batch_root.root_digest(),
+            ),
+        };
         debug_assert_eq!(
-            uuid_domain_map_root_key(self.ephemeral_accepted_batch_root.root_key()).ok(),
+            uuid_domain_map_root_key(batch_root_key).ok(),
             Some(evidence.post_frontier_root.batch_map_root_key)
         );
         debug_assert_eq!(
-            self.ephemeral_accepted_batch_root.root_digest(),
+            batch_root_digest,
             evidence.post_frontier_root.batch_map_root_digest
         );
         self.accepted_frontier.extend(post_documents);
@@ -12467,7 +12671,12 @@ impl ShardedHotEngine {
             // identity before staging. A batch that reaches here claiming one
             // is therefore not that original.
             let known_original = tip.accepted_batch == Some(batch_id)
-                || self.clean_checkpoint_causal_dots.get(&batch_id) == Some(&dot);
+                || self.clean_checkpoint_causal_dots.get(&batch_id) == Some(&dot)
+                || self
+                    .sealed_accepted_history
+                    .as_ref()
+                    .and_then(|history| history.row_by_batch(batch_id).ok().flatten())
+                    .is_some_and(|row| row.causal_dot == dot);
             if dot.counter() <= tip.accepted_counter && !known_original {
                 return Err(EngineError::CausalDotFork {
                     peer_id,
@@ -12640,11 +12849,23 @@ impl ShardedHotEngine {
     ) -> Result<Vec<(CausalPeerId, u64)>, EngineError> {
         let mut clock = BTreeMap::<CausalPeerId, u64>::new();
         for parent in direct_causal_heads {
+            let sealed_clock = self
+                .sealed_accepted_history
+                .as_ref()
+                .map(|history| history.row_by_batch(*parent).map_err(EngineError::Archive))
+                .transpose()?
+                .flatten()
+                .map(|row| row.canonical_causal_clock);
             let parent_clock = self
                 .local_overlay
                 .causal_clock(*parent)
-                .or_else(|| self.ephemeral_causal_clocks.get(parent).map(Vec::as_slice))
-                .ok_or(EngineError::MissingDependency(*parent))?;
+                .or_else(|| self.ephemeral_causal_clocks.get(parent).map(Vec::as_slice));
+            let parent_clock = match parent_clock {
+                Some(clock) => clock,
+                None => sealed_clock
+                    .as_deref()
+                    .ok_or(EngineError::MissingDependency(*parent))?,
+            };
             for (peer, counter) in parent_clock {
                 clock
                     .entry(*peer)
@@ -13200,6 +13421,28 @@ impl ShardedHotEngine {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
         let fingerprint = batch_fingerprint(&batch);
+        if let Some(covered) = self
+            .sealed_accepted_history
+            .as_ref()
+            .map(|history| history.row_by_batch(batch_id).map_err(EngineError::Archive))
+            .transpose()
+            .unwrap_or_else(|error| {
+                self.history_failure = Some(error.clone());
+                Some(None)
+            })
+            .flatten()
+        {
+            let disposition = if covered.evidence.manifest_fingerprint() == fingerprint {
+                BatchDisposition::DuplicateAccepted {
+                    no_op: covered.no_op,
+                }
+            } else {
+                BatchDisposition::Rejected {
+                    error: EngineError::BatchCollision(batch_id),
+                }
+            };
+            return self.outcome(batch_id, disposition, Vec::new());
+        }
         if let Some(existing_fingerprint) = self.archive_fingerprints.get(&batch_id) {
             if *existing_fingerprint != fingerprint {
                 let error = EngineError::BatchCollision(batch_id);
@@ -19489,7 +19732,7 @@ impl ShardedHotEngine {
             .as_ref()
             .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
         let batch = match store
-            .inspect_batch(source.source_batch_id())
+            .inspect_batch_with_cold_history(source.source_batch_id())
             .map_err(|error| EngineError::Archive(error.to_string()))?
         {
             BatchInspection::Ready(batch) => batch,
@@ -19662,7 +19905,7 @@ impl ShardedHotEngine {
         // torn-write / partial-delivery check the durable history record used
         // to perform.
         let batch = match store
-            .inspect_batch(source.source_batch_id())
+            .inspect_batch_with_cold_history(source.source_batch_id())
             .map_err(|error| EngineError::Archive(error.to_string()))?
         {
             BatchInspection::Ready(batch) => batch,
@@ -19912,7 +20155,7 @@ impl ShardedHotEngine {
                 );
                 let ordinary_ready = matches!(
                     store
-                        .inspect_batch(*batch_id)
+                        .inspect_batch_with_cold_history(*batch_id)
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
                 );
@@ -21078,7 +21321,24 @@ impl ShardedHotEngine {
         let mut work = self.history_work.get();
         work.dependency_status_lookups = work.dependency_status_lookups.saturating_add(1);
         self.history_work.set(work);
-        Ok(self.statuses.get(&batch_id).cloned())
+        if let Some(status) = self.statuses.get(&batch_id).cloned() {
+            return Ok(Some(status));
+        }
+        self.sealed_accepted_history
+            .as_ref()
+            .map(|history| {
+                history
+                    .row_by_batch(batch_id)
+                    .map_err(EngineError::Archive)
+                    .map(|row| {
+                        row.map(|row| ArchiveStatus::Accepted {
+                            no_op: row.no_op,
+                            evidence: row.evidence,
+                        })
+                    })
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     /// Whether this run has already authenticated the accepted effects of a
@@ -21133,11 +21393,18 @@ impl ShardedHotEngine {
                 "accepted status is not bound to the current accepted authority".into(),
             ));
         }
-        if self.accepted_sequence.get(&evidence.acceptance_sequence()) != Some(&batch_id)
-            || !self
+        let covered = self
+            .sealed_accepted_history
+            .as_ref()
+            .is_some_and(|history| {
+                evidence.acceptance_sequence() <= history.sequence()
+                    && history.contains_batch(batch_id).unwrap_or(false)
+            });
+        let hot = self.accepted_sequence.get(&evidence.acceptance_sequence()) == Some(&batch_id)
+            && self
                 .ephemeral_accepted_batch_entries
-                .contains_key(&batch_id)
-        {
+                .contains_key(&batch_id);
+        if !covered && !hot {
             return Err(EngineError::Archive(
                 "inline accepted status has no current accepted membership".into(),
             ));
@@ -24494,6 +24761,12 @@ impl ShardedHotEngine {
             .archive_fingerprints
             .get(&batch_id)
             .copied()
+            .or_else(|| {
+                self.sealed_accepted_history
+                    .as_ref()
+                    .and_then(|history| history.row_by_batch(batch_id).ok().flatten())
+                    .map(|row| row.evidence.manifest_fingerprint())
+            })
             .ok_or(EngineError::MissingDependency(batch_id))?;
         let manifest = store
             .reload_accepted_manifest(batch_id, expected_fingerprint)
@@ -30741,12 +31014,54 @@ pub(crate) mod validation_tests {
     }
 
     pub(crate) fn observable_engine_state(engine: &ShardedHotEngine) -> ObservableEngineState {
+        // Compare logical accepted state, not whether an immutable row happens
+        // to live in the tail maps or behind the sealed-generation root.
+        // This is an explicit test oracle and may enumerate accepted history.
+        let mut archive_fingerprints = engine.archive_fingerprints.clone();
+        let mut statuses = engine.statuses.clone();
+        let mut causal_clocks = engine.ephemeral_causal_clocks.clone();
+        let mut causal_dots = engine.clean_checkpoint_causal_dots.clone();
+        let mut accepted_sequence = engine.accepted_sequence.clone();
+        let mut required_objects = engine.clean_checkpoint_required_objects.clone();
+        if let Some(history) = engine.sealed_accepted_history.as_ref() {
+            history.note_sequence_enumeration();
+            for sequence in 1..=history.sequence() {
+                let row = history
+                    .row_by_sequence(sequence)
+                    .unwrap()
+                    .expect("observable sealed sequence remains complete");
+                let batch_id = row.evidence.batch_id();
+                archive_fingerprints.insert(batch_id, row.evidence.manifest_fingerprint());
+                statuses.insert(
+                    batch_id,
+                    ArchiveStatus::Accepted {
+                        no_op: row.no_op,
+                        evidence: row.evidence,
+                    },
+                );
+                causal_clocks.insert(batch_id, row.canonical_causal_clock);
+                causal_dots.insert(batch_id, row.causal_dot);
+                accepted_sequence.insert(sequence, batch_id);
+                if let Some(store) = engine.archive_store.as_ref() {
+                    let manifest = store
+                        .resolve_logical_manifest(batch_id)
+                        .unwrap()
+                        .expect("observable accepted manifest remains resolvable");
+                    required_objects.extend(
+                        manifest
+                            .required_objects()
+                            .iter()
+                            .map(|descriptor| descriptor.content_digest()),
+                    );
+                }
+            }
+        }
         ObservableEngineState {
             history_failure: engine.history_failure.clone(),
-            archive_batches: engine.archive.keys().copied().collect(),
-            archive_fingerprints: engine.archive_fingerprints.clone(),
+            archive_batches: statuses.keys().copied().collect(),
+            archive_fingerprints,
             persisted_staged: engine.persisted_staged.clone(),
-            statuses: engine.statuses.clone(),
+            statuses,
             staged_batches: engine.staged_batches.clone(),
             ephemeral_block_claims: engine.ephemeral_block_claims.clone(),
             logseq_claim_root: engine.logseq_claim_root,
@@ -30771,14 +31086,14 @@ pub(crate) mod validation_tests {
             accepted_tip_refcounts: engine.accepted_tip_refcounts.clone(),
             clean_projection_head_batches: engine.clean_projection_head_batches.clone(),
             ephemeral_causal_chain: engine.ephemeral_causal_chain.borrow().clone(),
-            ephemeral_causal_clocks: engine.ephemeral_causal_clocks.clone(),
-            clean_checkpoint_causal_dots: engine.clean_checkpoint_causal_dots.clone(),
-            clean_checkpoint_required_objects: engine.clean_checkpoint_required_objects.clone(),
-            ephemeral_accepted_batch_entries: engine.ephemeral_accepted_batch_entries.clone(),
-            ephemeral_accepted_document_root: engine.ephemeral_accepted_document_root.clone(),
-            ephemeral_accepted_batch_root: engine.ephemeral_accepted_batch_root.clone(),
+            ephemeral_causal_clocks: causal_clocks,
+            clean_checkpoint_causal_dots: causal_dots,
+            clean_checkpoint_required_objects: required_objects,
+            ephemeral_accepted_batch_entries: BTreeMap::new(),
+            ephemeral_accepted_document_root: RunLocalAuthenticatedMap::default(),
+            ephemeral_accepted_batch_root: RunLocalAuthenticatedMap::default(),
             accepted_frontier_root: engine.accepted_frontier_root.clone(),
-            accepted_sequence: engine.accepted_sequence.clone(),
+            accepted_sequence,
             next_acceptance_sequence: engine.next_acceptance_sequence,
             current_path_rows: ordered_rows(&engine.current_path_catalog.rows),
             current_path_available: engine.current_path_catalog.available,
@@ -35318,9 +35633,10 @@ pub(crate) mod validation_tests {
         // to one catalog plus page shards, keyed by 16-byte document ids,
         // moved it to 4. Replacing inline resident bytes with v2 image roster
         // references moved it to 5. Device-local acceptance-age metadata moved
-        // it to 6, so none of the older shapes can decode as this.
+        // it to 6. Current-action hot retention moved it to 7, so none of the
+        // older shapes can decode as this.
         assert_eq!(
-            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 6,
+            CLEAN_CHECKPOINT_STATE_SCHEMA_VERSION, 7,
             "changing the checkpoint state representation changes its schema"
         );
         let state_start = source

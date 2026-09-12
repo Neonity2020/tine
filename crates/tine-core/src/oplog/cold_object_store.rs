@@ -1279,14 +1279,18 @@ pub(crate) fn publish_cold_history_for_batches(
     let mut objects = BTreeMap::new();
     let mut manifests = BTreeMap::new();
     for batch_id in batches {
-        let manifest_bytes = store.read_manifest_bytes(*batch_id)?;
+        // A recovery generation can cover a batch that an earlier committed
+        // generation has already retired from hot storage. Relocation is
+        // idempotent over the logical archive, not conditional on a duplicate
+        // still existing in the hot namespace.
+        let manifest_bytes = store.resolve_logical_manifest_bytes(*batch_id)?;
         let manifest = super::OperationBatch::decode(&manifest_bytes)?;
         for descriptor in manifest.required_objects() {
             let digest = descriptor.content_digest();
             if objects.contains_key(&digest) {
                 continue;
             }
-            objects.insert(digest, store.read_object_bytes(digest)?);
+            objects.insert(digest, store.resolve_logical_object_bytes(digest)?);
         }
         manifests.insert(*batch_id, manifest_bytes);
     }

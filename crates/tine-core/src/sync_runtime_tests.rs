@@ -6925,7 +6925,8 @@ fn cold_open_repairs_only_torn_objects_covered_by_an_undrained_local_record() {
         serde_json::from_str::<serde_json::Value>(&refused).unwrap(),
         serde_json::json!({
             "kind": "clean-open",
-            "reason_code": "clean_open.store",
+            "reason_code": "clean_open.sqlite_projection",
+            "detail": { "scenario": "MS-REF-DISK-CORRUPT" },
         }),
         "{refused}"
     );
@@ -11295,7 +11296,7 @@ fn second_clean_cold_open_restores_checkpoint_instead_of_full_replay() {
     assert_eq!(second_counters.checkpoint_opens, 1);
     assert_eq!(second_counters.full_replay_opens, 0);
     assert_eq!(second_counters.committed_tail_replayed, 0);
-    assert_eq!(second_counters.checkpoint_roster_entries, 1);
+    assert_eq!(second_counters.checkpoint_roster_entries, 0);
     assert!(second_counters.checkpoint_payload_bytes > 0);
     assert_eq!(second_counters.archive_manifest_reads, 0);
     assert_eq!(second_counters.archive_object_reads, 0);
@@ -11422,7 +11423,7 @@ fn checkpoint_reopen_replays_exactly_the_unpublished_durable_tail() {
     let counters = counters.expect("tail reopen reports counters");
     assert_eq!(counters.checkpoint_opens, 1);
     assert_eq!(counters.full_replay_opens, 0);
-    assert_eq!(counters.checkpoint_roster_entries, 1);
+    assert_eq!(counters.checkpoint_roster_entries, 0);
     assert_eq!(counters.committed_tail_replayed, 1);
     let (restored, _) = load_application_exact(&third, "Root.md");
     assert_eq!(restored.blocks[0].raw, "uncheckpointed frontier two");
@@ -11718,16 +11719,27 @@ fn p3_torn_checkpoint_full_replay() {
         .find(|entry| entry.file_type().unwrap().is_file())
         .unwrap();
     fs::remove_file(manifest.path()).unwrap();
+    let cold_history =
+        clean_operation_archive_directory(&fixture.request.archive_root).join("cold-history-v1");
+    if cold_history.exists() {
+        for entry in fs::read_dir(cold_history).unwrap().map(Result::unwrap) {
+            if entry.file_name().to_string_lossy().starts_with("pack-v1-") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
     let refused = SyncRuntimeHandle::open(reopen_request(&fixture.request));
     assert!(refused.handle.is_none());
     assert_eq!(
         refused.status.durable_refusal_scenario(),
-        Some(ManagedStorageRefusalScenario::DiskCorrupt)
+        Some(ManagedStorageRefusalScenario::DiskCorrupt),
+        "{:?}",
+        refused.status
     );
 }
 
 #[test]
-fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
+fn checkpoint_roots_resolve_a_retired_hot_manifest_from_cold_history() {
     let fixture =
         ActivationFixture::nested_unicode("clean-checkpoint-missing-manifest", 0xa178_8000);
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
@@ -11752,18 +11764,14 @@ fn checkpoint_roster_surfaces_missing_authoritative_manifest_immediately() {
     fs::remove_file(manifest).unwrap();
 
     let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-    assert!(reopened.handle.is_none());
-    assert!(
-        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { ref detail }
-            if detail.contains("checkpoint roster manifest") && detail.contains("missing")),
-        "missing roster authority must surface immediately: {:?}",
-        reopened.status
-    );
-    assert_eq!(
-        reopened.status.durable_refusal_scenario(),
-        Some(ManagedStorageRefusalScenario::DiskCorrupt),
-        "archive damage is a durable disk-corrupt refusal, never an unmarked retryable one"
-    );
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let handle = reopened
+        .handle
+        .expect("the marker-selected cold manifest remains authoritative");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
 }
 
 /// Wave-2 review H-1: a store whose sealed lazy-genesis baseline was written
@@ -11867,7 +11875,7 @@ fn checkpoint_roster_never_masks_mutated_authoritative_manifest() {
 }
 
 #[test]
-fn checkpoint_roster_surfaces_missing_required_object_immediately() {
+fn checkpoint_roots_resolve_a_retired_hot_object_from_cold_history() {
     let fixture = ActivationFixture::nested_unicode("clean-checkpoint-missing-object", 0xa178_9000);
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
@@ -11889,13 +11897,14 @@ fn checkpoint_roster_surfaces_missing_required_object_immediately() {
     fs::remove_file(object).unwrap();
 
     let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-    assert!(reopened.handle.is_none());
-    assert!(
-        matches!(reopened.status, SyncRuntimeOpenStatus::OpenRefused { ref detail }
-            if detail.contains("checkpoint roster object") && detail.contains("missing")),
-        "missing required object must surface immediately: {:?}",
-        reopened.status
-    );
+    assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+    let handle = reopened
+        .handle
+        .expect("the marker-selected cold object remains authoritative");
+    assert!(matches!(
+        handle.clean_shutdown().unwrap(),
+        SyncShutdownOutcome::Safe(_)
+    ));
 }
 
 #[test]

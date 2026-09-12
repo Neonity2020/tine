@@ -1089,7 +1089,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/oplog/object_store.rs",
             "cap.remove_file",
-            2,
+            4,
         ),
         (
             "crates/tine-core/src/oplog/object_store.rs",
@@ -2245,7 +2245,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // method rejects every call; it adds no writer family or write boundary.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a2b3e7300427ab954a56d50bdab4a6b16c9fd0939bb89372a56f8e01d81bd159",
+        "be4f0b4411e9f53cff752511f9645c54c3f9a9cf83a803db4beb6c4f0a326352",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

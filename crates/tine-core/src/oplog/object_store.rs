@@ -201,6 +201,12 @@ pub static INSPECT_BATCH_DIGEST_BYTES: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObjectStoreStats {
     pub directory_enumerations: usize,
+    pub namespace_manifest_decodes: usize,
+    pub namespace_object_decodes: usize,
+    /// These stay zero on a generation-aware open. They are explicit so the
+    /// bounded-open ratchet observes work rather than inferring it from time.
+    pub covered_namespace_manifest_decodes: usize,
+    pub covered_namespace_object_decodes: usize,
     pub accepted_manifest_reads: usize,
     pub accepted_object_reads: usize,
     pub dag_manifest_reads: usize,
@@ -217,11 +223,20 @@ pub struct ObjectStoreStats {
     pub hot_manifest_bytes: usize,
     pub cold_object_bytes: usize,
     pub cold_manifest_bytes: usize,
+    /// Logical batch inventories considered by generation relocation.  Later
+    /// generations increment this only for C+1..=new C.
+    pub relocation_batch_visits: usize,
+    pub retired_hot_manifests: usize,
+    pub retired_hot_objects: usize,
 }
 
 #[derive(Debug, Default)]
 struct StoreCounters {
     directory_enumerations: AtomicUsize,
+    namespace_manifest_decodes: AtomicUsize,
+    namespace_object_decodes: AtomicUsize,
+    covered_namespace_manifest_decodes: AtomicUsize,
+    covered_namespace_object_decodes: AtomicUsize,
     accepted_manifest_reads: AtomicUsize,
     accepted_object_reads: AtomicUsize,
     dag_manifest_reads: AtomicUsize,
@@ -235,6 +250,9 @@ struct StoreCounters {
     hot_manifest_bytes: AtomicUsize,
     cold_object_bytes: AtomicUsize,
     cold_manifest_bytes: AtomicUsize,
+    relocation_batch_visits: AtomicUsize,
+    retired_hot_manifests: AtomicUsize,
+    retired_hot_objects: AtomicUsize,
 }
 
 /// How one logical read is permitted to resolve its bytes.
@@ -1426,10 +1444,35 @@ impl ObjectStore {
     }
 
     pub(crate) fn validate_namespace(&self) -> Result<(), StoreError> {
+        self.validate_namespace_impl(None, &BTreeSet::new())?;
+        Ok(())
+    }
+
+    /// Validate only the hot tail selected by a qualified generation. A hot
+    /// duplicate of covered cold history is not an ordinary-open input.
+    pub(crate) fn validate_namespace_for_generation(
+        &self,
+        history: &super::checkpoint_generation::SealedAcceptedHistory,
+        pinned_batches: &BTreeSet<BatchId>,
+    ) -> Result<(), StoreError> {
+        let covered_hot = self.validate_namespace_impl(Some(history), pinned_batches)?;
+        // Resume a marker-last retirement interrupted by a crash. This is
+        // empty on every steady open; a recovery open verifies exact cold
+        // bytes before repeating the idempotent removals.
+        self.retire_hot_history_for_batches(&covered_hot, pinned_batches)?;
+        Ok(())
+    }
+
+    fn validate_namespace_impl(
+        &self,
+        covered: Option<&super::checkpoint_generation::SealedAcceptedHistory>,
+        pinned_batches: &BTreeSet<BatchId>,
+    ) -> Result<BTreeSet<BatchId>, StoreError> {
         let mut manifests = Vec::new();
         let mut manifest_fingerprints = BTreeMap::new();
         let mut manifest_names = BTreeSet::new();
         let mut object_names = BTreeSet::new();
+        let mut covered_hot = BTreeSet::new();
         for (directory, kind) in [
             (OBJECTS_DIR, NamespaceKind::Objects),
             (BATCHES_DIR, NamespaceKind::Batches),
@@ -1456,8 +1499,19 @@ impl ObjectStore {
                 match kind {
                     NamespaceKind::Objects => {
                         let expected = parse_object_filename(name)?;
+                        let is_covered = covered
+                            .map(|history| history.contains_object(expected))
+                            .transpose()
+                            .map_err(StoreError::UnsafeEntry)?
+                            .unwrap_or(false);
+                        if is_covered {
+                            continue;
+                        }
                         let bytes =
                             read_required_regular(&dir, name, MAX_OBJECT_BYTES as u64, None)?;
+                        self.counters
+                            .namespace_object_decodes
+                            .fetch_add(1, Ordering::Relaxed);
                         if ContentDigest::of(&bytes) != expected {
                             return Err(StoreError::ObjectPathMismatch(expected));
                         }
@@ -1475,8 +1529,20 @@ impl ObjectStore {
                     }
                     NamespaceKind::Batches => {
                         let expected = parse_manifest_filename(name)?;
+                        let is_covered = covered
+                            .map(|history| history.contains_batch(expected))
+                            .transpose()
+                            .map_err(StoreError::UnsafeEntry)?
+                            .unwrap_or(false);
+                        if is_covered && !pinned_batches.contains(&expected) {
+                            covered_hot.insert(expected);
+                            continue;
+                        }
                         let bytes =
                             read_required_regular(&dir, name, MAX_MANIFEST_BYTES as u64, None)?;
+                        self.counters
+                            .namespace_manifest_decodes
+                            .fetch_add(1, Ordering::Relaxed);
                         let manifest = OperationBatch::decode(&bytes)?;
                         if manifest.batch_id() != expected {
                             return Err(StoreError::ManifestPathMismatch {
@@ -1516,7 +1582,7 @@ impl ObjectStore {
             .write()
             .map_err(|_| StoreError::UnsafeEntry("object-name cache is poisoned".into()))? =
             object_names;
-        Ok(())
+        Ok(covered_hot)
     }
 
     fn check_or_establish_lineage(&self, lineage: LineageDigest) -> Result<(), StoreError> {
@@ -1797,7 +1863,133 @@ impl ObjectStore {
         &self,
         batches: &BTreeSet<BatchId>,
     ) -> Result<super::cold_object_store::ColdPublicationOutcome, StoreError> {
+        self.counters
+            .relocation_batch_visits
+            .fetch_add(batches.len(), Ordering::Relaxed);
         super::cold_object_store::publish_cold_history_for_batches(self, batches)
+    }
+
+    /// Retire exact hot names only after the cold root has made the same bytes
+    /// point-readable.  Removal is idempotent and the two namespace barriers
+    /// make every crash prefix resolve from hot, cold, or both.
+    pub(crate) fn retire_hot_history_for_batches(
+        &self,
+        batches: &BTreeSet<BatchId>,
+        pinned_batches: &BTreeSet<BatchId>,
+    ) -> Result<(usize, usize), StoreError> {
+        if batches.is_empty() {
+            return Ok((0, 0));
+        }
+        let cold = super::cold_object_store::ColdHistoryReader::open(self)?
+            .ok_or_else(|| StoreError::ColdHistoryRootMissing)?;
+        let mut pinned_objects = BTreeSet::new();
+        for batch_id in pinned_batches {
+            if let Some(bytes) = cold.manifest_bytes(*batch_id)? {
+                let manifest = OperationBatch::decode(&bytes)?;
+                pinned_objects.extend(
+                    manifest
+                        .required_objects()
+                        .iter()
+                        .map(ObjectDescriptor::content_digest),
+                );
+            }
+        }
+        // A batch accepted after the generation capture is not part of
+        // `batches`, but it can still share a content-addressed object with a
+        // covered batch. Keep every object named by that live hot tail. The
+        // validated manifest cache is already bounded by tail + explicit pins:
+        // each retirement below removes the covered, unpinned names from it.
+        let live_hot_batches = self
+            .validated_manifest_names
+            .read()
+            .map_err(|_| StoreError::UnsafeEntry("manifest-name cache is poisoned".into()))?
+            .clone();
+        for batch_id in live_hot_batches.difference(batches) {
+            if let Some(manifest) = self.read_manifest(*batch_id)? {
+                pinned_objects.extend(
+                    manifest
+                        .required_objects()
+                        .iter()
+                        .map(ObjectDescriptor::content_digest),
+                );
+            }
+        }
+        let mut retire_objects = BTreeSet::new();
+        let mut retire_manifests = Vec::new();
+        for batch_id in batches {
+            let cold_bytes =
+                cold.manifest_bytes(*batch_id)?
+                    .ok_or(StoreError::ColdManifestUnavailable {
+                        batch_id: *batch_id,
+                        reason: "generation relocation root omits a covered manifest".into(),
+                    })?;
+            let manifest = OperationBatch::decode(&cold_bytes)?;
+            for descriptor in manifest.required_objects() {
+                let digest = descriptor.content_digest();
+                let bytes =
+                    cold.object_bytes(digest)?
+                        .ok_or(StoreError::ColdObjectUnavailable {
+                            digest,
+                            reason: "generation relocation root omits a covered object".into(),
+                        })?;
+                if ContentDigest::of(&bytes) != digest {
+                    return Err(StoreError::ObjectPathMismatch(digest));
+                }
+                if !pinned_objects.contains(&digest) {
+                    retire_objects.insert(digest);
+                }
+            }
+            if !pinned_batches.contains(batch_id) {
+                retire_manifests.push(*batch_id);
+            }
+        }
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        let manifests = self.open_namespace(BATCHES_DIR)?;
+        let retired_object_names = retire_objects.clone();
+        let mut removed_objects = 0;
+        for digest in retire_objects {
+            match objects.remove_file(object_filename(digest)) {
+                Ok(()) => removed_objects += 1,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut removed_manifests = 0;
+        for batch_id in retire_manifests {
+            match manifests.remove_file(manifest_filename(batch_id)) {
+                Ok(()) => removed_manifests += 1,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if removed_objects != 0 {
+            sync_dir_required(&objects)?;
+        }
+        if removed_manifests != 0 {
+            sync_dir_required(&manifests)?;
+        }
+        self.counters
+            .retired_hot_objects
+            .fetch_add(removed_objects, Ordering::Relaxed);
+        self.counters
+            .retired_hot_manifests
+            .fetch_add(removed_manifests, Ordering::Relaxed);
+        {
+            let mut names = self
+                .validated_object_names
+                .write()
+                .map_err(|_| StoreError::UnsafeEntry("object-name cache is poisoned".into()))?;
+            names.retain(|digest| !retired_object_names.contains(digest));
+        }
+        self.validated_manifest_names
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("manifest-name cache is poisoned".into()))?
+            .retain(|batch_id| !batches.contains(batch_id) || pinned_batches.contains(batch_id));
+        self.validated_manifest_fingerprints
+            .write()
+            .map_err(|_| StoreError::UnsafeEntry("manifest fingerprint cache is poisoned".into()))?
+            .retain(|batch_id, _| !batches.contains(batch_id) || pinned_batches.contains(batch_id));
+        Ok((removed_manifests, removed_objects))
     }
 
     /// Republish every cold record into fresh packs and rebuild the locator
@@ -1831,6 +2023,14 @@ impl StoreCounters {
     fn snapshot(&self) -> ObjectStoreStats {
         ObjectStoreStats {
             directory_enumerations: self.directory_enumerations.load(Ordering::Relaxed),
+            namespace_manifest_decodes: self.namespace_manifest_decodes.load(Ordering::Relaxed),
+            namespace_object_decodes: self.namespace_object_decodes.load(Ordering::Relaxed),
+            covered_namespace_manifest_decodes: self
+                .covered_namespace_manifest_decodes
+                .load(Ordering::Relaxed),
+            covered_namespace_object_decodes: self
+                .covered_namespace_object_decodes
+                .load(Ordering::Relaxed),
             accepted_manifest_reads: self.accepted_manifest_reads.load(Ordering::Relaxed),
             accepted_object_reads: self.accepted_object_reads.load(Ordering::Relaxed),
             dag_manifest_reads: self.dag_manifest_reads.load(Ordering::Relaxed),
@@ -1846,6 +2046,9 @@ impl StoreCounters {
             hot_manifest_bytes: self.hot_manifest_bytes.load(Ordering::Relaxed),
             cold_object_bytes: self.cold_object_bytes.load(Ordering::Relaxed),
             cold_manifest_bytes: self.cold_manifest_bytes.load(Ordering::Relaxed),
+            relocation_batch_visits: self.relocation_batch_visits.load(Ordering::Relaxed),
+            retired_hot_manifests: self.retired_hot_manifests.load(Ordering::Relaxed),
+            retired_hot_objects: self.retired_hot_objects.load(Ordering::Relaxed),
         }
     }
 }

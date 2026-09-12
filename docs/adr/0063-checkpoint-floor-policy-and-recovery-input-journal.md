@@ -60,9 +60,11 @@ admission resume.
 The live actor records injected UTC and same-process monotonic observations only
 when a batch first becomes locally accepted. It persists recent observations
 plus eligible-through E in the disposable checkpoint; replay and installation
-do not create acceptance events. The publisher worker derives candidate
-frontiers by traversing the existing sealed accepted sequence through E and
-selects the oldest verified candidate satisfying the byte hysteresis target.
+do not create acceptance events. The publisher worker derives the bounded
+candidate described by ADR 0064: the latest qualifying document change in the
+current delta, otherwise one predecessor-index query, otherwise lazy genesis.
+It verifies that candidate against the byte hysteresis target without
+traversing the accepted sequence through E.
 
 ## Consequences
 

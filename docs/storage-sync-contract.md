@@ -1438,29 +1438,28 @@ The checkpoint contains every clean-runtime field that changes later
 admission, conflict, or query decisions, including the exact ephemeral
 page-name ownership state, current path/name/UUID claims and conflicts,
 accepted frontier and resident-document identities, projection-head batch locators,
-and the accepted sequence. The accepted roster is not a parallel list: it is
+the bounded current-action hot-retention closure, and the accepted sequence.
+The accepted roster is not a parallel list: it is
 the canonical `tine-storage` sealed accepted index with exact accepted evidence,
 causal records, status map and sequence root. The checkpoint also records each
-roster manifest fingerprint and the union of object names those manifests
-require. Run-local capabilities, cursor nonces, timing counters, LRU-only
+document's latest-change point root and a point-addressable covered-object root;
+it does not embed an H-sized manifest roster or required-object union in the
+payload. Run-local capabilities, cursor nonces, timing counters, LRU-only
 caches, attached graph/receipt handles, and an unaccepted foreground journal
 overlay are excluded; they are newly minted, rebuilt, or replayed by their own
 authority before use.
 
-On open, ordinary archive namespace validation still reads, digests and decodes
-every manifest and object exactly as before. During that existing manifest read
-the store retains a disposable fingerprint map. Checkpoint tail discovery then
-does names-only enumeration: roster members are neither reopened nor
-semantically replayed. A roster fingerprint mismatch discards the checkpoint
-and sequence-zero full-replays so the live archive wins. A roster-referenced
-manifest missing from the names set, an undecodable manifest found by ordinary
-namespace validation, or a required object missing from the object-name set is
-authoritative archive damage and surfaces immediately through the existing
-managed-open archive-damage path; discarding the checkpoint cannot repair it.
-The detection-latency change is therefore narrow: semantic re-application of
-pre-roster history moves from every open to checkpoint fallback/repair, while
-manifest decoding/identity binding, object digest validation, and required-name
-existence detection remain on every open.
+On open, the marker-selected generation and its terminal accepted proof are
+qualified before archive content validation. Namespace validation parses every
+hot name but does not read, digest or decode a name authenticated as covered;
+it fully validates only live tail and explicitly pinned hot manifests. Covered
+history is resolved through its sealed point indexes and exact cold originals.
+An absent or invalid generation takes the unchanged sequence-zero full audit.
+An interrupted post-marker retirement is discovered from covered hot names and
+resumes idempotently: cold manifest and object bytes are point-verified before
+any repeated unlink. Observable open-work counters require zero covered
+namespace manifest/object decodes, zero covered roster rows loaded, and zero
+covered-sequence enumeration on the healthy generation path.
 
 After checkpoint restore, only archive manifest names outside its roster enter
 the same dependency-staged fixed point described above. A failure to admit that
@@ -1472,8 +1471,10 @@ payload bytes, the actual tail replayed, and durable lag.
 
 Snapshot capture is coherent on the owning actor and is attempted after every
 accepted managed save. The actor captures canonical semantic metadata plus only
-the accepted roster and required-object additions after the publisher's durable
-frontier. For a document whose accepted dependency binding differs from the
+the accepted rows and required-object additions after the publisher's durable
+frontier C. The worker path-copies those additions into the predecessor's
+sealed accepted, covered-object and latest-document-change roots; a later
+generation visits exactly C+1..=new C, never 1..=E. For a document whose accepted dependency binding differs from the
 last published checkpoint, a resident document crosses the thread boundary as
 an upstream Snapshot clone; an evicted document carries only its exact
 dependencies and is reconstructed by the worker from its prior image plus the
@@ -1492,13 +1493,23 @@ image's S. It falls back to genesis/original replay only when the roster has no
 image for that document. For every changed document the worker measures the
 current image and a latest-state-only image at the same `S`. Removable bytes
 `R = max(0, I-L)` trigger a cut only when they exceed
-`B = max(256 KiB, 4*L)`. The worker traverses the existing sealed accepted
-sequence through `E`, verifies native candidate images without assuming size
-monotonicity, and selects the oldest legal `K` reaching `R_K < B/2`. If no
-candidate reaches the hysteresis target, the greatest safe age-eligible native
-cut is retained and the shortfall/overage cause is diagnostic. Age wins over
+`B = max(256 KiB, 4*L)`. The worker obtains at most one floor candidate per
+changed document: the latest qualifying change in the current delta, otherwise
+one predecessor query against the sealed latest-document-change root, otherwise
+lazy genesis. It verifies the native candidate image without assuming the
+requested floor is installed exactly. If that candidate does not reach the
+hysteresis target, the shortfall/overage cause is diagnostic. Age wins over
 size: recent or uncertain history is never removed to meet a budget, and a
 within-budget document never cuts even after months of device time.
+
+After cold publication has preserved exact bytes, `current` is replaced and
+only then may covered hot names be retired. The retained hot closure is bounded
+by current document/projection heads, causal peers, and current-action roots
+(unfinished receipt work, sweep predecessors and pending Restore). Newly
+completed action pins are retired by a later generation. Crash prefixes leave
+the old generation, the new generation with both copies, or the new generation
+with cold-only covered history; reopen accepts all three and repeats only safe
+post-marker retirement.
 
 Provider admission nevertheless implements the below-floor boundary before
 that policy becomes active. Preflight checks every declared affected/support

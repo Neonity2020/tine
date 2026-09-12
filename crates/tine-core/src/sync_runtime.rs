@@ -1172,6 +1172,26 @@ impl CleanOpenError {
                 _ => None,
             },
             Self::ProjectionStore(error) => projection_store_refusal_scenario(error),
+            Self::SqliteProjection(error)
+                if matches!(
+                    error.as_ref(),
+                    crate::oplog::sqlite::ProjectionError::Rebuild(_)
+                ) =>
+            {
+                Some(ManagedStorageRefusalScenario::DiskCorrupt)
+            }
+            Self::Store(error)
+                if matches!(
+                    error.as_ref(),
+                    crate::oplog::object_store::StoreError::ColdHistoryIndexUnavailable(_)
+                        | crate::oplog::object_store::StoreError::ColdHistoryRootMissing
+                        | crate::oplog::object_store::StoreError::ColdManifestConflict { .. }
+                        | crate::oplog::object_store::StoreError::ColdObjectUnavailable { .. }
+                        | crate::oplog::object_store::StoreError::ColdManifestUnavailable { .. }
+                ) =>
+            {
+                Some(ManagedStorageRefusalScenario::DiskCorrupt)
+            }
             _ => None,
         }
     }
@@ -2144,6 +2164,9 @@ pub struct SyncCheckpointPublicationDiagnostics {
     pub cold_manifest_bytes: u64,
     pub cold_object_reads: u64,
     pub cold_object_bytes: u64,
+    pub relocation_batch_visits: u64,
+    pub retired_hot_manifests: u64,
+    pub retired_hot_objects: u64,
     pub image_phase_ms: u64,
     pub payload_phase_ms: u64,
     pub publication_phase_ms: u64,
@@ -7007,6 +7030,12 @@ impl CleanRuntimeActorCore {
         }
     }
 
+    fn refresh_checkpoint_retention(&self) {
+        self.runtime.engine().install_checkpoint_sweep_retention(
+            &self.sweeps.current_action_roots().retention_closure(),
+        );
+    }
+
     fn execute_local(
         &mut self,
         graph: &Graph,
@@ -7014,6 +7043,7 @@ impl CleanRuntimeActorCore {
         transaction: &OperationTransaction,
         projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        self.refresh_checkpoint_retention();
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
                 batch_id: pending.batch_id(),
@@ -7122,6 +7152,7 @@ impl CleanRuntimeActorCore {
         projection_turns: &mut ProjectionTurnJournalState,
         prepared: &PreparedBatch,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        self.refresh_checkpoint_retention();
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
                 batch_id: pending.batch_id(),
@@ -7173,6 +7204,7 @@ impl CleanRuntimeActorCore {
         projection_turns: &mut ProjectionTurnJournalState,
         prepared: &PreparedBatch,
     ) -> Result<CleanActorMutationOutcome, CleanActorMutationFailure> {
+        self.refresh_checkpoint_retention();
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorMutationOutcome::RetainedPriorPending {
                 batch_id: pending.batch_id(),
@@ -7227,6 +7259,7 @@ impl CleanRuntimeActorCore {
         receipts: &ProjectionReceiptStore,
         projection_turns: &mut ProjectionTurnJournalState,
     ) -> Option<CleanActorMutationOutcome> {
+        self.refresh_checkpoint_retention();
         // Escalation never stops the retries: an identical detail string three
         // times is not proof the failure is deterministic (a transient
         // filesystem condition can repeat verbatim), so every tick still
@@ -7575,6 +7608,7 @@ impl CleanRuntimeActorCore {
         paths: &BTreeSet<ManagedPath>,
         projection_turns: &mut ProjectionTurnJournalState,
     ) -> Result<CleanActorExternalOutcome, CleanActorMutationFailure> {
+        self.refresh_checkpoint_retention();
         if let Some(pending) = self.pending.as_ref() {
             return Ok(CleanActorExternalOutcome::DurablePending {
                 batch_id: pending.batch_id(),
@@ -8165,6 +8199,7 @@ fn activate_clean_runtime_resources_retaining_archive(
         let membership = LazyAcceptedBatchMembership::new(&engine);
         SweepManager::open(&store, &membership).map_err(CleanOpenError::from)?
     };
+    engine.install_checkpoint_sweep_retention(&sweeps.current_action_roots().retention_closure());
     let mut runtime = CleanLocalRuntime::from_open_parts(
         request.identities.session_id,
         endpoint,
@@ -8303,13 +8338,12 @@ fn build_full_history_replacement_engine(
                     ))
                 }
             };
-        let durable_sequence = loaded.accepted_rows.len() as u64;
+        let durable_sequence = loaded.accepted_sequence;
         let tail = loaded.tail.clone();
         engine
             .restore_clean_checkpoint(
                 &loaded.state_bytes,
-                loaded.accepted_rows,
-                loaded.required_objects,
+                Arc::clone(&loaded.accepted_history),
                 Arc::clone(&loaded.documents),
             )
             .map_err(CleanOpenError::from)?;
@@ -8584,7 +8618,23 @@ fn open_clean_runtime_resources_with_progress(
     store
         .repair_covered_object_mismatches(&covered)
         .map_err(CleanOpenError::from)?;
-    store.validate_namespace().map_err(CleanOpenError::from)?;
+    // Qualify the marker-selected generation before namespace content
+    // validation. A valid generation authenticates the covered names, so the
+    // validator decodes only the live tail. Without one, preserve the
+    // sequence-zero full-audit fallback.
+    let checkpoint_open = crate::oplog::checkpoint_generation::open_checkpoint(&store);
+    if let Err(crate::oplog::checkpoint_generation::CleanCheckpointOpenError::ArchiveDamage(
+        error,
+    )) = &checkpoint_open
+    {
+        return Err(error.clone());
+    }
+    if !matches!(
+        &checkpoint_open,
+        Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(_))
+    ) {
+        store.validate_namespace().map_err(CleanOpenError::from)?;
+    }
     trace.phase(
         SyncRuntimeCleanOpenStage::ObjectStoreRepairAndValidation,
         stage_progress,
@@ -8603,7 +8653,6 @@ fn open_clean_runtime_resources_with_progress(
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::RetainedRuntimeTailReplay,
     });
-    let checkpoint_open = crate::oplog::checkpoint_generation::open_checkpoint(&store);
     trace.phase(
         SyncRuntimeCleanOpenStage::CleanCheckpointOpen,
         stage_progress,
@@ -8622,18 +8671,16 @@ fn open_clean_runtime_resources_with_progress(
             eprintln!("clean checkpoint is disposable and will be rebuilt: {error}");
         }
         Ok(crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded)) => {
-            counters.checkpoint_roster_entries = loaded.accepted_rows.len();
-            counters.checkpoint_manifest_names =
-                loaded.accepted_rows.len().saturating_add(loaded.tail.len());
-            counters.checkpoint_required_object_names = loaded.required_objects.len();
+            counters.checkpoint_roster_entries = 0;
+            counters.checkpoint_manifest_names = loaded.tail.len();
+            counters.checkpoint_required_object_names = 0;
             counters.checkpoint_capture_work = loaded.capture_work;
             counters.checkpoint_payload_bytes = loaded.payload_bytes;
-            let durable_sequence = loaded.accepted_rows.len() as u64;
+            let durable_sequence = loaded.accepted_sequence;
             let tail = loaded.tail.clone();
             match engine.restore_clean_checkpoint(
                 &loaded.state_bytes,
-                loaded.accepted_rows,
-                loaded.required_objects,
+                Arc::clone(&loaded.accepted_history),
                 Arc::clone(&loaded.documents),
             ) {
                 Ok(()) => {
@@ -8775,12 +8822,9 @@ fn open_clean_runtime_resources_with_progress(
     // history, and it names every document and dependency head an unfinished
     // action or explicit pending Restore still pins.
     //
-    // P3 manager handoff: `checkpoint_generation.rs` is the owner that should
-    // consume `SweepManager::current_action_roots()` /
-    // `CurrentActionRoots::retention_closure()` when it captures a generation;
-    // this open only measures it.
     {
         let closure = sweeps.current_action_roots().retention_closure();
+        engine.install_checkpoint_sweep_retention(&closure);
         counters.current_action_sweep_pins = closure.sweeps.len();
         counters.current_action_retained_documents = closure.documents.len();
     }
@@ -11948,6 +11992,9 @@ fn run_actor_loop(
     started: SyncSender<ActorStartupEvent>,
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
+    if let Err(error) = actor.refresh_checkpoint_durable_action_retention() {
+        actor.terminal = Some(error);
+    }
     let snapshot = actor.snapshot();
     *shared_status.write().unwrap() = snapshot.clone();
     if started.send(ActorStartupEvent(Ok(snapshot))).is_err() {
@@ -11968,6 +12015,9 @@ fn run_actor_loop(
         let request = match receiver.recv_timeout(timeout) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = actor.refresh_checkpoint_durable_action_retention() {
+                    actor.terminal = Some(error);
+                }
                 if actor
                     .managed_local
                     .as_ref()
@@ -12504,6 +12554,9 @@ fn run_actor_loop(
                 }
             },
         };
+        if let Err(error) = actor.refresh_checkpoint_durable_action_retention() {
+            actor.terminal = Some(error);
+        }
         if let Err(error) = actor.flush_local_completions_if_required() {
             actor.terminal = Some(error);
         }
@@ -14501,6 +14554,50 @@ impl RuntimeActor {
             return Ok(clean.runtime.engine());
         }
         Err(SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    /// Install the exact bounded roots owned by durable work queues before a
+    /// generation can retire their hot dependencies. The queues are already
+    /// indexed/decoded, so this is O(P), never a retained-history walk.
+    fn refresh_checkpoint_durable_action_retention(&self) -> Result<(), String> {
+        let Some(clean) = self.clean.as_ref() else {
+            return Ok(());
+        };
+        fn retain_manifest(batches: &mut BTreeSet<BatchId>, manifest: &OperationBatch) {
+            batches.insert(manifest.batch_id());
+            for document in manifest.dependency_frontier().documents() {
+                batches.extend(document.direct_dependency_heads().iter().copied());
+            }
+        }
+        let mut batches = BTreeSet::new();
+        if let Some(managed) = self.managed_local.as_ref() {
+            for record in managed.pending_index.records_by_batch.values() {
+                retain_manifest(&mut batches, record.prepared_batch().manifest());
+            }
+        }
+        if let Some(turns) = self.projection_turns.as_ref() {
+            for turn in turns.undrained_turns().map_err(|error| error.to_string())? {
+                if let Some(batch_id) = turn.origin.batch_id() {
+                    batches.insert(batch_id);
+                }
+                for page in turn.pages {
+                    for document in page.frontier.documents() {
+                        batches.extend(document.direct_dependency_heads().iter().copied());
+                    }
+                }
+            }
+        }
+        if let Some(recovery) = self.recovery_input.as_ref() {
+            for envelope in recovery.pending_envelopes() {
+                let prepared = envelope.prepared_batch()?;
+                retain_manifest(&mut batches, prepared.manifest());
+            }
+        }
+        clean
+            .runtime
+            .engine()
+            .install_checkpoint_durable_action_retention(batches);
+        Ok(())
     }
 
     fn local_completion_deadline_remaining(&self, now: Instant) -> Option<Duration> {
@@ -24710,19 +24807,30 @@ impl RuntimeActor {
         }
 
         let (paths, full_scan_epoch) = {
-            let clean = self.clean.as_mut().expect("clean actor remains installed");
-            if clean.full_scan.is_none()
-                && clean.completed_full_scan.is_none()
-                && !clean.watcher.pending()
-            {
+            let watcher_idle = self.clean.as_ref().is_some_and(|clean| {
+                clean.full_scan.is_none()
+                    && clean.completed_full_scan.is_none()
+                    && !clean.watcher.pending()
+            });
+            if watcher_idle {
                 return if self.provider_has_work() {
                     self.tick_clean_provider()
                 } else if self.search_index_build_has_work() {
                     self.tick_clean_search_index_build()
+                } else if self
+                    .clean
+                    .as_ref()
+                    .expect("clean actor remains installed")
+                    .runtime
+                    .engine()
+                    .schedule_clean_checkpoint_idle()
+                {
+                    SyncRuntimeTick::Recovering
                 } else {
                     SyncRuntimeTick::Idle
                 };
             }
+            let clean = self.clean.as_mut().expect("clean actor remains installed");
             if let Some((epoch, changed)) = clean.completed_full_scan.as_ref() {
                 (changed.clone(), Some(*epoch))
             } else if clean.full_scan.is_some() || clean.watcher.full_scan {

@@ -11385,8 +11385,7 @@ fn managed_page_shard_checkpoint_and_full_replay_agree() {
     restored
         .restore_clean_checkpoint(
             &loaded.state_bytes,
-            loaded.accepted_rows,
-            loaded.required_objects,
+            Arc::clone(&loaded.accepted_history),
             Arc::clone(&loaded.documents),
         )
         .unwrap();
