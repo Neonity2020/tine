@@ -1536,6 +1536,10 @@ fn clean_generation_refusal_stems_are_pinned_to_in_scope_scenarios() {
             "clean shared join generation destination already exists",
             "MS-REF-STALE-GENERATION",
         ),
+        (
+            "clean shutdown could not drain the checkpoint publisher",
+            "MS-REF-DISK-CORRUPT",
+        ),
     ] {
         assert!(
             runtime.contains(stem),

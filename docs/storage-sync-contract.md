@@ -2031,13 +2031,14 @@ table:
 | prepare-share while an absence publication barrier is active | A half-synced folder or dying mount delivers mass absence; publishing the first shared baseline would propagate history-bearing deletions before disposition | Refuse with `external deletions awaiting disposition`; retain all local durability and retry after sweep close/grace expiry or explicit disposition |
 | exact provider removal whose caller requires the source present, on a path that is already absent | Sync-service delivery, an honest concurrent instance, or this device's own earlier completed removal has already taken the path; the completed journal record for that removal has since been compacted against provider state (§2.10c-i) | Report `UnknownProviderPath` for the exact path. This is the same answer the `RequirePresent` policy gives for any absent source; the caller re-observes provider state (the clean provider path walk reads the path before it asks for the removal). A caller whose policy is `SettleIfAbsent` settles instead. |
 
-The two internal generation refusals below are pinned to the durable scenario
+The three internal generation refusals below are pinned to the durable scenario
 vocabulary above. They are not new public scenario IDs.
 
 | Refusal stem | Scenario ID | In-scope scenario and required response |
 | --- | --- | --- |
 | `clean authority orphan is not a private directory` | `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool substituted a symlink, special file, or regular file where cleanup owns only private directories. Refuse without following or removing the substituted entry. |
 | `clean shared join generation destination already exists` | `MS-REF-STALE-GENERATION` | An honest concurrent instance advanced the generation after this join validated its prior marker. Abort the stale join; reopen follows the marker-named complete pair and reclaims unreferenced generation state. |
+| `clean shutdown could not drain the checkpoint publisher` | `MS-REF-DISK-CORRUPT` | A disk/media error or torn write fails the in-flight cold publication that the checkpoint worker performs. The generation worker became an archive writer with the hot-retirement landing, so a settled actor must join it before `Safe`: `Safe` asserts that no writer is left inside the archive, and returning it over a failed publication would be a false claim callers act on. Refuse `Safe` and report the drain error. Recovery is preserved, not removed — marker-last ordering leaves every crash prefix readable, and both callers keep a path forward (`stop_without_clean_drain` for the forced return, the emergency return for the graceful one). |
 
 #### Checks with no in-scope scenario, and what happened to them
 

@@ -8181,6 +8181,26 @@ impl ShardedHotEngine {
             .and_then(|publisher| publisher.last_diagnostics())
     }
 
+    /// Wait for the clean-checkpoint worker to stop writing, and nothing else.
+    ///
+    /// Shutdown needs exactly this and must not get more. Its sibling
+    /// [`Self::wait_for_clean_checkpoint`] carries a `cfg(test)` block that
+    /// SCHEDULES a catch-up publication when the durable sequence trails the
+    /// accepted one -- correct for a fixture that wants a settled frontier,
+    /// wrong for a shutdown path, where it would make the test build do work
+    /// the release build does not and hide any difference between them.
+    ///
+    /// An absent publisher is not a failure: Direct mode and a pre-activation
+    /// managed runtime have no worker to drain, and refusing there would be a
+    /// refusal with no in-scope threat scenario to name.
+    pub(crate) fn drain_clean_checkpoint_publisher(&mut self) -> Result<(), EngineError> {
+        let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
+            return Ok(());
+        };
+        publisher.wait_for_idle().map_err(EngineError::Archive)?;
+        self.adopt_published_identity_generation()
+    }
+
     pub(crate) fn wait_for_clean_checkpoint(&mut self) -> Result<(), EngineError> {
         self.clean_checkpoint_publisher
             .as_ref()
@@ -12613,15 +12633,7 @@ impl ShardedHotEngine {
             _ => return Err(EngineError::MissingDependency(batch_id)),
         };
         let expected_fingerprint = self
-            .archive_fingerprints
-            .get(&batch_id)
-            .copied()
-            .or_else(|| {
-                self.sealed_accepted_history
-                    .as_ref()
-                    .and_then(|history| history.row_by_batch(batch_id).ok().flatten())
-                    .map(|row| row.evidence.manifest_fingerprint())
-            })
+            .accepted_manifest_fingerprint(batch_id)
             .ok_or(EngineError::MissingDependency(batch_id))?;
         if evidence.manifest_fingerprint != expected_fingerprint {
             return Err(EngineError::Archive(format!(
@@ -20290,12 +20302,9 @@ impl ShardedHotEngine {
             }
         };
         if !matches!(
-            self.statuses.get(&source.source_batch_id()),
+            self.archive_status(source.source_batch_id())?,
             Some(ArchiveStatus::Accepted { .. })
-        ) || self
-            .archive_fingerprints
-            .get(&source.source_batch_id())
-            .copied()
+        ) || self.accepted_manifest_fingerprint(source.source_batch_id())
             != Some(batch_fingerprint(&batch))
             || self.portable_path_root != source.portable_path_index_root()
         {
@@ -21912,6 +21921,33 @@ impl ShardedHotEngine {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// The manifest fingerprint this endpoint's accepted history binds to a
+    /// batch, wherever that history currently lives.
+    ///
+    /// There is one answer to this question and this is it. The resident
+    /// `archive_fingerprints` map holds only batches this run still keeps hot,
+    /// and a clean checkpoint restore clears it (as it clears `statuses`);
+    /// after that the sealed accepted history is the point authority for the
+    /// identical fact, storing the same digest as `manifest_fingerprint`. A
+    /// caller that reads the resident map directly silently stops recognizing
+    /// its own accepted history the moment a checkpoint covers the batch, so
+    /// read it through here -- [`Self::archive_status`] is the matching
+    /// fallback for the status half of the same binding.
+    fn accepted_manifest_fingerprint(&self, batch_id: BatchId) -> Option<ContentDigest> {
+        self.archive_fingerprints
+            .get(&batch_id)
+            .copied()
+            .or_else(|| {
+                self.sealed_accepted_history.as_ref().and_then(|history| {
+                    history
+                        .row_by_batch(batch_id)
+                        .ok()
+                        .flatten()
+                        .map(|row| row.evidence.manifest_fingerprint())
+                })
+            })
     }
 
     /// Whether this run has already authenticated the accepted effects of a
@@ -24396,12 +24432,14 @@ impl ShardedHotEngine {
                         selection.exact_state_batch()
                     ))
                 })?;
+            // Both halves of this binding must survive a checkpoint that
+            // covers the batch: `archive_status` above falls back to the sealed
+            // accepted history, and so must the fingerprint (see
+            // `accepted_manifest_fingerprint`).
+            let selected_fingerprint =
+                self.accepted_manifest_fingerprint(selection.exact_state_batch());
             if !matches!(selected_status, ArchiveStatus::Accepted { .. })
-                || self
-                    .archive_fingerprints
-                    .get(&selection.exact_state_batch())
-                    .copied()
-                    != Some(batch_fingerprint(&selected_batch))
+                || selected_fingerprint != Some(batch_fingerprint(&selected_batch))
             {
                 return Err(EngineError::Archive(
                     "selected exact-title batch is not bound to accepted history".into(),
@@ -25377,15 +25415,7 @@ impl ShardedHotEngine {
             .as_ref()
             .ok_or(EngineError::MissingDependency(batch_id))?;
         let expected_fingerprint = self
-            .archive_fingerprints
-            .get(&batch_id)
-            .copied()
-            .or_else(|| {
-                self.sealed_accepted_history
-                    .as_ref()
-                    .and_then(|history| history.row_by_batch(batch_id).ok().flatten())
-                    .map(|row| row.evidence.manifest_fingerprint())
-            })
+            .accepted_manifest_fingerprint(batch_id)
             .ok_or(EngineError::MissingDependency(batch_id))?;
         let manifest = store
             .reload_accepted_manifest(batch_id, expected_fingerprint)
@@ -36610,6 +36640,77 @@ pub(crate) mod validation_tests {
             "BlockDelta::birth is authorization-only and is never persisted; a \
              new read site must independently derive what it authorizes, or \
              carry a comparator check. Imitate the two sites listed here."
+        );
+    }
+
+    /// The resident fingerprint map has exactly one reader that answers
+    /// "what is this accepted batch bound to".
+    ///
+    /// `archive_fingerprints` holds only batches this run still keeps hot, and
+    /// `restore_clean_checkpoint` clears it alongside `statuses`; the sealed
+    /// accepted history then carries the identical digest. P4a converted the
+    /// status half ([`ShardedHotEngine::archive_status`] falls back) and left
+    /// the fingerprint half behind, so `authenticate_selected_title_transition`
+    /// failed every exact-title transition after restore with "selected
+    /// exact-title batch is not bound to accepted history".
+    /// `authorize_projection_tombstone` carried the identical stale read; it is
+    /// the pre-0.7 twin of `authorize_clean_projection_tombstone` and currently
+    /// has no caller, so it was fixed for consistency rather than because a
+    /// user path reached it. The live clean path asks the same question through
+    /// `accepted_batch_evidence`, which already had the fallback.
+    ///
+    /// The functions pinned below are the map's own lifecycle (clear, remove,
+    /// and the staging-collision compare-and-insert that reads it twice) plus
+    /// the one accessor. Every binding check goes through
+    /// `accepted_manifest_fingerprint`. A new direct reader is how this defect
+    /// returns, so it fails here first.
+    #[test]
+    fn accepted_fingerprints_have_one_fallback_aware_reader() {
+        let production = include_str!("hot_engine.rs")
+            .split("#[cfg(test)]\npub(crate) mod validation_tests")
+            .next()
+            .expect("the hot-engine production half remains identifiable");
+        let mut enclosing = "<file scope>";
+        let mut sites = Vec::new();
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+            {
+                enclosing = rest
+                    .split(['(', '<'])
+                    .next()
+                    .expect("a function declaration names a function");
+            }
+            // The struct field and its initializer are declarations, and doc
+            // comments discuss the map without reading it.
+            if !line.contains("archive_fingerprints")
+                || trimmed.starts_with("archive_fingerprints:")
+                || trimmed.starts_with("///")
+            {
+                continue;
+            }
+            sites.push(enclosing);
+        }
+        assert_eq!(
+            sites,
+            vec![
+                "restore_clean_checkpoint",
+                "commit_clean_prepared",
+                "prepare_acceptance_evidence",
+                "stage_ready_internal",
+                "stage_ready_internal",
+                "accepted_manifest_fingerprint",
+            ],
+            "a binding check must read the accepted manifest fingerprint through \
+             `accepted_manifest_fingerprint`, which falls back to the sealed \
+             accepted history: the resident map is empty for every batch a clean \
+             checkpoint has covered. `prepare_acceptance_evidence` is the one \
+             exception, and it is hot-only by construction -- it indexes \
+             `self.archive[&batch_id]` for the same batch on the next line. \
+             Imitate `authenticate_selected_title_transition`."
         );
     }
 

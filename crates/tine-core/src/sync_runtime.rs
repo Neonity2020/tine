@@ -26383,8 +26383,34 @@ impl RuntimeActor {
                     // (Direct mode, or before activation) simply has nothing to
                     // wait for -- never a refusal, which would have no in-scope
                     // threat scenario to name.
+                    //
+                    // A drain that FAILS does refuse Safe, and that refusal is
+                    // `MS-REF-DISK-CORRUPT` in the contract's refusal table
+                    // (`docs/storage-sync-contract.md`, stem `clean shutdown
+                    // could not drain the checkpoint publisher`): a disk error
+                    // or torn write fails the in-flight cold publication. Both
+                    // callers keep a path forward -- the confirmed return falls
+                    // back to `stop_without_clean_drain`, the graceful one
+                    // surfaces the emergency return.
+                    //
+                    // `drain_clean_checkpoint_publisher`, not
+                    // `wait_for_clean_checkpoint`: the latter schedules a
+                    // catch-up publication under `cfg(test)`, so shutdown would
+                    // behave differently in the build that tests it.
                     if let Some(clean) = self.clean.as_mut() {
-                        let _ = clean.runtime.engine_mut().wait_for_clean_checkpoint();
+                        clean
+                            .runtime
+                            .engine_mut()
+                            .drain_clean_checkpoint_publisher()
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(format!(
+                                    // One unbroken literal: the stem is pinned
+                                    // by `clean_generation_refusal_stems_are_\
+                                    // pinned_to_in_scope_scenarios`, which greps
+                                    // this source for it.
+                                    "clean shutdown could not drain the checkpoint publisher: {error}"
+                                ))
+                            })?;
                     }
                     self.stopped_safe = true;
                     return Ok(SyncShutdownOutcome::Safe(self.snapshot()));
