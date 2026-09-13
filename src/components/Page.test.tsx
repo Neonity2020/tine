@@ -30,7 +30,7 @@ import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, registerLiveSaveConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 
 beforeAll(async () => {
@@ -1427,7 +1427,7 @@ describe("page actions entry point", () => {
     }
   });
 
-  it.each(["save refusal", "other page conflict"])("names the actual blocker when title rename cannot flush: %s (GH #535)", async (blocker) => {
+  it.each(["save refusal", "other page conflict", "missing conflict review", "many conflicts"])("names the actual blocker when title rename cannot flush: %s (GH #535)", async (blocker) => {
     const dto: PageDto = {
       name: "Rename me", kind: "page", title: "Rename me", pre_block: null,
       path: "pages/Rename me.md",
@@ -1452,7 +1452,15 @@ describe("page actions entry point", () => {
     try {
       await flushMicrotasks(); await flushMicrotasks();
       if (blocker === "save refusal") addDirty(dto.name);
-      else markConflict("Other page");
+      else if (blocker === "missing conflict review") {
+        save.mockRejectedValue({ kind: "save-conflict", reasonCode: "conflict.pinned_owner", epoch: null });
+        addDirty(dto.name);
+      } else if (blocker === "many conflicts") {
+        for (const name of ["First", "Second", "Third", "Fourth"]) markConflict(name);
+      } else {
+        await registerLiveSaveConflict({ ...dto, name: "Other page", path: "pages/Other page.md" }, null, 1);
+        markConflict("Other page");
+      }
       root.querySelector<HTMLElement>(".page-title")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
       await tick();
       const input = root.querySelector<HTMLInputElement>(".page-title-input")!;
@@ -1467,11 +1475,22 @@ describe("page actions entry point", () => {
         expect(isDirty(dto.name)).toBe(true);
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
         expect(warning.mock.calls[0][0]).not.toContain("conflict");
+      } else if (blocker === "missing conflict review") {
+        expect(save).toHaveBeenCalled();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
+        expect(warning.mock.calls[0][0]).toContain("no conflict review");
+        expect(warning.mock.calls[0][0]).not.toContain("Open that page");
+      } else if (blocker === "many conflicts") {
+        expect(warning.mock.calls[0][0]).toContain("and 1 more");
+        expect(warning.mock.calls[0][0]).not.toContain("Fourth");
       } else {
         expect(save).not.toHaveBeenCalled();
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Other page” has an unresolved save conflict'));
       }
-    } finally { clearConflict("Other page"); dispose(); }
+    } finally {
+      for (const name of ["Other page", dto.name, "First", "Second", "Third", "Fourth"]) clearConflict(name);
+      dispose();
+    }
   });
 
   it("keeps a path-bearing title owner through sidebar, new-tab, and menu gestures", async () => {
