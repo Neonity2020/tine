@@ -241,9 +241,24 @@ jobs:
               }
             }
           } finally {
-            $manifest.repetitionsCompleted = $manifest.runs.Count
-            $manifest.completedAt = (Get-Date).ToUniversalTime().ToString("o")
-            $manifest | ConvertTo-Json -Depth 8 | Out-File -FilePath (Join-Path $burnInRoot "burn-in-manifest.json") -Encoding utf8
+            try {
+              $retainedRelativePath = "tested-binary\tine.exe"
+              $retainedPath = Join-Path $burnInRoot $retainedRelativePath
+              New-Item -ItemType Directory -Force -Path (Split-Path -Parent $retainedPath) | Out-Null
+              Copy-Item -LiteralPath $app -Destination $retainedPath -Force
+              $retainedHash = (Get-FileHash -Algorithm SHA256 $retainedPath).Hash.ToLowerInvariant()
+              $manifest["retainedExecutable"] = [ordered]@{
+                relativePath = $retainedRelativePath
+                sha256 = $retainedHash
+              }
+              if ($retainedHash -ne $expectedHash) {
+                throw "retained candidate executable hash mismatch: expected ${expectedHash}, got ${retainedHash}"
+              }
+            } finally {
+              $manifest.repetitionsCompleted = $manifest.runs.Count
+              $manifest.completedAt = (Get-Date).ToUniversalTime().ToString("o")
+              $manifest | ConvertTo-Json -Depth 8 | Out-File -FilePath (Join-Path $burnInRoot "burn-in-manifest.json") -Encoding utf8
+            }
           }
       - name: Upload Windows E2E evidence
         if: always()

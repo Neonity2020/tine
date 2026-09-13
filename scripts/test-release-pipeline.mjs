@@ -208,6 +208,11 @@ assert.match(
   "a quarantined Windows managed-storage failure must stop burn-in even when the ordinary runner exits zero"
 );
 assert.match(
+  uiE2eWorkflow,
+  /retainedRelativePath = "tested-binary\\tine\.exe"[\s\S]*?Copy-Item -LiteralPath \$app -Destination \$retainedPath -Force[\s\S]*?Get-FileHash -Algorithm SHA256 \$retainedPath[\s\S]*?retained candidate executable hash mismatch/,
+  "the exact post-burn-in Windows executable must be retained and verified in the evidence artifact"
+);
+assert.match(
   windowsManagedScenario,
   /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
   "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
