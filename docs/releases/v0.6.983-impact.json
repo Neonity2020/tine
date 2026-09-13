@@ -2625,6 +2625,38 @@
         "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
         "refs": []
       }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Externally replaced images refresh reliably in linked asset folders.** File notifications through an approved assets symlink now reach every graph window sharing that folder, including after files are deleted.",
+      "userVisible": true,
+      "regressions": [
+        "UI-EXTERNAL-ASSET-WATCH-LEXICAL-ALIAS"
+      ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "Correction restores existing interaction or safety behavior; no new user action is introduced.",
+        "refs": []
+      },
+      "docs": {
+        "status": "update",
+        "reason": "Approved lexical asset aliases normalize to the existing canonical capability for all live windows; no new approval or asset write path is introduced.",
+        "refs": [
+          "docs/storage-sync-contract.md"
+        ]
+      },
+      "website": {
+        "status": "update",
+        "reason": "Regenerate and verify the Guide site from canonical templates; no separate marketing claim proposed.",
+        "refs": [
+          "website/guide/"
+        ]
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
+        "refs": []
+      }
     }
   ]
 }

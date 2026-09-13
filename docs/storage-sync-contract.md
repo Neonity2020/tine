@@ -943,7 +943,11 @@ The native watcher may observe metadata changes below the approved assets
 capability solely to invalidate WebView render caches. That observation grants
 no managed actor admission, publishes no operation or provider object, and does
 not make Tine responsible for transferring or resolving asset bytes; the user's
-whole-directory synchronizer remains their transport.
+whole-directory synchronizer remains their transport. Notifications through a graph's
+`assets` symlink are mapped to its currently approved canonical asset root
+before per-window routing, including when several graph windows share that
+root. This mapping uses all live approved bindings and works after deletion;
+it neither follows an event path to a new target nor grants approval.
 
 Authority is transferred only by a validated, durably published record while
 the current owner retains the relevant lease/capability. A path name, a newer
