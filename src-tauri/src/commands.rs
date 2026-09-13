@@ -2942,7 +2942,7 @@ mod capture_quick_switch_tests {
             storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
-            capture_graph: Mutex::new(None),
+            capture_graph: Mutex::new(Default::default()),
             sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
