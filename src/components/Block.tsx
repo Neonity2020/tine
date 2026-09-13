@@ -1777,6 +1777,16 @@ export function Editor(props: { id: string }): JSX.Element {
     setHasSel(selected);
     if (!selected) setSelectionOverflowOpen(false);
   };
+  onMount(() => {
+    const owner = ref.ownerDocument;
+    const syncNativeSelection = () => {
+      if (owner.activeElement === ref) updateSel();
+    };
+    // Native selection may notify the document or textarea without select or
+    // mouseup. Capture both, but only update the editor that owns focus.
+    owner.addEventListener("selectionchange", syncNativeSelection, true);
+    onCleanup(() => owner.removeEventListener("selectionchange", syncNativeSelection, true));
+  });
   createEffect(() => {
     if (!selectionOverflowOpen() || !hasSel()) return;
     const unregister = registerTransientLayer({

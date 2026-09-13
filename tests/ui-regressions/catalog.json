@@ -9316,16 +9316,17 @@
         "android"
       ],
       "layer": "native",
-      "status": "reported",
+      "status": "reproduced",
       "coverage": {
         "tests": [
           "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
-          ".github/scripts/android-ui-runtime.sh"
+          ".github/scripts/android-ui-runtime.sh",
+          "src/components/Block.mobileSelectionToolbar.test.tsx"
         ],
         "scenario": "android-ui-runtime.initial-native-selection-toolbar",
-        "failBefore": "unavailable"
+        "failBefore": "proven"
       },
-      "notes": "The focused method is designed to tap a real demo-graph block, request the Android IME, and probe short and long rendered text with initial native long presses only\u2014no follow-up handle drag, IME dismissal, or orientation change. Hosted API-35 run 33251907222 compiled and executed the harness but timed out before a focused textarea existed, retaining a valid screenshot and structured harness-failure receipt but no journey receipt. #375 therefore remains unproven; this row records an acceptance-lane gap, not product or OEM ActionMode/IME evidence."
+      "notes": "Sep 13 native run34767461218 reaches a focused editor: single-line long press selects offsets16..21 (words), retains IME, but mounts no mobile formatting toolbar. Editor listened only for select/mouseup, missing native selectionchange. Focused fail-before/pass-after regression covers document and textarea selectionchange plus foreign-focus refusal; owner-document capture listener now synchronizes the focused editor and cleans up on unmount. Native pass-after remains pending. Wrapped-case harness also remeasures geometry after IME resize before the literal first-line-caret/second-line-hold sequence."
     },
     {
       "id": "UI-CODEBLOCK-BODY-ONLY-412",
