@@ -1773,6 +1773,10 @@ mod tests {
             .contains("On Windows and Linux **Ctrl+Y** also redoes"));
         assert!(tips.markdown.contains("remapping Redo replaces both"));
         assert!(tips.markdown.contains("custom maximum"));
+        assert!(tips.markdown.contains("**Unbind**"));
+        assert!(tips.markdown.contains("**Reset** restores its default"));
+        let capture = GUIDE_TEMPLATES.iter().find(|template| template.title == "Features/Quick capture").expect("capture page is registered");
+        assert!(capture.markdown.contains("**File capture** button"));
     }
 
     #[test]
