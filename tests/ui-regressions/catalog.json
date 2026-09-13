@@ -11161,6 +11161,166 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: with the projection rebuilding, a query block said 'No results' and offered 'why empty?', which opened an empty panel. Classification: blocking stateful UX (the readiness state was hidden behind a false answer). Mechanism: query_parse retried on readiness with no pending signal, so no reading existed, nothing ran, total() fell to 0, and the empty-answer affordance rendered with an undefined explanation request. Fix: the parse retry reports its readiness like the run does ('Rebuilding the query index…' in the status line and the empty panel), and 'No results' / 'why empty?' render only once an operation has actually come back empty."
+    },
+    {
+      "id": "UI-EDITOR-TAB-SELECTION-20260913",
+      "title": "Indent and outdent preserve caret and selection",
+      "family": "editor",
+      "sources": {
+        "issues": [
+          519
+        ],
+        "commits": [
+          "9c693efb"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.tabOwnership.test.tsx",
+          "src/components/Block.tabClickedSelection.test.tsx",
+          "src/components/Block.tabNoopSelection.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "21 of 38 focused cases fail before; all 38 pass after. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
+    },
+    {
+      "id": "UI-SHORTCUT-UNBIND-20260913",
+      "title": "Unbind removes shortcuts while preserving command access",
+      "family": "keyboard-shortcuts",
+      "sources": {
+        "issues": [
+          523
+        ],
+        "commits": [
+          "93e61598"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Settings.unbindRecording.test.tsx",
+          "src/components/Settings.p1a1.recording.test.tsx",
+          "src/keybindings.test.ts"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Recorder remains active in harvested candidate; repaired cancellation passes. File capture fallback remains a native-window acceptance gate. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
+    },
+    {
+      "id": "UI-EMOJI-DISPLAY-EDITOR-20260913",
+      "title": "Windows and Apple emoji display follows the editor font",
+      "family": "emoji",
+      "sources": {
+        "issues": [
+          458
+        ],
+        "commits": [
+          "4f3e1f90"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/emojiPlatform.test.tsx",
+          "src/render/emojiLogicalText.test.tsx",
+          "src/editableEmojiFont.test.ts"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "3 of 10 render cases fail before; 10 pass after. Capture entry installs the same font policy. Linux Chromium confirms SVG policy and emulated native branches; actual Windows and Apple glyphs and Linux WebKitGTK safety remain native gates. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
+    },
+    {
+      "id": "UI-JOURNAL-ROLLOVER-EDITOR-20260913",
+      "title": "Returning after midnight adds today without disrupting editing",
+      "family": "journals",
+      "sources": {
+        "issues": [
+          532
+        ],
+        "commits": [
+          "acd4d31e"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx",
+          "scripts/check-journal-rollover.mjs"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "6 of 65 component cases fail before; 65 pass after. Chromium clean, dirty and visibility-return preserve identical editor, selection, focus and draft. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
+    },
+    {
+      "id": "UI-REFERENCE-TASK-STATE-20260913",
+      "title": "Block references preserve task state and literal task words",
+      "family": "references",
+      "sources": {
+        "issues": [
+          518
+        ],
+        "commits": [
+          "7707012c"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/blockRefTaskState.test.tsx",
+          "src/render/blockRefTaskAcceptance.test.tsx",
+          "src/render/blockRefLive.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "66 of 76 rendered cases fail before; 76 pass after, plus exact 40 shared reference/live cases pass. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
+    },
+    {
+      "id": "UI-RESET-INTERFACE-ZOOM-20260913",
+      "title": "Command palette resets interface zoom without changing navigation",
+      "family": "zoom",
+      "sources": {
+        "issues": [
+          522
+        ],
+        "commits": [
+          "ab06c831"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QuickSwitcher.zoom.test.tsx",
+          "src/components/QuickSwitcher.zoomAcceptance.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "8 of 9 rendered cases fail before; 9 pass after; PDF/block routes and focused pane retained. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
     }
   ]
 }

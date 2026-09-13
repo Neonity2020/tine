@@ -2627,6 +2627,11 @@ export function Editor(props: { id: string }): JSX.Element {
       revealCaretColumn(start);
       return;
     }
+    if (want !== null && typeof want === "object" && "start" in want) {
+      ref.setSelectionRange(want.start, want.end, want.direction);
+      revealCaretColumn(want.direction === "backward" ? want.start : want.end);
+      return;
+    }
     let offset: number;
     if (want == null) {
       offset = editorValue().length;
@@ -3048,14 +3053,16 @@ export function Editor(props: { id: string }): JSX.Element {
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll) { nudgeListItem(ll, +2); return true; }
       if (!outlineScope?.navOnly && outlineScope?.roots.includes(props.id)) return true;
-      commit(ref.value); indentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
+      const selection = { start: ref.selectionStart, end: ref.selectionEnd, direction: ref.selectionDirection };
+      commit(ref.value); indentBlock(props.id, selection, structuralSurface()); return true;
     },
     "editor/outdent": (e) => {
       e.preventDefault();
       const ll = listLineAt(ref.value, ref.selectionStart, pageFmt());
       if (ll && ll.indent.length > 0) { nudgeListItem(ll, -2); return true; }
       if (outlineScope?.forceExpandedRoot === doc.byId[props.id]?.parent) return true;
-      commit(ref.value); outdentBlock(props.id, ref.selectionStart, structuralSurface()); return true;
+      const selection = { start: ref.selectionStart, end: ref.selectionEnd, direction: ref.selectionDirection };
+      commit(ref.value); outdentBlock(props.id, selection, structuralSurface()); return true;
     },
   };
   const mobileKeyEvent = { preventDefault() {} } as KeyboardEvent;

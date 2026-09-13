@@ -7,7 +7,7 @@
 // each with its own roots. A single-page route is just a feed of length one.
 
 import { createStore, produce, unwrap } from "solid-js/store";
-import { createSignal, createMemo, createRoot } from "solid-js";
+import { batch, createSignal, createMemo, createRoot } from "solid-js";
 import type { GraphChange } from "./backend";
 import type {
   ActivationIntent,
@@ -76,6 +76,7 @@ import {
   captureHistoryEditorContext,
   restoreHistoryEditorContext,
   type HistoryEditorContext,
+  type EditorSelection,
 } from "./editorController";
 import { notifyModeReset, notifyOutlineSelectionStarted, onGraphRebound } from "./modeHooks";
 import { sheetConfigFromRaw } from "./sheet/config";
@@ -1585,7 +1586,7 @@ export function loadSingle(dto: PageDto, opts: { endEdit?: boolean } = {}) {
 /** Load the journals feed as the main view. */
 export async function loadFeed(
   dtos: PageDto[],
-  opts: { endEdit?: boolean; expectedGraphBinding?: number } = {},
+  opts: { endEdit?: boolean; expectedGraphBinding?: number; preserveExisting?: boolean; isRequestLive?: () => boolean } = {},
 ): Promise<boolean> {
   // Publication FOLLOWS installation. When the DTO is declined the name used to
   // be published into the feed anyway, so the feed rendered a dirty path-pinned
@@ -1601,11 +1602,19 @@ export async function loadFeed(
   const binding = opts.expectedGraphBinding ?? graphBinding();
   const installed: string[] = [];
   for (const dto of dtos) {
-    if (!(await upsertUnlessDirty(dto, binding))) return false;
+    // Calendar rollover can add days without replacing or unmounting any live
+    // feed page. In particular, even a clean active editor owns its exact nodes.
+    if (opts.preserveExisting && doc.feed.includes(dto.name)) {
+      installed.push(dto.name);
+      continue;
+    }
+    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding, isRequestLive: opts.isRequestLive })) return false;
     installed.push(dto.name);
   }
-  if (binding !== graphBinding()) return false;
-  setDoc("feed", installed);
+  if (binding !== graphBinding() || opts.isRequestLive?.() === false) return false;
+  setDoc("feed", opts.preserveExisting
+    ? [...installed, ...doc.feed.filter((name) => !installed.includes(name))]
+    : installed);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
@@ -3710,7 +3719,7 @@ export function splitBlock(
  * embed mid-keystroke: `editing()` in Block.tsx prefers the NON-embed rendering
  * when no surface is named, so the editor remounts on the source copy of the
  * same block further down the page (GH #477). */
-export function indentBlock(id: string, caretOffset: number, editingSurface: string | null = null) {
+export function indentBlock(id: string, caretOffset: number | EditorSelection, editingSurface: string | null = null) {
   if (!blockWritable(id)) return;
   const i = indexInSiblings(id);
   if (i <= 0) return;
@@ -3718,28 +3727,32 @@ export function indentBlock(id: string, caretOffset: number, editingSurface: str
   const sibs = rootsOf(id);
   const newParent = sibs[i - 1];
   const pageName = doc.byId[id].page;
-  setDoc(
-    produce((s) => {
-      const arr = s.byId[id].parent === null
-        ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
-        : s.byId[s.byId[id].parent!].children;
-      arr.splice(arr.indexOf(id), 1);
-      s.byId[id].parent = newParent;
-      s.byId[newParent].children.push(id);
-      // Expand the new parent — and clear any persisted collapsed:: in its raw,
-      // else a reload would re-collapse it and hide the just-indented child.
-      const np = s.byId[newParent];
-      np.raw = rawWithCollapsed(np.raw, false, formatForBlock(newParent));
-      np.collapsed = false;
-    })
-  );
-  startEditing(id, caretOffset, null, editingSurface);
+  // Reparenting remounts the editor. Publish its selection and ownership in the
+  // same reactive flush as the tree change, before the replacement can focus.
+  batch(() => {
+    setDoc(
+      produce((s) => {
+        const arr = s.byId[id].parent === null
+          ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
+          : s.byId[s.byId[id].parent!].children;
+        arr.splice(arr.indexOf(id), 1);
+        s.byId[id].parent = newParent;
+        s.byId[newParent].children.push(id);
+        // Expand the new parent — and clear any persisted collapsed:: in its raw,
+        // else a reload would re-collapse it and hide the just-indented child.
+        const np = s.byId[newParent];
+        np.raw = rawWithCollapsed(np.raw, false, formatForBlock(newParent));
+        np.collapsed = false;
+      })
+    );
+    startEditing(id, caretOffset, null, editingSurface);
+  });
   markDirty(pageName);
 }
 
 /** Shift+Tab: move the block out to be the next sibling of its parent.
  *  `editingSurface` as in `indentBlock` (GH #477). */
-export function outdentBlock(id: string, caretOffset: number, editingSurface: string | null = null) {
+export function outdentBlock(id: string, caretOffset: number | EditorSelection, editingSurface: string | null = null) {
   const node = doc.byId[id];
   if (!node || !blockWritable(id) || node.parent === null) return;
   pushUndo("outdent", [node.page]);
@@ -3747,30 +3760,32 @@ export function outdentBlock(id: string, caretOffset: number, editingSurface: st
   const grandParent = doc.byId[parentId].parent;
   const pageName = node.page;
 
-  setDoc(
-    produce((s) => {
-      const parent = s.byId[parentId];
-      const idx = parent.children.indexOf(id);
-      // OG only reparents the following siblings for traditional outdenting;
-      // logical outdenting stops after moving this block (`src/main/frontend/modules/outliner/core.cljs:835-852`
-      // at `6e7afa8eb`). Keep this decision inside the shared store operation so
-      // keyboard, mobile, and any future caller all use the same mode.
-      if (logicalOutdenting()) {
-        parent.children.splice(idx, 1);
-      } else {
-        const following = parent.children.splice(idx);
-        following.shift(); // drop id
-        for (const f of following) s.byId[f].parent = id;
-        s.byId[id].children.push(...following);
-      }
-      s.byId[id].parent = grandParent;
-      const gArr = grandParent === null
-        ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
-        : s.byId[grandParent].children;
-      gArr.splice(gArr.indexOf(parentId) + 1, 0, id);
-    })
-  );
-  startEditing(id, caretOffset, null, editingSurface);
+  batch(() => {
+    setDoc(
+      produce((s) => {
+        const parent = s.byId[parentId];
+        const idx = parent.children.indexOf(id);
+        // OG only reparents the following siblings for traditional outdenting;
+        // logical outdenting stops after moving this block (`src/main/frontend/modules/outliner/core.cljs:835-852`
+        // at `6e7afa8eb`). Keep this decision inside the shared store operation so
+        // keyboard, mobile, and any future caller all use the same mode.
+        if (logicalOutdenting()) {
+          parent.children.splice(idx, 1);
+        } else {
+          const following = parent.children.splice(idx);
+          following.shift(); // drop id
+          for (const f of following) s.byId[f].parent = id;
+          s.byId[id].children.push(...following);
+        }
+        s.byId[id].parent = grandParent;
+        const gArr = grandParent === null
+          ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
+          : s.byId[grandParent].children;
+        gArr.splice(gArr.indexOf(parentId) + 1, 0, id);
+      })
+    );
+    startEditing(id, caretOffset, null, editingSurface);
+  });
   markDirty(pageName);
 }
 
