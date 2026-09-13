@@ -7397,6 +7397,35 @@
   "failBefore": "Hosted CI only: panics at oplog/sqlite.rs:12650 on publish_cold_history_for_batches().unwrap() with ColdHistoryRootMissing; stderr names the cause as 'sealed accepted index store: No such file or directory (os error 2)' and the same run logs 'clean checkpoint write failed; retrying at the next trigger: cold history index is unavailable'. Does not reproduce locally (42/42 green, serial and 12-way parallel)."
  },
  "notes": "QUARANTINED, NOT FIXED -- the test carries #[ignore] and must be un-ignored before the next release (Martin's call, 2026-09-13). Quarantined rather than patched because the failure is very likely a production initialization-ORDER defect in cold-history/sealed-index setup rather than a test defect: the checkpoint writer itself fails with the same missing-store cause in the same run, so a test-side workaround would hide a real storage bug. Suspected user-visible shape if confirmed: on a machine/timing where the sealed accepted index store is not yet present, a clean checkpoint write fails and retries indefinitely, so cold history never becomes available and hot objects are never retired -- an availability and unbounded-growth risk, not a corruption risk. Do not un-ignore without diagnosing why the store directory is absent at that point."
+},
+{
+ "id": "REG-WINDOWS-SMB-CAPABILITY-UNC-533",
+ "title": "Capability directory enumeration preserves absolute UNC paths on Windows SMB graphs",
+ "family": "direct-files-graph-open",
+ "sources": {
+  "issues": [
+   533
+  ],
+  "commits": [
+   "d5600500"
+  ],
+  "internal": "Windows loopback SMB fail-before and pass-after using exact cap-primitives4.0.2 dependency"
+ },
+ "platforms": [
+  "windows"
+ ],
+ "layer": "filesystem-capability-dependency",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "vendor/cap-primitives-4.0.2/src/windows/fs/get_path.rs::tests::removing_extended_prefix_keeps_unc_paths_absolute",
+   "scripts/probes/windows-smb-open/run.ps1",
+   ".github/workflows/ci.yml#windows-smb-probe"
+  ],
+  "scenario": "windows.smb-unc-and-mapped-retained-handle-enumeration",
+  "failBefore": "https://github.com/martinkoutecky/tine/actions/runs/34755503592 : local path passes; both UNC and mappedZ pass ambient writes/reads, cap no-follow directory open and FileIdInfo but entries() fails NotFound OS3."
+ },
+ "notes": "The owning cap-primitives helper reconstructed a retained Windows handle's extended UNC path by stripping only the first4 prefix code units, yielding relative UNC/server/share. The local patch converts that prefix to ordinary absolute UNC while preserving the existing local-drive conversion and caller no-follow/conflict/durability guards. Pass-after https://github.com/martinkoutecky/tine/actions/runs/34755743020 : same local/UNC/mapped paths enumerate and read, nested Unicode files read, all3 outside junction controls refuse with OS681, and the prefix unit cases pass. This is a proven Windows loopback capability-layer correction, not a claim that every NAS implementation or full Tauri workflow was exercised."
 }
 ]
 }
