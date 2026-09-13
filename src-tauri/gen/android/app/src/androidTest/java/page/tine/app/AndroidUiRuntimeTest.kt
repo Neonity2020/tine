@@ -1167,10 +1167,11 @@ class AndroidUiRuntimeTest {
     // changing window.innerWidth. Convert back to the physical viewport before
     // injecting; omission previously turned a zoomed overflow tap into Settings.
     val rootZoom = rect.optDouble("rootZoom", 1.0)
-    val x = (cssX * rootZoom * webView.width / viewportWidth)
-      .coerceIn(1.0, (webView.width - 1).toDouble())
-    val y = (cssY * rootZoom * webView.height / viewportHeight)
-      .coerceIn(1.0, (webView.height - 1).toDouble())
+    val x = cssX * rootZoom * webView.width / viewportWidth
+    val y = cssY * rootZoom * webView.height / viewportHeight
+    require(x >= 0 && x < webView.width && y >= 0 && y < webView.height) {
+      "native touch target is outside the viewport; reveal it through the UI before tapping: point=($x,$y), rect=$rect"
+    }
     return x.toFloat() to y.toFloat()
   }
 

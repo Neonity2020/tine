@@ -11522,6 +11522,29 @@
         "failBefore": "proven"
       },
       "notes": "Measured mirror growth104px displaced source editor104px. One active-editor anchor per existing autosize frame now absorbs only above-editor displacement; native height:auto protection remains. Browser covers mirror above/below, no mirror, large editor versus same no-mirror control, Undo, coalesced commits, wheel/focus/disconnect interruptions. Packaged Windows geometry remains a release gate."
+    },
+    {
+      "id": "UI-PDF-COMPACT-TOOLBAR-CLIPPED-INTERNAL",
+      "title": "More and Close remain reachable in the full compact PDF toolbar",
+      "family": "pdf-reader",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "2026-09-13 native run34770759988 compact320px PDF Notes setup failure"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-pdf-toolbar-reachability.mjs"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Native run34770759988 at320px exposed More and Close clipped after the fixed title/pager/Find/zoom cluster. Actual production PdfViewer plus Inter and a real one-page PDF reproduces unreachable More/Close at320 and Close at360;1100 remains reachable. Narrow container CSS gives the title its own row, retains existing control order and More menu, and anchors panels below the64px toolbar. Real browser acceptance checks every visible control hit target, touch More to Notes, and keyboard/touch Close at320/360/1100. Native motionPoint rejects offscreen targets instead of silently clamping them to the edge. Native corrected-layout acceptance remains pending."
     }
   ]
 }
