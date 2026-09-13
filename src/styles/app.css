@@ -11169,6 +11169,27 @@ html.drag-selection-suppressed * {
    (Notes) journeys were reporting. Guarded by
    scripts/check-pdf-overflow-reachability.mjs. */
 @container pdfviewer (max-width: 520px) {
+  /* Give the document title its own row so the fixed pager/zoom controls
+     cannot push More and Close outside a phone-sized pane. */
+  .pdf-toolbar {
+    height: 64px;
+    flex-basis: 64px;
+    flex-wrap: wrap;
+    align-content: center;
+    row-gap: 4px;
+  }
+  .pdf-title {
+    flex: 0 0 100%;
+  }
+  .pdf-toolbar-actions {
+    flex: 0 0 100%;
+    justify-content: space-between;
+    gap: 2px;
+  }
+  .pdf-settings-menu,
+  .pdf-outline-panel {
+    top: 68px;
+  }
   .pdf-toolbar .pdf-overflow-action {
     display: none;
   }
