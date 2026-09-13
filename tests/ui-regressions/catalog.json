@@ -2,6 +2,27 @@
   "schemaVersion": 1,
   "entries": [
 {
+  "id": "UI-CAPTURE-COLD-START-GRAPH-BINDING",
+  "title": "Quick Capture shown during main graph startup obtains its read-only graph binding before autocomplete",
+  "family": "quick-capture",
+  "sources": {
+    "issues": [],
+    "commits": []
+  },
+  "platforms": [
+    "linux"
+  ],
+  "layer": "native",
+  "status": "reproduced",
+  "coverage": {
+    "tests": [
+      "scripts/e2e-capture.mjs"
+    ],
+    "failBefore": "proven"
+  },
+  "notes": "Native a65aa7ef cold-process restart: ordered physical [, [, F, z input yields [[Fz]] at caret4, followed by unhandled rejection no graph bound for quick capture and no autocomplete rows. First-show and hidden-window reopen phases pass after separate intermediate harness corrections. show_capture clears the binding when refresh cannot find a graph; capture_graph_binding only reads that selection, and fallback focus can still expose editor. No repair or release proof yet. Evidence release-capture-pair-20260913/native-after.log and cold-restart-failure.log; scope is startup show before a usable graph selection, not permission to retarget stale reads."
+},
+{
   "id": "UI-QUERY-SINGLE-SLASH-COMMAND",
   "title": "One Query slash command routes to the query builder",
   "family": "query-builder",
