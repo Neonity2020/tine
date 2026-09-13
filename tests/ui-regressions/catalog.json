@@ -11398,6 +11398,29 @@
         "failBefore": "proven"
       },
       "notes": "Approved issue394 and discussion297 comments18056119/18082471. Browser necessity run fails on eb1f83d3; revised defaults pass light/dark/custom with actual Inter font loaded. No native WebKit or release claim. Covers state checkbox colors/hover, unstruck completed labels, struck content, title line height and overridable primary text defaults."
+    },
+    {
+      "id": "UI-CODE-SCROLLBAR-520",
+      "title": "Rendered code scrollbar owns its drag instead of entering block editing",
+      "family": "caret-navigation",
+      "sources": {
+        "issues": [
+          520
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-code-scrollbar.mjs"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Headful Chromium actual native horizontal scrollbar drag fails before and passes after shared edit-entry ownership repair at normal/1.25 zoom; code text still enters editing. Evidence/code-scrollbar-520-20260913. macOS overlay acceptance remains unverified; no release claim."
     }
   ]
 }
