@@ -203,6 +203,11 @@ assert.match(
   "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
 );
 assert.match(
+  uiE2eWorkflow,
+  /scenarioResultPath = Join-Path[\s\S]*?scenarioStatus = \(Get-Content -Raw \$scenarioResultPath \| ConvertFrom-Json\)\.status[\s\S]*?\$scenarioStatus -eq "passed"[\s\S]*?if \(\$scenarioStatus -ne "passed"\)/,
+  "a quarantined Windows managed-storage failure must stop burn-in even when the ordinary runner exits zero"
+);
+assert.match(
   windowsManagedScenario,
   /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
   "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"

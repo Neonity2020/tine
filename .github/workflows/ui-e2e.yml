@@ -210,22 +210,32 @@ jobs:
               $exitCode = $LASTEXITCODE
               $completedAt = (Get-Date).ToUniversalTime()
               $afterHash = (Get-FileHash -Algorithm SHA256 $app).Hash.ToLowerInvariant()
+              $scenarioResultPath = Join-Path $env:E2E_ARTIFACT_DIR "windows-managed-storage\result.json"
+              $scenarioStatus = "missing"
+              if (Test-Path $scenarioResultPath) {
+                $scenarioStatus = (Get-Content -Raw $scenarioResultPath | ConvertFrom-Json).status
+              }
               $manifest.runs.Add([ordered]@{
                 repetition = $run
                 artifactDirectory = $env:E2E_ARTIFACT_DIR
                 startedAt = $startedAt.ToString("o")
                 completedAt = $completedAt.ToString("o")
-                exitCode = $exitCode
+                processExitCode = $exitCode
+                scenarioResultPath = $scenarioResultPath
+                scenarioStatus = $scenarioStatus
                 executableSha256Before = $beforeHash
                 executableSha256After = $afterHash
-                result = if ($exitCode -eq 0 -and $afterHash -eq $expectedHash) { "pass" } else { "fail" }
+                result = if ($exitCode -eq 0 -and $scenarioStatus -eq "passed" -and $afterHash -eq $expectedHash) { "pass" } else { "fail" }
               })
 
               if ($afterHash -ne $expectedHash) {
                 throw "candidate executable changed during repetition ${run}: expected ${expectedHash}, got ${afterHash}"
               }
               if ($exitCode -ne 0) {
-                throw "managed-storage burn-in repetition ${run} failed with exit code ${exitCode}"
+                throw "managed-storage burn-in repetition ${run} process failed with exit code ${exitCode}"
+              }
+              if ($scenarioStatus -ne "passed") {
+                throw "managed-storage burn-in repetition ${run} scenario status was ${scenarioStatus}; see ${scenarioResultPath}"
               }
             }
           } finally {
