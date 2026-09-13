@@ -13,14 +13,15 @@
         "all"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "scripts/check-drag-selection.mjs"
+          "scripts/check-drag-selection.mjs",
+          "scripts/e2e-editor-interactions.mjs"
         ],
         "failBefore": "proven"
       },
-      "notes": "Martin report September 13. Real Block Chromium gesture compared with native textarea clicks at identical positions: wrapping text drifts 6 characters by row 4 and 16 by row 6 at repaired master eb1f83d3; explicit-newline controls pass. Per-character zero-width spans in the measurement mirror introduce word-break opportunities absent from the editor. Native platform acceptance remains pending."
+      "notes": "Native textarea oracle shows original wrapped row4 +6 and row6 +16 character drift; intact text Range mirror fixes24 Chromium cases across wrapping/Unicode/code/zoom. Real Linux Tauri effb342 native pointer row4/6 passes alongside code/embedded editing checks. Evidence/drag-selection-20260913. Final combined binary verification pending; no release claim."
     },
     {
       "id": "UI-QUERY-ASYNC-REORDER-FOCUS-20260908",

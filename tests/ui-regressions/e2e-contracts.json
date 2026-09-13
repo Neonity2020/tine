@@ -1426,6 +1426,11 @@
      "authority": "Markdown and Org wrapper bytes remain file-owned structure while the editor mutates only the projected code payload.",
      "userOutcome": "Editing the code payload preserves exactly one opening and closing wrapper in the Direct Files page.",
      "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Dragging from rendered multiline text into lower wrapped rows keeps the selection endpoint at the same native textarea caret position as the pointer.",
+     "blocking": true
     }
    ],
    "acceptableVariations": [
@@ -1434,7 +1439,7 @@
    "nonRequirements": [
     "Exact code-card pixels, syntax colors, caret animation, DOM nesting, or generated runtime block ids."
    ],
-   "stability": "stable"
+   "stability": "burn-in"
   },
   "scripts/e2e-conflict-keep-mine.mjs": {
    "contracts": [
