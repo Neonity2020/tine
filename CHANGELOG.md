@@ -194,6 +194,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Compact PDF toolbars keep More and Close reachable.** The document title
+  uses its own row in narrow panes, and settings and outline panels stay below
+  the controls (UI-PDF-COMPACT-TOOLBAR-CLIPPED-INTERNAL).
+
 - **Dragging down through multiline text keeps selection under the pointer.**
   Starting a drag in rendered text no longer accumulates a character offset on
   each wrapped line; code blocks and Unicode text follow the same native caret.
