@@ -1776,7 +1776,9 @@ mod tests {
         assert!(tips.markdown.contains("**Unbind**"));
         assert!(tips.markdown.contains("**Reset** restores its default"));
         assert!(tips.markdown.contains("**Reset interface zoom**"));
-        assert!(tips.markdown.contains("PDF/image zoom and block zoom unchanged"));
+        assert!(tips
+            .markdown
+            .contains("PDF/image zoom and block zoom unchanged"));
         let capture = GUIDE_TEMPLATES
             .iter()
             .find(|template| template.title == "Features/Quick capture")

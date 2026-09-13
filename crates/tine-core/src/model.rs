@@ -27407,20 +27407,18 @@ fn rename_rewrite_upper_bound(
                 .filter(|byte| matches!(*byte, b'#' | b'[' | b','))
                 .count(),
         )?,
-        usize_to_u64(
-            if content.contains("::") {
-                content
-                    .lines()
-                    .filter(|line| {
-                        line.as_bytes()
-                            .windows(6)
-                            .any(|window| window.eq_ignore_ascii_case(b"tags::"))
-                    })
-                    .count()
-            } else {
-                0
-            },
-        )?,
+        usize_to_u64(if content.contains("::") {
+            content
+                .lines()
+                .filter(|line| {
+                    line.as_bytes()
+                        .windows(6)
+                        .any(|window| window.eq_ignore_ascii_case(b"tags::"))
+                })
+                .count()
+        } else {
+            0
+        })?,
     )?;
     let replacement_growth = checked_mul_bytes(candidates, checked_add_bytes(max_name, 8)?)?;
     let code_delimiters = usize_to_u64(
