@@ -52,6 +52,11 @@ on:
           - android-ui-runtime-pdf-routes
           - android-ui-runtime-toolbar
           - performance
+      android_ui_app_run:
+        description: Optional prior Android UI run whose exact retained app APK is reused for test-only changes
+        required: false
+        default: ""
+        type: string
       windows_test_name:
         description: Full Rust harness name for one exact Windows tine-core test (windows scope only)
         required: false
@@ -553,6 +558,9 @@ jobs:
   # per-method screenshots, DOM/native receipts, JUnit accounting, and logcat.
   # A reported UI outcome remains red until its exact method passes here.
   android-ui-runtime:
+    permissions:
+      contents: read
+      actions: read
     name: Android UI runtime / MotionEvent proof receipts
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes' || inputs.scope == 'android-ui-runtime-toolbar')
     runs-on: ubuntu-22.04
@@ -594,9 +602,39 @@ jobs:
         run: |
           node -e "const f='./src-tauri/tauri.conf.json',c=require(f);c.identifier='page.tine.app';require('fs').writeFileSync(f,JSON.stringify(c,null,2)+'\n');"
 
-      - name: Build debug x86_64 app and instrumentation APKs
+      - name: Restore exact tested app for harness-only rerun
+        if: inputs.android_ui_app_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_RUN: ${{ inputs.android_ui_app_run }}
         run: |
-          npx tauri android build --debug --target x86_64 --apk --ci
+          [[ "$APP_RUN" =~ ^[0-9]+$ ]]
+          app_sha=$(gh run view "$APP_RUN" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)
+          git fetch origin "$app_sha"
+          changed=$(git diff --name-only "$app_sha" HEAD -- . \
+            ':!src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt' \
+            ':!.github/scripts/android-ui-runtime.sh' ':!.github/workflows/ci.yml')
+          if [[ -n "$changed" ]]; then
+            printf 'Cannot reuse app APK after production changes:\n%s\n' "$changed" >&2
+            exit 1
+          fi
+          mkdir -p test-results/android-ui-runtime/reused
+          gh run download "$APP_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name "android-ui-runtime-$app_sha" --dir test-results/android-ui-runtime/reused
+          (cd test-results/android-ui-runtime/reused && sha256sum --check tested-apks.sha256)
+          mkdir -p src-tauri/gen/android/app/build/outputs/apk/reused
+          cp test-results/android-ui-runtime/reused/tested-app.apk src-tauri/gen/android/app/build/outputs/apk/reused/tested-app.apk
+          printf 'app_run=%s\napp_sha=%s\ninstrumentation_sha=%s\n' "$APP_RUN" "$app_sha" "$GITHUB_SHA" \
+            > test-results/android-ui-runtime/app-provenance.txt
+          rm -rf test-results/android-ui-runtime/reused
+
+      - name: Build debug x86_64 app and instrumentation APKs
+        env:
+          REUSE_APP: ${{ inputs.android_ui_app_run }}
+        run: |
+          if [[ -z "$REUSE_APP" ]]; then
+            npx tauri android build --debug --target x86_64 --apk --ci
+          fi
           cd src-tauri/gen/android
           ./gradlew :app:assembleUniversalDebugAndroidTest \
             -PabiList=x86_64 -ParchList=x86_64 -PtargetList=x86_64 \
