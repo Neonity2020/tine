@@ -23,9 +23,6 @@ fi
 
 # Retain the exact installed bytes with the receipts, including failed journeys.
 # Debug emulator APKs are evidence artifacts, not signed release deliveries.
-mkdir -p "$artifact_root/gradle"
-cp "$android_root/tauri.settings.gradle" "$artifact_root/gradle/tauri.settings.gradle"
-cp "$android_root/app/tauri.build.gradle.kts" "$artifact_root/gradle/tauri.build.gradle.kts"
 cp "${app_apks[0]}" "$artifact_root/tested-app.apk"
 cp "${test_apks[0]}" "$artifact_root/tested-instrumentation.apk"
 (
