@@ -267,17 +267,21 @@ class AndroidUiRuntimeTest {
         val blockId = target.getString("blockId")
         val entryHit = evaluateJson(webView, """
           (() => {
-            const hit = document.elementFromPoint(${target.getDouble("left") + target.getDouble("width") - 6.0},
-              ${target.getDouble("top") + target.getDouble("lineHeight") * 0.5});
+            const content = document.querySelector('.ls-block[data-block-id="${blockId}"] > .block-main > .block-content-wrapper');
+            const rect = content.getBoundingClientRect();
+            const lineHeight = parseFloat(getComputedStyle(content).lineHeight) || 20;
+            const hit = document.elementFromPoint(rect.right - 6, rect.top + lineHeight / 2);
             return JSON.stringify({ blockId: hit?.closest('.ls-block')?.dataset.blockId || '',
               contentOwner: hit?.closest('.block-content-wrapper')?.closest('.ls-block')?.dataset.blockId || '',
-              tag: hit?.tagName || '', className: hit?.className || '', target: ${target} });
+              tag: hit?.tagName || '', className: hit?.className || '', target: ${target},
+              currentBounds: { left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+                lineHeight, viewportWidth: innerWidth, viewportHeight: innerHeight } });
           })()
         """.trimIndent())
         assertEquals("native editor entry must hit the selected block: $entryHit", blockId, entryHit.optString("blockId"))
         assertEquals("native editor entry must hit editable content: $entryHit", blockId, entryHit.optString("contentOwner"))
         Log.i(RECEIPT_TAG, "native selection entry: $entryHit")
-        tapContentEditorEntry(webView, target)
+        tapContentEditorEntry(webView, entryHit.getJSONObject("currentBounds"))
         awaitEditor(webView, blockId, kind != "single-line")
         showIme(scenario, webView)
         var textarea = awaitEditor(webView, blockId, kind != "single-line")
@@ -978,13 +982,52 @@ class AndroidUiRuntimeTest {
             lineHeight, blockId: block.dataset.blockId, textLength: content.innerText.trim().length });
         })()
       """.trimIndent())
-      if (result != null) return result
+      if (result != null) return awaitStableContentTarget(webView, result)
       if (attempt < MAX_FIXTURE_SCROLLS) swipeUp(webView)
     }
     throw AssertionError(
       "timed out waiting for a demo block with $minimumTextLength..$maximumTextLength visible characters " +
         "after $MAX_FIXTURE_SCROLLS native scroll gestures",
     )
+  }
+
+  private fun awaitStableContentTarget(webView: WebView, initial: JSONObject): JSONObject {
+    var previous: JSONObject? = null
+    var settled = initial
+    var stableSamples = 0
+    val keys = listOf("left", "top", "width", "height", "viewportWidth", "viewportHeight")
+    awaitCondition("same editable target settles after imported AST, fonts and viewport layout") {
+      val current = evaluateJsonOrNull(webView, """
+        (() => {
+          if (document.fonts.status !== 'loaded') return null;
+          if ([...document.querySelectorAll('.ast-deferred')].some(node => {
+            const rect = node.getBoundingClientRect(); return rect.bottom > 0 && rect.top < innerHeight;
+          })) return null;
+          const block = document.querySelector('.ls-block[data-block-id="${initial.getString("blockId")}"]');
+          const content = block?.querySelector(':scope > .block-main > .block-content-wrapper');
+          if (!content) return null;
+          const rect = content.getBoundingClientRect();
+          const lineHeight = parseFloat(getComputedStyle(content).lineHeight) || 20;
+          const hit = document.elementFromPoint(rect.right - 6, rect.top + lineHeight / 2);
+          if (hit?.closest('.block-content-wrapper') !== content) return null;
+          return JSON.stringify({ left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+            viewportWidth: innerWidth, viewportHeight: innerHeight, lineHeight,
+            blockId: block.dataset.blockId, textLength: content.innerText.trim().length });
+        })()
+      """.trimIndent())
+      if (current == null) { stableSamples = 0; false } else {
+        val native = nativeViewportState(webView)
+        val expectedHeight = current.getDouble("viewportHeight") * native.getDouble("webViewWidth") / current.getDouble("viewportWidth")
+        val coordinatesAgree = abs(expectedHeight - native.getDouble("webViewHeight")) <= 1
+        stableSamples = if (coordinatesAgree && previous != null && keys.all {
+          abs(current.getDouble(it) - previous!!.getDouble(it)) < 0.5
+        }) stableSamples + 1 else 0
+        previous = current
+        settled = current.put("nativeViewport", native)
+        stableSamples >= 2
+      }
+    }
+    return settled.put("initialBounds", initial)
   }
 
   private fun setRootZoom(webView: WebView, scale: Double) {
