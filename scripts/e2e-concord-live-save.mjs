@@ -479,14 +479,45 @@ async function runBackend(mode) {
   }
 }
 
+// Xvfb supplies a display, but native dialog activation also needs an EWMH
+// window manager. Keep that owner alive across both app SIGKILL/restart cases.
+function windowManagerReady() {
+  try {
+    return /window id # 0x[1-9a-f][0-9a-f]*/i.test(execFileSync(
+      "xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], { encoding: "utf8" },
+    ));
+  } catch { return false; }
+}
+
+let windowManager;
+let windowManagerLog;
 let failure;
 try {
+  if (!windowManagerReady()) {
+    windowManagerLog = fs.openSync(path.join(ARTIFACTS, "openbox.log"), "w");
+    windowManager = spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
+      stdio: ["ignore", windowManagerLog, windowManagerLog],
+    });
+    let startError;
+    windowManager.on("error", (error) => { startError = error; });
+    await waitFor(() => {
+      if (startError) throw startError;
+      return windowManager.exitCode === null && windowManagerReady();
+    }, 15_000, "window manager did not become ready");
+  }
+  fs.writeFileSync(path.join(ARTIFACTS, "window-manager.json"), JSON.stringify({
+    ownedPid: windowManager?.pid ?? null,
+    supportingWindow: execFileSync("xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], { encoding: "utf8" }).trim(),
+  }, null, 2));
   await runBackend("direct");
   await runBackend("managed");
   console.log("PASS: Harvest B3 Direct/Managed restart capsule matrix");
 } catch (error) {
   failure = error;
   console.error("FAIL:", error?.stack ?? error);
+} finally {
+  windowManager?.kill("SIGTERM");
+  if (windowManagerLog !== undefined) fs.closeSync(windowManagerLog);
 }
 
 process.exit(failure ? 1 : 0);
