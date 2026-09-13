@@ -1,7 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { For } from 'solid-js';
 import { render } from 'solid-js/web';
-import { startEditing } from '../editorController';
 import { installKeybindings } from '../keybindings';
 import { initParser } from '../render/parse';
 import { doc, loadSingle, pageByName, resetStore } from '../store';

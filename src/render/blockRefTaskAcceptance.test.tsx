@@ -27,7 +27,7 @@ function setupTaskTarget(id: string, raw: string, refText: string, format: "md" 
   const target = {
     id,
     raw,
-    marker: (() => { const parsed = parseBody(raw, format)[0]; return parsed && "marker" in parsed ? parsed.marker ?? null : null; })(),
+    marker: (() => { const parsed = parseBody(raw, format)[0]; return parsed && "marker" in parsed ? parsed.marker ?? undefined : undefined; })(),
     collapsed: false,
     children: [],
     properties: [["id", id]] as [string, string][],

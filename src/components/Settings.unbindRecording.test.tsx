@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { render } from 'solid-js/web';
 import { createEffect, onCleanup } from 'solid-js';
 import { installKeybindings, matchesCommand, paletteCommands } from '../keybindings';
-import { closeSettings, openSettings, setShortcutOverrides, shortcutOverrides, setShortcutOverride, resetShortcutOverride } from '../ui';
+import { closeSettings, openSettings, setShortcutOverrides, shortcutOverrides } from '../ui';
 import { clearTransientLayersForTest } from '../transientLayers';
 import { Settings } from './Settings';
 const tick=()=>new Promise(r=>setTimeout(r,0));

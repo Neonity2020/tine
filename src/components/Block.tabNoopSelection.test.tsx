@@ -20,7 +20,6 @@ describe('exploratory GH519 newer selection wins',()=>{
     for(const reverse of [false,true]){
       it(`${label} ${reverse?'outdent':'indent'}`,async()=>{
         const current={id:'current',raw:text,collapsed:false,children:[]};
-        const parent={id:'previous',raw:'Previous',collapsed:false,children:reverse?[current]:[]};
         loadSingle({name:'Probe',kind:'page',title:'Probe',pre_block:null,blocks:[current]});
         startEditing('current',0);keys=installKeybindings();
         const root=document.createElement('div');document.body.append(root);
