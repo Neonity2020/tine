@@ -497,7 +497,11 @@ function hasRecordedSemanticFailure(output, errors) {
   // successful checks alone do not rule out an infrastructure retry.
   const combined = `${output}\n${errors}`.replace(/\u001b\[[0-9;]*m/g, "");
   return /^\s*(?:FAIL:|[1-9]\d* FAILURES\b)/m.test(combined)
-    || /\bAssertionError(?: \[[^\]]+\])?:/.test(combined);
+    || /\bAssertionError(?: \[[^\]]+\])?:/.test(combined)
+    // A scenario's explicit expected/actual observation is an assertion even
+    // when it uses Error rather than AssertionError. Anchor to the emitted
+    // error line, not a source excerpt printed with an uncaught stack trace.
+    || /^\s*Error: [^\r\n]*; expected=.+ actual=.+$/m.test(combined);
 }
 
 function isRetryableDriverTransportFailure(output, errors, timedOut) {

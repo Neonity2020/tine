@@ -1444,6 +1444,21 @@ assert.ok(nativeHarnessFailureSource, "the release runner is missing its Quick C
 const isRetryableNativeHarnessFailure = new Function(
   `${semanticFailureSource[0]}\n${nativeHarnessFailureSource[0]}\nreturn isRetryableNativeHarnessFailure;`
 )();
+const captureRetryOutput = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/capture-stdout.txt"), "utf8");
+const captureRetryErrors = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/capture-stderr.txt"), "utf8");
+assert.equal(isRetryableNativeHarnessFailure("capture", captureRetryOutput, captureRetryErrors, false), false,
+  "an explicit Capture expected/actual mismatch must dominate native-window errors");
+const classificationSource = e2eRunner.match(/function failureClassification\(id, output, errors, timedOut\) \{[\s\S]*?\n\}/);
+assert.ok(classificationSource);
+const classifyFailure = new Function(`${semanticFailureSource[0]}\n${driverTransportFailureSource[0]}\n${nativeHarnessFailureSource[0]}\n${classificationSource[0]}\nreturn failureClassification;`)();
+assert.equal(classifyFailure("capture", captureRetryOutput, captureRetryErrors, false), "ambiguous",
+  "withholding retry must also stop classifying the semantic mismatch as infrastructure");
+assert.equal(isRetryableNativeHarnessFailure("capture", "",
+  "Error: native window query unavailable\nxdo_get_active_window reported an error\nXGetWindowProperty[_NET_ACTIVE_WINDOW] failed", false), true,
+  "generic native errors without semantic observations remain retryable");
+assert.equal(isRetryableNativeHarnessFailure("capture", "throw new Error(`expected=${expected} actual=${actual}`)",
+  "xdo_get_active_window reported an error\nXGetWindowProperty[_NET_ACTIVE_WINDOW] failed", false), true,
+  "a source-code excerpt is not an observed expectation mismatch");
 assert.equal(isRetryableNativeHarnessFailure("capture", "FAIL: saved capture was lost",
   "BadWindow (invalid Window parameter)\nxdo_get_active_window reported an error", false), false,
   "a native cleanup failure must not erase a recorded semantic failure");
