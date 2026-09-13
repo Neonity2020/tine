@@ -2,6 +2,100 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-MANAGED-INDEPENDENT-PATH-CONTENT-ADMISSION",
+ "title": "Independent rename and other-page content edits preserve author intents in either delivery order",
+ "family": "managed-storage",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/oplog/import_integration_tests.rs::transported_path_root_is_metadata_but_local_journal_checks_its_prefix",
+   "crates/tine-core/src/oplog/import_integration_tests.rs::concurrent_rename_and_other_page_edit_keep_author_intents_and_converge"
+  ],
+  "scenario": "reg-managed-independent-path-content-admission",
+  "failBefore": "Not established by this metadata registration."
+ },
+ "notes": "Actual author projection intents retain original encoded manifests; both delivery orders preserve renamed path and independent content. Transported path context does not gate receiver authority, while local journal prefix mismatch is rejected without prefix advancement. This is engine admission evidence, not a new multi-device native receipt. Registered 2026-09-13 by inspection of existing test bodies. No new test execution or fail-before/pass-after evidence; full candidate CI pending."
+},
+{
+ "id": "REG-QE-BLOCK-INDEXED-BACKLINK-NARROWING",
+ "title": "Indexed explicit-reference candidate blocks preserve walked results while reducing classifications",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/sql_gates_tests.rs::block_narrowing_answers_exactly_what_the_walk_answers",
+   "crates/tine-core/src/query/sql_gates_tests.rs::block_narrowing_answers_exactly_what_the_walk_answers_on_a_real_corpus"
+  ],
+  "scenario": "reg-qe-block-indexed-backlink-narrowing",
+  "failBefore": "Not established by this metadata registration."
+ },
+ "notes": "Fast-corpus assertions require identical walked/narrowed reference rows, nonempty narrowing and fewer classifications. Plain-reference candidates remain outside explicit block narrowing. The real-corpus test is ignored by default and requires TINE_QUERY_IDENTITY_GRAPH; no fresh corpus or wall-clock speedup receipt is claimed. Registered 2026-09-13 by inspection of existing test bodies. No new test execution or fail-before/pass-after evidence; full candidate CI pending."
+},
+{
+ "id": "REG-QE-PAGE-ANCHOR-PAGE-ROWS",
+ "title": "Page-anchored execution returns page rows rather than block descriptors",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/conformance.rs::the_page_anchor_returns_page_rows_and_reads_no_document",
+   "crates/tine-core/src/query/results_tests.rs::a_page_anchored_statement_has_no_block_descriptor"
+  ],
+  "scenario": "reg-qe-page-anchor-page-rows",
+  "failBefore": "Not established by this metadata registration."
+ },
+ "notes": "Conformance checks page-row variant and namespace membership; SQL result test rejects block-descriptor construction for page anchoring. These backend assertions do not certify every page predicate or native page-row rendering. Registered 2026-09-13 by inspection of existing test bodies. No new test execution or fail-before/pass-after evidence; full candidate CI pending."
+},
+{
+ "id": "REG-QE-TYPED-CASE-LIST-ATOM-COMPARISONS",
+ "title": "Property atoms compare by effective type and explicit case and list comparison modes",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/conformance.rs::property_atoms_compare_by_their_keys_effective_type",
+   "crates/tine-core/src/query/conformance.rs::the_case_matrix_mode_og_reproduces_ogs_measured_answers",
+   "crates/tine-core/src/query/conformance.rs::each_mode_changes_only_the_answers_its_decision_owns",
+   "crates/tine-core/src/query/conformance.rs::the_typed_case_separates_both_untyped_from_both"
+  ],
+  "scenario": "reg-qe-typed-case-list-atom-comparisons",
+  "failBefore": "Not established by this metadata registration."
+ },
+ "notes": "Assertions distinguish numeric/date comparison from text ordering, reject uncoercible values even for inequality while retaining presence, and isolate case folding, comma splitting and declared-number coercion against frozen OG expectations. Oracle comments are historical provenance, not a new live OG run; these fixtures do not imply exhaustive operator or graph parity. Registered 2026-09-13 by inspection of existing test bodies. No new test execution or fail-before/pass-after evidence; full candidate CI pending."
+},
+{
  "id": "REG-MANAGED-AUTOMATIC-HISTORY-RECONSTRUCTION",
  "title": "Automatic history reconstruction preserves original operations and resumes after missing prerequisites arrive",
  "family": "managed-storage",
