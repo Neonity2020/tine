@@ -31,7 +31,7 @@ export interface LongPressHandlers {
   onPointerUp(e: PointerEvent): void;
   onPointerCancel(e: PointerEvent): void;
   /** Consume the compatibility click emitted when a completed hold releases. */
-  consumeClick(): boolean;
+  consumeClick(event?: MouseEvent): boolean;
   dispose(): void;
 }
 
@@ -48,7 +48,8 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
   let armed: { id: number; x: number; y: number } | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let firedPointer: number | null = null;
-  let clearSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
+  let ownedClickPointer: number | null = null;
+  let clickDocument: Document | null = null;
   let suppressClick = false;
   const cancel = () => {
     armed = null;
@@ -59,10 +60,25 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
   };
   const clearSuppression = () => {
     suppressClick = false;
-    if (clearSuppressionTimer !== null) {
-      clearTimeout(clearSuppressionTimer);
-      clearSuppressionTimer = null;
-    }
+    ownedClickPointer = null;
+    clickDocument?.removeEventListener("click", consumeOwnedClick, true);
+    clickDocument?.removeEventListener("pointerdown", nextGesture, true);
+    clickDocument = null;
+  };
+  const nextGesture = (event: PointerEvent) => {
+    if (!event.isPrimary) return;
+    firedPointer = null;
+    clearSuppression();
+  };
+  const consumeOwnedClick = (event: MouseEvent) => {
+    if (event.detail === 0 || ownedClickPointer === null) return;
+    if (event instanceof PointerEvent && event.pointerId !== ownedClickPointer) return;
+    // A newly opened menu can retarget this hold's compatibility click to its
+    // overlay. Capture the gesture before that new target can activate/close.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    firedPointer = null;
+    clearSuppression();
   };
   return {
     onPointerDown(e: PointerEvent) {
@@ -76,6 +92,11 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
         firedPointer = armedNow.id;
         const el = target();
         if (!el) return;
+        clearSuppression();
+        ownedClickPointer = armedNow.id;
+        clickDocument = el.ownerDocument;
+        clickDocument.addEventListener("click", consumeOwnedClick, true);
+        clickDocument.addEventListener("pointerdown", nextGesture, true);
         const contextMenu = new MouseEvent("contextmenu", {
           bubbles: true,
           cancelable: true,
@@ -99,9 +120,8 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
       if (firedPointer === e.pointerId) {
         firedPointer = null;
         suppressClick = true;
-        // Compatibility `click` follows pointerup immediately. Keep the guard
-        // briefly, then release it if this WebView emits no click.
-        clearSuppressionTimer = setTimeout(clearSuppression, 250);
+        // Ownership ends at its compatibility click or the next gesture,
+        // including when this WebView emits no click. No timing window.
         e.preventDefault();
         e.stopPropagation();
       }
@@ -111,7 +131,8 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
       if (firedPointer === e.pointerId) firedPointer = null;
       cancel();
     },
-    consumeClick() {
+    consumeClick(event?: MouseEvent) {
+      if (event?.type === "click" && event.detail === 0) return false;
       // Some touch WebViews synthesize compatibility mouse events before
       // pointerup. Surfaces that activate on mousedown must be able to decline
       // them as soon as the hold has fired, not only after release.
