@@ -5781,7 +5781,7 @@ dependencies = [
 
 [[package]]
 name = "tine-ios-folder-picker-native"
-version = "0.6.982"
+version = "0.6.983"
 dependencies = [
  "tauri",
  "tauri-plugin",
