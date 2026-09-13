@@ -27408,14 +27408,18 @@ fn rename_rewrite_upper_bound(
                 .count(),
         )?,
         usize_to_u64(
-            content
-                .lines()
-                .filter(|line| {
-                    line.as_bytes()
-                        .windows(6)
-                        .any(|window| window.eq_ignore_ascii_case(b"tags::"))
-                })
-                .count(),
+            if content.contains("::") {
+                content
+                    .lines()
+                    .filter(|line| {
+                        line.as_bytes()
+                            .windows(6)
+                            .any(|window| window.eq_ignore_ascii_case(b"tags::"))
+                    })
+                    .count()
+            } else {
+                0
+            },
         )?,
     )?;
     let replacement_growth = checked_mul_bytes(candidates, checked_add_bytes(max_name, 8)?)?;

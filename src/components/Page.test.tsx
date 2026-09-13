@@ -2,7 +2,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { backend, QueryNotReadyError } from "../backend";
-import { graphBinding, setBaseRev } from "../persistence";
+import { addDirty, graphBinding, setBaseRev } from "../persistence";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import { notifyGraphRebound } from "../modeHooks";
 import { initParser } from "../render/parse";
@@ -31,7 +31,7 @@ import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, registerLiveSaveConflict, recentPages, rightSidebar, setDataRev, setGraphMeta, setRightSidebar, setToasts, toasts } from "../ui";
 import { resetSharedQueryResultsForTests } from "../queryResultCache";
 
 beforeAll(async () => {
@@ -1581,6 +1581,72 @@ describe("page actions entry point", () => {
       await flushMicrotasks();
       expect(rename).not.toHaveBeenCalled();
     } finally {
+      dispose();
+    }
+  });
+
+  it.each(["save refusal", "other page conflict", "missing conflict review", "many conflicts"])("names the actual blocker when title rename cannot flush: %s (GH #535)", async (blocker) => {
+    const dto: PageDto = {
+      name: "Rename me", kind: "page", title: "Rename me", pre_block: null,
+      path: "pages/Rename me.md",
+      blocks: [{ id: "rename-root", raw: "Unsaved body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "rename-root": node("rename-root", "Unsaved body", dto.name) },
+      pages: [{ ...page(dto.name, "page", ["rename-root"]), path: dto.path }],
+      feed: [], loaded: true,
+    });
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(dto);
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([]);
+    vi.spyOn(backend(), "getUnlinkedRefs").mockResolvedValue([]);
+    const save = vi.spyOn(backend(), "savePage").mockRejectedValue({
+      kind: "direct-save-failure", reasonCode: "identity.name_taken",
+      message: "Another file owns this page name",
+    });
+    const rename = vi.spyOn(backend(), "renamePage");
+    const warning = vi.spyOn(globalThis, "alert").mockImplementation(() => {});
+    mainPaneRouter.openFile(dto.path!, dto.name, "page", { inPlace: true });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks(); await flushMicrotasks();
+      if (blocker === "save refusal") addDirty(dto.name);
+      else if (blocker === "missing conflict review") {
+        save.mockRejectedValue({ kind: "save-conflict", reasonCode: "conflict.pinned_owner", epoch: null });
+        addDirty(dto.name);
+      } else if (blocker === "many conflicts") {
+        for (const name of ["First", "Second", "Third", "Fourth"]) markConflict(name);
+      } else {
+        await registerLiveSaveConflict({ ...dto, name: "Other page", path: "pages/Other page.md" }, null, 1);
+        markConflict("Other page");
+      }
+      root.querySelector<HTMLElement>(".page-title")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      await tick();
+      const input = root.querySelector<HTMLInputElement>(".page-title-input")!;
+      input.value = "Renamed";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      for (let i = 0; i < 10; i++) await flushMicrotasks();
+      expect(rename).not.toHaveBeenCalled();
+      expect(doc.byId["rename-root"].raw).toBe("Unsaved body");
+      if (blocker === "save refusal") {
+        expect(save).toHaveBeenCalled();
+        expect(isDirty(dto.name)).toBe(true);
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
+        expect(warning.mock.calls[0][0]).not.toContain("conflict");
+      } else if (blocker === "missing conflict review") {
+        expect(save).toHaveBeenCalled();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
+        expect(warning.mock.calls[0][0]).toContain("no conflict review");
+        expect(warning.mock.calls[0][0]).not.toContain("Open that page");
+      } else if (blocker === "many conflicts") {
+        expect(warning.mock.calls[0][0]).toContain("and 1 more");
+        expect(warning.mock.calls[0][0]).not.toContain("Fourth");
+      } else {
+        expect(save).not.toHaveBeenCalled();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Other page” has an unresolved save conflict'));
+      }
+    } finally {
+      for (const name of ["Other page", dto.name, "First", "Second", "Third", "Fourth"]) clearConflict(name);
       dispose();
     }
   });

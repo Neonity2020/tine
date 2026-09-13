@@ -1,6 +1,31 @@
 {
  "schemaVersion": 1,
  "entries": [
+  {
+   "id": "REG-DIRECT-RENAME-LITERAL-SCANNER-406",
+   "title": "Direct rename copies literal runs and omits scans whose required syntax is absent",
+   "family": "page-rename",
+   "sources": {
+    "issues": [
+     406
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/refs.rs",
+     "crates/tine-core/tests/graph.rs"
+    ],
+    "scenario": "direct-files.rename-literal-run-scanner-preserves-references",
+    "failBefore": "proven"
+   },
+   "notes": "Partial GH #406 performance improvement. Controlled optimized Linux Graph::rename_page_reporting measurement with 10005 generated files, 164430159 bytes, and 5 edited files: baseline median 2087.725 ms, identical-binary control 2078.299 ms, candidate median 1366.6345 ms (34.54% reduction). Scanner differential probe compared 40000 generated Markdown/Org inputs against frozen prior scanner with zero mismatches. Every current file remains read; namespace/ref rewrite, no-follow paths, collisions, base revisions, publication and rollback are unchanged. Hosted title workflow and Windows reporter latency remain unverified; do not interpret this row as closing the full issue."
+  },
 {
  "id": "REG-QE-EXPORT-EXPLICIT-TQL-DIALECT",
  "title": "Copy and export preserve the declared TQL dialect and subtree membership",

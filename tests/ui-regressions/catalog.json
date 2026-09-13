@@ -11447,6 +11447,30 @@
         "failBefore": "proven"
       },
       "notes": "Real touch Chromium reproduces pointerup dispatch, focused-editor bridge handoff, toolbar replacement, and duplicate synthesized click on eb1f83d3. Scrolled strip loses its position; packet preserves toolbar ownership and consumes only the matching pointer click. Pass-after: six actual touch structural cases, rapid independent taps and horizontal swipe pass; same DOM and scroll retained. Native Android/iOS acceptance pending."
+    },
+    {
+      "id": "UI-PAGE-RENAME-FLUSH-DIAGNOSTIC-535",
+      "title": "A refused page rename names pending or conflicted pages without inventing a conflict",
+      "family": "page-rename",
+      "sources": {
+        "issues": [
+          535
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx"
+        ],
+        "scenario": "page-rename.actual-flush-blocker-preserves-drafts",
+        "failBefore": "proven"
+      },
+      "notes": "Partial GH #535: actual title DOM submission through real persistence with a typed non-conflict save failure and an unrelated conflict. Rename remains refused and pending body edits remain intact; message names the actual pending/conflicted page, caps listed names at three, and never directs the user to absent conflict review UI. Windows native save refusal and reporter-specific root cause remain unverified. Context-menu caller uses the identical read-only diagnostic; ContextMenu render suite passes."
     }
   ]
 }
