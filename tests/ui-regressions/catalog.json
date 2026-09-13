@@ -1,6 +1,31 @@
 {
   "schemaVersion": 1,
   "entries": [
+{
+  "id": "UI-EXTERNAL-ASSET-WATCH-LEXICAL-ALIAS",
+  "title": "Approved external assets refresh for symlink-spelled native events",
+  "family": "media",
+  "sources": {
+    "issues": [
+      127
+    ],
+    "commits": []
+  },
+  "platforms": [
+    "linux"
+  ],
+  "layer": "native",
+  "status": "reported",
+  "coverage": {
+    "tests": [
+      "scripts/e2e-external-assets.mjs",
+      "src-tauri/src/watcher.rs::external_asset_alias_events_refresh_replacement_and_deletion"
+    ],
+    "scenario": "external-assets-lexical-watch-alias",
+    "failBefore": "proven"
+  },
+  "notes": "Exact db6f8bc2 full suite and isolated native rerun retain stale loaded blob after atomic replacement; no asset-changed event delivered. Kernel inotify proof gives identical descriptor1 for canonical external directory and graph/assets symlink. Pinned notify recursive follow_links(true) and paths.insert overwrite lexical descriptor owner; HashSet watch order can select graph/assets while canonical AssetWatchState rejects the path. Evidence tine-agents/evidence/external-assets-diagnostic-20260913/. Root owns normalization repair and final native proof; replacement/deletion and shared approved targets must remain covered."
+},
     {
       "id": "UI-CONCORD-DURABLE-REVIEW-CURRENT-AUTHORITY",
       "title": "Restarted Concord review binds Apply to the current displayed disk revision",
