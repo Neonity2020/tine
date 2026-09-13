@@ -49,7 +49,7 @@ adb shell settings put secure show_ime_with_hard_keyboard 1
 
 run_journey() {
   local method="$1"
-  local name runner_output runner_log receipt_file failure_file screenshot_file receipts started finished failed status png_signature
+  local name runner_output runner_log receipt_file failure_file screenshot_file receipts started finished failed status png_signature selection_kind selection_stage stage_name
   name="${method//./_}"
   name="${name//\#/_}"
   runner_output="$artifact_root/$name.junit.txt"
@@ -85,6 +85,14 @@ run_journey() {
   # The test captures while the menu/selection/topbar is alive and writes
   # beside its JSON receipt; pull those exact in-journey bytes.
   adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$method.png" > "$screenshot_file" || true
+  if [[ "$method" == "initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement" ]]; then
+    for selection_kind in first-line-caret-second-line-hold single-line; do
+      for selection_stage in before-hold after-hold; do
+        stage_name="selection-$selection_kind-$selection_stage.png"
+        adb exec-out run-as page.tine.app cat "files/android-ui-runtime/$stage_name" > "$artifact_root/$stage_name" || true
+      done
+    done
+  fi
   # The log line is convenient in an Actions failure view, while this exact file
   # is the durable DOM/native receipt (large responsive matrices can exceed a
   # single logcat line). Debug instrumentation permits run-as without exposing

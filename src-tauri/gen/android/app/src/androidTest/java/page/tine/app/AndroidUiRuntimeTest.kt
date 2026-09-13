@@ -1101,7 +1101,13 @@ class AndroidUiRuntimeTest {
 
   private fun editorLinePoint(webView: WebView, editor: JSONObject, line: Int): Pair<Float, Float> {
     val lineHeight = editor.getDouble("lineHeight")
-    val cssX = editor.getDouble("left") + minOf(56.0, editor.getDouble("width") * 0.32)
+    // Android can place its insertion handle below the first-line caret. The
+    // same-column native probe was intercepted before WebView received any
+    // touch event. Keep the initial second-line hold over text in a separate
+    // column; this is not a handle drag or a retry after selection failure.
+    val column = if (line == 0) minOf(56.0, editor.getDouble("width") * 0.32)
+      else editor.getDouble("width") * 0.60
+    val cssX = editor.getDouble("left") + column
     val cssY = editor.getDouble("top") + lineHeight * (line + 0.5)
     require(cssY < editor.getDouble("top") + editor.getDouble("height")) {
       "requested visual line $line lies outside the active editor: $editor"
