@@ -314,6 +314,24 @@ class AndroidUiRuntimeTest {
   @Test
   fun toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll() {
     withFreshDemoGraph("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll") { scenario, webView ->
+      // First-run Guide/CPU notices are sticky and overlap bottom editor chrome.
+      // Dismiss them through their real controls before beginning the gesture.
+      for (attempt in 0 until 8) {
+        val close = elementRectOrNull(webView, ".toast-close") ?: break
+        tap(webView, close)
+      }
+      evaluateJson(webView, """
+        (() => {
+          window.__tineToolbarEvents = [];
+          for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'click']) {
+            document.addEventListener(type, event => window.__tineToolbarEvents.push({
+              type, target: event.target.closest?.('button')?.getAttribute('aria-label') || event.target.className,
+              x: event.clientX, y: event.clientY, pointerId: event.pointerId,
+            }), true);
+          }
+          return JSON.stringify({installed: true});
+        })()
+      """.trimIndent())
       // Ordinary app-private Markdown enters through the production watcher.
       val root = findGeneratedDirectFilesGraph(ApplicationProvider.getApplicationContext<Context>())
       val welcome = File(root, "pages").listFiles()?.singleOrNull {
@@ -333,7 +351,7 @@ class AndroidUiRuntimeTest {
           const rows = [...document.querySelectorAll('.ls-block')].filter(row => /^Toolbar [A-EX]$/.test(text(row)));
           const current = rows.find(row => text(row) === 'Toolbar C');
           const toolbar = document.querySelector('[aria-label="Editor toolbar"]');
-          return JSON.stringify({activeEditor: document.activeElement === current?.querySelector('textarea.block-editor'),
+          return JSON.stringify({events: window.__tineToolbarEvents, activeEditor: document.activeElement === current?.querySelector('textarea.block-editor'),
             parent: text(current?.parentElement?.closest('.ls-block')),
             order: rows.filter(row => !row.parentElement?.closest('.ls-block')).map(text).join(','),
             scroll: toolbar?.querySelector('.mobile-keyboard-toolbar-strip')?.scrollLeft ?? toolbar?.scrollLeft ?? 0});
@@ -352,9 +370,18 @@ class AndroidUiRuntimeTest {
           webView.rootView.getLocationOnScreen(rootLocation)
           val imeBottom = webView.rootWindowInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
           val imeTop = rootLocation[1] + webView.rootView.height - imeBottom
+          val hit = evaluateJson(webView, """
+            (() => {
+              const button = document.querySelector(${JSONObject.quote(selector)});
+              const rect = button.getBoundingClientRect();
+              const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+              return JSON.stringify({matches: target === button || button.contains(target),
+                target: target?.closest('button')?.getAttribute('aria-label') || target?.className || ''});
+            })()
+          """.trimIndent())
           geometry = JSONObject().put("button", bounds).put("motionY", location[1] + point.second)
-            .put("imeTop", imeTop).put("imeBottom", imeBottom).put("webViewHeight", webView.height)
-          imeBottom > 0 && location[1] + point.second < imeTop
+            .put("imeTop", imeTop).put("imeBottom", imeBottom).put("webViewHeight", webView.height).put("hit", hit)
+          imeBottom > 0 && location[1] + point.second < imeTop && hit.optBoolean("matches")
         }
         stages.put(JSONObject().put("action", "$label touch geometry").put("geometry", geometry))
         emitReceipt("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
