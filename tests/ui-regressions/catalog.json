@@ -9291,7 +9291,7 @@
         "android"
       ],
       "layer": "native",
-      "status": "reproduced",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
@@ -9300,7 +9300,7 @@
         "scenario": "android-ui-runtime.page-reference-exclusive-long-press",
         "failBefore": "proven"
       },
-      "notes": "The manual native method installs a DOM mutation trace, sends one Android ACTION_DOWN/long-press/ACTION_UP sequence to a rendered demo-graph page reference, and fails unless exactly one Page actions menu remains while preview count, selection text, and route stay unchanged. Hosted run 33251907222 reached a real demo page reference and retained the full product-failure receipt: zero Page actions menus, one preview, and selected text `Roadmap`, with the route unchanged. The emulator result must not be substituted for the reporter's OEM outcome."
+      "notes": "The manual native method installs a DOM mutation trace, sends one Android ACTION_DOWN/long-press/ACTION_UP sequence to a rendered demo-graph page reference, and fails unless exactly one Page actions menu remains while preview count, selection text, and route stay unchanged. Hosted run 33251907222 reached a real demo page reference and retained the full product-failure receipt: zero Page actions menus, one preview, and selected text `Roadmap`, with the route unchanged. The emulator result must not be substituted for the reporter's OEM outcome. Sep13 run34770759988 at9d4be8ad passes the physical Android hold: menu adds1/removes0, previews0, selection and route unchanged. Real mouse-only hover and fired-hold ownership suppress matching duplicate native contextmenu and retargeted compatibility click while preserving keyboard/AT activation. Earlier fail-before and OEM observation boundary remain as stated."
     },
     {
       "id": "UI-ANDROID-UI-RUNTIME-INITIAL-SELECTION-375",
@@ -9316,7 +9316,7 @@
         "android"
       ],
       "layer": "native",
-      "status": "reproduced",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt::initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
@@ -9326,7 +9326,7 @@
         "scenario": "android-ui-runtime.initial-native-selection-toolbar",
         "failBefore": "proven"
       },
-      "notes": "Sep 13 native run34767461218 reaches a focused editor: single-line long press selects offsets16..21 (words), retains IME, but mounts no mobile formatting toolbar. Editor listened only for select/mouseup, missing native selectionchange. Focused fail-before/pass-after regression covers document and textarea selectionchange plus foreign-focus refusal; owner-document capture listener now synchronizes the focused editor and cleans up on unmount. Native pass-after remains pending. Wrapped-case harness also remeasures geometry after IME resize before the literal first-line-caret/second-line-hold sequence."
+      "notes": "Sep13 native run34767461218 selected single-line offsets16..21 with IME retained but no Tine toolbar. A focused editor selectionchange listener now synchronizes toolbar state; document/textarea capture and foreign-focus refusal have causal component proof. Native run34770759988 at9d4be8ad passes both initial selections without handle movement: wrapped first-line caret7..7 to second-line word49..54 and single-line16..21, toolbar visible and IME retained. Wrapped same-column hold was intercepted before WebView DOM; fixture now holds a second-line glyph in a separate column, retaining one physical DOWN/hold/UP. Before/after native screenshots and trusted selectionchange trace retained. This is API35 emulator evidence, not every OEM WebView."
     },
     {
       "id": "UI-CODEBLOCK-BODY-ONLY-412",
