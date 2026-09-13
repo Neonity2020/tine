@@ -433,6 +433,26 @@ class AndroidUiRuntimeTest {
       reopened.put("lineHeight", 24)
       tapContentEditorEntry(webView, reopened)
       showIme(scenario, webView)
+      // The stable strip retains its scroll across keyboard hide/reopen. Reveal
+      // Outdent with a real swipe before attempting its guarded native tap.
+      val reopenedStrip = awaitElementRect(webView, ".mobile-keyboard-toolbar-strip")
+      val reverseStart = motionPoint(webView, reopenedStrip)
+      val reverseEnd = motionPoint(webView, reopenedStrip,
+        reopenedStrip.getDouble("left") + reopenedStrip.getDouble("width") / 2 + 64,
+        reopenedStrip.getDouble("top") + reopenedStrip.getDouble("height") / 2)
+      val reverseDown = SystemClock.uptimeMillis()
+      dispatchMotion(webView, reverseDown, MotionEvent.ACTION_DOWN, reverseStart.first, reverseStart.second)
+      repeat(12) { index ->
+        SystemClock.sleep(25)
+        dispatchMotion(webView, reverseDown, MotionEvent.ACTION_MOVE,
+          reverseStart.first + (reverseEnd.first - reverseStart.first) * (index + 1) / 12, reverseStart.second)
+      }
+      SystemClock.sleep(300)
+      dispatchMotion(webView, reverseDown, MotionEvent.ACTION_UP, reverseEnd.first, reverseEnd.second)
+      awaitCondition("reverse swipe reveals the leading toolbar controls") { state().getDouble("scroll") <= 1 }
+      val revealed = state()
+      stages.put(revealed.put("action", "native reverse swipe after reopen"))
+      assertEquals("reverse swipe must not move the block", "Toolbar B", revealed.getString("parent"))
       action("Outdent", "", "Toolbar A,Toolbar B,Toolbar C,Toolbar D,Toolbar E")
       emitReceipt("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
         JSONObject().put("journey", "495-496-native-toolbar").put("stages", stages))
