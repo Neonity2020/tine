@@ -18,10 +18,11 @@ try{
   const box=await page.getByRole("button",{name:label,exact:true}).boundingBox();
   await page.touchscreen.tap(box.x+box.width/2,box.y+box.height/2);
   await page.waitForTimeout(40);
-  const result=await page.evaluate(()=>({commands:[...window.toolbarProbe.commands],trace:[...window.toolbarProbe.trace],sameToolbar:window.beforeToolbar===document.querySelector("[data-mobile-keyboard-toolbar]"),scroll:document.querySelector(".mobile-keyboard-toolbar-strip")?.scrollLeft,parent:window.toolbarProbe.doc.byId.current?.parent,roots:window.toolbarProbe.doc.pages.find(p=>p.name==="Toolbar probe")?.roots}));
+  const result=await page.evaluate(()=>({commands:[...window.toolbarProbe.commands],trace:[...window.toolbarProbe.trace],activeEditor:document.activeElement?.matches("textarea.block-editor")&&document.activeElement.closest(".ls-block")?.dataset.blockId==="current",sameToolbar:window.beforeToolbar===document.querySelector("[data-mobile-keyboard-toolbar]"),scroll:document.querySelector(".mobile-keyboard-toolbar-strip")?.scrollLeft,parent:window.toolbarProbe.doc.byId.current?.parent,roots:window.toolbarProbe.doc.pages.find(p=>p.name==="Toolbar probe")?.roots}));
   const expectedParent=kind==="indent"?"parent":kind==="outdent"?"grand":null;
   const expectedRoots=label==="Move block up"?["a","current","b","d","e"]:label==="Move block down"?["a","b","d","current","e"]:null;
   if(result.parent!==expectedParent || (expectedRoots && JSON.stringify(result.roots)!==JSON.stringify(expectedRoots)))failures.push(`${kind}/${label}/${scroll}: wrong structural result`);
+  if(!result.activeEditor)failures.push(`${kind}/${label}/${scroll}: focused editor was lost`);
   if(result.commands.length!==1)failures.push(`${kind}/${label}/${scroll}: ${result.commands.join(",")}`);
   if(!result.sameToolbar||result.scroll!==scroll)failures.push(`${kind}/${label}/${scroll}: toolbar replaced or scroll reset`);
   results.push({kind,label,requestedScroll:scroll,...result});
@@ -35,6 +36,18 @@ try{
  const rapid=await page.evaluate(()=>({commands:[...window.toolbarProbe.commands],parent:window.toolbarProbe.doc.byId.current?.parent}));
  if(rapid.commands.length!==2||rapid.parent!=="previous")failures.push("rapid independent taps were dropped or duplicated");
  results.push({kind:"rapid",...rapid});
+ // Real keyboard selection must survive the same native blur/remount as touch.
+ for(const kind of ["indent","outdent"]) for(const direction of ["forward","backward"]){
+  await page.evaluate(kind=>window.toolbarProbe.setup(kind),kind);
+  await page.keyboard.press(direction==="forward"?"Home":"End");
+  for(let i=0;i<3;i++)await page.keyboard.press(direction==="forward"?"Shift+ArrowRight":"Shift+ArrowLeft");
+  const before=await page.locator("textarea.block-editor").evaluate(e=>({start:e.selectionStart,end:e.selectionEnd,direction:e.selectionDirection}));
+  await page.keyboard.press(kind==="indent"?"Tab":"Shift+Tab");
+  await page.waitForTimeout(40);
+  const after=await page.evaluate(()=>{const e=document.activeElement;return e?.matches("textarea.block-editor")?{start:e.selectionStart,end:e.selectionEnd,direction:e.selectionDirection}:null});
+  if(!after||JSON.stringify(before)!==JSON.stringify(after)||before.direction!==direction||before.end-before.start!==3)failures.push(`${kind}/${direction}: keyboard selection or focus lost`);
+  results.push({kind:"keyboard-selection",operation:kind,direction,before,after});
+ }
  // A horizontal swipe over buttons belongs to scrolling, not activation.
  await page.evaluate(()=>window.toolbarProbe.setup("move"));
  const strip=await page.locator(".mobile-keyboard-toolbar-strip").boundingBox();

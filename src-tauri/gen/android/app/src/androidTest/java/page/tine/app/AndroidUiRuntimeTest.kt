@@ -333,7 +333,8 @@ class AndroidUiRuntimeTest {
           const rows = [...document.querySelectorAll('.ls-block')].filter(row => /^Toolbar [A-EX]$/.test(text(row)));
           const current = rows.find(row => text(row) === 'Toolbar C');
           const toolbar = document.querySelector('[aria-label="Editor toolbar"]');
-          return JSON.stringify({parent: text(current?.parentElement?.closest('.ls-block')),
+          return JSON.stringify({activeEditor: document.activeElement === current?.querySelector('textarea.block-editor'),
+            parent: text(current?.parentElement?.closest('.ls-block')),
             order: rows.filter(row => !row.parentElement?.closest('.ls-block')).map(text).join(','),
             scroll: toolbar?.querySelector('.mobile-keyboard-toolbar-strip')?.scrollLeft ?? toolbar?.scrollLeft ?? 0});
         })()
@@ -343,6 +344,7 @@ class AndroidUiRuntimeTest {
         SystemClock.sleep(500) // Observe the compatibility click too, not just pointerup.
         val observed = state().put("action", label)
         stages.put(observed)
+        assertTrue("one $label touch must retain the active editor: $observed", observed.getBoolean("activeEditor"))
         assertEquals("one $label touch parent: $observed", parent, observed.getString("parent"))
         assertEquals("one $label touch order: $observed", order, observed.getString("order"))
       }
