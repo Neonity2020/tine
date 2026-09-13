@@ -69,7 +69,11 @@ run_journey() {
   adb logcat -c || true
 
   set +e
+  # The AndroidX runner otherwise posts ActivityFinisher after JUnit returns.
+  # Keep this isolated method's activity alive until the existing shell force-stop;
+  # automatic teardown of the API35 WebView can abort HWUI after a passing journey.
   adb shell am instrument -w \
+    -e waitForActivitiesToComplete false \
     -e class "page.tine.app.AndroidUiRuntimeTest#$method" \
     page.tine.app.test/androidx.test.runner.AndroidJUnitRunner > "$runner_output" 2>&1
   status=$?

@@ -363,7 +363,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
     !props.tag && !isGuidePageName(targetName()) && pageIsMissing(targetName());
   const kind = (): PageKind => (isGuidePageName(targetName()) ? "page" : isJournalTitle(targetName()) ? "journal" : "page");
   const open = (e: MouseEvent) => {
-    if (longPress.consumeClick()) {
+    if (longPress.consumeClick(e)) {
       e.preventDefault();
       e.stopPropagation();
       return;
