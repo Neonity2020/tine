@@ -118,10 +118,13 @@ methods=(
   longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation \
   initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement \
   generatedDirectFilesPdfRouteHonorsHardwareBackHistory \
+  toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll \
   systemBarStripAndIconsAgreeWithTinesOwnThemeNotTheDeviceNightSetting
 )
 if [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "205" ]]; then
   methods=(responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent)
+elif [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "toolbar" ]]; then
+  methods=(toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll)
 elif [[ "${TINE_ANDROID_UI_RUNTIME_ONLY:-}" == "pdf-routes" ]]; then
   methods=(generatedDirectFilesPdfRouteHonorsHardwareBackHistory)
 fi

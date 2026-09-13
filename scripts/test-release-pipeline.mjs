@@ -934,7 +934,7 @@ assert.equal(
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes')"
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'android-ui-runtime' || inputs.scope == 'android-ui-runtime-205' || inputs.scope == 'android-ui-runtime-pdf-routes' || inputs.scope == 'android-ui-runtime-toolbar')"
 );
 assert.match(
   yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"),
@@ -974,6 +974,7 @@ for (const evidence of [
   assert.ok(androidUiRuntimeScript.includes(evidence), `Android UI runtime runner is missing ${evidence}`);
 }
 for (const method of [
+  "toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
   "responsiveChromeFitsPortraitAndLandscapeAtDefault90And110Percent",
   "longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation",
   "initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement",
@@ -1694,3 +1695,6 @@ try {
 }
 
 console.log("Release pipeline fixture tests passed (exact-SHA CI gate + release workflow + fail-closed cases).");
+
+assert.ok(androidUiRuntimeScript.includes('methods=(toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll)'), "focused toolbar scope must execute the physical toolbar journey");
+assert.match(yamlNamedStep(androidUiRuntime, "Run physical Android UI MotionEvent proofs").join("\n"), /inputs\.scope == 'android-ui-runtime-toolbar'[\s\S]*?'toolbar'/);
