@@ -627,6 +627,13 @@ jobs:
             exit 1
           fi
           (cd test-results/android-ui-runtime/reused && sha256sum --check tested-apks.sha256)
+          if [[ ! -s test-results/android-ui-runtime/reused/gradle/tauri.settings.gradle ||
+                ! -s test-results/android-ui-runtime/reused/gradle/tauri.build.gradle.kts ]]; then
+            echo 'Original run lacks generated Gradle inputs; use a standard native build.' >&2
+            exit 1
+          fi
+          cp test-results/android-ui-runtime/reused/gradle/tauri.settings.gradle src-tauri/gen/android/tauri.settings.gradle
+          cp test-results/android-ui-runtime/reused/gradle/tauri.build.gradle.kts src-tauri/gen/android/app/tauri.build.gradle.kts
           mkdir -p src-tauri/gen/android/app/build/outputs/apk/reused
           cp test-results/android-ui-runtime/reused/tested-app.apk src-tauri/gen/android/app/build/outputs/apk/reused/tested-app.apk
           printf 'reuse_kind=diagnostic\napp_run=%s\napp_sha=%s\ninstrumentation_sha=%s\n' "$APP_RUN" "$app_sha" "$GITHUB_SHA" \
