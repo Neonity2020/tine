@@ -42,4 +42,4 @@ icon:: ⌨️
 	- Select several task bullets and press **Ctrl/Cmd+Enter** to advance each one through your workflow in a single Undo step. The selection toolbar can also wrap selected text as a page link or inline code.
 	- **Namespaces**: name a page `Project/Roadmap` and it nests under `Project` in the sidebar. This page lives under `Features`.
 	- **Page icons**: add a property like `icon:: 📚` at the very top of a page — that's where the ⌨️ on this one comes from.
-	- **Interface zoom** with **Ctrl + / - / 0**, and PDFs, images, and audio all have their own controls.
+	- **Interface zoom** with **Ctrl/Cmd + / - / 0** while the notes pane is focused. To return the whole interface to its default **100%**, open the command palette (**Ctrl/Cmd+Shift+P**) and choose **Reset interface zoom**. This leaves PDF/image zoom and block zoom unchanged; a focused PDF keeps its own **Ctrl/Cmd + / - / 0** controls.
