@@ -333,16 +333,38 @@ class AndroidUiRuntimeTest {
           const rows = [...document.querySelectorAll('.ls-block')].filter(row => /^Toolbar [A-EX]$/.test(text(row)));
           const current = rows.find(row => text(row) === 'Toolbar C');
           const toolbar = document.querySelector('[aria-label="Editor toolbar"]');
-          return JSON.stringify({parent: text(current?.parentElement?.closest('.ls-block')),
+          return JSON.stringify({activeEditor: document.activeElement === current?.querySelector('textarea.block-editor'),
+            parent: text(current?.parentElement?.closest('.ls-block')),
             order: rows.filter(row => !row.parentElement?.closest('.ls-block')).map(text).join(','),
             scroll: toolbar?.querySelector('.mobile-keyboard-toolbar-strip')?.scrollLeft ?? toolbar?.scrollLeft ?? 0});
         })()
       """.trimIndent())
       fun action(label: String, parent: String, order: String) {
-        tap(webView, awaitElementRect(webView, "[aria-label='Editor toolbar'] button[aria-label='$label']"))
+        val selector = "[aria-label='Editor toolbar'] button[aria-label='$label']"
+        var bounds = awaitElementRect(webView, selector)
+        var geometry = JSONObject()
+        val tappable = waitForCondition(SELECTION_TIMEOUT_MS) {
+          bounds = awaitElementRect(webView, selector)
+          val point = motionPoint(webView, bounds)
+          val location = IntArray(2)
+          val rootLocation = IntArray(2)
+          webView.getLocationOnScreen(location)
+          webView.rootView.getLocationOnScreen(rootLocation)
+          val imeBottom = webView.rootWindowInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
+          val imeTop = rootLocation[1] + webView.rootView.height - imeBottom
+          geometry = JSONObject().put("button", bounds).put("motionY", location[1] + point.second)
+            .put("imeTop", imeTop).put("imeBottom", imeBottom).put("webViewHeight", webView.height)
+          imeBottom > 0 && location[1] + point.second < imeTop
+        }
+        stages.put(JSONObject().put("action", "$label touch geometry").put("geometry", geometry))
+        emitReceipt("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
+          JSONObject().put("journey", "495-496-native-toolbar").put("stages", stages))
+        assertTrue("toolbar must be physically above the IME before touch: $geometry", tappable)
+        tap(webView, bounds)
         SystemClock.sleep(500) // Observe the compatibility click too, not just pointerup.
         val observed = state().put("action", label)
         stages.put(observed)
+        assertTrue("one $label touch must retain the active editor: $observed", observed.getBoolean("activeEditor"))
         assertEquals("one $label touch parent: $observed", parent, observed.getString("parent"))
         assertEquals("one $label touch order: $observed", order, observed.getString("order"))
       }

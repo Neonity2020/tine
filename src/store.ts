@@ -3712,6 +3712,20 @@ export function splitBlock(
   markDirty(pageName);
 }
 
+// A batched reparent publishes the new caret before DOM removal. The old
+// textarea can blur during that flush; own precisely this structural handoff
+// so its blur cannot erase the replacement editor's intent (GH #519/#495).
+function reparentEditingBlock(page: string, update: () => void): void {
+  const ownsMove = !isBlockMoving();
+  if (ownsMove) setBlockMoving(true, page);
+  try {
+    batch(update);
+    markDirty(page);
+  } finally {
+    if (ownsMove) setBlockMoving(false);
+  }
+}
+
 /** Tab: make the block the last child of its previous sibling.
  *
  * `editingSurface` names the surface the caret must stay on, exactly as the
@@ -3729,7 +3743,7 @@ export function indentBlock(id: string, caretOffset: number | EditorSelection, e
   const pageName = doc.byId[id].page;
   // Reparenting remounts the editor. Publish its selection and ownership in the
   // same reactive flush as the tree change, before the replacement can focus.
-  batch(() => {
+  reparentEditingBlock(pageName, () => {
     setDoc(
       produce((s) => {
         const arr = s.byId[id].parent === null
@@ -3747,7 +3761,6 @@ export function indentBlock(id: string, caretOffset: number | EditorSelection, e
     );
     startEditing(id, caretOffset, null, editingSurface);
   });
-  markDirty(pageName);
 }
 
 /** Shift+Tab: move the block out to be the next sibling of its parent.
@@ -3760,7 +3773,7 @@ export function outdentBlock(id: string, caretOffset: number | EditorSelection, 
   const grandParent = doc.byId[parentId].parent;
   const pageName = node.page;
 
-  batch(() => {
+  reparentEditingBlock(pageName, () => {
     setDoc(
       produce((s) => {
         const parent = s.byId[parentId];
@@ -3786,7 +3799,6 @@ export function outdentBlock(id: string, caretOffset: number | EditorSelection, 
     );
     startEditing(id, caretOffset, null, editingSurface);
   });
-  markDirty(pageName);
 }
 
 /** Backspace at offset 0: merge into the previous visible block (same page). */
