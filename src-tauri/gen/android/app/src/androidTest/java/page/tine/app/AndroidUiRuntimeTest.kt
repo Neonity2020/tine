@@ -278,17 +278,23 @@ class AndroidUiRuntimeTest {
         assertEquals("native editor entry must hit editable content: $entryHit", blockId, entryHit.optString("contentOwner"))
         Log.i(RECEIPT_TAG, "native selection entry: $entryHit")
         tapContentEditorEntry(webView, target)
-        val textarea = awaitEditor(webView, blockId, kind != "single-line")
+        awaitEditor(webView, blockId, kind != "single-line")
+        showIme(scenario, webView)
+        var textarea = awaitEditor(webView, blockId, kind != "single-line")
         if (kind != "single-line") {
           // Establish the reporter's literal starting state through touch: the
           // caret is on visual line one while the keyboard is already open,
           // then the only long press lands on visual line two.
           tapAtEditorLine(webView, textarea, 0)
+          textarea = awaitEditor(webView, blockId, true)
         }
-        showIme(scenario, webView)
         val imeBefore = imeVisible(webView)
         val orientationBefore = currentOrientation(scenario)
         val before = selectionState(webView, blockId)
+        before.put("holdEditorBounds", textarea)
+        before.put("nativeViewport", nativeViewportState(webView))
+        val holdPoint = if (kind == "single-line") motionPoint(webView, textarea) else editorLinePoint(webView, textarea, 1)
+        before.put("holdMotionPoint", JSONArray().put(holdPoint.first.toDouble()).put(holdPoint.second.toDouble()))
         if (kind == "single-line") longPress(webView, textarea) else longPressAtEditorLine(webView, textarea, 1)
         val completeStateObserved = waitForCondition(SELECTION_TIMEOUT_MS) {
           val state = selectionState(webView, blockId)
@@ -1221,6 +1227,12 @@ class AndroidUiRuntimeTest {
         selectedText: editor ? editor.value.slice(editor.selectionStart, editor.selectionEnd) : '',
         editorVisualLines: editor ? Math.max(1, Math.round(editor.getBoundingClientRect().height /
           (parseFloat(getComputedStyle(editor).lineHeight) || 20))) : 0,
+        editorBounds: editor?.getBoundingClientRect().toJSON() || null,
+        viewport: { width: innerWidth, height: innerHeight, visualWidth: visualViewport?.width, visualHeight: visualViewport?.height },
+        keyboardToolbarBounds: document.querySelector('[data-mobile-keyboard-toolbar]')?.getBoundingClientRect().toJSON() || null,
+        toolbarBounds: toolbarRect?.toJSON() || null,
+        toolbarDisplay: toolbarStyle?.display || null,
+        toolbarVisibility: toolbarStyle?.visibility || null,
         mobileToolbar: !!toolbar,
         toolbarVisible: !!toolbar && toolbarStyle.display !== 'none' && toolbarStyle.visibility !== 'hidden' &&
           toolbarRect.width > 0 && toolbarRect.height > 0,
@@ -1243,7 +1255,8 @@ class AndroidUiRuntimeTest {
         .put("webViewWidth", webView.width)
         .put("webViewHeight", webView.height)
         .put("statusBarTop", status?.top ?: 0)
-        .put("navigationBarBottom", navigation?.bottom ?: 0))
+        .put("navigationBarBottom", navigation?.bottom ?: 0)
+        .put("imeBottom", rootInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0))
       latch.countDown()
     }
     assertTrue("native WebView geometry was unavailable", latch.await(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS))

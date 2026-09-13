@@ -49,6 +49,7 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
   let timer: ReturnType<typeof setTimeout> | null = null;
   let firedPointer: number | null = null;
   let ownedClickPointer: number | null = null;
+  let ownedPointerType: string | null = null;
   let clickDocument: Document | null = null;
   let suppressClick = false;
   const cancel = () => {
@@ -61,6 +62,8 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
   const clearSuppression = () => {
     suppressClick = false;
     ownedClickPointer = null;
+    ownedPointerType = null;
+    clickDocument?.removeEventListener("contextmenu", consumeOwnedContextMenu, true);
     clickDocument?.removeEventListener("click", consumeOwnedClick, true);
     clickDocument?.removeEventListener("pointerdown", nextGesture, true);
     clickDocument = null;
@@ -69,6 +72,16 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
     if (!event.isPrimary) return;
     firedPointer = null;
     clearSuppression();
+  };
+  const consumeOwnedContextMenu = (event: MouseEvent) => {
+    if (ownedContextMenuEvents.has(event) || ownedClickPointer === null) return;
+    // Android can deliver its native hold menu after our timer opened the
+    // overlay. Keyboard/mouse context menus have a different pointer identity.
+    if (!(event instanceof PointerEvent) || event.pointerId !== ownedClickPointer ||
+        event.pointerType !== ownedPointerType) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    // Keep ownership: the same hold may still emit its compatibility click.
   };
   const consumeOwnedClick = (event: MouseEvent) => {
     if (event.detail === 0 || ownedClickPointer === null) return;
@@ -94,7 +107,9 @@ export function createLongPress(target: () => HTMLElement | undefined): LongPres
         if (!el) return;
         clearSuppression();
         ownedClickPointer = armedNow.id;
+        ownedPointerType = e.pointerType;
         clickDocument = el.ownerDocument;
+        clickDocument.addEventListener("contextmenu", consumeOwnedContextMenu, true);
         clickDocument.addEventListener("click", consumeOwnedClick, true);
         clickDocument.addEventListener("pointerdown", nextGesture, true);
         const contextMenu = new MouseEvent("contextmenu", {

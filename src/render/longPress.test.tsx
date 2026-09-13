@@ -80,6 +80,26 @@ describe("createLongPress", () => {
     } finally { overlay.remove(); }
   });
 
+  it("consumes the same hold's native contextmenu before the overlay and still consumes its later click", () => {
+    const overlay = document.createElement("div");
+    document.body.append(overlay);
+    let menus = 0, clicks = 0;
+    overlay.addEventListener("contextmenu", () => menus++);
+    overlay.addEventListener("click", () => clicks++);
+    try {
+      el.dispatchEvent(pointer("pointerdown", 40, 60, { pointerId: 7 }));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY);
+      expect(heard).toHaveLength(1); // Tine's owned synthetic menu still arrives.
+      overlay.dispatchEvent(pointer("contextmenu", 40, 66, { pointerId: 7 }));
+      expect(menus).toBe(0);
+      overlay.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
+      expect(menus).toBe(1); // Keyboard context menu remains independent.
+      el.dispatchEvent(pointer("pointerup", 40, 60, { pointerId: 7 }));
+      overlay.dispatchEvent(pointer("click", 40, 60, { pointerId: 7, detail: 1 }));
+      expect(clicks).toBe(0);
+    } finally { overlay.remove(); }
+  });
+
   it("does not consume another pointer and removes capture ownership on dispose", () => {
     const overlay = document.createElement("div");
     document.body.append(overlay);
