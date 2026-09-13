@@ -239,6 +239,7 @@ class AndroidUiRuntimeTest {
   @Test
   fun initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement() {
     withFreshDemoGraph("initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement") { scenario, webView ->
+      dismissFirstRunNotices(webView)
       val selections = JSONArray()
       val failures = mutableListOf<String>()
 
@@ -253,6 +254,15 @@ class AndroidUiRuntimeTest {
       )) {
         val target = awaitContentBlock(webView, textBounds.first, textBounds.second, kind == "single-line")
         val blockId = target.getString("blockId")
+        val entryHit = evaluateJson(webView, """
+          (() => {
+            const hit = document.elementFromPoint(${target.getDouble("left") + target.getDouble("width") - 6.0},
+              ${target.getDouble("top") + target.getDouble("lineHeight") * 0.5});
+            return JSON.stringify({ blockId: hit?.closest('.ls-block')?.dataset.blockId || '',
+              tag: hit?.tagName || '', className: hit?.className || '', target: ${target} });
+          })()
+        """.trimIndent())
+        assertEquals("native editor entry must hit the selected block: $entryHit", blockId, entryHit.optString("blockId"))
         tapContentEditorEntry(webView, target)
         val textarea = awaitEditor(webView, blockId, kind != "single-line")
         if (kind != "single-line") {
@@ -314,12 +324,7 @@ class AndroidUiRuntimeTest {
   @Test
   fun toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll() {
     withFreshDemoGraph("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll") { scenario, webView ->
-      // First-run Guide/CPU notices are sticky and overlap bottom editor chrome.
-      // Dismiss them through their real controls before beginning the gesture.
-      for (attempt in 0 until 8) {
-        val close = elementRectOrNull(webView, ".toast-close") ?: break
-        tap(webView, close)
-      }
+      dismissFirstRunNotices(webView)
       evaluateJson(webView, """
         (() => {
           window.__tineToolbarEvents = [];
@@ -462,13 +467,19 @@ class AndroidUiRuntimeTest {
   @Test
   fun generatedDirectFilesPdfRouteHonorsHardwareBackHistory() {
     withFreshDemoGraph("generatedDirectFilesPdfRouteHonorsHardwareBackHistory") { scenario, webView ->
+      dismissFirstRunNotices(webView)
       val fixture = installGeneratedPdfLinkFixture()
       val sourceRoute = "Welcome to Tine"
       val notesRoute = "hls__android-route"
       val stages = JSONArray()
 
       awaitCondition("production watcher imports the generated Direct Files link") {
-        pdfRouteState(webView).optInt("sourcePdfLinks") == 1
+        // Offscreen AstBody content is intentionally a raw deferred placeholder.
+        // Import must precede scrolling; parsed PDF anchors need not exist yet.
+        evaluateJson(webView, """
+          (() => JSON.stringify({ imported: [...document.querySelectorAll('.block-content-wrapper')]
+            .some(content => content.textContent.includes('Android route PDF')) }))()
+        """.trimIndent()).optBoolean("imported")
       }
       val pdfLink = awaitVisibleElementByScrolling(
         webView,
@@ -719,6 +730,15 @@ class AndroidUiRuntimeTest {
           it.optInt("blocks") >= 3 &&
           it.optString("activeDrawer").isEmpty()
       }
+    }
+  }
+
+  private fun dismissFirstRunNotices(webView: WebView) {
+    // Sticky Guide/CPU notices may cover a valid editor or link target.
+    // Use their actual controls, keeping native hit testing intact.
+    for (attempt in 0 until 8) {
+      val close = elementRectOrNull(webView, ".toast-close") ?: break
+      tap(webView, close)
     }
   }
 
