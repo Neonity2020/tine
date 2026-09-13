@@ -16,12 +16,13 @@
   "status": "reported",
   "coverage": {
     "tests": [
-      "src/editor/autocomplete.test.ts::filters by label substring"
+      "src/editor/autocomplete.test.ts::filters by label substring",
+      "src/components/QueryMacro.test.tsx::choosing the Query slash command opens its sheet and field chooser"
     ],
     "scenario": "ui-query-single-slash-command",
     "failBefore": "unavailable"
   },
-  "notes": "The assertion checks exactly one Query label and query-builder action, with duplicate legacy label removed from the preserved ranking fixture. Partial workflow coverage: automatic field-chooser opening after actual slash insertion is not established by this test. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
+  "notes": "The assertion checks exactly one Query label and query-builder action, with duplicate legacy label removed from the preserved ranking fixture. Mounted QueryMacro regression now exercises textarea input, autocomplete mousedown and the real Block completion handoff through scaffold persistence, edit exit, mounted sheet and chooser. Render-harness autofocus probe found focus outside the chooser; autofocus and native acceptance remain unverified. 2026-09-13 QueryMacro render suite passes 38 tests including the mounted slash handoff; no fail-before or native receipt. Full candidate CI pending."
 },
 {
   "id": "UI-QUERY-TYPED-READINESS-RESOURCE",
