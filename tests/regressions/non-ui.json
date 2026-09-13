@@ -7357,6 +7357,21 @@
   "failBefore": "On d61cfb3d the test panics after 10 s: 'queries never answered again after a save that created a block; last: not ready (recovering)', with 495 'projection is stale; indexed reads are unavailable' lines (tine-agents/evidence/2026-09-11-query-fixes/wedge-fail-before.log)"
  },
  "notes": "User outcome: pressing Enter to create a block, then saving, made every query in the app say 'Rebuilding the query index...' permanently (a plain text edit did not). Classification: blocking core operation. Mechanism: a block created in the editor is saved with the frontend's live id (b<base36 time>-<n>), which the in-memory save path deliberately keeps; lower_blocks refused the WHOLE page delta because that id is not a UUID, the failed turn latched a full rebuild, and every rebuild re-lowered the same live document and failed the same way. Fix: a non-UUID live id gets a deterministic 16-byte projection key (the row's public identity is the id string, so answers still name the block by the editor's id). The walk fallback the query campaign retired used to hide this refusal."
+},
+{
+ "id": "REG-COLD-HISTORY-INDEX-INIT-RACE-001",
+ "title": "Cold-history publication must not depend on the sealed accepted index store already existing",
+ "family": "managed-storage",
+ "sources": { "issues": [], "commits": [], "internal": "2026-09-13 master CI: intermittent failure across runs 34686286172 and 34751395025" },
+ "platforms": ["all"], "layer": "rust-core", "status": "reported",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/oplog/sqlite.rs::tests::projection_replay_resolves_a_rebaselined_batch_through_the_single_resolver"
+  ],
+  "scenario": "managed.cold-history-index-init",
+  "failBefore": "Hosted CI only: panics at oplog/sqlite.rs:12650 on publish_cold_history_for_batches().unwrap() with ColdHistoryRootMissing; stderr names the cause as 'sealed accepted index store: No such file or directory (os error 2)' and the same run logs 'clean checkpoint write failed; retrying at the next trigger: cold history index is unavailable'. Does not reproduce locally (42/42 green, serial and 12-way parallel)."
+ },
+ "notes": "QUARANTINED, NOT FIXED -- the test carries #[ignore] and must be un-ignored before the next release (Martin's call, 2026-09-13). Quarantined rather than patched because the failure is very likely a production initialization-ORDER defect in cold-history/sealed-index setup rather than a test defect: the checkpoint writer itself fails with the same missing-store cause in the same run, so a test-side workaround would hide a real storage bug. Suspected user-visible shape if confirmed: on a machine/timing where the sealed accepted index store is not yet present, a clean checkpoint write fails and retries indefinitely, so cold history never becomes available and hot objects are never retired -- an availability and unbounded-growth risk, not a corruption risk. Do not un-ignore without diagnosing why the store directory is absent at that point."
 }
 ]
 }
