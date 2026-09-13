@@ -308,7 +308,10 @@ function createPeekBridge(disabled: () => boolean) {
       closeT = undefined;
     }
   };
-  const anchorEnter = () => {
+  const anchorEnter = (event: PointerEvent) => {
+    // Touch WebViews synthesize mouse hover around a hold. Only a real mouse
+    // may arm a hover preview; hybrid devices keep their mouse behavior.
+    if (event.pointerType !== "mouse") { dismiss(); return; }
     if (disabled()) return;
     clearClose();
     clearOpen();
@@ -400,8 +403,8 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
         // so the gestures can't leak to the browser (GH #42, GH #207).
         onMouseDown={internalLinkMouseDown}
         onClick={open}
-        onMouseEnter={peek.anchorEnter}
-        onMouseLeave={peek.anchorLeave}
+        onPointerEnter={peek.anchorEnter}
+        onPointerLeave={peek.anchorLeave}
         onPointerDown={longPress.onPointerDown}
         onPointerMove={longPress.onPointerMove}
         onPointerUp={longPress.onPointerUp}
@@ -1342,8 +1345,8 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
         // Shared guard: suppress native shift-range-selection / middle-click
         // autoscroll up front (GH #42, GH #207).
         onMouseDown={internalLinkMouseDown}
-        onMouseEnter={peek.anchorEnter}
-        onMouseLeave={peek.anchorLeave}
+        onPointerEnter={peek.anchorEnter}
+        onPointerLeave={peek.anchorLeave}
         // Middle-click → background tab with the block anchor (GH #283).
         onAuxClick={(e) => {
           if (internalLinkAuxClick(e, () => {
