@@ -1,6 +1,74 @@
 {
   "schemaVersion": 1,
   "entries": [
+{
+  "id": "UI-QUERY-SINGLE-SLASH-COMMAND",
+  "title": "One Query slash command routes to the query builder",
+  "family": "query-builder",
+  "sources": {
+    "issues": [],
+    "commits": []
+  },
+  "platforms": [
+    "all"
+  ],
+  "layer": "render",
+  "status": "reported",
+  "coverage": {
+    "tests": [
+      "src/editor/autocomplete.test.ts::filters by label substring"
+    ],
+    "scenario": "ui-query-single-slash-command",
+    "failBefore": "unavailable"
+  },
+  "notes": "The assertion checks exactly one Query label and query-builder action, with duplicate legacy label removed from the preserved ranking fixture. Partial workflow coverage: automatic field-chooser opening after actual slash insertion is not established by this test. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
+},
+{
+  "id": "UI-QUERY-TYPED-READINESS-RESOURCE",
+  "title": "Typed pending query reads retry while permanent failures remain terminal",
+  "family": "query-builder",
+  "sources": {
+    "issues": [],
+    "commits": []
+  },
+  "platforms": [
+    "all"
+  ],
+  "layer": "render",
+  "status": "reported",
+  "coverage": {
+    "tests": [
+      "src/queryReadiness.test.ts",
+      "src/createReadyQueryResource.test.tsx",
+      "src/components/QueryResultSections.test.tsx::q3_pending_and_failure_are_not_the_empty_state"
+    ],
+    "scenario": "ui-query-typed-readiness-resource",
+    "failBefore": "unavailable"
+  },
+  "notes": "Typed reason-code tests cover pending backoff, terminal failure preservation and cancellation; ready-resource tests cover retained current rows and clearing stale graph rows; result sections distinguish pending/error from empty results. Partial surface coverage: this registration does not establish rendered Search, Ctrl+K and block-picker Retry controls or their complete integration. Those three surface acceptance paths remain to be mapped or tested. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
+},
+{
+  "id": "UI-QUERY-ADVANCED-TEXT-ONLY",
+  "title": "Advanced query reports do not offer the filter builder or Simple conversion",
+  "family": "query-builder",
+  "sources": {
+    "issues": [],
+    "commits": []
+  },
+  "platforms": [
+    "all"
+  ],
+  "layer": "render",
+  "status": "reported",
+  "coverage": {
+    "tests": [
+      "src/components/QueryMacro.test.tsx::renders an advanced query's report without offering the filter builder"
+    ],
+    "scenario": "ui-query-advanced-text-only",
+    "failBefore": "unavailable"
+  },
+  "notes": "Mounted Block/ContextMenu test verifies ran: task report, retained count, absent sentence/sheet and absent Simple conversion button. It covers the advanced-query rendering path; no native workflow or exhaustive lossless handwritten-source roundtrip is claimed. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
+},
     {
       "id": "UI-MULTILINE-DRAG-ENDPOINT-20260913",
       "title": "Dragging from a rendered multiline block keeps the text selection endpoint under the pointer",
