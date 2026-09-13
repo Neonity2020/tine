@@ -15,7 +15,7 @@ pdf += `xref\n0 5\n0000000000 65535 f \n${offsets.slice(1).map(n => String(n).pa
 Object.assign(backend(), { openPdf: async () => ({highlights: [], page: 1, scale: 1}), readAsset: async () => new TextEncoder().encode(pdf) });
 const owner = activatePdfOwnership("/pdf-toolbar-probe");
 (window as any).pdfProbe = { notes: 0, close: 0 };
-render(() => <div class="pdf-pane pdf-route-pane" style="width:100vw;height:100vh"><PdfViewer
+render(() => <div class="pdf-pane pdf-route-pane" style="width:100%;height:100vh"><PdfViewer
   filename="android-route.pdf" label="Android route PDF" owner={owner}
   onOpenNotes={() => (window as any).pdfProbe.notes++}
   onClose={() => (window as any).pdfProbe.close++}/></div>, document.getElementById("root")!);

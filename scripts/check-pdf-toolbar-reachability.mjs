@@ -19,12 +19,12 @@ await server.listen();
 const browser = await chromium.launch({args:["--no-sandbox"]});
 const results=[], failures=[];
 try {
- for (const width of [320,360,1100]) {
+ for (const [width, zoom] of [[280,1],[320,1],[320,1.1],[360,1],[1100,1]]) {
   const page=await browser.newPage({viewport:{width,height:640},hasTouch:true});
   page.on("pageerror", e => console.error(e.message));
   await page.goto(`${server.resolvedUrls.local[0]}scripts/fixtures/pdf-toolbar/index.html`);
   await page.waitForSelector('[data-pdf-ready="true"]');
-  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(zoom => { document.documentElement.style.zoom=String(zoom); return document.fonts.ready; }, zoom);
   const geometry=await page.evaluate(() => [...document.querySelectorAll('.pdf-toolbar button,.pdf-page-input')]
    .filter(el=>getComputedStyle(el).display!=="none").map(el=>{
     const r=el.getBoundingClientRect(), x=r.x+r.width/2,y=r.y+r.height/2;
@@ -32,20 +32,27 @@ try {
     return {label:el.getAttribute("title"),rect:r.toJSON(),hittable:r.width>0&&r.height>0&&!!hit&&(el===hit||el.contains(hit))};
    }));
   const missing=geometry.filter(x=>!x.hittable).map(x=>x.label);
-  results.push({width,geometry});
-  await page.screenshot({path:path.join(out,`${width}.png`)});
-  if(missing.length){failures.push(`${width}: ${missing.join(", ")}`);await page.close();continue;}
+  results.push({width,zoom,geometry});
+  await page.screenshot({path:path.join(out,`${width}-${zoom}.png`)});
+  if(missing.length){failures.push(`${width}@${zoom}: ${missing.join(", ")}`);await page.close();continue;}
+  await page.locator('[title^="Find in document"]').tap();
+  const findBounds = await page.locator('.pdf-find-bar').boundingBox();
+  const toolbarBounds = await page.locator('.pdf-toolbar').boundingBox();
+  if (findBounds.y < toolbarBounds.y+toolbarBounds.height-1) failures.push(`${width}@${zoom}: Find overlaps toolbar`);
+  await page.locator('.pdf-find-bar button[title="Close (Esc)"]').tap();
   await page.locator('[aria-label="More settings"]').tap();
   await page.waitForSelector('[aria-label="PDF settings"]');
+  const settingsBounds=await page.locator('[aria-label="PDF settings"]').boundingBox();
+  if(settingsBounds.y < toolbarBounds.y+toolbarBounds.height-1) failures.push(`${width}@${zoom}: settings overlaps toolbar`);
   if(width<=520) {
    await page.locator('.pdf-settings-overflow button').filter({hasText:/^Notes$/}).tap();
-   if(await page.evaluate(()=>window.pdfProbe.notes)!==1) failures.push(`${width}: Notes did not activate`);
+   if(await page.evaluate(()=>window.pdfProbe.notes)!==1) failures.push(`${width}@${zoom}: Notes did not activate`);
   } else await page.locator('[aria-label="More settings"]').tap();
   // Native button keyboard activation stays available in the same DOM.
   await page.locator('[aria-label="Close PDF"]').focus();await page.keyboard.press("Enter");
-  if(await page.evaluate(()=>window.pdfProbe.close)!==1) failures.push(`${width}: keyboard Close did not activate`);
+  if(await page.evaluate(()=>window.pdfProbe.close)!==1) failures.push(`${width}@${zoom}: keyboard Close did not activate`);
   await page.locator('[aria-label="Close PDF"]').tap();
-  if(await page.evaluate(()=>window.pdfProbe.close)!==2) failures.push(`${width}: touch Close did not activate`);
+  if(await page.evaluate(()=>window.pdfProbe.close)!==2) failures.push(`${width}@${zoom}: touch Close did not activate`);
   await page.close();
  }
  await writeFile(path.join(out,"results.json"),JSON.stringify({results,failures},null,2));
