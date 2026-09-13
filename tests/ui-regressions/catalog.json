@@ -5,11 +5,21 @@
       "id": "UI-MULTILINE-DRAG-ENDPOINT-20260913",
       "title": "Dragging from a rendered multiline block keeps the text selection endpoint under the pointer",
       "family": "caret-navigation",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "reproduced",
-      "coverage": { "tests": ["scripts/check-drag-selection.mjs"], "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "scripts/check-drag-selection.mjs"
+        ],
+        "failBefore": "proven"
+      },
       "notes": "Martin report September 13. Real Block Chromium gesture compared with native textarea clicks at identical positions: wrapping text drifts 6 characters by row 4 and 16 by row 6 at repaired master eb1f83d3; explicit-newline controls pass. Per-character zero-width spans in the measurement mirror introduce word-break opportunities absent from the editor. Native platform acceptance remains pending."
     },
     {
@@ -38,8 +48,13 @@
       "id": "UI-QUERY-PAGE-SNAPSHOT-UNDO-LIFETIME-20260908",
       "title": "Scoped page undo keeps the open query sheet mounted",
       "family": "query-builder",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -55,8 +70,13 @@
       "id": "UI-QUERY-SHEET-P6-CONTROLS-20260908",
       "title": "The query sheet can select, disable, group and reorder conditions without a second tree editor",
       "family": "query-builder",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -78,25 +98,38 @@
         ],
         "failBefore": "proven"
       },
-      "notes": "SPEC \u00a77.4 remainder (packet P6) over the existing Off/boolean IR: no new predicate syntax, no grammar, printer, IPC, persistence or registry change. Selection and the enabled switch are two controls, so a grouping gesture cannot change what the query returns. Grouping, moving and disabling are pure operations in src/editor/queryBuilder.ts (groupSelected, moveSibling, toggleDisabledAt) called through the one QuerySheet apply boundary; the drag reuses rowReorder.ts and dragSelectionGuard rather than a second pointer loop or a drag library. Locators are paths into a captured root revision: a replaced root, an anchor switch or an unmount drops the selection and cancels the drag without applying. Switching a group off also exposed a defect that predates this packet on every `none of` group: an edit addressed at the and/or INSIDE a not/off wrote into the one-element array filterChildren synthesizes, so the header cycle, None of and Ungroup did nothing and still returned a new tree the sheet saved. Assignment now goes through assignAt; unwrapAt lifts a single child out of a unary wrapper and refuses two or more rather than inventing a De Morgan rewrite (\u00a73.5), and the group menu omits Ungroup exactly where it would be refused. SheetNode records the not's own location, so Remove none of no longer strips an Off that happened to be outermost. Fail-before evidence: tine-agents/evidence/qe/p6-controls/fail-before.log (26 pure and 20 mounted tests fail against base ad41c224 while the 7 pre-existing sheet tests and the ungroup-losslessness pin still pass)."
+      "notes": "SPEC §7.4 remainder (packet P6) over the existing Off/boolean IR: no new predicate syntax, no grammar, printer, IPC, persistence or registry change. Selection and the enabled switch are two controls, so a grouping gesture cannot change what the query returns. Grouping, moving and disabling are pure operations in src/editor/queryBuilder.ts (groupSelected, moveSibling, toggleDisabledAt) called through the one QuerySheet apply boundary; the drag reuses rowReorder.ts and dragSelectionGuard rather than a second pointer loop or a drag library. Locators are paths into a captured root revision: a replaced root, an anchor switch or an unmount drops the selection and cancels the drag without applying. Switching a group off also exposed a defect that predates this packet on every `none of` group: an edit addressed at the and/or INSIDE a not/off wrote into the one-element array filterChildren synthesizes, so the header cycle, None of and Ungroup did nothing and still returned a new tree the sheet saved. Assignment now goes through assignAt; unwrapAt lifts a single child out of a unary wrapper and refuses two or more rather than inventing a De Morgan rewrite (§3.5), and the group menu omits Ungroup exactly where it would be refused. SheetNode records the not's own location, so Remove none of no longer strips an Off that happened to be outermost. Fail-before evidence: tine-agents/evidence/qe/p6-controls/fail-before.log (26 pure and 20 mounted tests fail against base ad41c224 while the 7 pre-existing sheet tests and the ungroup-losslessness pin still pass)."
     },
     {
       "id": "UI-QUERY-SHEET-P6-NATIVE-390-20260908",
       "title": "Query-sheet select/disable/group/reorder controls fit 390px and survive save, reopen and undo on a device",
       "family": "query-builder",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "native",
       "status": "reported",
-      "coverage": { "tests": [], "failBefore": "unavailable" },
+      "coverage": {
+        "tests": [],
+        "failBefore": "unavailable"
+      },
       "notes": "The component layer proves the IR each gesture saves; it cannot prove geometry, touch, or that the saved tree round-trips through the block on disk. Outstanding manager work for the P6 controls packet: a 390px browser/native pass showing the handle, selection box, enabled switch, row menu and Group selected bar all reachable without horizontal overflow and without hover; a touch drag started from the handle only; and a save/reopen/undo journey showing a grouped or reordered query re-reading as the same tree with one undo step per gesture. Rust Off round-trip and oracle gates are also the manager's."
     },
     {
       "id": "UI-QUERY-CANDIDATE-ORACLE-ONLY-20260908",
       "title": "Production query requests do not run the retired candidate planner",
       "family": "query-results",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "unit",
       "status": "covered",
       "coverage": {
@@ -112,23 +145,39 @@
       "id": "UI-QUERY-TODO-SCROLL-POSITION-20260907",
       "title": "Completing a TODO in a long multiline query should preserve the reader's place",
       "family": "query-results",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "native",
       "status": "reported",
-      "coverage": { "tests": [], "scenario": "query.todo-scroll-position", "failBefore": "unavailable" },
+      "coverage": {
+        "tests": [],
+        "scenario": "query.todo-scroll-position",
+        "failBefore": "unavailable"
+      },
       "notes": "User reports a jump after completing a result. Synthetic native grouped, same-host, incremental-scroll and page-sorted controls have not reproduced viewport movement. Page sorting did reproduce a related remount defect, tracked separately; correcting it does not close this report. Exact query, view and platform remain pending. Campaign QUERY-RESULT-SCROLL-REPORT.md records evidence."
     },
     {
       "id": "UI-QUERY-SORTED-GROUP-CONTINUITY-20260908",
       "title": "Removing a sorted query result preserves surviving result components",
       "family": "query-results",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/components/QueryMacro.test.tsx::keeps sorted result nodes mounted when another result disappears"],
+        "tests": [
+          "src/components/QueryMacro.test.tsx::keeps sorted result nodes mounted when another result disappears"
+        ],
         "scenario": "query.sorted-group-continuity",
         "failBefore": "proven"
       },
@@ -11097,8 +11146,13 @@
       "id": "UI-QUERY-REGISTRY-UNAVAILABLE-001",
       "title": "A property-registry read that fails is reported and retryable, not a crash or an endless index",
       "family": "query-builder",
-      "sources": { "issues": [], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
@@ -11321,6 +11375,29 @@
         "failBefore": "proven"
       },
       "notes": "8 of 9 rendered cases fail before; 9 pass after; PDF/block routes and focused pane retained. Evidence: tine-agents/evidence/release-experiment-fixes-20260913. Revalidated from eb1f83d3; no native or shipped claim."
+    },
+    {
+      "id": "UI-DEFAULT-TASK-CSS-394",
+      "title": "Task state controls and completed content stay readable across themes",
+      "family": "theme-presentation",
+      "sources": {
+        "issues": [
+          394
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-default-task-css.mjs"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Approved issue394 and discussion297 comments18056119/18082471. Browser necessity run fails on eb1f83d3; revised defaults pass light/dark/custom with actual Inter font loaded. No native WebKit or release claim. Covers state checkbox colors/hover, unstruck completed labels, struck content, title line height and overridable primary text defaults."
     }
   ]
 }
