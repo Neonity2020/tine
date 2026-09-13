@@ -43,6 +43,7 @@ on:
         options:
           - full
           - windows
+          - windows-smb-probe
           - android
           - android-compile
           - android-runtime
@@ -338,6 +339,26 @@ jobs:
   # The independently certified tine-storage package is not retested here.
   # Windows compiles every tine-core target against the exact pin and executes
   # declared cross-layer durability/lifecycle smokes in isolated processes.
+  windows-smb-probe:
+    name: Diagnostic / Windows loopback SMB checked opens (GH533)
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-smb-probe'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Compare local, UNC and mapped-drive file access
+        shell: pwsh
+        run: |
+          Start-Transcript -Path windows-smb-probe.log
+          try { & ./scripts/probes/windows-smb-open/run.ps1 }
+          finally { Stop-Transcript }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-smb-probe-${{ github.sha }}
+          path: windows-smb-probe.log
+
   windows-compile:
     name: Full CI / Windows core compile + integration smoke
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows' || (inputs.scope == 'full' && inputs.windows_test_name == ''))
