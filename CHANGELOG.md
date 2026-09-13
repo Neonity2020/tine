@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Commands can have no keyboard shortcut** without becoming unavailable in
+  the command palette. Shortcut recording can be cancelled, and help reflects
+  cleared bindings (GH #523).
+- **Reset interface zoom** is available in the command palette (GH #522).
+
 - **Changes from a long-absent device now merge automatically.** If an older
   incoming change falls behind this device's compact local history, Tine
   rebuilds that history, waits for any still-arriving prerequisite, and resumes
@@ -189,6 +194,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Dragging down through multiline text keeps selection under the pointer.**
+  Starting a drag in rendered text no longer accumulates a character offset on
+  each wrapped line; code blocks and Unicode text follow the same native caret.
+- **Windows network graphs open correctly through UNC paths and mapped SMB
+  drives.** Directory enumeration preserves the network root while retaining
+  filesystem path-confinement checks (GH #533).
+- **Android formatting-toolbar taps perform each command once.** The toolbar
+  retains its horizontal position and editing focus, stays above the keyboard,
+  and keeps the keyboard open during sibling moves (GH #495, #496).
+- **Touch long-press page menus stay open.** Touch does not arm desktop hover
+  previews, and duplicate native context-menu or compatibility-click events no
+  longer dismiss the menu just opened (GH #207).
+- **Initial native Android text selection updates the formatting toolbar**
+  without requiring a later selection-handle movement (GH #375).
+- **Indent and outdent preserve the caret and selection** instead of moving
+  them to the end of the block (GH #519).
+- **Code-block horizontal scrollbars can be dragged** without the click
+  entering edit mode (GH #520).
+- **Embed gestures keep the intended host or source.** Clicking a gap does not
+  edit the host block; dragging an embedded root moves that occurrence, while
+  nested source controls retain their own actions (GH #514, #516).
+- **Editing below an expanded embed preserves the viewport**, including Undo
+  and Redo when the source text changes the embed's height (GH #515).
+- **Journals adds the new day after midnight without replacing the active
+  editor**, preserving its draft, focus and selection (GH #532).
+- **Block references render live task states** while preserving literal task
+  words and aliases (GH #518).
+- **Editor emoji font selection follows the platform display font**, reducing
+  the font switch between reading and editing (GH #458).
+
 - **Quitting while a change arrives from another device now shuts down cleanly.**
   If a synced change landed in the moment you closed Tine, the shutdown reported
   an error instead of finishing normally. Nothing was lost either way — the
@@ -350,6 +385,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   left alone when you edit a neighbour.
 
 ### Changed
+
+- **Page rename scans less text in Direct Files graphs.** A controlled
+  10,005-file graph completed the reference scan about 34.5% faster; the later
+  whole-graph cache refresh remains a separate cost (GH #406).
+- **Blocked rename/save messages identify the actual pending work**, conflicts
+  or reopen requirement. This improves diagnosis of GH #535; the underlying
+  reported false-conflict state is not yet resolved.
+- **Default task styling** uses consistent checkbox colors, strikes through
+  completed task text without its label, and applies the approved hover,
+  opacity, title-spacing and primary-text theme adjustments (GH #394).
 
 - **A query with two conditions no longer reads the whole graph to answer about
   three blocks.** Every condition in a query was asked of the index as its own
