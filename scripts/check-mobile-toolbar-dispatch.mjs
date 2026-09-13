@@ -48,6 +48,14 @@ try{
   if(!after||JSON.stringify(before)!==JSON.stringify(after)||before.direction!==direction||before.end-before.start!==3)failures.push(`${kind}/${direction}: keyboard selection or focus lost`);
   results.push({kind:"keyboard-selection",operation:kind,direction,before,after});
  }
+ for(const label of ["Move block up","Move block down"])for(const direction of ["forward","backward"]){
+  await page.evaluate(()=>window.toolbarProbe.setup("move"));await page.keyboard.press(direction==="forward"?"Home":"End");
+  for(let i=0;i<3;i++)await page.keyboard.press(direction==="forward"?"Shift+ArrowRight":"Shift+ArrowLeft");
+  const before=await page.locator("textarea.block-editor").evaluate(e=>({start:e.selectionStart,end:e.selectionEnd,direction:e.selectionDirection}));
+  const box=await page.getByRole("button",{name:label,exact:true}).boundingBox();await page.touchscreen.tap(box.x+box.width/2,box.y+box.height/2);await page.waitForTimeout(40);
+  const after=await page.evaluate(()=>{const e=document.activeElement;return e?.matches("textarea.block-editor")?{start:e.selectionStart,end:e.selectionEnd,direction:e.selectionDirection}:null});
+  if(JSON.stringify(before)!==JSON.stringify(after))failures.push(`${label}/${direction}: move lost selection or focus`);results.push({kind:"move-selection",label,direction,before,after});
+ }
  // A horizontal swipe over buttons belongs to scrolling, not activation.
  await page.evaluate(()=>window.toolbarProbe.setup("move"));
  const strip=await page.locator(".mobile-keyboard-toolbar-strip").boundingBox();

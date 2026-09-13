@@ -2919,20 +2919,29 @@ export function Editor(props: { id: string }): JSX.Element {
   // reorder briefly blurs the textarea; cross-day it remounts).
   const moveBlockCmd = (e: KeyboardEvent, dir: 1 | -1): boolean => {
     e.preventDefault();
-    const start = ref.selectionStart;
+    const movedEditor = ref;
+    const selection = { start: ref.selectionStart, end: ref.selectionEnd, direction: ref.selectionDirection };
+    const restoreMovedEditor = () => {
+      if (ref !== movedEditor || !movedEditor.isConnected || editingId() !== props.id) return;
+      if (document.activeElement !== movedEditor && document.activeElement !== document.body) return;
+      movedEditor.focus();
+      movedEditor.setSelectionRange(
+        Math.min(selection.start, movedEditor.value.length),
+        Math.min(selection.end, movedEditor.value.length), selection.direction,
+      );
+    };
     commit(ref.value);
     setBlockMoving(true, doc.byId[props.id]?.page);
-    startEditing(props.id, start, null, structuralSurface());
+    startEditing(props.id, selection, null, structuralSurface());
     const move = outlineScope && !outlineScope.navOnly
       ? (moveItem(props.id, dir), Promise.resolve())
       : moveBlockFeed(props.id, dir).then(() => undefined);
+    // Synchronous sibling reorders retain the same textarea. Restore it in this
+    // gesture: waiting a frame lets Android dismiss the IME despite later focus.
+    restoreMovedEditor();
     void move.then(() => {
       requestAnimationFrame(() => {
-        if (ref.isConnected) {
-          ref.focus();
-          const o = Math.min(start, ref.value.length);
-          ref.setSelectionRange(o, o);
-        }
+        if (document.activeElement !== movedEditor) restoreMovedEditor();
         setBlockMoving(false);
       });
     });
