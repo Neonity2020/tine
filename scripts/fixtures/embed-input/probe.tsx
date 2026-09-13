@@ -15,11 +15,13 @@ const leaf=(id:string,raw=id,children:any[]=[])=>({id,raw,collapsed:false,childr
 let sourcePage="Embed probe";
 backend().resolveBlocks=async()=>[{page:sourcePage,kind:"page",blocks:[leaf("source","Source root\nid:: source")]}];
 render(()=><main class="main-content" style="padding:32px;height:650px;overflow:auto"><For each={pageByName("Embed probe")?.roots??[]}>{id=><Block id={id}/>}</For></main>,document.getElementById("root")!);
-(window as any).embedProbe={doc,editingId,route,async setup(readonlyHost=false){
+(window as any).embedProbe={doc,editingId,route,async setup(readonlyHost=false,position="above",large=false){
  endEdit("blur");resetStore();
  sourcePage=readonlyHost?"Source page":"Embed probe";
  openPage("Embed probe","page");
- loadSingle({read_only:readonlyHost,name:"Embed probe",title:"Embed probe",kind:"page",pre_block:null,blocks:[leaf("before"),leaf("host","{{embed ((source))}}"),leaf("after"),...(!readonlyHost?[leaf("source","Source root\nid:: source",[leaf("child-one"),leaf("child-two")])]:[]),leaf("tail")]});
+ const source=leaf("source",`${large ? "Long source line\n".repeat(25) : "Source root\n"}id:: source`,[leaf("child-one"),leaf("child-two")]);
+ const blocks=[leaf("before"),...(position==="above"?[leaf("host","{{embed ((source))}}")]:[]),leaf("after"),...(!readonlyHost?[source]:[]),...(position==="below"?[leaf("host","{{embed ((source))}}")]:[]),leaf("tail")];
+ loadSingle({read_only:readonlyHost,name:"Embed probe",title:"Embed probe",kind:"page",pre_block:null,blocks});
  if(readonlyHost)await ensurePageLoaded({name:"Source page",title:"Source page",kind:"page",pre_block:null,blocks:[leaf("source","Source root\nid:: source",[leaf("child-one"),leaf("child-two")])]});
  await new Promise(r=>setTimeout(r,50));
 }};

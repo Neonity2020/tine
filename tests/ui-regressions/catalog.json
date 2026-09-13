@@ -11175,6 +11175,30 @@
             "failBefore": "proven"
       },
       "notes": "Real mouse geometry reproduces host edit on embedded blank row gap and source movement from the visible root bullet. Boundaries now preserve host occurrence drag, source zoom/disclosure and child editing/drag. Readonly host refuses drag even when source is writable. Native Windows WebView proof remains a release gate."
+},
+{
+      "id": "UI-EMBED-EDITOR-SCROLL-ANCHOR-20260913",
+      "title": "Typing in a source below its growing embed retains the editor screen position",
+      "family": "editor",
+      "sources": {
+            "issues": [
+                  515
+            ],
+            "commits": []
+      },
+      "platforms": [
+            "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+            "tests": [
+                  "scripts/check-embed-scroll-anchor.mjs",
+                  "src/editor/scrollAnchor.test.ts"
+            ],
+            "failBefore": "proven"
+      },
+      "notes": "Measured mirror growth104px displaced source editor104px. One active-editor anchor per existing autosize frame now absorbs only above-editor displacement; native height:auto protection remains. Browser covers mirror above/below, no mirror, large editor versus same no-mirror control, Undo, coalesced commits, wheel/focus/disconnect interruptions. Packaged Windows geometry remains a release gate."
 }
   ]
 }
