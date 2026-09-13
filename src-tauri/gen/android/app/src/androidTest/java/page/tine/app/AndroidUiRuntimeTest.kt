@@ -292,6 +292,26 @@ class AndroidUiRuntimeTest {
           tapAtEditorLine(webView, textarea, 0)
           textarea = awaitEditor(webView, blockId, true)
         }
+        evaluateJson(webView, """
+          (() => {
+            window.__nativeSelectionEvents = [];
+            if (!window.__nativeSelectionTraceInstalled) {
+              window.__nativeSelectionTraceInstalled = true;
+              for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'touchstart', 'touchend', 'contextmenu', 'selectionchange']) {
+                document.addEventListener(type, event => {
+                  const editor = document.activeElement;
+                  window.__nativeSelectionEvents.push({type, time: performance.now(), trusted: event.isTrusted,
+                    target: event.target?.className || event.target?.nodeName, x: event.clientX, y: event.clientY,
+                    touchX: event.touches?.[0]?.clientX, touchY: event.touches?.[0]?.clientY,
+                    pointerId: event.pointerId, pointerType: event.pointerType,
+                    start: editor?.selectionStart, end: editor?.selectionEnd});
+                }, true);
+              }
+            }
+            return JSON.stringify({installed:true});
+          })()
+        """.trimIndent())
+        captureStageScreenshot("selection-$kind-before-hold")
         val imeBefore = imeVisible(webView)
         val orientationBefore = currentOrientation(scenario)
         val before = selectionState(webView, blockId)
@@ -300,11 +320,13 @@ class AndroidUiRuntimeTest {
         val holdPoint = if (kind == "single-line") motionPoint(webView, textarea) else editorLinePoint(webView, textarea, 1)
         before.put("holdMotionPoint", JSONArray().put(holdPoint.first.toDouble()).put(holdPoint.second.toDouble()))
         if (kind == "single-line") longPress(webView, textarea) else longPressAtEditorLine(webView, textarea, 1)
+        captureStageScreenshot("selection-$kind-after-hold")
         val completeStateObserved = waitForCondition(SELECTION_TIMEOUT_MS) {
           val state = selectionState(webView, blockId)
           state.optInt("selectionLength") > 0 && state.optBoolean("toolbarVisible") && imeVisible(webView)
         }
         val observed = selectionState(webView, blockId)
+        observed.put("events", evaluateJson(webView, "JSON.stringify({events: window.__nativeSelectionEvents})").getJSONArray("events"))
         observed.put("kind", kind)
         observed.put("caretProbeVisualLine", if (kind == "single-line") JSONObject.NULL else 0)
         observed.put("holdProbeVisualLine", if (kind == "single-line") 0 else 1)
@@ -1079,7 +1101,13 @@ class AndroidUiRuntimeTest {
 
   private fun editorLinePoint(webView: WebView, editor: JSONObject, line: Int): Pair<Float, Float> {
     val lineHeight = editor.getDouble("lineHeight")
-    val cssX = editor.getDouble("left") + minOf(56.0, editor.getDouble("width") * 0.32)
+    // Android can place its insertion handle below the first-line caret. The
+    // same-column native probe was intercepted before WebView received any
+    // touch event. Keep the initial second-line hold over text in a separate
+    // column; this is not a handle drag or a retry after selection failure.
+    val column = if (line == 0) minOf(56.0, editor.getDouble("width") * 0.32)
+      else editor.getDouble("width") * 0.60
+    val cssX = editor.getDouble("left") + column
     val cssY = editor.getDouble("top") + lineHeight * (line + 0.5)
     require(cssY < editor.getDouble("top") + editor.getDouble("height")) {
       "requested visual line $line lies outside the active editor: $editor"
@@ -1448,6 +1476,16 @@ class AndroidUiRuntimeTest {
       SystemClock.sleep(POLL_MS)
     }
     return false
+  }
+
+  private fun captureStageScreenshot(name: String) {
+    val directory = File(ApplicationProvider.getApplicationContext<Context>().filesDir, "android-ui-runtime")
+    require(directory.mkdirs() || directory.isDirectory)
+    val screenshot = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
+      ?: throw AssertionError("missing native stage screenshot: $name")
+    File(directory, "$name.png").outputStream().use {
+      assertTrue("could not encode native stage screenshot: $name", screenshot.compress(Bitmap.CompressFormat.PNG, 100, it))
+    }
   }
 
   private fun emitReceipt(test: String, receipt: JSONObject) {
