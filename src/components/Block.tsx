@@ -2687,6 +2687,7 @@ export function Editor(props: { id: string }): JSX.Element {
       owner: editingOwner(),
       surface: surfaceKey,
       selection: () => ({ start: ref.selectionStart, end: ref.selectionEnd }),
+      viewport: () => ({ editor: ref, scroller: nearestScrollableY(ref) }),
       focused: () => typeof document !== "undefined" && document.activeElement === ref,
     });
     onCleanup(unregisterHistoryTarget);
