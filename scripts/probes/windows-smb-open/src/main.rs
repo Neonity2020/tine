@@ -62,6 +62,15 @@ fn probe(root: &Path) -> io::Result<()> {
     let mut file=step("cap pages open_with Probe.md [read,no-follow]", pages.open_with("Probe.md",&opts))?;
     let mut bytes=Vec::new();step("cap file read_to_end",file.read_to_end(&mut bytes))?;assert_eq!(bytes,expected);
     let bytes=step("cap graph read pages/Probe.md",retained.read("pages/Probe.md"))?;assert_eq!(bytes,expected);
+    step("ambient create nested Unicode control", fs::create_dir_all(root.join("pages/nested folder")))?;
+    step("ambient write nested Unicode control", fs::write(root.join("pages/nested folder/图谱.md"), expected))?;
+    let nested = checked_dir(&pages, "nested folder")?;
+    let bytes = step("cap nested Unicode file read", nested.read("图谱.md"))?;
+    assert_eq!(bytes, expected);
+    let link_meta = step("cap symlink_metadata of known outside junction", retained.symlink_metadata("outside-link"))?;
+    assert!(link_meta.file_type().is_symlink(), "refusal control must really be a link");
+    assert!(checked_dir(&retained, "outside-link").is_err(), "no-follow boundary accepted outside junction");
+    println!("PASS no-follow refuses known outside junction");
     println!("COMPLETE root={}",root.display());
     Ok(())
 }

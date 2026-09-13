@@ -347,6 +347,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.96.0
+      - name: UNC prefix normalization controls
+        run: cargo test --locked --manifest-path scripts/probes/windows-smb-open/Cargo.toml -p cap-primitives --lib removing_extended_prefix_keeps_unc_paths_absolute -- --nocapture
       - name: Compare local, UNC and mapped-drive file access
         shell: pwsh
         run: |

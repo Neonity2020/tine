@@ -7,6 +7,9 @@ $drive = "Z:"
 $createdShare = $false
 $createdMapping = $false
 New-Item -ItemType Directory -Path $graphRoot | Out-Null
+$outside = Join-Path $shareRoot "outside-control"
+New-Item -ItemType Directory -Path $outside | Out-Null
+New-Item -ItemType Junction -Path (Join-Path $graphRoot "outside-link") -Target $outside | Out-Null
 try {
     if (Get-PSDrive -Name Z -ErrorAction SilentlyContinue) { throw "Z: already occupied" }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
