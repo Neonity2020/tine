@@ -2,6 +2,50 @@
  "schemaVersion": 1,
  "entries": [
 {
+ "id": "REG-MANAGED-CHECKPOINT-TITLE-RACE-CLASSIFICATION",
+ "title": "Restored checkpoint title races classify as quarantined conflict rather than malformed index",
+ "family": "managed-storage",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/sync_runtime_tests.rs::restored_checkpoint_title_race_preserves_catalog_index_agreement"
+  ],
+  "scenario": "reg-managed-checkpoint-title-race-classification",
+  "failBefore": "Not established by this source-only registration."
+ },
+ "notes": "Two divergent offline titles after clean checkpoints and reopen reach bounded RecoveryBlocked Quarantined on both peers, without malformed page-name ownership index or wrong terminal state. This does NOT assert automatic convergence or uninterrupted syncing. Current Unreleased wording overclaims the tested outcome; integrating owner must narrow it before release. Existing body inspected 2026-09-13; no new execution, native delivery or performance evidence. Full candidate CI pending."
+},
+{
+ "id": "REG-MANAGED-SAME-PAGE-MOVE-PRESERVES-CHILD-ORDER",
+ "title": "Same-page subtree move changes only root membership and preserves concurrent child order",
+ "family": "managed-storage",
+ "sources": {
+  "issues": [],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::same_page_nested_move_writes_only_the_root_pair_and_preserves_concurrent_child_reorder"
+  ],
+  "scenario": "reg-managed-same-page-move-preserves-child-order",
+  "failBefore": "Not established by this source-only registration."
+ },
+ "notes": "Wrong-home move is rejected; valid move writes the home document and root membership only. Both delivery orders retain concurrent child order, unchanged grandchild order and identical canonical snapshots. This does not establish bulk reconstruction or multi-delete performance; the historical author_outline_builds_page_membership_once_for_many_independent_deletes test no longer exists. That compound changelog performance claim remains unresolved. Existing body inspected 2026-09-13; no new execution, native delivery or performance evidence. Full candidate CI pending."
+},
+{
  "id": "REG-MANAGED-INDEPENDENT-PATH-CONTENT-ADMISSION",
  "title": "Independent rename and other-page content edits preserve author intents in either delivery order",
  "family": "managed-storage",
