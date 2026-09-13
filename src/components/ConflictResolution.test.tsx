@@ -606,7 +606,7 @@ describe("in-page conflict resolution", () => {
     }
   });
 
-  it("rehydrates a durable live conflict after restart and uses its revision guard", async () => {
+  it("rehydrates a durable live conflict and applies the currently reviewed disk revision", async () => {
     const draft: PageDto = {
       name: "Durable",
       kind: "page",
@@ -627,7 +627,7 @@ describe("in-page conflict resolution", () => {
     expect(restored.live?.page.blocks[0].raw).toBe("draft");
     loadSingle({
       ...draft,
-      rev: "disk-rev",
+      rev: "newer-disk-rev",
       blocks: [{ id: "disk", raw: "disk from phone", collapsed: false, children: [] }],
     });
 
@@ -640,7 +640,7 @@ describe("in-page conflict resolution", () => {
     stubBackend({
       durableLiveSaveConflictDiff: async () => ({
         ...markerDiff.diff,
-        conflict_rev: "disk-rev",
+        conflict_rev: "newer-disk-rev",
       }),
       resolveDurableLiveSaveConflict: resolve,
       getPageByPath: async () => null,
@@ -656,7 +656,7 @@ describe("in-page conflict resolution", () => {
       await flush();
       expect(resolve).toHaveBeenCalledTimes(1);
       expect(resolve.mock.calls[0][0].blocks[0].raw).toBe("draft");
-      expect(resolve.mock.calls[0][1]).toBe("disk-rev");
+      expect(resolve.mock.calls[0][1]).toBe("newer-disk-rev");
     } finally {
       dispose();
     }

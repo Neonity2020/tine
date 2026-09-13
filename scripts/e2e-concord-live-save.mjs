@@ -351,7 +351,9 @@ async function runBackend(mode) {
   };
   const forceKillApp = async () => {
     const window = await waitFor(
-      () => windowIds(env)[0],
+      // Graph selection gives the main window a graph-qualified title. The
+      // plain title matcher above deliberately remains for native dialogs.
+      () => windowIds(env, "^Tine( — .*)?$")[0],
       30_000,
       `${suffix}: native app window was absent before SIGKILL`,
     );
@@ -362,6 +364,14 @@ async function runBackend(mode) {
     if (!Number.isInteger(pid) || pid <= 0) {
       throw new Error(`${suffix}: native window exposed invalid app pid ${pid}`);
     }
+    const executable = fs.realpathSync(`/proc/${pid}/exe`);
+    if (executable !== fs.realpathSync(APP)) {
+      throw new Error(`${suffix}: refusing to kill unexpected executable ${executable}`);
+    }
+    fs.writeFileSync(path.join(ARTIFACTS, `${suffix}-killed-app.json`), JSON.stringify({
+      window, pid, executable,
+      title: execFileSync("xdotool", ["getwindowname", window], { encoding: "utf8", env }).trim(),
+    }, null, 2));
     process.kill(pid, "SIGKILL");
     await waitFor(() => !processAlive(pid), 30_000, `${suffix}: SIGKILL did not stop Tine pid ${pid}`);
     browser = undefined;
@@ -452,6 +462,17 @@ async function runBackend(mode) {
     const legacy = await browser.execute(() => localStorage.getItem("tine.concord.live-conflicts.v1"));
     if (legacy !== null) throw new Error(`${suffix}: retired localStorage channel survived first use`);
     console.log(`PASS: ${suffix} SIGKILL restart restored exact capsules, re-observed newer owners, and resolved both sides`);
+  } catch (error) {
+    try {
+      await browser.saveScreenshot(path.join(ARTIFACTS, `${suffix}-failure.png`));
+      const state = await browser.execute(() => ({
+        body: document.body.innerText,
+        active: document.activeElement?.outerHTML,
+        conflicts: [...document.querySelectorAll(".page-conflict")].map(el => el.outerHTML),
+      }));
+      fs.writeFileSync(path.join(ARTIFACTS, `${suffix}-failure.json`), JSON.stringify(state, null, 2));
+    } catch {}
+    throw error;
   } finally {
     try { await stopDriver(true); } catch {}
     await sleep(1500);
