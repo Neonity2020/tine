@@ -303,6 +303,14 @@ decode (torn or foreign bytes at this app-private boundary) is set aside as
 reopens empty; it never blocks capture or resolution. Explicit resolution re-proves
 the active backend's authority and durably rewrites the envelope, or removes
 and directory-syncs the final file, before the frontend acknowledges success.
+For a recovered Direct Files draft, the stored disk revision selects the durable
+recovery path but does not authorize the next write. Review returns the revision
+of the current disk snapshot it actually displays. Apply rechecks that revision
+under the page lock; a subsequent external change returns `conflict.base_rev`
+and preserves the newer bytes for another review. The native and browser review
+adapters share this rule, covered by
+`rehydrates a durable live conflict and applies the currently reviewed disk revision`
+and `concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk`.
 This state is recovery material only: it grants neither graph authority nor a
 Managed storage selection, and no byte is written into the user's graph.
 

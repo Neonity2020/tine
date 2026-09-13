@@ -2593,6 +2593,38 @@
         "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
         "refs": []
       }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Recovered drafts can be resolved after files change while Tine is closed.** Concord now applies choices to the same current file version shown in its review. A further change after review still stops the write and asks for a fresh review.",
+      "userVisible": true,
+      "regressions": [
+        "UI-CONCORD-DURABLE-REVIEW-CURRENT-AUTHORITY"
+      ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "Correction restores existing interaction or safety behavior; no new user action is introduced.",
+        "refs": []
+      },
+      "docs": {
+        "status": "update",
+        "reason": "Recovered Direct review authority must name the displayed current revision; post-review races retain the guarded refusal.",
+        "refs": [
+          "docs/storage-sync-contract.md"
+        ]
+      },
+      "website": {
+        "status": "update",
+        "reason": "Regenerate and verify the Guide site from canonical templates; no separate marketing claim proposed.",
+        "refs": [
+          "website/guide/"
+        ]
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
+        "refs": []
+      }
     }
   ]
 }

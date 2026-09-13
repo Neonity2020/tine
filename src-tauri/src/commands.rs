@@ -4632,10 +4632,13 @@ pub(crate) async fn conflict_capsule_diff(
             }
             None => {
                 let graph = slot.legacy_graph()?;
-                if let Some(expected_disk_rev) = disk_rev {
+                if disk_rev.is_some() {
                     let diff = graph
                         .durable_live_save_conflict_diff(&page, base_text.as_deref())
                         .map_err(CommandError::from)?;
+                    // The capsule selects recovery mode; the newly displayed
+                    // disk snapshot supplies authority for this review.
+                    let expected_disk_rev = diff.conflict_rev.clone();
                     Ok(ConflictCapsuleReview {
                         diff,
                         authority: ConflictCapsuleAuthority::DirectDurable { expected_disk_rev },

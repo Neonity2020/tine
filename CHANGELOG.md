@@ -344,6 +344,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Recovered drafts can be resolved after files change while Tine is closed.** Concord now applies choices to the same current file version shown in its review. A further change after review still stops the write and asks for a fresh review.
+
 - **Quick Capture works on a cold launch.** Starting Tine with `--capture` waits for the selected graph to open before showing the capture window, so page suggestions and the saved completion policy are ready for the first input.
 
 - **Compact PDF toolbars keep More and Close reachable.** The document title

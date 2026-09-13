@@ -14123,9 +14123,12 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let theirs_text = self.managed_read_to_string(&write, &path)?;
         if content_rev(&theirs_text) != expected_disk_rev {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "live conflict changed on disk",
+            return Err(DirectSaveError::into_io(
+                DirectSaveFailureCode::ConflictBaseRev,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "live conflict changed on disk",
+                ),
             ));
         }
         if Format::from_path(&path) == Format::Org && !crate::org::org_editable(&theirs_text) {

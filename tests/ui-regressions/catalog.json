@@ -23,7 +23,7 @@
         "scenario": "concord-durable-review-current-authority",
         "failBefore": "proven"
       },
-      "notes": "Exact a65 native SIGKILL restart displays newer outage bytes but Apply rejects AlreadyExists because the review returns pre-crash capsule disk_rev as authority. Both drafts and external bytes remain safe. Native before receipt: tine-agents/evidence/release-concord-window-20260913/RECEIPT.md and diagnose-callback-wire/after-apply-mine.json. Focused render regression fails disk-rev versus newer-disk-rev. Core post-review external-write rejection remains required. Production repair and native pass-after pending."
+      "notes": "Exact a65 native SIGKILL restart displays newer outage bytes but Apply rejects AlreadyExists because the review returns pre-crash capsule disk_rev as authority. Both drafts and external bytes remain safe. Native before receipt: tine-agents/evidence/release-concord-window-20260913/RECEIPT.md and diagnose-callback-wire/after-apply-mine.json. Focused render regression fails disk-rev versus newer-disk-rev. Core post-review external-write rejection remains required. Both review adapters now mint authority from the displayed diff revision. The post-review disk check remains mandatory and returns typed conflict.base_rev without changing newer bytes. Focused render and core checks pass; combined native pass-after and deployment remain pending."
     },
 {
   "id": "UI-CAPTURE-COLD-START-GRAPH-BINDING",
@@ -44,7 +44,7 @@
     ],
     "failBefore": "proven"
   },
-  "notes": "Native a65aa7ef cold-process restart: ordered physical [, [, F, z input yields [[Fz]] at caret4, followed by unhandled rejection no graph bound for quick capture and no autocomplete rows. First-show and hidden-window reopen phases pass after separate intermediate harness corrections. show_capture clears the binding when refresh cannot find a graph; capture_graph_binding only reads that selection, and fallback focus can still expose editor. No repair or release proof yet. Evidence release-capture-pair-20260913/native-after.log and cold-restart-failure.log; scope is startup show before a usable graph selection, not permission to retarget stale reads."
+  "notes": "Native a65 cold-process restart failed after ordered physical input with no graph bound for quick capture. The native pending-show handoff now binds the graph before mapping Capture and rejects superseded show completion/focus. Exact release-profile candidate31876e1e passed the complete Linux/WebKit Capture journey in one attempt, including initial page/tag input and save, hidden-window policy refresh, and cold restarted typed-policy autocomplete. Evidence: release-capture-pair-20260913/NATIVE-PASS-31876e1e.md. Integration/deployment and final combined release gates remain pending; Windows/macOS native confirmation is not claimed. Frontend reads never retarget the selected graph."
 },
 {
   "id": "UI-QUERY-SINGLE-SLASH-COMMAND",

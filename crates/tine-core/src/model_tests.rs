@@ -19556,9 +19556,15 @@ fn concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk() {
     // An unseen external write invalidates the durable authority rather than
     // being overwritten by choices computed for the prior disk revision.
     fs::write(&path, "- one\n- newer disk two\n").unwrap();
-    assert!(reopened
-        .resolve_durable_live_save_conflict(&page, &capture.disk_rev, &decisions, "union",)
-        .is_err());
+    let rejected = reopened
+        .resolve_durable_live_save_conflict(&page, &capture.disk_rev, &decisions, "union")
+        .unwrap_err();
+    assert_eq!(rejected.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(direct_save_failure_code(&rejected), "conflict.base_rev");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "- one\n- newer disk two\n"
+    );
 
     let refreshed = reopened
         .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
