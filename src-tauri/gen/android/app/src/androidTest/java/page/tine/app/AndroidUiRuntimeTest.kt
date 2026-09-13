@@ -196,6 +196,7 @@ class AndroidUiRuntimeTest {
   @Test
   fun longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation() {
     withFreshDemoGraph("longPressPageReferenceOpensExactlyOnePageActionsMenuWithoutPreviewSelectionOrNavigation") { _, webView ->
+      dismissFirstRunNotices(webView)
       val pageRef = awaitVisibleElementByScrolling(webView, "a.page-ref", "a rendered page reference in the demo graph")
       installLongPressMutationTrace(webView)
       val before = locationAndSelection(webView)
@@ -240,6 +241,16 @@ class AndroidUiRuntimeTest {
   fun initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement() {
     withFreshDemoGraph("initialNativeSelectionShowsMobileToolbarForSingleAndWrappedLinesWithoutHandleMovement") { scenario, webView ->
       dismissFirstRunNotices(webView)
+      val graphRoot = findGeneratedDirectFilesGraph(ApplicationProvider.getApplicationContext<Context>())
+      val welcome = File(graphRoot, "pages").listFiles()?.singleOrNull {
+        it.isFile && runCatching { it.readText().contains("# Welcome to Tine") }.getOrDefault(false)
+      } ?: throw AssertionError("missing generated Welcome fixture")
+      welcome.writeText("# Welcome to Tine\n\n- Native selection paragraph has ordinary editable words across several visual lines so the caret can begin on the first line before a still hold selects a word on the second line.\n- Short selection words\n")
+      awaitCondition("production watcher imports editable native selection paragraphs") {
+        evaluateJson(webView, """
+          (() => JSON.stringify({ imported: document.body.textContent.includes('Native selection paragraph') }))()
+        """.trimIndent()).optBoolean("imported")
+      }
       val selections = JSONArray()
       val failures = mutableListOf<String>()
 
@@ -259,10 +270,13 @@ class AndroidUiRuntimeTest {
             const hit = document.elementFromPoint(${target.getDouble("left") + target.getDouble("width") - 6.0},
               ${target.getDouble("top") + target.getDouble("lineHeight") * 0.5});
             return JSON.stringify({ blockId: hit?.closest('.ls-block')?.dataset.blockId || '',
+              contentOwner: hit?.closest('.block-content-wrapper')?.closest('.ls-block')?.dataset.blockId || '',
               tag: hit?.tagName || '', className: hit?.className || '', target: ${target} });
           })()
         """.trimIndent())
         assertEquals("native editor entry must hit the selected block: $entryHit", blockId, entryHit.optString("blockId"))
+        assertEquals("native editor entry must hit editable content: $entryHit", blockId, entryHit.optString("contentOwner"))
+        Log.i(RECEIPT_TAG, "native selection entry: $entryHit")
         tapContentEditorEntry(webView, target)
         val textarea = awaitEditor(webView, blockId, kind != "single-line")
         if (kind != "single-line") {
@@ -1120,7 +1134,7 @@ class AndroidUiRuntimeTest {
       (() => {
         const state = {
           menuAdds: 0, menuRemoves: 0, previewAdds: 0, previewRemoves: 0,
-          selectionEvents: [], routeEvents: [], mutations: [],
+          selectionEvents: [], routeEvents: [], mutations: [], inputEvents: [],
         };
         const route = () => document.querySelector('.page-title')?.textContent?.trim() || '';
         const snapshot = () => ({
@@ -1133,6 +1147,14 @@ class AndroidUiRuntimeTest {
           if (!(node instanceof Element)) return 0;
           return (node.matches(selector) ? 1 : 0) + node.querySelectorAll(selector).length;
         };
+        for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup', 'click', 'contextmenu']) {
+          document.addEventListener(type, event => state.inputEvents.push({
+            type, trusted: event.isTrusted, target: event.target?.className || event.target?.tagName,
+            path: event.composedPath().slice(0, 6).map(node => node.className || node.tagName || node.constructor.name),
+            x: event.clientX, y: event.clientY, pointerId: event.pointerId,
+            at: performance.now(), ...snapshot(),
+          }), true);
+        }
         const observer = new MutationObserver((records) => {
           for (const record of records) {
             for (const node of record.addedNodes) {

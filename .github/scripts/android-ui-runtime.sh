@@ -117,6 +117,9 @@ run_journey() {
     ! jq -e --arg method "$method" '.test == $method and .screenshot == ($method + ".png")' "$receipt_file" >/dev/null 2>&1 ||
     [[ "$png_signature" != "89504e470d0a1a0a" ]] || [[ ! -s "$receipts" ]]; then
     printf 'Android UI runtime method %s is RED; inspect %s\n' "$method" "$artifact_root" >&2
+    # Keep the actionable assertion visible without downloading retained APKs.
+    tail -n 45 "$runner_output" >&2
+    if [[ -s "$receipt_file" ]]; then head -c 16000 "$receipt_file" >&2; printf '\n' >&2; fi
     return 1
   fi
 }
