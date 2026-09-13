@@ -74,6 +74,7 @@ import {
   endEdit,
   startEditing,
   captureHistoryEditorContext,
+  captureRawHistoryViewport,
   restoreHistoryEditorContext,
   type HistoryEditorContext,
   type EditorSelection,
@@ -3414,11 +3415,13 @@ function performUndo(): Promise<void> | null {
   if (entry.kind === "managed-move") {
     return replayManagedMoveHistory(entry, "undo");
   }
+  const restoreViewport = entry.kind === "raw" ? captureRawHistoryViewport(entry.id) : undefined;
   redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
   scheduleSave();
   restoreEntryContext(entry.context);
+  restoreViewport?.();
   return null;
 }
 
@@ -3442,11 +3445,13 @@ function performRedo(): Promise<void> | null {
     pushToast("Redo skipped: a block with the same id now exists", "error");
     return null;
   }
+  const restoreViewport = entry.kind === "raw" ? captureRawHistoryViewport(entry.id) : undefined;
   undoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("redo");
   scheduleSave();
   restoreEntryContext(entry.context);
+  restoreViewport?.();
   return null;
 }
 

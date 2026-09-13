@@ -24,3 +24,20 @@ it.each(["blur", "disconnect", "cancel"])("drops a pending anchor on %s", (cause
   if (cause === "blur") f.editor.blur(); else if (cause === "disconnect") f.editor.remove(); else f.anchor.cancel();
   f.anchor.restore(); expect(f.scroller.scrollTop).toBe(50);
 });
+
+it("restores to an explicitly supplied focused replacement in the same scroller", () => {
+  const f = fixture();
+  const replacement = document.createElement("textarea");
+  f.editor.replaceWith(replacement); replacement.focus();
+  replacement.getBoundingClientRect = () => ({ top: 70 } as DOMRect);
+  f.anchor.restore(replacement);
+  expect(f.scroller.scrollTop).toBe(20);
+});
+it("rejects a replacement in another scroller", () => {
+  const f = fixture();
+  const replacement = document.createElement("textarea");
+  document.body.append(replacement); replacement.focus();
+  replacement.getBoundingClientRect = () => ({ top: 70 } as DOMRect);
+  f.anchor.restore(replacement);
+  expect(f.scroller.scrollTop).toBe(50);
+});

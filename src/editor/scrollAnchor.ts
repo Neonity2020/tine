@@ -13,11 +13,11 @@ export function captureEditorScrollAnchor(editor: HTMLTextAreaElement, scroller:
   };
   return {
     cancel() { cancel(); cleanup(); },
-    restore() {
+    restore(currentEditor: HTMLTextAreaElement | null = editor) {
       cleanup();
-      if (canceled || !editor.isConnected || !scroller.isConnected ||
-          document.activeElement !== editor || scroller.scrollTop !== scrollTop) return;
-      const displacement = editor.getBoundingClientRect().top - top;
+      if (canceled || !currentEditor?.isConnected || !scroller.isConnected || !scroller.contains(currentEditor) ||
+          document.activeElement !== currentEditor || scroller.scrollTop !== scrollTop) return;
+      const displacement = currentEditor.getBoundingClientRect().top - top;
       if (Math.abs(displacement) > 0.5) scroller.scrollTop += displacement;
     },
   };
