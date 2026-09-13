@@ -1,0 +1,25 @@
+import { For } from "solid-js";
+import { render } from "solid-js/web";
+import { Block } from "../../../src/components/Block";
+import { backend } from "../../../src/backend";
+import { initParser } from "../../../src/render/parse";
+import { editingId, endEdit } from "../../../src/editorController";
+import { doc, loadSingle, pageByName, resetStore, ensurePageLoaded } from "../../../src/store";
+import "../../../src/styles/inter.css";
+import "../../../src/styles/theme.css";
+import "../../../src/styles/ls-shim.css";
+import "../../../src/styles/app.css";
+import { openPage, route } from "../../../src/router";
+await initParser();
+const leaf=(id:string,raw=id,children:any[]=[])=>({id,raw,collapsed:false,children});
+let sourcePage="Embed probe";
+backend().resolveBlocks=async()=>[{page:sourcePage,kind:"page",blocks:[leaf("source","Source root\nid:: source")]}];
+render(()=><main class="main-content" style="padding:32px;height:650px;overflow:auto"><For each={pageByName("Embed probe")?.roots??[]}>{id=><Block id={id}/>}</For></main>,document.getElementById("root")!);
+(window as any).embedProbe={doc,editingId,route,async setup(readonlyHost=false){
+ endEdit("blur");resetStore();
+ sourcePage=readonlyHost?"Source page":"Embed probe";
+ openPage("Embed probe","page");
+ loadSingle({read_only:readonlyHost,name:"Embed probe",title:"Embed probe",kind:"page",pre_block:null,blocks:[leaf("before"),leaf("host","{{embed ((source))}}"),leaf("after"),...(!readonlyHost?[leaf("source","Source root\nid:: source",[leaf("child-one"),leaf("child-two")])]:[]),leaf("tail")]});
+ if(readonlyHost)await ensurePageLoaded({name:"Source page",title:"Source page",kind:"page",pre_block:null,blocks:[leaf("source","Source root\nid:: source",[leaf("child-one"),leaf("child-two")])]});
+ await new Promise(r=>setTimeout(r,50));
+}};

@@ -11472,6 +11472,31 @@
         "failBefore": "proven"
       },
       "notes": "Partial GH #535: actual title DOM submission through real persistence with a typed non-conflict save failure and an unrelated conflict. Rename remains refused and pending body edits remain intact; message names the actual pending/conflicted page, caps listed names at three, and never directs the user to absent conflict review UI. Windows native save refusal and reporter-specific root cause remain unverified. Context-menu caller uses the identical read-only diagnostic; ContextMenu render suite passes."
+    },
+    {
+      "id": "UI-EMBED-INPUT-OWNERSHIP-20260913",
+      "title": "Embed gaps do not edit the host and root bullet drag moves the host occurrence",
+      "family": "editor",
+      "sources": {
+        "issues": [
+          514,
+          516
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-embed-input.mjs",
+          "src/components/Block.embedHierarchy.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Real mouse geometry reproduces host edit on embedded blank row gap and source movement from the visible root bullet. Boundaries now preserve host occurrence drag, source zoom/disclosure and child editing/drag. Readonly host refuses drag even when source is writable. Native Windows WebView proof remains a release gate."
     }
   ]
 }

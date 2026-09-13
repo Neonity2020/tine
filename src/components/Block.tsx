@@ -428,7 +428,7 @@ function CollapseAllBorder(props: { id: string; readOnly: boolean }): JSX.Elemen
   );
 }
 
-export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean }): JSX.Element {
+export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean; dragHostId?: string }): JSX.Element {
   // ONE store read per block for the node itself. Every derivation below reads
   // `node()` several times over, and each raw `doc.byId[id]` costs two Solid
   // store proxy traps (plus a wrap); on a 2000-block page that proxy `get` was
@@ -608,7 +608,13 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
               // PRIMARY-paste that these destinations replace. The bullet ran
               // its own onMouseDown and skipped it.
               internalLinkMouseDown(e);
-              if (e.button === 0 && !readOnly()) beginDrag(props.id, e);
+              // A transparent whole-block embed has only this root bullet. Its
+              // drag moves the occurrence; click/zoom still belongs to source.
+              // Inline/page embeds retain their ordinary source drag semantics.
+              const host = e.currentTarget.closest<HTMLElement>(".block-embed-host");
+              const dragOwner = props.dragHostId && host?.dataset.blockId === props.dragHostId
+                ? props.dragHostId : props.id;
+              if (e.button === 0 && pageWritable(doc.byId[dragOwner].page)) beginDrag(dragOwner, e);
             }}
             onClick={(e) => {
               e.stopPropagation();
