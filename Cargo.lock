@@ -5704,7 +5704,7 @@ dependencies = [
 
 [[package]]
 name = "tine"
-version = "0.6.982"
+version = "0.6.983"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
@@ -5742,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.6.982"
+version = "0.6.983"
 dependencies = [
  "ahash",
  "ammonia",

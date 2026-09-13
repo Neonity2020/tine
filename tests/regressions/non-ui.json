@@ -21,7 +21,7 @@
   "scenario": "reg-managed-checkpoint-title-race-classification",
   "failBefore": "Not established by this source-only registration."
  },
- "notes": "Two divergent offline titles after clean checkpoints and reopen reach bounded RecoveryBlocked Quarantined on both peers, without malformed page-name ownership index or wrong terminal state. This does NOT assert automatic convergence or uninterrupted syncing. Current Unreleased wording overclaims the tested outcome; integrating owner must narrow it before release. Existing body inspected 2026-09-13; no new execution, native delivery or performance evidence. Full candidate CI pending."
+ "notes": "Two divergent offline titles after clean checkpoints and reopen reach bounded RecoveryBlocked Quarantined on both peers, without malformed page-name ownership index or wrong terminal state. This does NOT assert automatic convergence or uninterrupted syncing. Release0.6.983 wording states conflict classification and explicitly preserves the possibility of blocked synchronization. Existing body inspected 2026-09-13; no new execution, native delivery or performance evidence. Full candidate CI pending."
 },
 {
  "id": "REG-MANAGED-SAME-PAGE-MOVE-PRESERVES-CHILD-ORDER",
@@ -43,7 +43,7 @@
   "scenario": "reg-managed-same-page-move-preserves-child-order",
   "failBefore": "Not established by this source-only registration."
  },
- "notes": "Wrong-home move is rejected; valid move writes the home document and root membership only. Both delivery orders retain concurrent child order, unchanged grandchild order and identical canonical snapshots. This does not establish bulk reconstruction or multi-delete performance; the historical author_outline_builds_page_membership_once_for_many_independent_deletes test no longer exists. That compound changelog performance claim remains unresolved. Existing body inspected 2026-09-13; no new execution, native delivery or performance evidence. Full candidate CI pending."
+ "notes": "Wrong-home move is rejected; valid move writes the home document and root membership only. Both delivery orders retain concurrent child order, unchanged grandchild order and identical canonical snapshots. This does not establish bulk reconstruction or multi-delete performance; the historical author_outline_builds_page_membership_once_for_many_independent_deletes test no longer exists. The unsupported bulk reconstruction performance claim was removed from release0.6.983 wording. Existing body inspected 2026-09-13; no new execution, native delivery or performance evidence. Full candidate CI pending."
 },
 {
  "id": "REG-MANAGED-INDEPENDENT-PATH-CONTENT-ADMISSION",

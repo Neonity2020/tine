@@ -1190,11 +1190,15 @@ mod tests {
         // suspect there is anything to click. The anchor-switch prompt is
         // promised in the same words the prompt itself uses.
         assert!(page.markdown.contains("- ## Read a query, then edit it"));
-        assert!(page.markdown.contains("type **/query** and choose **Query**"));
+        assert!(page
+            .markdown
+            .contains("type **/query** and choose **Query**"));
         assert!(page.markdown.contains("field chooser ready"));
         assert!(page.markdown.contains("observed majority type"));
         assert!(page.markdown.contains("cannot be read as the key’s type"));
-        assert!(page.markdown.contains("A hand-written advanced query stays editable as text"));
+        assert!(page
+            .markdown
+            .contains("A hand-written advanced query stays editable as text"));
         assert!(page.markdown.contains("**Find blocks ▾ where …**"));
         assert!(page.markdown.contains("**+ Add condition**"));
         assert!(page.markdown.contains("**Try again**"));
@@ -1421,8 +1425,12 @@ mod tests {
         assert!(page.markdown.contains("**why empty?**"));
         assert!(page.markdown.contains("lists the pages themselves"));
         assert!(page.markdown.contains("`{{query (all-page-tags)}}`"));
-        assert!(page.markdown.contains("every page with at least one `tags::` value"));
-        assert!(page.markdown.contains("Unlinked References header identifies that waiting state"));
+        assert!(page
+            .markdown
+            .contains("every page with at least one `tags::` value"));
+        assert!(page
+            .markdown
+            .contains("Unlinked References header identifies that waiting state"));
         assert!(page.markdown.contains("Save page"));
         assert!(page.markdown.contains("tine.view::"));
         assert!(page.markdown.contains("[[Workflows/Find and revisit]]"));
@@ -1475,8 +1483,12 @@ mod tests {
         assert!(page.markdown.contains("normal tab in a companion pane"));
         assert!(page.markdown.contains("drag the PDF tab"));
         assert!(page.markdown.contains("PDF preparation waits and retries"));
-        assert!(page.markdown.contains("A query about pages cannot currently be included"));
-        assert!(page.markdown.contains("Starting another **Export to PDF…** or switching graphs"));
+        assert!(page
+            .markdown
+            .contains("A query about pages cannot currently be included"));
+        assert!(page
+            .markdown
+            .contains("Starting another **Export to PDF…** or switching graphs"));
         assert!(page
             .markdown
             .contains("opens no print dialog for an incomplete page"));
