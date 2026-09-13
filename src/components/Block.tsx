@@ -802,7 +802,13 @@ function beginEditGesture(
     if (over === g.blockId) {
       const active = document.activeElement;
       if (active instanceof HTMLTextAreaElement && active.classList.contains("block-editor")) {
-        if (g.caretPoints === undefined) g.caretPoints = textareaCaretPoints(active);
+        if (g.caretPoints === undefined) {
+          // Edit entry maps raw source offsets into the actual textarea (code
+          // wrappers, for example, are hidden). Continue from that native
+          // anchor rather than mixing raw-block and editor coordinates.
+          g.offset = active.selectionStart;
+          g.caretPoints = textareaCaretPoints(active);
+        }
         const points = g.caretPoints;
         if (points?.length) {
           const rect = active.getBoundingClientRect();

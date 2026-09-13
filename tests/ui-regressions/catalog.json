@@ -2,6 +2,17 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-MULTILINE-DRAG-ENDPOINT-20260913",
+      "title": "Dragging from a rendered multiline block keeps the text selection endpoint under the pointer",
+      "family": "caret-navigation",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "reproduced",
+      "coverage": { "tests": ["scripts/check-drag-selection.mjs"], "failBefore": "proven" },
+      "notes": "Martin report September 13. Real Block Chromium gesture compared with native textarea clicks at identical positions: wrapping text drifts 6 characters by row 4 and 16 by row 6 at repaired master eb1f83d3; explicit-newline controls pass. Per-character zero-width spans in the measurement mirror introduce word-break opportunities absent from the editor. Native platform acceptance remains pending."
+    },
+    {
       "id": "UI-QUERY-ASYNC-REORDER-FOCUS-20260908",
       "title": "Keyboard reorder retains the moved handle after deferred query saves",
       "family": "query-builder",
