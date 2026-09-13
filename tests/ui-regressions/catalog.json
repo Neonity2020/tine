@@ -11150,6 +11150,31 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: with the projection rebuilding, a query block said 'No results' and offered 'why empty?', which opened an empty panel. Classification: blocking stateful UX (the readiness state was hidden behind a false answer). Mechanism: query_parse retried on readiness with no pending signal, so no reading existed, nothing ran, total() fell to 0, and the empty-answer affordance rendered with an undefined explanation request. Fix: the parse retry reports its readiness like the run does ('Rebuilding the query index…' in the status line and the empty panel), and 'No results' / 'why empty?' render only once an operation has actually come back empty."
-    }
+    },
+{
+      "id": "UI-EMBED-INPUT-OWNERSHIP-20260913",
+      "title": "Embed gaps do not edit the host and root bullet drag moves the host occurrence",
+      "family": "editor",
+      "sources": {
+            "issues": [
+                  514,
+                  516
+            ],
+            "commits": []
+      },
+      "platforms": [
+            "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+            "tests": [
+                  "scripts/check-embed-input.mjs",
+                  "src/components/Block.embedHierarchy.test.tsx"
+            ],
+            "failBefore": "proven"
+      },
+      "notes": "Real mouse geometry reproduces host edit on embedded blank row gap and source movement from the visible root bullet. Boundaries now preserve host occurrence drag, source zoom/disclosure and child editing/drag. Readonly host refuses drag even when source is writable. Native Windows WebView proof remains a release gate."
+}
   ]
 }
