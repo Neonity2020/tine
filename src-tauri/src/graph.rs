@@ -207,16 +207,13 @@ pub(crate) struct CaptureGraphBindingResult {
 pub(crate) fn refresh_capture_graph_binding(
     state: &AppState,
     show_generation: u64,
-) -> Result<u64, crate::command_error::CommandError> {
+) -> Result<Option<u64>, crate::command_error::CommandError> {
     let target = capture_target_for_state(state)?;
     let slot = slot_for_window(state, &target).map_err(crate::command_error::CommandError::from)?;
     let binding_generation = slot.binding_generation;
-    if !state.complete_capture_show(show_generation, target, binding_generation) {
-        return Err(crate::command_error::CommandError::prose(
-            "capture show was superseded",
-        ));
-    }
-    Ok(binding_generation)
+    Ok(state
+        .complete_capture_show(show_generation, target, binding_generation)
+        .then_some(binding_generation))
 }
 
 /// Return the binding selected by the native capture-show path. This is

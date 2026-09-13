@@ -247,14 +247,19 @@ fn show_capture(app: &tauri::AppHandle) {
     }
     let state = app.state::<AppState>();
     let show_generation = state.begin_capture_show();
-    if graph::refresh_capture_graph_binding(&state, show_generation).is_err() {
-        // Cold startup opens the graph asynchronously in the main WebView.
-        // Leave Capture hidden until that publication can install its lease;
-        // accepting typing now would expose an editor with no graph target.
-        if let Some(window) = app.get_webview_window("capture") {
-            let _ = window.hide();
+    match graph::refresh_capture_graph_binding(&state, show_generation) {
+        Ok(Some(_)) => {}
+        Ok(None) => return, // A newer show already owns this window.
+        Err(_) => {
+            // Cold startup opens the graph asynchronously in the main WebView.
+            // Leave Capture hidden until publication installs its read lease.
+            if state.pending_capture_show() == Some(show_generation) {
+                if let Some(window) = app.get_webview_window("capture") {
+                    let _ = window.hide();
+                }
+            }
+            return;
         }
-        return;
     }
     present_capture(app, show_generation);
 }
@@ -266,6 +271,9 @@ fn complete_pending_capture_show(app: &tauri::AppHandle, label: String, binding_
     };
     let ready_app = app.clone();
     let _ = app.run_on_main_thread(move || {
+        if ready_app.get_webview_window(&label).is_none() {
+            return;
+        }
         let state = ready_app.state::<AppState>();
         // Keep the slot stable while installing the lease. A completed older
         // graph open must not resurrect its binding after a switch or close.
@@ -407,13 +415,9 @@ fn capture_frontend_ready(
                 "capture window is hidden",
             ));
         }
-        let show_generation = app
-            .state::<AppState>()
-            .bound_capture_show()
-            .ok_or_else(|| {
-                crate::command_error::CommandError::prose("capture graph is not ready")
-            })?;
-        activate_capture_window(&app, show_generation);
+        if let Some(show_generation) = app.state::<AppState>().bound_capture_show() {
+            activate_capture_window(&app, show_generation);
+        }
         Ok(())
     }
 
