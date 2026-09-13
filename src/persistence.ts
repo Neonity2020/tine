@@ -1365,6 +1365,24 @@ export async function flushAll(): Promise<boolean> {
     && conflicts().length === 0;
 }
 
+/** Explain a refused rename flush using the state that actually blocked it.
+ * The guard remains graph-wide because rename reloads every mounted page. */
+export function renameFlushFailureMessage(): string {
+  if (reopenRequired) {
+    return "Couldn't rename: storage needs to reopen before pending edits can save. Your pending edits are still here.";
+  }
+  const quoted = (names: readonly string[]) => names.map((name) => `“${name}”`).join(", ");
+  const conflicted = conflicts();
+  if (conflicted.length) {
+    return `Couldn't rename: ${quoted(conflicted)} ${conflicted.length === 1 ? "has an unresolved save conflict" : "have unresolved save conflicts"}. Open ${conflicted.length === 1 ? "that page" : "those pages"} and resolve ${conflicted.length === 1 ? "it" : "them"} before renaming. Your pending edits are still here.`;
+  }
+  const pending = [...new Set([...dirty, ...saveChain.keys()])];
+  if (pending.length) {
+    return `Couldn't save pending edits in ${quoted(pending)} before renaming. Check the save error for ${pending.length === 1 ? "that page" : "those pages"}, then try again. Your pending edits are still here.`;
+  }
+  return "Couldn't finish pending saves before renaming. Check the save error, then try again. Your pending edits are still here.";
+}
+
 /** Resolve a save conflict by overwriting the on-disk file with the in-memory
  *  version ("keep mine"). Returns whether the overwrite succeeded — the caller
  *  must not clear the conflict unless it did. */

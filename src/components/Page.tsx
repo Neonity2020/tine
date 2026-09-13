@@ -32,7 +32,7 @@ import { copyGuideIntoGraph, ensureGuidePagesLoaded, isGuidePageName } from "../
 import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
-import { graphBinding } from "../persistence";
+import { graphBinding, renameFlushFailureMessage } from "../persistence";
 import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
 import { selectedThemePresentation } from "../themeGallery";
 import { TodayTaskSummary } from "./TodayTaskSummary";
@@ -772,7 +772,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       // `[[refs]]`, so a dirty edit on ANY page (not just the renamed one) would
       // be read stale and its link left dangling. Abort if anything can't save.
       if (!(await flushAll())) {
-        alert("Couldn't save pending edits — resolve the conflict before renaming.");
+        alert(renameFlushFailureMessage());
         return;
       }
       const outcome = await renameOrMergePage(props.page.name, next, props.page.path);
