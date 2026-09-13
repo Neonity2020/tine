@@ -21,8 +21,16 @@ if [[ ${#app_apks[@]} -ne 1 || ${#test_apks[@]} -ne 1 ]]; then
   exit 1
 fi
 
-adb install -r "${app_apks[0]}"
-adb install -r "${test_apks[0]}"
+# Retain the exact installed bytes with the receipts, including failed journeys.
+# Debug emulator APKs are evidence artifacts, not signed release deliveries.
+cp "${app_apks[0]}" "$artifact_root/tested-app.apk"
+cp "${test_apks[0]}" "$artifact_root/tested-instrumentation.apk"
+(
+  cd "$artifact_root"
+  sha256sum tested-app.apk tested-instrumentation.apk > tested-apks.sha256
+)
+adb install -r "$artifact_root/tested-app.apk"
+adb install -r "$artifact_root/tested-instrumentation.apk"
 # Hosted emulators expose a hardware keyboard by default. Keep the real soft
 # keyboard visible as well so WindowInsets/IME assertions exercise the reported
 # phone boundary instead of timing out for an emulator configuration reason.
