@@ -199,7 +199,7 @@ assert.match(
 assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
 assert.match(
   uiE2eWorkflow,
-  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
+  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_MANAGED_COLD_INDEX_TIMEOUT_MS: "300000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
   "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
 );
 assert.match(
@@ -216,6 +216,11 @@ assert.match(
   windowsManagedScenario,
   /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
   "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
+);
+assert.match(
+  windowsManagedScenario,
+  /COLD_INDEX_TIMEOUT_MS[\s\S]*?coldIndexStarted = Date\.now\(\);\s*await openPage\(nestedTitle, \{ timeout: COLD_INDEX_TIMEOUT_MS \}\);\s*receipt\.milestones\.directFilesColdReady = \{[\s\S]*?elapsedMs:[\s\S]*?maxMs: COLD_INDEX_TIMEOUT_MS[\s\S]*?directFilesPageSwitch = await measurePageSwitches\(\)/,
+  "reporter-scale cold readiness must have a finite recorded bound distinct from warm page-switch measurements"
 );
 // `affe9be1` moved page navigation into ONE implementation, so this property no
 // longer lives in the journey: the scenario calls `openPageByName` and the row
