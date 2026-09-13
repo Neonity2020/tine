@@ -11888,16 +11888,40 @@ fn checkpoint_roots_resolve_a_retired_hot_object_from_cold_history() {
     let (page, revision) = load_application_exact(&handle, "Root.md");
     let _ = save_application_block_text(&handle, page, revision, "object roster authority");
     drain_managed_local(&handle);
+    handle.force_clean_checkpoint_for_test().unwrap();
     drop(handle);
 
-    let objects = clean_operation_archive_directory(&fixture.request.archive_root).join("objects");
-    let object = fs::read_dir(&objects)
+    // This test's precondition is that cold history covers the object it
+    // deletes; otherwise the reopen cannot resolve it and fails with
+    // `missing stored file <digest>.object`. Neither half of that precondition
+    // used to be forced: the checkpoint was whatever `drain_managed_local`
+    // incidentally left behind, and the object was whichever entry `read_dir`
+    // happened to return first. Both are environment-dependent, and CI failed
+    // on them. Force the checkpoint, then select the exact object the
+    // generation's cold accepted-history index proves it covers.
+    let operations = clean_operation_archive_directory(&fixture.request.archive_root);
+    let objects = operations.join("objects");
+    let store = ObjectStore::open(&operations, fixture.request.identities.workspace_id).unwrap();
+    let loaded =
+        match crate::oplog::checkpoint_generation::open_checkpoint_with_cold_history(&store)
+            .unwrap()
+        {
+            crate::oplog::checkpoint_generation::CleanCheckpointOpen::Loaded(loaded) => loaded,
+            _ => panic!("forced checkpoint was not available"),
+        };
+    let object = store
+        .committed_manifest_names_with_cold_history()
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.is_file() && !path.file_name().unwrap().to_string_lossy().starts_with('.')
+        .into_iter()
+        .filter_map(|batch_id| store.resolve_logical_manifest(batch_id).unwrap())
+        .flat_map(|manifest| manifest.required_objects().to_vec())
+        .find_map(|descriptor| {
+            let digest = descriptor.content_digest();
+            let path = objects.join(format!("{digest}.object"));
+            (path.is_file() && loaded.accepted_history.contains_object(digest).unwrap())
+                .then_some(path)
         })
-        .expect("accepted archive has an object");
+        .expect("accepted archive has a hot object explicitly covered by cold history");
     fs::remove_file(object).unwrap();
 
     let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
