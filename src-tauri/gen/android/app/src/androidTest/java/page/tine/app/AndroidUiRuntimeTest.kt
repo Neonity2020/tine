@@ -959,7 +959,8 @@ class AndroidUiRuntimeTest {
               const singleLine = rect.height <= lineHeight * 1.6;
               return length >= $minimumTextLength && length <= $maximumTextLength &&
                 (${if (requireSingleVisualLine) "singleLine" else "!singleLine"}) &&
-                rect.top > 64 && rect.bottom < window.innerHeight * 0.58;
+                rect.top > 64 &&
+                (${if (requireSingleVisualLine) "rect.bottom" else "rect.top + lineHeight * 2"}) < window.innerHeight * 0.58;
             });
           if (!block) return null;
           const content = block.querySelector(':scope > .block-main > .block-content-wrapper');
