@@ -10,7 +10,10 @@ import { deferEditorStartUntilFresh } from "./freshnessBarrier";
 // last visual row (Up), resolved against the TARGET's own editor value/layout
 // so hidden props, calc/annotation blocks, and soft-wrapped lines land correctly.
 // Where layout is unavailable, Up falls back to the last source line.
-export type CaretPos = number | { col: number; edge: "first" | "last" };
+// Structural edits keep the same editor projection, so a selection is expressed
+// in textarea coordinates (unlike numeric raw-block targets).
+export type EditorSelection = { start: number; end: number; direction: "forward" | "backward" | "none" };
+export type CaretPos = number | { col: number; edge: "first" | "last" } | EditorSelection;
 
 export type EndEditReason =
   | "blur"
