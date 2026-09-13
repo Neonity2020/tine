@@ -8,6 +8,7 @@ import { notifyGraphRebound } from "../modeHooks";
 import { initParser } from "../render/parse";
 import {
   doc,
+  editorActivationFor,
   pageByName,
   readPageProperty,
   resetStore,
@@ -24,7 +25,7 @@ import {
   type FeedPage,
   type Node as StoreNode,
 } from "../store";
-import { editingId, endEdit, startEditing } from "../editorController";
+import { editingId, editingOwner, activeSurface, endEdit, startEditing } from "../editorController";
 import { journalTitle } from "../journal";
 import type { GraphMeta, JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
@@ -123,6 +124,163 @@ function graphMetaWithTemplate(template: string | null): GraphMeta {
 }
 
 describe("Journals feed generation lifecycle", () => {
+  it.each([
+    { dirty: false, template: false },
+    { dirty: true, template: false },
+    { dirty: false, template: true },
+    { dirty: true, template: true },
+  ])("shows the new local day without ending an active editor (unsaved: $dirty, template: $template)", async ({ dirty, template }) => {
+    vi.stubGlobal("IntersectionObserver", class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2030, 11, 31, 22));
+    setGraphMeta(graphMetaWithTemplate(template ? "Daily" : null));
+    const yesterday = journalTitle(new Date());
+    const oldDto = journalDto(yesterday, "Existing notes stay here");
+    let materialized: PageDto | null = null;
+    vi.spyOn(backend(), "getPage").mockImplementation(async (name) => name === yesterday ? oldDto : materialized);
+    vi.spyOn(backend(), "listTemplates").mockResolvedValue([{
+      name: "Daily", page: "Templates", kind: "page",
+      blocks: [{ id: "template-note", raw: "Daily template note", collapsed: false, children: [] }],
+    }]);
+    const save = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
+      materialized = dto;
+      return { revision: "new-day-template" };
+    });
+    const api = vi.spyOn(backend(), "journalFeedPage").mockImplementation(async () =>
+      feedResponse(materialized ? [materialized, oldDto] : [oldDto])
+    );
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(doc.feed).toContain(yesterday);
+      expect(mounted.root.textContent).toContain("Existing notes stay here");
+      startEditing(oldDto.blocks[0].id, 5);
+      await flushMicrotasks();
+      const editor = mounted.root.querySelector<HTMLTextAreaElement>("textarea.block-editor")!;
+      expect(editor).not.toBeNull();
+      if (dirty) {
+        editor.value = "Existing notes with unsaved overnight text";
+        editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "text" }));
+      }
+      editor.focus();
+      editor.setSelectionRange(3, 12, "backward");
+      expect(document.activeElement).toBe(editor);
+      const text = editor.value;
+      const owner = editingOwner();
+      const surface = activeSurface();
+      const oldPage = pageByName(yesterday);
+      const oldNode = doc.byId[oldDto.blocks[0].id];
+      const activation = editorActivationFor(yesterday);
+      vi.setSystemTime(new Date(2031, 0, 2, 8));
+      const today = journalTitle(new Date());
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await flushMicrotasks();
+      await flushMicrotasks();
+      await flushMicrotasks();
+      await flushMicrotasks();
+      await vi.waitFor(() => expect(doc.feed[0]).toBe(today));
+      expect(mounted.root.textContent).toContain(today);
+      expect(doc.feed).toContain(yesterday);
+      expect(pageByName(yesterday)).toBe(oldPage);
+      expect(doc.byId[oldDto.blocks[0].id]).toBe(oldNode);
+      expect(mounted.root.querySelector("textarea.block-editor")).toBe(editor);
+      expect(editor.value).toBe(text);
+      expect([editor.selectionStart, editor.selectionEnd, editor.selectionDirection]).toEqual([3, 12, "backward"]);
+      expect(document.activeElement).toBe(editor);
+      expect(editingId()).toBe(oldDto.blocks[0].id);
+      expect(editingOwner()).toBe(owner);
+      expect(activeSurface()).toBe(surface);
+      expect(editorActivationFor(yesterday)).toBe(activation);
+      expect(isDirty(yesterday)).toBe(dirty);
+      expect(save).toHaveBeenCalledTimes(template ? 1 : 0);
+      if (template) expect(mounted.root.textContent).toContain("Daily template note");
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await flushMicrotasks();
+      expect(api).toHaveBeenCalledTimes(2);
+      expect(save).toHaveBeenCalledTimes(template ? 1 : 0);
+      expect(doc.feed.filter((name) => name === today)).toHaveLength(1);
+    } finally {
+      mounted.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("preserves an editor acquired during the rollover read and retains older loaded days", async () => {
+    vi.stubGlobal("IntersectionObserver", class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2030, 6, 15, 22));
+    const yesterday = journalTitle(new Date());
+    const old = journalDto(yesterday, "existing notes");
+    const older = journalDto("Jul 1st, 2030", "older loaded notes");
+    const api = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([old, older]));
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      await flushMicrotasks();
+      const oldPage = pageByName(yesterday);
+      const olderPage = pageByName(older.name);
+      let release!: (response: JournalFeedPage) => void;
+      api.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+      vi.setSystemTime(new Date(2030, 6, 16, 8));
+      window.dispatchEvent(new Event("focus"));
+      await flushMicrotasks();
+      expect(api).toHaveBeenCalledTimes(2);
+      startEditing(old.blocks[0].id, 3);
+      setRaw(old.blocks[0].id, "unsaved while feed read was in flight");
+      release(feedResponse([journalDto(journalTitle(new Date()))]));
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(doc.feed).toEqual([journalTitle(new Date()), yesterday, older.name]);
+      expect(pageByName(yesterday)).toBe(oldPage);
+      expect(pageByName(older.name)).toBe(olderPage);
+      expect(doc.byId[old.blocks[0].id].raw).toBe("unsaved while feed read was in flight");
+      expect(editingId()).toBe(old.blocks[0].id);
+    } finally {
+      mounted.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not install a rollover day whose surface disappears during activation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2030, 6, 15, 22));
+    const yesterday = journalTitle(new Date());
+    vi.spyOn(backend(), "journalFeedPage").mockImplementation(async () => feedResponse([journalDto(yesterday)]));
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      await flushMicrotasks();
+      let release!: () => void;
+      vi.spyOn(backend(), "activateAbsentEditor").mockImplementationOnce((name) => new Promise((resolve) => {
+        release = () => resolve({ activation: 987654, target: `journals/${name}.md`, prospective: true });
+      }));
+      vi.setSystemTime(new Date(2030, 6, 16, 8));
+      const today = journalTitle(new Date());
+      window.dispatchEvent(new Event("focus"));
+      await flushMicrotasks();
+      expect(release).toBeTypeOf("function");
+      mounted.dispose();
+      release();
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(doc.feed).toEqual([yesterday]);
+      expect(pageByName(today)).toBeUndefined();
+    } finally {
+      mounted.dispose();
+    }
+  });
+
   it("surfaces an initial feed read failure instead of claiming the graph has no journals", async () => {
     vi.spyOn(backend(), "journalFeedPage").mockRejectedValue(
       new Error("iCloud journal read failed"),

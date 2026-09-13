@@ -1586,7 +1586,7 @@ export function loadSingle(dto: PageDto, opts: { endEdit?: boolean } = {}) {
 /** Load the journals feed as the main view. */
 export async function loadFeed(
   dtos: PageDto[],
-  opts: { endEdit?: boolean; expectedGraphBinding?: number } = {},
+  opts: { endEdit?: boolean; expectedGraphBinding?: number; preserveExisting?: boolean; isRequestLive?: () => boolean } = {},
 ): Promise<boolean> {
   // Publication FOLLOWS installation. When the DTO is declined the name used to
   // be published into the feed anyway, so the feed rendered a dirty path-pinned
@@ -1602,11 +1602,19 @@ export async function loadFeed(
   const binding = opts.expectedGraphBinding ?? graphBinding();
   const installed: string[] = [];
   for (const dto of dtos) {
-    if (!(await upsertUnlessDirty(dto, binding))) return false;
+    // Calendar rollover can add days without replacing or unmounting any live
+    // feed page. In particular, even a clean active editor owns its exact nodes.
+    if (opts.preserveExisting && doc.feed.includes(dto.name)) {
+      installed.push(dto.name);
+      continue;
+    }
+    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding, isRequestLive: opts.isRequestLive })) return false;
     installed.push(dto.name);
   }
-  if (binding !== graphBinding()) return false;
-  setDoc("feed", installed);
+  if (binding !== graphBinding() || opts.isRequestLive?.() === false) return false;
+  setDoc("feed", opts.preserveExisting
+    ? [...installed, ...doc.feed.filter((name) => !installed.includes(name))]
+    : installed);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
