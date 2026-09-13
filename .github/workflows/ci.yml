@@ -610,7 +610,8 @@ jobs:
         run: |
           [[ "$APP_RUN" =~ ^[0-9]+$ ]]
           app_sha=$(gh run view "$APP_RUN" --repo "$GITHUB_REPOSITORY" --json headSha --jq .headSha)
-          git fetch origin "$app_sha"
+          git fetch --deepen=256 origin "$GITHUB_SHA" "$app_sha"
+          git merge-base --is-ancestor "$app_sha" HEAD
           changed=$(git diff --name-only "$app_sha" HEAD -- . \
             ':!src-tauri/gen/android/app/src/androidTest/java/page/tine/app/AndroidUiRuntimeTest.kt' \
             ':!.github/scripts/android-ui-runtime.sh' ':!.github/workflows/ci.yml')
@@ -621,10 +622,14 @@ jobs:
           mkdir -p test-results/android-ui-runtime/reused
           gh run download "$APP_RUN" --repo "$GITHUB_REPOSITORY" \
             --name "android-ui-runtime-$app_sha" --dir test-results/android-ui-runtime/reused
+          if [[ -e test-results/android-ui-runtime/reused/app-provenance.txt ]]; then
+            echo 'Transitive app reuse is refused; select the original app build run.' >&2
+            exit 1
+          fi
           (cd test-results/android-ui-runtime/reused && sha256sum --check tested-apks.sha256)
           mkdir -p src-tauri/gen/android/app/build/outputs/apk/reused
           cp test-results/android-ui-runtime/reused/tested-app.apk src-tauri/gen/android/app/build/outputs/apk/reused/tested-app.apk
-          printf 'app_run=%s\napp_sha=%s\ninstrumentation_sha=%s\n' "$APP_RUN" "$app_sha" "$GITHUB_SHA" \
+          printf 'reuse_kind=diagnostic\napp_run=%s\napp_sha=%s\ninstrumentation_sha=%s\n' "$APP_RUN" "$app_sha" "$GITHUB_SHA" \
             > test-results/android-ui-runtime/app-provenance.txt
           rm -rf test-results/android-ui-runtime/reused
 
