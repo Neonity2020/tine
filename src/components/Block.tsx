@@ -1,3 +1,4 @@
+import { captureEditorScrollAnchor } from "../editor/scrollAnchor";
 import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { autocompleteFacets, backend } from "../backend";
@@ -1313,6 +1314,8 @@ export function Editor(props: { id: string }): JSX.Element {
     surfaceKey.startsWith("ref:") || surfaceKey.startsWith("embed:") ? surfaceKey : null;
   const structuralSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
+  let pendingScrollAnchor: ReturnType<typeof captureEditorScrollAnchor> | undefined;
+  onCleanup(() => pendingScrollAnchor?.cancel());
   let pluginSlashInvocation = 0;
   let editorMounted = true;
   onCleanup(() => {
@@ -1400,6 +1403,13 @@ export function Editor(props: { id: string }): JSX.Element {
     // dirty or push undo — avoids churn and can't rewrite the block's bytes.
     if (next === node().raw) return;
     const setRawOpts = opts && "timetracking" in opts ? { timetracking: opts.timetracking } : undefined;
+    // Capture at most once for the existing autosize frame, before live mirrors
+    // above us react to setRaw. No document-wide occurrence scan is needed.
+    if (pendingScrollAnchor === undefined) {
+      pendingScrollAnchor = ref && document.activeElement === ref
+        ? captureEditorScrollAnchor(ref, nearestScrollableY(ref)) : null;
+    }
+    autosize();
     setRaw(props.id, next, setRawOpts);
   };
 
@@ -2601,6 +2611,8 @@ export function Editor(props: { id: string }): JSX.Element {
     autosizeRaf = requestAnimationFrame(() => {
       autosizeRaf = undefined;
       resizeNow();
+      pendingScrollAnchor?.restore();
+      pendingScrollAnchor = undefined;
     });
   };
 
