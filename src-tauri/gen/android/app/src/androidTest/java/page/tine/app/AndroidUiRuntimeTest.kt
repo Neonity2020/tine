@@ -312,6 +312,73 @@ class AndroidUiRuntimeTest {
   }
 
   @Test
+  fun toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll() {
+    withFreshDemoGraph("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll") { scenario, webView ->
+      // Ordinary app-private Markdown enters through the production watcher.
+      val root = findGeneratedDirectFilesGraph(ApplicationProvider.getApplicationContext<Context>())
+      val welcome = File(root, "pages").listFiles()?.singleOrNull {
+        it.isFile && runCatching { it.readText().contains("# Welcome to Tine") }.getOrDefault(false)
+      } ?: throw AssertionError("missing generated Welcome fixture")
+      welcome.writeText("# Welcome to Tine\n\n- Toolbar A\n- Toolbar B\n  - Toolbar X\n- Toolbar C\n- Toolbar D\n- Toolbar E\n")
+      val target = awaitElementRectByText(webView, ".block-content-wrapper", "Toolbar C")
+      target.put("lineHeight", 24)
+      tapContentEditorEntry(webView, target)
+      showIme(scenario, webView)
+      awaitElementRect(webView, "[aria-label='Editor toolbar']:not([hidden])")
+      val stages = JSONArray()
+      fun state(): JSONObject = evaluateJson(webView, """
+        (() => {
+          const text = row => (row?.querySelector(':scope > .block-main textarea')?.value ||
+            row?.querySelector(':scope > .block-main > .block-content-wrapper')?.textContent || '').trim();
+          const rows = [...document.querySelectorAll('.ls-block')].filter(row => /^Toolbar [A-EX]$/.test(text(row)));
+          const current = rows.find(row => text(row) === 'Toolbar C');
+          const toolbar = document.querySelector('[aria-label="Editor toolbar"]');
+          return JSON.stringify({parent: text(current?.parentElement?.closest('.ls-block')),
+            order: rows.filter(row => !row.parentElement?.closest('.ls-block')).map(text).join(','),
+            scroll: toolbar?.querySelector('.mobile-keyboard-toolbar-strip')?.scrollLeft ?? toolbar?.scrollLeft ?? 0});
+        })()
+      """.trimIndent())
+      fun action(label: String, parent: String, order: String) {
+        tap(webView, awaitElementRect(webView, "[aria-label='Editor toolbar'] button[aria-label='$label']"))
+        SystemClock.sleep(500) // Observe the compatibility click too, not just pointerup.
+        val observed = state().put("action", label)
+        stages.put(observed)
+        assertEquals("one $label touch parent: $observed", parent, observed.getString("parent"))
+        assertEquals("one $label touch order: $observed", order, observed.getString("order"))
+      }
+      action("Indent", "Toolbar B", "Toolbar A,Toolbar B,Toolbar D,Toolbar E")
+      action("Indent", "Toolbar X", "Toolbar A,Toolbar B,Toolbar D,Toolbar E")
+      action("Outdent", "Toolbar B", "Toolbar A,Toolbar B,Toolbar D,Toolbar E")
+      action("Outdent", "", "Toolbar A,Toolbar B,Toolbar C,Toolbar D,Toolbar E")
+      action("Move block up", "", "Toolbar A,Toolbar C,Toolbar B,Toolbar D,Toolbar E")
+      action("Move block down", "", "Toolbar A,Toolbar B,Toolbar C,Toolbar D,Toolbar E")
+      val strip = awaitElementRect(webView, ".mobile-keyboard-toolbar-strip")
+      val start = motionPoint(webView, strip)
+      val end = motionPoint(webView, strip,
+        strip.getDouble("left") + strip.getDouble("width") / 2 - 42,
+        strip.getDouble("top") + strip.getDouble("height") / 2)
+      val down = SystemClock.uptimeMillis()
+      dispatchMotion(webView, down, MotionEvent.ACTION_DOWN, start.first, start.second)
+      repeat(12) { index ->
+        SystemClock.sleep(25)
+        dispatchMotion(webView, down, MotionEvent.ACTION_MOVE,
+          start.first + (end.first - start.first) * (index + 1) / 12, start.second)
+      }
+      SystemClock.sleep(300)
+      dispatchMotion(webView, down, MotionEvent.ACTION_UP, end.first, end.second)
+      SystemClock.sleep(300)
+      val scrolled = state()
+      stages.put(scrolled.put("action", "native horizontal swipe"))
+      assertTrue("physical toolbar swipe must change scroll: $scrolled", scrolled.getDouble("scroll") > 10)
+      assertEquals("swipe must not move the block", "", scrolled.getString("parent"))
+      action("Indent", "Toolbar B", "Toolbar A,Toolbar B,Toolbar D,Toolbar E")
+      assertEquals("editor handoff must preserve strip scroll", scrolled.getDouble("scroll"), state().getDouble("scroll"), 1.0)
+      emitReceipt("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
+        JSONObject().put("journey", "495-496-native-toolbar").put("stages", stages))
+    }
+  }
+
+  @Test
   fun generatedDirectFilesPdfRouteHonorsHardwareBackHistory() {
     withFreshDemoGraph("generatedDirectFilesPdfRouteHonorsHardwareBackHistory") { scenario, webView ->
       val fixture = installGeneratedPdfLinkFixture()

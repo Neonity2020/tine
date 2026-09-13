@@ -11421,6 +11421,32 @@
         "failBefore": "proven"
       },
       "notes": "Headful Chromium actual native horizontal scrollbar drag fails before and passes after shared edit-entry ownership repair at normal/1.25 zoom; code text still enters editing. Evidence/code-scrollbar-520-20260913. macOS overlay acceptance remains unverified; no release claim."
+    },
+    {
+      "id": "UI-MOBILE-TOOLBAR-SINGLE-GESTURE-20260913",
+      "title": "A mobile toolbar tap dispatches once and retains scrolled action positions",
+      "family": "mobile-editor",
+      "sources": {
+        "issues": [
+          495,
+          496
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "android",
+        "ios"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/check-mobile-toolbar-dispatch.mjs",
+          "src/components/MobileKeyboardToolbar.test.tsx"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Real touch Chromium reproduces pointerup dispatch, focused-editor bridge handoff, toolbar replacement, and duplicate synthesized click on eb1f83d3. Scrolled strip loses its position; packet preserves toolbar ownership and consumes only the matching pointer click. Pass-after: six actual touch structural cases, rapid independent taps and horizontal swipe pass; same DOM and scroll retained. Native Android/iOS acceptance pending."
     }
   ]
 }
