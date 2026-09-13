@@ -1381,12 +1381,16 @@ assert.match(
   /TAURI_DRIVER: process\.env\.TAURI_DRIVER \|\| \(process\.platform === "win32" \? "msedgedriver\.exe" : "tauri-driver"\)/,
   "Windows scenarios still route native WebView2 through the unnecessary Tauri proxy"
 );
+const semanticFailureSource = e2eRunner.match(
+  /function hasRecordedSemanticFailure\(output, errors\) \{[\s\S]*?\n\}/
+);
+assert.ok(semanticFailureSource, "the release runner is missing semantic-failure precedence");
 const driverTransportFailureSource = e2eRunner.match(
   /function isRetryableDriverTransportFailure\(output, errors, timedOut\) \{[\s\S]*?\n\}/
 );
 assert.ok(driverTransportFailureSource, "the release runner is missing its WebDriver transport retry predicate");
 const isRetryableDriverTransportFailure = new Function(
-  `${driverTransportFailureSource[0]}\nreturn isRetryableDriverTransportFailure;`
+  `${semanticFailureSource[0]}\n${driverTransportFailureSource[0]}\nreturn isRetryableDriverTransportFailure;`
 )();
 assert.equal(
   isRetryableDriverTransportFailure(
@@ -1419,13 +1423,33 @@ assert.equal(
   isRetryableDriverTransportFailure("WebDriverError: invalid session id", "", true), false,
   "scenario timeouts must not be retried as driver infrastructure failures"
 );
+// Exact generated-graph Sheets output from native release a65aa7ef: semantic
+// FAIL checks preceded a later cleanup invalid-session error.
+const sheetsRetryOutput = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/sheets-stdout.txt"), "utf8");
+const sheetsRetryErrors = fs.readFileSync(path.join(process.cwd(), "scripts/fixtures/retry-classifier/sheets-stderr.txt"), "utf8");
+assert.equal(isRetryableDriverTransportFailure(sheetsRetryOutput, sheetsRetryErrors, false), false,
+  "a cleanup invalid session must not erase already-recorded Sheets failures");
+for (const semantic of ["FAIL: saved edit was lost", "3 FAILURES (74 checks)", "AssertionError: page content differed", "AssertionError [ERR_ASSERTION]: data differed", "\u001b[31mFAIL: saved edit was lost\u001b[0m"]) {
+  assert.equal(isRetryableDriverTransportFailure(semantic, "WebDriverError: GET /session failed: ECONNRESET", false), false,
+    "recorded semantic failure must dominate later driver transport loss");
+}
+assert.equal(isRetryableDriverTransportFailure("PASS: startup displayed", "WebDriverError: invalid session id", false), true,
+  "successful observations alone must not disable legitimate transport retries");
+assert.equal(isRetryableDriverTransportFailure("0 FAILURES (4 checks)", "WebDriverError: invalid session id", false), true,
+  "a zero-failure summary must not disable a legitimate transport retry");
 const nativeHarnessFailureSource = e2eRunner.match(
   /function isRetryableNativeHarnessFailure\(id, output, errors, timedOut\) \{[\s\S]*?\n\}/
 );
 assert.ok(nativeHarnessFailureSource, "the release runner is missing its Quick Capture native-harness retry predicate");
 const isRetryableNativeHarnessFailure = new Function(
-  `${nativeHarnessFailureSource[0]}\nreturn isRetryableNativeHarnessFailure;`
+  `${semanticFailureSource[0]}\n${nativeHarnessFailureSource[0]}\nreturn isRetryableNativeHarnessFailure;`
 )();
+assert.equal(isRetryableNativeHarnessFailure("capture", "FAIL: saved capture was lost",
+  "BadWindow (invalid Window parameter)\nxdo_get_active_window reported an error", false), false,
+  "a native cleanup failure must not erase a recorded semantic failure");
+assert.equal(isRetryableNativeHarnessFailure("page-properties", "FAIL: content changed",
+  "E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown", false), false,
+  "a later missing-input marker must not erase an earlier semantic failure");
 assert.equal(
   isRetryableNativeHarnessFailure(
     "capture",

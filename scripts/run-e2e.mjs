@@ -491,8 +491,17 @@ function xmlEscape(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
 }
 
+function hasRecordedSemanticFailure(output, errors) {
+  // Scenarios may finish their assertions, then lose the driver during cleanup.
+  // Positive failure evidence takes precedence over any later transport error;
+  // successful checks alone do not rule out an infrastructure retry.
+  const combined = `${output}\n${errors}`.replace(/\u001b\[[0-9;]*m/g, "");
+  return /^\s*(?:FAIL:|[1-9]\d* FAILURES\b)/m.test(combined)
+    || /\bAssertionError(?: \[[^\]]+\])?:/.test(combined);
+}
+
 function isRetryableDriverTransportFailure(output, errors, timedOut) {
-  if (timedOut) return false;
+  if (timedOut || hasRecordedSemanticFailure(output, errors)) return false;
   const combined = `${output}\n${errors}`;
   const webDriverError = /WebDriverError/.test(combined);
   const invalidSession = /WebDriverError:\s*invalid session id\b/.test(combined);
@@ -502,7 +511,7 @@ function isRetryableDriverTransportFailure(output, errors, timedOut) {
 }
 
 function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
-  if (timedOut) return false;
+  if (timedOut || hasRecordedSemanticFailure(output, errors)) return false;
   const combined = `${output}\n${errors}`;
   // Page-properties proves the target editor and document focus before sending
   // ArrowDown, then records the capture-phase key event. Only a missing event is
