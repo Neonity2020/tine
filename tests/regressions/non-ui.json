@@ -1,6 +1,201 @@
 {
  "schemaVersion": 1,
  "entries": [
+{
+ "id": "REG-MANAGED-AUTOMATIC-HISTORY-RECONSTRUCTION",
+ "title": "Automatic history reconstruction preserves original operations and resumes after missing prerequisites arrive",
+ "family": "managed-storage",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 3 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/sync_runtime_tests.rs::p3_automatic_full_history_reconstruction_preserves_original_and_resumes",
+   "crates/tine-core/src/sync_runtime_tests.rs::p3_missing_recovery_prerequisite_is_bounded_then_delivery_cascades"
+  ],
+  "scenario": "reg-managed-automatic-history-reconstruction",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Cold-only history reconstruction preserves exact manifest/object bytes and restores authoring; withheld-parent recovery bounds repeated reconstruction and resumes on delivery. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-MANAGED-PERSISTENT-WRITER-INCARNATION",
+ "title": "Clean and checkpoint reopens preserve writer lanes while lost records separate causal incarnations",
+ "family": "managed-storage",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 42 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/sync_runtime_tests.rs::clean_and_checkpoint_reopens_continue_one_persistent_writer_lane",
+   "crates/tine-core/src/sync_runtime_tests.rs::a_lost_writer_record_keeps_an_older_published_epoch_causally_apart"
+  ],
+  "scenario": "reg-managed-persistent-writer-incarnation",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Healthy full-replay and checkpoint reopens retain peer identities and own causal counters; lost or undecodable records keep older published epochs causally distinct. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-MANAGED-EXACT-PEER-RANGE-ADMISSION",
+ "title": "Incoming updates start at exact retained peer counters and reject overlapping ranges",
+ "family": "managed-storage",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 43 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/oplog/shallow_authoring_tests.rs::exact_frontier_alone_does_not_reject_overlapping_peer_ranges",
+   "crates/tine-core/src/oplog/shallow_authoring_tests.rs::update_ranges_start_at_exact_retained_peer_counters"
+  ],
+  "scenario": "reg-managed-exact-peer-range-admission",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Exact frontier equality alone is insufficient: overlapping peer ranges are rejected and exact retained-counter exports are accepted. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-QE-SELECTIVE-CONJUNCTION-SQL",
+ "title": "Positive conjunction bounds and indexed subqueries preserve query results",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 54 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/sql_gates_tests.rs::a_nested_conjunction_is_part_of_the_root_conjunction",
+   "crates/tine-core/src/query/sql_gates_tests.rs::a_positively_bounded_query_searches_its_anchor_and_indexes_its_subqueries",
+   "crates/tine-core/src/query/sql_gates_tests.rs::the_baseline_and_current_statements_are_measured_against_each_other"
+  ],
+  "scenario": "reg-qe-selective-conjunction-sql",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Nested conjunctions participate in root conjunction bounds and positively bounded queries retain anchor/indexed-subquery behavior. The baseline comparison is ignored by default and requires TINE_QUERY_IDENTITY_GRAPH plus TINE_QUERY_STATEMENT_BASELINE; it is a benchmark harness, not a fresh speedup receipt. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-QE-ORDER-SAMPLE-COMPLETE-STATISTICS",
+ "title": "Ordering and sampling use the complete match set before display caps",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 58 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/results_tests.rs::q4_blocks_sort_all_before_row_cap_and_sample",
+   "crates/tine-core/src/query/results_tests.rs::q4_unsorted_sample_uses_complete_base_order",
+   "crates/tine-core/src/query/results_tests.rs::q4_statistics_cap1_of3_includes_tail_numeric_group"
+  ],
+  "scenario": "reg-qe-order-sample-complete-statistics",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Block ordering precedes caps and sampling; unsorted samples use complete base order and statistics include tail numeric groups beyond the displayed cap. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-QE-PRINT-INDEXED-QUERY-SUBTREES",
+ "title": "Print uses indexed query subtrees and preserves export readiness and cancellation",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 59 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/sync_runtime_tests.rs::print_managed_uses_actor_body_and_sqlite_query_subtrees",
+   "crates/tine-core/src/sync_runtime_tests.rs::print_query_routes_have_no_parsed_graph_hydration",
+   "src/print.query.test.ts"
+  ],
+  "scenario": "reg-qe-print-indexed-query-subtrees",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Managed Print uses actor bodies and SQLite query subtrees; query routes do not hydrate parsed graphs. Frontend Print tests cover its query preparation contract; native PDF rendering needs separate receipts. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-DIRECT-REGISTRY-INDEXED-ROW-SOURCE",
+ "title": "Ready Direct registry rebuilds read the projection and preserve row-source equivalence",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 60 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::every_implemented_row_source_builds_the_same_registry",
+   "crates/tine-core/src/model_tests.rs::registry_row_sources_agree_on_a_real_graph"
+  ],
+  "scenario": "reg-direct-registry-indexed-row-source",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Constructed graph test checks equivalent registries across row sources and proves projection wiring with indexed-read counters. Real-graph equivalence test is ignored by default and needs TINE_REGISTRY_TIMING_GRAPH; no real-corpus or timing run claimed. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
+{
+ "id": "REG-DIRECT-WARM-REOPEN-NO-PARSE",
+ "title": "Unchanged Direct warm reopen parses no pages and answers public queries through SQL",
+ "family": "query-engine",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Release impact registration for Unreleased item 63 at 6bc9c675"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "needs-revalidation",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection.rs::warm_reopen_parses_nothing_and_answers_from_sql",
+   "crates/tine-core/src/direct_projection.rs::public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache"
+  ],
+  "scenario": "reg-direct-warm-reopen-no-parse",
+  "failBefore": "Not established by this metadata registration; existing test source inspected only."
+ },
+ "notes": "Counters assert zero page/stream parses and lowerings on unchanged warm reopen; public bounded and IR queries use SQLite without parsed-cache hydration. This structural proof is not a wall-clock latency measurement. Registered 2026-09-13 from existing executable test bodies. No new test execution, fail-before/pass-after, performance or native delivery result is claimed. Full candidate CI is pending; current release acceptance remains with the integrating owner."
+},
   {
    "id": "REG-DIRECT-RENAME-LITERAL-SCANNER-406",
    "title": "Direct rename copies literal runs and omits scans whose required syntax is absent",
