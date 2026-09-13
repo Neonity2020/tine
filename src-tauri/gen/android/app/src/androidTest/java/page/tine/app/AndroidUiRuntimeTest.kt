@@ -395,6 +395,18 @@ class AndroidUiRuntimeTest {
       assertEquals("swipe must not move the block", "", scrolled.getString("parent"))
       action("Indent", "Toolbar B", "Toolbar A,Toolbar B,Toolbar D,Toolbar E")
       assertEquals("editor handoff must preserve strip scroll", scrolled.getDouble("scroll"), state().getDouble("scroll"), 1.0)
+      val keyboardViewportHeight = webView.height
+      tap(webView, awaitElementRect(webView, "button[aria-label='Hide keyboard']"))
+      awaitCondition("native viewport recovers after hiding the keyboard") {
+        !imeVisible(webView) && webView.height > keyboardViewportHeight
+      }
+      stages.put(JSONObject().put("action", "hide keyboard")
+        .put("keyboardViewportHeight", keyboardViewportHeight).put("restoredViewportHeight", webView.height))
+      val reopened = awaitElementRectByText(webView, ".block-content-wrapper", "Toolbar C")
+      reopened.put("lineHeight", 24)
+      tapContentEditorEntry(webView, reopened)
+      showIme(scenario, webView)
+      action("Outdent", "", "Toolbar A,Toolbar B,Toolbar C,Toolbar D,Toolbar E")
       emitReceipt("toolbarStructuralTouchesDispatchOnceAndRetainHorizontalScroll",
         JSONObject().put("journey", "495-496-native-toolbar").put("stages", stages))
     }
