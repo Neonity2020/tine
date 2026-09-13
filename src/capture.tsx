@@ -44,8 +44,13 @@ import { CAPTURE_SCRATCH_NAME, createCaptureScratchPage } from "./captureSeed";
 // selection highlight, and data-theme="dark" did nothing.
 import "./styles/theme.css";
 import "./lsShimInstall";
+import "./styles/inter.css";
+import "@fontsource-variable/noto-emoji/wght.css";
+import { installEditableEmojiPlatform } from "./editableEmoji";
 import "./styles/app.css";
 import "./styles/capture.css";
+
+installEditableEmojiPlatform();
 
 const SCRATCH = CAPTURE_SCRATCH_NAME;
 
