@@ -16319,14 +16319,27 @@ fn joined_shared_pair_from_graph_copy(
     receiver.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
     receiver.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
 
-    let descriptor = activate_and_prepare_shared(&initiator);
+    // Exact-feed work is page-batched. These copied release corpora are
+    // intentionally larger than the fixed small-fixture budget, so retain a
+    // finite one-turn-per-source-page bound plus the established recovery
+    // slack. The latency interval below starts only after both initial feeds
+    // settle.
+    let initiator_pages = activation_source_counts(&initiator.graph_root).0;
+    let initiator_active = SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone());
+    let initiator_joining = initiator_active.handle.expect("initiator LocalActive");
+    drive_initial_feed_with_turn_budget(&initiator_joining, initiator_pages.saturating_add(128));
+    let descriptor = initiator_joining
+        .prepare_shared()
+        .expect("initiator SharedActive");
+    drop(initiator_joining);
     copy_provider_tree(
         &initiator.request.provider_root,
         &receiver.request.provider_root,
     );
     let receiver_active = SyncRuntimeHandle::activate_or_resume_local(receiver.request.clone());
     let receiver_joining = receiver_active.handle.expect("receiver LocalActive");
-    drive_initial_feed(&receiver_joining);
+    let receiver_pages = activation_source_counts(&receiver.graph_root).0;
+    drive_initial_feed_with_turn_budget(&receiver_joining, receiver_pages.saturating_add(128));
     receiver_joining
         .join_shared(descriptor)
         .unwrap_or_else(|error| panic!("real-corpus receiver could not join: {error}"));
@@ -25936,21 +25949,34 @@ fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {
                 &format!("committed sync latency marker {label} {index}"),
             );
             let committed = std::time::Instant::now();
+            let publish_started = std::time::Instant::now();
             publish_shared_batch(&author_handle, &author, batch_id);
+            let publish = publish_started.elapsed();
+            let author_settle_started = std::time::Instant::now();
             settle_shared_provider(&author_handle);
+            let author_settle = author_settle_started.elapsed();
+            let provider_copy_started = std::time::Instant::now();
             let delivered = copy_provider_batch(
                 &author,
                 &receiver,
                 batch_id,
                 ProviderBatchDelivery::Complete,
             );
+            let provider_copy = provider_copy_started.elapsed();
+            let receiver_observe_started = std::time::Instant::now();
             receiver_handle
                 .observe_provider_paths(delivered, false)
                 .unwrap();
+            let receiver_observe = receiver_observe_started.elapsed();
 
             let mut visible = false;
+            let receiver_admission_started = std::time::Instant::now();
+            let mut receiver_turns = 0usize;
             for _ in 0..1_024 {
+                receiver_turns = receiver_turns.saturating_add(1);
+                let tick_started = std::time::Instant::now();
                 let tick = receiver_handle.tick().unwrap();
+                let tick_elapsed = tick_started.elapsed();
                 assert!(
                     !matches!(
                         tick,
@@ -25961,21 +25987,43 @@ fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {
                     ),
                     "peer admission failed for {label} edit {index}: {tick:?}"
                 );
-                visible = matches!(
-                    receiver_handle
-                        .query(SyncRuntimeQueryRequest::LoadPage {
-                            page_id: page_id.to_string(),
-                            block_limit: 4,
-                        })
-                        .unwrap(),
-                    SyncRuntimeQueryReply::PageWithBlocks(Some(_))
-                );
+                let query_started = std::time::Instant::now();
+                let query = receiver_handle
+                    .query(SyncRuntimeQueryRequest::LoadPage {
+                        page_id: page_id.to_string(),
+                        block_limit: 4,
+                    })
+                    .unwrap();
+                let query_elapsed = query_started.elapsed();
+                if tick_elapsed >= Duration::from_millis(100)
+                    || query_elapsed >= Duration::from_millis(100)
+                {
+                    eprintln!(
+                        "managed_sync_latency_slow_turn corpus={label} edit={index} turn={receiver_turns} tick_us={} query_us={} tick={tick:?}",
+                        tick_elapsed.as_micros(),
+                        query_elapsed.as_micros(),
+                    );
+                }
+                visible = matches!(query, SyncRuntimeQueryReply::PageWithBlocks(Some(_)));
                 if visible {
                     break;
                 }
             }
             assert!(visible, "peer did not expose {label} edit {index}");
-            latency_us.push(committed.elapsed().as_micros() as u64);
+            let receiver_admission = receiver_admission_started.elapsed();
+            let total = committed.elapsed();
+            if total >= Duration::from_millis(250) {
+                eprintln!(
+                    "managed_sync_latency_slow corpus={label} edit={index} total_us={} publish_us={} author_settle_us={} provider_copy_us={} receiver_observe_us={} receiver_admission_us={} receiver_turns={receiver_turns}",
+                    total.as_micros(),
+                    publish.as_micros(),
+                    author_settle.as_micros(),
+                    provider_copy.as_micros(),
+                    receiver_observe.as_micros(),
+                    receiver_admission.as_micros(),
+                );
+            }
+            latency_us.push(total.as_micros() as u64);
         }
 
         latency_us.sort_unstable();
