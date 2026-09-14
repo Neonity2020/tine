@@ -102,6 +102,15 @@ describe("native E2E harness wiring", () => {
     expect(capture).not.toContain("browser.");
   });
 
+  it("keeps sparse two-device failure screenshots outside the journey's WebDriver session", () => {
+    const source = fs.readFileSync(path.join(scriptsDir, "e2e-sparse-v2-two-device.mjs"), "utf8");
+    const failureCapture = source.match(
+      /} catch \(error\) \{[\s\S]*?const failure = \{/,
+    )?.[0] ?? "";
+    expect(failureCapture).toContain("saveEvidenceScreenshot(");
+    expect(failureCapture).not.toContain("browser?.saveScreenshot(");
+  });
+
   it("both checks fire on known-bad input", () => {
     const bad = ["const env = { ...process.env };", "await ensureDisplay();"].join("\n");
     const order = displayOrder(bad);

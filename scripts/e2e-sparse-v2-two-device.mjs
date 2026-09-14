@@ -173,6 +173,19 @@ function windowManagerReady() {
   } catch { return false; }
 }
 
+function saveEvidenceScreenshot(destination) {
+  const result = spawnSync(
+    process.env.E2E_X11_SCREENSHOT || "import",
+    ["-silent", "-window", "root", destination],
+    { env, encoding: "utf8", timeout: 10_000 },
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `X11 screenshot failed: ${result.error || result.stderr || `status ${result.status}`}`,
+    );
+  }
+}
+
 async function assertBody(text, label, timeout = 30_000) {
   try {
     await browser.waitUntil(async () => (await browser.$("body").getText()).includes(text), {
@@ -1089,7 +1102,7 @@ try {
   );
   console.log(`PASS: sparse-v2 two-device ${JOIN_ORDERING} held through ordered partial provider delivery: ${JSON.stringify(receipt.milestones)}`);
 } catch (error) {
-  try { await browser?.saveScreenshot(path.join(ARTIFACTS, `failure-${JOIN_ORDERING}.png`)); } catch {}
+  try { saveEvidenceScreenshot(path.join(ARTIFACTS, `failure-${JOIN_ORDERING}.png`)); } catch {}
   const failure = {
     testedCommit: receipt.testedCommit,
     journey: "sparse-v2-two-device",

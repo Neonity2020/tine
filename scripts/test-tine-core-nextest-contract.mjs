@@ -26,6 +26,8 @@ import {
   ONE_RELEASE_CI_EXCEPTION,
   ONE_RELEASE_CI_EXCEPTION_VERSION,
   PROJECT_VERSION,
+  RELEASE_E2E_EXCEPTION,
+  RELEASE_E2E_EXCEPTION_VERSION,
   classifyRetiredManagedV1Problems,
   linuxReleaseExcludedTestNames,
   oneReleaseCiExceptionActive,
@@ -37,7 +39,7 @@ import {
 // that forces the waiver to be re-measured and re-approved each release instead
 // of quietly becoming permanent: the assertions below prove the exception is
 // INACTIVE here, so a release that has not re-decided cannot inherit it.
-const NEXT_RELEASE_VERSION = "0.6.983";
+const NEXT_RELEASE_VERSION = "0.6.984";
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -156,8 +158,11 @@ assert.deepEqual(
   ONE_RELEASE_CI_EXCEPTION.releaseE2eNonblockingScenarioKeys,
   ["linux-release:managed-journal-feed"]
 );
-assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "managed-journal-feed"), exceptionActive);
-assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "managed-journal-feed", NEXT_RELEASE_VERSION), false);
+assert.deepEqual(RELEASE_E2E_EXCEPTION.scenarioKeys, ["linux-managed-real-release:sparse-v2-two-device-real"]);
+assert.equal(RELEASE_E2E_EXCEPTION_VERSION, "0.6.983");
+assert.equal(releaseE2eScenarioIsNonblocking("linux-managed-real-release", "sparse-v2-two-device-real"), PROJECT_VERSION === RELEASE_E2E_EXCEPTION_VERSION);
+assert.equal(releaseE2eScenarioIsNonblocking("linux-managed-real-release", "sparse-v2-two-device-real", NEXT_RELEASE_VERSION), false);
+assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "managed-journal-feed", ONE_RELEASE_CI_EXCEPTION_VERSION), true);
 assert.equal(releaseE2eScenarioIsNonblocking("linux-release", "some-other-scenario"), false);
 assert.deepEqual(
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
