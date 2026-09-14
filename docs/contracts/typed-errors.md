@@ -275,7 +275,7 @@ Exemplar to imitate: `android_media::call`.
 
 ### `Prose` census
 
-The phase-A syntactic census is 116 production sites (95 in `commands.rs`,
+The phase-A syntactic census is 123 production sites (102 in `commands.rs`,
 21 in `state.rs`; test fixtures excluded). `CommandError::prose` is an identity
 adapter when a phase-B helper already returns `CommandError`, so those retained
 E2 call sites do not erase the typed variant. Phase B adds the placement rows
@@ -307,8 +307,20 @@ no source error to type. No legacy prose site was retained, reintroduced, or
 converted back from a typed variant, and the settings retirement owner below is
 unchanged.
 
+116 → 123 (2026-09-14, publish-query stage 1): `publish_query_plan` and
+`publish_query` each carry the three wrong-reply/deferred arms every
+`sparse_application_handle` command carries (`Published`/`Planned` wrong
+reply, `Refused { message }`, `Deferred`), and `query_publication_error` passes
+the core's `QueryPublicationError::Refused(String)` — a user-facing refusal
+composed in `tine-core` with no source error — through as prose. The budget
+refusal is NOT prose: it is a tagged `query-unavailable` /
+`export_asset_budget_exceeded` error. No legacy prose site was retained,
+reintroduced, or converted back from a typed variant; the retirement owners
+below are unchanged.
+
 | File | Enclosing symbols | Legacy template | Why no typed source exists | Retirement owner |
 | --- | --- | --- | --- | --- |
+| `commands.rs` | `publish_query_plan`, `publish_query`, `query_publication_error` | wrong-reply/deferred/refusal wording | enum outcome has no error value in that arm; core refusal is composed prose | managed outcome taxonomy follow-up |
 | `state.rs` | `require_legacy_authority`, `legacy_graph`, `wait_for_legacy_drain`, `bind`, `replace_if_current` | authority/lease/binding literal or bounded contextual message | local state predicate, not a source error | typed state domain follow-up |
 | `state.rs` | `owned_graph_context`, `canonical_graph_root`, `slot_for_window`, `slot_for_bound_window`, `capture_quick_switch_slot`, `refresh_graph_for_label` | missing/stale/bound-window/canonical-path literal | local state predicate or E2b bridge | W4-E2b |
 | `commands.rs` | `load_workspaces`, `save_workspaces`, `sparse_application_handle`, `prepare_tine_quit_all_slots`, `open_page_file` | unchanged helper display | E2 compatibility adapter; typed phase-B errors pass through unchanged | phase-A adapter cleanup |

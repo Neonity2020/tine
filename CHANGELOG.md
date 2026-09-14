@@ -8,6 +8,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Export…** on any query publishes the pages its results live on as a
+  standalone HTML site under `published-queries/<name>/`, regardless of
+  `public::`. The dialog reviews the page list first; a block query exports
+  whole pages and says so. Links to pages outside the export stay inert,
+  nested queries show only in-export results, and referenced images and files
+  are copied into the folder so it can be moved anywhere. An export that
+  would copy more than the new **Query export size limit** (Settings → Graph)
+  stops and offers the setting; a taken name can be replaced (the previous
+  export is kept in recovery) or given a separate folder. `published-queries/`
+  is never read back as pages.
+
 ### Fixed
 
 - Privacy-safe diagnostic reports now include the bounded reason code for

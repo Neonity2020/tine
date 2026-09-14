@@ -24,7 +24,7 @@ icon:: 📖
 - ## Share the result
   - 1. From the notes page title's right-click menu (or its ⋯ menu): **Copy page as Markdown** puts a clean outline on the clipboard, **Copy / export as…** offers a rendered copy, and **Export to PDF…** prints the whole page through your OS print dialog — always on a light background, whatever your theme. While query results are updating, PDF preparation waits and retries. If a query exceeds a Print limit, narrow it and try again; Tine shows the reason and opens no print dialog for an incomplete page.
   - A query about pages cannot currently be included in a printed page. Starting another **Export to PDF…** or switching graphs cancels the earlier preparation.
-  - 2. Publishing on the web? Pages marked `public:: true` are included in the static HTML export (Settings → Graph → **Export graph to HTML**).
+  - 2. Publishing on the web? Pages marked `public:: true` are included in the static HTML export (Settings → Graph → **Export graph to HTML**). To share just one reading list or project, press **Export…** on a query: the pages its results live on become a standalone site in `published-queries/<name>/`, public or not.
   - Your annotations are stored Logseq-compatibly — the `hls__` page with your notes, an `.edn` sidecar and any clipped area images under `assets/` — so launch snapshots cover your notes, config, and PDF highlights (not media files), and another Logseq-compatible tool reads the same annotations.
 - ## Where next
   - The exact highlight, merge, and storage rules are mapped in [[Features/PDF annotation]]. For quoting anything else with `((…))` and the reference panels, see [[Workflows/Find and revisit]]; for snapshots and backups, [[Reference/Files, external edits, and backups]].
