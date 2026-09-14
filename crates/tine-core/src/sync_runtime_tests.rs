@@ -28449,6 +28449,18 @@ fn managed_projection_rebuild_manual_benchmark() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(8);
     let fixture = ActivationFixture::copied_graph("managed-projection-rebuild", 0xa0e9, &source);
+    // Age authoritative history through a page whose shape the benchmark owns.
+    // Picking the first non-empty page in a real corpus made the gate depend on
+    // whether replacing that page's first flattened block happened to preserve
+    // its document structure. The corpus is still the 1,000+ file activation
+    // and rebuild workload; this one added page only supplies valid repeatable
+    // edits before the projection is discarded.
+    let benchmark_path = "pages/tine-managed-projection-rebuild-benchmark.md";
+    fs::write(
+        fixture.graph_root.join(benchmark_path),
+        b"- projection rebuild benchmark\n",
+    )
+    .expect("controlled projection-rebuild benchmark page is writable");
     let workspace_id = fixture.request.identities.workspace_id;
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
@@ -28479,22 +28491,13 @@ fn managed_projection_rebuild_manual_benchmark() {
     }
     managed_paths.sort();
     let graph_files = managed_paths.len();
-    let editable = managed_paths
-        .into_iter()
-        .filter(|path| {
-            let (page, _) = load_application_exact(&handle, path);
-            !page.blocks.is_empty()
-        })
-        .take(rounds.max(1))
-        .collect::<Vec<_>>();
     assert!(
-        !editable.is_empty(),
-        "real graph copy has an editable managed page"
+        managed_paths.iter().any(|path| path == benchmark_path),
+        "controlled benchmark page is part of the activated real graph copy"
     );
 
     for round in 0..rounds {
-        let path = &editable[round % editable.len()];
-        let (page, revision) = load_application_exact(&handle, path);
+        let (page, revision) = load_application_exact(&handle, benchmark_path);
         let _ = save_application_block_text(
             &handle,
             page,
