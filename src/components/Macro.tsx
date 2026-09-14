@@ -2,6 +2,7 @@ import { For, Show, Switch, Match, createEffect, createMemo, createResource, cre
 import { backend, QueryPrintRefusedError, type QueryNotReadyError } from "../backend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
+import { queryExportBudgetBytes } from "../queryExportBudget";
 import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openQueryExport, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, undo, undoTopTag, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
@@ -516,6 +517,7 @@ export function QueryMacro(props: {
       name: titleOption() ?? "",
       folder: null,
       replace: false,
+      assetBudgetBytes: queryExportBudgetBytes(),
     };
   };
   const sheet = createMemo(() => {

@@ -127,6 +127,14 @@ import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath, rebindCurrentStorageAuthority } from "../graph";
 import { settingsMaximized, setSettingsMaximized } from "../settingsLayout";
+import {
+  DEFAULT_QUERY_EXPORT_BUDGET_MIB,
+  MAX_QUERY_EXPORT_BUDGET_MIB,
+  MIN_QUERY_EXPORT_BUDGET_MIB,
+  changeQueryExportBudgetMiB,
+  queryExportBudgetMiB,
+  resetQueryExportBudget,
+} from "../queryExportBudget";
 import { flushAll } from "../store";
 import {
   AdoptionArchivedError,
@@ -2364,6 +2372,33 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
               {props.publishMsg}
             </div>
           </Show>
+        </div>
+      </div>
+
+      <div class="settings-row" data-setting-label="Query export size limit">
+        <span class="settings-label">Query export size limit</span>
+        <div>
+          <div class="settings-width-control">
+            <input
+              class="settings-num settings-width-number"
+              aria-label="Query export size limit in MiB"
+              type="number"
+              min={MIN_QUERY_EXPORT_BUDGET_MIB}
+              max={MAX_QUERY_EXPORT_BUDGET_MIB}
+              step="64"
+              value={queryExportBudgetMiB()}
+              onChange={(event) => changeQueryExportBudgetMiB(event.currentTarget.valueAsNumber)}
+            />
+            <span class="settings-width-unit">MiB</span>
+            <Show when={queryExportBudgetMiB() !== DEFAULT_QUERY_EXPORT_BUDGET_MIB}>
+              <button class="settings-btn" onClick={resetQueryExportBudget}>Reset</button>
+            </Show>
+          </div>
+          <div class="settings-hint" style={{ "margin-top": "4px" }}>
+            "Export…" on a query copies the images and files its pages reference into the export
+            folder so the folder can be moved anywhere. An export that would copy more than this
+            stops instead of leaving a folder with missing files. Saved on this device.
+          </div>
         </div>
       </div>
     </>

@@ -130,6 +130,7 @@ import { initRefCompletionSettings } from "./refCompletionSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initSettingsLayout } from "./settingsLayout";
+import { initQueryExportBudget } from "./queryExportBudget";
 import {
   conflictPolicyAlwaysAsk,
   holdExternalChange,
@@ -1203,6 +1204,7 @@ export function App(): JSX.Element {
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
   onMount(() => void initSettingsLayout());
+  onMount(() => void initQueryExportBudget());
   onMount(() => void initConflictPolicy());
   // Demo gate for the screenshot harness (mirrors `?conflicts`): turn the
   // always-ask policy on and hold one external change, so the bar is visible

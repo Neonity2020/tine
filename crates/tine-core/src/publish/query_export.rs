@@ -63,6 +63,9 @@ pub struct QueryPublicationRequest {
     /// of failing when it exists.
     #[serde(default)]
     pub replace: bool,
+    /// Byte budget for copied assets (Settings → Graph); `None` = the default.
+    #[serde(default)]
+    pub asset_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,13 +100,17 @@ pub struct QueryPublicationPlan {
 pub enum QueryPublicationError {
     /// A user-facing reason the export cannot proceed as requested.
     Refused(String),
+    /// Copied assets would exceed the export's byte budget; the message names
+    /// the asset, the limit and the setting that raises it. Typed so the UI
+    /// can offer the setting in one click.
+    AssetBudget(String),
     Io(io::Error),
 }
 
 impl std::fmt::Display for QueryPublicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused(message) => f.write_str(message),
+            Self::Refused(message) | Self::AssetBudget(message) => f.write_str(message),
             Self::Io(error) => error.fmt(f),
         }
     }
@@ -113,6 +120,12 @@ impl std::error::Error for QueryPublicationError {}
 
 impl From<io::Error> for QueryPublicationError {
     fn from(error: io::Error) -> Self {
+        if let Some(exceeded) = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<super::AssetBudgetExceeded>())
+        {
+            return Self::AssetBudget(exceeded.0.clone());
+        }
         Self::Io(error)
     }
 }
@@ -416,6 +429,11 @@ pub(crate) fn publish_query_documents(
             leaf: plan.folder.clone(),
             replace: request.replace,
         },
+        asset_budget_bytes: Some(
+            request
+                .asset_budget_bytes
+                .unwrap_or(super::QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES),
+        ),
     };
     let pages = capture
         .into_iter()

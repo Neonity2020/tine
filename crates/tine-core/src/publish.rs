@@ -1363,22 +1363,49 @@ struct Ctx<'a> {
 }
 
 /// One export's asset copier: bounded reads from the ORIGINAL graph's
-/// `assets/`, one copy per referenced file, a per-file threshold that omits
-/// (with a warning) and a cumulative ceiling that omits the rest.
+/// `assets/`, one copy per referenced file, under ONE user-adjustable byte
+/// budget. A missing or unreadable asset is omitted with a warning; an asset
+/// that would take the export over budget FAILS the export (Martin,
+/// 2026-09-14: a silently partial export is worse than a refusal that names
+/// the limit and where to raise it).
 struct AssetSink<'a> {
     source_root: &'a Path,
     stage: &'a PublishStage,
     /// Authored asset path → published relative URL.
     copied: HashMap<String, String>,
-    per_asset: u64,
+    budget: u64,
     remaining: u64,
     warnings: Vec<String>,
+    /// Set once an asset did not fit; the export is then refused after render.
+    over_budget: Option<String>,
 }
 
-/// One referenced local asset may be this large before it is omitted.
-pub const QUERY_EXPORT_ASSET_MAX_BYTES: u64 = 256 * 1024 * 1024;
-/// All copied assets together may reach this before the rest are omitted.
-pub const QUERY_EXPORT_ASSETS_TOTAL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// The default byte budget for one query export's copied assets (Settings →
+/// Graph → "Query export size limit" overrides it per device).
+pub const QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The export's copied assets would exceed the budget; carried inside the
+/// `io::Error` so the query-export layer can hand the user a typed refusal
+/// with the message intact.
+#[derive(Debug)]
+pub struct AssetBudgetExceeded(pub String);
+
+impl std::fmt::Display for AssetBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssetBudgetExceeded {}
+
+fn format_mib(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    if mib >= 100.0 {
+        format!("{mib:.0} MiB")
+    } else {
+        format!("{mib:.1} MiB")
+    }
+}
 
 impl AssetSink<'_> {
     /// The graph-relative `assets/…` path an authored reference names, or
@@ -1403,16 +1430,43 @@ impl AssetSink<'_> {
     }
 
     /// Copy `src` into the stage once; returns the published relative URL, or
-    /// `None` (with a recorded warning) when the asset is missing or over budget.
+    /// `None` when the asset is missing (warning recorded) or would break the
+    /// budget (the export is refused once rendering finishes).
     fn copy(&mut self, src: &str) -> Option<String> {
         let rel = Self::asset_relative(src)?;
         if let Some(published) = self.copied.get(&rel) {
             return Some(published.clone());
         }
+        if self.over_budget.is_some() {
+            return None;
+        }
         let published = format!("assets/{rel}");
-        let limit = self.per_asset.min(self.remaining);
         let path = self.source_root.join("assets").join(&rel);
-        match read_file_bounded(&path, limit) {
+        let len = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => {
+                self.warnings
+                    .push(format!("Asset {rel} was omitted: not a regular file."));
+                return None;
+            }
+            Err(error) => {
+                self.warnings
+                    .push(format!("Asset {rel} was omitted: {error}"));
+                return None;
+            }
+        };
+        if len > self.remaining {
+            self.over_budget = Some(format!(
+                "Export stopped: copying {rel} ({}) would take the export's assets past the {} limit \
+                 ({} already copied). Raise \"Query export size limit\" in Settings → Graph, or \
+                 take the asset off the exported pages.",
+                format_mib(len),
+                format_mib(self.budget),
+                format_mib(self.budget - self.remaining),
+            ));
+            return None;
+        }
+        match read_file_bounded(&path, self.remaining) {
             Ok(Some(bytes)) => {
                 if let Err(error) = write_publish_stage_asset(self.stage, &published, &bytes) {
                     self.warnings
@@ -1423,9 +1477,12 @@ impl AssetSink<'_> {
                 self.copied.insert(rel, published.clone());
                 Some(published)
             }
+            // Grew under an external editor between the size check and the read.
             Ok(None) => {
-                self.warnings.push(format!(
-                    "Asset {rel} was omitted: it exceeds the export size limit."
+                self.over_budget = Some(format!(
+                    "Export stopped: {rel} grew past the {} asset limit while it was being copied. \
+                     Raise \"Query export size limit\" in Settings → Graph and try again.",
+                    format_mib(self.budget)
                 ));
                 None
             }
@@ -3356,10 +3413,12 @@ fn run_static_query(
             result.matched_total.unwrap_or(result.total)
         ));
     }
+    let sampled = view.sample.is_some();
     if let Some(roots) = subtrees {
         return Ok(StaticQueryOutcome {
             pre_filter_total: roots.len(),
             rows: StaticQueryRows::Subtrees(roots),
+            sampled,
         });
     }
     Ok(match result.rows {
@@ -3372,6 +3431,7 @@ fn run_static_query(
             StaticQueryOutcome {
                 rows: StaticQueryRows::Block(groups),
                 pre_filter_total,
+                sampled,
             }
         }
         QueryRows::Page { pages } => {
@@ -3383,6 +3443,7 @@ fn run_static_query(
             StaticQueryOutcome {
                 rows: StaticQueryRows::Page(pages),
                 pre_filter_total,
+                sampled,
             }
         }
     })
@@ -3406,6 +3467,9 @@ fn record_print_error(ctx: &Ctx, error: PrintPreparationError) {
 struct StaticQueryOutcome {
     rows: StaticQueryRows,
     pre_filter_total: usize,
+    /// The view sampled BEFORE the rows were filtered to the publication, so
+    /// the drawn set was influenced by content outside it.
+    sampled: bool,
 }
 
 fn render_query_with_title(
@@ -3486,17 +3550,21 @@ fn render_query_outcome(
             out.push_str("</ul>");
         }
     }
-    if omitted > 0 {
+    // A query export says nothing about what it left out — the count of
+    // omitted rows is itself information about pages outside the export
+    // (Martin, 2026-09-14). The `publish/` site keeps its count: there the
+    // reader already knows the graph has private pages.
+    if omitted > 0 && !ctx.inert_outside_links {
         out.push_str(&format!(
-            "<div class=\"query-omitted\">{} result{} {} omitted.</div>",
+            "<div class=\"query-omitted\">{} result{} on non-public pages omitted.</div>",
             omitted,
-            if omitted == 1 { "" } else { "s" },
-            if ctx.inert_outside_links {
-                "outside this export"
-            } else {
-                "on non-public pages"
-            }
+            if omitted == 1 { "" } else { "s" }
         ));
+    }
+    if ctx.inert_outside_links && outcome.sampled {
+        out.push_str(
+            "<div class=\"query-sampled\">Sampled across the whole graph before this export was selected; the draw may differ from the live graph.</div>",
+        );
     }
     out.push_str("</div>");
     out
@@ -4792,27 +4860,6 @@ fn write_publish_stage_file(stage: &PublishStage, name: &str, bytes: &[u8]) -> i
 thread_local! {
     static PUBLISH_STAGE_WRITE_SWAP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static PUBLISH_RECOVERY_SWAP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    /// `(per_asset, total)` budget for the next export's asset sink, so tests
-    /// can exercise the omission paths without writing gigabytes.
-    static QUERY_EXPORT_ASSET_BUDGET: RefCell<Option<(u64, u64)>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn query_export_asset_budget() -> (u64, u64) {
-    QUERY_EXPORT_ASSET_BUDGET.with(|b| {
-        b.borrow_mut().take().unwrap_or((
-            QUERY_EXPORT_ASSET_MAX_BYTES,
-            QUERY_EXPORT_ASSETS_TOTAL_MAX_BYTES,
-        ))
-    })
-}
-
-#[cfg(not(test))]
-fn query_export_asset_budget() -> (u64, u64) {
-    (
-        QUERY_EXPORT_ASSET_MAX_BYTES,
-        QUERY_EXPORT_ASSETS_TOTAL_MAX_BYTES,
-    )
 }
 
 #[cfg(test)]
@@ -5160,6 +5207,10 @@ impl PublicationOutput {
 pub struct PublicationTarget {
     pub selection: PublicationSelection,
     pub output: PublicationOutput,
+    /// `Some(budget)`: the output is a movable folder — copy every referenced
+    /// local asset into `<leaf>/assets/` under this byte budget. `None`: the
+    /// site keeps linking the graph's sibling `assets/` directory.
+    pub asset_budget_bytes: Option<u64>,
 }
 
 impl PublicationTarget {
@@ -5172,6 +5223,7 @@ impl PublicationTarget {
                 leaf: "publish".to_string(),
                 replace: true,
             },
+            asset_budget_bytes: None,
         }
     }
 }
@@ -5363,15 +5415,15 @@ pub(crate) fn publish_graph_documents_inner(
     let mut count = 0;
     // A closed export travels: copy its referenced assets in. The graph site
     // keeps linking the sibling `assets/` folder as it always has.
-    let asset_sink = matches!(target.selection, PublicationSelection::Paths(_)).then(|| {
-        let (per_asset, remaining) = query_export_asset_budget();
+    let asset_sink = target.asset_budget_bytes.map(|budget| {
         RefCell::new(AssetSink {
             source_root: &graph.root,
             stage: &stage,
             copied: HashMap::new(),
-            per_asset,
-            remaining,
+            budget,
+            remaining: budget,
             warnings: Vec::new(),
+            over_budget: None,
         })
     });
     // The render context: the block-ref index + the graph (so `{{query}}`/`{{embed}}`/
@@ -5456,11 +5508,19 @@ pub(crate) fn publish_graph_documents_inner(
             .ensure_current()
             .map_err(publication_query_io_error)?;
     }
-    let warnings = asset_sink
+    let (warnings, over_budget) = asset_sink
         .as_ref()
-        .map(|sink| sink.borrow().warnings.clone())
+        .map(|sink| {
+            let sink = sink.borrow();
+            (sink.warnings.clone(), sink.over_budget.clone())
+        })
         .unwrap_or_default();
     drop(ctx);
+    if let Some(message) = over_budget {
+        // Nothing reaches the destination: the stage is removed with the
+        // snapshot root, and whatever occupied the folder before stays.
+        return Err(io::Error::other(AssetBudgetExceeded(message)));
+    }
     let retired = commit_publish_stage(graph, stage, &target.output)?;
     Ok(PublishOutcome {
         path: out.display().to_string(),
@@ -6671,6 +6731,7 @@ mod tests {
             name: name.into(),
             folder: None,
             replace: false,
+            asset_budget_bytes: None,
         }
     }
 
@@ -6807,9 +6868,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn query_export_copies_referenced_assets_into_the_leaf() {
-        let dir = query_export_fixture("assets");
+    fn asset_fixture(tag: &str) -> PathBuf {
+        let dir = query_export_fixture(tag);
         for sub in ["assets/sub/deep", "assets/a", "assets/b"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -6818,27 +6878,27 @@ mod tests {
         fs::write(dir.join("assets/b/same.png"), b"b-bytes").unwrap();
         fs::write(dir.join("assets/report.pdf"), b"%PDF-1.4 pdf-bytes").unwrap();
         fs::write(dir.join("assets/talk.mp3"), b"mp3-bytes").unwrap();
-        fs::write(dir.join("assets/huge.bin"), vec![7u8; 64]).unwrap();
-        fs::write(dir.join("assets/late.png"), b"late-bytes").unwrap();
         // The page body references every shape the spec lists: nested path,
-        // same basename in two directories, non-image link + audio, a missing
-        // file, an oversized file, and a file that arrives over the total cap.
+        // same basename in two directories, non-image link + audio, a remote
+        // link, a missing file, and a repeat reference.
         fs::write(
             dir.join("pages/Tasks.md"),
             "- TODO first-task ![nested](../assets/sub/deep/pic.png) ![a](../assets/a/same.png) ![b](../assets/b/same.png)\n\
              - [report](../assets/report.pdf) [ext](https://example.com/x.png)\n\
              - ![music](../assets/talk.mp3)\n\
-             - ![gone](../assets/missing.png) ![huge](../assets/huge.bin) ![again](../assets/a/same.png)\n\
-             - ![late](../assets/late.png)\n",
+             - ![gone](../assets/missing.png) ![again](../assets/a/same.png)\n",
         )
         .unwrap();
+        dir
+    }
+
+    #[test]
+    fn query_export_copies_referenced_assets_into_the_leaf() {
+        let dir = asset_fixture("assets-copy");
         let graph = Graph::open(&dir);
         let _projection = prepare_publication_graph(&graph);
         let request = todo_request("With assets");
         let plan = plan_query_publication(&graph, &request).unwrap();
-        // per-asset 40 B (huge.bin is 64), total 60 B: everything before
-        // late.png fits (10+7+7+18+9 = 51), late.png (10) does not.
-        QUERY_EXPORT_ASSET_BUDGET.with(|b| *b.borrow_mut() = Some((40, 60)));
         let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
         let out = PathBuf::from(&outcome.path);
         let html = fs::read_to_string(out.join("tasks.html")).unwrap();
@@ -6871,22 +6931,78 @@ mod tests {
         );
         // Referenced twice, copied once.
         assert_eq!(html.matches(r#"src="assets/a/same.png""#).count(), 2);
-        // Omitted: missing, over the per-asset limit, over the total limit.
-        assert!(!out.join("assets/huge.bin").exists());
-        assert!(!out.join("assets/late.png").exists());
-        assert_eq!(html.matches("asset-omitted").count(), 3, "{html}");
-        assert_eq!(outcome.warnings.len(), 3, "{:?}", outcome.warnings);
-        assert!(outcome.warnings.iter().any(|w| w.contains("missing.png")));
-        assert!(outcome
-            .warnings
-            .iter()
-            .any(|w| w.contains("huge.bin") && w.contains("size limit")));
-        assert!(outcome
-            .warnings
-            .iter()
-            .any(|w| w.contains("late.png") && w.contains("size limit")));
+        // Missing: a visible marker and one warning, but the export succeeds.
+        assert_eq!(html.matches("asset-omitted").count(), 1, "{html}");
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("missing.png"));
         // The graph site is untouched by all of this: nothing under publish/.
         assert!(!dir.join("publish").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_over_the_asset_budget_is_refused_whole() {
+        let dir = asset_fixture("assets-budget");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        // 10 + 7 + 7 + 18 = 42 bytes fit; talk.mp3 (9) does not.
+        let request = query_export::QueryPublicationRequest {
+            asset_budget_bytes: Some(45),
+            ..todo_request("With assets")
+        };
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let error = publish_query(&graph, &request, &plan.fingerprint).unwrap_err();
+        let query_export::QueryPublicationError::AssetBudget(message) = &error else {
+            panic!("expected a typed budget refusal, got {error:?}");
+        };
+        assert!(message.contains("talk.mp3"), "{message}");
+        assert!(message.contains("Settings"), "{message}");
+        // Nothing reached the destination and no stage was left behind.
+        assert!(!dir.join("published-queries").join("with-assets").exists());
+        assert!(!dir.join("publish").exists());
+        // The same request under a sufficient budget succeeds.
+        let request = query_export::QueryPublicationRequest {
+            asset_budget_bytes: Some(51),
+            ..request
+        };
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert!(dir
+            .join("published-queries/with-assets/assets/talk.mp3")
+            .exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A nested query inside an exported page neither counts what it left
+    /// out nor hides that a sample was drawn over the whole graph.
+    #[test]
+    fn query_export_nested_query_is_silent_about_the_outside_but_flags_sampling() {
+        let dir = query_export_fixture("nested");
+        // Dashboard hosts a query over ALL todos (3 owners) but is only
+        // exported because it carries a matching task of its own.
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- TODO dash-task\n- {{query (task TODO)}}\n- {{query (and (task TODO) (page \"Private Notes\"))}}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- {{query (and (task TODO) (sample 1))}}\n- TODO first-task\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("Nested");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        let out = PathBuf::from(&outcome.path);
+        let dashboard = fs::read_to_string(out.join("dashboard.html")).unwrap();
+        assert!(!dashboard.contains("query-omitted"), "{dashboard}");
+        assert!(!dashboard.contains("omitted"), "{dashboard}");
+        assert!(!dashboard.contains("private-sentinel-text"), "{dashboard}");
+        let tasks = fs::read_to_string(out.join("tasks.html")).unwrap();
+        assert!(tasks.contains("query-sampled"), "{tasks}");
+        assert!(!dashboard.contains("query-sampled"), "{dashboard}");
         let _ = fs::remove_dir_all(&dir);
     }
 

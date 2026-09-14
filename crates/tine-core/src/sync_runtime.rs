@@ -3076,6 +3076,11 @@ pub enum SyncApplicationQueryPublishOutcome {
     Refused {
         message: String,
     },
+    /// Copied assets would exceed the export's byte budget (typed so the UI
+    /// can offer the setting that raises it).
+    OverBudget {
+        message: String,
+    },
     Deferred {
         state: SyncEditorDeferred,
     },
@@ -21789,6 +21794,9 @@ impl RuntimeActor {
             Ok(outcome) => Ok(outcome),
             Err(QueryPublicationError::Refused(message)) => {
                 Ok(SyncApplicationQueryPublishOutcome::Refused { message })
+            }
+            Err(QueryPublicationError::AssetBudget(message)) => {
+                Ok(SyncApplicationQueryPublishOutcome::OverBudget { message })
             }
             Err(QueryPublicationError::Io(error)) => {
                 Ok(SyncApplicationQueryPublishOutcome::Refused {

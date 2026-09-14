@@ -1912,6 +1912,9 @@ pub(crate) async fn publish_query_plan(
                 SyncApplicationQueryPublishOutcome::Refused { message } => {
                     Err(CommandError::prose(message))
                 }
+                SyncApplicationQueryPublishOutcome::OverBudget { message } => {
+                    Err(query_export_budget_error(message))
+                }
                 SyncApplicationQueryPublishOutcome::Deferred { .. } => Err(CommandError::prose(
                     "Tine-managed storage is updating pages. Try again when it finishes.",
                 )),
@@ -1958,6 +1961,9 @@ pub(crate) async fn publish_query(
                 SyncApplicationQueryPublishOutcome::Refused { message } => {
                     Err(CommandError::prose(message))
                 }
+                SyncApplicationQueryPublishOutcome::OverBudget { message } => {
+                    Err(query_export_budget_error(message))
+                }
                 SyncApplicationQueryPublishOutcome::Deferred { .. } => Err(CommandError::prose(
                     "Tine-managed storage is updating pages. Try again when it finishes.",
                 )),
@@ -1978,8 +1984,20 @@ fn query_publication_error(
     use tine_core::publish::query_export::QueryPublicationError;
     match error {
         QueryPublicationError::Refused(message) => CommandError::prose(message),
+        QueryPublicationError::AssetBudget(message) => query_export_budget_error(message),
         QueryPublicationError::Io(error) => CommandError::from(error),
     }
+}
+
+/// Reason code the export dialog keys its "Adjust limit in Settings" action on.
+pub(crate) const QUERY_EXPORT_BUDGET_REASON: &str = "export_asset_budget_exceeded";
+
+fn query_export_budget_error(message: String) -> CommandError {
+    CommandError::tagged(
+        "query-unavailable",
+        Some(QUERY_EXPORT_BUDGET_REASON),
+        Some(serde_json::json!({ "message": message })),
+    )
 }
 
 /// Render one page to a self-contained HTML document (assets inlined, no sidebar)

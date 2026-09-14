@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createResource, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { backend } from "../backend";
-import { queryExportRequest, closeQueryExport, pushToast } from "../ui";
+import { backend, QueryUnavailableError } from "../backend";
+import { queryExportRequest, closeQueryExport, openSettings, pushToast } from "../ui";
 import { registerTransientLayer } from "../transientLayers";
 import type { QueryPublicationPlan, QueryPublicationRequest } from "../types";
 
@@ -19,6 +19,9 @@ export function QueryExportDialog(): JSX.Element {
 }
 
 type Destination = "create" | "replace" | "separate";
+
+/** Mirrors `QUERY_EXPORT_BUDGET_REASON` in `src-tauri/src/commands.rs`. */
+export const QUERY_EXPORT_BUDGET_REASON = "export_asset_budget_exceeded";
 
 function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
   let root: HTMLDivElement | undefined;
@@ -42,6 +45,9 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
   const [acknowledged, setAcknowledged] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [failure, setFailure] = createSignal<string | null>(null);
+  // The export would copy more assets than the device's limit allows: the
+  // failure names the limit and offers the setting in one click.
+  const [overBudget, setOverBudget] = createSignal(false);
 
   const [plan] = createResource(
     () => plannedName(),
@@ -98,6 +104,7 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
     if (!p || !f || !canExport()) return;
     setBusy(true);
     setFailure(null);
+    setOverBudget(false);
     try {
       const outcome = await backend().publishQuery(
         {
@@ -127,9 +134,16 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
       }
     } catch (e) {
       setFailure(String((e as Error)?.message ?? e));
+      setOverBudget(
+        e instanceof QueryUnavailableError && e.reasonCode === QUERY_EXPORT_BUDGET_REASON,
+      );
     } finally {
       setBusy(false);
     }
+  };
+  const adjustLimit = () => {
+    closeQueryExport();
+    openSettings("graph");
   };
 
   onMount(() => {
@@ -255,7 +269,18 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
           </Show>
 
           <Show when={failure()}>
-            {(message) => <div class="query-export-refused" role="alert">{message()}</div>}
+            {(message) => (
+              <div class="query-export-refused" role="alert">
+                {message()}
+                <Show when={overBudget()}>
+                  <div style={{ "margin-top": "6px" }}>
+                    <button class="export-btn-secondary" onClick={adjustLimit}>
+                      Adjust limit in Settings…
+                    </button>
+                  </div>
+                </Show>
+              </div>
+            )}
           </Show>
         </div>
 

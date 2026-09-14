@@ -1146,6 +1146,8 @@ export interface QueryPublicationRequest {
   /** The exact reviewed leaf folder; carried back unchanged on confirm. */
   folder?: string | null;
   replace?: boolean;
+  /** Byte budget for copied assets (Settings → Graph); `null` = the backend default. */
+  assetBudgetBytes?: number | null;
 }
 
 export interface QueryPublicationPage {
