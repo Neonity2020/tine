@@ -1485,6 +1485,28 @@
    ],
    "stability": "quarantined",
    "quarantineReason": "2026-09-09: Initial parallel Direct run timed out creating its WebDriver session before the app launched; unchanged binary and script passed when rerun sequentially. Managed also passed. Retain as nonblocking until startup instability is resolved and sequential burn-in is recorded."
+  },
+  "scripts/e2e-publish-query.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Export\u2026 on a block query publishes the whole owner pages of its results (and only those) into published-queries/<name>/, with outside page links inert and referenced assets copied into the folder.",
+     "blocking": false
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "The dialog lists the owner pages before anything is written and will not export a block query until whole-page export is acknowledged.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "Exact HTML structure, ordering and styling of the exported pages may vary while page membership, link inertness and asset copying hold."
+   ],
+   "nonRequirements": [
+    "No screenshots, geometry, toast wording or search-index contents are asserted."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-14: new journey (publish-query stage 1); nonblocking until a sequential unchanged-binary burn-in on Direct and Managed is recorded."
   }
  }
 }
