@@ -1,6 +1,28 @@
 {
   "schemaVersion": 1,
   "entries": [
+    {
+      "id": "UI-CLOSE-UNSAVED-RECOVERY",
+      "title": "Failed close identifies and preserves unsaved page drafts",
+      "family": "conflict-resolution",
+      "sources": { "issues": [540], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "reported",
+      "coverage": { "tests": ["src/components/UnsavedRecovery.test.tsx"], "failBefore": "pending" },
+      "notes": "Close must expose affected pages, current save state and non-destructive recovery before any discard. Generic native confirmation does not identify drafts. Preserve existing guarded writes."
+    },
+    {
+      "id": "UI-MISSING-PHYSICAL-CONFLICT-RECOVERY",
+      "title": "Unavailable conflict page exposes its retained draft without retargeting files",
+      "family": "conflict-resolution",
+      "sources": { "issues": [541], "commits": [] },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "reported",
+      "coverage": { "tests": ["src/components/Page.test.tsx"], "failBefore": "pending" },
+      "notes": "A failed pinned page read must not hide retained conflict recovery; never fall back to a different same-name physical file or create a new graph file implicitly."
+    },
 {
   "id": "UI-EXTERNAL-ASSET-WATCH-LEXICAL-ALIAS",
   "title": "Approved external assets refresh for symlink-spelled native events",
