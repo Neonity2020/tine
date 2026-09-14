@@ -480,6 +480,12 @@ export function QueryMacro(props: {
    *  for as long as the projection needs — widens exactly that window. The
    *  displayed rows are unaffected: `groupResource` keeps its own `latest`. */
   const executionReading = (): ParsedQuery | undefined => {
+    // `latest` throws once the fetcher rejected (a published export refuses a
+    // substituted argument it never baked — the macro shown in another page's
+    // Linked References); with no error boundary above, that throw would blank
+    // the page. A rejected execution parse is "no runnable form", and the
+    // refusal is surfaced through `emptyResultsMessage` instead.
+    if (executionParsed.error) return undefined;
     const snapshot = executionParsed.latest;
     return snapshot && snapshot.request.argument === executionArg() ? snapshot.reading : undefined;
   };
@@ -1305,12 +1311,20 @@ export function QueryMacro(props: {
    *  "why empty?" affordance describe an ANSWER; before the first operation
    *  lands (parse pending, engine rebuilding) there is no answer to explain. */
   const ranEmpty = () => !!displayedOperation() && !groupResource.loading && !groupResource.error && total() === 0;
+  /** The typed refusal of either parse — authored or execution-side — when no
+   *  operation has landed: a published export answers only the queries it
+   *  was made with, and says so instead of "unavailable". */
+  const parseRefusal = (): QueryUnavailableError | null => {
+    if (displayedOperation()) return null;
+    for (const error of [parsedSnapshot.error, executionParsed.error]) {
+      if (error instanceof QueryUnavailableError) return error;
+    }
+    return null;
+  };
   const emptyResultsMessage = () => groupsPending()?.message ?? parsePending()?.message
-    ?? (groupResource.error || (!displayedOperation() && parsedSnapshot.error)
-      ? (!displayedOperation() && parsedSnapshot.error instanceof QueryUnavailableError
-        // A typed refusal explains itself (a published export answers only
-        // the queries it was made with); anything else stays generic.
-        ? parsedSnapshot.error.message : "Query results unavailable")
+    ?? (groupResource.error || (!displayedOperation() && (parsedSnapshot.error || executionParsed.error))
+      // A typed refusal explains itself; anything else stays generic.
+      ? (parseRefusal()?.message ?? "Query results unavailable")
       : groupResource.loading || !displayedOperation() ? "Loading query results…" : "No results");
   const groupsError = () => {
     const error = groupResource.error;
@@ -2040,6 +2054,14 @@ export function QueryMacro(props: {
                   has not landed yet — so the count never disappears. */}
               <Show when={!showBuilder()}>
                 <span class="query-count">{total()}</span>
+              </Show>
+              {/* A published export has no builder sentence to say the rows
+                  are a sample; the header says it, so a reader knows the
+                  count is not the whole answer. */}
+              <Show when={published && displayView().sample !== undefined}>
+                <span class="query-sample-note" title="The export shows a sample of the matching rows">
+                  {" "}sample of {displayView().sample}
+                </span>
               </Show>
               <Show when={props.blockId && !exportRefusal() && !published}>
                 <button

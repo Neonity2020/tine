@@ -124,3 +124,59 @@ pub fn anchored_view(parsed: &ParsedQuery, anchor: super::ir::Anchor) -> ViewSet
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::ir::Anchor;
+
+    /// The producer half of the published-export view key: the engine writes
+    /// its `ViewSettings` DENSELY (every list field present, empty or not),
+    /// while the frontend resolves the same scoped draft sparsely
+    /// (`queryParsedDisplaySettings` omits what the draft did not state).
+    /// `publishedBackend.ts` `viewKey` folds the two together; this pins the
+    /// shape it folds, so a serde change here fails before a reader gets the
+    /// unsampled twin's rows (`publishedBackend.test.ts`, "matches a view the
+    /// engine wrote densely…", is the consumer half).
+    #[test]
+    fn anchored_view_of_a_scoped_draft_serializes_densely() {
+        // `tine.block-display:: 1` is the marker that makes the block-scoped
+        // draft PRESENT; the sample rides inside it.
+        let properties = vec![
+            ("tine.block-display".to_string(), "1".to_string()),
+            ("tine.block-sample".to_string(), "2".to_string()),
+        ];
+        let parsed = parse_query_pair(
+            "(task TODO)",
+            QueryTextDialect::MacroQuery,
+            &properties,
+            Registry::none(),
+        );
+        assert_eq!(
+            parsed
+                .scoped
+                .block_display
+                .as_ref()
+                .and_then(|draft| draft.sample),
+            Some(2),
+            "the scoped draft carries the sample"
+        );
+        let block = serde_json::to_value(anchored_view(&parsed, Anchor::Block)).unwrap();
+        assert_eq!(
+            block,
+            serde_json::json!({
+                "view": "list",
+                "sort": [],
+                "columns": [],
+                "aggregates": [],
+                "sample": 2
+            })
+        );
+        let page = serde_json::to_value(anchored_view(&parsed, Anchor::Page)).unwrap();
+        assert_eq!(
+            page,
+            serde_json::json!({ "view": "list", "sort": [], "columns": [], "aggregates": [] }),
+            "the page half inherits the singular view, which the draft did not touch"
+        );
+    }
+}

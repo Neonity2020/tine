@@ -49,7 +49,10 @@ that differ only in `tine.sample::` are two records) — and a miss is a typed
 `query-unavailable` / `published_export_static`, never a browser-side run.
 The engine runs each query under the view its result kind resolves to, the
 way the app does (`anchored_view`), and the export's home block carries the
-host block's `tine.*` properties so the home opens under the same display. The Quick Switcher's
+host block's `tine.*` properties so the home opens under the same display
+(an advanced home has none to carry; it runs under its own settings). The
+engine's view is written densely and the app's resolved sparsely; the two are
+compared under one normalizing key, pinned from both sides. The Quick Switcher's
 navigation search is a substring match over the snapshot's page names and block
 text, as the browser mock's is; every other search lane is refused. Every other method is
 classified answered / constant / refused, and the guard test
@@ -76,7 +79,8 @@ window are not shipped; the export uses the browser's emoji face.
   a typed reason, and the Guide says so; local table-column sorting re-orders
   baked rows in the browser and changes nothing. A reader who wants more needs
   the app. Settings, favorites, the graph switcher and the plugin registry are
-  not offered in an export.
+  not offered in an export. A sampled query says "sample of N" beside its
+  count, since the builder sentence that says so in the app is not offered.
 - The frontend bundle is embedded in the binary already; an export copies it
   (~8 MB of assets) beside the pages. No second build, no second embed.
 - `Backend` grows a third implementation that must be kept classified; the

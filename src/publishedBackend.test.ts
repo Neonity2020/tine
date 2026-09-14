@@ -5,9 +5,11 @@ import {
   publishedSnapshotUrl,
   stableJson,
   validateSnapshot,
+  viewKey,
   type PublishedSnapshot,
 } from "./publishedBackend";
 import { PublishedExportReadOnlyError, QueryUnavailableError } from "./backend";
+import { queryParsedDisplaySettings } from "./editor/queryDisplayDraft";
 import type { ParsedQuery, QueryResult } from "./editor/queryIr";
 
 // The snapshot backend answers exactly what the engine baked (spec §5.2): a
@@ -172,6 +174,34 @@ describe("published backend: the two query seams", () => {
     expect(await backend.queryRun(query, { view: "board" } as never, { current_page: "Dashboard" })).toEqual(result("dashboard-rows"));
   });
 
+  it("matches a view the engine wrote densely against the sparse view the app resolves for it", async () => {
+    // The producer (`anchored_view` in Rust) serializes `ViewSettings` with
+    // its list fields always present; the consumer (`queryParsedDisplaySettings`
+    // → `queryDisplaySettings`) omits every field a scoped draft did not state.
+    // The two must select the same record, or a scoped `tine.block-sample::`
+    // twin would silently answer with its unsampled sibling's rows.
+    const two = fixture();
+    const plain = two.queries[1];
+    const parsedScoped = {
+      ...parsed("dashboard-executed"),
+      view: { view: "list", sort: [], columns: [], aggregates: [] },
+      block_display: { sample: 2 },
+    };
+    two.queries.push({
+      ...plain,
+      parsed: parsedScoped as never,
+      properties: [["tine.block-sample", "2"]],
+      view: { view: "list", sort: [], columns: [], aggregates: [], sample: 2 } as never,
+      result: result("two-of-four"),
+    });
+    const backend = publishedBackend(() => Promise.resolve(two));
+    const asked = queryParsedDisplaySettings(parsedScoped as never, "block");
+    expect(asked).toEqual({ view: "list", sample: 2 });
+    expect(await backend.queryRun(parsed("dashboard-executed").query, asked, { current_page: "Dashboard" })).toEqual(result("two-of-four"));
+    expect(viewKey({ view: "list", sort: [], columns: [], aggregates: [], sample: 2 })).toBe(viewKey({ sample: 2, view: "list" }));
+    expect(viewKey({ view: "list", columns: ["page"] })).not.toBe(viewKey({ view: "list" }));
+  });
+
   it("answers only the assets it copied: a path that leaves assets/ is refused, not fetched", async () => {
     const backend = publishedBackend(load);
     const fetched: string[] = [];
@@ -183,7 +213,14 @@ describe("published backend: the two query seams", () => {
     try {
       expect(await backend.streamAsset("talk.mp3")).toBe("../assets/talk.mp3");
       expect(await backend.streamAsset("2026/a b.png")).toBe("../assets/2026/a%20b.png");
-      for (const name of ["../../private.png", "assets/../../x", "/etc/passwd", "https://example.test/x", "a//b", "."]) {
+      // What the static copier accepts (`AssetSink::asset_relative`) is
+      // answered under the path it copied to: a colon in a name is a name,
+      // `.` and empty steps collapse the way `Path::components` collapses them.
+      expect(await backend.streamAsset("x:y.png")).toBe("../assets/x%3Ay.png");
+      expect(await backend.streamAsset("nested//a.png")).toBe("../assets/nested/a.png");
+      expect(await backend.streamAsset("nested/./a.png")).toBe("../assets/nested/a.png");
+      expect(await backend.streamAsset(".hidden.png")).toBe("../assets/.hidden.png");
+      for (const name of ["../../private.png", "assets/../../x", "/etc/passwd", "https://example.test/x", "data:image/png;base64,AA", "a\\b.png", ".", "", "./"]) {
         expect(await backend.streamAsset(name), name).toBe("");
         expect(await backend.readAsset(name), name).toEqual(new Uint8Array());
       }

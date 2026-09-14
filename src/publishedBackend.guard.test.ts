@@ -20,15 +20,25 @@ import { PublishedExportReadOnlyError } from "./backend";
 // Blessed exemplar for the pattern: src/plugins/capabilityBoundary.test.ts.
 
 /** Every member of `export interface Backend` in backend.ts — method
- *  signatures and function-valued properties alike — read through the
- *  TypeScript AST, so indentation, comments, overloads and property syntax
- *  cannot hide a member from the classification. */
+ *  signatures and function-valued properties alike, own or inherited through
+ *  `extends` from an interface in the same file — read through the
+ *  TypeScript AST, so indentation, comments, overloads, property syntax and
+ *  inheritance cannot hide a member from the classification. A base that is
+ *  not declared in the file cannot be walked and fails loudly. */
 export function backendInterfaceMethods(source = readFileSync(new URL("./backend.ts", import.meta.url), "utf8")): string[] {
   const file = ts.createSourceFile("backend.ts", source, ts.ScriptTarget.Latest, true);
-  const names = new Set<string>();
+  const interfaces = new Map<string, ts.InterfaceDeclaration>();
   for (const statement of file.statements) {
-    if (!ts.isInterfaceDeclaration(statement) || statement.name.text !== "Backend") continue;
-    for (const member of statement.members) {
+    if (ts.isInterfaceDeclaration(statement)) interfaces.set(statement.name.text, statement);
+  }
+  const names = new Set<string>();
+  const visited = new Set<string>();
+  const collect = (name: string) => {
+    if (visited.has(name)) return;
+    visited.add(name);
+    const declaration = interfaces.get(name);
+    if (!declaration) throw new Error(`Backend extends ${name}, which is not an interface declared in backend.ts`);
+    for (const member of declaration.members) {
       if (ts.isMethodSignature(member) || ts.isPropertySignature(member)) {
         if (member.name && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name))) names.add(member.name.text);
         else throw new Error(`Backend member with an unsupported name at ${member.pos}`);
@@ -36,7 +46,15 @@ export function backendInterfaceMethods(source = readFileSync(new URL("./backend
         throw new Error(`Backend member that is neither a method nor a property at ${member.pos}`);
       }
     }
-  }
+    for (const clause of declaration.heritageClauses ?? []) {
+      if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+      for (const type of clause.types) {
+        if (!ts.isIdentifier(type.expression)) throw new Error(`Backend extends an unsupported base at ${type.pos}`);
+        collect(type.expression.text);
+      }
+    }
+  };
+  collect("Backend");
   expect(names.size).toBeGreaterThan(0);
   return [...names].sort();
 }
@@ -52,6 +70,14 @@ describe("published backend classification (spec §5)", () => {
       "export interface Backend {\n  a(): Promise<void>;\n\tb?(): void;\n    c: () => Promise<void>;\n  /* d(): void */\n  // e(): void\n  f<T>(x: T): T;\n  f(): void;\n}\n",
     );
     expect(names).toEqual(["a", "b", "c", "f"]);
+  });
+
+  it("sees a member inherited through `extends`, and refuses a base it cannot read", () => {
+    const names = backendInterfaceMethods(
+      "interface Reads { g(): void }\ninterface Writes extends Reads { h(): void }\nexport interface Backend extends Writes, Reads {\n  a(): void;\n}\n",
+    );
+    expect(names).toEqual(["a", "g", "h"]);
+    expect(() => backendInterfaceMethods("export interface Backend extends Elsewhere { a(): void }\n")).toThrow(/Elsewhere/);
   });
 
   it("puts every Backend method in exactly one class", () => {

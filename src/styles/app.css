@@ -8301,6 +8301,13 @@ img.emoji {
   line-height: 18px;
 }
 
+/* A published export's "sample of N" beside the count (no builder sentence
+   carries the sample there). */
+.query-sample-note {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .reference-group {
   margin-bottom: 14px;
   background: var(--bg-secondary);

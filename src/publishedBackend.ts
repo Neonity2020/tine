@@ -122,6 +122,21 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
+/** The key two `ViewSettings` are compared under. The engine serializes its
+ *  dense struct (`sort: []`, `columns: []`, `aggregates: []` are always
+ *  written) while the frontend's `queryDisplaySettings` omits every field it
+ *  has nothing to say about; both mean the same display, so an absent field
+ *  and an empty list are the same key. */
+export function viewKey(view: ViewSettings): string {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(view)) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    out[key] = value;
+  }
+  return stableJson(out);
+}
+
 /** The host block's `tine.*` properties as `parseQuery` receives them, compared
  *  the way the engine reads them: keys case-insensitively, values trimmed. */
 function propertiesEqual(a: [string, string][], b: [string, string][]): boolean {
@@ -238,13 +253,16 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
       .map((entry) => structuredClone(entry));
   };
   /** `../assets/<name>` — or null when the authored name would leave the
-   *  export's own `assets/` folder (`..`, an empty segment, an absolute or
-   *  scheme-bearing path). A selected block may author any image path; the
-   *  export answers only for the assets it copied. */
+   *  export's own `assets/` folder. The rule is the static exporter's
+   *  (`AssetSink::asset_relative` in `publish.rs`): a remote reference, a
+   *  backslash, an absolute path or a `..` step is refused; `.` and empty
+   *  steps collapse the way `Path::components` collapses them, so every name
+   *  the export copied is answered under the path it was copied to. A colon
+   *  inside a file name (`x:y.png`) is a name, not a scheme. */
   const assetUrl = (name: string): string | null => {
-    if (/^[a-z][a-z0-9+.-]*:/i.test(name) || name.startsWith("/") || name.startsWith("\\")) return null;
-    const segments = name.split(/[\\/]/);
-    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return null;
+    if (name.includes("://") || name.startsWith("data:") || name.includes("\\") || name.startsWith("/")) return null;
+    const segments = name.split("/").filter((segment) => segment !== "" && segment !== ".");
+    if (segments.length === 0 || segments.includes("..")) return null;
     return `../assets/${segments.map(encodeURIComponent).join("/")}`;
   };
 
@@ -439,12 +457,12 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     async queryRun(query: Query, view: ViewSettings, context?: ExecutionContext): Promise<QueryResult> {
       const snapshot = await load();
       const wanted = stableJson(query);
-      const wantedView = stableJson(view);
+      const wantedView = viewKey(view);
       const page = context?.current_page ?? undefined;
       const candidates = snapshot.queries.filter((record) =>
         stableJson(record.parsed.query) === wanted || (record.execution && stableJson(record.execution.parsed.query) === wanted));
       const inContext = candidates.filter((record) => (record.context.current_page ?? undefined) === page);
-      const hit = inContext.find((record) => stableJson(record.view) === wantedView)
+      const hit = inContext.find((record) => viewKey(record.view) === wantedView)
         ?? inContext[0]
         ?? (page === undefined ? candidates[0] : undefined);
       if (hit) return structuredClone(hit.result);

@@ -63,7 +63,17 @@ A query export's `app/` runs this frontend over `app/snapshot.json` through
   text, dialect, `tine.*` view property, or current page; a run asked under a
   view the export never ran gets the page's baked answer for that query, and a
   run asked with no page at all — a query inside a sheet cell — gets the one
-  record of that query), or `runGraphSearch`
+  record of that query). Views are compared under `viewKey`: the engine
+  writes `ViewSettings` densely (`sort: []`, `columns: []`, `aggregates: []`
+  always present) and the app resolves a scoped draft sparsely, so an absent
+  field and an empty list are the same key (`wire_parse.rs`
+  `anchored_view_of_a_scoped_draft_serializes_densely` pins the producer
+  shape, `publishedBackend.test.ts` the consumer). The refusal can come from
+  either parse: the authored one, or the execution-side parse of a
+  `<% current page %>` argument substituted for a page the export never ran
+  it on (the macro shown in another page's Linked References); `Macro.tsx`
+  reads that resource's `error` before `latest` and shows the message where
+  the rows would be. Or `runGraphSearch`
   was asked on any lane but the Quick Switcher's (`quick-switch*`), which get a
   plain substring match over the snapshot's page names, aliases and block text
   for navigation. The snapshot holds answers, not an index; no query is re-run
@@ -82,8 +92,15 @@ includes two reader affordances that reach the browser, not the graph:
 clipboard copy (`writeText`/`writeRich`) and `confirm`. `queryFacets` and
 `referencedPageNames` answer empty: the export carries answers, not the
 facet or reference inventories a sentence builder would need. Asset reads
-answer only names inside the export's own `assets/` folder; a name with `..`,
-an empty segment, an absolute path or a scheme is refused without a request.
+answer only names inside the export's own `assets/` folder, under the rule
+the static copier applies (`AssetSink::asset_relative` in `publish.rs`): a
+remote (`://`, `data:`) reference, a backslash, an absolute path or a `..`
+step is refused without a request; `.` and empty steps collapse, and a colon
+inside a file name is a name. Presentation limits of the baked home page: a
+sampled query shows "sample of N" beside its count (the builder sentence that
+says so in the app is not offered), and an advanced (`#+BEGIN_QUERY`) home
+carries no host `tine.*` properties — the home runs under the query's own
+settings, as the app runs an advanced query.
 
 ## Command error boundary
 
