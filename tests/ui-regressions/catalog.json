@@ -9,7 +9,7 @@
       "platforms": ["all"],
       "layer": "render",
       "status": "reported",
-      "coverage": { "tests": ["src/components/UnsavedRecovery.test.tsx"], "failBefore": "pending" },
+      "coverage": { "tests": ["src/App.test.tsx", "src/components/UnsavedRecovery.test.tsx", "scripts/e2e-concord-live-save.mjs"], "failBefore": "proven" },
       "notes": "Close must expose affected pages, current save state and non-destructive recovery before any discard. Generic native confirmation does not identify drafts. Preserve existing guarded writes."
     },
     {
@@ -20,7 +20,7 @@
       "platforms": ["all"],
       "layer": "render",
       "status": "reported",
-      "coverage": { "tests": ["src/components/Page.test.tsx"], "failBefore": "pending" },
+      "coverage": { "tests": ["src/components/Page.test.tsx", "src/components/ConflictResolution.test.tsx", "crates/tine-core/src/model_tests.rs", "scripts/e2e-concord-live-save.mjs"], "failBefore": "proven" },
       "notes": "A failed pinned page read must not hide retained conflict recovery; never fall back to a different same-name physical file or create a new graph file implicitly."
     },
     {

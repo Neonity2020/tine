@@ -35,6 +35,7 @@ const NATIVE_PORT = process.env.E2E_NATIVE_PORT
 const RUN_LABEL = (process.env.TINE_E2E_RUN_LABEL || "concord-live-save")
   .replaceAll(/[^A-Za-z0-9_.-]/g, "-");
 const ARTIFACTS = path.resolve(process.env.E2E_ARTIFACT_DIR || "/tmp");
+const MISSING_TARGET = process.env.TINE_E2E_MISSING_TARGET === "1";
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 
 function waitFor(check, timeout, message, interval = 100) {
@@ -270,7 +271,7 @@ async function waitForApp(browser, phase) {
 }
 
 async function runBackend(mode) {
-  const suffix = mode === "managed" ? "managed" : "direct";
+  const suffix = MISSING_TARGET ? "direct-missing" : mode === "managed" ? "managed" : "direct";
   const graph = `/tmp/tgraph-concord-live-save-${suffix}`;
   const xdg = `/tmp/txdg-concord-live-save-${suffix}`;
   const data = `${xdg}/data`;
@@ -280,6 +281,9 @@ async function runBackend(mode) {
   const theirsFile = `${graph}/pages/${theirsName}.md`;
   fs.rmSync(graph, { recursive: true, force: true });
   fs.rmSync(xdg, { recursive: true, force: true });
+  if (process.env.TINE_E2E_SEED_GRAPH) {
+    fs.cpSync(path.resolve(process.env.TINE_E2E_SEED_GRAPH), graph, { recursive: true });
+  }
   for (const dir of [`${graph}/pages`, `${graph}/journals`, `${graph}/logseq`, data, `${xdg}/config`, `${xdg}/cache`]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -423,8 +427,29 @@ async function runBackend(mode) {
       baseRevs.set(item.name, capsule.live.base_rev);
     }
 
+    if (MISSING_TARGET) {
+      const before = new Set(windowIds(env));
+      const appWindow = [...before][0];
+      if (!appWindow) throw new Error("close recovery: native app window absent");
+      execFileSync("xdotool", ["windowactivate", "--sync", appWindow], { env });
+      execFileSync("xdotool", ["key", "--clearmodifiers", "alt+F4"], { env });
+      const dialog = await waitFor(() => windowIds(env).find((id) => !before.has(id)),
+        45_000, "failed close did not ask before discarding drafts");
+      execFileSync("xdotool", ["windowactivate", "--sync", dialog], { env });
+      execFileSync("xdotool", ["key", "--clearmodifiers", "alt+n"], { env });
+      await browser.$(".unsaved-recovery-panel").waitForDisplayed({ timeout: 15_000 });
+      const recovery = await browser.$(".unsaved-recovery-panel").getText();
+      for (const item of cases) {
+        if (!recovery.includes(item.name) || !recovery.includes(item.local)) {
+          throw new Error(`close recovery omitted ${item.name} or its writing`);
+        }
+      }
+      await browser.saveScreenshot(path.join(ARTIFACTS, "refused-close-recovery.png"));
+      await (await visibleButtonContaining(browser, "Keep working")).click();
+    }
     await forceKillApp();
     for (const item of cases) atomicReplace(item.file, `- ${item.outage}\n`);
+    if (MISSING_TARGET) fs.unlinkSync(mineFile);
     await startDriver("restart");
     browser = await newSession();
     await waitForApp(browser, `${suffix}:restart`);
@@ -443,8 +468,24 @@ async function runBackend(mode) {
       assertCapsuleRecord(restoredByName.get(item.name), item, mode, baseRevs.get(item.name));
     }
 
-    await openPage(browser, mineName);
-    await assertLiveConflict(browser, cases[0].local, cases[0].outage, `${suffix}:mine:restart`);
+    if (MISSING_TARGET) {
+      // Use the reported conflict entry, which pins the physical path. A plain
+      // page link may legitimately open a prospective page by name instead.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await browser.$(".conflict-queue-badge").click();
+        await browser.waitUntil(async () => (await browser.$$(".page-conflict")).length > 0,
+          { timeout: 15_000, timeoutMsg: "conflict entry did not open its review" });
+        if ((await browser.$$(".recovery-draft")).length) break;
+      }
+      await browser.$(".recovery-draft").waitForExist({ timeout: 15_000 });
+      const preview = await browser.$(".recovery-draft pre").getText();
+      if (!preview.includes(cases[0].local)) throw new Error("missing-target view lost retained writing");
+      if (fs.existsSync(mineFile)) throw new Error("viewing missing-target recovery created a graph file");
+      await browser.saveScreenshot(path.join(ARTIFACTS, "missing-target-recovery.png"));
+    } else {
+      await openPage(browser, mineName);
+      await assertLiveConflict(browser, cases[0].local, cases[0].outage, `${suffix}:mine:restart`);
+    }
     await resolveEverywhere(browser, "mine");
     await waitForFileText(mineFile, (text) => text.includes(cases[0].local), `${suffix}: keep retained draft`);
     const afterFirst = readCapsule(data).envelope.capsules;
@@ -510,7 +551,7 @@ try {
     supportingWindow: execFileSync("xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], { encoding: "utf8" }).trim(),
   }, null, 2));
   await runBackend("direct");
-  await runBackend("managed");
+  if (!MISSING_TARGET) await runBackend("managed");
   console.log("PASS: Harvest B3 Direct/Managed restart capsule matrix");
 } catch (error) {
   failure = error;

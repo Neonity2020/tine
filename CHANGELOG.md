@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- Closing with failed saves identifies the affected pages. Choosing not to
+  discard opens a recovery panel with page navigation, save retry, and draft
+  copying, including a complete recovery copy (GH #540).
+- A conflict whose original physical page is unavailable exposes its retained
+  draft and guarded resolution instead of hiding recovery behind the page-load
+  error (GH #541).
+
 ## [0.6.983] - 2026-09-13
 
 ### Added

@@ -20,6 +20,7 @@ import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
 import { PageConflictResolution } from "./ConflictResolution";
+import { RecoveryDraft } from "./UnsavedRecovery";
 import { ExternalChangeBar } from "./ExternalChangeBar";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
@@ -265,6 +266,7 @@ export function PageView(): JSX.Element {
   // an older rejected request could replace a newer page with its error state.
   const [loadedRoute, setLoadedRoute] = createSignal<ReturnType<PaneRouter["route"]> | null>(null);
   const [loadError, setLoadError] = createSignal<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = createSignal(0);
 
   // Depend on the active route BY VALUE: opening a background tab (or pinning /
   // reordering / closing another tab) mutates the `tabs` signal but not the active
@@ -278,6 +280,7 @@ export function PageView(): JSX.Element {
   });
   createEffect(() => {
     const r = currentRoute();
+    loadAttempt();
     const epoch = graphEpoch(); // reload when the open graph changes
     const binding = graphBinding();
     const deleteFallbackTrace = markPageDeleteFallbackFetch(pane.paneId, r.kind);
@@ -534,6 +537,19 @@ export function PageView(): JSX.Element {
           <div class="page-load-error-hint">
             Tine did not modify the file. Try reopening, or check the file on disk.
           </div>
+          <Show when={(() => {
+            const route = currentRoute();
+            if (route.kind !== "page") return;
+            const conflict = conflictObjectFor(route.path, route.name);
+            return conflict && conflict.page_path === route.path && conflict.live ? conflict : undefined;
+          })()}>
+            {(conflict) => <>
+              <p>The conflict's original file is unavailable. Your retained draft is available below; copy it before making changes to the files on disk.</p>
+              <RecoveryDraft page={conflict().live!.page} />
+              <PageConflictResolution conflict={conflict()} unavailable onResolved={() => setLoadAttempt((n) => n + 1)} />
+            </>}
+          </Show>
+          <button onClick={() => setLoadAttempt((n) => n + 1)}>Try opening again</button>
         </div>
       </div>
     }>

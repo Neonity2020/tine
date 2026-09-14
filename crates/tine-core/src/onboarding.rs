@@ -665,6 +665,9 @@ mod tests {
         assert!(page.markdown.contains("`logseq/config.edn` is live too"));
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("Retry saving"));
+        assert!(page.markdown.contains("Copy complete recovery data"));
+        assert!(page.markdown.contains("Try opening again"));
 
         let index = GUIDE_TEMPLATES
             .iter()

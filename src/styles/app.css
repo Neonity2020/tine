@@ -11772,6 +11772,32 @@ html.drag-selection-suppressed * {
   font-size: 12.5px;
 }
 
+.unsaved-recovery-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100100;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 35%);
+}
+.unsaved-recovery-panel {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 20px;
+  width: min(720px, 100%);
+  max-height: 85vh;
+  overflow: auto;
+}
+.recovery-draft pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 250px;
+  overflow: auto;
+  user-select: text;
+}
+.unsaved-recovery-panel button { margin: 4px; }
 .graph-transition-shield {
   position: fixed;
   inset: 0;

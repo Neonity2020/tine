@@ -1100,6 +1100,23 @@ describe("tag-page table", () => {
 });
 
 describe("zoomed block view", () => {
+  it("exposes the retained draft when its physical conflict page cannot be opened (GH #541)", async () => {
+    setGraphMeta({ root: "/graph", preferred_format: "md" } as never);
+    const dto: PageDto = { name: "Missing notes", title: "Missing notes", kind: "page",
+      path: "pages/Missing notes.md", pre_block: null,
+      blocks: [{ id: "retained", raw: "Several days of retained writing", children: [], collapsed: false }] };
+    await registerLiveSaveConflict(dto, "old-rev", 1);
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(null);
+    const save = vi.spyOn(backend(), "savePage");
+    mainPaneRouter.openFile(dto.path!, dto.name, dto.kind, { inPlace: true });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      expect(root.textContent).toContain("Several days of retained writing");
+      expect([...root.querySelectorAll("button")].some((b) => b.textContent === "Copy draft")).toBe(true);
+      expect(save).not.toHaveBeenCalled();
+    } finally { dispose(); clearConflict(dto.name); }
+  });
   it("zooms to the unique authored ID rather than a sibling's matching runtime locator (GH #373)", async () => {
     const claimed = "12345678-1234-8234-8234-123456789abc";
     const intendedRuntime = "87654321-4321-8321-8321-cba987654321";

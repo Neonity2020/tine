@@ -222,6 +222,7 @@ const suites = {
     ["external-graph-wide-changes", "scripts/e2e-external-graph-wide-changes.mjs", {}],
     ["concord-focus-freshness", "scripts/e2e-concord-focus-freshness.mjs", {}],
     ["concord-live-save", "scripts/e2e-concord-live-save.mjs", {}],
+    ["concord-missing-target", "scripts/e2e-concord-live-save.mjs", { TINE_E2E_MISSING_TARGET: "1" }],
     ["concord-sync-copy-native", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify" }],
     ["concord-sync-copy-poll", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "poll" }],
     ["concord-sync-copy-native-same-content", "scripts/e2e-concord-sync-copy.mjs", { TINE_E2E_WATCH_MODE: "inotify", TINE_E2E_CONCORD_DECISION: "mine" }],
