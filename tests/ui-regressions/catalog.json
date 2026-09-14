@@ -23,6 +23,21 @@
       "coverage": { "tests": ["src/components/Page.test.tsx"], "failBefore": "pending" },
       "notes": "A failed pinned page read must not hide retained conflict recovery; never fall back to a different same-name physical file or create a new graph file implicitly."
     },
+    {
+      "id": "UI-FOCUS-RESCAN-INPUT-STALL-GH539",
+      "title": "Returning to a graph completes its freshness check without stranding editing",
+      "family": "external-changes",
+      "sources": { "issues": [539], "commits": [] },
+      "platforms": ["windows"],
+      "layer": "native",
+      "status": "reported",
+      "coverage": {
+        "tests": ["scripts/e2e-concord-focus-freshness.mjs", "src/reloadOnFocus.test.tsx"],
+        "scenario": "focus-rescan-input-stall-gh539",
+        "failBefore": "unavailable"
+      },
+      "notes": "Blocking stateful UX report on Windows 11 v0.6.982: intermittent input stall followed by missing watcher-rescan completion toast. Exact 1a091d74 Linux/WebKit native external-winner-before-edit journey and ten focused tests pass; this does not reproduce or resolve the Windows report. Both reported tag and candidate use a 30-second completion timeout; reporter estimates 3-5 seconds. Native rescan is process-wide and serial across all bound graph lanes, so unrelated graph work can delay completion, but no specific stalled lane or event-delivery failure is proven. Preserve freshness admission safety. Need affected-run debug log, storage/watch mode, graph/window counts and timing evidence. Receipt: tine-agents/evidence/new-bugs-20260914/GH539/RECEIPT.md."
+    },
 {
   "id": "UI-EXTERNAL-ASSET-WATCH-LEXICAL-ALIAS",
   "title": "Approved external assets refresh for symlink-spelled native events",
