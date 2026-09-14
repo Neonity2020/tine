@@ -1,7 +1,7 @@
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend } from "../backend";
-import { DiagnosticsTab } from "./DiagnosticsTab";
+import { DIAGNOSTIC_PREVIEW_LIMIT, DiagnosticsTab } from "./DiagnosticsTab";
 
 describe("DiagnosticsTab", () => {
   afterEach(() => {
@@ -30,8 +30,9 @@ describe("DiagnosticsTab", () => {
   });
 
   it("copies only the generated report and can clear retained events", async () => {
+    const completeReport = `safe-report\n${"x".repeat(DIAGNOSTIC_PREVIEW_LIMIT * 2)}`;
     vi.spyOn(backend(), "diagnosticReport").mockResolvedValue({
-      text: "safe-report",
+      text: completeReport,
       suggestedFileName: "tine-diagnostics.json",
     });
     const copy = vi.spyOn(backend(), "writeText").mockResolvedValue();
@@ -43,10 +44,12 @@ describe("DiagnosticsTab", () => {
     ([...root.querySelectorAll("button")].find((button) =>
       button.textContent?.includes("Create diagnostic report")
     ) as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(root.querySelector("textarea")?.value).toBe("safe-report"));
+    await vi.waitFor(() => expect(root.querySelector("textarea")?.value).toContain("Preview shortened"));
+    expect(root.querySelector("textarea")?.value.length).toBeLessThan(completeReport.length);
+    expect(root.textContent).toContain("exports the complete report");
 
     ([...root.querySelectorAll("button")].find((button) => button.textContent === "Copy report") as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(copy).toHaveBeenCalledWith("safe-report"));
+    await vi.waitFor(() => expect(copy).toHaveBeenCalledWith(completeReport));
 
     ([...root.querySelectorAll("button")].find((button) => button.textContent === "Clear recorded events") as HTMLButtonElement).click();
     await vi.waitFor(() => expect(clear).toHaveBeenCalled());

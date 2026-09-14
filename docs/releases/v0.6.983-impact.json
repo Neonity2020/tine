@@ -2660,12 +2660,14 @@
     },
     {
       "section": "Fixed",
-      "text": "Privacy-safe diagnostic reports now include the bounded reason code for failed Tine-managed storage page saves, making prolonged unsaved-draft failures diagnosable without debug mode or a special build (GH #540).",
+      "text": "Privacy-safe diagnostic reports now include the bounded reason code for failed Tine-managed storage page saves, making prolonged unsaved-draft failures diagnosable without debug mode or a special build. A large report's selectable preview is shortened so Settings remains responsive; Copy and Save still export the complete report (GH #540).",
       "userVisible": true,
-      "regressions": [],
+      "regressions": [
+        "UI-DIAGNOSTIC-REPORT-343"
+      ],
       "guide": {
         "status": "not-applicable",
-        "reason": "The existing Diagnostics flow is unchanged; this adds content-free evidence to its saved report.",
+        "reason": "The existing Diagnostics guide already directs users to Copy or Save the complete report; the bounded on-screen preview explains itself when active.",
         "refs": []
       },
       "docs": {
