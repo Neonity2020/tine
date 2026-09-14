@@ -800,6 +800,48 @@ fn managed_save_debug_detail_line(
         .map(|detail| format!("managed storage save refusal detail: {detail}"))
 }
 
+fn managed_save_diagnostic_outcome(
+    elapsed: std::time::Duration,
+    outcome: &Result<
+        SyncApplicationPageSaveOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) -> Option<&'static str> {
+    match outcome {
+        Err(error) => Some(error.diagnostic_reason_code()),
+        Ok(SyncApplicationPageSaveOutcome::Conflict { reason }) => {
+            Some(reason.diagnostic_reason_code())
+        }
+        Ok(SyncApplicationPageSaveOutcome::Deferred { state }) => {
+            Some(state.diagnostic_reason_code())
+        }
+        Ok(SyncApplicationPageSaveOutcome::Prepared) => Some("managed.unexpected_prepared"),
+        Ok(SyncApplicationPageSaveOutcome::Saved { .. })
+        | Ok(SyncApplicationPageSaveOutcome::Unchanged { .. })
+            if elapsed.as_millis() >= SAVE_DIAGNOSTIC_THRESHOLD_MS =>
+        {
+            Some("ok")
+        }
+        Ok(_) => None,
+    }
+}
+
+fn report_managed_save_diagnostics(
+    elapsed: std::time::Duration,
+    outcome: &Result<
+        SyncApplicationPageSaveOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) {
+    let Some(reason) = managed_save_diagnostic_outcome(elapsed, outcome) else {
+        return;
+    };
+    crate::debug::record_managed_save(
+        reason,
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    );
+}
+
 #[tauri::command]
 pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, CommandError> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -1031,7 +1073,7 @@ fn collect_graph_text(
 /// A Direct-Markdown save is slow enough to be worth a line above this. Chosen
 /// so ordinary saves stay silent (0.6.5 saved in single-digit milliseconds) while
 /// anything a user would notice as a hitch is on the record.
-const DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
+const SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
 
 /// Turn a failed Direct save into a message the frontend can act on.
 ///
@@ -1084,7 +1126,7 @@ fn report_direct_save_diagnostics(
     elapsed: std::time::Duration,
     error: Option<&std::io::Error>,
 ) {
-    if error.is_none() && elapsed.as_millis() < DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS {
+    if error.is_none() && elapsed.as_millis() < SAVE_DIAGNOSTIC_THRESHOLD_MS {
         return;
     }
     let report = graph.guarded_graph_text_identity_report();
@@ -1158,7 +1200,9 @@ pub(crate) async fn save_page(
                         force.unwrap_or(false),
                         managed_conflict_observation,
                         |request| {
+                            let started = Instant::now();
                             let saved = handle.save_application_page(request);
+                            report_managed_save_diagnostics(started.elapsed(), &saved);
                             if crate::debug::debug_enabled() {
                                 if let Err(error) = &saved {
                                     if let Some(line) = managed_save_debug_detail_line(error) {
@@ -5394,6 +5438,44 @@ mod application_page_authority_tests {
             Some(
                 "managed storage save refusal detail: Finalize: exact internal coordinator refusal"
             )
+        );
+    }
+
+    #[test]
+    fn managed_save_diagnostic_names_actor_conflict_deferred_and_success_outcomes() {
+        let failure = Err(SyncApplicationPageRequestError::ActorRefusedWithCode(
+            SyncEditorRefusalCode::TrustedLocalAppendOutcomeUnknown,
+        ));
+        let conflict = Ok(SyncApplicationPageSaveOutcome::Conflict {
+            reason: SyncApplicationPageConflict::StaleBase,
+        });
+        let deferred = Ok(SyncApplicationPageSaveOutcome::Deferred {
+            state: SyncEditorDeferred::RetryableExternalWork,
+        });
+        let saved = Ok(SyncApplicationPageSaveOutcome::Saved {
+            batch_id: "batch".into(),
+            page: page("Notes", PageKind::Page, "pages/Notes.md", "- saved"),
+            revision: "revision".into(),
+        });
+        assert_eq!(
+            managed_save_diagnostic_outcome(std::time::Duration::ZERO, &failure),
+            Some("trusted_local.append_outcome_unknown")
+        );
+        assert_eq!(
+            managed_save_diagnostic_outcome(std::time::Duration::ZERO, &conflict),
+            Some("managed.conflict.stale_base")
+        );
+        assert_eq!(
+            managed_save_diagnostic_outcome(std::time::Duration::ZERO, &deferred),
+            Some("managed.deferred.retryable_external_work")
+        );
+        assert_eq!(
+            managed_save_diagnostic_outcome(std::time::Duration::ZERO, &saved),
+            None
+        );
+        assert_eq!(
+            managed_save_diagnostic_outcome(std::time::Duration::from_millis(150), &saved),
+            Some("ok")
         );
     }
 

@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Privacy-safe diagnostic reports now include the bounded reason code for
+  failed Tine-managed storage page saves, making prolonged unsaved-draft
+  failures diagnosable without debug mode or a special build (GH #540).
 - Closing with failed saves identifies the affected pages. Choosing not to
   discard opens a recovery panel with page navigation, save retry, and draft
   copying, including a complete recovery copy (GH #540).
