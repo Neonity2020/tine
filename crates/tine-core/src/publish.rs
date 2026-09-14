@@ -3481,10 +3481,14 @@ fn run_static_query_with(
                 .map(|execution| &execution.parsed)
                 .unwrap_or(&authored);
             let query = effective.query.clone();
-            let view = overrides
-                .view
-                .clone()
-                .unwrap_or_else(|| effective.view.clone());
+            // The app runs a query under the view of its result kind — the
+            // Pages section under the page-scoped settings, Blocks under the
+            // block-scoped ones (`Macro.tsx` `pageResultView`/`blockResultView`).
+            // Baking the singular merged view instead would record an
+            // unsampled answer for a `tine.block-sample::` host.
+            let view = overrides.view.clone().unwrap_or_else(|| {
+                crate::query::wire_parse::anchored_view(effective, effective.query.anchor)
+            });
             let lookup_context = match &scope.page {
                 Some(page) => ExecutionContext::on_page(page.clone()),
                 None => ExecutionContext::none(),
@@ -5742,7 +5746,7 @@ pub(crate) fn publish_graph_documents_inner(
                 if let Some(scope) = &scope {
                     let mut scope = scope.borrow_mut();
                     scope.page = Some(home_name.clone());
-                    scope.block_properties.clear();
+                    scope.block_properties = app.query.properties();
                     scope.nesting = 0;
                 }
                 let input = app.query.dialect().input();
@@ -5751,7 +5755,7 @@ pub(crate) fn publish_graph_documents_inner(
                         current_page: app.query.current_page.clone(),
                     }),
                     view: app.query.view.clone(),
-                    properties: Some(Vec::new()),
+                    properties: Some(app.query.properties()),
                     host_block_id: app.query.host_block_id.clone(),
                 };
                 run_static_query_with(
@@ -7089,6 +7093,7 @@ mod tests {
             current_page: Some("Dashboard".into()),
             view: None,
             host_block_id: None,
+            host_properties: Vec::new(),
             name: name.into(),
             folder: None,
             replace: false,
@@ -9042,13 +9047,17 @@ mod tests {
         // other block does.
         fs::write(
             dir.join("pages/Dashboard.md"),
-            "- TODO dash-task\n- {{query (task TODO)}}\n- {{query (and (task TODO) <% current page %>)}}\n  tine.view:: table\n",
+            "- TODO dash-task\n- {{query (task TODO)}}\n- {{query (and (task TODO) <% current page %>)}}\n  tine.view:: table\n- {{query (task TODO)}}\n  tine.sample:: 1\n- {{query (task TODO)}}\n  tine.block-display:: 1\n  tine.block-sample:: 2\n",
         )
         .unwrap();
         let graph = Graph::open(&dir);
         let _projection = prepare_publication_graph(&graph);
         let mut request = todo_request("Tasks");
         request.app_bundle = Some(fake_app_bundle());
+        request.host_properties = vec![
+            ("tine.view".into(), "table".into()),
+            ("tine.sample".into(), "1".into()),
+        ];
         let plan = plan_query_publication(&graph, &request).unwrap();
         let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
@@ -9116,11 +9125,16 @@ mod tests {
         let entries = snapshot["entries"].as_array().unwrap();
         assert_eq!(entries[0]["name"], "Tasks (export)");
         assert_eq!(entries.len(), pages.len());
-        // The home page's blocks: the macro, then one link per page.
+        // The home page's blocks: the macro carrying the host's tine.*
+        // properties, then one link per page.
         let home_blocks = pages[0]["blocks"].as_array().unwrap();
         assert_eq!(
             home_blocks[0]["raw"].as_str().unwrap().trim(),
-            "{{query (task TODO)}}"
+            "{{query (task TODO)}}\ntine.view:: table\ntine.sample:: 1"
+        );
+        assert_eq!(
+            home_blocks[0]["properties"],
+            serde_json::json!([["tine.view", "table"], ["tine.sample", "1"]])
         );
         assert_eq!(home_blocks.len(), 1 + 4);
         // Backlinks come from the closed sub-graph only: "Also Selected" is
@@ -9145,20 +9159,53 @@ mod tests {
         assert!(home["execution"].is_null());
         assert!(home["result"]["statistics"].is_null());
         assert_eq!(home["result"]["exceeded"], false);
-        assert_eq!(home["result"]["total"], home["result"]["matched_total"]);
+        // The home run is keyed by the host's properties and runs under the
+        // view they resolve to: `tine.sample:: 1` bakes one sampled row.
+        assert_eq!(
+            home["properties"],
+            serde_json::json!([["tine.view", "table"], ["tine.sample", "1"]])
+        );
+        assert_eq!(home["view"]["sample"], 1);
+        assert_eq!(home["view"]["view"], "table");
         let home_rows: usize = home["result"]["groups"]
             .as_array()
             .unwrap()
             .iter()
             .map(|g| g["blocks"].as_array().unwrap().len())
             .sum();
-        assert_eq!(home["result"]["total"], home_rows);
-        assert_eq!(home_rows, 4, "{}", home["result"]);
+        assert_eq!(home_rows, 1, "{}", home["result"]);
         let dashboard: Vec<&serde_json::Value> = queries
             .iter()
             .filter(|q| q["host"] == "Dashboard")
             .collect();
-        assert_eq!(dashboard.len(), 2, "{queries:?}");
+        assert_eq!(dashboard.len(), 4, "{queries:?}");
+        // Three `(task TODO)` twins on one page are three records, told apart
+        // by the view each ran under: unsampled, `tine.sample:: 1`, and the
+        // block-scoped `tine.block-sample:: 2` (resolved the way the app
+        // resolves it, not the singular merge that would ignore it).
+        let twins: Vec<&&serde_json::Value> = dashboard
+            .iter()
+            .filter(|q| q["argument"] == "(task TODO)")
+            .collect();
+        assert_eq!(twins.len(), 3);
+        let mut samples: Vec<(Option<u64>, usize)> = twins
+            .iter()
+            .map(|q| {
+                let rows: usize = q["result"]["groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|g| g["blocks"].as_array().unwrap().len())
+                    .sum();
+                (q["view"]["sample"].as_u64(), rows)
+            })
+            .collect();
+        samples.sort_unstable();
+        assert_eq!(
+            samples,
+            vec![(None, 4), (Some(1), 1), (Some(2), 2)],
+            "{twins:?}"
+        );
         let focused = dashboard
             .iter()
             .find(|q| q["argument"].as_str().unwrap().contains("current page"))

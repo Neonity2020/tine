@@ -237,7 +237,16 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
       .slice(0, limit)
       .map((entry) => structuredClone(entry));
   };
-  const assetUrl = (name: string) => `../assets/${name.split("/").map(encodeURIComponent).join("/")}`;
+  /** `../assets/<name>` — or null when the authored name would leave the
+   *  export's own `assets/` folder (`..`, an empty segment, an absolute or
+   *  scheme-bearing path). A selected block may author any image path; the
+   *  export answers only for the assets it copied. */
+  const assetUrl = (name: string): string | null => {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(name) || name.startsWith("/") || name.startsWith("\\")) return null;
+    const segments = name.split(/[\\/]/);
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return null;
+    return `../assets/${segments.map(encodeURIComponent).join("/")}`;
+  };
 
   const answered = {
     // ---- graph identity ----
@@ -420,16 +429,25 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
       }
       throw await staticQueryRefusal();
     },
-    async queryRun(query: Query, _view: ViewSettings, context?: ExecutionContext): Promise<QueryResult> {
+    /** The record whose query IR, page context and view all match wins; two
+     *  identical queries on one page that differ only in `tine.sample::` are
+     *  two records with two views. Then the same query in the same context
+     *  under another view (a later view change is refused anyway, so the baked
+     *  answer is the one the export shows). A run asked with no page at all
+     *  (a query rendered inside a sheet cell, which carries no host page) falls
+     *  back to the one record of that query. */
+    async queryRun(query: Query, view: ViewSettings, context?: ExecutionContext): Promise<QueryResult> {
       const snapshot = await load();
       const wanted = stableJson(query);
-      const page = context?.current_page;
-      for (const record of snapshot.queries) {
-        if ((record.context.current_page ?? undefined) !== (page ?? undefined)) continue;
-        if (stableJson(record.parsed.query) === wanted || (record.execution && stableJson(record.execution.parsed.query) === wanted)) {
-          return structuredClone(record.result);
-        }
-      }
+      const wantedView = stableJson(view);
+      const page = context?.current_page ?? undefined;
+      const candidates = snapshot.queries.filter((record) =>
+        stableJson(record.parsed.query) === wanted || (record.execution && stableJson(record.execution.parsed.query) === wanted));
+      const inContext = candidates.filter((record) => (record.context.current_page ?? undefined) === page);
+      const hit = inContext.find((record) => stableJson(record.view) === wantedView)
+        ?? inContext[0]
+        ?? (page === undefined ? candidates[0] : undefined);
+      if (hit) return structuredClone(hit.result);
       throw await staticQueryRefusal();
     },
     /** The Quick Switcher's lanes get a plain substring match over page names,
@@ -474,19 +492,22 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     // ---- assets and the browser ----
     async readAsset(name: string) {
       await load();
-      const response = await fetch(assetUrl(name));
+      const url = assetUrl(name);
+      if (!url) return new Uint8Array();
+      const response = await fetch(url);
       if (!response.ok) return new Uint8Array();
       return new Uint8Array(await response.arrayBuffer());
     },
     async streamAsset(name: string) {
       await load();
-      return assetUrl(name);
+      return assetUrl(name) ?? "";
     },
     async openExternal(url: string) {
       window.open(url, "_blank", "noopener");
     },
     async openAsset(name: string) {
-      window.open(assetUrl(name), "_blank", "noopener");
+      const url = assetUrl(name);
+      if (url) window.open(url, "_blank", "noopener");
     },
     async writeText(text: string) {
       const { writeClipboardTextStrict } = await import("./clipboard");

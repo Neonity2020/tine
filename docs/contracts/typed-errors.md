@@ -60,7 +60,10 @@ A query export's `app/` runs this frontend over `app/snapshot.json` through
 
 - `query-unavailable` with reason code `published_export_static` — `parseQuery`
   or `queryRun` was asked for a query the export was not made with (a changed
-  text, dialect, `tine.*` view property, or current page), or `runGraphSearch`
+  text, dialect, `tine.*` view property, or current page; a run asked under a
+  view the export never ran gets the page's baked answer for that query, and a
+  run asked with no page at all — a query inside a sheet cell — gets the one
+  record of that query), or `runGraphSearch`
   was asked on any lane but the Quick Switcher's (`quick-switch*`), which get a
   plain substring match over the snapshot's page names, aliases and block text
   for navigation. The snapshot holds answers, not an index; no query is re-run
@@ -71,9 +74,16 @@ A query export's `app/` runs this frontend over `app/snapshot.json` through
   plugin install, capture, native pickers, OS access). The class lives in
   `backend.ts` because `publishedBackend.ts` is imported by it.
 
-`src/publishedBackend.guard.test.ts` requires every `Backend` method to be in
-exactly one of answered / constant / refused / absent, so a new method cannot
-reach a reader's browser unclassified.
+`src/publishedBackend.guard.test.ts` reads `interface Backend` through the
+TypeScript AST and requires every member to be in exactly one of answered /
+constant / refused / absent, so a new method cannot reach a reader's browser
+unclassified. Beyond the Quick Switcher lanes, the answered set deliberately
+includes two reader affordances that reach the browser, not the graph:
+clipboard copy (`writeText`/`writeRich`) and `confirm`. `queryFacets` and
+`referencedPageNames` answer empty: the export carries answers, not the
+facet or reference inventories a sentence builder would need. Asset reads
+answer only names inside the export's own `assets/` folder; a name with `..`,
+an empty segment, an absolute path or a scheme is refused without a request.
 
 ## Command error boundary
 

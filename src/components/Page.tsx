@@ -955,6 +955,7 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
           >
             <span aria-hidden="true">⋯</span>
           </button>
+          <Show when={!isPublishedExport()}>
           <button
             class="fav-star"
             classList={{ active: isFavorite(props.page.name) }}
@@ -971,6 +972,7 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
               />
             </svg>
           </button>
+          </Show>
           </Show>
         </div>
       </div>

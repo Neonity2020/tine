@@ -148,7 +148,50 @@ describe("published backend: the two query seams", () => {
     await expect(backend.queryRun(parsed("home").query, {} as never, { current_page: "Dashboard" })).rejects.toMatchObject({
       reasonCode: PUBLISHED_QUERY_REASON,
     });
-    await expect(backend.queryRun(parsed("home").query, {} as never)).rejects.toBeInstanceOf(QueryUnavailableError);
+    // A run asked with no page at all (a query in a sheet cell carries no host
+    // page) gets the one record of that query; an unknown IR is still refused.
+    expect(await backend.queryRun(parsed("home").query, {} as never)).toEqual(result("home-rows"));
+    await expect(backend.queryRun({ kind: "fixture", marker: "never baked" } as never, {} as never)).rejects.toBeInstanceOf(
+      QueryUnavailableError,
+    );
+  });
+
+  it("queryRun tells two identical queries on one page apart by the view they were baked under", async () => {
+    const two = fixture();
+    const plain = two.queries[1];
+    two.queries.push(
+      { ...plain, properties: [["tine.sample", "1"]], view: { view: "table", sample: 1 } as never, result: result("sampled") },
+      { ...plain, properties: [["tine.sample", "3"]], view: { view: "table", sample: 3 } as never, result: result("three") },
+    );
+    const backend = publishedBackend(() => Promise.resolve(two));
+    const query = parsed("dashboard-executed").query;
+    expect(await backend.queryRun(query, { sample: 1, view: "table" } as never, { current_page: "Dashboard" })).toEqual(result("sampled"));
+    expect(await backend.queryRun(query, { view: "table", sample: 3 } as never, { current_page: "Dashboard" })).toEqual(result("three"));
+    // A view the export never ran under still gets this page's baked answer
+    // (a later view change is refused; the export shows what it baked).
+    expect(await backend.queryRun(query, { view: "board" } as never, { current_page: "Dashboard" })).toEqual(result("dashboard-rows"));
+  });
+
+  it("answers only the assets it copied: a path that leaves assets/ is refused, not fetched", async () => {
+    const backend = publishedBackend(load);
+    const fetched: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      fetched.push(String(url));
+      return { ok: true, arrayBuffer: async () => new Uint8Array([1]).buffer };
+    }) as unknown as typeof fetch;
+    try {
+      expect(await backend.streamAsset("talk.mp3")).toBe("../assets/talk.mp3");
+      expect(await backend.streamAsset("2026/a b.png")).toBe("../assets/2026/a%20b.png");
+      for (const name of ["../../private.png", "assets/../../x", "/etc/passwd", "https://example.test/x", "a//b", "."]) {
+        expect(await backend.streamAsset(name), name).toBe("");
+        expect(await backend.readAsset(name), name).toEqual(new Uint8Array());
+      }
+      expect(await backend.readAsset("talk.mp3")).toEqual(new Uint8Array([1]));
+      expect(fetched).toEqual(["../assets/talk.mp3"]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("returns copies, so a consumer mutating a result cannot corrupt the snapshot", async () => {

@@ -65,7 +65,7 @@ function loadQueryDoc(queryRaw: string, kind?: "advanced") {
       [argument]: { form: argument, kind },
     };
     for (const name of FOCUS_PAGES) {
-      const substituted = argument.replace(/<%\s*current page\s*%>/gi, `[[${name}]]`);
+      const substituted = argument.replace(/<%\s*current page\s*%>/gi, () => `[[${name}]]`);
       readings[substituted] = { form: substituted, kind };
     }
     backendReadsQueries(readings);

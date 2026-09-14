@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import {
   PUBLISHED_ABSENT_METHODS,
@@ -18,26 +19,25 @@ import { PublishedExportReadOnlyError } from "./backend";
 //
 // Blessed exemplar for the pattern: src/plugins/capabilityBoundary.test.ts.
 
-function backendInterfaceMethods(): string[] {
-  const source = readFileSync(new URL("./backend.ts", import.meta.url), "utf8");
-  const start = source.indexOf("export interface Backend {");
-  expect(start).toBeGreaterThan(0);
-  let depth = 0;
-  let end = start;
-  for (let i = source.indexOf("{", start); i < source.length; i++) {
-    if (source[i] === "{") depth++;
-    if (source[i] === "}") depth--;
-    if (depth === 0) {
-      end = i;
-      break;
+/** Every member of `export interface Backend` in backend.ts — method
+ *  signatures and function-valued properties alike — read through the
+ *  TypeScript AST, so indentation, comments, overloads and property syntax
+ *  cannot hide a member from the classification. */
+export function backendInterfaceMethods(source = readFileSync(new URL("./backend.ts", import.meta.url), "utf8")): string[] {
+  const file = ts.createSourceFile("backend.ts", source, ts.ScriptTarget.Latest, true);
+  const names = new Set<string>();
+  for (const statement of file.statements) {
+    if (!ts.isInterfaceDeclaration(statement) || statement.name.text !== "Backend") continue;
+    for (const member of statement.members) {
+      if (ts.isMethodSignature(member) || ts.isPropertySignature(member)) {
+        if (member.name && (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name))) names.add(member.name.text);
+        else throw new Error(`Backend member with an unsupported name at ${member.pos}`);
+      } else {
+        throw new Error(`Backend member that is neither a method nor a property at ${member.pos}`);
+      }
     }
   }
-  const body = source
-    .slice(start, end)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/.*$/gm, "");
-  const names = new Set<string>();
-  for (const match of body.matchAll(/^ {2}([A-Za-z_][A-Za-z0-9_]*)\??\s*[(<]/gm)) names.add(match[1]);
+  expect(names.size).toBeGreaterThan(0);
   return [...names].sort();
 }
 
@@ -46,6 +46,13 @@ describe("published backend classification (spec §5)", () => {
   const constant = new Set<string>(PUBLISHED_CONSTANT_METHODS);
   const refused = new Set<string>(PUBLISHED_REFUSED_METHODS);
   const absent = new Set<string>(PUBLISHED_ABSENT_METHODS);
+
+  it("sees a member however it is written: tab-indented, optional, or a function-valued property", () => {
+    const names = backendInterfaceMethods(
+      "export interface Backend {\n  a(): Promise<void>;\n\tb?(): void;\n    c: () => Promise<void>;\n  /* d(): void */\n  // e(): void\n  f<T>(x: T): T;\n  f(): void;\n}\n",
+    );
+    expect(names).toEqual(["a", "b", "c", "f"]);
+  });
 
   it("puts every Backend method in exactly one class", () => {
     const methods = backendInterfaceMethods();

@@ -261,8 +261,9 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
                 <div class="query-export-note">
                   Destination: <code>{destinationPath()}</code>
                   <br />
-                  This exports these pages regardless of their public setting. It creates local
-                  files and does not upload them. Unsaved edits are not included.
+                  This exports these pages regardless of their public setting. It creates a static
+                  site and an app version as local files and does not upload them; host the folder
+                  to open it as an app. Unsaved edits are not included.
                 </div>
               </>
             )}

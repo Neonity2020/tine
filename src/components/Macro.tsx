@@ -1,5 +1,5 @@
 import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
-import { backend, QueryPrintRefusedError, type QueryNotReadyError } from "../backend";
+import { backend, QueryPrintRefusedError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
 import { isPublishedExport } from "../publishedBackend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
@@ -454,7 +454,10 @@ export function QueryMacro(props: {
     if (!currentPageMarker()) return null;
     const pageName = focusedQueryPage();
     if (!pageName) return null; // no focused page: leave verbatim, like templates
-    return arg().replace(/<%\s*current page\s*%>/gi, `[[${pageName}]]`);
+    // A function replacer: a page named `A$&B` must be spliced literally, not
+    // read as a `$&` replacement pattern (the native export substitutes the
+    // same text and must produce the same argument).
+    return arg().replace(/<%\s*current page\s*%>/gi, () => `[[${pageName}]]`);
   });
   const executionRequest = createMemo(() => {
     const argument = executionArg();
@@ -515,6 +518,7 @@ export function QueryMacro(props: {
       currentPage: page ?? null,
       view: reading.query.anchor === "page" ? pageResultView() : blockResultView(),
       hostBlockId: props.blockId ?? null,
+      hostProperties: blockDirectives(),
       name: titleOption() ?? "",
       folder: null,
       replace: false,
@@ -1303,7 +1307,10 @@ export function QueryMacro(props: {
   const ranEmpty = () => !!displayedOperation() && !groupResource.loading && !groupResource.error && total() === 0;
   const emptyResultsMessage = () => groupsPending()?.message ?? parsePending()?.message
     ?? (groupResource.error || (!displayedOperation() && parsedSnapshot.error)
-      ? "Query results unavailable"
+      ? (!displayedOperation() && parsedSnapshot.error instanceof QueryUnavailableError
+        // A typed refusal explains itself (a published export answers only
+        // the queries it was made with); anything else stays generic.
+        ? parsedSnapshot.error.message : "Query results unavailable")
       : groupResource.loading || !displayedOperation() ? "Loading query results…" : "No results");
   const groupsError = () => {
     const error = groupResource.error;

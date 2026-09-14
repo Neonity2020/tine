@@ -18,10 +18,11 @@ Three routes were on the table for where the answers come from:
   cannot be built with the pinned dependencies: `libsqlite3-sys 0.35` supports
   only `wasm32-wasi*`, not the browser target, and the engine's answers are
   SQL-only by invariant.
-- **R-B — a second, browser-side engine.** A TypeScript reimplementation of the
-  query surface for exports. Two engines over one query language drift; the
-  project already retired a "walk arm" once so that every query answer is one
-  engine's answer.
+- **R-B — a second, browser-side engine.** sqlite-wasm plus the query
+  executor extracted from `tine-core` into a separate crate built for the
+  browser. Two builds of one engine still drift in what surrounds them (the
+  capture, the recency axis, the registry); the project already retired a
+  "walk arm" once so that every query answer is one engine's answer.
 - **R-C — bake.** Run the one native engine at export time over the closed
   sub-graph of exported pages, record every query's `parseQuery` answer and
   `queryRun` result, and ship the frontend build beside a `snapshot.json`. The
@@ -42,9 +43,13 @@ exported page.
 
 `src/publishedBackend.ts` answers the `Backend` interface from the snapshot.
 `parseQuery` and `queryRun` are lookups keyed exactly as `Macro.tsx` asks —
-dialect, `tine.*` host properties and text; stable JSON of the IR and the
-current page — and a miss is a typed `query-unavailable` /
-`published_export_static`, never a browser-side run. The Quick Switcher's
+dialect, `tine.*` host properties and text; stable JSON of the IR, the current
+page and the view the run was baked under (two `(task TODO)` twins on one page
+that differ only in `tine.sample::` are two records) — and a miss is a typed
+`query-unavailable` / `published_export_static`, never a browser-side run.
+The engine runs each query under the view its result kind resolves to, the
+way the app does (`anchored_view`), and the export's home block carries the
+host block's `tine.*` properties so the home opens under the same display. The Quick Switcher's
 navigation search is a substring match over the snapshot's page names and block
 text, as the browser mock's is; every other search lane is refused. Every other method is
 classified answered / constant / refused, and the guard test
@@ -67,9 +72,11 @@ window are not shipped; the export uses the browser's emoji face.
 - The decision is reversible at exactly two methods. A future browser-side
   engine (R-A) replaces `parseQuery` and `queryRun` in `publishedBackend.ts`;
   nothing else in the app changes.
-- Exports are static by design: sorting, view changes and new queries are
-  refused with a typed reason, and the Guide says so. A reader who wants those
-  needs the app.
+- Exports are static by design: view changes and new queries are refused with
+  a typed reason, and the Guide says so; local table-column sorting re-orders
+  baked rows in the browser and changes nothing. A reader who wants more needs
+  the app. Settings, favorites, the graph switcher and the plugin registry are
+  not offered in an export.
 - The frontend bundle is embedded in the binary already; an export copies it
   (~8 MB of assets) beside the pages. No second build, no second embed.
 - `Backend` grows a third implementation that must be kept classified; the

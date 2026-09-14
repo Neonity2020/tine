@@ -104,6 +104,12 @@ pub struct HomeQuery {
     /// The block the query was written in, dropped from its results exactly
     /// as the plan dropped it (GH #469).
     pub host_block_id: Option<String>,
+    /// The host block's `tine.*` properties (view, sample, sort…). Written
+    /// onto the home block so the app resolves the same display the query
+    /// was exported under; a `#+BEGIN_QUERY` container cannot carry block
+    /// properties, so an advanced home keeps its reviewed `view` only for
+    /// the native run.
+    pub host_properties: Vec<(String, String)>,
 }
 
 impl HomeQuery {
@@ -133,14 +139,37 @@ impl HomeQuery {
             source.to_string()
         }
     }
-    /// The one block the home page opens with.
+    /// The one block the home page opens with: the macro line, then the host
+    /// block's `tine.*` properties (a simple macro only — see `host_properties`).
     pub fn block_text(&self) -> String {
         let source = self.source.trim();
         if self.advanced {
             format!("#+BEGIN_QUERY\n  {{:query {source}}}\n  #+END_QUERY")
         } else {
-            format!("{{{{{} {source}}}}}", self.macro_name())
+            let mut text = format!("{{{{{} {source}}}}}", self.macro_name());
+            for (key, value) in self.properties() {
+                text.push_str("\n  ");
+                text.push_str(&key);
+                text.push_str(":: ");
+                text.push_str(&value);
+            }
+            text
         }
+    }
+    /// The properties the app's `parseQuery` receives for the home block:
+    /// the host's `tine.*` properties, single-line values only (a multi-line
+    /// value cannot be a block property), none for a `#+BEGIN_QUERY` home.
+    pub fn properties(&self) -> Vec<(String, String)> {
+        if self.advanced {
+            return Vec::new();
+        }
+        self.host_properties
+            .iter()
+            .filter(|(key, value)| {
+                key.starts_with("tine.") && !value.contains('\n') && !key.contains('\n')
+            })
+            .map(|(key, value)| (key.clone(), value.trim().to_string()))
+            .collect()
     }
 }
 
@@ -531,8 +560,22 @@ mod tests {
             current_page: None,
             view: None,
             host_block_id: None,
+            host_properties: Vec::new(),
         };
         assert_eq!(og.block_text(), "{{query (task TODO)}}");
+        let sampled = HomeQuery {
+            host_properties: vec![
+                ("tine.view".into(), "board".into()),
+                ("tine.sample".into(), " 1 ".into()),
+                ("id".into(), "0000".into()),
+            ],
+            ..og.clone()
+        };
+        assert_eq!(
+            sampled.block_text(),
+            "{{query (task TODO)}}\n  tine.view:: board\n  tine.sample:: 1"
+        );
+        assert_eq!(sampled.properties().len(), 2);
         assert_eq!(og.argument(), "(task TODO)");
         let tql = HomeQuery {
             simple_dialect: Some(QueryDialect::Tql),
@@ -544,8 +587,10 @@ mod tests {
         let advanced = HomeQuery {
             advanced: true,
             source: "[:find (pull ?b [*]) :where (task ?b \"TODO\")]".into(),
+            host_properties: vec![("tine.sample".into(), "1".into())],
             ..tql
         };
+        assert!(advanced.properties().is_empty());
         assert_eq!(
             advanced.block_text(),
             "#+BEGIN_QUERY\n  {:query [:find (pull ?b [*]) :where (task ?b \"TODO\")]}\n  #+END_QUERY"

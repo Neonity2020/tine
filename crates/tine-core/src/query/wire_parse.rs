@@ -87,3 +87,40 @@ pub fn parse_query_pair(
         scoped,
     }
 }
+
+/// The view the app runs a parsed query under: `queryParsedDisplaySettings`
+/// (`src/editor/queryDisplayDraft.ts`) transcribed. The result kind's scoped
+/// presentation wins over the singular one (default list); a present scoped
+/// draft replaces the singular display wholesale — it does not inherit from
+/// the query text — while an absent one inherits the merged singular view.
+pub fn anchored_view(parsed: &ParsedQuery, anchor: super::ir::Anchor) -> ViewSettings {
+    use super::ir::{Anchor, ViewKind};
+    let page = matches!(anchor, Anchor::Page);
+    let scoped_presentation = if page {
+        parsed.scoped.page_presentation
+    } else {
+        parsed.scoped.block_presentation
+    };
+    let presentation = scoped_presentation
+        .or(parsed.view.view)
+        .unwrap_or(ViewKind::List);
+    let draft = if page {
+        parsed.scoped.page_display.as_ref()
+    } else {
+        parsed.scoped.block_display.as_ref()
+    };
+    match draft {
+        Some(draft) => ViewSettings {
+            view: Some(presentation),
+            sort: draft.sort.clone().unwrap_or_default(),
+            group_by: draft.group_by.clone(),
+            columns: draft.columns.clone().unwrap_or_default(),
+            aggregates: draft.aggregates.clone().unwrap_or_default(),
+            sample: draft.sample,
+        },
+        None => ViewSettings {
+            view: Some(presentation),
+            ..parsed.view.clone()
+        },
+    }
+}

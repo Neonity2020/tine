@@ -53,6 +53,11 @@ pub struct QueryPublicationRequest {
     /// the UI excludes it (GH #469).
     #[serde(default)]
     pub host_block_id: Option<String>,
+    /// The host block's `tine.*` properties — the ones the app handed
+    /// `parseQuery` — so the export's home block carries the same display
+    /// settings (view, sample, sort) the query was exported under.
+    #[serde(default)]
+    pub host_properties: Vec<(String, String)>,
     /// Export name; the folder derives from it unless `folder` is given.
     pub name: String,
     /// The exact reviewed leaf directory name. Carried back unchanged from the
@@ -452,6 +457,7 @@ pub(crate) fn publish_query_documents(
                     current_page: request.current_page.clone(),
                     view: request.view.clone(),
                     host_block_id: request.host_block_id.clone(),
+                    host_properties: request.host_properties.clone(),
                 },
             }),
     };

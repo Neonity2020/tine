@@ -27,7 +27,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   query's results on the export's own home page, Ctrl+K page navigation,
   Linked References and block previews, with every answer computed by Tine at
   export time and nothing editable. Queries show the results they had when
-  exported; sorting, view changes and new queries are refused with a typed
+  exported, under the view they had; view changes and new queries are refused with a typed
   reason. `index.html` opened from disk, or with `?static`, keeps the plain
   static site.
 

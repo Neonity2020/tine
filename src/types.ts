@@ -1142,6 +1142,9 @@ export interface QueryPublicationRequest {
   currentPage?: string | null;
   view?: ViewSettings | null;
   hostBlockId?: string | null;
+  /** The host block's `tine.*` properties, as handed to `parseQuery`; the
+   *  export's home block carries them so it opens under the same display. */
+  hostProperties?: [string, string][];
   name: string;
   /** The exact reviewed leaf folder; carried back unchanged on confirm. */
   folder?: string | null;
