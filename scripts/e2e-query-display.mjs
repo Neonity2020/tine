@@ -241,14 +241,29 @@ async function press(browser, selector, text) {
 async function pickField(browser, triggerText, key) {
   await press(browser, ".qd-panel .qd-add, .qd-panel .qd-row-btn", triggerText);
   await browser.$(".qd-field-picker .qs-vocab-options").waitForExist({ timeout: 8_000 });
-  const offered = await browser.execute(() =>
-    [...document.querySelectorAll(".qd-field-picker .qs-vocab-option")].map((el) => el.getAttribute("data-vocabulary-key")));
-  if (!offered.includes(key)) {
-    fail(`the ${JSON.stringify(triggerText)} picker does not offer ${key}; it offers ${JSON.stringify(offered)}`);
+  // The five builtins render before the asynchronous property registry. Seeing
+  // those rows proves only that the picker opened, not that its vocabulary is
+  // complete. Wait for the requested field and click the node in the same
+  // browser turn so a registry rerender cannot detach it between lookup and
+  // activation.
+  let offered = [];
+  try {
+    await browser.waitUntil(async () => {
+      const outcome = await browser.execute((wanted) => {
+        const options = [...document.querySelectorAll(".qd-field-picker .qs-vocab-option")];
+        const keys = options.map((el) => el.getAttribute("data-vocabulary-key"));
+        const option = options.find((el) => el.getAttribute("data-vocabulary-key") === wanted);
+        if (!option) return { picked: false, keys };
+        option.focus?.();
+        option.click();
+        return { picked: true, keys };
+      }, key);
+      offered = outcome.keys;
+      return outcome.picked;
+    }, { timeout: 15_000, interval: 250 });
+  } catch {
+    fail(`the ${JSON.stringify(triggerText)} picker never offered ${key}; last offered ${JSON.stringify(offered)}`);
   }
-  await activate(browser, `.qd-field-picker .qs-vocab-option[data-vocabulary-key="${key}"]`, {
-    describe: `the ${JSON.stringify(key)} option in the ${JSON.stringify(triggerText)} picker`,
-  });
   await browser.$(".qd-field-picker").waitForExist({ reverse: true, timeout: 5_000 });
 }
 
@@ -304,6 +319,35 @@ async function waitForProperty(browser, page, key, value) {
         + `  read properties: ${JSON.stringify([...properties(page)])}\n`
         + `  file:\n${raw}`,
     );
+  }
+}
+
+/** Set Sample as one retryable interaction.
+ *
+ * The panel can remount after focus but before WebDriver delivers the keys. A
+ * single focus/type attempt therefore proves nothing when the old value stays
+ * in the file. Reacquire and select the live input on every attempt, then stop
+ * only when the exact persisted property observes the requested value. */
+async function setSampleAndWait(browser, page, value) {
+  let observed = properties(page).get("tine.sample") ?? null;
+  try {
+    await browser.waitUntil(async () => {
+      const prepared = await browser.execute(() => {
+        const input = document.querySelector(".qd-panel .qd-sample");
+        if (!(input instanceof HTMLInputElement)) return false;
+        input.focus();
+        input.select();
+        return document.activeElement === input;
+      });
+      if (!prepared) return false;
+      await browser.keys(value.split(""));
+      await browser.keys(["Enter"]);
+      await sleep(200);
+      observed = properties(page).get("tine.sample") ?? null;
+      return observed === value;
+    }, { timeout: 15_000, interval: 350 });
+  } catch {
+    fail(`${page}: retryable Sample interaction never persisted ${JSON.stringify(value)}; last observed ${JSON.stringify(observed)}`);
   }
 }
 
@@ -415,10 +459,7 @@ await withApp(0, async (browser) => {
   await waitForProperty(browser, "Display", "tine.columns", "owner");
 
   await openDisplay(browser);
-  await activate(browser, ".qd-panel .qd-sample", { describe: "the Sample input" });
-  await browser.keys("25".split(""));
-  await browser.keys(["Enter"]);
-  await waitForProperty(browser, "Display", "tine.sample", "25");
+  await setSampleAndWait(browser, "Display", "25");
 
   // --- 4. the panel edits LISTS, not first entries --------------------------
   await openDisplay(browser);
