@@ -10,7 +10,7 @@ import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { openPageByName } from "./lib/e2e-navigation.mjs";
 import { enableManagedStorage } from "./lib/e2e-managed-activation.mjs";
 import { waitForFileText } from "./e2e-file-poll.mjs";
-import { freeLoopbackPort, tauriCapabilities, waitForHttpServer, webdriverServerArgs } from "./e2e-capabilities.mjs";
+import { freeLoopbackPort, resolveTauriDriver, tauriCapabilities, waitForHttpServer, webdriverServerArgs } from "./e2e-capabilities.mjs";
 
 await ensureDisplay();
 const tmp = fs.mkdtempSync("/tmp/tine-publish-query-");
@@ -30,7 +30,7 @@ fs.writeFileSync(path.join(graph, "assets/shot.png"), Buffer.from("89504e470d0a1
 const app = process.env.TINE_APP || `${process.env.HOME}/research/tine`;
 const port = await freeLoopbackPort();
 const nativePort = await freeLoopbackPort(new Set([port]));
-const tdPath = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? `${process.env.CARGO_HOME}/bin/tauri-driver` : "tauri-driver");
+const tdPath = resolveTauriDriver();
 const log = fs.openSync(path.join(tmp, "driver.log"), "w");
 const wm = managed ? spawn("openbox", ["--sm-disable"], { detached: true, stdio: ["ignore", log, log] }) : undefined;
 const td = spawn(tdPath, webdriverServerArgs(port, nativePort, "/usr/bin/WebKitWebDriver"), {
