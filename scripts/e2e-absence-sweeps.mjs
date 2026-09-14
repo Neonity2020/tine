@@ -221,22 +221,28 @@ async function bodyText() {
 }
 
 
-// Artifact screenshots are evidence, not assertions. WebKitWebDriver
-// intermittently stalls a session-level call (screenshot GETs in particular;
-// UND_ERR_HEADERS_TIMEOUT after ~5 minutes) while the app and the journey's
-// semantic state are perfectly healthy — burn-in run 1 failed exactly there
-// with the product state verified correct in the failure body. Losing a
-// screenshot must not fail the journey.
+// Artifact screenshots are evidence, not assertions. Capture the X11 display
+// out of process so a stuck screenshot cannot consume or reap the WebDriver
+// session that owns the semantic journey. A timeout kills only ImageMagick's
+// short-lived capture process; the app and driver remain available.
 async function saveEvidenceScreenshot(name) {
-  try {
-    await webdriverLifecycle.run(
-      `screenshot:${name}`,
-      () => browser.saveScreenshot(path.join(ARTIFACTS, name)),
-    );
-  } catch (error) {
-    (receipt.screenshotFailures ??= []).push({ name, error: String(error).slice(0, 200) });
-    writeReceipt();
-  }
+  const destination = path.join(ARTIFACTS, name);
+  const capture = spawnSync(process.env.E2E_X11_SCREENSHOT || "import", [
+    "-silent",
+    "-window",
+    "root",
+    destination,
+  ], {
+    env,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (capture.status === 0 && fs.existsSync(destination)) return;
+  (receipt.screenshotFailures ??= []).push({
+    name,
+    error: String(capture.error || capture.stderr || `capture exited ${capture.status}`).slice(0, 200),
+  });
+  writeReceipt();
 }
 
 async function visibleButtons() {

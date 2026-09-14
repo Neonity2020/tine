@@ -92,6 +92,16 @@ describe("native E2E harness wiring", () => {
     ).toEqual([]);
   });
 
+  it("keeps optional absence-sweep screenshots outside the journey's WebDriver session", () => {
+    const source = fs.readFileSync(path.join(scriptsDir, "e2e-absence-sweeps.mjs"), "utf8");
+    const capture = source.match(
+      /async function saveEvidenceScreenshot[\s\S]*?\n}\n\nasync function visibleButtons/,
+    )?.[0] ?? "";
+    expect(capture).toContain("spawnSync(");
+    expect(capture).not.toContain("webdriverLifecycle");
+    expect(capture).not.toContain("browser.");
+  });
+
   it("both checks fire on known-bad input", () => {
     const bad = ["const env = { ...process.env };", "await ensureDisplay();"].join("\n");
     const order = displayOrder(bad);
