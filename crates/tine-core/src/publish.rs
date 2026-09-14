@@ -696,20 +696,34 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
 
         if name == "a" && has_class(inner, "page-ref") {
             if let Some(page) = tag_attr(inner, "data-page") {
-                out.push_str(&format!(
-                    "<a class=\"ref\" href=\"{}.html\">",
-                    page_slug(ctx, &unescape(page))
-                ));
+                let page = unescape(page);
+                if ctx.inert_outside_links && !publish_page_allowed(ctx, &page) {
+                    // Outside the exported set: keep the authored text, drop the
+                    // destination (there is no file to point at).
+                    out.push_str("<span class=\"ref ref-outside\">");
+                    inert_link_closures += 1;
+                } else {
+                    out.push_str(&format!(
+                        "<a class=\"ref\" href=\"{}.html\">",
+                        page_slug(ctx, &page)
+                    ));
+                }
                 strip_brackets = true;
                 continue;
             }
         }
         if name == "a" && has_class(inner, "tag") {
             if let Some(page) = tag_attr(inner, "data-page") {
-                out.push_str(&format!(
-                    "<a class=\"tag\" href=\"{}.html\">",
-                    page_slug(ctx, &unescape(page))
-                ));
+                let page = unescape(page);
+                if ctx.inert_outside_links && !publish_page_allowed(ctx, &page) {
+                    out.push_str("<span class=\"tag tag-outside\">");
+                    inert_link_closures += 1;
+                } else {
+                    out.push_str(&format!(
+                        "<a class=\"tag\" href=\"{}.html\">",
+                        page_slug(ctx, &page)
+                    ));
+                }
                 continue;
             }
         }
@@ -1285,6 +1299,12 @@ struct Ctx<'a> {
     /// Exact captured physical-path capabilities for `@page` rows. A page row
     /// must agree on path, title and kind before it may become a public link.
     page_links: Option<&'a HashMap<String, PublicationPageLink>>,
+    /// A query export is a closed set chosen by the user: a `[[page]]` or `#tag`
+    /// whose target is outside it renders as inert text instead of a dangling
+    /// `<a href>` to a file that was never written. The graph site (`publish/`)
+    /// keeps its historical dangling links (`false`); changing that is a
+    /// separate contract, not a side effect of this flag.
+    inert_outside_links: bool,
 }
 
 struct PublicationPageLink {
@@ -4016,6 +4036,7 @@ pub(crate) fn page_print_html_document(
         print_error: Some(&print_error),
         pages: None,
         page_links: None,
+        inert_outside_links: false,
     };
     // `page_html` builds the heading + outline and wraps it in `shell`; we want the
     // same body but the print shell, so mirror its body build here.
@@ -4436,6 +4457,7 @@ struct PublicationGraphSnapshot {
 
 #[cfg(windows)]
 mod private_directory;
+pub mod query_export;
 
 /// Create `path` as a directory only its owner may read, write or traverse,
 /// failing if it already exists.
@@ -4495,7 +4517,7 @@ impl PublicationGraphSnapshot {
 }
 
 struct PublishRecovery {
-    #[cfg(test)]
+    /// Ambient spelling, reported to the user so retired content can be found.
     path: PathBuf,
     dir: Dir,
 }
@@ -4627,7 +4649,7 @@ fn publish_recovery_race_hook(_recovery: &PublishRecovery) -> io::Result<()> {
     Ok(())
 }
 
-fn reserve_publish_recovery(graph: &Graph, root: &Dir) -> io::Result<PublishRecovery> {
+fn reserve_publish_recovery(graph: &Graph, root: &Dir, leaf: &str) -> io::Result<PublishRecovery> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4642,13 +4664,12 @@ fn reserve_publish_recovery(graph: &Graph, root: &Dir) -> io::Result<PublishReco
         .unwrap_or(0);
     for _ in 0..128 {
         let name = format!(
-            "{stamp}-{}__previous-publish",
+            "{stamp}-{}__previous-{leaf}",
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
         match recovery_root.create_dir(&name) {
             Ok(()) => {
                 return Ok(PublishRecovery {
-                    #[cfg(test)]
                     path: recovery.join(&name),
                     dir: recovery_root.open_dir(&name)?,
                 });
@@ -4663,8 +4684,39 @@ fn reserve_publish_recovery(graph: &Graph, root: &Dir) -> io::Result<PublishReco
     ))
 }
 
-fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::Result<()> {
+/// Install a complete stage at `output`. Returns where the previous occupant
+/// was retired, when there was one. `replace: false` is create-only: a
+/// directory that appeared since the user reviewed the destination makes the
+/// commit fail with the stage retired into recovery and nothing else touched.
+fn commit_publish_stage(
+    graph: &Graph,
+    stage: PublishStage,
+    output: &PublicationOutput,
+) -> io::Result<Option<PathBuf>> {
+    let out = output.path(graph);
+    let out = out.as_path();
     graph.ensure_write_target(out)?;
+    // The parent (`published-queries/`) is created through the bound graph
+    // capability; the graph site's parent is the root itself.
+    let leaf_rel = output.relative();
+    if output
+        .parent
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || output.leaf.is_empty()
+        || Path::new(&output.leaf)
+            .file_name()
+            .is_none_or(|value| value != output.leaf.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "static-publish output must be one directory name under the graph",
+        ));
+    }
+    if !output.parent.as_os_str().is_empty() {
+        graph.ensure_write_target(&graph.root.join(&output.parent))?;
+        stage.root.create_dir_all(&output.parent)?;
+    }
     // cap-std may represent a directory capability with an O_PATH descriptor on
     // Linux, which cannot itself be fsynced. Every generated file is fsynced;
     // directory durability remains best-effort, matching the other atomic paths.
@@ -4683,7 +4735,7 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
     // Reject a pre-existing alias without touching it. A replacement racing the
     // check is moved as an inode into bound recovery and rejected there; it is
     // never followed for a write.
-    let old_recovery = match root.symlink_metadata("publish") {
+    let old_recovery = match root.symlink_metadata(&leaf_rel) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(io::Error::new(
@@ -4691,9 +4743,23 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
                     "static-publish output is not a real directory",
                 ));
             }
-            let recovery = reserve_publish_recovery(graph, &root)?;
+            if !output.replace {
+                // Create-only: the reviewed destination was free and is not
+                // any more. Retire our own stage so nothing dangles; the
+                // occupant is untouched.
+                let bad = reserve_publish_recovery(graph, &root, &output.leaf)?;
+                let _ = root.rename(&path_rel(&graph.root, &path), &bad.dir, "unused-stage");
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Another export appeared at {}; choose a different name or replace it.",
+                        out.display()
+                    ),
+                ));
+            }
+            let recovery = reserve_publish_recovery(graph, &root, &output.leaf)?;
             publish_recovery_race_hook(&recovery)?;
-            root.rename("publish", &recovery.dir, "previous")?;
+            root.rename(&leaf_rel, &recovery.dir, "previous")?;
             let retired = recovery.dir.symlink_metadata("previous")?;
             if !retired.is_dir() || retired.file_type().is_symlink() {
                 return Err(io::Error::new(
@@ -4706,6 +4772,9 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    let retired_path = old_recovery
+        .as_ref()
+        .map(|recovery| recovery.path.join("previous"));
 
     if let Err(error) = crate::model::move_file_noreplace(&path, out) {
         // The previous site stays complete in conflict recovery. Avoid a
@@ -4718,24 +4787,46 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
         && !out_meta.file_type().is_symlink()
         && identity_from_path(out).is_ok_and(|live| live == identity);
     if same_stage {
-        return Ok(());
+        return Ok(retired_path);
     }
 
     // A replaced stage must never remain live. Move it through the bound graph
     // and recovery directory handles; the previous complete site is already
     // retained separately and is not overwritten during automatic recovery.
-    let bad = reserve_publish_recovery(graph, &root)?;
-    let _ = root.rename("publish", &bad.dir, "invalid-stage");
+    let bad = reserve_publish_recovery(graph, &root, &output.leaf)?;
+    let _ = root.rename(&leaf_rel, &bad.dir, "invalid-stage");
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "static-publish staging directory changed during commit",
     ))
 }
 
+/// Graph-relative spelling of a path known to sit directly under the root.
+fn path_rel(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Export public pages to `<root>/publish/`. Returns (output dir, page count).
 /// Only pages with `public:: true` are published, unless
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
+    let (pages, sources) = capture_direct_publication_sources(graph)?;
+    graph.with_publication_query_reader(&sources, |reader| {
+        publish_graph_documents_with_queries(graph, pages, reader)
+    })
+}
+
+/// Fresh parse of every listed page: the documents the renderer will see and
+/// the `(entry, revision)` pairs the query reader must correspond to.
+#[allow(clippy::type_complexity)]
+pub(crate) fn capture_direct_publication_sources(
+    graph: &Graph,
+) -> io::Result<(
+    Vec<(crate::model::PageEntry, doc::Document)>,
+    Vec<(crate::model::PageEntry, String)>,
+)> {
     let mut pages = Vec::new();
     let mut sources = Vec::new();
     for listed in graph.list_pages() {
@@ -4746,9 +4837,44 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         sources.push((entry.clone(), revision));
         pages.push((entry, document));
     }
-    graph.with_publication_query_reader(&sources, |reader| {
-        publish_graph_documents_with_queries(graph, pages, reader)
-    })
+    Ok((pages, sources))
+}
+
+/// Plan a query export on Direct Files: fresh capture, one coherent reader.
+pub fn plan_query_publication(
+    graph: &Graph,
+    request: &query_export::QueryPublicationRequest,
+) -> Result<query_export::QueryPublicationPlan, query_export::QueryPublicationError> {
+    let (_, sources) = capture_direct_publication_sources(graph)?;
+    graph
+        .with_publication_query_reader(&sources, |reader| {
+            Ok(query_export::plan_query_publication(graph, &sources, reader, request)
+                .map(|(plan, _)| plan))
+        })?
+}
+
+/// Confirmed query export on Direct Files.
+pub fn publish_query(
+    graph: &Graph,
+    request: &query_export::QueryPublicationRequest,
+    fingerprint: &str,
+) -> Result<PublishOutcome, query_export::QueryPublicationError> {
+    let (pages, sources) = capture_direct_publication_sources(graph)?;
+    let capture = pages
+        .into_iter()
+        .zip(sources.iter())
+        .map(|((entry, document), (_, revision))| (entry, document, revision.clone()))
+        .collect();
+    graph
+        .with_publication_query_reader(&sources, |reader| {
+            Ok(query_export::publish_query_documents(
+                graph,
+                capture,
+                reader,
+                request,
+                fingerprint,
+            ))
+        })?
 }
 
 /// Publish one already-authoritative graph snapshot. Managed storage obtains
@@ -4759,7 +4885,8 @@ fn publish_graph_documents(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
 ) -> io::Result<(String, usize)> {
-    publish_graph_documents_inner(graph, pages, None)
+    publish_graph_documents_inner(graph, pages, None, &PublicationTarget::graph_site())
+        .map(|outcome| (outcome.path, outcome.pages))
 }
 
 /// Render one already-authoritative document capture while every query surface
@@ -4769,15 +4896,88 @@ pub(crate) fn publish_graph_documents_with_queries(
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: &dyn PublicationQueryRead,
 ) -> io::Result<(String, usize)> {
-    publish_graph_documents_inner(graph, pages, Some(queries))
+    publish_graph_documents_inner(graph, pages, Some(queries), &PublicationTarget::graph_site())
+        .map(|outcome| (outcome.path, outcome.pages))
 }
 
-fn publish_graph_documents_inner(
+/// Which pages a static export contains. The renderer computes every closure
+/// index (slugs, block refs, backlinks, embeds, nested-query hydration, search)
+/// over exactly this set, so the selection is the whole privacy boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationSelection {
+    /// The graph site: pages carrying `public:: true`, or every page under
+    /// `:publishing/all-pages-public?`. Ambiguous identities are skipped.
+    PublicProperty,
+    /// A closed, user-reviewed set of graph-relative source paths (a query
+    /// export). A selected path that is missing from the capture, or whose
+    /// logical name has a physical twin, refuses the whole export: the user
+    /// reviewed a list, so silently shipping fewer pages is the wrong outcome.
+    Paths(std::collections::BTreeSet<String>),
+}
+
+/// Where a static export is installed: `<graph root>/<parent>/<leaf>/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationOutput {
+    /// Graph-relative parent directory; empty for the graph site.
+    pub parent: PathBuf,
+    /// The leaf directory name (`publish`, or a query export's folder).
+    pub leaf: String,
+    /// `true`: whatever occupies the leaf at commit time is retired into
+    /// conflict recovery before the stage is installed. `false`: the install
+    /// is create-only and fails if anything is there.
+    pub replace: bool,
+}
+
+impl PublicationOutput {
+    /// `<graph root>/<parent>/<leaf>`.
+    pub fn path(&self, graph: &Graph) -> PathBuf {
+        graph.root.join(&self.parent).join(&self.leaf)
+    }
+    fn relative(&self) -> PathBuf {
+        self.parent.join(&self.leaf)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationTarget {
+    pub selection: PublicationSelection,
+    pub output: PublicationOutput,
+}
+
+impl PublicationTarget {
+    /// The historical `publish/` site: `public::` pages, replaced in place.
+    pub fn graph_site() -> Self {
+        PublicationTarget {
+            selection: PublicationSelection::PublicProperty,
+            output: PublicationOutput {
+                parent: PathBuf::new(),
+                leaf: "publish".to_string(),
+                replace: true,
+            },
+        }
+    }
+}
+
+/// What one static export produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishOutcome {
+    /// Installed output directory.
+    pub path: String,
+    /// Pages written.
+    pub pages: usize,
+    /// Where the previous occupant of the output directory was retired, when
+    /// there was one. Always reported: the user must be able to find content
+    /// that appeared between review and commit.
+    pub retired: Option<String>,
+}
+
+pub(crate) fn publish_graph_documents_inner(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: Option<&dyn PublicationQueryRead>,
-) -> io::Result<(String, usize)> {
-    let out = graph.root.join("publish");
+    target: &PublicationTarget,
+) -> io::Result<PublishOutcome> {
+    let out = target.output.path(graph);
     graph.ensure_write_target(&out)?;
     let stage = reserve_publish_stage(graph)?;
     write_publish_stage_file(&stage, "style.css", STYLE.as_bytes())?;
@@ -4819,8 +5019,14 @@ fn publish_graph_documents_inner(
     // from `public` below.
     let mut public: Vec<(&str, PageKind, Arc<doc::Document>)> = Vec::new();
     let mut public_paths = Vec::new();
+    let mut selected_seen = 0usize;
     for (e, parsed) in entries {
-        let is_public = all_public || page_is_public(parsed.pre_block.as_deref());
+        let is_public = match &target.selection {
+            PublicationSelection::PublicProperty => {
+                all_public || page_is_public(parsed.pre_block.as_deref())
+            }
+            PublicationSelection::Paths(paths) => paths.contains(&e.rel_path),
+        };
         if !is_public {
             continue;
         }
@@ -4830,13 +5036,31 @@ fn publish_graph_documents_inner(
             .unwrap_or(0)
             != 1
         {
+            if let PublicationSelection::Paths(_) = &target.selection {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Two files claim the page \"{}\"; resolve the duplicate before exporting it.",
+                        e.name
+                    ),
+                ));
+            }
             if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
                 eprintln!("tine export: refusing one ambiguous public page identity");
             }
             continue;
         }
+        selected_seen += 1;
         public.push((e.name.as_str(), e.kind, Arc::clone(parsed)));
         public_paths.push((e.rel_path.clone(), e.name.clone(), e.kind));
+    }
+    if let PublicationSelection::Paths(paths) = &target.selection {
+        if selected_seen != paths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "The reviewed pages changed before the export ran; review them again.",
+            ));
+        }
     }
 
     // Every downstream document resolver gets the same exact revision as the
@@ -4929,6 +5153,7 @@ fn publish_graph_documents_inner(
         print_error: None,
         pages: Some(&page_docs),
         page_links: Some(&page_links),
+        inert_outside_links: matches!(target.selection, PublicationSelection::Paths(_)),
     };
     for (name, kind, parsed) in &public {
         let slug = slug_of(name);
@@ -4995,8 +5220,12 @@ fn publish_graph_documents_inner(
             .ensure_current()
             .map_err(publication_query_io_error)?;
     }
-    commit_publish_stage(graph, stage, &out)?;
-    Ok((out.display().to_string(), count))
+    let retired = commit_publish_stage(graph, stage, &target.output)?;
+    Ok(PublishOutcome {
+        path: out.display().to_string(),
+        pages: count,
+        retired: retired.map(|path| path.display().to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -5028,6 +5257,7 @@ mod tests {
             print_error: None,
             pages: None,
             page_links: None,
+            inert_outside_links: false,
         };
         decorate(&lsdoc::render_html(&body_blocks(raw), &md_opts()), &ctx, 0)
     }
@@ -5176,6 +5406,7 @@ mod tests {
                 print_error: None,
                 pages: None,
                 page_links: None,
+                inert_outside_links: false,
             },
             0,
         );
@@ -5439,7 +5670,7 @@ mod tests {
         let compact = production.split_whitespace().collect::<String>();
         let checked = compact.find("queries.ensure_current()").unwrap();
         let commit = compact
-            .find("commit_publish_stage(graph,stage,&out)")
+            .find("commit_publish_stage(graph,stage,&target.output)")
             .unwrap();
         assert!(
             checked < commit,
@@ -5634,7 +5865,7 @@ mod tests {
         write_publish_stage_file(&stage, "index.html", b"generated site").unwrap();
         symlink(&outside, dir.join("publish")).unwrap();
 
-        assert!(commit_publish_stage(&graph, stage, &dir.join("publish")).is_err());
+        assert!(commit_publish_stage(&graph, stage, &PublicationTarget::graph_site().output).is_err());
 
         assert_eq!(
             fs::read_to_string(outside.join("index.html")).unwrap(),
@@ -5901,6 +6132,7 @@ mod tests {
             print_error: None,
             pages: None,
             page_links: None,
+            inert_outside_links: false,
         };
 
         assert!(inline_asset_uri(&cumulative_ctx, "../assets/one.png").is_some());
@@ -6148,6 +6380,200 @@ mod tests {
             "the TQL query returned its row: {dashboard}"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn query_export_fixture(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-query-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(dir.join("logseq/config.edn"), "{}\n").unwrap();
+        // Tasks: one matching block, one NOT matching (whole-page export must
+        // carry it), a link to a page outside the set and one inside it.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO first-task [[Private Notes]]\n- unmatched-sibling-text [[Also Selected]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Also Selected.md"),
+            "- TODO second-task #Private\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Private Notes.md"),
+            "- private-sentinel-text\n- DONE not-a-todo\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals/2026_01_02.md"), "- TODO journal-task\n").unwrap();
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- {{query (task TODO)}}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn todo_request(name: &str) -> query_export::QueryPublicationRequest {
+        query_export::QueryPublicationRequest {
+            query: "(task TODO)".into(),
+            advanced: false,
+            simple_dialect: None,
+            current_page: Some("Dashboard".into()),
+            view: None,
+            host_block_id: None,
+            name: name.into(),
+            folder: None,
+            replace: false,
+        }
+    }
+
+    #[test]
+    fn query_export_publishes_whole_owner_pages_and_nothing_else() {
+        let dir = query_export_fixture("owners");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("Open tasks");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        assert_eq!(plan.anchor, "block");
+        assert_eq!(plan.row_count, 3, "{plan:?}");
+        assert!(!plan.exists);
+        assert_eq!(plan.folder, "open-tasks");
+        let names: Vec<&str> = plan.pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"Tasks") && names.contains(&"Also Selected"));
+        assert!(plan.pages.iter().any(|p| p.journal), "journal owner kept");
+        assert!(!names.contains(&"Private Notes"), "DONE block must not select");
+        assert!(!names.contains(&"Dashboard"), "host page has no match");
+
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert_eq!(outcome.pages, 3);
+        assert!(outcome.retired.is_none());
+        let out = PathBuf::from(&outcome.path);
+        assert_eq!(out, dir.join("published-queries").join("open-tasks"));
+        let tasks = fs::read_to_string(out.join("tasks.html")).unwrap();
+        assert!(tasks.contains("unmatched-sibling-text"), "whole page: {tasks}");
+        assert!(
+            tasks.contains("also-selected.html"),
+            "inside-set link resolves: {tasks}"
+        );
+        assert!(
+            !tasks.contains("private-notes.html") && tasks.contains("Private Notes"),
+            "outside-set link is inert text, not a dangling href: {tasks}"
+        );
+        assert!(tasks.contains("ref-outside"), "{tasks}");
+        assert!(!out.join("private-notes.html").exists());
+        let also = fs::read_to_string(out.join("also-selected.html")).unwrap();
+        assert!(
+            !also.contains("private.html") && also.contains("tag-outside"),
+            "outside tag inert: {also}"
+        );
+        let index = fs::read_to_string(out.join("search-index.js")).unwrap();
+        assert!(!index.contains("private-sentinel-text"), "outside content: {index}");
+        assert!(
+            !index.contains("\"title\":\"Private Notes\""),
+            "an outside page is never a page entry (its name may appear as authored text on a selected page): {index}"
+        );
+        assert!(!dir.join("publish").exists(), "the graph site is untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_refuses_a_stale_review_and_respects_create_vs_replace() {
+        let dir = query_export_fixture("replace");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("Open tasks");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+
+        // Content of a selected page changes after review: same paths, new
+        // revision, so the fingerprint moves and the export refuses.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO first-task edited\n- unmatched-sibling-text\n",
+        )
+        .unwrap();
+        drop(_projection);
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let stale = publish_query(&graph, &request, &plan.fingerprint);
+        assert!(
+            matches!(stale, Err(query_export::QueryPublicationError::Refused(ref m)) if m.contains("changed")),
+            "{stale:?}"
+        );
+
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        let out = dir.join("published-queries").join("open-tasks");
+        assert!(out.join("tasks.html").exists());
+
+        // Second export of the same name: the plan reports the collision and
+        // a free suffix; create-only refuses; replace retires the old site.
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        assert!(plan.exists);
+        assert_eq!(plan.suggested_folder.as_deref(), Some("open-tasks-2"));
+        let refused = publish_query(&graph, &request, &plan.fingerprint);
+        assert!(
+            matches!(refused, Err(query_export::QueryPublicationError::Refused(_))),
+            "{refused:?}"
+        );
+        fs::write(out.join("manual-note.txt"), "kept in recovery").unwrap();
+        let replacing = query_export::QueryPublicationRequest {
+            replace: true,
+            folder: Some(plan.folder.clone()),
+            ..request.clone()
+        };
+        let plan = plan_query_publication(&graph, &replacing).unwrap();
+        let outcome = publish_query(&graph, &replacing, &plan.fingerprint).unwrap();
+        let retired = PathBuf::from(outcome.retired.expect("previous export retired"));
+        assert!(retired.starts_with(dir.join("logseq/.tine-trash/conflicts")));
+        assert_eq!(
+            fs::read_to_string(retired.join("manual-note.txt")).unwrap(),
+            "kept in recovery"
+        );
+        assert!(!out.join("manual-note.txt").exists());
+        assert!(out.join("tasks.html").exists());
+
+        // A separate export under the suggested folder lands beside it.
+        let separate = query_export::QueryPublicationRequest {
+            folder: Some("open-tasks-2".into()),
+            ..request.clone()
+        };
+        let plan = plan_query_publication(&graph, &separate).unwrap();
+        assert!(!plan.exists);
+        publish_query(&graph, &separate, &plan.fingerprint).unwrap();
+        assert!(dir.join("published-queries/open-tasks-2/tasks.html").exists());
+        assert!(out.join("tasks.html").exists(), "sibling untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_refuses_twins_and_empty_results() {
+        let dir = query_export_fixture("twins");
+        // A second file claiming "Tasks": the export must refuse, not ship one.
+        fs::write(dir.join("journals/Tasks.md"), "- TODO twin-task\n").unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let twin = plan_query_publication(&graph, &todo_request("Open tasks"));
+        assert!(
+            matches!(twin, Err(query_export::QueryPublicationError::Refused(ref m)) if m.contains("Two files")),
+            "{twin:?}"
+        );
+        let mut none = todo_request("Nothing");
+        none.query = "(task CANCELED)".into();
+        let plan = plan_query_publication(&graph, &none).unwrap();
+        assert!(plan.pages.is_empty());
+        let refused = publish_query(&graph, &none, &plan.fingerprint);
+        assert!(
+            matches!(refused, Err(query_export::QueryPublicationError::Refused(ref m)) if m.contains("no results")),
+            "{refused:?}"
+        );
+        assert!(!dir.join("published-queries").join("nothing").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6846,6 +7272,7 @@ mod tests {
             print_error: None,
             pages: None,
             page_links: None,
+            inert_outside_links: false,
         };
 
         let oversized = "x".repeat(crate::query::QUERY_SOURCE_MAX_BYTES + 1);

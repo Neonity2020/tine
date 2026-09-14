@@ -3058,6 +3058,28 @@ pub enum SyncApplicationPublishOutcome {
     Deferred { state: SyncEditorDeferred },
 }
 
+/// One query-export step on Managed storage: the plan, the installed site, a
+/// user-facing refusal, or the same editor deferral every publication turn can
+/// hit while pages are still settling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationQueryPublishOutcome {
+    Planned {
+        plan: crate::publish::query_export::QueryPublicationPlan,
+    },
+    Published {
+        path: String,
+        pages: usize,
+        retired: Option<String>,
+    },
+    Refused {
+        message: String,
+    },
+    Deferred {
+        state: SyncEditorDeferred,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationGuideCopyOutcome {
@@ -5870,6 +5892,28 @@ impl SyncRuntimeHandle {
         &self,
     ) -> Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError> {
         self.application_request(|reply| ActorRequest::PublishApplicationHtml { reply })
+    }
+
+    /// Plan (`fingerprint: None`) or commit (`Some`) a query export over the
+    /// actor's own authoritative documents and one main query image.
+    pub fn publish_application_query(
+        &self,
+        request: crate::publish::query_export::QueryPublicationRequest,
+        fingerprint: Option<String>,
+    ) -> Result<SyncApplicationQueryPublishOutcome, SyncApplicationPageRequestError> {
+        if request.query.len() > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    text_bytes: request.query.len(),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        self.application_request(|reply| ActorRequest::PublishApplicationQuery {
+            request: Box::new(request),
+            fingerprint,
+            reply,
+        })
     }
 
     pub fn copy_application_guide(
@@ -11956,6 +12000,13 @@ enum ActorRequest {
     PublishApplicationHtml {
         reply: mpsc::Sender<Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError>>,
     },
+    PublishApplicationQuery {
+        request: Box<crate::publish::query_export::QueryPublicationRequest>,
+        fingerprint: Option<String>,
+        reply: mpsc::Sender<
+            Result<SyncApplicationQueryPublishOutcome, SyncApplicationPageRequestError>,
+        >,
+    },
     CopyApplicationGuide {
         title: String,
         reply:
@@ -12314,6 +12365,15 @@ fn run_actor_loop(
             }
             ActorRequest::PublishApplicationHtml { reply } => {
                 let result = actor.publish_application_html();
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::PublishApplicationQuery {
+                request,
+                fingerprint,
+                reply,
+            } => {
+                let result = actor.publish_application_query(&request, fingerprint.as_deref());
                 let _ = reply.send(result);
                 false
             }
@@ -21642,6 +21702,30 @@ impl RuntimeActor {
         if let Some(state) = self.drain_clean_foreground_for_command() {
             return Ok(SyncApplicationPublishOutcome::Deferred { state });
         }
+        let pages = self
+            .capture_publication_documents()?
+            .into_iter()
+            .map(|(entry, document, _)| (entry, document))
+            .collect();
+        let capture = self.capture_current_query_read(true)?;
+        let output = self
+            .managed_query
+            .with_publication_query_reader(&capture, |reader| {
+                crate::publish::publish_graph_documents_with_queries(&self.graph, pages, reader)
+            });
+        let (path, pages) = output
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_query_snapshot"))?
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_output"))?;
+        Ok(SyncApplicationPublishOutcome::Published { path, pages })
+    }
+
+    /// Every ready page as the exact authoritative document plus the revision
+    /// of that exact load — the revision is what a query export's review
+    /// fingerprint is pinned to.
+    #[allow(clippy::type_complexity)]
+    fn capture_publication_documents(
+        &self,
+    ) -> Result<Vec<(PageEntry, crate::doc::Document, String)>, SyncApplicationPageRequestError> {
         let inventory = self.application_inventory_ready()?;
         let mut pages = Vec::with_capacity(inventory.len());
         for entry in inventory {
@@ -21654,18 +21738,59 @@ impl RuntimeActor {
             let document = crate::model::page_dto_document(&current.page).map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt("publish_page_parse")
             })?;
-            pages.push((entry, document));
+            pages.push((entry, document, current.revision));
         }
+        Ok(pages)
+    }
+
+    fn publish_application_query(
+        &mut self,
+        request: &crate::publish::query_export::QueryPublicationRequest,
+        fingerprint: Option<&str>,
+    ) -> Result<SyncApplicationQueryPublishOutcome, SyncApplicationPageRequestError> {
+        use crate::publish::query_export::{
+            plan_query_publication, publish_query_documents, QueryPublicationError,
+        };
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationQueryPublishOutcome::Deferred { state });
+        }
+        if let Some(state) = self.drain_clean_foreground_for_command() {
+            return Ok(SyncApplicationQueryPublishOutcome::Deferred { state });
+        }
+        let documents = self.capture_publication_documents()?;
         let capture = self.capture_current_query_read(true)?;
         let output = self
             .managed_query
-            .with_publication_query_reader(&capture, |reader| {
-                crate::publish::publish_graph_documents_with_queries(&self.graph, pages, reader)
-            });
-        let (path, pages) = output
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_query_snapshot"))?
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_output"))?;
-        Ok(SyncApplicationPublishOutcome::Published { path, pages })
+            .with_publication_query_reader(&capture, |reader| match fingerprint {
+                None => {
+                    let sources: Vec<_> = documents
+                        .iter()
+                        .map(|(entry, _, revision)| (entry.clone(), revision.clone()))
+                        .collect();
+                    plan_query_publication(&self.graph, &sources, reader, request)
+                        .map(|(plan, _)| SyncApplicationQueryPublishOutcome::Planned { plan })
+                }
+                Some(fingerprint) => {
+                    publish_query_documents(&self.graph, documents, reader, request, fingerprint)
+                        .map(|outcome| SyncApplicationQueryPublishOutcome::Published {
+                            path: outcome.path,
+                            pages: outcome.pages,
+                            retired: outcome.retired,
+                        })
+                }
+            })
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_query_snapshot"))?;
+        match output {
+            Ok(outcome) => Ok(outcome),
+            Err(QueryPublicationError::Refused(message)) => {
+                Ok(SyncApplicationQueryPublishOutcome::Refused { message })
+            }
+            Err(QueryPublicationError::Io(error)) => Ok(
+                SyncApplicationQueryPublishOutcome::Refused {
+                    message: error.to_string(),
+                },
+            ),
+        }
     }
 
     fn copy_application_guide(
