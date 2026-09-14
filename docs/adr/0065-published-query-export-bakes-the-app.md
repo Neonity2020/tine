@@ -77,7 +77,9 @@ window are not shipped; the export uses the browser's emoji face.
   note.
 
 **Unit cost:** per export, one `snapshot.json` (the exported pages' DTOs plus
-one record per query; 3.4 KB for the three-page E2E fixture with one query) and one
+one record per query; 3.4 KB for the three-page E2E fixture with one query,
+716 KB for 86 pages and 4 queries on the anonymized real-graph corpus) and one
 copy of the frontend bundle (~8 MB); nothing per edit, nothing persisted in the
-graph, nothing read back. Measured on the `e2e-publish-query` fixture,
-2026-09-14.
+graph, nothing read back. Export of the 86-page selection took 0.3 s and the
+published app booted in 0.25 s over local HTTP. Measured on the
+`e2e-publish-query` fixture and the anonymized corpus, 2026-09-14.
