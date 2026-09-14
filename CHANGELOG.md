@@ -8,19 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
-### Fixed
-
-- Privacy-safe diagnostic reports now include the bounded reason code for
-  failed Tine-managed storage page saves, making prolonged unsaved-draft
-  failures diagnosable without debug mode or a special build (GH #540).
-- Closing with failed saves identifies the affected pages. Choosing not to
-  discard opens a recovery panel with page navigation, save retry, and draft
-  copying, including a complete recovery copy (GH #540).
-- A conflict whose original physical page is unavailable exposes its retained
-  draft and guarded resolution instead of hiding recovery behind the page-load
-  error (GH #541).
-
-## [0.6.983] - 2026-09-13
+## [0.6.983] - 2026-09-14
 
 ### Added
 
@@ -355,6 +343,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   warns about one.
 
 ### Fixed
+
+- Privacy-safe diagnostic reports now include the bounded reason code for
+  failed Tine-managed storage page saves, making prolonged unsaved-draft
+  failures diagnosable without debug mode or a special build (GH #540).
+
+- Closing with failed saves identifies the affected pages. Choosing not to
+  discard opens a recovery panel with page navigation, save retry, and draft
+  copying, including a complete recovery copy (GH #540).
+
+- A conflict whose original physical page is unavailable exposes its retained
+  draft and guarded resolution instead of hiding recovery behind the page-load
+  error (GH #541).
 
 - **Recovered drafts can be resolved after files change while Tine is closed.** Concord now applies choices to the same current file version shown in its review. A further change after review still stops the write and asks for a fresh review.
 
