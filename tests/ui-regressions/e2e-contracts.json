@@ -343,7 +343,8 @@
    "nonRequirements": [
     "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, millisecond timing, or a particular internal queue implementation."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-09-14: Martin explicitly accepted quarantine for this managed-storage journey because Managed Storage is experimental and currently broken; retain its assertions, 180-second timeout, and failure artifacts while it does not block v0.6.983."
   },
   "scripts/e2e-media.mjs": {
    "contracts": [
