@@ -19608,6 +19608,125 @@ fn as_editor(graph: &Graph, dto: &mut PageDto) {
     dto.activation = Some(handle.activation.as_u64());
 }
 
+#[test]
+fn durable_draft_deleted_file_review_is_read_only_and_apply_restores() {
+    for extension in ["md", "org"] {
+        let root = scratch("durable-draft-deleted");
+        let relative = format!("pages/Note.{extension}");
+        let path = root.join(&relative);
+        let base = if extension == "md" { "- original\n" } else { "* original\n" };
+        fs::write(&path, base).unwrap();
+        let graph = Graph::open(&root);
+        let mut page = graph.load_by_path(&relative).unwrap().unwrap();
+        page.blocks[0].raw = "retained draft".into();
+        drop(graph);
+        fs::remove_file(&path).unwrap();
+        let reopened = Graph::open(&root);
+        let diff = reopened.durable_live_save_conflict_diff(&page, Some(base)).unwrap();
+        assert!(!path.exists(), "review must not recreate the file");
+        assert_eq!(diff.conflict_rev, "absent");
+        reopened.resolve_durable_live_save_conflict(
+            &page, &diff.conflict_rev, &std::collections::HashMap::new(), "mine",
+        ).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("retained draft"));
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn durable_draft_absence_review_refuses_even_an_empty_recreated_file() {
+    let root = scratch("durable-draft-recreated");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    fs::remove_file(&path).unwrap();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    fs::write(&path, "").unwrap();
+    let error = graph.resolve_durable_live_save_conflict(
+        &page, &diff.conflict_rev, &std::collections::HashMap::new(), "mine",
+    ).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    assert_eq!(page.blocks[0].raw, "retained draft");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_draft_absence_apply_never_clobbers_a_late_creator() {
+    let root = scratch("durable-draft-late-create");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    fs::remove_file(&path).unwrap();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    let raced = path.clone();
+    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&raced, "- external winner\n")));
+    });
+    let result = graph.resolve_durable_live_save_conflict(
+        &page, &diff.conflict_rev, &std::collections::HashMap::new(), "mine",
+    );
+    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    assert!(result.is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
+    assert_eq!(page.blocks[0].raw, "retained draft");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_draft_present_apply_checks_bytes_at_bound_publication() {
+    let root = scratch("durable-draft-late-write");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    let raced = path.clone();
+    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&raced, "- external winner\n")));
+    });
+    let result = graph.resolve_durable_live_save_conflict(
+        &page, &diff.conflict_rev, &std::collections::HashMap::new(), "mine",
+    );
+    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    assert!(result.is_err(), "a later write must refuse the stale merge");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn durable_draft_present_apply_refuses_a_late_same_bytes_new_identity() {
+    let root = scratch("durable-draft-late-identity");
+    let path = root.join("pages/Note.md");
+    fs::write(&path, "- original\n").unwrap();
+    let graph = Graph::open(&root);
+    let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+    page.blocks[0].raw = "retained draft".into();
+    let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
+    let raced = path.clone();
+    let replacement = root.join("external-replacement.tmp");
+    fs::write(&replacement, "- original\n").unwrap();
+    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::remove_file(&raced)?;
+            fs::rename(&replacement, &raced)
+        }));
+    });
+    let result = graph.resolve_durable_live_save_conflict(
+        &page, &diff.conflict_rev, &std::collections::HashMap::new(), "mine",
+    );
+    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    assert!(result.is_err(), "same bytes must not substitute a different physical file");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "- original\n");
+    assert_eq!(page.blocks[0].raw, "retained draft");
+    let _ = fs::remove_dir_all(root);
+}
+
 fn gh254_code(error: &io::Error) -> &'static str {
     direct_save_failure_code(error)
 }

@@ -14090,15 +14090,22 @@ impl Graph {
     ) -> io::Result<crate::sync_diff::SyncConflictDiff> {
         let write = self.admit_managed_text_writer()?;
         let (path, _) = self.save_target(&write, page)?;
-        let theirs_text = self.managed_read_to_string(&write, &path)?;
+        let theirs_text = self
+            .managed_read_optional_editor_conflict_snapshot(&write, &path)?
+            .map(|(text, _)| text);
         let mine = page_dto_document(page)?;
-        let theirs = parse_doc(&path, &theirs_text);
+        let theirs = parse_doc(&path, theirs_text.as_deref().unwrap_or_default());
         let mut diff = match base_text {
             Some(base) => crate::sync_diff::diff3_docs(&parse_doc(&path, base), &mine, &theirs),
             None => crate::sync_diff::diff_docs(&mine, &theirs),
         };
         diff.base_rev = page.rev.clone().unwrap_or_default();
-        diff.conflict_rev = content_rev(&theirs_text);
+        // Absence is distinct from an existing empty file: a later creator
+        // must invalidate this review even when it writes zero bytes.
+        diff.conflict_rev = theirs_text
+            .as_deref()
+            .map(content_rev)
+            .unwrap_or_else(|| "absent".to_owned());
         Ok(diff)
     }
 
@@ -14121,8 +14128,14 @@ impl Graph {
         let (path, _) = self.save_target(&write, page)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
-        let theirs_text = self.managed_read_to_string(&write, &path)?;
-        if content_rev(&theirs_text) != expected_disk_rev {
+        let (theirs_text, expected_identity) = self
+            .managed_read_optional_editor_conflict_snapshot(&write, &path)?
+            .unzip();
+        let current_disk_rev = theirs_text
+            .as_deref()
+            .map(content_rev)
+            .unwrap_or_else(|| "absent".to_owned());
+        if current_disk_rev != expected_disk_rev {
             return Err(DirectSaveError::into_io(
                 DirectSaveFailureCode::ConflictBaseRev,
                 io::Error::new(
@@ -14131,14 +14144,18 @@ impl Graph {
                 ),
             ));
         }
-        if Format::from_path(&path) == Format::Org && !crate::org::org_editable(&theirs_text) {
+        if Format::from_path(&path) == Format::Org
+            && theirs_text
+                .as_deref()
+                .is_some_and(|text| !crate::org::org_editable(text))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the org file does not round-trip; not merging",
             ));
         }
         let mine = page_dto_document(page)?;
-        let theirs = parse_doc(&path, &theirs_text);
+        let theirs = parse_doc(&path, theirs_text.as_deref().unwrap_or_default());
         let pre_block = match pre_choice {
             "theirs" => theirs.pre_block.clone(),
             "mine" => mine.pre_block.clone(),
@@ -14160,9 +14177,9 @@ impl Graph {
             &write,
             &resolved,
             &path,
-            Some(&theirs_text),
+            theirs_text.as_deref(),
             true,
-            None,
+            expected_identity,
             None,
             None,
             cacheable,
