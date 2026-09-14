@@ -11736,6 +11736,31 @@
         "failBefore": "proven"
       },
       "notes": "Blocking stateful UX. The plan's folder and fingerprint travel back unchanged on confirm (stateless preview→commit). An over-budget refusal (typed query-unavailable / export_asset_budget_exceeded) shows 'Adjust limit in Settings…' which opens Settings → Graph in one click. Native real-app coverage of the button→dialog→folder path is pending; see REG-QUERY-EXPORT-CLOSURE-001 for the core contract."
+    },
+    {
+      "id": "UI-QUERY-EXPORT-APP-001",
+      "title": "A query export opens in a browser as the read-only Tine app over its baked snapshot: home page with the exported query's rows, page navigation, Linked References, no editing, and ?static keeps the static site",
+      "family": "publishing",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "tine-agents/specs/notes/2026-09-14-publish-query-stage2.md (v2, Astra-verified)"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/publishedBackend.test.ts",
+          "src/publishedBackend.guard.test.ts",
+          "scripts/e2e-published-app.mjs"
+        ],
+        "scenario": "publish.query-export-app",
+        "failBefore": "proven"
+      },
+      "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export…, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. Playwright journey is quarantined until burn-in."
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
 import { backend, QueryPrintRefusedError, type QueryNotReadyError } from "../backend";
+import { isPublishedExport } from "../publishedBackend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
 import { queryExportBudgetBytes } from "../queryExportBudget";
@@ -1572,10 +1573,14 @@ export function QueryMacro(props: {
   // The query text pane holds text that does not parse: the rows below are the
   // last reading that RAN, so they are greyed rather than blanked (§4.3.1).
   const [paneStale, setPaneStale] = createSignal(false);
+  /** A published export (Stage 2) shows each query exactly as it was baked:
+   *  no builder, no view switcher, no re-export — the snapshot cannot answer a
+   *  changed query, so the controls that would change one are not offered. */
+  const published = isPublishedExport();
   /** Whether the sentence-and-sheet builder is hosted for this block. The
    *  result count lives beside the sentence when it is, and in the header when
    *  it is not (§7.2). */
-  const showBuilder = () => !!props.blockId && !isAdvanced() && !!builderSession();
+  const showBuilder = () => !!props.blockId && !isAdvanced() && !!builderSession() && !published;
   /** **Where the inline Display panel is offered** (P5B).
    *
    *  It needs a block to write `tine.*` to and a builder to host it — and it is
@@ -2029,7 +2034,7 @@ export function QueryMacro(props: {
               <Show when={!showBuilder()}>
                 <span class="query-count">{total()}</span>
               </Show>
-              <Show when={props.blockId && !exportRefusal()}>
+              <Show when={props.blockId && !exportRefusal() && !published}>
                 <button
                   type="button"
                   class="query-export-button"
@@ -2043,7 +2048,7 @@ export function QueryMacro(props: {
                   Export…
                 </button>
               </Show>
-              <Show when={props.blockId && !inlineDisplay()}>
+              <Show when={props.blockId && !inlineDisplay() && !published}>
                 <div class="query-view-switcher" role="group" aria-label="Query view" onClick={stop}>
                   <For each={QUERY_VIEWS}>
                     {(view) => (

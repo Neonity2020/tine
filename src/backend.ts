@@ -85,6 +85,7 @@ import type {
 import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
+import { isPublishedExport, publishedBackend } from "./publishedBackend";
 import { recordGraphOpenCommand } from "./graphOpenTrace";
 
 export type ConflictCapsuleAuthority =
@@ -233,12 +234,19 @@ export type BackendErrorKind =
   | "managed-actor-refusal"
   | "query-not-ready"
   | "query-unavailable"
-  | "query-print-refused";
+  | "query-print-refused"
+  | "published-export-read-only";
 
 const BACKEND_ERROR_MESSAGES: Record<
   Exclude<
     BackendErrorKind,
-    "save-conflict" | "direct-save-failure" | "managed-actor-refusal" | "query-print-refused" | "query-not-ready" | "query-unavailable"
+    | "save-conflict"
+    | "direct-save-failure"
+    | "managed-actor-refusal"
+    | "query-print-refused"
+    | "query-not-ready"
+    | "query-unavailable"
+    | "published-export-read-only"
   >,
   string
 > = {
@@ -380,6 +388,18 @@ export class QueryUnavailableError extends BackendError {
   constructor(readonly reasonCode: string, message: string) {
     super("query-unavailable", message);
     this.name = "QueryUnavailableError";
+  }
+}
+
+/** A published query export (Stage 2) answers reads from its baked snapshot
+ *  and refuses everything that would write, sync, install, or reach the OS.
+ *  Defined here, not in `publishedBackend.ts`, because that module is imported
+ *  by this one: a class it exported would sit in the ES-module cycle's
+ *  temporal dead zone at the moment `backend()` first selects it. */
+export class PublishedExportReadOnlyError extends BackendError {
+  constructor() {
+    super("published-export-read-only", "This is a read-only published export.");
+    this.name = "PublishedExportReadOnlyError";
   }
 }
 
@@ -2462,7 +2482,7 @@ let _backend: Backend | null = null;
 
 export function backend(): Backend {
   if (!_backend) {
-    _backend = isTauri() ? new TauriBackend() : mockBackend();
+    _backend = isTauri() ? new TauriBackend() : isPublishedExport() ? publishedBackend() : mockBackend();
   }
   return _backend;
 }

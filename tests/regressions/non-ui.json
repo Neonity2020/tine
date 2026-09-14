@@ -7895,6 +7895,33 @@
   "failBefore": "proven"
  },
  "notes": "Exact safety/interoperability. Selection is the set of physical owner pages; the fingerprint covers anchor, row count, folder and every selected page's path/name/kind/revision, so a changed graph between review and commit is refused. Create fails if the folder appeared meanwhile (own stage retired as unused-stage); Replace retires the occupant into logseq/.tine-trash/conflicts and reports the path. Assets copy into <leaf>/assets/<rel> under the request's byte budget; exceeding it refuses the whole export with a typed error. published-queries/ is a fixed graph-text exclusion and GRAPH_TEXT_SCOPE_VERSION moved 1→2 (one Managed rebuild). The 57 pre-existing publish/ tests are unchanged: golden equivalence of the graph site."
+},
+{
+ "id": "REG-QUERY-EXPORT-APP-CLOSURE-001",
+ "title": "The app snapshot of a query export holds exactly the exported pages and the queries recorded over them: no outside page, block, backlink, alias, icon or result row, and every query row was computed by the native engine at export time",
+ "family": "static-publication-privacy",
+ "sources": {
+  "issues": [],
+  "commits": [
+   "8a274ac7"
+  ],
+  "internal": "tine-agents/specs/notes/2026-09-14-publish-query-stage2.md (v2, Astra-verified)"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core-publish",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/publish.rs::tests::query_export_ships_the_app_over_a_closed_snapshot",
+   "crates/tine-core/src/publish.rs::tests::query_export_without_an_embedded_frontend_warns_and_ships_no_app",
+   "crates/tine-core/src/publish/app_export.rs::tests"
+  ],
+  "scenario": "publish.query-export-app-closure",
+  "failBefore": "proven"
+ },
+ "notes": "Exact safety/interoperability. The snapshot is built from a closed sub-graph (PublicationGraphSnapshot over the selected pages only), so backlinks, block_ref_counts, aliases and icons cannot name an outside page. Query rows are recorded by the same executor that renders the static site, with the export's scope rules (<% current page %> substitution, on-page context, BEGIN_QUERY table view, nested rows not recorded, host block removed from the home run). The home page is synthesized (name = export name, or '<name> (export)' on collision) and never written to the graph. A build without the embedded frontend warns and ships no app/. Byte search for a private sentinel is the privacy oracle."
 }
 ]
 }

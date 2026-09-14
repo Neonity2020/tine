@@ -4309,7 +4309,7 @@ fn shell(title: &str, main: &str, home_href: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https: http:; media-src 'self' blob: https: http:; frame-src https://www.youtube.com https://player.vimeo.com\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; img-src 'self' data: https: http:; media-src 'self' blob: https: http:; frame-src https://www.youtube.com https://player.vimeo.com\">\
 <title>{title}</title>\
 <link rel=\"stylesheet\" href=\"style.css\">{katex}{hljs}</head><body>\
 <aside class=\"sidebar\">\
@@ -6168,6 +6168,13 @@ mod tests {
         );
         let alpha = fs::read_to_string(out.join("alpha.html")).unwrap();
         assert!(alpha.contains("Content-Security-Policy"), "{alpha}");
+        // The shell's own KaTeX stylesheet loads its fonts from the same CDN;
+        // without a font-src the browser blocks them (observed in the Stage 2
+        // published-app journey) and math falls back to system fonts.
+        assert!(
+            alpha.contains("font-src 'self' data: https://cdn.jsdelivr.net"),
+            "{alpha}"
+        );
         assert!(!alpha.contains(" onload="), "{alpha}");
         assert!(sidx.contains("window.__tineBlocks="));
         assert!(

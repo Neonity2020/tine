@@ -52,6 +52,29 @@ Campaign integration is still in progress: native availability producers,
 per-consumer native job cancellation and production traversal retirement remain
 required before RET2 acceptance.
 
+### Published query exports (Stage 2)
+
+A query export's `app/` runs this frontend over `app/snapshot.json` through
+`src/publishedBackend.ts`, selected by `backend()` when the document carries
+`<meta name="tine-published">`. Two typed refusals are specific to it:
+
+- `query-unavailable` with reason code `published_export_static` — `parseQuery`
+  or `queryRun` was asked for a query the export was not made with (a changed
+  text, dialect, `tine.*` view property, or current page), or `runGraphSearch`
+  was asked on any lane but the Quick Switcher's (`quick-switch*`), which get a
+  plain substring match over the snapshot's page names, aliases and block text
+  for navigation. The snapshot holds answers, not an index; no query is re-run
+  in a reader's browser. `detail.message` is "This export answers only the
+  queries it was made with."
+- `published-export-read-only` (`PublishedExportReadOnlyError`) — any `Backend`
+  method classified as refused in `PUBLISHED_REFUSED_METHODS` (writes, sync,
+  plugin install, capture, native pickers, OS access). The class lives in
+  `backend.ts` because `publishedBackend.ts` is imported by it.
+
+`src/publishedBackend.guard.test.ts` requires every `Backend` method to be in
+exactly one of answered / constant / refused / absent, so a new method cannot
+reach a reader's browser unclassified.
+
 ## Command error boundary
 
 Every Tauri command and helper under `src-tauri/src` now rejects with

@@ -23,7 +23,7 @@ fs.writeFileSync(path.join(graph, "logseq/config.edn"), "{}\n");
 fs.writeFileSync(path.join(graph, "pages/Dashboard.md"), "- {{query (task TODO)}}\n");
 // Whole-page contract: the DONE sibling and the [[Private]] link ride along;
 // Private itself (no TODO) does not, and its link is inert in the export.
-fs.writeFileSync(path.join(graph, "pages/Alpha.md"), "- TODO Alpha export root ![shot](../assets/shot.png)\n\t- Alpha export child\n- DONE alpha done sibling [[Private]]\n");
+fs.writeFileSync(path.join(graph, "pages/Alpha.md"), "- TODO Alpha export root ![shot](../assets/shot.png)\n\t- Alpha export child [[Beta]]\n- DONE alpha done sibling [[Private]]\n");
 fs.writeFileSync(path.join(graph, "pages/Beta.org"), "* TODO Beta export root\n** Beta export child\n");
 fs.writeFileSync(path.join(graph, "pages/Private.md"), "- private sentinel text\n");
 fs.writeFileSync(path.join(graph, "assets/shot.png"), Buffer.from("89504e470d0a1a0a", "hex"));
@@ -40,6 +40,32 @@ const td = spawn(tdPath, webdriverServerArgs(port, nativePort, "/usr/bin/WebKitW
 });
 console.log(JSON.stringify({ artifact: tmp, app, managed }));
 const out = path.join(graph, "published-queries", "open-tasks");
+
+/** The Stage 2 app beside the static site: `app/index.html` marked as a
+ *  published export, a schema-1 snapshot holding exactly the exported pages,
+ *  the bundle's scripts, and a root redirect the static page loads. */
+function appChecks(out, alphaHtml) {
+  const appIndexPath = path.join(out, "app/index.html");
+  const snapshotPath = path.join(out, "app/snapshot.json");
+  const appIndex = fs.existsSync(appIndexPath) ? fs.readFileSync(appIndexPath, "utf8") : "";
+  const snapshotText = fs.existsSync(snapshotPath) ? fs.readFileSync(snapshotPath, "utf8") : "";
+  let snapshot = null;
+  try { snapshot = JSON.parse(snapshotText); } catch {}
+  const pageNames = snapshot ? snapshot.pages.map((page) => page.name) : [];
+  const scripts = fs.existsSync(path.join(out, "app/assets")) ? fs.readdirSync(path.join(out, "app/assets")).filter((f) => f.endsWith(".js")) : [];
+  return {
+    "app/index.html is marked as a published export": appIndex.includes('<meta name="tine-published" content="snapshot.json">'),
+    "app/index.html is titled by the export name": appIndex.includes("<title>Open tasks</title>"),
+    // No graph page is named "Open tasks", so the home page takes the export's name.
+    "snapshot is schema 1 with the home page first": snapshot?.schema === 1 && snapshot?.home === "Open tasks" && pageNames[0] === "Open tasks",
+    "snapshot holds exactly the exported pages": pageNames.length === 3 && pageNames.includes("Alpha") && pageNames.includes("Beta"),
+    "snapshot has no private text": !snapshotText.includes("private sentinel text") && !pageNames.includes("Private") && !pageNames.includes("Dashboard"),
+    "snapshot records the home query with its two rows": Array.isArray(snapshot?.queries) && snapshot.queries.some((q) => q.host === snapshot.home && q.result?.total === 2),
+    "app bundle ships its scripts": scripts.length >= 1,
+    "static index loads the redirect shim": fs.existsSync(path.join(out, "app-redirect.js")) && fs.readFileSync(path.join(out, "index.html"), "utf8").includes('src="app-redirect.js"'),
+    "static page links its ?static fallback note": alphaHtml.length > 0 && fs.readFileSync(path.join(out, "index.html"), "utf8").includes("publish-app-note"),
+  };
+}
 let browser;
 try {
   await waitForHttpServer(`http://127.0.0.1:${port}/status`);
@@ -86,6 +112,8 @@ try {
     "index present": files.includes("index.html"),
     "graph site untouched": !fs.existsSync(path.join(graph, "publish")),
     "dialog closed": (await browser.$$(".query-export-modal")).length === 0,
+    // Stage 2: the export also ships the read-only app over a baked snapshot.
+    ...appChecks(out, alpha),
   };
   for (const [label, ok] of Object.entries(checks)) console.log(`${ok ? "PASS" : "FAIL"}: ${label}`);
   if (Object.values(checks).some((ok) => !ok)) throw new Error("publish-query invariants failed");
