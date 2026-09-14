@@ -219,6 +219,8 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("present_conflict_override", LegacyOnly),
     ("preview_block", ManagedRouted),
     ("publish_html", ManagedRouted),
+    ("publish_query", ManagedRouted),
+    ("publish_query_plan", ManagedRouted),
     // SPEC §7.1. `query_print` and `query_og_expressible` are pure functions
     // of the IR they are handed -- no graph, either mode. The other four read
     // the graph and route to the sparse actor like every other query command.

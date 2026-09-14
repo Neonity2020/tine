@@ -2,7 +2,7 @@ import { For, Show, Switch, Match, createEffect, createMemo, createResource, cre
 import { backend, QueryPrintRefusedError, type QueryNotReadyError } from "../backend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
-import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
+import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openQueryExport, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, undo, undoTopTag, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
@@ -69,7 +69,7 @@ import { InlineText } from "../render/inline";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
 import { SheetContainer } from "./SheetContainer";
-import type { PageKind, RefGroup } from "../types";
+import type { PageKind, QueryPublicationRequest, RefGroup } from "../types";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
@@ -490,6 +490,34 @@ export function QueryMacro(props: {
   // uses (never authoring rewrites): presentation and execution can't disagree
   // about what ran (GH #301).
   const friendlySearch = createMemo(() => savedDslToFriendlySearch(executableForm()));
+  /** Why "Export query results…" is not offered for this query, or null. A
+   *  Friendly saved search runs through a different execution path and is not
+   *  exportable yet; a query with no runnable reading has nothing to export. */
+  const exportRefusal = (): string | null => {
+    if (friendlySearch() !== null) return "Friendly searches can't be exported yet";
+    if (!runnable()) return "The query has not been read yet";
+    return null;
+  };
+  /** Exactly what this surface executed: the substituted form, the anchor's
+   *  effective view, the bound current page, and the host block — so the
+   *  export resolves the SAME rows the header count shows. */
+  const exportRequest = (): QueryPublicationRequest | null => {
+    const reading = runnable();
+    if (!reading || exportRefusal()) return null;
+    const kind = reading.query.source.kind;
+    const page = executionPage();
+    return {
+      query: executableForm(),
+      advanced: kind === "advanced",
+      simpleDialect: kind === "tql" ? "tql" : "og",
+      currentPage: page ?? null,
+      view: reading.query.anchor === "page" ? pageResultView() : blockResultView(),
+      hostBlockId: props.blockId ?? null,
+      name: titleOption() ?? "",
+      folder: null,
+      replace: false,
+    };
+  };
   const sheet = createMemo(() => {
     if (!props.blockId || !doc.byId[props.blockId]) return null;
     return sheetConfig(facetsOf(doc.byId[props.blockId].raw, formatForBlock(props.blockId)).properties);
@@ -1998,6 +2026,20 @@ export function QueryMacro(props: {
                   has not landed yet — so the count never disappears. */}
               <Show when={!showBuilder()}>
                 <span class="query-count">{total()}</span>
+              </Show>
+              <Show when={props.blockId && !exportRefusal()}>
+                <button
+                  type="button"
+                  class="query-export-button"
+                  title="Export the pages containing these results as a static site"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const request = exportRequest();
+                    if (request) openQueryExport(request);
+                  }}
+                >
+                  Export…
+                </button>
               </Show>
               <Show when={props.blockId && !inlineDisplay()}>
                 <div class="query-view-switcher" role="group" aria-label="Query view" onClick={stop}>

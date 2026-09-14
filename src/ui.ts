@@ -2193,6 +2193,17 @@ export function closePdfExport() {
   setPdfExportPage(null);
 }
 
+// "Export query results…": the query surface hands over exactly what it
+// executed; the dialog plans, shows the page set, and confirms. One at a time.
+export const [queryExportRequest, setQueryExportRequest] =
+  createSignal<import("./types").QueryPublicationRequest | null>(null);
+export function openQueryExport(request: import("./types").QueryPublicationRequest) {
+  setQueryExportRequest(request);
+}
+export function closeQueryExport() {
+  setQueryExportRequest(null);
+}
+
 // The PDF currently open in the side pane. `filename` is the stable resource
 // identity; page/highlightId are a navigation intent within that resource.
 // Keeping those concepts separate lets a second reference into the same PDF

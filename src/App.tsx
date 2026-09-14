@@ -37,6 +37,7 @@ import {
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
 import { PdfExportDialog } from "./components/PdfExportDialog";
+import { QueryExportDialog } from "./components/QueryExportDialog";
 import { StartupRecoveryLayer } from "./components/StartupRecovery";
 import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
@@ -1849,6 +1850,7 @@ export function App(): JSX.Element {
       <ExportModal />
       <UnsavedRecovery />
       <PdfExportDialog />
+      <QueryExportDialog />
       <Show when={settingsOpen()}>
         <Suspense>
           <Settings />

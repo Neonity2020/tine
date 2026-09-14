@@ -218,7 +218,7 @@ fn walk(dir: &Path, f: &mut impl FnMut(&Path, &String)) {
         if path.is_dir() {
             // Skip Tine/Logseq output + VCS dirs.
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if matches!(name, ".git" | "publish" | ".obsidian") {
+            if matches!(name, ".git" | "publish" | "published-queries" | ".obsidian") {
                 continue;
             }
             walk(&path, f);

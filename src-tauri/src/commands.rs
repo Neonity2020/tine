@@ -27,8 +27,8 @@ use tine_core::sync_runtime::{
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
     SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
-    SyncRuntimeHandle,
+    SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome,
+    SyncApplicationQueryPublishOutcome, SyncApplicationUnitOutcome, SyncRuntimeHandle,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1887,6 +1887,99 @@ pub(crate) async fn publish_html(state: GraphContext<'_>) -> Result<(String, usi
     })
     .await
     .map_err(CommandError::worker)?
+}
+
+/// Plan a query export: resolve the pages that own the query's results, without
+/// writing anything. The dialog shows the plan and echoes its fingerprint back.
+#[tauri::command]
+pub(crate) async fn publish_query_plan(
+    request: tine_core::publish::query_export::QueryPublicationRequest,
+    state: GraphContext<'_>,
+) -> Result<tine_core::publish::query_export::QueryPublicationPlan, CommandError> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .publish_application_query(request, None)
+                .map_err(CommandError::from)?
+            {
+                SyncApplicationQueryPublishOutcome::Planned { plan } => Ok(plan),
+                SyncApplicationQueryPublishOutcome::Published { .. } => Err(CommandError::prose(
+                    "Tine-managed storage answered a plan with a publication.",
+                )),
+                SyncApplicationQueryPublishOutcome::Refused { message } => {
+                    Err(CommandError::prose(message))
+                }
+                SyncApplicationQueryPublishOutcome::Deferred { .. } => Err(CommandError::prose(
+                    "Tine-managed storage is updating pages. Try again when it finishes.",
+                )),
+            },
+            None => tine_core::publish::plan_query_publication(&*slot.legacy_graph()?, &request)
+                .map_err(query_publication_error),
+        }
+    })
+    .await
+    .map_err(CommandError::worker)?
+}
+
+/// Commit a reviewed query export. `fingerprint` is the plan's; the export is
+/// refused if the reviewed page set moved.
+#[tauri::command]
+pub(crate) async fn publish_query(
+    request: tine_core::publish::query_export::QueryPublicationRequest,
+    fingerprint: String,
+    state: GraphContext<'_>,
+) -> Result<tine_core::publish::PublishOutcome, CommandError> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .publish_application_query(request, Some(fingerprint))
+                .map_err(CommandError::from)?
+            {
+                SyncApplicationQueryPublishOutcome::Published {
+                    path,
+                    pages,
+                    retired,
+                    warnings,
+                } => Ok(tine_core::publish::PublishOutcome {
+                    path,
+                    pages,
+                    retired,
+                    warnings,
+                }),
+                SyncApplicationQueryPublishOutcome::Planned { .. } => Err(CommandError::prose(
+                    "Tine-managed storage answered a publication with a plan.",
+                )),
+                SyncApplicationQueryPublishOutcome::Refused { message } => {
+                    Err(CommandError::prose(message))
+                }
+                SyncApplicationQueryPublishOutcome::Deferred { .. } => Err(CommandError::prose(
+                    "Tine-managed storage is updating pages. Try again when it finishes.",
+                )),
+            },
+            None => {
+                tine_core::publish::publish_query(&*slot.legacy_graph()?, &request, &fingerprint)
+                    .map_err(query_publication_error)
+            }
+        }
+    })
+    .await
+    .map_err(CommandError::worker)?
+}
+
+fn query_publication_error(
+    error: tine_core::publish::query_export::QueryPublicationError,
+) -> CommandError {
+    use tine_core::publish::query_export::QueryPublicationError;
+    match error {
+        QueryPublicationError::Refused(message) => CommandError::prose(message),
+        QueryPublicationError::Io(error) => CommandError::from(error),
+    }
 }
 
 /// Render one page to a self-contained HTML document (assets inlined, no sidebar)

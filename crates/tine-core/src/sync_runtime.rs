@@ -3071,6 +3071,7 @@ pub enum SyncApplicationQueryPublishOutcome {
         path: String,
         pages: usize,
         retired: Option<String>,
+        warnings: Vec<String>,
     },
     Refused {
         message: String,
@@ -21725,7 +21726,8 @@ impl RuntimeActor {
     #[allow(clippy::type_complexity)]
     fn capture_publication_documents(
         &self,
-    ) -> Result<Vec<(PageEntry, crate::doc::Document, String)>, SyncApplicationPageRequestError> {
+    ) -> Result<Vec<(PageEntry, crate::doc::Document, String)>, SyncApplicationPageRequestError>
+    {
         let inventory = self.application_inventory_ready()?;
         let mut pages = Vec::with_capacity(inventory.len());
         for entry in inventory {
@@ -21776,20 +21778,23 @@ impl RuntimeActor {
                             path: outcome.path,
                             pages: outcome.pages,
                             retired: outcome.retired,
+                            warnings: outcome.warnings,
                         })
                 }
             })
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_query_snapshot"))?;
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("publish_query_snapshot")
+            })?;
         match output {
             Ok(outcome) => Ok(outcome),
             Err(QueryPublicationError::Refused(message)) => {
                 Ok(SyncApplicationQueryPublishOutcome::Refused { message })
             }
-            Err(QueryPublicationError::Io(error)) => Ok(
-                SyncApplicationQueryPublishOutcome::Refused {
+            Err(QueryPublicationError::Io(error)) => {
+                Ok(SyncApplicationQueryPublishOutcome::Refused {
                     message: error.to_string(),
-                },
-            ),
+                })
+            }
         }
     }
 

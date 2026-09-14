@@ -78,6 +78,9 @@ import type {
   QueryPageScope,
   QueryExportBatch,
   QueryExportSpec,
+  PublishOutcome,
+  QueryPublicationPlan,
+  QueryPublicationRequest,
 } from "./types";
 import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
@@ -767,6 +770,11 @@ export interface Backend {
   /** Rename a page and update all [[refs]]/#tags across the graph. */
   renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
+  /** Plan a query export: the pages that own the query's results, plus the
+   *  fingerprint the confirm step echoes back. Writes nothing. */
+  publishQueryPlan(request: QueryPublicationRequest): Promise<QueryPublicationPlan>;
+  /** Commit a reviewed query export; refused if the reviewed set moved. */
+  publishQuery(request: QueryPublicationRequest, fingerprint: string): Promise<PublishOutcome>;
   /** Render one page to a self-contained HTML document (assets inlined, no
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
    *  the page doesn't exist. */
@@ -1754,6 +1762,12 @@ class TauriBackend implements Backend {
   }
   publishHtml() {
     return this.call<[string, number]>("publish_html");
+  }
+  publishQueryPlan(request: QueryPublicationRequest) {
+    return this.call<QueryPublicationPlan>("publish_query_plan", { request });
+  }
+  publishQuery(request: QueryPublicationRequest, fingerprint: string) {
+    return this.call<PublishOutcome>("publish_query", { request, fingerprint });
   }
   pagePrintHtml(name: string, opts: PrintOpts) {
     return this.call<string>("page_print_html", { name, opts });

@@ -435,7 +435,10 @@ mod tests {
 
     #[test]
     fn folder_is_a_capped_nonempty_slug() {
-        assert_eq!(query_export_folder("Reading list 2026!"), "reading-list-2026");
+        assert_eq!(
+            query_export_folder("Reading list 2026!"),
+            "reading-list-2026"
+        );
         assert_eq!(query_export_folder("   "), "query");
         assert_eq!(query_export_folder("---"), "query");
         let long = "x".repeat(200);

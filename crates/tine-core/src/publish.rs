@@ -311,6 +311,27 @@ fn build_slug_map(names: &[&str]) -> (SlugMap, Vec<(String, String, String)>) {
 /// source of truth). Falls back to a raw `slug()` for a name not in the map — a
 /// reference to a page that isn't being exported (its link is dead either way),
 /// or the single-page print export (`ctx.slugs == None`, no cross-page files).
+enum ExportAssetUrl {
+    Keep(String),
+    Omitted,
+}
+
+/// Route a safe local URL through the export's asset sink when there is one:
+/// a copied asset gets its in-export URL, an omitted one is reported, and
+/// anything that is not a local asset reference passes through unchanged.
+fn export_asset_url(ctx: &Ctx, url: &str) -> ExportAssetUrl {
+    let Some(sink) = ctx.asset_sink else {
+        return ExportAssetUrl::Keep(url.to_string());
+    };
+    if AssetSink::asset_relative(url).is_none() {
+        return ExportAssetUrl::Keep(url.to_string());
+    }
+    match sink.borrow_mut().copy(url) {
+        Some(published) => ExportAssetUrl::Keep(published),
+        None => ExportAssetUrl::Omitted,
+    }
+}
+
 fn page_slug(ctx: &Ctx, name: &str) -> String {
     ctx.slugs
         .and_then(|m| m.get(&name.to_lowercase()))
@@ -805,11 +826,16 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
                         );
                     }
                 } else if let Some(src) = safe_media_url(&src) {
-                    out.push_str(&format!(
-                        "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
-                        esc_attr(&src),
-                        esc_attr(&alt)
-                    ));
+                    match export_asset_url(ctx, src) {
+                        ExportAssetUrl::Keep(src) => out.push_str(&format!(
+                            "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
+                            esc_attr(&src),
+                            esc_attr(&alt)
+                        )),
+                        ExportAssetUrl::Omitted => out.push_str(
+                            "<span class=\"asset-omitted\">[Image omitted: unavailable or over the export size limit]</span>",
+                        ),
+                    }
                 } else {
                     out.push_str("<span class=\"unsafe-link\">[Unsafe image URL omitted]</span>");
                 }
@@ -821,10 +847,15 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
                 let _ = take_to_close(html, &mut i, name); // empty element
                 let src = unescape(asset);
                 if let Some(src) = safe_media_url(&src) {
-                    out.push_str(&format!(
-                        "<{name} class=\"media-embed\" controls src=\"{}\"></{name}>",
-                        esc_attr(src)
-                    ));
+                    match export_asset_url(ctx, src) {
+                        ExportAssetUrl::Keep(src) => out.push_str(&format!(
+                            "<{name} class=\"media-embed\" controls src=\"{}\"></{name}>",
+                            esc_attr(&src)
+                        )),
+                        ExportAssetUrl::Omitted => out.push_str(
+                            "<span class=\"asset-omitted\">[Media omitted: unavailable or over the export size limit]</span>",
+                        ),
+                    }
                 } else {
                     out.push_str("<span class=\"unsafe-link\">[Unsafe media URL omitted]</span>");
                 }
@@ -834,9 +865,29 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
         if name == "a" {
             if let Some(href) = tag_attr(inner, "href").map(unescape) {
                 if safe_export_url(&href).is_some() {
-                    out.push('<');
-                    out.push_str(inner);
-                    out.push('>');
+                    match export_asset_url(ctx, &href) {
+                        ExportAssetUrl::Keep(rewritten) if rewritten != href => {
+                            // Re-emit the tag with the copied asset's URL; every
+                            // other attribute stays as lsdoc rendered it.
+                            let rebuilt = inner.replacen(
+                                &format!("href=\"{}\"", esc_attr(&href)),
+                                &format!("href=\"{}\"", esc_attr(&rewritten)),
+                                1,
+                            );
+                            out.push('<');
+                            out.push_str(&rebuilt);
+                            out.push('>');
+                        }
+                        ExportAssetUrl::Keep(_) => {
+                            out.push('<');
+                            out.push_str(inner);
+                            out.push('>');
+                        }
+                        ExportAssetUrl::Omitted => {
+                            out.push_str("<span class=\"asset-omitted\">");
+                            inert_link_closures += 1;
+                        }
+                    }
                 } else {
                     out.push_str("<span class=\"unsafe-link\">");
                     inert_link_closures += 1;
@@ -1305,6 +1356,141 @@ struct Ctx<'a> {
     /// keeps its historical dangling links (`false`); changing that is a
     /// separate contract, not a side effect of this flag.
     inert_outside_links: bool,
+    /// A query export is a movable folder: every referenced local asset is
+    /// copied into `<leaf>/assets/` and the link rewritten, through this sink.
+    /// `None` keeps the graph site's `../assets/<file>` links.
+    asset_sink: Option<&'a RefCell<AssetSink<'a>>>,
+}
+
+/// One export's asset copier: bounded reads from the ORIGINAL graph's
+/// `assets/`, one copy per referenced file, a per-file threshold that omits
+/// (with a warning) and a cumulative ceiling that omits the rest.
+struct AssetSink<'a> {
+    source_root: &'a Path,
+    stage: &'a PublishStage,
+    /// Authored asset path → published relative URL.
+    copied: HashMap<String, String>,
+    per_asset: u64,
+    remaining: u64,
+    warnings: Vec<String>,
+}
+
+/// One referenced local asset may be this large before it is omitted.
+pub const QUERY_EXPORT_ASSET_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// All copied assets together may reach this before the rest are omitted.
+pub const QUERY_EXPORT_ASSETS_TOTAL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+impl AssetSink<'_> {
+    /// The graph-relative `assets/…` path an authored reference names, or
+    /// `None` for remote/data/unsafe/non-asset references.
+    fn asset_relative(src: &str) -> Option<String> {
+        if src.contains("://") || src.starts_with("data:") || src.contains('\\') {
+            return None;
+        }
+        let trimmed = src.trim_start_matches("./");
+        let rel = trimmed
+            .strip_prefix("../assets/")
+            .or_else(|| trimmed.strip_prefix("assets/"))?;
+        let rel = rel.split(['?', '#']).next().unwrap_or(rel);
+        if rel.is_empty()
+            || Path::new(rel)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        Some(rel.to_string())
+    }
+
+    /// Copy `src` into the stage once; returns the published relative URL, or
+    /// `None` (with a recorded warning) when the asset is missing or over budget.
+    fn copy(&mut self, src: &str) -> Option<String> {
+        let rel = Self::asset_relative(src)?;
+        if let Some(published) = self.copied.get(&rel) {
+            return Some(published.clone());
+        }
+        let published = format!("assets/{rel}");
+        let limit = self.per_asset.min(self.remaining);
+        let path = self.source_root.join("assets").join(&rel);
+        match read_file_bounded(&path, limit) {
+            Ok(Some(bytes)) => {
+                if let Err(error) = write_publish_stage_asset(self.stage, &published, &bytes) {
+                    self.warnings
+                        .push(format!("Couldn't copy asset {rel}: {error}"));
+                    return None;
+                }
+                self.remaining = self.remaining.saturating_sub(bytes.len() as u64);
+                self.copied.insert(rel, published.clone());
+                Some(published)
+            }
+            Ok(None) => {
+                self.warnings.push(format!(
+                    "Asset {rel} was omitted: it exceeds the export size limit."
+                ));
+                None
+            }
+            Err(error) => {
+                self.warnings
+                    .push(format!("Asset {rel} was omitted: {error}"));
+                None
+            }
+        }
+    }
+}
+
+/// Read a regular file, refusing (`Ok(None)`) once more than `max` bytes are
+/// seen — bounded DURING the read, so a file growing under an external editor
+/// cannot exceed the allowance between a metadata check and the read.
+fn read_file_bounded(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    if metadata.len() > max {
+        return Ok(None);
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Write one copied asset at `assets/<rel>` inside the stage. Only that
+/// prefix, only normal path components; parents are created inside the bound
+/// stage handle.
+fn write_publish_stage_asset(
+    stage: &PublishStage,
+    published: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let relative = Path::new(published);
+    let ok = relative.starts_with("assets")
+        && relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && relative.file_name().is_some();
+    if !ok {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "static-publish asset must live under assets/",
+        ));
+    }
+    publish_stage_write_race_hook(stage)?;
+    if let Some(parent) = relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+        stage.dir.create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = stage.dir.open_with(relative, &options)?;
+    file.write_all(bytes)?;
+    crate::durability_counters::sync_file(&file)
 }
 
 struct PublicationPageLink {
@@ -3302,9 +3488,14 @@ fn render_query_outcome(
     }
     if omitted > 0 {
         out.push_str(&format!(
-            "<div class=\"query-omitted\">{} result{} on non-public pages omitted.</div>",
+            "<div class=\"query-omitted\">{} result{} {} omitted.</div>",
             omitted,
-            if omitted == 1 { "" } else { "s" }
+            if omitted == 1 { "" } else { "s" },
+            if ctx.inert_outside_links {
+                "outside this export"
+            } else {
+                "on non-public pages"
+            }
         ));
     }
     out.push_str("</div>");
@@ -4037,6 +4228,7 @@ pub(crate) fn page_print_html_document(
         pages: None,
         page_links: None,
         inert_outside_links: false,
+        asset_sink: None,
     };
     // `page_html` builds the heading + outline and wraps it in `shell`; we want the
     // same body but the print shell, so mirror its body build here.
@@ -4600,6 +4792,27 @@ fn write_publish_stage_file(stage: &PublishStage, name: &str, bytes: &[u8]) -> i
 thread_local! {
     static PUBLISH_STAGE_WRITE_SWAP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static PUBLISH_RECOVERY_SWAP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// `(per_asset, total)` budget for the next export's asset sink, so tests
+    /// can exercise the omission paths without writing gigabytes.
+    static QUERY_EXPORT_ASSET_BUDGET: RefCell<Option<(u64, u64)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn query_export_asset_budget() -> (u64, u64) {
+    QUERY_EXPORT_ASSET_BUDGET.with(|b| {
+        b.borrow_mut().take().unwrap_or((
+            QUERY_EXPORT_ASSET_MAX_BYTES,
+            QUERY_EXPORT_ASSETS_TOTAL_MAX_BYTES,
+        ))
+    })
+}
+
+#[cfg(not(test))]
+fn query_export_asset_budget() -> (u64, u64) {
+    (
+        QUERY_EXPORT_ASSET_MAX_BYTES,
+        QUERY_EXPORT_ASSETS_TOTAL_MAX_BYTES,
+    )
 }
 
 #[cfg(test)]
@@ -4846,11 +5059,12 @@ pub fn plan_query_publication(
     request: &query_export::QueryPublicationRequest,
 ) -> Result<query_export::QueryPublicationPlan, query_export::QueryPublicationError> {
     let (_, sources) = capture_direct_publication_sources(graph)?;
-    graph
-        .with_publication_query_reader(&sources, |reader| {
-            Ok(query_export::plan_query_publication(graph, &sources, reader, request)
-                .map(|(plan, _)| plan))
-        })?
+    graph.with_publication_query_reader(&sources, |reader| {
+        Ok(
+            query_export::plan_query_publication(graph, &sources, reader, request)
+                .map(|(plan, _)| plan),
+        )
+    })?
 }
 
 /// Confirmed query export on Direct Files.
@@ -4865,16 +5079,15 @@ pub fn publish_query(
         .zip(sources.iter())
         .map(|((entry, document), (_, revision))| (entry, document, revision.clone()))
         .collect();
-    graph
-        .with_publication_query_reader(&sources, |reader| {
-            Ok(query_export::publish_query_documents(
-                graph,
-                capture,
-                reader,
-                request,
-                fingerprint,
-            ))
-        })?
+    graph.with_publication_query_reader(&sources, |reader| {
+        Ok(query_export::publish_query_documents(
+            graph,
+            capture,
+            reader,
+            request,
+            fingerprint,
+        ))
+    })?
 }
 
 /// Publish one already-authoritative graph snapshot. Managed storage obtains
@@ -4896,8 +5109,13 @@ pub(crate) fn publish_graph_documents_with_queries(
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: &dyn PublicationQueryRead,
 ) -> io::Result<(String, usize)> {
-    publish_graph_documents_inner(graph, pages, Some(queries), &PublicationTarget::graph_site())
-        .map(|outcome| (outcome.path, outcome.pages))
+    publish_graph_documents_inner(
+        graph,
+        pages,
+        Some(queries),
+        &PublicationTarget::graph_site(),
+    )
+    .map(|outcome| (outcome.path, outcome.pages))
 }
 
 /// Which pages a static export contains. The renderer computes every closure
@@ -4959,7 +5177,8 @@ impl PublicationTarget {
 }
 
 /// What one static export produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublishOutcome {
     /// Installed output directory.
     pub path: String,
@@ -4969,6 +5188,9 @@ pub struct PublishOutcome {
     /// there was one. Always reported: the user must be able to find content
     /// that appeared between review and commit.
     pub retired: Option<String>,
+    /// Non-fatal omissions (an asset over budget or missing), user-facing.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 pub(crate) fn publish_graph_documents_inner(
@@ -5139,6 +5361,19 @@ pub(crate) fn publish_graph_documents_inner(
     let mut sidebar_pages: Vec<serde_json::Value> = Vec::new();
     let mut welcome_html: Option<String> = None;
     let mut count = 0;
+    // A closed export travels: copy its referenced assets in. The graph site
+    // keeps linking the sibling `assets/` folder as it always has.
+    let asset_sink = matches!(target.selection, PublicationSelection::Paths(_)).then(|| {
+        let (per_asset, remaining) = query_export_asset_budget();
+        RefCell::new(AssetSink {
+            source_root: &graph.root,
+            stage: &stage,
+            copied: HashMap::new(),
+            per_asset,
+            remaining,
+            warnings: Vec::new(),
+        })
+    });
     // The render context: the block-ref index + the graph (so `{{query}}`/`{{embed}}`/
     // `{{namespace}}` macros can resolve against real data at publish time) + the
     // slug map (so cross-page links resolve to the actual written files).
@@ -5154,6 +5389,7 @@ pub(crate) fn publish_graph_documents_inner(
         pages: Some(&page_docs),
         page_links: Some(&page_links),
         inert_outside_links: matches!(target.selection, PublicationSelection::Paths(_)),
+        asset_sink: asset_sink.as_ref(),
     };
     for (name, kind, parsed) in &public {
         let slug = slug_of(name);
@@ -5220,11 +5456,17 @@ pub(crate) fn publish_graph_documents_inner(
             .ensure_current()
             .map_err(publication_query_io_error)?;
     }
+    let warnings = asset_sink
+        .as_ref()
+        .map(|sink| sink.borrow().warnings.clone())
+        .unwrap_or_default();
+    drop(ctx);
     let retired = commit_publish_stage(graph, stage, &target.output)?;
     Ok(PublishOutcome {
         path: out.display().to_string(),
         pages: count,
         retired: retired.map(|path| path.display().to_string()),
+        warnings,
     })
 }
 
@@ -5258,6 +5500,7 @@ mod tests {
             pages: None,
             page_links: None,
             inert_outside_links: false,
+            asset_sink: None,
         };
         decorate(&lsdoc::render_html(&body_blocks(raw), &md_opts()), &ctx, 0)
     }
@@ -5407,6 +5650,7 @@ mod tests {
                 pages: None,
                 page_links: None,
                 inert_outside_links: false,
+                asset_sink: None,
             },
             0,
         );
@@ -5865,7 +6109,9 @@ mod tests {
         write_publish_stage_file(&stage, "index.html", b"generated site").unwrap();
         symlink(&outside, dir.join("publish")).unwrap();
 
-        assert!(commit_publish_stage(&graph, stage, &PublicationTarget::graph_site().output).is_err());
+        assert!(
+            commit_publish_stage(&graph, stage, &PublicationTarget::graph_site().output).is_err()
+        );
 
         assert_eq!(
             fs::read_to_string(outside.join("index.html")).unwrap(),
@@ -6133,6 +6379,7 @@ mod tests {
             pages: None,
             page_links: None,
             inert_outside_links: false,
+            asset_sink: None,
         };
 
         assert!(inline_asset_uri(&cumulative_ctx, "../assets/one.png").is_some());
@@ -6384,10 +6631,8 @@ mod tests {
     }
 
     fn query_export_fixture(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tine-publish-query-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tine-publish-query-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
@@ -6411,11 +6656,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("journals/2026_01_02.md"), "- TODO journal-task\n").unwrap();
-        fs::write(
-            dir.join("pages/Dashboard.md"),
-            "- {{query (task TODO)}}\n",
-        )
-        .unwrap();
+        fs::write(dir.join("pages/Dashboard.md"), "- {{query (task TODO)}}\n").unwrap();
         dir
     }
 
@@ -6448,7 +6689,10 @@ mod tests {
         assert_eq!(names.len(), 3, "{names:?}");
         assert!(names.contains(&"Tasks") && names.contains(&"Also Selected"));
         assert!(plan.pages.iter().any(|p| p.journal), "journal owner kept");
-        assert!(!names.contains(&"Private Notes"), "DONE block must not select");
+        assert!(
+            !names.contains(&"Private Notes"),
+            "DONE block must not select"
+        );
         assert!(!names.contains(&"Dashboard"), "host page has no match");
 
         let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
@@ -6457,7 +6701,10 @@ mod tests {
         let out = PathBuf::from(&outcome.path);
         assert_eq!(out, dir.join("published-queries").join("open-tasks"));
         let tasks = fs::read_to_string(out.join("tasks.html")).unwrap();
-        assert!(tasks.contains("unmatched-sibling-text"), "whole page: {tasks}");
+        assert!(
+            tasks.contains("unmatched-sibling-text"),
+            "whole page: {tasks}"
+        );
         assert!(
             tasks.contains("also-selected.html"),
             "inside-set link resolves: {tasks}"
@@ -6474,7 +6721,10 @@ mod tests {
             "outside tag inert: {also}"
         );
         let index = fs::read_to_string(out.join("search-index.js")).unwrap();
-        assert!(!index.contains("private-sentinel-text"), "outside content: {index}");
+        assert!(
+            !index.contains("private-sentinel-text"),
+            "outside content: {index}"
+        );
         assert!(
             !index.contains("\"title\":\"Private Notes\""),
             "an outside page is never a page entry (its name may appear as authored text on a selected page): {index}"
@@ -6519,7 +6769,10 @@ mod tests {
         assert_eq!(plan.suggested_folder.as_deref(), Some("open-tasks-2"));
         let refused = publish_query(&graph, &request, &plan.fingerprint);
         assert!(
-            matches!(refused, Err(query_export::QueryPublicationError::Refused(_))),
+            matches!(
+                refused,
+                Err(query_export::QueryPublicationError::Refused(_))
+            ),
             "{refused:?}"
         );
         fs::write(out.join("manual-note.txt"), "kept in recovery").unwrap();
@@ -6547,8 +6800,93 @@ mod tests {
         let plan = plan_query_publication(&graph, &separate).unwrap();
         assert!(!plan.exists);
         publish_query(&graph, &separate, &plan.fingerprint).unwrap();
-        assert!(dir.join("published-queries/open-tasks-2/tasks.html").exists());
+        assert!(dir
+            .join("published-queries/open-tasks-2/tasks.html")
+            .exists());
         assert!(out.join("tasks.html").exists(), "sibling untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_copies_referenced_assets_into_the_leaf() {
+        let dir = query_export_fixture("assets");
+        for sub in ["assets/sub/deep", "assets/a", "assets/b"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        fs::write(dir.join("assets/sub/deep/pic.png"), b"nested-png").unwrap();
+        fs::write(dir.join("assets/a/same.png"), b"a-bytes").unwrap();
+        fs::write(dir.join("assets/b/same.png"), b"b-bytes").unwrap();
+        fs::write(dir.join("assets/report.pdf"), b"%PDF-1.4 pdf-bytes").unwrap();
+        fs::write(dir.join("assets/talk.mp3"), b"mp3-bytes").unwrap();
+        fs::write(dir.join("assets/huge.bin"), vec![7u8; 64]).unwrap();
+        fs::write(dir.join("assets/late.png"), b"late-bytes").unwrap();
+        // The page body references every shape the spec lists: nested path,
+        // same basename in two directories, non-image link + audio, a missing
+        // file, an oversized file, and a file that arrives over the total cap.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO first-task ![nested](../assets/sub/deep/pic.png) ![a](../assets/a/same.png) ![b](../assets/b/same.png)\n\
+             - [report](../assets/report.pdf) [ext](https://example.com/x.png)\n\
+             - ![music](../assets/talk.mp3)\n\
+             - ![gone](../assets/missing.png) ![huge](../assets/huge.bin) ![again](../assets/a/same.png)\n\
+             - ![late](../assets/late.png)\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("With assets");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        // per-asset 40 B (huge.bin is 64), total 60 B: everything before
+        // late.png fits (10+7+7+18+9 = 51), late.png (10) does not.
+        QUERY_EXPORT_ASSET_BUDGET.with(|b| *b.borrow_mut() = Some((40, 60)));
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        let out = PathBuf::from(&outcome.path);
+        let html = fs::read_to_string(out.join("tasks.html")).unwrap();
+
+        // Copied: nested path preserved; same basename kept apart by directory.
+        assert_eq!(
+            fs::read(out.join("assets/sub/deep/pic.png")).unwrap(),
+            b"nested-png"
+        );
+        assert_eq!(fs::read(out.join("assets/a/same.png")).unwrap(), b"a-bytes");
+        assert_eq!(fs::read(out.join("assets/b/same.png")).unwrap(), b"b-bytes");
+        assert_eq!(
+            fs::read(out.join("assets/report.pdf")).unwrap(),
+            b"%PDF-1.4 pdf-bytes"
+        );
+        assert_eq!(fs::read(out.join("assets/talk.mp3")).unwrap(), b"mp3-bytes");
+        // URLs rewritten to the movable leaf; the original graph paths are gone.
+        assert!(html.contains(r#"src="assets/sub/deep/pic.png""#), "{html}");
+        assert!(html.contains(r#"src="assets/a/same.png""#), "{html}");
+        assert!(html.contains(r#"src="assets/b/same.png""#), "{html}");
+        assert!(html.contains(r#"href="assets/report.pdf""#), "{html}");
+        assert!(html.contains(r#"src="assets/talk.mp3""#), "{html}");
+        assert!(
+            !html.contains("../assets/"),
+            "no link escapes the leaf: {html}"
+        );
+        assert!(
+            html.contains("https://example.com/x.png"),
+            "remote link untouched"
+        );
+        // Referenced twice, copied once.
+        assert_eq!(html.matches(r#"src="assets/a/same.png""#).count(), 2);
+        // Omitted: missing, over the per-asset limit, over the total limit.
+        assert!(!out.join("assets/huge.bin").exists());
+        assert!(!out.join("assets/late.png").exists());
+        assert_eq!(html.matches("asset-omitted").count(), 3, "{html}");
+        assert_eq!(outcome.warnings.len(), 3, "{:?}", outcome.warnings);
+        assert!(outcome.warnings.iter().any(|w| w.contains("missing.png")));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("huge.bin") && w.contains("size limit")));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("late.png") && w.contains("size limit")));
+        // The graph site is untouched by all of this: nothing under publish/.
+        assert!(!dir.join("publish").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -7273,6 +7611,7 @@ mod tests {
             pages: None,
             page_links: None,
             inert_outside_links: false,
+            asset_sink: None,
         };
 
         let oversized = "x".repeat(crate::query::QUERY_SOURCE_MAX_BYTES + 1);

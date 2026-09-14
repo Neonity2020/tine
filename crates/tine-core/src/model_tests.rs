@@ -14537,6 +14537,7 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     for refused in [
         "assets/note.md",
         "publish/note.md",
+        "published-queries/open-tasks/pages/note.md",
         ".tine-sync/note.md",
         "logseq/bak/pages/note.md",
         "logseq/version-files/note.md",
@@ -14661,6 +14662,7 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
     for refused in [
         "assets/note.md",
         "publish/note.md",
+        "published-queries/open-tasks/pages/note.md",
         ".tine-sync/note.md",
         "logseq/.recycle/note.md",
         "logseq/bak/pages/note.md",
@@ -16277,6 +16279,44 @@ fn checked_open_and_resolve_reject_symlink_escape() {
     assert!(g.resolve_rel("pages/escape/foreign.md").is_none());
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&outside);
+}
+
+/// A query export is a copy of graph pages living under the graph root, so the
+/// scanner must never read it back as pages: an exported `Secret.md` would
+/// otherwise reappear as a twin of its own source (and leak into a later
+/// export). The fixed exclusion lives in `graph_text_scope::fixed_excluded`.
+#[test]
+fn published_queries_output_never_becomes_pages() {
+    let dir = scratch("published-queries-excluded");
+    fs::write(dir.join("pages/Secret.md"), "- real-page\n").unwrap();
+    fs::create_dir_all(dir.join("published-queries/open-tasks/pages")).unwrap();
+    fs::write(
+        dir.join("published-queries/open-tasks/pages/Secret.md"),
+        "- exported-copy\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("published-queries/open-tasks/Loose Page.md"),
+        "- exported-loose\n",
+    )
+    .unwrap();
+    let g = Graph::open(&dir);
+    let pages = g.list_pages();
+    assert_eq!(
+        pages.iter().filter(|p| p.name == "Secret").count(),
+        1,
+        "{pages:?}"
+    );
+    assert!(
+        pages
+            .iter()
+            .all(|p| !p.rel_path.starts_with("published-queries/")),
+        "{pages:?}"
+    );
+    assert!(g
+        .resolve_rel("published-queries/open-tasks/pages/Secret.md")
+        .is_none());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
