@@ -39,6 +39,7 @@ pub(crate) struct TrustedLocalPreparationStageTimings {
     pub(crate) draft: Duration,
     pub(crate) capture: Duration,
     pub(crate) finalize: Duration,
+    pub(crate) writer_lane_reservation: Duration,
 }
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ thread_local! {
             draft: Duration::ZERO,
             capture: Duration::ZERO,
             finalize: Duration::ZERO,
+            writer_lane_reservation: Duration::ZERO,
         });
 }
 
@@ -1255,6 +1257,8 @@ fn prepare_local_inner(
     // publishes the same batch straight into the archive. Reserving the lane at
     // the end of preparation therefore precedes BOTH durable publications with
     // one call site, and the batch's causal dot is already final.
+    #[cfg(test)]
+    let writer_lane_reservation_started = Instant::now();
     if let Some(local_lane) = local_lane {
         reserve_writer_lane_for_publication(
             admission,
@@ -1264,6 +1268,10 @@ fn prepare_local_inner(
             &prepared,
         )?;
     }
+    #[cfg(test)]
+    note_trusted_local_preparation_stage(|timings| {
+        timings.writer_lane_reservation = writer_lane_reservation_started.elapsed();
+    });
     fault(OperationalFaultPoint::AfterFinalize)?;
     #[cfg(test)]
     note_trusted_local_preparation_stage(|timings| {

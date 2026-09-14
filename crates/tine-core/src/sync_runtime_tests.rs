@@ -27063,6 +27063,7 @@ fn assert_managed_application_save_detail_accounting(
             detail.finalize_base_objects,
             detail.finalize_projection_intents,
             detail.finalize_seal_pending,
+            preparation.writer_lane_reservation,
         ],
         "finalize",
     );
@@ -27657,6 +27658,10 @@ fn managed_application_save_phase_receipt(
         managed_application_save_quantiles(samples, |sample| sample.preparation_stages.capture);
     let (finalize_p50, finalize_p95) =
         managed_application_save_quantiles(samples, |sample| sample.preparation_stages.finalize);
+    let (writer_lane_reservation_p50, writer_lane_reservation_p95) =
+        managed_application_save_quantiles(samples, |sample| {
+            sample.preparation_stages.writer_lane_reservation
+        });
     let (prepared_p50, prepared_p95) =
         managed_application_save_quantiles(samples, |sample| sample.stages.prepared_record);
     let (graph_p50, graph_p95) =
@@ -27684,7 +27689,7 @@ fn managed_application_save_phase_receipt(
     let detail = managed_application_save_detail_phase_receipt(samples);
     let editor_request = managed_application_save_editor_request_receipt(samples);
     format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} editor_request: {} local_mutation_detail: {}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} writer_lane_reservation_p50_ms={:.3} writer_lane_reservation_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} editor_request: {} local_mutation_detail: {}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(actor_total_p50),
@@ -27715,6 +27720,8 @@ fn managed_application_save_phase_receipt(
             startup_ms(capture_p95),
             startup_ms(finalize_p50),
             startup_ms(finalize_p95),
+            startup_ms(writer_lane_reservation_p50),
+            startup_ms(writer_lane_reservation_p95),
             startup_ms(prepared_p50),
             startup_ms(prepared_p95),
             startup_ms(graph_p50),
