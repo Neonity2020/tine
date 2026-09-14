@@ -66,6 +66,11 @@ pub struct QueryPublicationRequest {
     /// Byte budget for copied assets (Settings → Graph); `None` = the default.
     #[serde(default)]
     pub asset_budget_bytes: Option<u64>,
+    /// The frontend bundle the exporting binary embeds, attached by the Tauri
+    /// layer (never by the wire): when present, the export also carries the
+    /// read-only app under `app/` (Stage 2). `None` = static site only.
+    #[serde(skip)]
+    pub app_bundle: Option<std::sync::Arc<super::app_export::PublishedAppBundle>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +164,7 @@ pub(crate) type CapturedSource = (PageEntry, String);
 
 /// Remove the host block from the groups, keeping its children, exactly as the
 /// frontend's `withoutHostBlock` does.
-fn without_host_block(groups: Vec<RefGroup>, host: Option<&str>) -> Vec<RefGroup> {
+pub(super) fn without_host_block(groups: Vec<RefGroup>, host: Option<&str>) -> Vec<RefGroup> {
     let Some(host) = host else {
         return groups;
     };
@@ -434,6 +439,21 @@ pub(crate) fn publish_query_documents(
                 .asset_budget_bytes
                 .unwrap_or(super::QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES),
         ),
+        app: request
+            .app_bundle
+            .as_ref()
+            .map(|bundle| super::app_export::AppPublication {
+                name: request.name.clone(),
+                bundle: std::sync::Arc::clone(bundle),
+                query: super::app_export::HomeQuery {
+                    source: request.query.clone(),
+                    advanced: request.advanced,
+                    simple_dialect: request.simple_dialect,
+                    current_page: request.current_page.clone(),
+                    view: request.view.clone(),
+                    host_block_id: request.host_block_id.clone(),
+                },
+            }),
     };
     let pages = capture
         .into_iter()

@@ -1927,15 +1927,42 @@ pub(crate) async fn publish_query_plan(
     .map_err(CommandError::worker)?
 }
 
+/// The frontend bundle this binary embeds, filtered to what a published
+/// export ships (`index.html` + `assets/*`). A dev build without embedded
+/// assets yields an empty bundle, which the exporter reports as a warning.
+fn embedded_app_bundle(
+    app: &tauri::AppHandle,
+) -> tine_core::publish::app_export::PublishedAppBundle {
+    use tine_core::publish::app_export::PublishedAppBundle;
+    let resolver = app.asset_resolver();
+    let paths: Vec<String> = resolver
+        .iter()
+        .map(|(path, _)| path.into_owned())
+        .filter(|path| PublishedAppBundle::ships(path))
+        .collect();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        if let Some(asset) = resolver.get(path.clone()) {
+            files.push((path.trim_start_matches('/').to_string(), asset.bytes));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    PublishedAppBundle { files }
+}
+
 /// Commit a reviewed query export. `fingerprint` is the plan's; the export is
 /// refused if the reviewed page set moved.
 #[tauri::command]
 pub(crate) async fn publish_query(
-    request: tine_core::publish::query_export::QueryPublicationRequest,
+    mut request: tine_core::publish::query_export::QueryPublicationRequest,
     fingerprint: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::publish::PublishOutcome, CommandError> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
+    // Stage 2: the export also carries the read-only app — this binary's own
+    // embedded frontend. Tauri stores embedded assets compressed, so each
+    // shipped path is read back through the resolver, never from `iter()`.
+    request.app_bundle = Some(std::sync::Arc::new(embedded_app_bundle(&app)));
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
@@ -2336,26 +2363,12 @@ pub(crate) async fn run_advanced_query(
 // `run_advanced_query` / `query_facets` / `export_query_subtrees` commands stay
 // and keep working: P0-ts moves the frontend, and their deletion is a P1 item.
 
-/// The INPUT a `query_parse` caller has, on the wire (SPEC §7.1).
-///
-/// `og`, `tql` and `advanced` are explicit FORM inputs. `macro_query` and
-/// `macro_tql` take the COMPLETE raw macro argument, without the outer
-/// delimiters, and are the only inputs that split a trailing options map — one
-/// splitter, in Rust, so the frontend's own splitters can be deleted in P0-ts
-/// (X4, W2).
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum QueryTextDialect {
-    Og,
-    Tql,
-    /// `{{query #+BEGIN_QUERY …}}` — datalog, parsed as the advanced form.
-    Advanced,
-    /// The complete argument of a `{{query …}}` macro: OG or advanced, decided
-    /// here by the one Rust discriminator rather than by a frontend regex.
-    MacroQuery,
-    /// The complete argument of a `{{tine-query …}}` macro: TQL.
-    MacroTql,
-}
+/// The INPUT a `query_parse` caller has, on the wire (SPEC §7.1), and the
+/// `{query, view}` pair it answers with. Both live in tine-core
+/// (`query::wire_parse`) because the query publisher bakes the exact
+/// `parseQuery` answer into an exported app; the command layer only re-exports
+/// them.
+pub(crate) use tine_core::query::wire_parse::{ParsedQuery, QueryTextDialect};
 
 /// The printed form a `query_print` caller wants (SPEC §4.3, §7.1).
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
@@ -2370,29 +2383,6 @@ pub(crate) enum QueryPrintDialect {
     AdvancedMacro,
 }
 
-/// The `{query, view}` pair every parse returns (SPEC §7.1).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ParsedQuery {
-    pub(crate) query: tine_core::query::ir::Query,
-    pub(crate) view: tine_core::query::ir::ViewSettings,
-    #[serde(default, flatten)]
-    pub(crate) scoped: tine_core::query::ir::ScopedDisplaySettings,
-}
-
-/// The core input a wire dialect parses as. `Advanced` is OG's
-/// `{{query #+BEGIN_QUERY …}}` form, which the OG parser already detects and
-/// reports (M5); it is not a third parser.
-fn core_query_input(dialect: QueryTextDialect) -> tine_core::query::QueryInput {
-    use tine_core::query::QueryInput;
-    match dialect {
-        QueryTextDialect::Og => QueryInput::Og,
-        QueryTextDialect::Advanced => QueryInput::Advanced,
-        QueryTextDialect::Tql => QueryInput::Tql,
-        QueryTextDialect::MacroQuery => QueryInput::MacroQuery,
-        QueryTextDialect::MacroTql => QueryInput::MacroTql,
-    }
-}
-
 fn core_print_dialect(dialect: QueryPrintDialect) -> tine_core::query::print::PrintDialect {
     use tine_core::query::print::PrintDialect;
     match dialect {
@@ -2403,27 +2393,7 @@ fn core_print_dialect(dialect: QueryPrintDialect) -> tine_core::query::print::Pr
     }
 }
 
-/// The whole of `query_parse` that is not slot plumbing: parse, then merge the
-/// host block's `tine.*` properties over the lifted directives (§4.1).
-fn parse_query_pair(
-    text: &str,
-    dialect: QueryTextDialect,
-    block_properties: &[(String, String)],
-    registry: &tine_core::query::registry::Registry,
-) -> ParsedQuery {
-    let (query, parsed_view) = tine_core::query::parse_query_input(
-        text,
-        core_query_input(dialect),
-        tine_core::date::JournalDate::today(),
-        registry,
-    );
-    let scoped = tine_core::query::view::read_scoped_display_settings(block_properties);
-    ParsedQuery {
-        query,
-        view: tine_core::query::view::merge_block_property_view(&parsed_view, block_properties),
-        scoped,
-    }
-}
+pub(crate) use tine_core::query::wire_parse::parse_query_pair;
 
 /// The whole of `query_print` that is not `#[tauri::command]`: print, and turn
 /// a printer refusal into the one `CommandError` carrying the diagnostic.

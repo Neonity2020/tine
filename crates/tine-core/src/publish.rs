@@ -1360,6 +1360,12 @@ struct Ctx<'a> {
     /// copied into `<leaf>/assets/` and the link rewritten, through this sink.
     /// `None` keeps the graph site's `../assets/<file>` links.
     asset_sink: Option<&'a RefCell<AssetSink<'a>>>,
+    /// Query exports only (Stage 2): where the renderer is, so each query
+    /// runs exactly as the app will ask for it (its page as `current page`,
+    /// its host block's `tine.*` properties merged into the view).
+    scope: Option<&'a RefCell<app_export::RenderScope>>,
+    /// Query exports with an app: every executed query, keyed as the app asks.
+    recorder: Option<&'a RefCell<app_export::QueryRecorder>>,
 }
 
 /// One export's asset copier: bounded reads from the ORIGINAL graph's
@@ -1527,8 +1533,22 @@ fn write_publish_stage_asset(
     published: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
+    write_publish_stage_nested(stage, "assets", published, bytes)
+}
+
+/// Write one file under a nested prefix (`assets/…` for copied assets,
+/// `app/…` for the read-only app bundle) inside the stage: only that prefix,
+/// only normal path components; parents are created inside the bound stage
+/// handle.
+fn write_publish_stage_nested(
+    stage: &PublishStage,
+    prefix: &str,
+    published: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
     let relative = Path::new(published);
-    let ok = relative.starts_with("assets")
+    let ok = relative.starts_with(prefix)
+        && relative != Path::new(prefix)
         && relative
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
@@ -1536,7 +1556,7 @@ fn write_publish_stage_asset(
     if !ok {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "static-publish asset must live under assets/",
+            format!("static-publish file must live under {prefix}/"),
         ));
     }
     publish_stage_write_race_hook(stage)?;
@@ -1768,9 +1788,28 @@ fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx
 }
 
 /// Render an embedded page's block (a `DocBlock`) as an `<li>`, mirroring `render_result_block`.
+/// Stage 2: while a block's body renders, its `tine.*` properties are the ones
+/// the app hands `parseQuery` for any macro in it. Returns the previous set.
+fn enter_block_scope(ctx: &Ctx, b: &DocBlock) -> Option<Vec<(String, String)>> {
+    ctx.scope.map(|scope| {
+        std::mem::replace(
+            &mut scope.borrow_mut().block_properties,
+            app_export::tine_block_properties(b),
+        )
+    })
+}
+
+fn leave_block_scope(ctx: &Ctx, previous: Option<Vec<(String, String)>>) {
+    if let (Some(scope), Some(previous)) = (ctx.scope, previous) {
+        scope.borrow_mut().block_properties = previous;
+    }
+}
+
 fn render_embedded_block(b: &DocBlock, out: &mut String, ctx: &Ctx, depth: u8) {
     out.push_str("<li>");
+    let scope_properties = enter_block_scope(ctx, b);
     emit_block_inner(&b.raw, out, ctx, depth);
+    leave_block_scope(ctx, scope_properties);
     if !b.children.is_empty() {
         out.push_str("<ul>");
         for c in &b.children {
@@ -3172,6 +3211,7 @@ fn render_query_sheet(
             return;
         }
     };
+    let _nested = NestedResultsGuard::enter(ctx);
     let mut render = |hydrated: &[HydratedQueryBlock<'_>]| {
         let rows = hydrated
             .iter()
@@ -3342,6 +3382,50 @@ fn run_static_query(
     check_nesting: bool,
     ctx: &Ctx,
 ) -> Result<StaticQueryOutcome, String> {
+    run_static_query_with(src, input, check_nesting, ctx, QueryRunOverrides::default())
+}
+
+/// What one caller knows better than the render scope (Stage 2): the export's
+/// own home query keeps its REVIEWED binding and view while the record's
+/// lookup key stays the home page.
+#[derive(Default)]
+struct QueryRunOverrides {
+    context: Option<ExecutionContext>,
+    view: Option<crate::query::ir::ViewSettings>,
+    properties: Option<Vec<(String, String)>>,
+    host_block_id: Option<String>,
+}
+
+/// While query RESULT rows render, a macro inside them belongs to another
+/// page's context and is not one the app will ask for: it is not recorded.
+struct NestedResultsGuard<'a>(Option<&'a RefCell<app_export::RenderScope>>);
+
+impl<'a> NestedResultsGuard<'a> {
+    fn enter(ctx: &Ctx<'a>) -> Self {
+        if let Some(scope) = ctx.scope {
+            let mut scope = scope.borrow_mut();
+            scope.nesting = scope.nesting.saturating_add(1);
+        }
+        NestedResultsGuard(ctx.scope)
+    }
+}
+
+impl Drop for NestedResultsGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.0 {
+            let mut scope = scope.borrow_mut();
+            scope.nesting = scope.nesting.saturating_sub(1);
+        }
+    }
+}
+
+fn run_static_query_with(
+    src: &str,
+    input: crate::query::QueryInput,
+    check_nesting: bool,
+    ctx: &Ctx,
+    overrides: QueryRunOverrides,
+) -> Result<StaticQueryOutcome, String> {
     const STATIC_QUERY_MAX_ROWS: usize = 20_000;
     const STATIC_QUERY_MAX_BYTES: usize = 32 * 1024 * 1024;
     if !crate::query::query_source_within_limit(src) {
@@ -3363,8 +3447,82 @@ fn run_static_query(
             rows: Vec::new(),
             generation: 0,
         });
-    let (query, view) =
-        crate::query::parse_query_input(src, input, crate::date::JournalDate::today(), &registry);
+    // A query export (Stage 2) runs each query exactly as the app will ask
+    // for it: `<% current page %>` bound to the page being rendered, the host
+    // block's `tine.*` properties merged into the view, the page as the
+    // execution context. The graph site and print keep their historical
+    // context-free run.
+    let scoped = ctx.scope.map(|scope| scope.borrow().clone());
+    let mut record: Option<app_export::QuerySnapshot> = None;
+    let (query, view, context) = match &scoped {
+        Some(scope) => {
+            let dialect = crate::query::wire_parse::QueryTextDialect::from_input(input);
+            let properties = overrides
+                .properties
+                .clone()
+                .unwrap_or_else(|| scope.block_properties.clone());
+            let authored =
+                crate::query::wire_parse::parse_query_pair(src, dialect, &properties, &registry);
+            let execution = scope
+                .page
+                .as_deref()
+                .and_then(|page| app_export::substitute_current_page(src, page))
+                .map(|argument| {
+                    let parsed = crate::query::wire_parse::parse_query_pair(
+                        &argument,
+                        dialect,
+                        &properties,
+                        &registry,
+                    );
+                    app_export::QueryExecutionParse { argument, parsed }
+                });
+            let effective = execution
+                .as_ref()
+                .map(|execution| &execution.parsed)
+                .unwrap_or(&authored);
+            let query = effective.query.clone();
+            let view = overrides
+                .view
+                .clone()
+                .unwrap_or_else(|| effective.view.clone());
+            let lookup_context = match &scope.page {
+                Some(page) => ExecutionContext::on_page(page.clone()),
+                None => ExecutionContext::none(),
+            };
+            let context = overrides
+                .context
+                .clone()
+                .unwrap_or_else(|| lookup_context.clone());
+            if ctx.recorder.is_some() && scope.nesting == 0 {
+                record = Some(app_export::QuerySnapshot {
+                    host: scope.page.clone().unwrap_or_default(),
+                    argument: src.to_string(),
+                    dialect,
+                    properties,
+                    parsed: authored,
+                    execution,
+                    context: lookup_context,
+                    executed_context: context.clone(),
+                    view: view.clone(),
+                    result: app_export::closed_result(
+                        QueryRows::Page { pages: Vec::new() },
+                        Vec::new(),
+                        crate::query::ir::QueryReport::default(),
+                    ),
+                });
+            }
+            (query, view, context)
+        }
+        None => {
+            let (query, view) = crate::query::parse_query_input(
+                src,
+                input,
+                crate::date::JournalDate::today(),
+                &registry,
+            );
+            (query, view, ExecutionContext::none())
+        }
+    };
     // Advanced source is intentionally unresolved at parse time. The shared
     // reader resolves it before deciding which diagnostics are actionable.
     let Some(reader) = ctx.query_reader else {
@@ -3381,11 +3539,11 @@ fn run_static_query(
     };
     let (result, subtrees) = if ctx.print_error.is_some() {
         reader
-            .run_subtrees(&query, &view, bounds, &ExecutionContext::none())
+            .run_subtrees(&query, &view, bounds, &context)
             .map(|answer| (answer.result, Some(answer.roots)))
     } else {
         reader
-            .run(&query, &view, bounds, &ExecutionContext::none())
+            .run(&query, &view, bounds, &context)
             .map(|result| (result, None))
     }
     .map_err(|error| {
@@ -3421,13 +3579,32 @@ fn run_static_query(
             sampled,
         });
     }
-    Ok(match result.rows {
+    let QueryResult {
+        rows,
+        diagnostics,
+        report,
+        ..
+    } = result;
+    let outcome = match rows {
         QueryRows::Block { groups } => {
             let pre_filter_total = groups.iter().map(|group| group.blocks.len()).sum();
-            let groups = groups
+            let groups: Vec<RefGroup> = groups
                 .into_iter()
                 .filter(|group| publish_page_allowed(ctx, &group.page))
                 .collect();
+            let groups = match overrides.host_block_id.as_deref() {
+                Some(host) => query_export::without_host_block(groups, Some(host)),
+                None => groups,
+            };
+            if let Some(record) = record.as_mut() {
+                record.result = app_export::closed_result(
+                    QueryRows::Block {
+                        groups: groups.clone(),
+                    },
+                    diagnostics,
+                    report,
+                );
+            }
             StaticQueryOutcome {
                 rows: StaticQueryRows::Block(groups),
                 pre_filter_total,
@@ -3436,17 +3613,30 @@ fn run_static_query(
         }
         QueryRows::Page { pages } => {
             let pre_filter_total = pages.len();
-            let pages = pages
+            let pages: Vec<PageRow> = pages
                 .into_iter()
                 .filter(|page| publication_page_link(ctx, page).is_some())
                 .collect();
+            if let Some(record) = record.as_mut() {
+                record.result = app_export::closed_result(
+                    QueryRows::Page {
+                        pages: pages.clone(),
+                    },
+                    diagnostics,
+                    report,
+                );
+            }
             StaticQueryOutcome {
                 rows: StaticQueryRows::Page(pages),
                 pre_filter_total,
                 sampled,
             }
         }
-    })
+    };
+    if let (Some(record), Some(recorder)) = (record, ctx.recorder) {
+        recorder.borrow_mut().queries.push(record);
+    }
+    Ok(outcome)
 }
 
 enum StaticQueryRows {
@@ -3502,6 +3692,7 @@ fn render_query_outcome(
         StaticQueryRows::Page(pages) => pages.len(),
     };
     let omitted = outcome.pre_filter_total.saturating_sub(total);
+    let _nested = NestedResultsGuard::enter(ctx);
     let mut out = format!(
         "<div class=\"query\"><div class=\"query-head\">{} <span class=\"query-count\">{}</span></div>",
         esc(title.unwrap_or("Query")),
@@ -3914,12 +4105,21 @@ fn render_block_ordered(
         ));
     }
     emit_header_facets(b.marker(), b.priority(), out);
+    let scope_properties = enter_block_scope(ctx, b);
     match &begin_query {
         Some(BeginQueryInspection::Supported(begin)) => {
             if let Some(graph) = ctx.graph {
+                // The app renders this container as
+                // `{{query <query> {:table-view? true}}}` (`BeginQuery.tsx`);
+                // a query export records exactly that argument.
+                let source = if ctx.scope.is_some() {
+                    format!("{} {{:table-view? true}}", begin.query)
+                } else {
+                    begin.query.clone()
+                };
                 out.push_str(&render_query_with_title(
                     graph,
-                    &begin.query,
+                    &source,
                     begin.title.as_deref(),
                     ctx,
                     0,
@@ -3956,6 +4156,7 @@ fn render_block_ordered(
             )),
         },
     }
+    leave_block_scope(ctx, scope_properties);
     out.push_str("</div>");
     let props = b.properties();
     let props = if sheet.is_some() {
@@ -4296,6 +4497,8 @@ pub(crate) fn page_print_html_document(
         pages: None,
         page_links: None,
         inert_outside_links: false,
+        scope: None,
+        recorder: None,
         asset_sink: None,
     };
     // `page_html` builds the heading + outline and wraps it in `shell`; we want the
@@ -4715,6 +4918,7 @@ struct PublicationGraphSnapshot {
     root: PublicationSnapshotRoot,
 }
 
+pub mod app_export;
 #[cfg(windows)]
 mod private_directory;
 pub mod query_export;
@@ -5211,6 +5415,8 @@ pub struct PublicationTarget {
     /// local asset into `<leaf>/assets/` under this byte budget. `None`: the
     /// site keeps linking the graph's sibling `assets/` directory.
     pub asset_budget_bytes: Option<u64>,
+    /// `Some`: also publish the read-only app under `app/` (query exports).
+    pub app: Option<app_export::AppPublication>,
 }
 
 impl PublicationTarget {
@@ -5224,6 +5430,7 @@ impl PublicationTarget {
                 replace: true,
             },
             asset_budget_bytes: None,
+            app: None,
         }
     }
 }
@@ -5426,6 +5633,15 @@ pub(crate) fn publish_graph_documents_inner(
             over_budget: None,
         })
     });
+    // Stage 2: a query export runs every query as the app will ask for it
+    // (`scope`) and, when it also ships the app, records each answer.
+    let is_query_export = matches!(target.selection, PublicationSelection::Paths(_));
+    let scope = is_query_export.then(|| RefCell::new(app_export::RenderScope::default()));
+    let recorder = target
+        .app
+        .as_ref()
+        .filter(|app| app.bundle.index().is_some())
+        .map(|_| RefCell::new(app_export::QueryRecorder::default()));
     // The render context: the block-ref index + the graph (so `{{query}}`/`{{embed}}`/
     // `{{namespace}}` macros can resolve against real data at publish time) + the
     // slug map (so cross-page links resolve to the actual written files).
@@ -5440,10 +5656,18 @@ pub(crate) fn publish_graph_documents_inner(
         print_error: None,
         pages: Some(&page_docs),
         page_links: Some(&page_links),
-        inert_outside_links: matches!(target.selection, PublicationSelection::Paths(_)),
+        inert_outside_links: is_query_export,
+        scope: scope.as_ref(),
+        recorder: recorder.as_ref(),
         asset_sink: asset_sink.as_ref(),
     };
     for (name, kind, parsed) in &public {
+        if let Some(scope) = &scope {
+            let mut scope = scope.borrow_mut();
+            scope.page = Some((*name).to_string());
+            scope.block_properties.clear();
+            scope.nesting = 0;
+        }
         let slug = slug_of(name);
         let file = format!("{slug}.html");
         let html = page_html(
@@ -5501,20 +5725,144 @@ pub(crate) fn publish_graph_documents_inner(
     );
     let pages_html = shell("Pages", &main, &home_file);
     write_publish_stage_file(&stage, "pages.html", pages_html.as_bytes())?;
-    let entry_html = welcome_html.unwrap_or(pages_html);
+    let mut entry_html = welcome_html.unwrap_or(pages_html);
+    let mut app_warnings = Vec::new();
+    if let Some(app) = &target.app {
+        match (app.bundle.index(), &recorder) {
+            (Some(index), Some(recorder)) => {
+                let index_html = app_export::rewrite_index(index, &app.name)?;
+                // The export's own query, run for the app's home page: its
+                // lookup key is the home page, its binding and view are the
+                // reviewed ones, and the host block stays out (GH #469).
+                let taken: HashSet<String> = public
+                    .iter()
+                    .map(|(name, _, _)| crate::refs::page_key(name))
+                    .collect();
+                let home_name = app_export::home_page_name(&app.name, &taken);
+                if let Some(scope) = &scope {
+                    let mut scope = scope.borrow_mut();
+                    scope.page = Some(home_name.clone());
+                    scope.block_properties.clear();
+                    scope.nesting = 0;
+                }
+                let input = app.query.dialect().input();
+                let overrides = QueryRunOverrides {
+                    context: Some(ExecutionContext {
+                        current_page: app.query.current_page.clone(),
+                    }),
+                    view: app.query.view.clone(),
+                    properties: Some(Vec::new()),
+                    host_block_id: app.query.host_block_id.clone(),
+                };
+                run_static_query_with(
+                    &app.query.argument(),
+                    input,
+                    !matches!(input, crate::query::QueryInput::MacroTql),
+                    &ctx,
+                    overrides,
+                )
+                .map_err(|html| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "The export's query could not be run for the app: {}",
+                            app_export::strip_tags(&html)
+                        ),
+                    )
+                })?;
+                // The closed sub-graph: every graph-shaped answer the app
+                // needs (backlinks, block-ref counts, aliases, icons) comes
+                // from the selected pages and nothing else (I-8).
+                let selected: HashSet<String> = taken;
+                let mut closed_pages: Vec<(crate::model::PageEntry, Arc<doc::Document>)> =
+                    snapshot_pages
+                        .iter()
+                        .filter(|(entry, _)| selected.contains(&crate::refs::page_key(&entry.name)))
+                        .map(|(entry, document)| {
+                            let mut document = Arc::clone(document);
+                            crate::model::assign_doc_runtime_ids(
+                                &mut Arc::make_mut(&mut document).roots,
+                                &entry.rel_path,
+                            );
+                            (entry.clone(), document)
+                        })
+                        .collect();
+                closed_pages.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+                let closed = PublicationGraphSnapshot::new(closed_pages.clone())?;
+                let queries = std::mem::take(&mut recorder.borrow_mut().queries);
+                let snapshot_json = app_export::build_snapshot(app_export::SnapshotInputs {
+                    name: &app.name,
+                    home: &app.query,
+                    closed: &closed.graph,
+                    pages: &closed_pages,
+                    queries,
+                    home_name: &home_name,
+                    exported_at: app_export::exported_at_now(),
+                })?;
+                for (path, bytes) in &app.bundle.files {
+                    if path == "index.html" {
+                        continue;
+                    }
+                    write_publish_stage_nested(
+                        &stage,
+                        app_export::APP_DIR,
+                        &format!("{}/{path}", app_export::APP_DIR),
+                        bytes,
+                    )?;
+                }
+                write_publish_stage_nested(
+                    &stage,
+                    app_export::APP_DIR,
+                    &format!("{}/index.html", app_export::APP_DIR),
+                    index_html.as_bytes(),
+                )?;
+                write_publish_stage_nested(
+                    &stage,
+                    app_export::APP_DIR,
+                    &format!("{}/{}", app_export::APP_DIR, app_export::SNAPSHOT_FILE),
+                    &snapshot_json,
+                )?;
+                // The static site stays the no-JS fallback; served over HTTP
+                // its front door opens the app unless asked not to (`?static`).
+                // The redirect is a separate file because the shell's CSP
+                // allows no inline script.
+                write_publish_stage_file(
+                    &stage,
+                    app_export::REDIRECT_FILE,
+                    app_export::REDIRECT_JS.as_bytes(),
+                )?;
+                entry_html = entry_html
+                    .replacen(
+                        "<head>",
+                        &format!(
+                            "<head><script src=\"{}\"></script>",
+                            app_export::REDIRECT_FILE
+                        ),
+                        1,
+                    )
+                    .replacen(
+                        "<main>",
+                        &format!("<main>{}", app_export::STATIC_APP_NOTE),
+                        1,
+                    );
+            }
+            _ => app_warnings.push(app_export::NO_BUNDLE_WARNING.to_string()),
+        }
+    }
     write_publish_stage_file(&stage, "index.html", entry_html.as_bytes())?;
     if let Some(queries) = queries {
         queries
             .ensure_current()
             .map_err(publication_query_io_error)?;
     }
-    let (warnings, over_budget) = asset_sink
+    let (mut warnings, over_budget) = asset_sink
         .as_ref()
         .map(|sink| {
             let sink = sink.borrow();
             (sink.warnings.clone(), sink.over_budget.clone())
         })
         .unwrap_or_default();
+    warnings.extend(app_warnings);
     drop(ctx);
     if let Some(message) = over_budget {
         // Nothing reaches the destination: the stage is removed with the
@@ -5560,6 +5908,8 @@ mod tests {
             pages: None,
             page_links: None,
             inert_outside_links: false,
+            scope: None,
+            recorder: None,
             asset_sink: None,
         };
         decorate(&lsdoc::render_html(&body_blocks(raw), &md_opts()), &ctx, 0)
@@ -5710,6 +6060,8 @@ mod tests {
                 pages: None,
                 page_links: None,
                 inert_outside_links: false,
+                scope: None,
+                recorder: None,
                 asset_sink: None,
             },
             0,
@@ -6439,6 +6791,8 @@ mod tests {
             pages: None,
             page_links: None,
             inert_outside_links: false,
+            scope: None,
+            recorder: None,
             asset_sink: None,
         };
 
@@ -6732,6 +7086,7 @@ mod tests {
             folder: None,
             replace: false,
             asset_budget_bytes: None,
+            app_bundle: None,
         }
     }
 
@@ -7727,6 +8082,8 @@ mod tests {
             pages: None,
             page_links: None,
             inert_outside_links: false,
+            scope: None,
+            recorder: None,
             asset_sink: None,
         };
 
@@ -8648,5 +9005,203 @@ mod tests {
         let pfile = dir.join("print-sample.html");
         fs::write(&pfile, print).unwrap();
         println!("SAMPLE_PRINT_HTML={}", pfile.display());
+    }
+
+    fn fake_app_bundle() -> Arc<app_export::PublishedAppBundle> {
+        Arc::new(app_export::PublishedAppBundle {
+            files: vec![
+                (
+                    "assets/index-abc123.js".into(),
+                    b"console.log('bundle');".to_vec(),
+                ),
+                (
+                    "index.html".into(),
+                    b"<!doctype html><html><head><meta charset=\"utf-8\"><title>Tine</title>\
+<script type=\"module\" src=\"./assets/index-abc123.js\"></script></head><body><div id=\"root\"></div></body></html>"
+                        .to_vec(),
+                ),
+            ],
+        })
+    }
+
+    /// Stage 2: a query export with an embedded bundle ships the read-only
+    /// app beside the static site, over a snapshot computed from the selected
+    /// pages and nothing else, keyed exactly as the app will ask.
+    #[test]
+    fn query_export_ships_the_app_over_a_closed_snapshot() {
+        let dir = query_export_fixture("app");
+        // Dashboard hosts the export's own query AND a focused-page query;
+        // it is exported because its host block does not match but its
+        // other block does.
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- TODO dash-task\n- {{query (task TODO)}}\n- {{query (and (task TODO) <% current page %>)}}\n  tine.view:: table\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let mut request = todo_request("Tasks");
+        request.app_bundle = Some(fake_app_bundle());
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let out = PathBuf::from(&outcome.path);
+
+        // The bundle, rewritten: marker in <head>, the export's name as title.
+        let app_index = fs::read_to_string(out.join("app/index.html")).unwrap();
+        assert!(
+            app_index.contains("<head><meta name=\"tine-published\" content=\"snapshot.json\">")
+        );
+        assert!(app_index.contains("<title>Tasks</title>"), "{app_index}");
+        assert!(!app_index.contains("<title>Tine</title>"));
+        assert_eq!(
+            fs::read(out.join("app/assets/index-abc123.js")).unwrap(),
+            b"console.log('bundle');"
+        );
+        // The static front door opens the app over HTTP, through a separate
+        // script (the shell's CSP forbids inline script), and says so.
+        let index = fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(
+            index.contains("<head><script src=\"app-redirect.js\"></script>"),
+            "{index}"
+        );
+        assert!(index.contains("publish-app-note"), "{index}");
+        let redirect = fs::read_to_string(out.join("app-redirect.js")).unwrap();
+        assert!(redirect.contains("location.replace(\"app/\""));
+        assert!(redirect.contains("static"));
+
+        // The snapshot: exactly the contracted top-level keys.
+        let bytes = fs::read(out.join("app/snapshot.json")).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut keys: Vec<&str> = snapshot
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        let mut expected = app_export::SNAPSHOT_TOP_LEVEL_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        assert_eq!(snapshot["schema"], app_export::SNAPSHOT_SCHEMA);
+        assert_eq!(snapshot["name"], "Tasks");
+        // "Tasks" is a selected page, so the home page steps aside.
+        assert_eq!(snapshot["home"], "Tasks (export)");
+        let pages = snapshot["pages"].as_array().unwrap();
+        assert_eq!(pages[0]["name"], "Tasks (export)");
+        assert!(pages.iter().all(|page| page["read_only"] == true));
+        let mut names: Vec<&str> = pages.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "Also Selected",
+                "Dashboard",
+                "Jan 2nd, 2026",
+                "Tasks",
+                "Tasks (export)"
+            ]
+        );
+        // Every selected page carries its own graph-relative path; the app
+        // opens pages by that path.
+        let tasks = pages.iter().find(|p| p["name"] == "Tasks").unwrap();
+        assert_eq!(tasks["path"], "pages/Tasks.md");
+        let entries = snapshot["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["name"], "Tasks (export)");
+        assert_eq!(entries.len(), pages.len());
+        // The home page's blocks: the macro, then one link per page.
+        let home_blocks = pages[0]["blocks"].as_array().unwrap();
+        assert_eq!(
+            home_blocks[0]["raw"].as_str().unwrap().trim(),
+            "{{query (task TODO)}}"
+        );
+        assert_eq!(home_blocks.len(), 1 + 4);
+        // Backlinks come from the closed sub-graph only: "Also Selected" is
+        // linked from Tasks (selected); Private Notes is nowhere.
+        let backlinks = snapshot["backlinks"].as_object().unwrap();
+        assert!(backlinks.contains_key("Also Selected"), "{backlinks:?}");
+        assert!(!backlinks.contains_key("Private Notes"));
+
+        // Queries: the home query keyed by the home page but executed with
+        // the reviewed binding; Dashboard's two macros keyed by Dashboard,
+        // the focused one with its substituted execution parse and the
+        // host block's tine.* properties.
+        let queries = snapshot["queries"].as_array().unwrap();
+        let home = queries
+            .iter()
+            .find(|q| q["host"] == "Tasks (export)")
+            .expect("home query recorded");
+        assert_eq!(home["argument"], "(task TODO)");
+        assert_eq!(home["dialect"], "macro_query");
+        assert_eq!(home["context"]["current_page"], "Tasks (export)");
+        assert_eq!(home["executed_context"]["current_page"], "Dashboard");
+        assert!(home["execution"].is_null());
+        assert!(home["result"]["statistics"].is_null());
+        assert_eq!(home["result"]["exceeded"], false);
+        assert_eq!(home["result"]["total"], home["result"]["matched_total"]);
+        let home_rows: usize = home["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["blocks"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(home["result"]["total"], home_rows);
+        assert_eq!(home_rows, 4, "{}", home["result"]);
+        let dashboard: Vec<&serde_json::Value> = queries
+            .iter()
+            .filter(|q| q["host"] == "Dashboard")
+            .collect();
+        assert_eq!(dashboard.len(), 2, "{queries:?}");
+        let focused = dashboard
+            .iter()
+            .find(|q| q["argument"].as_str().unwrap().contains("current page"))
+            .unwrap();
+        assert_eq!(
+            focused["execution"]["argument"],
+            "(and (task TODO) [[Dashboard]])"
+        );
+        assert_eq!(focused["properties"][0][0], "tine.view");
+        assert_eq!(focused["properties"][0][1], "table");
+        assert_eq!(focused["context"]["current_page"], "Dashboard");
+        assert_eq!(focused["executed_context"]["current_page"], "Dashboard");
+        assert_eq!(focused["result"]["total"], 1);
+
+        // Nothing outside the selection reaches the snapshot: not the
+        // unselected page's text, not its path.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("private-sentinel-text"));
+        assert!(!text.contains("Private Notes.md"));
+        assert!(!text.contains("not-a-todo"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_without_an_embedded_frontend_warns_and_ships_no_app() {
+        let dir = query_export_fixture("no-app");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let mut request = todo_request("Plain");
+        request.app_bundle = Some(Arc::new(app_export::PublishedAppBundle::default()));
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert_eq!(
+            outcome.warnings,
+            vec![app_export::NO_BUNDLE_WARNING.to_string()]
+        );
+        let out = PathBuf::from(&outcome.path);
+        assert!(!out.join("app").exists());
+        assert!(!out.join("app-redirect.js").exists());
+        let index = fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(!index.contains("app-redirect.js"));
+        // A bundle whose shell cannot carry the marker is refused whole.
+        let mut request = todo_request("Broken");
+        request.app_bundle = Some(Arc::new(app_export::PublishedAppBundle {
+            files: vec![("index.html".into(), b"<html><body></body></html>".to_vec())],
+        }));
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let error = publish_query(&graph, &request, &plan.fingerprint).unwrap_err();
+        assert!(error.to_string().contains("not exportable"), "{error}");
+        assert!(!dir.join("published-queries/broken").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
