@@ -13287,18 +13287,27 @@ fn direct_query_bench_sample(graph: &Graph, query: &str) -> Duration {
     started.elapsed()
 }
 
+fn direct_query_bench_ready_sample(graph: &Graph, query: &str) -> Duration {
+    let started = Instant::now();
+    let answer = graph
+        .run_query_bounded(query, 20_000, 32 * 1024 * 1024)
+        .expect("a ready Direct projection must answer the benchmark query");
+    std::hint::black_box((answer.total, answer.exceeded));
+    started.elapsed()
+}
+
 fn direct_query_bench_report(
     class: &str,
     phase: &str,
     samples: &mut [Duration],
     pages: usize,
     blocks: usize,
-    indexed_reads: u64,
+    statement_reads: u64,
 ) {
     samples.sort();
     let ms = |duration: Duration| duration.as_secs_f64() * 1_000.0;
     println!(
-        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} indexed_reads={indexed_reads}",
+        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} statement_reads={statement_reads}",
         ms(samples[samples.len() / 2]),
         ms(samples[samples.len() * 95 / 100]),
         ms(samples[samples.len() - 1]),
@@ -13354,13 +13363,24 @@ fn direct_query_latency_manual_benchmark() {
     ];
     let mut serial = 0;
     for (class, query) in classes {
-        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
+        direct_query_bench_ready_sample(&graph, query);
+        let repeated_statements_before = graph.direct_projection_statement_reads_test();
         let mut repeated = (0..rounds)
-            .map(|_| direct_query_bench_sample(&graph, query))
+            .map(|_| direct_query_bench_ready_sample(&graph, query))
             .collect::<Vec<_>>();
-        direct_query_bench_report(class, "repeat", &mut repeated, pages, blocks, 0);
+        let repeated_statement_reads = graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(repeated_statements_before);
+        direct_query_bench_report(
+            class,
+            "repeat",
+            &mut repeated,
+            pages,
+            blocks,
+            repeated_statement_reads,
+        );
 
-        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         let mut invalidated = Vec::with_capacity(rounds);
         for sample in 0..rounds {
             serial += 1;
@@ -13368,11 +13388,11 @@ fn direct_query_latency_manual_benchmark() {
             wait_for_direct_query_projection(&graph);
             graph.reset_direct_projection_candidate_probe_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
-            let candidate_before = graph.direct_projection_indexed_reads_test();
-            let elapsed = direct_query_bench_sample(&graph, query);
-            let candidate_queries_completed = graph
-                .direct_projection_indexed_reads_test()
-                .saturating_sub(candidate_before);
+            let statement_before = graph.direct_projection_statement_reads_test();
+            let elapsed = direct_query_bench_ready_sample(&graph, query);
+            let statement_queries_completed = graph
+                .direct_projection_statement_reads_test()
+                .saturating_sub(statement_before);
             let fallback_reads = graph
                 .direct_projection_fallback_reads_test()
                 .saturating_sub(fallback_before);
@@ -13382,29 +13402,29 @@ fn direct_query_latency_manual_benchmark() {
             // query still materializes.
             let evaluated_pages = graph.direct_projection_hydrated_pages_test().len();
             println!(
-                "b4_query_sample class={class} run={} sample={} candidateQueriesCompleted={candidate_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
+                "b4_query_sample class={class} run={} sample={} statementQueriesCompleted={statement_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
                 std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
                 sample + 1,
                 elapsed.as_secs_f64() * 1_000.0,
             );
             invalidated.push(elapsed);
         }
-        let indexed_reads = graph
-            .direct_projection_indexed_reads_test()
-            .saturating_sub(indexed_before);
+        let statement_reads = graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(statements_before);
         direct_query_bench_report(
             class,
             "invalidated_ready",
             &mut invalidated,
             pages,
             blocks,
-            indexed_reads,
+            statement_reads,
         );
     }
 
     let mut ready_hits = 0_usize;
     let mut ready_misses = 0_usize;
-    let indexed_before = graph.direct_projection_indexed_reads_test();
+    let statements_before = graph.direct_projection_statement_reads_test();
     let mut immediate = Vec::with_capacity(rounds);
     for save in 0..rounds {
         serial += 1;
@@ -13422,7 +13442,7 @@ fn direct_query_latency_manual_benchmark() {
         let ready_latency_ms = readiness_started.elapsed().as_secs_f64() * 1_000.0;
         let oracle =
             crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 * 1024 * 1024);
-        let candidate_before = graph.direct_projection_indexed_reads_test();
+        let statement_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         let actual = graph
             .run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024)
@@ -13431,26 +13451,26 @@ fn direct_query_latency_manual_benchmark() {
             && serde_json::to_vec(actual.groups.as_ref()).unwrap()
                 == serde_json::to_vec(&oracle.groups).unwrap();
         println!(
-            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete candidate_reads={} fallback_reads={} oracle_equal={oracle_equal}",
+            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete statement_reads={} fallback_reads={} oracle_equal={oracle_equal}",
             std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
             save + 1,
-            graph.direct_projection_indexed_reads_test().saturating_sub(candidate_before),
+            graph.direct_projection_statement_reads_test().saturating_sub(statement_before),
             graph.direct_projection_fallback_reads_test().saturating_sub(fallback_before),
         );
     }
-    let indexed_reads = graph
-        .direct_projection_indexed_reads_test()
-        .saturating_sub(indexed_before);
+    let statement_reads = graph
+        .direct_projection_statement_reads_test()
+        .saturating_sub(statements_before);
     direct_query_bench_report(
         "sparse_task",
         "data_rev_immediate",
         &mut immediate,
         pages,
         blocks,
-        indexed_reads,
+        statement_reads,
     );
     println!(
-        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} indexed_reads={indexed_reads}",
+        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} statement_reads={statement_reads}",
         ready_hits + ready_misses,
     );
 
