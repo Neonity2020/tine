@@ -428,12 +428,12 @@ async function runBackend(mode) {
     }
 
     if (MISSING_TARGET) {
-      const before = new Set(windowIds(env));
+      const before = new Set(windowIds(env, "^Tine( — .*)?$"));
       const appWindow = [...before][0];
       if (!appWindow) throw new Error("close recovery: native app window absent");
       execFileSync("xdotool", ["windowactivate", "--sync", appWindow], { env });
       execFileSync("xdotool", ["key", "--clearmodifiers", "alt+F4"], { env });
-      const dialog = await waitFor(() => windowIds(env).find((id) => !before.has(id)),
+      const dialog = await waitFor(() => windowIds(env, "^(Tine|Unsaved changes)$").find((id) => !before.has(id)),
         45_000, "failed close did not ask before discarding drafts");
       execFileSync("xdotool", ["windowactivate", "--sync", dialog], { env });
       execFileSync("xdotool", ["key", "--clearmodifiers", "alt+n"], { env });
