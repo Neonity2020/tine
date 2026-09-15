@@ -80,7 +80,7 @@ pub use graph_text_errors::*;
 pub(crate) use projection_rename::*;
 mod projection_fs;
 pub use atomic_fs::*;
-pub(crate) use projection_fs::*;
+use projection_fs::*;
 mod trash;
 use asset_files::*;
 use asset_refs::*;
