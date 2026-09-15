@@ -6732,7 +6732,7 @@ mod tests {
             "a warm reopen parses nothing"
         );
         assert_eq!(graph.warm_stream_parses_test(), 0);
-        let projection = graph.direct_projection_test().unwrap();
+        let _projection = graph.direct_projection_test().unwrap();
         assert!(
             !graph.has_parsed_cache_test(),
             "readiness must not require the whole-graph parsed cache"

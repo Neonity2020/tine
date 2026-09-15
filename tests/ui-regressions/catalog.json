@@ -8469,7 +8469,7 @@
         "scenario": "diagnostics.user-controlled-report",
         "failBefore": "proven"
       },
-      "notes": "The settings surface did not exist before GH #343. It now states the exclusion and no-upload boundary beside the action, previews the exact JSON, copies only that generated report, offers native Save on desktop, and clears retained current/previous events on request."
+      "notes": "The settings surface did not exist before GH #343. It now states the exclusion and no-upload boundary beside the action, keeps a large selectable preview bounded while Copy and Save retain the complete JSON, offers native Save on desktop, and clears retained current/previous events on request. GH #540 supplied a 2.8 MB Windows report whose full textarea made Settings extremely sluggish."
     },
     {
       "id": "UI-REFFILTER-CHIPS-FOLLOW-TEXT-173",
@@ -11291,6 +11291,46 @@
         "failBefore": "proven"
       },
       "notes": "Native run34770759988 at320px exposed More and Close clipped after the fixed title/pager/Find/zoom cluster. Actual production PdfViewer plus Inter and a real one-page PDF reproduces unreachable More/Close at320 and Close at360;1100 remains reachable. Narrow container CSS gives the title its own row, retains existing control order and More menu, and anchors panels below the64px toolbar. Real browser acceptance checks every visible control hit target, touch More to Notes, and keyboard/touch Close at320/360/1100. Native motionPoint rejects offscreen targets instead of silently clamping them to the edge. Native corrected-layout acceptance remains pending. Expanded browser neighbors280px and320px at110% root UI zoom also pass; Find and settings surfaces remain below the toolbar. Native Android full run34772033660 at40c08daac766e191474b0eb930c73df8c3b8a6c5 passes all six methods, including PDF source/Find/Notes/Back history with unclamped physical pointer coordinates. Versioned candidate gates remain separate."
+    },
+    {
+      "id": "UI-QUERY-EXPORT-DIALOG-001",
+      "title": "Export… on a query reviews the owner pages, requires acknowledging whole-page export for block queries, and offers Replace or a separate folder on a taken name",
+      "family": "publishing",
+      "sources": { "issues": [], "commits": [], "internal": "2026-09-14 publish-query stage 1 (Martin, rich export idea)" },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/components/QueryExportDialog.test.tsx", "src/components/Settings.queryExportBudget.test.tsx", "scripts/e2e-publish-query.mjs"],
+        "scenario": "publish.query-export-dialog",
+        "failBefore": "proven"
+      },
+      "notes": "Blocking stateful UX. The plan's folder and fingerprint travel back unchanged on confirm (stateless preview→commit). An over-budget refusal (typed query-unavailable / export_asset_budget_exceeded) shows 'Adjust limit in Settings…' which opens Settings → Graph in one click. Native real-app coverage (scripts/e2e-publish-query.mjs, Direct and Managed, linux-release since 2026-09-15): the Export… button opens the dialog, an untitled query asks for a name, the plan lists exactly the owner pages, Export stays disabled until whole-page export is acknowledged, and the folder is written. The Replace / separate-folder choice on a taken name is covered by the render test only. See REG-QUERY-EXPORT-CLOSURE-001 for the core contract."
+    },
+    {
+      "id": "UI-QUERY-EXPORT-APP-001",
+      "title": "A query export opens in a browser as the read-only Tine app over its baked snapshot: home page with the exported query's rows, page navigation, Linked References, no editing, and ?static keeps the static site",
+      "family": "publishing",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "tine-agents/specs/notes/2026-09-14-publish-query-stage2.md (v2, Astra-verified)"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/publishedBackend.test.ts",
+          "src/publishedBackend.guard.test.ts",
+          "scripts/e2e-published-app.mjs"
+        ],
+        "scenario": "publish.query-export-app",
+        "failBefore": "proven"
+      },
+      "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page + the view compared under viewKey, which folds the engine's dense ViewSettings and the app's sparse resolution together) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export…, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. The Playwright journey passed a five-round sequential unchanged-binary burn-in (Direct and Managed exports, 27/27 each round, binary built from 5ab70870) on 2026-09-15 and runs in linux-release."
     }
   ]
 }

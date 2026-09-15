@@ -288,14 +288,15 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(contract).toContain("## `CommandError` boundary");
-    expect(contract).toContain("The syntactic census is 46 production sites");
+    expect(contract).toContain("The syntactic census is 47 production sites");
 
     const proseSites = (withoutRustTestModules(commands).match(/CommandError::prose/g) ?? []).length
       + (withoutRustTestModules(state).match(/CommandError::prose/g) ?? []).length;
-    // 46 after the Managed Storage removal (2026-09-15): the managed command
-    // surface and its wrong-reply arms are gone. The ratchet retires legacy
+    // 47 after the Managed Storage removal (2026-09-15): the managed command
+    // surface and its wrong-reply arms are gone; the one site added since is
+    // query_publication_error's pass-through of the core's composed refusal. The ratchet retires legacy
     // untyped WORDING; see docs/contracts/typed-errors.md.
-    expect(proseSites).toBe(46);
+    expect(proseSites).toBe(47);
 
     const phaseB = parity.slice(
       parity.indexOf("const PHASE_B_COMMANDS"),

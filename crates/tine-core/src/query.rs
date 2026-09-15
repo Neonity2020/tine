@@ -59,6 +59,7 @@ pub(crate) mod export_results;
 pub(crate) mod friendly;
 pub(crate) mod tql;
 pub mod view;
+pub mod wire_parse;
 
 use eval::EvalCtx;
 use ir::{Anchor, Attr, CmpOp, Filter, Quant, Query, Rel, SortDir, Source, Value, ViewSettings};
@@ -6712,7 +6713,6 @@ mod tests {
     #[test]
     fn ordered_view_sort_uses_secondary_direction_before_sample_and_keeps_ties() {
         use ir::Field;
-        use std::sync::Arc;
         let blocks = [("a", "Ada"), ("b", "Bo"), ("c", "Bo")]
             .into_iter()
             .map(|(id, owner)| BlockDto {

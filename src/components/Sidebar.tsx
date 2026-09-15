@@ -14,6 +14,7 @@ import { openSwitcher, favorites, favoritesLayout, recentPages, openPageContextM
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, reportGraphOpenFailure, type LoadGraphPathOutcome } from "../graph";
 import { backend, type KnownGraph } from "../backend";
+import { isPublishedExport } from "../publishedBackend";
 import { writeClipboardText } from "../clipboard";
 import { isMobilePlatform } from "../nativeChrome";
 import { allPages as allGraphPages, pageListLabels } from "../pages";
@@ -218,10 +219,13 @@ export function Sidebar(props: {
     <div class="left-sidebar-inner">
       <div class="sidebar-header">
         <div class="app-logo">Tine</div>
-        <GraphSwitcher
-          onActiveNavigationComplete={props.onActiveNavigationComplete}
-          actions={props.graphActions ?? graphNavigationActions}
-        />
+        {/* A published export is one graph with nothing to switch to. */}
+        <Show when={!isPublishedExport()}>
+          <GraphSwitcher
+            onActiveNavigationComplete={props.onActiveNavigationComplete}
+            actions={props.graphActions ?? graphNavigationActions}
+          />
+        </Show>
       </div>
 
       <div class="nav-contents">

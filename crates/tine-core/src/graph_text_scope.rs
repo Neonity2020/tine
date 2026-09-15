@@ -17,7 +17,9 @@ use std::fmt::Write as _;
 use std::str::FromStr;
 
 /// Version bound by later watcher, enrollment, backup, and restore packets.
-pub const GRAPH_TEXT_SCOPE_VERSION: u32 = 1;
+/// 2 (2026-09-14): `published-queries/` — the query-export output tree — became
+/// a fixed exclusion, so no scan admits pages out of an export.
+pub const GRAPH_TEXT_SCOPE_VERSION: u32 = 2;
 pub const GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_HIDDEN_EDN_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_HIDDEN_EDN_ENTRIES: usize = 1024;
@@ -625,6 +627,10 @@ fn fixed_excluded(components: &[&str]) -> bool {
         .any(|component| component.eq_ignore_ascii_case("node_modules"))
         || starts_with(components, &["assets"])
         || starts_with(components, &["publish"])
+        || starts_with(
+            components,
+            &[crate::publish::query_export::PUBLISHED_QUERIES_DIR],
+        )
         || starts_with(components, &[".tine-sync"])
         || starts_with(components, &["logseq", ".recycle"])
         || starts_with(components, &["logseq", "bak"])
@@ -689,6 +695,9 @@ mod tests {
             "logseq/pages-metadata.edn",
             "assets/page.md",
             "publish/page.org",
+            "published-queries/open-tasks/page.md",
+            "published-queries/open-tasks/pages/nested.md",
+            "Published-Queries/x/page.md",
             ".tine-sync/page.md",
             "logseq/.tine-trash/pages/page.md",
             "archive/private/page.md",

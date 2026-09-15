@@ -57,10 +57,14 @@ import type {
   QueryPageScope,
   QueryExportBatch,
   QueryExportSpec,
+  PublishOutcome,
+  QueryPublicationPlan,
+  QueryPublicationRequest,
 } from "./types";
 import { measureIssue248Async } from "./issue248Probe";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
+import { isPublishedExport, publishedBackend } from "./publishedBackend";
 import { recordGraphOpenCommand } from "./graphOpenTrace";
 
 export type ConflictCapsuleAuthority =
@@ -199,12 +203,13 @@ export type BackendErrorKind =
   | "operation-cancelled"
   | "query-not-ready"
   | "query-unavailable"
-  | "query-print-refused";
+  | "query-print-refused"
+  | "published-export-read-only";
 
 const BACKEND_ERROR_MESSAGES: Record<
   Exclude<
     BackendErrorKind,
-    "save-conflict" | "direct-save-failure" | "query-print-refused" | "query-not-ready" | "query-unavailable"
+    "save-conflict" | "direct-save-failure" | "query-print-refused" | "query-not-ready" | "query-unavailable" | "published-export-read-only"
   >,
   string
 > = {
@@ -289,6 +294,17 @@ export class QueryUnavailableError extends BackendError {
   }
 }
 
+/** A published query export (Stage 2) answers reads from its baked snapshot
+ *  and refuses everything that would write, sync, install, or reach the OS.
+ *  Defined here, not in `publishedBackend.ts`, because that module is imported
+ *  by this one: a class it exported would sit in the ES-module cycle's
+ *  temporal dead zone at the moment `backend()` first selects it. */
+export class PublishedExportReadOnlyError extends BackendError {
+  constructor() {
+    super("published-export-read-only", "This is a read-only published export.");
+    this.name = "PublishedExportReadOnlyError";
+  }
+}
 
 export class DirectSaveFailureError extends BackendError {
   constructor(readonly reasonCode: string, readonly ioErrorKind: string) {
@@ -552,6 +568,11 @@ export interface Backend {
   /** Rename a page and update all [[refs]]/#tags across the graph. */
   renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
+  /** Plan a query export: the pages that own the query's results, plus the
+   *  fingerprint the confirm step echoes back. Writes nothing. */
+  publishQueryPlan(request: QueryPublicationRequest): Promise<QueryPublicationPlan>;
+  /** Commit a reviewed query export; refused if the reviewed set moved. */
+  publishQuery(request: QueryPublicationRequest, fingerprint: string): Promise<PublishOutcome>;
   /** Render one page to a self-contained HTML document (assets inlined, no
    *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
    *  the page doesn't exist. */
@@ -1399,6 +1420,12 @@ class TauriBackend implements Backend {
   publishHtml() {
     return this.call<[string, number]>("publish_html");
   }
+  publishQueryPlan(request: QueryPublicationRequest) {
+    return this.call<QueryPublicationPlan>("publish_query_plan", { request });
+  }
+  publishQuery(request: QueryPublicationRequest, fingerprint: string) {
+    return this.call<PublishOutcome>("publish_query", { request, fingerprint });
+  }
   pagePrintHtml(name: string, opts: PrintOpts) {
     return this.call<string>("page_print_html", { name, opts });
   }
@@ -2084,7 +2111,7 @@ let _backend: Backend | null = null;
 
 export function backend(): Backend {
   if (!_backend) {
-    _backend = isTauri() ? new TauriBackend() : mockBackend();
+    _backend = isTauri() ? new TauriBackend() : isPublishedExport() ? publishedBackend() : mockBackend();
   }
   return _backend;
 }

@@ -109,6 +109,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "present_conflict_override",
     "preview_block",
     "publish_html",
+    "publish_query",
+    "publish_query_plan",
     "query_explain_empty",
     "query_facets",
     "query_og_expressible",

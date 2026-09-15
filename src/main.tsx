@@ -6,6 +6,7 @@ import { initParser } from "./render/parse";
 import { applyTheme, applyAccent, pushToast } from "./ui";
 import { startCommunityExtensions } from "./plugins/startup";
 import { isTauri } from "./backend";
+import { isPublishedExport, loadPublishedSnapshot } from "./publishedBackend";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 // Full upstream Inter variable fonts retain OpenType stylistic sets/character
 // variants. Fontsource's per-script static subsets stripped them (GH #298).
@@ -26,6 +27,7 @@ import { installPlatformAttribute } from "./nativeChrome";
 
 installPlatformAttribute();
 installSystemInsetOwner();
+const published = isPublishedExport();
 installEditableEmojiPlatform();
 applyTheme();
 applyAccent();
@@ -52,8 +54,29 @@ async function revealMainWindowAfterStableFrame(): Promise<void> {
   await getCurrentWindow().show();
 }
 
+// A published export (Stage 2) renders nothing without its baked snapshot, so
+// that fetch is the one startup dependency whose failure refuses to mount: the
+// readiness frame stays and says why (typically: opened from file://).
+const SNAPSHOT_REFUSAL = "Couldn't load snapshot.json — serve this folder over HTTP";
+let startupRefusal: string | null = null;
+const publishedSnapshotReady = published
+  ? loadPublishedSnapshot().then(
+      () => undefined,
+      (error) => {
+        console.error("published snapshot unavailable:", error);
+        startupRefusal = SNAPSHOT_REFUSAL;
+      },
+    )
+  : Promise.resolve();
+
 const mount = () => {
   const root = document.getElementById("root")!;
+  if (startupRefusal) {
+    const shell = root.querySelector(".startup-shell span:last-child");
+    if (shell) shell.textContent = startupRefusal;
+    else root.textContent = startupRefusal;
+    return;
+  }
   // index.html owns the immediate, dependency-free readiness frame. Remove it
   // only when Solid is ready to synchronously install the real application.
   root.replaceChildren();
@@ -70,4 +93,5 @@ void Promise.all([
   initParser().catch((e) => console.error("lsdoc-wasm init failed:", e)),
   Promise.race([restoreSession(), new Promise((r) => setTimeout(r, 1500))]),
   communityExtensionsReady,
+  publishedSnapshotReady,
 ]).then(mount, mount);

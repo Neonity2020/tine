@@ -109,6 +109,9 @@ function twemojiAssets(): Plugin {
 
 // Tauri expects a fixed port and serves the built assets from dist/.
 export default defineConfig({
+  // Relative asset URLs: the same `dist/` is served by Tauri at the origin root
+  // and by a published query export from an `app/` subfolder (Stage 2, D3).
+  base: "./",
   plugins: [solid(), twemojiAssets(), retainDiagnosticSourceMaps()],
   define: {
     __BUILD_TIME__: JSON.stringify(BUILD_TIME),

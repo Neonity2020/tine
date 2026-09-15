@@ -1052,17 +1052,6 @@ fn managed_write_identity_mismatch_error() -> io::Error {
     )
 }
 
-/// Refusal for any graph-text write attempted through a read-only view. It is
-/// deliberately a hard error rather than a silent no-op: a caller that reached
-/// here is routed wrongly, and the write it wanted must go through the managed
-/// runtime instead. See [`Graph::derived_read_only`].
-fn derived_read_only_write_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "this graph view is read-only: graph text is owned by Tine-managed storage",
-    )
-}
-
 /// An active managed-text writer admission. Its only job is to keep the graph
 /// handoff mint from observing a false quiescent point.
 struct ManagedTextWritePermit {
@@ -1546,20 +1535,6 @@ impl EditorConflictSite {
 
 pub struct Graph {
     pub root: PathBuf,
-    /// This instance may only ever *read* graph text.
-    ///
-    /// Tine-managed storage keeps the oplog as the sole authority and projects
-    /// it onto the ordinary Markdown/Org tree. Whole-graph reads -- backlinks,
-    /// search, `{{query}}`, aliases -- want that tree, but nothing outside the
-    /// managed runtime may write it, or a write would land behind the oplog's
-    /// back and be reverted (or worse, survive) at the next reconciliation.
-    ///
-    /// Rather than promise per caller that a command only reads, this flag fails
-    /// the *single* graph-text write admission (`admit_managed_text_writer`) and
-    /// the in-root write-containment check closed for the whole instance. Asset
-    /// writes keep their own capability and are deliberately still permitted:
-    /// `assets/` is outside the oplog's document domain.
-    derived_read_only: bool,
     /// Retained no-follow identity of the graph root. Sparse projection writes
     /// fail closed when this capability could not be established at graph open.
     projection_root: Option<Dir>,
@@ -4112,13 +4087,6 @@ impl Graph {
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
-        // Publish writes reach the tree without a graph-text writer permit, so
-        // the read-only view has to refuse them here too. Configuration and the
-        // recoverable trash have their own capabilities below: both are outside
-        // the oplog's document domain and stay writable in a read-only view.
-        if self.derived_read_only {
-            return Err(derived_read_only_write_error());
-        }
         self.ensure_within_graph_root(target)
     }
 
@@ -4214,21 +4182,10 @@ impl Graph {
 
     /// Open a graph directory, reading `logseq/config.edn` if present.
     pub fn open(root: impl AsRef<Path>) -> Graph {
-        Self::open_inner(root, false)
+        Self::open_inner(root)
     }
 
-    /// Open the same directory as a **read-only view of graph text**.
-    ///
-    /// This is what Tine-managed storage hands to whole-graph read commands.
-    /// The projected Markdown/Org tree is the managed runtime's own output, so
-    /// reading it answers backlinks/search/query questions from the oplog's
-    /// materialization -- but this instance can never write graph text back.
-    /// See [`Graph::derived_read_only`].
-    pub fn open_derived_read_only(root: impl AsRef<Path>) -> Graph {
-        Self::open_inner(root, true)
-    }
-
-    fn open_inner(root: impl AsRef<Path>, derived_read_only: bool) -> Graph {
+    fn open_inner(root: impl AsRef<Path>) -> Graph {
         let root = root.as_ref().to_path_buf();
         let projection_root = open_projection_root_nofollow(&root).ok();
         let managed_write_binding =
@@ -4252,7 +4209,6 @@ impl Graph {
         let graph_text_admission_instance = Arc::new(GraphTextAdmissionInstance);
         Graph {
             assets_root: root.join("assets"),
-            derived_read_only,
             projection_root,
             interrupted_publication_claimants: RwLock::new(std::collections::BTreeSet::new()),
             root,
@@ -4307,9 +4263,6 @@ impl Graph {
     /// warm, its exact snapshot is queued; otherwise `install_built` supplies it
     /// when the ordinary background warm completes.
     pub fn attach_direct_projection(&self, path: PathBuf) -> io::Result<()> {
-        if self.derived_read_only {
-            return Ok(());
-        }
         let projection = Arc::new(crate::direct_projection::DirectProjection::start(path)?);
         let mut slot = self.direct_projection.lock().unwrap();
         if slot.is_some() {
@@ -5828,12 +5781,6 @@ impl Graph {
     }
 
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
-        // Every graph-text write in this file passes through here, which is why
-        // the read-only view is enforced at this one point rather than trusted
-        // to each of the ~28 callers.
-        if self.derived_read_only {
-            return Err(derived_read_only_write_error());
-        }
         let binding = self.managed_write_binding()?;
         let mut permit = binding.gate.admit_writer()?;
         if let Err(error) = managed_write_after_admission_hook() {
@@ -20117,7 +20064,7 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
     }
 }
 
-fn page_dto_checked(entry: &PageEntry, doc: &Document) -> io::Result<PageDto> {
+pub(crate) fn page_dto_checked(entry: &PageEntry, doc: &Document) -> io::Result<PageDto> {
     Ok(PageDto {
         activation: None,
         name: entry.name.clone(),

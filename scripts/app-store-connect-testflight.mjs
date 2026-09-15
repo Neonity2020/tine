@@ -151,7 +151,7 @@ function missingReviewContact(detail) {
   ].filter((field) => !attrs[field]);
 }
 
-async function state({ wait = false } = {}) {
+async function state({ wait = false, proveMembership = false } = {}) {
   const appResource = await app();
   const build = await latestBuild(appResource.id, { wait });
   const [localizations, groups, review, submissions] = await Promise.all([
@@ -174,7 +174,30 @@ async function state({ wait = false } = {}) {
       limit: "20",
     }),
   ]);
-  return { appResource, build, localizations, groups, review, submissions };
+  const publicGroup = groups.find(
+    (item) =>
+      !item.attributes.isInternalGroup && item.attributes.name === groupName,
+  );
+  let publicGroupBuildIds = null;
+  if (proveMembership && publicGroup) {
+    const attached = await request(
+      "GET",
+      `/betaGroups/${publicGroup.id}/relationships/builds?${query({ limit: "200" })}`,
+    );
+    if (attached.links?.next) {
+      throw new Error("public beta group build list exceeds one page; cannot prove membership");
+    }
+    publicGroupBuildIds = attached.data.map((item) => item.id);
+  }
+  return {
+    appResource,
+    build,
+    localizations,
+    groups,
+    review,
+    submissions,
+    publicGroupBuildIds,
+  };
 }
 
 function safeSummary(current) {
@@ -191,6 +214,10 @@ function safeSummary(current) {
       ...attributes,
     })),
     groups: current.groups.map(({ id, attributes }) => ({ id, ...attributes })),
+    selectedBuildInPublicBetaGroup:
+      current.publicGroupBuildIds === null
+        ? null
+        : current.publicGroupBuildIds.includes(current.build.id),
     reviewContactComplete: missingReviewContact(current.review).length === 0,
     missingReviewContactFields: missingReviewContact(current.review),
     submissions: current.submissions.map(({ id, attributes }) => ({
@@ -410,7 +437,9 @@ async function publishLink() {
 
 switch (command) {
   case "inspect":
-    console.log(JSON.stringify(safeSummary(await state()), null, 2));
+    console.log(
+      JSON.stringify(safeSummary(await state({ proveMembership: true })), null, 2),
+    );
     break;
   case "prepare":
     await prepare();

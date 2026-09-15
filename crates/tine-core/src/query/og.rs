@@ -625,14 +625,21 @@ impl<'a> OgParse<'a> {
                         span,
                     );
                 }
-                through_page(Filter::rel(
-                    Rel::Props,
-                    Quant::Any,
-                    Filter::and(vec![
-                        Filter::attr(Attr::Key, CmpOp::Eq, Value::text("tags")),
-                        Filter::attr(Attr::AtomCount, CmpOp::Gt, Value::Number { number: 0.0 }),
-                    ]),
-                ))
+                // Use the canonical presence and blank forms: both have a
+                // lossless TQL spelling. A bare `atom_count > 0` has none.
+                // Presence is required because `not(blank)` includes absence.
+                let key = Filter::attr(Attr::Key, CmpOp::Eq, Value::text("tags"));
+                Filter::and(vec![
+                    through_page(Filter::rel(Rel::Props, Quant::Any, key.clone())),
+                    Filter::not(through_page(Filter::rel(
+                        Rel::Props,
+                        Quant::Any,
+                        Filter::and(vec![
+                            key,
+                            Filter::attr(Attr::AtomCount, CmpOp::Eq, Value::Number { number: 0.0 }),
+                        ]),
+                    ))),
+                ])
             }
             // Tine extensions, kept parsing for existing files, never OG-expressible.
             "search" => {
@@ -1175,15 +1182,14 @@ mod tests {
         assert!(!query.is_invalid(), "{:?}", query.diagnostics);
         assert_eq!(query.anchor, Anchor::Page);
         assert_eq!(
-            query.filter,
-            Filter::rel(
-                Rel::Props,
-                Quant::Any,
-                Filter::and(vec![
-                    Filter::attr(Attr::Key, CmpOp::Eq, Value::text("tags")),
-                    Filter::attr(Attr::AtomCount, CmpOp::Gt, Value::Number { number: 0.0 }),
-                ])
+            query.normalized().filter,
+            super::super::tql::parse_tql(
+                "@page and prop('tags') is not null and not prop('tags') = ''",
+                crate::query::registry::Registry::none(),
             )
+            .0
+            .normalized()
+            .filter
         );
     }
 

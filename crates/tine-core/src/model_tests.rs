@@ -1124,190 +1124,6 @@ fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) ->
     ConflictOverride { observation_epoch }
 }
 
-/// The read-only view exists so managed storage can answer whole-graph
-/// questions from its own projected tree. It must answer them -- and it must
-/// not be able to write that tree back, because the oplog owns it.
-#[test]
-fn a_derived_read_only_graph_reads_the_tree_but_cannot_write_it() {
-    let dir = scratch("derived-read-only-graph");
-    fs::write(
-        dir.join("pages/Alpha.md"),
-        "- alpha mentions [[Target]]\n- and again [[Target]]\n",
-    )
-    .unwrap();
-    fs::write(dir.join("pages/Target.md"), "- the target page\n").unwrap();
-
-    let view = Graph::open_derived_read_only(&dir);
-
-    // Reads: the whole point. Backlinks are the query that was dead in
-    // managed mode, so assert that one specifically.
-    let groups = view.backlinks("Target");
-    assert_eq!(
-        groups
-            .iter()
-            .map(|group| group.page.as_str())
-            .collect::<Vec<_>>(),
-        vec!["Alpha"],
-        "the read-only view must resolve backlinks from the projected tree"
-    );
-    assert!(
-        view.list_pages().iter().any(|entry| entry.name == "Alpha"),
-        "the read-only view must enumerate pages"
-    );
-
-    // Writes: refused at the single graph-text admission, whatever the
-    // caller. A command routed here by mistake fails loudly rather than
-    // leaving a file behind the oplog's back.
-    let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
-    let base_rev = page.rev.clone();
-    page.blocks[0].raw = "- alpha edited behind the oplog".into();
-    let refused = view.save_page(&page, base_rev.as_deref()).unwrap_err();
-    assert_eq!(
-        refused.kind(),
-        io::ErrorKind::PermissionDenied,
-        "a graph-text write through the read-only view must be refused: {refused}"
-    );
-    assert_eq!(
-        fs::read_to_string(dir.join("pages/Alpha.md")).unwrap(),
-        "- alpha mentions [[Target]]\n- and again [[Target]]\n",
-        "the refused save must not have touched the file"
-    );
-
-    // Control: the same directory opened normally still saves, so the test
-    // proves the flag and not some unrelated breakage in the fixture.
-    let writable = Graph::open(&dir);
-    let mut page = writable.load_by_path("pages/Alpha.md").unwrap().unwrap();
-    let base_rev = page.rev.clone();
-    page.blocks[0].raw = "- alpha edited by the owner".into();
-    writable
-        .save_page(&page, base_rev.as_deref())
-        .expect("an ordinary graph still writes");
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// `assets/` is outside the oplog's document domain, so importing an image
-/// while managed storage owns graph text must keep working.
-#[test]
-fn a_derived_read_only_graph_still_accepts_asset_writes() {
-    let dir = scratch("derived-read-only-assets");
-    let source = dir.join("incoming.png");
-    fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
-
-    let view = Graph::open_derived_read_only(&dir);
-    let stored = view
-        .import_asset(&source, Some("picture.png"))
-        .expect("asset writes are outside the graph-text boundary");
-    assert!(
-        dir.join("assets").join(&stored).exists(),
-        "the imported asset must land in assets/"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// Every Settings toggle writes `logseq/config.edn`, and configuration is
-/// **not** oplog-owned: the managed scanner classifies it
-/// `GraphTextScanPathClass::Configuration` and the baseline adapter drops
-/// those rows as "not managed content", so no managed path, import or
-/// projection ever covers it. Persisting a setting must therefore keep
-/// working while managed storage owns graph text.
-#[test]
-fn a_derived_read_only_graph_still_writes_graph_configuration() {
-    let dir = scratch("derived-read-only-config");
-    let view = Graph::open_derived_read_only(&dir);
-
-    view.set_favorites(&["Alpha".to_owned(), "Beta".to_owned()])
-        .expect("configuration is outside the graph-text boundary");
-    view.set_start_of_week(3)
-        .expect("configuration is outside the graph-text boundary");
-
-    let written = fs::read_to_string(dir.join("logseq/config.edn"))
-        .expect("the setting must have been persisted");
-    assert!(
-        written.contains(":favorites [\"Alpha\" \"Beta\"]"),
-        "favorites must round-trip into config.edn: {written}"
-    );
-    assert!(
-        written.contains(":start-of-week 3"),
-        "start of week must round-trip into config.edn: {written}"
-    );
-
-    // The same view still cannot touch graph text, so the config capability
-    // did not widen into the oplog's domain.
-    fs::write(dir.join("pages/Alpha.md"), "- alpha\n").unwrap();
-    let view = Graph::open_derived_read_only(&dir);
-    let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
-    let base_rev = page.rev.clone();
-    page.blocks[0].raw = "- alpha edited behind the oplog".into();
-    assert_eq!(
-        view.save_page(&page, base_rev.as_deref())
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::PermissionDenied,
-        "a config write must not have widened the graph-text boundary"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// `logseq/.tine-trash` sits next to `assets`, `publish` and `.tine-sync` in
-/// `graph_text_scope::fixed_excluded`, so nothing under it is scanned,
-/// imported or projected. Trashing an orphaned asset is an asset-side write
-/// into that tree and must stay available under managed storage; trashing a
-/// recognized sync-conflict copy is likewise outside graph discovery and can
-/// be discarded into that tree; trashing a journal file is a graph-text
-/// deletion and must not.
-#[test]
-fn a_derived_read_only_graph_trashes_assets_but_not_journals() {
-    let dir = scratch("derived-read-only-trash");
-    fs::create_dir_all(dir.join("assets")).unwrap();
-    fs::write(dir.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
-    fs::write(dir.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
-    let conflict = "Alpha.sync-conflict-20260810-120000-DEVICE.md";
-    fs::write(dir.join("pages").join(conflict), "- conflict evidence\n").unwrap();
-
-    let view = Graph::open_derived_read_only(&dir);
-
-    view.trash_asset("orphan.png")
-        .expect("the trash tree is outside the graph-text boundary");
-    assert!(
-        !dir.join("assets/orphan.png").exists(),
-        "the orphaned asset must have left assets/"
-    );
-    assert_eq!(
-        view.asset_trash_stats().count,
-        1,
-        "the orphaned asset must be recoverable from the trash"
-    );
-
-    let removed = view
-        .empty_asset_trash()
-        .expect("emptying the asset trash is an asset-side write");
-    assert_eq!(removed, 1, "the emptied entry must be counted");
-
-    let conflict_path = format!("pages/{conflict}");
-    view.trash_sync_conflict(&conflict_path)
-        .expect("a conflict copy is excluded from the graph-text domain");
-    assert!(!dir.join("pages").join(conflict).exists());
-    assert_eq!(view.asset_trash_stats().conflicts, 1);
-
-    // A journal file is graph text. Its deletion belongs to the oplog and
-    // stays refused at the single graph-text admission.
-    let refused = view.trash_journal_file("2026_08_07.md").unwrap_err();
-    assert_eq!(
-        refused.kind(),
-        io::ErrorKind::PermissionDenied,
-        "a journal deletion must stay refused under managed storage: {refused}"
-    );
-    assert!(
-        dir.join("journals/2026_08_07.md").exists(),
-        "the refused journal deletion must not have touched the file"
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn external_document_admission_reuses_the_retained_parse() {
     let dir = scratch("external-admission-parse-count");
@@ -10252,18 +10068,27 @@ fn direct_query_bench_sample(graph: &Graph, query: &str) -> Duration {
     started.elapsed()
 }
 
+fn direct_query_bench_ready_sample(graph: &Graph, query: &str) -> Duration {
+    let started = Instant::now();
+    let answer = graph
+        .run_query_bounded(query, 20_000, 32 * 1024 * 1024)
+        .expect("a ready Direct projection must answer the benchmark query");
+    std::hint::black_box((answer.total, answer.exceeded));
+    started.elapsed()
+}
+
 fn direct_query_bench_report(
     class: &str,
     phase: &str,
     samples: &mut [Duration],
     pages: usize,
     blocks: usize,
-    indexed_reads: u64,
+    statement_reads: u64,
 ) {
     samples.sort();
     let ms = |duration: Duration| duration.as_secs_f64() * 1_000.0;
     println!(
-        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} indexed_reads={indexed_reads}",
+        "b4_query class={class} phase={phase} median_ms={:.6} p95_ms={:.6} max_ms={:.6} rounds={} pages={pages} blocks={blocks} statement_reads={statement_reads}",
         ms(samples[samples.len() / 2]),
         ms(samples[samples.len() * 95 / 100]),
         ms(samples[samples.len() - 1]),
@@ -10319,13 +10144,24 @@ fn direct_query_latency_manual_benchmark() {
     ];
     let mut serial = 0;
     for (class, query) in classes {
-        std::hint::black_box(graph.run_query_bounded(query, 20_000, 32 * 1024 * 1024));
+        direct_query_bench_ready_sample(&graph, query);
+        let repeated_statements_before = graph.direct_projection_statement_reads_test();
         let mut repeated = (0..rounds)
-            .map(|_| direct_query_bench_sample(&graph, query))
+            .map(|_| direct_query_bench_ready_sample(&graph, query))
             .collect::<Vec<_>>();
-        direct_query_bench_report(class, "repeat", &mut repeated, pages, blocks, 0);
+        let repeated_statement_reads = graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(repeated_statements_before);
+        direct_query_bench_report(
+            class,
+            "repeat",
+            &mut repeated,
+            pages,
+            blocks,
+            repeated_statement_reads,
+        );
 
-        let indexed_before = graph.direct_projection_indexed_reads_test();
+        let statements_before = graph.direct_projection_statement_reads_test();
         let mut invalidated = Vec::with_capacity(rounds);
         for sample in 0..rounds {
             serial += 1;
@@ -10333,11 +10169,11 @@ fn direct_query_latency_manual_benchmark() {
             wait_for_direct_query_projection(&graph);
             graph.reset_direct_projection_candidate_probe_test();
             let fallback_before = graph.direct_projection_fallback_reads_test();
-            let candidate_before = graph.direct_projection_indexed_reads_test();
-            let elapsed = direct_query_bench_sample(&graph, query);
-            let candidate_queries_completed = graph
-                .direct_projection_indexed_reads_test()
-                .saturating_sub(candidate_before);
+            let statement_before = graph.direct_projection_statement_reads_test();
+            let elapsed = direct_query_bench_ready_sample(&graph, query);
+            let statement_queries_completed = graph
+                .direct_projection_statement_reads_test()
+                .saturating_sub(statement_before);
             let fallback_reads = graph
                 .direct_projection_fallback_reads_test()
                 .saturating_sub(fallback_before);
@@ -10347,29 +10183,29 @@ fn direct_query_latency_manual_benchmark() {
             // query still materializes.
             let evaluated_pages = graph.direct_projection_hydrated_pages_test().len();
             println!(
-                "b4_query_sample class={class} run={} sample={} candidateQueriesCompleted={candidate_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
+                "b4_query_sample class={class} run={} sample={} statementQueriesCompleted={statement_queries_completed} fallbackReads={fallback_reads} fullGraphEvaluations={full_graph_evaluations} evaluatedPages={evaluated_pages} medianMs={:.6}",
                 std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
                 sample + 1,
                 elapsed.as_secs_f64() * 1_000.0,
             );
             invalidated.push(elapsed);
         }
-        let indexed_reads = graph
-            .direct_projection_indexed_reads_test()
-            .saturating_sub(indexed_before);
+        let statement_reads = graph
+            .direct_projection_statement_reads_test()
+            .saturating_sub(statements_before);
         direct_query_bench_report(
             class,
             "invalidated_ready",
             &mut invalidated,
             pages,
             blocks,
-            indexed_reads,
+            statement_reads,
         );
     }
 
     let mut ready_hits = 0_usize;
     let mut ready_misses = 0_usize;
-    let indexed_before = graph.direct_projection_indexed_reads_test();
+    let statements_before = graph.direct_projection_statement_reads_test();
     let mut immediate = Vec::with_capacity(rounds);
     for save in 0..rounds {
         serial += 1;
@@ -10387,7 +10223,7 @@ fn direct_query_latency_manual_benchmark() {
         let ready_latency_ms = readiness_started.elapsed().as_secs_f64() * 1_000.0;
         let oracle =
             crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 * 1024 * 1024);
-        let candidate_before = graph.direct_projection_indexed_reads_test();
+        let statement_before = graph.direct_projection_statement_reads_test();
         let fallback_before = graph.direct_projection_fallback_reads_test();
         let actual = graph
             .run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024)
@@ -10396,26 +10232,26 @@ fn direct_query_latency_manual_benchmark() {
             && serde_json::to_vec(actual.groups.as_ref()).unwrap()
                 == serde_json::to_vec(&oracle.groups).unwrap();
         println!(
-            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete candidate_reads={} fallback_reads={} oracle_equal={oracle_equal}",
+            "b4_readiness save={}-{} generation={generation} immediate_ready={immediate_ready} ready_latency_ms={ready_latency_ms:.6} terminal_event=worker_apply_complete statement_reads={} fallback_reads={} oracle_equal={oracle_equal}",
             std::env::var("TINE_B4_QUERY_BENCH_RUN").unwrap_or_else(|_| "1".into()),
             save + 1,
-            graph.direct_projection_indexed_reads_test().saturating_sub(candidate_before),
+            graph.direct_projection_statement_reads_test().saturating_sub(statement_before),
             graph.direct_projection_fallback_reads_test().saturating_sub(fallback_before),
         );
     }
-    let indexed_reads = graph
-        .direct_projection_indexed_reads_test()
-        .saturating_sub(indexed_before);
+    let statement_reads = graph
+        .direct_projection_statement_reads_test()
+        .saturating_sub(statements_before);
     direct_query_bench_report(
         "sparse_task",
         "data_rev_immediate",
         &mut immediate,
         pages,
         blocks,
-        indexed_reads,
+        statement_reads,
     );
     println!(
-        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} indexed_reads={indexed_reads}",
+        "b4_projection_hit_rate samples={} ready_hits={ready_hits} ready_misses={ready_misses} statement_reads={statement_reads}",
         ready_hits + ready_misses,
     );
 
@@ -10834,6 +10670,7 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     for refused in [
         "assets/note.md",
         "publish/note.md",
+        "published-queries/open-tasks/pages/note.md",
         ".tine-sync/note.md",
         "logseq/bak/pages/note.md",
         "logseq/version-files/note.md",
@@ -10954,6 +10791,7 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
     for refused in [
         "assets/note.md",
         "publish/note.md",
+        "published-queries/open-tasks/pages/note.md",
         ".tine-sync/note.md",
         "logseq/.recycle/note.md",
         "logseq/bak/pages/note.md",
@@ -11891,6 +11729,44 @@ fn checked_open_and_resolve_reject_symlink_escape() {
     assert!(g.resolve_rel("pages/escape/foreign.md").is_none());
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_dir_all(&outside);
+}
+
+/// A query export is a copy of graph pages living under the graph root, so the
+/// scanner must never read it back as pages: an exported `Secret.md` would
+/// otherwise reappear as a twin of its own source (and leak into a later
+/// export). The fixed exclusion lives in `graph_text_scope::fixed_excluded`.
+#[test]
+fn published_queries_output_never_becomes_pages() {
+    let dir = scratch("published-queries-excluded");
+    fs::write(dir.join("pages/Secret.md"), "- real-page\n").unwrap();
+    fs::create_dir_all(dir.join("published-queries/open-tasks/pages")).unwrap();
+    fs::write(
+        dir.join("published-queries/open-tasks/pages/Secret.md"),
+        "- exported-copy\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("published-queries/open-tasks/Loose Page.md"),
+        "- exported-loose\n",
+    )
+    .unwrap();
+    let g = Graph::open(&dir);
+    let pages = g.list_pages();
+    assert_eq!(
+        pages.iter().filter(|p| p.name == "Secret").count(),
+        1,
+        "{pages:?}"
+    );
+    assert!(
+        pages
+            .iter()
+            .all(|p| !p.rel_path.starts_with("published-queries/")),
+        "{pages:?}"
+    );
+    assert!(g
+        .resolve_rel("published-queries/open-tasks/pages/Secret.md")
+        .is_none());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]

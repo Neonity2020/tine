@@ -12,6 +12,7 @@ import {
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
+import { isPublishedExport } from "../publishedBackend";
 import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename, renameOrMergePage } from "../graph";
 import { Block, OutlineScopeContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
@@ -124,7 +125,9 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false, rol
     // otherwise the intentionally reactive pending-retry effect observes the
     // old true value during that store write and starts a duplicate restart.
     pendingFeedRestart = false;
-    const installed = await loadFeed(withToday(response.pages), {
+    // A published export's feed is the baked journals only: there is no file to
+    // create lazily, so no empty "today" is prepended.
+    const installed = await loadFeed(isPublishedExport() ? response.pages : withToday(response.pages), {
       endEdit: false,
       expectedGraphBinding: owner.graphBinding,
       preserveExisting: rollover,
@@ -567,7 +570,7 @@ export function PageView(): JSX.Element {
                 {/* Agenda sits at the bottom of today's (the first) day, like OG.
                     Window is configurable (Settings → Journal) and keyed off the
                     item's scheduled/deadline date over the whole graph. */}
-                <Show when={i() === 0 && currentRoute().kind === "journals"}>
+                <Show when={i() === 0 && currentRoute().kind === "journals" && !isPublishedExport()}>
                   <div class="agenda-block">
                     <QueryMacro
                       body={agendaQuery()}
@@ -952,6 +955,7 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
           >
             <span aria-hidden="true">⋯</span>
           </button>
+          <Show when={!isPublishedExport()}>
           <button
             class="fav-star"
             classList={{ active: isFavorite(props.page.name) }}
@@ -968,6 +972,7 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
               />
             </svg>
           </button>
+          </Show>
           </Show>
         </div>
       </div>
@@ -1002,7 +1007,7 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
           </button>
         </div>
       </Show>
-      <Show when={props.page.readOnly && !props.page.guide}>
+      <Show when={props.page.readOnly && !props.page.guide && !isPublishedExport()}>
         <div class="page-readonly-banner" title="Tine can't reproduce this .org file byte-for-byte, so it's shown read-only to avoid corrupting it. Edit it in Logseq/Emacs.">
           Read-only — this <code>.org</code> file uses a structure Tine can't safely
           round-trip yet, so it won't be edited here.

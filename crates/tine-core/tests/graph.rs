@@ -182,7 +182,7 @@ fn graph_text_scope_discovers_all_formats_titles_dates_and_applies_exclusions() 
     }
 
     let graph = Graph::open(&root);
-    assert_eq!(graph.graph_text_scope_version(), 1);
+    assert_eq!(graph.graph_text_scope_version(), 2);
     let pages = graph.list_pages();
     let paths = pages
         .iter()

@@ -2258,7 +2258,7 @@ impl Compiler<'_> {
             };
         };
 
-        // `= ''` and `all-page-tags`'s `atom_count > 0` are properties of the
+        // Cardinality tests such as `= ''` are properties of the
         // whole atom list, not of one atom, and are scoped by presence.
         if let Some(count) = self.atom_count_test(&test, &owner, &key_literal, &owner_type_literal)
         {

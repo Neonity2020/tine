@@ -656,6 +656,11 @@ mod tests {
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("Retry saving"));
+        // Query export: the whole-page consequence and the size limit must be
+        // in the Guide, because the dialog's one checkbox is all the UI says.
+        assert!(page.markdown.contains("published-queries/<name>/"));
+        assert!(page.markdown.contains("exports **whole pages**"));
+        assert!(page.markdown.contains("Query export size limit"));
         assert!(page.markdown.contains("Copy complete recovery data"));
         assert!(page.markdown.contains("Try opening again"));
 

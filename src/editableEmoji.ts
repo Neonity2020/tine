@@ -1,4 +1,9 @@
-export type EditableEmojiPlatform = "windows" | "apple" | "android" | "safe-monochrome";
+import { isPublishedExport } from "./publishedBackend";
+
+/** `published` is a query export opened in an ordinary browser (Stage 2): its
+ *  bundle ships no Twemoji SVGs, so display and editing both use the browser's
+ *  own emoji face. */
+export type EditableEmojiPlatform = "windows" | "apple" | "android" | "safe-monochrome" | "published";
 
 export function editableEmojiPlatform(userAgent: string): EditableEmojiPlatform {
   if (/Android/i.test(userAgent)) return "android";
@@ -10,7 +15,7 @@ export function editableEmojiPlatform(userAgent: string): EditableEmojiPlatform 
 /** Select the emoji policy before first paint. Windows and Apple display
  * surfaces share the editable font; other platforms retain Twemoji display. */
 export function installEditableEmojiPlatform(userAgent = navigator.userAgent): EditableEmojiPlatform {
-  const platform = editableEmojiPlatform(userAgent);
+  const platform = isPublishedExport() ? "published" : editableEmojiPlatform(userAgent);
   document.documentElement.dataset.editableEmoji = platform;
   return platform;
 }
@@ -19,5 +24,5 @@ export function installEditableEmojiPlatform(userAgent = navigator.userAgent): E
  * An absent/unknown policy must retain the crash-safe SVG display path. */
 export function usesNativeEmojiDisplay(): boolean {
   const platform = document.documentElement.dataset.editableEmoji;
-  return platform === "windows" || platform === "apple";
+  return platform === "windows" || platform === "apple" || platform === "published";
 }

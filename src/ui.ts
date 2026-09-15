@@ -1,6 +1,7 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createMemo, createSignal, useContext } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
+import { isPublishedExport } from "./publishedBackend";
 import { graphBinding } from "./persistence";
 import type {
   ConflictObject,
@@ -131,7 +132,7 @@ export const [workflow, setWorkflow] = createSignal<"now" | "todo">("now");
 /** Set the workflow and persist it to config.edn (graph-portable, like Logseq).
  *  The signal is the runtime source of truth; the file is re-read on next open. */
 export function changeWorkflow(wf: "now" | "todo") {
-  if (wf === workflow()) return;
+  if (wf === workflow() || isPublishedExport()) return;
   setWorkflow(wf);
   void backend().setPreferredWorkflow(wf).catch(() => {});
 }
@@ -145,6 +146,7 @@ export function logbookWithSecondSupport(): boolean {
 }
 
 export function changeTimetrackingEnabled(enabled: boolean) {
+  if (isPublishedExport()) return;
   const m = graphMeta();
   if (m && m.enable_timetracking === enabled) return;
   if (m) setGraphMeta({ ...m, enable_timetracking: enabled });
@@ -156,6 +158,7 @@ export function showBrackets(): boolean {
 }
 
 export function changeShowBrackets(on: boolean) {
+  if (isPublishedExport()) return;
   const m = graphMeta();
   if (m && m.show_brackets === on) return;
   if (m) setGraphMeta({ ...m, show_brackets: on });
@@ -1268,6 +1271,9 @@ export const favoritesLayout = createMemo(() =>
   reconcileLayout(storedFavoritesLayout(), favorites().map((f) => f.name))
 );
 export function toggleFavorite(name: string, kind: "page" | "journal" = "page") {
+  // A published export has no favorites to keep: the star is not rendered
+  // and a shortcut must not change the sidebar away from the snapshot.
+  if (isPublishedExport()) return;
   const f = favorites();
   const target = favoriteKey(name, kind);
   const matches = (item: FavItem) => favoriteKey(item.name, item.kind) === target;
@@ -2048,6 +2054,9 @@ export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [graphTransitioning, setGraphTransitioning] = createSignal(false);
 export const [settingsTabRequest, setSettingsTabRequest] = createSignal<SettingsTabId | null>(null);
 export function openSettings(tab?: SettingsTabId) {
+  // Settings is where the graph, storage, plugins and preferences are
+  // changed; a published export changes none of them (spec §5).
+  if (isPublishedExport()) return;
   if (tab) setSettingsTabRequest(tab);
   setSettingsOpen(true);
 }
@@ -2174,6 +2183,17 @@ export function openPdfExport(name: string) {
 }
 export function closePdfExport() {
   setPdfExportPage(null);
+}
+
+// "Export query results…": the query surface hands over exactly what it
+// executed; the dialog plans, shows the page set, and confirms. One at a time.
+export const [queryExportRequest, setQueryExportRequest] =
+  createSignal<import("./types").QueryPublicationRequest | null>(null);
+export function openQueryExport(request: import("./types").QueryPublicationRequest) {
+  setQueryExportRequest(request);
+}
+export function closeQueryExport() {
+  setQueryExportRequest(null);
 }
 
 // The PDF currently open in the side pane. `filename` is the stable resource

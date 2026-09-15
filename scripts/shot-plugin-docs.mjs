@@ -119,6 +119,48 @@ try {
   page.on("pageerror", (error) => errors.push(String(error)));
   page.on("console", (message) => message.type() === "error" && errors.push(`console: ${message.text()}`));
 
+  // The browser preview deliberately has no query engine. Give this plugin
+  // journey fixed engine answers through the existing mock-only data seam, so
+  // it can prove a completed row exists and that the plugin actually hides it.
+  await page.addInitScript(() => {
+    const text = (value) => ({ kind: "text", text: value });
+    globalThis.__tineMockQueryFixture = {
+      parse: {
+        query: {
+          anchor: "block",
+          filter: {
+            kind: "leaf",
+            leaf: {
+              kind: "attr",
+              attr: "task",
+              op: "in",
+              value: { kind: "list", items: [text("TODO"), text("DOING"), text("DONE")] },
+            },
+          },
+          diagnostics: [],
+          source: { kind: "og", original: "(todo TODO DOING DONE)", og_options: "" },
+        },
+        view: { view: "table" },
+      },
+      run: {
+        anchor: "block",
+        groups: [{
+          page: "Plugin tasks",
+          kind: "page",
+          blocks: [
+            { id: "plugin-todo", raw: "TODO Open task", collapsed: false, children: [], marker: "TODO" },
+            { id: "plugin-done", raw: "DONE Closed task", collapsed: false, children: [], marker: "DONE" },
+          ],
+        }],
+        diagnostics: [],
+        report: { ran: ["task"], ignored: [], supported: true },
+        total: 2,
+        matched_total: 2,
+        exceeded: false,
+      },
+    };
+  });
+
   await page.goto(url);
   await page.waitForSelector(".page-title");
   await dismissInitialMobileDrawer(page);
@@ -144,17 +186,12 @@ try {
   await queryBlock.locator(".block-content").first().click({ position: { x: 24, y: 10 } });
   const editor = page.locator("textarea.block-editor");
   await editor.waitFor();
-  await editor.fill(
-    PLATFORM === "desktop"
-      ? "Tasks\n{{query (todo TODO DOING DONE)}}"
-      : "Tasks\n{{query (todo TODO DOING DONE)}}\ntine.view:: table",
-  );
+  await editor.fill("Tasks\n{{query (todo TODO DOING DONE)}}\ntine.view:: table");
   await page.keyboard.press("Escape");
   await editor.waitFor({ state: "detached" });
-  if (PLATFORM === "desktop") {
-    await tasksBlock.getByRole("button", { name: "Table", exact: true }).click();
-  }
   await page.locator(".sheet-table").waitFor();
+  const initialClosedCells = tasksBlock.locator(".sheet-table .sheet-cell").filter({ hasText: /^(?:DONE|CANCELED|CANCELLED)$/ });
+  if (!(await initialClosedCells.count())) throw new Error("canned query result did not expose a completed row before filtering");
   await tasksBlock.locator(".block-content").first().click({ position: { x: 24, y: 10 } });
   const tableEditor = page.locator("textarea.block-editor");
   await tableEditor.waitFor();

@@ -311,6 +311,27 @@ fn build_slug_map(names: &[&str]) -> (SlugMap, Vec<(String, String, String)>) {
 /// source of truth). Falls back to a raw `slug()` for a name not in the map — a
 /// reference to a page that isn't being exported (its link is dead either way),
 /// or the single-page print export (`ctx.slugs == None`, no cross-page files).
+enum ExportAssetUrl {
+    Keep(String),
+    Omitted,
+}
+
+/// Route a safe local URL through the export's asset sink when there is one:
+/// a copied asset gets its in-export URL, an omitted one is reported, and
+/// anything that is not a local asset reference passes through unchanged.
+fn export_asset_url(ctx: &Ctx, url: &str) -> ExportAssetUrl {
+    let Some(sink) = ctx.asset_sink else {
+        return ExportAssetUrl::Keep(url.to_string());
+    };
+    if AssetSink::asset_relative(url).is_none() {
+        return ExportAssetUrl::Keep(url.to_string());
+    }
+    match sink.borrow_mut().copy(url) {
+        Some(published) => ExportAssetUrl::Keep(published),
+        None => ExportAssetUrl::Omitted,
+    }
+}
+
 fn page_slug(ctx: &Ctx, name: &str) -> String {
     ctx.slugs
         .and_then(|m| m.get(&name.to_lowercase()))
@@ -696,20 +717,34 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
 
         if name == "a" && has_class(inner, "page-ref") {
             if let Some(page) = tag_attr(inner, "data-page") {
-                out.push_str(&format!(
-                    "<a class=\"ref\" href=\"{}.html\">",
-                    page_slug(ctx, &unescape(page))
-                ));
+                let page = unescape(page);
+                if ctx.inert_outside_links && !publish_page_allowed(ctx, &page) {
+                    // Outside the exported set: keep the authored text, drop the
+                    // destination (there is no file to point at).
+                    out.push_str("<span class=\"ref ref-outside\">");
+                    inert_link_closures += 1;
+                } else {
+                    out.push_str(&format!(
+                        "<a class=\"ref\" href=\"{}.html\">",
+                        page_slug(ctx, &page)
+                    ));
+                }
                 strip_brackets = true;
                 continue;
             }
         }
         if name == "a" && has_class(inner, "tag") {
             if let Some(page) = tag_attr(inner, "data-page") {
-                out.push_str(&format!(
-                    "<a class=\"tag\" href=\"{}.html\">",
-                    page_slug(ctx, &unescape(page))
-                ));
+                let page = unescape(page);
+                if ctx.inert_outside_links && !publish_page_allowed(ctx, &page) {
+                    out.push_str("<span class=\"tag tag-outside\">");
+                    inert_link_closures += 1;
+                } else {
+                    out.push_str(&format!(
+                        "<a class=\"tag\" href=\"{}.html\">",
+                        page_slug(ctx, &page)
+                    ));
+                }
                 continue;
             }
         }
@@ -791,11 +826,16 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
                         );
                     }
                 } else if let Some(src) = safe_media_url(&src) {
-                    out.push_str(&format!(
-                        "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
-                        esc_attr(&src),
-                        esc_attr(&alt)
-                    ));
+                    match export_asset_url(ctx, src) {
+                        ExportAssetUrl::Keep(src) => out.push_str(&format!(
+                            "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
+                            esc_attr(&src),
+                            esc_attr(&alt)
+                        )),
+                        ExportAssetUrl::Omitted => out.push_str(
+                            "<span class=\"asset-omitted\">[Image omitted: unavailable or over the export size limit]</span>",
+                        ),
+                    }
                 } else {
                     out.push_str("<span class=\"unsafe-link\">[Unsafe image URL omitted]</span>");
                 }
@@ -807,10 +847,15 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
                 let _ = take_to_close(html, &mut i, name); // empty element
                 let src = unescape(asset);
                 if let Some(src) = safe_media_url(&src) {
-                    out.push_str(&format!(
-                        "<{name} class=\"media-embed\" controls src=\"{}\"></{name}>",
-                        esc_attr(src)
-                    ));
+                    match export_asset_url(ctx, src) {
+                        ExportAssetUrl::Keep(src) => out.push_str(&format!(
+                            "<{name} class=\"media-embed\" controls src=\"{}\"></{name}>",
+                            esc_attr(&src)
+                        )),
+                        ExportAssetUrl::Omitted => out.push_str(
+                            "<span class=\"asset-omitted\">[Media omitted: unavailable or over the export size limit]</span>",
+                        ),
+                    }
                 } else {
                     out.push_str("<span class=\"unsafe-link\">[Unsafe media URL omitted]</span>");
                 }
@@ -820,9 +865,29 @@ fn decorate_source(html: &str, raw: Option<&str>, ctx: &Ctx, depth: u8) -> Strin
         if name == "a" {
             if let Some(href) = tag_attr(inner, "href").map(unescape) {
                 if safe_export_url(&href).is_some() {
-                    out.push('<');
-                    out.push_str(inner);
-                    out.push('>');
+                    match export_asset_url(ctx, &href) {
+                        ExportAssetUrl::Keep(rewritten) if rewritten != href => {
+                            // Re-emit the tag with the copied asset's URL; every
+                            // other attribute stays as lsdoc rendered it.
+                            let rebuilt = inner.replacen(
+                                &format!("href=\"{}\"", esc_attr(&href)),
+                                &format!("href=\"{}\"", esc_attr(&rewritten)),
+                                1,
+                            );
+                            out.push('<');
+                            out.push_str(&rebuilt);
+                            out.push('>');
+                        }
+                        ExportAssetUrl::Keep(_) => {
+                            out.push('<');
+                            out.push_str(inner);
+                            out.push('>');
+                        }
+                        ExportAssetUrl::Omitted => {
+                            out.push_str("<span class=\"asset-omitted\">");
+                            inert_link_closures += 1;
+                        }
+                    }
                 } else {
                     out.push_str("<span class=\"unsafe-link\">");
                     inert_link_closures += 1;
@@ -1285,6 +1350,224 @@ struct Ctx<'a> {
     /// Exact captured physical-path capabilities for `@page` rows. A page row
     /// must agree on path, title and kind before it may become a public link.
     page_links: Option<&'a HashMap<String, PublicationPageLink>>,
+    /// A query export is a closed set chosen by the user: a `[[page]]` or `#tag`
+    /// whose target is outside it renders as inert text instead of a dangling
+    /// `<a href>` to a file that was never written. The graph site (`publish/`)
+    /// keeps its historical dangling links (`false`); changing that is a
+    /// separate contract, not a side effect of this flag.
+    inert_outside_links: bool,
+    /// A query export is a movable folder: every referenced local asset is
+    /// copied into `<leaf>/assets/` and the link rewritten, through this sink.
+    /// `None` keeps the graph site's `../assets/<file>` links.
+    asset_sink: Option<&'a RefCell<AssetSink<'a>>>,
+    /// Query exports only (Stage 2): where the renderer is, so each query
+    /// runs exactly as the app will ask for it (its page as `current page`,
+    /// its host block's `tine.*` properties merged into the view).
+    scope: Option<&'a RefCell<app_export::RenderScope>>,
+    /// Query exports with an app: every executed query, keyed as the app asks.
+    recorder: Option<&'a RefCell<app_export::QueryRecorder>>,
+}
+
+/// One export's asset copier: bounded reads from the ORIGINAL graph's
+/// `assets/`, one copy per referenced file, under ONE user-adjustable byte
+/// budget. A missing or unreadable asset is omitted with a warning; an asset
+/// that would take the export over budget FAILS the export (Martin,
+/// 2026-09-14: a silently partial export is worse than a refusal that names
+/// the limit and where to raise it).
+struct AssetSink<'a> {
+    source_root: &'a Path,
+    stage: &'a PublishStage,
+    /// Authored asset path → published relative URL.
+    copied: HashMap<String, String>,
+    budget: u64,
+    remaining: u64,
+    warnings: Vec<String>,
+    /// Set once an asset did not fit; the export is then refused after render.
+    over_budget: Option<String>,
+}
+
+/// The default byte budget for one query export's copied assets (Settings →
+/// Graph → "Query export size limit" overrides it per device).
+pub const QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The export's copied assets would exceed the budget; carried inside the
+/// `io::Error` so the query-export layer can hand the user a typed refusal
+/// with the message intact.
+#[derive(Debug)]
+pub struct AssetBudgetExceeded(pub String);
+
+impl std::fmt::Display for AssetBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssetBudgetExceeded {}
+
+fn format_mib(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    if mib >= 100.0 {
+        format!("{mib:.0} MiB")
+    } else {
+        format!("{mib:.1} MiB")
+    }
+}
+
+impl AssetSink<'_> {
+    /// The graph-relative `assets/…` path an authored reference names, or
+    /// `None` for remote/data/unsafe/non-asset references.
+    fn asset_relative(src: &str) -> Option<String> {
+        if src.contains("://") || src.starts_with("data:") || src.contains('\\') {
+            return None;
+        }
+        let trimmed = src.trim_start_matches("./");
+        let rel = trimmed
+            .strip_prefix("../assets/")
+            .or_else(|| trimmed.strip_prefix("assets/"))?;
+        let rel = rel.split(['?', '#']).next().unwrap_or(rel);
+        if rel.is_empty()
+            || Path::new(rel)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        Some(rel.to_string())
+    }
+
+    /// Copy `src` into the stage once; returns the published relative URL, or
+    /// `None` when the asset is missing (warning recorded) or would break the
+    /// budget (the export is refused once rendering finishes).
+    fn copy(&mut self, src: &str) -> Option<String> {
+        let rel = Self::asset_relative(src)?;
+        if let Some(published) = self.copied.get(&rel) {
+            return Some(published.clone());
+        }
+        if self.over_budget.is_some() {
+            return None;
+        }
+        let published = format!("assets/{rel}");
+        let path = self.source_root.join("assets").join(&rel);
+        let len = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => {
+                self.warnings
+                    .push(format!("Asset {rel} was omitted: not a regular file."));
+                return None;
+            }
+            Err(error) => {
+                self.warnings
+                    .push(format!("Asset {rel} was omitted: {error}"));
+                return None;
+            }
+        };
+        if len > self.remaining {
+            self.over_budget = Some(format!(
+                "Export stopped: copying {rel} ({}) would take the export's assets past the {} limit \
+                 ({} already copied). Raise \"Query export size limit\" in Settings → Graph, or \
+                 take the asset off the exported pages.",
+                format_mib(len),
+                format_mib(self.budget),
+                format_mib(self.budget - self.remaining),
+            ));
+            return None;
+        }
+        match read_file_bounded(&path, self.remaining) {
+            Ok(Some(bytes)) => {
+                if let Err(error) = write_publish_stage_asset(self.stage, &published, &bytes) {
+                    self.warnings
+                        .push(format!("Couldn't copy asset {rel}: {error}"));
+                    return None;
+                }
+                self.remaining = self.remaining.saturating_sub(bytes.len() as u64);
+                self.copied.insert(rel, published.clone());
+                Some(published)
+            }
+            // Grew under an external editor between the size check and the read.
+            Ok(None) => {
+                self.over_budget = Some(format!(
+                    "Export stopped: {rel} grew past the {} asset limit while it was being copied. \
+                     Raise \"Query export size limit\" in Settings → Graph and try again.",
+                    format_mib(self.budget)
+                ));
+                None
+            }
+            Err(error) => {
+                self.warnings
+                    .push(format!("Asset {rel} was omitted: {error}"));
+                None
+            }
+        }
+    }
+}
+
+/// Read a regular file, refusing (`Ok(None)`) once more than `max` bytes are
+/// seen — bounded DURING the read, so a file growing under an external editor
+/// cannot exceed the allowance between a metadata check and the read.
+fn read_file_bounded(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    if metadata.len() > max {
+        return Ok(None);
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Write one copied asset at `assets/<rel>` inside the stage. Only that
+/// prefix, only normal path components; parents are created inside the bound
+/// stage handle.
+fn write_publish_stage_asset(
+    stage: &PublishStage,
+    published: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    write_publish_stage_nested(stage, "assets", published, bytes)
+}
+
+/// Write one file under a nested prefix (`assets/…` for copied assets,
+/// `app/…` for the read-only app bundle) inside the stage: only that prefix,
+/// only normal path components; parents are created inside the bound stage
+/// handle.
+fn write_publish_stage_nested(
+    stage: &PublishStage,
+    prefix: &str,
+    published: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let relative = Path::new(published);
+    let ok = relative.starts_with(prefix)
+        && relative != Path::new(prefix)
+        && relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && relative.file_name().is_some();
+    if !ok {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("static-publish file must live under {prefix}/"),
+        ));
+    }
+    publish_stage_write_race_hook(stage)?;
+    if let Some(parent) = relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+        stage.dir.create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = stage.dir.open_with(relative, &options)?;
+    file.write_all(bytes)?;
+    crate::durability_counters::sync_file(&file)
 }
 
 struct PublicationPageLink {
@@ -1505,9 +1788,28 @@ fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx
 }
 
 /// Render an embedded page's block (a `DocBlock`) as an `<li>`, mirroring `render_result_block`.
+/// Stage 2: while a block's body renders, its `tine.*` properties are the ones
+/// the app hands `parseQuery` for any macro in it. Returns the previous set.
+fn enter_block_scope(ctx: &Ctx, b: &DocBlock) -> Option<Vec<(String, String)>> {
+    ctx.scope.map(|scope| {
+        std::mem::replace(
+            &mut scope.borrow_mut().block_properties,
+            app_export::tine_block_properties(b),
+        )
+    })
+}
+
+fn leave_block_scope(ctx: &Ctx, previous: Option<Vec<(String, String)>>) {
+    if let (Some(scope), Some(previous)) = (ctx.scope, previous) {
+        scope.borrow_mut().block_properties = previous;
+    }
+}
+
 fn render_embedded_block(b: &DocBlock, out: &mut String, ctx: &Ctx, depth: u8) {
     out.push_str("<li>");
+    let scope_properties = enter_block_scope(ctx, b);
     emit_block_inner(&b.raw, out, ctx, depth);
+    leave_block_scope(ctx, scope_properties);
     if !b.children.is_empty() {
         out.push_str("<ul>");
         for c in &b.children {
@@ -2909,6 +3211,7 @@ fn render_query_sheet(
             return;
         }
     };
+    let _nested = NestedResultsGuard::enter(ctx);
     let mut render = |hydrated: &[HydratedQueryBlock<'_>]| {
         let rows = hydrated
             .iter()
@@ -3079,6 +3382,50 @@ fn run_static_query(
     check_nesting: bool,
     ctx: &Ctx,
 ) -> Result<StaticQueryOutcome, String> {
+    run_static_query_with(src, input, check_nesting, ctx, QueryRunOverrides::default())
+}
+
+/// What one caller knows better than the render scope (Stage 2): the export's
+/// own home query keeps its REVIEWED binding and view while the record's
+/// lookup key stays the home page.
+#[derive(Default)]
+struct QueryRunOverrides {
+    context: Option<ExecutionContext>,
+    view: Option<crate::query::ir::ViewSettings>,
+    properties: Option<Vec<(String, String)>>,
+    host_block_id: Option<String>,
+}
+
+/// While query RESULT rows render, a macro inside them belongs to another
+/// page's context and is not one the app will ask for: it is not recorded.
+struct NestedResultsGuard<'a>(Option<&'a RefCell<app_export::RenderScope>>);
+
+impl<'a> NestedResultsGuard<'a> {
+    fn enter(ctx: &Ctx<'a>) -> Self {
+        if let Some(scope) = ctx.scope {
+            let mut scope = scope.borrow_mut();
+            scope.nesting = scope.nesting.saturating_add(1);
+        }
+        NestedResultsGuard(ctx.scope)
+    }
+}
+
+impl Drop for NestedResultsGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(scope) = self.0 {
+            let mut scope = scope.borrow_mut();
+            scope.nesting = scope.nesting.saturating_sub(1);
+        }
+    }
+}
+
+fn run_static_query_with(
+    src: &str,
+    input: crate::query::QueryInput,
+    check_nesting: bool,
+    ctx: &Ctx,
+    overrides: QueryRunOverrides,
+) -> Result<StaticQueryOutcome, String> {
     const STATIC_QUERY_MAX_ROWS: usize = 20_000;
     const STATIC_QUERY_MAX_BYTES: usize = 32 * 1024 * 1024;
     if !crate::query::query_source_within_limit(src) {
@@ -3100,8 +3447,86 @@ fn run_static_query(
             rows: Vec::new(),
             generation: 0,
         });
-    let (query, view) =
-        crate::query::parse_query_input(src, input, crate::date::JournalDate::today(), &registry);
+    // A query export (Stage 2) runs each query exactly as the app will ask
+    // for it: `<% current page %>` bound to the page being rendered, the host
+    // block's `tine.*` properties merged into the view, the page as the
+    // execution context. The graph site and print keep their historical
+    // context-free run.
+    let scoped = ctx.scope.map(|scope| scope.borrow().clone());
+    let mut record: Option<app_export::QuerySnapshot> = None;
+    let (query, view, context) = match &scoped {
+        Some(scope) => {
+            let dialect = crate::query::wire_parse::QueryTextDialect::from_input(input);
+            let properties = overrides
+                .properties
+                .clone()
+                .unwrap_or_else(|| scope.block_properties.clone());
+            let authored =
+                crate::query::wire_parse::parse_query_pair(src, dialect, &properties, &registry);
+            let execution = scope
+                .page
+                .as_deref()
+                .and_then(|page| app_export::substitute_current_page(src, page))
+                .map(|argument| {
+                    let parsed = crate::query::wire_parse::parse_query_pair(
+                        &argument,
+                        dialect,
+                        &properties,
+                        &registry,
+                    );
+                    app_export::QueryExecutionParse { argument, parsed }
+                });
+            let effective = execution
+                .as_ref()
+                .map(|execution| &execution.parsed)
+                .unwrap_or(&authored);
+            let query = effective.query.clone();
+            // The app runs a query under the view of its result kind — the
+            // Pages section under the page-scoped settings, Blocks under the
+            // block-scoped ones (`Macro.tsx` `pageResultView`/`blockResultView`).
+            // Baking the singular merged view instead would record an
+            // unsampled answer for a `tine.block-sample::` host.
+            let view = overrides.view.clone().unwrap_or_else(|| {
+                crate::query::wire_parse::anchored_view(effective, effective.query.anchor)
+            });
+            let lookup_context = match &scope.page {
+                Some(page) => ExecutionContext::on_page(page.clone()),
+                None => ExecutionContext::none(),
+            };
+            let context = overrides
+                .context
+                .clone()
+                .unwrap_or_else(|| lookup_context.clone());
+            if ctx.recorder.is_some() && scope.nesting == 0 {
+                record = Some(app_export::QuerySnapshot {
+                    host: scope.page.clone().unwrap_or_default(),
+                    argument: src.to_string(),
+                    dialect,
+                    properties,
+                    parsed: authored,
+                    execution,
+                    context: lookup_context,
+                    executed_context: context.clone(),
+                    view: view.clone(),
+                    result: app_export::closed_result(
+                        QueryRows::Page { pages: Vec::new() },
+                        Vec::new(),
+                        crate::query::ir::QueryReport::default(),
+                    ),
+                });
+            }
+            (query, view, context)
+        }
+        None => {
+            let (query, view) = crate::query::parse_query_input(
+                src,
+                input,
+                crate::date::JournalDate::today(),
+                &registry,
+            );
+            (query, view, ExecutionContext::none())
+        }
+    };
     // Advanced source is intentionally unresolved at parse time. The shared
     // reader resolves it before deciding which diagnostics are actionable.
     let Some(reader) = ctx.query_reader else {
@@ -3118,11 +3543,11 @@ fn run_static_query(
     };
     let (result, subtrees) = if ctx.print_error.is_some() {
         reader
-            .run_subtrees(&query, &view, bounds, &ExecutionContext::none())
+            .run_subtrees(&query, &view, bounds, &context)
             .map(|answer| (answer.result, Some(answer.roots)))
     } else {
         reader
-            .run(&query, &view, bounds, &ExecutionContext::none())
+            .run(&query, &view, bounds, &context)
             .map(|result| (result, None))
     }
     .map_err(|error| {
@@ -3150,36 +3575,72 @@ fn run_static_query(
             result.matched_total.unwrap_or(result.total)
         ));
     }
+    let sampled = view.sample.is_some();
     if let Some(roots) = subtrees {
         return Ok(StaticQueryOutcome {
             pre_filter_total: roots.len(),
             rows: StaticQueryRows::Subtrees(roots),
+            sampled,
         });
     }
-    Ok(match result.rows {
+    let QueryResult {
+        rows,
+        diagnostics,
+        report,
+        ..
+    } = result;
+    let outcome = match rows {
         QueryRows::Block { groups } => {
             let pre_filter_total = groups.iter().map(|group| group.blocks.len()).sum();
-            let groups = groups
+            let groups: Vec<RefGroup> = groups
                 .into_iter()
                 .filter(|group| publish_page_allowed(ctx, &group.page))
                 .collect();
+            let groups = match overrides.host_block_id.as_deref() {
+                Some(host) => query_export::without_host_block(groups, Some(host)),
+                None => groups,
+            };
+            if let Some(record) = record.as_mut() {
+                record.result = app_export::closed_result(
+                    QueryRows::Block {
+                        groups: groups.clone(),
+                    },
+                    diagnostics,
+                    report,
+                );
+            }
             StaticQueryOutcome {
                 rows: StaticQueryRows::Block(groups),
                 pre_filter_total,
+                sampled,
             }
         }
         QueryRows::Page { pages } => {
             let pre_filter_total = pages.len();
-            let pages = pages
+            let pages: Vec<PageRow> = pages
                 .into_iter()
                 .filter(|page| publication_page_link(ctx, page).is_some())
                 .collect();
+            if let Some(record) = record.as_mut() {
+                record.result = app_export::closed_result(
+                    QueryRows::Page {
+                        pages: pages.clone(),
+                    },
+                    diagnostics,
+                    report,
+                );
+            }
             StaticQueryOutcome {
                 rows: StaticQueryRows::Page(pages),
                 pre_filter_total,
+                sampled,
             }
         }
-    })
+    };
+    if let (Some(record), Some(recorder)) = (record, ctx.recorder) {
+        recorder.borrow_mut().queries.push(record);
+    }
+    Ok(outcome)
 }
 
 enum StaticQueryRows {
@@ -3200,6 +3661,9 @@ fn record_print_error(ctx: &Ctx, error: PrintPreparationError) {
 struct StaticQueryOutcome {
     rows: StaticQueryRows,
     pre_filter_total: usize,
+    /// The view sampled BEFORE the rows were filtered to the publication, so
+    /// the drawn set was influenced by content outside it.
+    sampled: bool,
 }
 
 fn render_query_with_title(
@@ -3232,6 +3696,7 @@ fn render_query_outcome(
         StaticQueryRows::Page(pages) => pages.len(),
     };
     let omitted = outcome.pre_filter_total.saturating_sub(total);
+    let _nested = NestedResultsGuard::enter(ctx);
     let mut out = format!(
         "<div class=\"query\"><div class=\"query-head\">{} <span class=\"query-count\">{}</span></div>",
         esc(title.unwrap_or("Query")),
@@ -3280,12 +3745,21 @@ fn render_query_outcome(
             out.push_str("</ul>");
         }
     }
-    if omitted > 0 {
+    // A query export says nothing about what it left out — the count of
+    // omitted rows is itself information about pages outside the export
+    // (Martin, 2026-09-14). The `publish/` site keeps its count: there the
+    // reader already knows the graph has private pages.
+    if omitted > 0 && !ctx.inert_outside_links {
         out.push_str(&format!(
             "<div class=\"query-omitted\">{} result{} on non-public pages omitted.</div>",
             omitted,
             if omitted == 1 { "" } else { "s" }
         ));
+    }
+    if ctx.inert_outside_links && outcome.sampled {
+        out.push_str(
+            "<div class=\"query-sampled\">Sampled across the whole graph before this export was selected; the draw may differ from the live graph.</div>",
+        );
     }
     out.push_str("</div>");
     out
@@ -3635,12 +4109,21 @@ fn render_block_ordered(
         ));
     }
     emit_header_facets(b.marker(), b.priority(), out);
+    let scope_properties = enter_block_scope(ctx, b);
     match &begin_query {
         Some(BeginQueryInspection::Supported(begin)) => {
             if let Some(graph) = ctx.graph {
+                // The app renders this container as
+                // `{{query <query> {:table-view? true}}}` (`BeginQuery.tsx`);
+                // a query export records exactly that argument.
+                let source = if ctx.scope.is_some() {
+                    format!("{} {{:table-view? true}}", begin.query)
+                } else {
+                    begin.query.clone()
+                };
                 out.push_str(&render_query_with_title(
                     graph,
-                    &begin.query,
+                    &source,
                     begin.title.as_deref(),
                     ctx,
                     0,
@@ -3677,6 +4160,7 @@ fn render_block_ordered(
             )),
         },
     }
+    leave_block_scope(ctx, scope_properties);
     out.push_str("</div>");
     let props = b.properties();
     let props = if sheet.is_some() {
@@ -3829,7 +4313,7 @@ fn shell(title: &str, main: &str, home_href: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https: http:; media-src 'self' blob: https: http:; frame-src https://www.youtube.com https://player.vimeo.com\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; img-src 'self' data: https: http:; media-src 'self' blob: https: http:; frame-src https://www.youtube.com https://player.vimeo.com\">\
 <title>{title}</title>\
 <link rel=\"stylesheet\" href=\"style.css\">{katex}{hljs}</head><body>\
 <aside class=\"sidebar\">\
@@ -4016,6 +4500,10 @@ pub(crate) fn page_print_html_document(
         print_error: Some(&print_error),
         pages: None,
         page_links: None,
+        inert_outside_links: false,
+        scope: None,
+        recorder: None,
+        asset_sink: None,
     };
     // `page_html` builds the heading + outline and wraps it in `shell`; we want the
     // same body but the print shell, so mirror its body build here.
@@ -4434,8 +4922,10 @@ struct PublicationGraphSnapshot {
     root: PublicationSnapshotRoot,
 }
 
+pub mod app_export;
 #[cfg(windows)]
 mod private_directory;
+pub mod query_export;
 
 /// Create `path` as a directory only its owner may read, write or traverse,
 /// failing if it already exists.
@@ -4495,7 +4985,7 @@ impl PublicationGraphSnapshot {
 }
 
 struct PublishRecovery {
-    #[cfg(test)]
+    /// Ambient spelling, reported to the user so retired content can be found.
     path: PathBuf,
     dir: Dir,
 }
@@ -4627,7 +5117,7 @@ fn publish_recovery_race_hook(_recovery: &PublishRecovery) -> io::Result<()> {
     Ok(())
 }
 
-fn reserve_publish_recovery(graph: &Graph, root: &Dir) -> io::Result<PublishRecovery> {
+fn reserve_publish_recovery(graph: &Graph, root: &Dir, leaf: &str) -> io::Result<PublishRecovery> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4642,13 +5132,12 @@ fn reserve_publish_recovery(graph: &Graph, root: &Dir) -> io::Result<PublishReco
         .unwrap_or(0);
     for _ in 0..128 {
         let name = format!(
-            "{stamp}-{}__previous-publish",
+            "{stamp}-{}__previous-{leaf}",
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
         match recovery_root.create_dir(&name) {
             Ok(()) => {
                 return Ok(PublishRecovery {
-                    #[cfg(test)]
                     path: recovery.join(&name),
                     dir: recovery_root.open_dir(&name)?,
                 });
@@ -4663,8 +5152,39 @@ fn reserve_publish_recovery(graph: &Graph, root: &Dir) -> io::Result<PublishReco
     ))
 }
 
-fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::Result<()> {
+/// Install a complete stage at `output`. Returns where the previous occupant
+/// was retired, when there was one. `replace: false` is create-only: a
+/// directory that appeared since the user reviewed the destination makes the
+/// commit fail with the stage retired into recovery and nothing else touched.
+fn commit_publish_stage(
+    graph: &Graph,
+    stage: PublishStage,
+    output: &PublicationOutput,
+) -> io::Result<Option<PathBuf>> {
+    let out = output.path(graph);
+    let out = out.as_path();
     graph.ensure_write_target(out)?;
+    // The parent (`published-queries/`) is created through the bound graph
+    // capability; the graph site's parent is the root itself.
+    let leaf_rel = output.relative();
+    if output
+        .parent
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || output.leaf.is_empty()
+        || Path::new(&output.leaf)
+            .file_name()
+            .is_none_or(|value| value != output.leaf.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "static-publish output must be one directory name under the graph",
+        ));
+    }
+    if !output.parent.as_os_str().is_empty() {
+        graph.ensure_write_target(&graph.root.join(&output.parent))?;
+        stage.root.create_dir_all(&output.parent)?;
+    }
     // cap-std may represent a directory capability with an O_PATH descriptor on
     // Linux, which cannot itself be fsynced. Every generated file is fsynced;
     // directory durability remains best-effort, matching the other atomic paths.
@@ -4683,7 +5203,7 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
     // Reject a pre-existing alias without touching it. A replacement racing the
     // check is moved as an inode into bound recovery and rejected there; it is
     // never followed for a write.
-    let old_recovery = match root.symlink_metadata("publish") {
+    let old_recovery = match root.symlink_metadata(&leaf_rel) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(io::Error::new(
@@ -4691,9 +5211,23 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
                     "static-publish output is not a real directory",
                 ));
             }
-            let recovery = reserve_publish_recovery(graph, &root)?;
+            if !output.replace {
+                // Create-only: the reviewed destination was free and is not
+                // any more. Retire our own stage so nothing dangles; the
+                // occupant is untouched.
+                let bad = reserve_publish_recovery(graph, &root, &output.leaf)?;
+                let _ = root.rename(&path_rel(&graph.root, &path), &bad.dir, "unused-stage");
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "Another export appeared at {}; choose a different name or replace it.",
+                        out.display()
+                    ),
+                ));
+            }
+            let recovery = reserve_publish_recovery(graph, &root, &output.leaf)?;
             publish_recovery_race_hook(&recovery)?;
-            root.rename("publish", &recovery.dir, "previous")?;
+            root.rename(&leaf_rel, &recovery.dir, "previous")?;
             let retired = recovery.dir.symlink_metadata("previous")?;
             if !retired.is_dir() || retired.file_type().is_symlink() {
                 return Err(io::Error::new(
@@ -4706,6 +5240,9 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    let retired_path = old_recovery
+        .as_ref()
+        .map(|recovery| recovery.path.join("previous"));
 
     if let Err(error) = crate::model::move_file_noreplace(&path, out) {
         // The previous site stays complete in conflict recovery. Avoid a
@@ -4718,24 +5255,46 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
         && !out_meta.file_type().is_symlink()
         && identity_from_path(out).is_ok_and(|live| live == identity);
     if same_stage {
-        return Ok(());
+        return Ok(retired_path);
     }
 
     // A replaced stage must never remain live. Move it through the bound graph
     // and recovery directory handles; the previous complete site is already
     // retained separately and is not overwritten during automatic recovery.
-    let bad = reserve_publish_recovery(graph, &root)?;
-    let _ = root.rename("publish", &bad.dir, "invalid-stage");
+    let bad = reserve_publish_recovery(graph, &root, &output.leaf)?;
+    let _ = root.rename(&leaf_rel, &bad.dir, "invalid-stage");
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "static-publish staging directory changed during commit",
     ))
 }
 
+/// Graph-relative spelling of a path known to sit directly under the root.
+fn path_rel(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Export public pages to `<root>/publish/`. Returns (output dir, page count).
 /// Only pages with `public:: true` are published, unless
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
+    let (pages, sources) = capture_direct_publication_sources(graph)?;
+    graph.with_publication_query_reader(&sources, |reader| {
+        publish_graph_documents_with_queries(graph, pages, reader)
+    })
+}
+
+/// Fresh parse of every listed page: the documents the renderer will see and
+/// the `(entry, revision)` pairs the query reader must correspond to.
+#[allow(clippy::type_complexity)]
+pub(crate) fn capture_direct_publication_sources(
+    graph: &Graph,
+) -> io::Result<(
+    Vec<(crate::model::PageEntry, doc::Document)>,
+    Vec<(crate::model::PageEntry, String)>,
+)> {
     let mut pages = Vec::new();
     let mut sources = Vec::new();
     for listed in graph.list_pages() {
@@ -4746,9 +5305,44 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         sources.push((entry.clone(), revision));
         pages.push((entry, document));
     }
+    Ok((pages, sources))
+}
+
+/// Plan a query export on Direct Files: fresh capture, one coherent reader.
+pub fn plan_query_publication(
+    graph: &Graph,
+    request: &query_export::QueryPublicationRequest,
+) -> Result<query_export::QueryPublicationPlan, query_export::QueryPublicationError> {
+    let (_, sources) = capture_direct_publication_sources(graph)?;
     graph.with_publication_query_reader(&sources, |reader| {
-        publish_graph_documents_with_queries(graph, pages, reader)
-    })
+        Ok(
+            query_export::plan_query_publication(graph, &sources, reader, request)
+                .map(|(plan, _)| plan),
+        )
+    })?
+}
+
+/// Confirmed query export on Direct Files.
+pub fn publish_query(
+    graph: &Graph,
+    request: &query_export::QueryPublicationRequest,
+    fingerprint: &str,
+) -> Result<PublishOutcome, query_export::QueryPublicationError> {
+    let (pages, sources) = capture_direct_publication_sources(graph)?;
+    let capture = pages
+        .into_iter()
+        .zip(sources.iter())
+        .map(|((entry, document), (_, revision))| (entry, document, revision.clone()))
+        .collect();
+    graph.with_publication_query_reader(&sources, |reader| {
+        Ok(query_export::publish_query_documents(
+            graph,
+            capture,
+            reader,
+            request,
+            fingerprint,
+        ))
+    })?
 }
 
 /// Publish one already-authoritative graph snapshot. Managed storage obtains
@@ -4759,7 +5353,8 @@ fn publish_graph_documents(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
 ) -> io::Result<(String, usize)> {
-    publish_graph_documents_inner(graph, pages, None)
+    publish_graph_documents_inner(graph, pages, None, &PublicationTarget::graph_site())
+        .map(|outcome| (outcome.path, outcome.pages))
 }
 
 /// Render one already-authoritative document capture while every query surface
@@ -4769,15 +5364,105 @@ pub(crate) fn publish_graph_documents_with_queries(
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: &dyn PublicationQueryRead,
 ) -> io::Result<(String, usize)> {
-    publish_graph_documents_inner(graph, pages, Some(queries))
+    publish_graph_documents_inner(
+        graph,
+        pages,
+        Some(queries),
+        &PublicationTarget::graph_site(),
+    )
+    .map(|outcome| (outcome.path, outcome.pages))
 }
 
-fn publish_graph_documents_inner(
+/// Which pages a static export contains. The renderer computes every closure
+/// index (slugs, block refs, backlinks, embeds, nested-query hydration, search)
+/// over exactly this set, so the selection is the whole privacy boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationSelection {
+    /// The graph site: pages carrying `public:: true`, or every page under
+    /// `:publishing/all-pages-public?`. Ambiguous identities are skipped.
+    PublicProperty,
+    /// A closed, user-reviewed set of graph-relative source paths (a query
+    /// export). A selected path that is missing from the capture, or whose
+    /// logical name has a physical twin, refuses the whole export: the user
+    /// reviewed a list, so silently shipping fewer pages is the wrong outcome.
+    Paths(std::collections::BTreeSet<String>),
+}
+
+/// Where a static export is installed: `<graph root>/<parent>/<leaf>/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationOutput {
+    /// Graph-relative parent directory; empty for the graph site.
+    pub parent: PathBuf,
+    /// The leaf directory name (`publish`, or a query export's folder).
+    pub leaf: String,
+    /// `true`: whatever occupies the leaf at commit time is retired into
+    /// conflict recovery before the stage is installed. `false`: the install
+    /// is create-only and fails if anything is there.
+    pub replace: bool,
+}
+
+impl PublicationOutput {
+    /// `<graph root>/<parent>/<leaf>`.
+    pub fn path(&self, graph: &Graph) -> PathBuf {
+        graph.root.join(&self.parent).join(&self.leaf)
+    }
+    fn relative(&self) -> PathBuf {
+        self.parent.join(&self.leaf)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationTarget {
+    pub selection: PublicationSelection,
+    pub output: PublicationOutput,
+    /// `Some(budget)`: the output is a movable folder — copy every referenced
+    /// local asset into `<leaf>/assets/` under this byte budget. `None`: the
+    /// site keeps linking the graph's sibling `assets/` directory.
+    pub asset_budget_bytes: Option<u64>,
+    /// `Some`: also publish the read-only app under `app/` (query exports).
+    pub app: Option<app_export::AppPublication>,
+}
+
+impl PublicationTarget {
+    /// The historical `publish/` site: `public::` pages, replaced in place.
+    pub fn graph_site() -> Self {
+        PublicationTarget {
+            selection: PublicationSelection::PublicProperty,
+            output: PublicationOutput {
+                parent: PathBuf::new(),
+                leaf: "publish".to_string(),
+                replace: true,
+            },
+            asset_budget_bytes: None,
+            app: None,
+        }
+    }
+}
+
+/// What one static export produced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishOutcome {
+    /// Installed output directory.
+    pub path: String,
+    /// Pages written.
+    pub pages: usize,
+    /// Where the previous occupant of the output directory was retired, when
+    /// there was one. Always reported: the user must be able to find content
+    /// that appeared between review and commit.
+    pub retired: Option<String>,
+    /// Non-fatal omissions (an asset over budget or missing), user-facing.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn publish_graph_documents_inner(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: Option<&dyn PublicationQueryRead>,
-) -> io::Result<(String, usize)> {
-    let out = graph.root.join("publish");
+    target: &PublicationTarget,
+) -> io::Result<PublishOutcome> {
+    let out = target.output.path(graph);
     graph.ensure_write_target(&out)?;
     let stage = reserve_publish_stage(graph)?;
     write_publish_stage_file(&stage, "style.css", STYLE.as_bytes())?;
@@ -4819,8 +5504,14 @@ fn publish_graph_documents_inner(
     // from `public` below.
     let mut public: Vec<(&str, PageKind, Arc<doc::Document>)> = Vec::new();
     let mut public_paths = Vec::new();
+    let mut selected_seen = 0usize;
     for (e, parsed) in entries {
-        let is_public = all_public || page_is_public(parsed.pre_block.as_deref());
+        let is_public = match &target.selection {
+            PublicationSelection::PublicProperty => {
+                all_public || page_is_public(parsed.pre_block.as_deref())
+            }
+            PublicationSelection::Paths(paths) => paths.contains(&e.rel_path),
+        };
         if !is_public {
             continue;
         }
@@ -4830,13 +5521,31 @@ fn publish_graph_documents_inner(
             .unwrap_or(0)
             != 1
         {
+            if let PublicationSelection::Paths(_) = &target.selection {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Two files claim the page \"{}\"; resolve the duplicate before exporting it.",
+                        e.name
+                    ),
+                ));
+            }
             if crate::backend_error::runtime_debug_diagnostics_enabled() {
                 eprintln!("tine export: refusing one ambiguous public page identity");
             }
             continue;
         }
+        selected_seen += 1;
         public.push((e.name.as_str(), e.kind, Arc::clone(parsed)));
         public_paths.push((e.rel_path.clone(), e.name.clone(), e.kind));
+    }
+    if let PublicationSelection::Paths(paths) = &target.selection {
+        if selected_seen != paths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "The reviewed pages changed before the export ran; review them again.",
+            ));
+        }
     }
 
     // Every downstream document resolver gets the same exact revision as the
@@ -4915,6 +5624,28 @@ fn publish_graph_documents_inner(
     let mut sidebar_pages: Vec<serde_json::Value> = Vec::new();
     let mut welcome_html: Option<String> = None;
     let mut count = 0;
+    // A closed export travels: copy its referenced assets in. The graph site
+    // keeps linking the sibling `assets/` folder as it always has.
+    let asset_sink = target.asset_budget_bytes.map(|budget| {
+        RefCell::new(AssetSink {
+            source_root: &graph.root,
+            stage: &stage,
+            copied: HashMap::new(),
+            budget,
+            remaining: budget,
+            warnings: Vec::new(),
+            over_budget: None,
+        })
+    });
+    // Stage 2: a query export runs every query as the app will ask for it
+    // (`scope`) and, when it also ships the app, records each answer.
+    let is_query_export = matches!(target.selection, PublicationSelection::Paths(_));
+    let scope = is_query_export.then(|| RefCell::new(app_export::RenderScope::default()));
+    let recorder = target
+        .app
+        .as_ref()
+        .filter(|app| app.bundle.index().is_some())
+        .map(|_| RefCell::new(app_export::QueryRecorder::default()));
     // The render context: the block-ref index + the graph (so `{{query}}`/`{{embed}}`/
     // `{{namespace}}` macros can resolve against real data at publish time) + the
     // slug map (so cross-page links resolve to the actual written files).
@@ -4929,8 +5660,18 @@ fn publish_graph_documents_inner(
         print_error: None,
         pages: Some(&page_docs),
         page_links: Some(&page_links),
+        inert_outside_links: is_query_export,
+        scope: scope.as_ref(),
+        recorder: recorder.as_ref(),
+        asset_sink: asset_sink.as_ref(),
     };
     for (name, kind, parsed) in &public {
+        if let Some(scope) = &scope {
+            let mut scope = scope.borrow_mut();
+            scope.page = Some((*name).to_string());
+            scope.block_properties.clear();
+            scope.nesting = 0;
+        }
         let slug = slug_of(name);
         let file = format!("{slug}.html");
         let html = page_html(
@@ -4988,15 +5729,157 @@ fn publish_graph_documents_inner(
     );
     let pages_html = shell("Pages", &main, &home_file);
     write_publish_stage_file(&stage, "pages.html", pages_html.as_bytes())?;
-    let entry_html = welcome_html.unwrap_or(pages_html);
+    let mut entry_html = welcome_html.unwrap_or(pages_html);
+    let mut app_warnings = Vec::new();
+    if let Some(app) = &target.app {
+        match (app.bundle.index(), &recorder) {
+            (Some(index), Some(recorder)) => {
+                let index_html = app_export::rewrite_index(index, &app.name)?;
+                // The export's own query, run for the app's home page: its
+                // lookup key is the home page, its binding and view are the
+                // reviewed ones, and the host block stays out (GH #469).
+                let taken: HashSet<String> = public
+                    .iter()
+                    .map(|(name, _, _)| crate::refs::page_key(name))
+                    .collect();
+                let home_name = app_export::home_page_name(&app.name, &taken);
+                if let Some(scope) = &scope {
+                    let mut scope = scope.borrow_mut();
+                    scope.page = Some(home_name.clone());
+                    scope.block_properties = app.query.properties();
+                    scope.nesting = 0;
+                }
+                let input = app.query.dialect().input();
+                let overrides = QueryRunOverrides {
+                    context: Some(ExecutionContext {
+                        current_page: app.query.current_page.clone(),
+                    }),
+                    view: app.query.view.clone(),
+                    properties: Some(app.query.properties()),
+                    host_block_id: app.query.host_block_id.clone(),
+                };
+                run_static_query_with(
+                    &app.query.argument(),
+                    input,
+                    !matches!(input, crate::query::QueryInput::MacroTql),
+                    &ctx,
+                    overrides,
+                )
+                .map_err(|html| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "The export's query could not be run for the app: {}",
+                            app_export::strip_tags(&html)
+                        ),
+                    )
+                })?;
+                // The closed sub-graph: every graph-shaped answer the app
+                // needs (backlinks, block-ref counts, aliases, icons) comes
+                // from the selected pages and nothing else (I-8).
+                let selected: HashSet<String> = taken;
+                let mut closed_pages: Vec<(crate::model::PageEntry, Arc<doc::Document>)> =
+                    snapshot_pages
+                        .iter()
+                        .filter(|(entry, _)| selected.contains(&crate::refs::page_key(&entry.name)))
+                        .map(|(entry, document)| {
+                            let mut document = Arc::clone(document);
+                            crate::model::assign_doc_runtime_ids(
+                                &mut Arc::make_mut(&mut document).roots,
+                                &entry.rel_path,
+                            );
+                            (entry.clone(), document)
+                        })
+                        .collect();
+                closed_pages.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+                let closed = PublicationGraphSnapshot::new(closed_pages.clone())?;
+                let queries = std::mem::take(&mut recorder.borrow_mut().queries);
+                let snapshot_json = app_export::build_snapshot(app_export::SnapshotInputs {
+                    name: &app.name,
+                    home: &app.query,
+                    closed: &closed.graph,
+                    pages: &closed_pages,
+                    queries,
+                    home_name: &home_name,
+                    exported_at: app_export::exported_at_now(),
+                })?;
+                for (path, bytes) in &app.bundle.files {
+                    if path == "index.html" {
+                        continue;
+                    }
+                    write_publish_stage_nested(
+                        &stage,
+                        app_export::APP_DIR,
+                        &format!("{}/{path}", app_export::APP_DIR),
+                        bytes,
+                    )?;
+                }
+                write_publish_stage_nested(
+                    &stage,
+                    app_export::APP_DIR,
+                    &format!("{}/index.html", app_export::APP_DIR),
+                    index_html.as_bytes(),
+                )?;
+                write_publish_stage_nested(
+                    &stage,
+                    app_export::APP_DIR,
+                    &format!("{}/{}", app_export::APP_DIR, app_export::SNAPSHOT_FILE),
+                    &snapshot_json,
+                )?;
+                // The static site stays the no-JS fallback; served over HTTP
+                // its front door opens the app unless asked not to (`?static`).
+                // The redirect is a separate file because the shell's CSP
+                // allows no inline script.
+                write_publish_stage_file(
+                    &stage,
+                    app_export::REDIRECT_FILE,
+                    app_export::REDIRECT_JS.as_bytes(),
+                )?;
+                entry_html = entry_html
+                    .replacen(
+                        "<head>",
+                        &format!(
+                            "<head><script src=\"{}\"></script>",
+                            app_export::REDIRECT_FILE
+                        ),
+                        1,
+                    )
+                    .replacen(
+                        "<main>",
+                        &format!("<main>{}", app_export::STATIC_APP_NOTE),
+                        1,
+                    );
+            }
+            _ => app_warnings.push(app_export::NO_BUNDLE_WARNING.to_string()),
+        }
+    }
     write_publish_stage_file(&stage, "index.html", entry_html.as_bytes())?;
     if let Some(queries) = queries {
         queries
             .ensure_current()
             .map_err(publication_query_io_error)?;
     }
-    commit_publish_stage(graph, stage, &out)?;
-    Ok((out.display().to_string(), count))
+    let (mut warnings, over_budget) = asset_sink
+        .as_ref()
+        .map(|sink| {
+            let sink = sink.borrow();
+            (sink.warnings.clone(), sink.over_budget.clone())
+        })
+        .unwrap_or_default();
+    warnings.extend(app_warnings);
+    drop(ctx);
+    if let Some(message) = over_budget {
+        // Nothing reaches the destination: the stage is removed with the
+        // snapshot root, and whatever occupied the folder before stays.
+        return Err(io::Error::other(AssetBudgetExceeded(message)));
+    }
+    let retired = commit_publish_stage(graph, stage, &target.output)?;
+    Ok(PublishOutcome {
+        path: out.display().to_string(),
+        pages: count,
+        retired: retired.map(|path| path.display().to_string()),
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -5028,6 +5911,10 @@ mod tests {
             print_error: None,
             pages: None,
             page_links: None,
+            inert_outside_links: false,
+            scope: None,
+            recorder: None,
+            asset_sink: None,
         };
         decorate(&lsdoc::render_html(&body_blocks(raw), &md_opts()), &ctx, 0)
     }
@@ -5176,6 +6063,10 @@ mod tests {
                 print_error: None,
                 pages: None,
                 page_links: None,
+                inert_outside_links: false,
+                scope: None,
+                recorder: None,
+                asset_sink: None,
             },
             0,
         );
@@ -5281,6 +6172,13 @@ mod tests {
         );
         let alpha = fs::read_to_string(out.join("alpha.html")).unwrap();
         assert!(alpha.contains("Content-Security-Policy"), "{alpha}");
+        // The shell's own KaTeX stylesheet loads its fonts from the same CDN;
+        // without a font-src the browser blocks them (observed in the Stage 2
+        // published-app journey) and math falls back to system fonts.
+        assert!(
+            alpha.contains("font-src 'self' data: https://cdn.jsdelivr.net"),
+            "{alpha}"
+        );
         assert!(!alpha.contains(" onload="), "{alpha}");
         assert!(sidx.contains("window.__tineBlocks="));
         assert!(
@@ -5439,7 +6337,7 @@ mod tests {
         let compact = production.split_whitespace().collect::<String>();
         let checked = compact.find("queries.ensure_current()").unwrap();
         let commit = compact
-            .find("commit_publish_stage(graph,stage,&out)")
+            .find("commit_publish_stage(graph,stage,&target.output)")
             .unwrap();
         assert!(
             checked < commit,
@@ -5634,7 +6532,9 @@ mod tests {
         write_publish_stage_file(&stage, "index.html", b"generated site").unwrap();
         symlink(&outside, dir.join("publish")).unwrap();
 
-        assert!(commit_publish_stage(&graph, stage, &dir.join("publish")).is_err());
+        assert!(
+            commit_publish_stage(&graph, stage, &PublicationTarget::graph_site().output).is_err()
+        );
 
         assert_eq!(
             fs::read_to_string(outside.join("index.html")).unwrap(),
@@ -5901,6 +6801,10 @@ mod tests {
             print_error: None,
             pages: None,
             page_links: None,
+            inert_outside_links: false,
+            scope: None,
+            recorder: None,
+            asset_sink: None,
         };
 
         assert!(inline_asset_uri(&cumulative_ctx, "../assets/one.png").is_some());
@@ -6121,6 +7025,349 @@ mod tests {
             "the TQL query returned its row: {dashboard}"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn query_export_fixture(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tine-publish-query-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(dir.join("logseq/config.edn"), "{}\n").unwrap();
+        // Tasks: one matching block, one NOT matching (whole-page export must
+        // carry it), a link to a page outside the set and one inside it.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO first-task [[Private Notes]]\n- unmatched-sibling-text [[Also Selected]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Also Selected.md"),
+            "- TODO second-task #Private\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Private Notes.md"),
+            "- private-sentinel-text\n- DONE not-a-todo\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals/2026_01_02.md"), "- TODO journal-task\n").unwrap();
+        fs::write(dir.join("pages/Dashboard.md"), "- {{query (task TODO)}}\n").unwrap();
+        dir
+    }
+
+    fn todo_request(name: &str) -> query_export::QueryPublicationRequest {
+        query_export::QueryPublicationRequest {
+            query: "(task TODO)".into(),
+            advanced: false,
+            simple_dialect: None,
+            current_page: Some("Dashboard".into()),
+            view: None,
+            host_block_id: None,
+            host_properties: Vec::new(),
+            name: name.into(),
+            folder: None,
+            replace: false,
+            asset_budget_bytes: None,
+            app_bundle: None,
+        }
+    }
+
+    #[test]
+    fn query_export_publishes_whole_owner_pages_and_nothing_else() {
+        let dir = query_export_fixture("owners");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("Open tasks");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        assert_eq!(plan.anchor, "block");
+        assert_eq!(plan.row_count, 3, "{plan:?}");
+        assert!(!plan.exists);
+        assert_eq!(plan.folder, "open-tasks");
+        let names: Vec<&str> = plan.pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"Tasks") && names.contains(&"Also Selected"));
+        assert!(plan.pages.iter().any(|p| p.journal), "journal owner kept");
+        assert!(
+            !names.contains(&"Private Notes"),
+            "DONE block must not select"
+        );
+        assert!(!names.contains(&"Dashboard"), "host page has no match");
+
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert_eq!(outcome.pages, 3);
+        assert!(outcome.retired.is_none());
+        let out = PathBuf::from(&outcome.path);
+        assert_eq!(out, dir.join("published-queries").join("open-tasks"));
+        let tasks = fs::read_to_string(out.join("tasks.html")).unwrap();
+        assert!(
+            tasks.contains("unmatched-sibling-text"),
+            "whole page: {tasks}"
+        );
+        assert!(
+            tasks.contains("also-selected.html"),
+            "inside-set link resolves: {tasks}"
+        );
+        assert!(
+            !tasks.contains("private-notes.html") && tasks.contains("Private Notes"),
+            "outside-set link is inert text, not a dangling href: {tasks}"
+        );
+        assert!(tasks.contains("ref-outside"), "{tasks}");
+        assert!(!out.join("private-notes.html").exists());
+        let also = fs::read_to_string(out.join("also-selected.html")).unwrap();
+        assert!(
+            !also.contains("private.html") && also.contains("tag-outside"),
+            "outside tag inert: {also}"
+        );
+        let index = fs::read_to_string(out.join("search-index.js")).unwrap();
+        assert!(
+            !index.contains("private-sentinel-text"),
+            "outside content: {index}"
+        );
+        assert!(
+            !index.contains("\"title\":\"Private Notes\""),
+            "an outside page is never a page entry (its name may appear as authored text on a selected page): {index}"
+        );
+        assert!(!dir.join("publish").exists(), "the graph site is untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_refuses_a_stale_review_and_respects_create_vs_replace() {
+        let dir = query_export_fixture("replace");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("Open tasks");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+
+        // Content of a selected page changes after review: same paths, new
+        // revision, so the fingerprint moves and the export refuses.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO first-task edited\n- unmatched-sibling-text\n",
+        )
+        .unwrap();
+        drop(_projection);
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let stale = publish_query(&graph, &request, &plan.fingerprint);
+        assert!(
+            matches!(stale, Err(query_export::QueryPublicationError::Refused(ref m)) if m.contains("changed")),
+            "{stale:?}"
+        );
+
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        let out = dir.join("published-queries").join("open-tasks");
+        assert!(out.join("tasks.html").exists());
+
+        // Second export of the same name: the plan reports the collision and
+        // a free suffix; create-only refuses; replace retires the old site.
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        assert!(plan.exists);
+        assert_eq!(plan.suggested_folder.as_deref(), Some("open-tasks-2"));
+        let refused = publish_query(&graph, &request, &plan.fingerprint);
+        assert!(
+            matches!(
+                refused,
+                Err(query_export::QueryPublicationError::Refused(_))
+            ),
+            "{refused:?}"
+        );
+        fs::write(out.join("manual-note.txt"), "kept in recovery").unwrap();
+        let replacing = query_export::QueryPublicationRequest {
+            replace: true,
+            folder: Some(plan.folder.clone()),
+            ..request.clone()
+        };
+        let plan = plan_query_publication(&graph, &replacing).unwrap();
+        let outcome = publish_query(&graph, &replacing, &plan.fingerprint).unwrap();
+        let retired = PathBuf::from(outcome.retired.expect("previous export retired"));
+        assert!(retired.starts_with(dir.join("logseq/.tine-trash/conflicts")));
+        assert_eq!(
+            fs::read_to_string(retired.join("manual-note.txt")).unwrap(),
+            "kept in recovery"
+        );
+        assert!(!out.join("manual-note.txt").exists());
+        assert!(out.join("tasks.html").exists());
+
+        // A separate export under the suggested folder lands beside it.
+        let separate = query_export::QueryPublicationRequest {
+            folder: Some("open-tasks-2".into()),
+            ..request.clone()
+        };
+        let plan = plan_query_publication(&graph, &separate).unwrap();
+        assert!(!plan.exists);
+        publish_query(&graph, &separate, &plan.fingerprint).unwrap();
+        assert!(dir
+            .join("published-queries/open-tasks-2/tasks.html")
+            .exists());
+        assert!(out.join("tasks.html").exists(), "sibling untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn asset_fixture(tag: &str) -> PathBuf {
+        let dir = query_export_fixture(tag);
+        for sub in ["assets/sub/deep", "assets/a", "assets/b"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        fs::write(dir.join("assets/sub/deep/pic.png"), b"nested-png").unwrap();
+        fs::write(dir.join("assets/a/same.png"), b"a-bytes").unwrap();
+        fs::write(dir.join("assets/b/same.png"), b"b-bytes").unwrap();
+        fs::write(dir.join("assets/report.pdf"), b"%PDF-1.4 pdf-bytes").unwrap();
+        fs::write(dir.join("assets/talk.mp3"), b"mp3-bytes").unwrap();
+        // The page body references every shape the spec lists: nested path,
+        // same basename in two directories, non-image link + audio, a remote
+        // link, a missing file, and a repeat reference.
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- TODO first-task ![nested](../assets/sub/deep/pic.png) ![a](../assets/a/same.png) ![b](../assets/b/same.png)\n\
+             - [report](../assets/report.pdf) [ext](https://example.com/x.png)\n\
+             - ![music](../assets/talk.mp3)\n\
+             - ![gone](../assets/missing.png) ![again](../assets/a/same.png)\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn query_export_copies_referenced_assets_into_the_leaf() {
+        let dir = asset_fixture("assets-copy");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("With assets");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        let out = PathBuf::from(&outcome.path);
+        let html = fs::read_to_string(out.join("tasks.html")).unwrap();
+
+        // Copied: nested path preserved; same basename kept apart by directory.
+        assert_eq!(
+            fs::read(out.join("assets/sub/deep/pic.png")).unwrap(),
+            b"nested-png"
+        );
+        assert_eq!(fs::read(out.join("assets/a/same.png")).unwrap(), b"a-bytes");
+        assert_eq!(fs::read(out.join("assets/b/same.png")).unwrap(), b"b-bytes");
+        assert_eq!(
+            fs::read(out.join("assets/report.pdf")).unwrap(),
+            b"%PDF-1.4 pdf-bytes"
+        );
+        assert_eq!(fs::read(out.join("assets/talk.mp3")).unwrap(), b"mp3-bytes");
+        // URLs rewritten to the movable leaf; the original graph paths are gone.
+        assert!(html.contains(r#"src="assets/sub/deep/pic.png""#), "{html}");
+        assert!(html.contains(r#"src="assets/a/same.png""#), "{html}");
+        assert!(html.contains(r#"src="assets/b/same.png""#), "{html}");
+        assert!(html.contains(r#"href="assets/report.pdf""#), "{html}");
+        assert!(html.contains(r#"src="assets/talk.mp3""#), "{html}");
+        assert!(
+            !html.contains("../assets/"),
+            "no link escapes the leaf: {html}"
+        );
+        assert!(
+            html.contains("https://example.com/x.png"),
+            "remote link untouched"
+        );
+        // Referenced twice, copied once.
+        assert_eq!(html.matches(r#"src="assets/a/same.png""#).count(), 2);
+        // Missing: a visible marker and one warning, but the export succeeds.
+        assert_eq!(html.matches("asset-omitted").count(), 1, "{html}");
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("missing.png"));
+        // The graph site is untouched by all of this: nothing under publish/.
+        assert!(!dir.join("publish").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_over_the_asset_budget_is_refused_whole() {
+        let dir = asset_fixture("assets-budget");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        // 10 + 7 + 7 + 18 = 42 bytes fit; talk.mp3 (9) does not.
+        let request = query_export::QueryPublicationRequest {
+            asset_budget_bytes: Some(45),
+            ..todo_request("With assets")
+        };
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let error = publish_query(&graph, &request, &plan.fingerprint).unwrap_err();
+        let query_export::QueryPublicationError::AssetBudget(message) = &error else {
+            panic!("expected a typed budget refusal, got {error:?}");
+        };
+        assert!(message.contains("talk.mp3"), "{message}");
+        assert!(message.contains("Settings"), "{message}");
+        // Nothing reached the destination and no stage was left behind.
+        assert!(!dir.join("published-queries").join("with-assets").exists());
+        assert!(!dir.join("publish").exists());
+        // The same request under a sufficient budget succeeds.
+        let request = query_export::QueryPublicationRequest {
+            asset_budget_bytes: Some(51),
+            ..request
+        };
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert!(dir
+            .join("published-queries/with-assets/assets/talk.mp3")
+            .exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A nested query inside an exported page neither counts what it left
+    /// out nor hides that a sample was drawn over the whole graph.
+    #[test]
+    fn query_export_nested_query_is_silent_about_the_outside_but_flags_sampling() {
+        let dir = query_export_fixture("nested");
+        // Dashboard hosts a query over ALL todos (3 owners) but is only
+        // exported because it carries a matching task of its own.
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- TODO dash-task\n- {{query (task TODO)}}\n- {{query (and (task TODO) (page \"Private Notes\"))}}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Tasks.md"),
+            "- {{query (and (task TODO) (sample 1))}}\n- TODO first-task\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let request = todo_request("Nested");
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        let out = PathBuf::from(&outcome.path);
+        let dashboard = fs::read_to_string(out.join("dashboard.html")).unwrap();
+        assert!(!dashboard.contains("query-omitted"), "{dashboard}");
+        assert!(!dashboard.contains("omitted"), "{dashboard}");
+        assert!(!dashboard.contains("private-sentinel-text"), "{dashboard}");
+        let tasks = fs::read_to_string(out.join("tasks.html")).unwrap();
+        assert!(tasks.contains("query-sampled"), "{tasks}");
+        assert!(!dashboard.contains("query-sampled"), "{dashboard}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_refuses_twins_and_empty_results() {
+        let dir = query_export_fixture("twins");
+        // A second file claiming "Tasks": the export must refuse, not ship one.
+        fs::write(dir.join("journals/Tasks.md"), "- TODO twin-task\n").unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let twin = plan_query_publication(&graph, &todo_request("Open tasks"));
+        assert!(
+            matches!(twin, Err(query_export::QueryPublicationError::Refused(ref m)) if m.contains("Two files")),
+            "{twin:?}"
+        );
+        let mut none = todo_request("Nothing");
+        none.query = "(task CANCELED)".into();
+        let plan = plan_query_publication(&graph, &none).unwrap();
+        assert!(plan.pages.is_empty());
+        let refused = publish_query(&graph, &none, &plan.fingerprint);
+        assert!(
+            matches!(refused, Err(query_export::QueryPublicationError::Refused(ref m)) if m.contains("no results")),
+            "{refused:?}"
+        );
+        assert!(!dir.join("published-queries").join("nothing").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6819,6 +8066,10 @@ mod tests {
             print_error: None,
             pages: None,
             page_links: None,
+            inert_outside_links: false,
+            scope: None,
+            recorder: None,
+            asset_sink: None,
         };
 
         let oversized = "x".repeat(crate::query::QUERY_SOURCE_MAX_BYTES + 1);
@@ -7739,5 +8990,245 @@ mod tests {
         let pfile = dir.join("print-sample.html");
         fs::write(&pfile, print).unwrap();
         println!("SAMPLE_PRINT_HTML={}", pfile.display());
+    }
+
+    fn fake_app_bundle() -> Arc<app_export::PublishedAppBundle> {
+        Arc::new(app_export::PublishedAppBundle {
+            files: vec![
+                (
+                    "assets/index-abc123.js".into(),
+                    b"console.log('bundle');".to_vec(),
+                ),
+                (
+                    "index.html".into(),
+                    b"<!doctype html><html><head><meta charset=\"utf-8\"><title>Tine</title>\
+<script type=\"module\" src=\"./assets/index-abc123.js\"></script></head><body><div id=\"root\"></div></body></html>"
+                        .to_vec(),
+                ),
+            ],
+        })
+    }
+
+    /// Stage 2: a query export with an embedded bundle ships the read-only
+    /// app beside the static site, over a snapshot computed from the selected
+    /// pages and nothing else, keyed exactly as the app will ask.
+    #[test]
+    fn query_export_ships_the_app_over_a_closed_snapshot() {
+        let dir = query_export_fixture("app");
+        // Dashboard hosts the export's own query AND a focused-page query;
+        // it is exported because its host block does not match but its
+        // other block does.
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            "- TODO dash-task\n- {{query (task TODO)}}\n- {{query (and (task TODO) <% current page %>)}}\n  tine.view:: table\n- {{query (task TODO)}}\n  tine.sample:: 1\n- {{query (task TODO)}}\n  tine.block-display:: 1\n  tine.block-sample:: 2\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let mut request = todo_request("Tasks");
+        request.app_bundle = Some(fake_app_bundle());
+        request.host_properties = vec![
+            ("tine.view".into(), "table".into()),
+            ("tine.sample".into(), "1".into()),
+        ];
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let out = PathBuf::from(&outcome.path);
+
+        // The bundle, rewritten: marker in <head>, the export's name as title.
+        let app_index = fs::read_to_string(out.join("app/index.html")).unwrap();
+        assert!(
+            app_index.contains("<head><meta name=\"tine-published\" content=\"snapshot.json\">")
+        );
+        assert!(app_index.contains("<title>Tasks</title>"), "{app_index}");
+        assert!(!app_index.contains("<title>Tine</title>"));
+        assert_eq!(
+            fs::read(out.join("app/assets/index-abc123.js")).unwrap(),
+            b"console.log('bundle');"
+        );
+        // The static front door opens the app over HTTP, through a separate
+        // script (the shell's CSP forbids inline script), and says so.
+        let index = fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(
+            index.contains("<head><script src=\"app-redirect.js\"></script>"),
+            "{index}"
+        );
+        assert!(index.contains("publish-app-note"), "{index}");
+        let redirect = fs::read_to_string(out.join("app-redirect.js")).unwrap();
+        assert!(redirect.contains("location.replace(\"app/\""));
+        assert!(redirect.contains("static"));
+
+        // The snapshot: exactly the contracted top-level keys.
+        let bytes = fs::read(out.join("app/snapshot.json")).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut keys: Vec<&str> = snapshot
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        let mut expected = app_export::SNAPSHOT_TOP_LEVEL_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        assert_eq!(snapshot["schema"], app_export::SNAPSHOT_SCHEMA);
+        assert_eq!(snapshot["name"], "Tasks");
+        // "Tasks" is a selected page, so the home page steps aside.
+        assert_eq!(snapshot["home"], "Tasks (export)");
+        let pages = snapshot["pages"].as_array().unwrap();
+        assert_eq!(pages[0]["name"], "Tasks (export)");
+        assert!(pages.iter().all(|page| page["read_only"] == true));
+        let mut names: Vec<&str> = pages.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "Also Selected",
+                "Dashboard",
+                "Jan 2nd, 2026",
+                "Tasks",
+                "Tasks (export)"
+            ]
+        );
+        // Every selected page carries its own graph-relative path; the app
+        // opens pages by that path.
+        let tasks = pages.iter().find(|p| p["name"] == "Tasks").unwrap();
+        assert_eq!(tasks["path"], "pages/Tasks.md");
+        let entries = snapshot["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["name"], "Tasks (export)");
+        assert_eq!(entries.len(), pages.len());
+        // The home page's blocks: the macro carrying the host's tine.*
+        // properties, then one link per page.
+        let home_blocks = pages[0]["blocks"].as_array().unwrap();
+        assert_eq!(
+            home_blocks[0]["raw"].as_str().unwrap().trim(),
+            "{{query (task TODO)}}\ntine.view:: table\ntine.sample:: 1"
+        );
+        assert_eq!(
+            home_blocks[0]["properties"],
+            serde_json::json!([["tine.view", "table"], ["tine.sample", "1"]])
+        );
+        assert_eq!(home_blocks.len(), 1 + 4);
+        // Backlinks come from the closed sub-graph only: "Also Selected" is
+        // linked from Tasks (selected); Private Notes is nowhere.
+        let backlinks = snapshot["backlinks"].as_object().unwrap();
+        assert!(backlinks.contains_key("Also Selected"), "{backlinks:?}");
+        assert!(!backlinks.contains_key("Private Notes"));
+
+        // Queries: the home query keyed by the home page but executed with
+        // the reviewed binding; Dashboard's two macros keyed by Dashboard,
+        // the focused one with its substituted execution parse and the
+        // host block's tine.* properties.
+        let queries = snapshot["queries"].as_array().unwrap();
+        let home = queries
+            .iter()
+            .find(|q| q["host"] == "Tasks (export)")
+            .expect("home query recorded");
+        assert_eq!(home["argument"], "(task TODO)");
+        assert_eq!(home["dialect"], "macro_query");
+        assert_eq!(home["context"]["current_page"], "Tasks (export)");
+        assert_eq!(home["executed_context"]["current_page"], "Dashboard");
+        assert!(home["execution"].is_null());
+        assert!(home["result"]["statistics"].is_null());
+        assert_eq!(home["result"]["exceeded"], false);
+        // The home run is keyed by the host's properties and runs under the
+        // view they resolve to: `tine.sample:: 1` bakes one sampled row.
+        assert_eq!(
+            home["properties"],
+            serde_json::json!([["tine.view", "table"], ["tine.sample", "1"]])
+        );
+        assert_eq!(home["view"]["sample"], 1);
+        assert_eq!(home["view"]["view"], "table");
+        let home_rows: usize = home["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["blocks"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(home_rows, 1, "{}", home["result"]);
+        let dashboard: Vec<&serde_json::Value> = queries
+            .iter()
+            .filter(|q| q["host"] == "Dashboard")
+            .collect();
+        assert_eq!(dashboard.len(), 4, "{queries:?}");
+        // Three `(task TODO)` twins on one page are three records, told apart
+        // by the view each ran under: unsampled, `tine.sample:: 1`, and the
+        // block-scoped `tine.block-sample:: 2` (resolved the way the app
+        // resolves it, not the singular merge that would ignore it).
+        let twins: Vec<&&serde_json::Value> = dashboard
+            .iter()
+            .filter(|q| q["argument"] == "(task TODO)")
+            .collect();
+        assert_eq!(twins.len(), 3);
+        let mut samples: Vec<(Option<u64>, usize)> = twins
+            .iter()
+            .map(|q| {
+                let rows: usize = q["result"]["groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|g| g["blocks"].as_array().unwrap().len())
+                    .sum();
+                (q["view"]["sample"].as_u64(), rows)
+            })
+            .collect();
+        samples.sort_unstable();
+        assert_eq!(
+            samples,
+            vec![(None, 4), (Some(1), 1), (Some(2), 2)],
+            "{twins:?}"
+        );
+        let focused = dashboard
+            .iter()
+            .find(|q| q["argument"].as_str().unwrap().contains("current page"))
+            .unwrap();
+        assert_eq!(
+            focused["execution"]["argument"],
+            "(and (task TODO) [[Dashboard]])"
+        );
+        assert_eq!(focused["properties"][0][0], "tine.view");
+        assert_eq!(focused["properties"][0][1], "table");
+        assert_eq!(focused["context"]["current_page"], "Dashboard");
+        assert_eq!(focused["executed_context"]["current_page"], "Dashboard");
+        assert_eq!(focused["result"]["total"], 1);
+
+        // Nothing outside the selection reaches the snapshot: not the
+        // unselected page's text, not its path.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("private-sentinel-text"));
+        assert!(!text.contains("Private Notes.md"));
+        assert!(!text.contains("not-a-todo"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_export_without_an_embedded_frontend_warns_and_ships_no_app() {
+        let dir = query_export_fixture("no-app");
+        let graph = Graph::open(&dir);
+        let _projection = prepare_publication_graph(&graph);
+        let mut request = todo_request("Plain");
+        request.app_bundle = Some(Arc::new(app_export::PublishedAppBundle::default()));
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let outcome = publish_query(&graph, &request, &plan.fingerprint).unwrap();
+        assert_eq!(
+            outcome.warnings,
+            vec![app_export::NO_BUNDLE_WARNING.to_string()]
+        );
+        let out = PathBuf::from(&outcome.path);
+        assert!(!out.join("app").exists());
+        assert!(!out.join("app-redirect.js").exists());
+        let index = fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(!index.contains("app-redirect.js"));
+        // A bundle whose shell cannot carry the marker is refused whole.
+        let mut request = todo_request("Broken");
+        request.app_bundle = Some(Arc::new(app_export::PublishedAppBundle {
+            files: vec![("index.html".into(), b"<html><body></body></html>".to_vec())],
+        }));
+        let plan = plan_query_publication(&graph, &request).unwrap();
+        let error = publish_query(&graph, &request, &plan.fingerprint).unwrap_err();
+        assert!(error.to_string().contains("not exportable"), "{error}");
+        assert!(!dir.join("published-queries/broken").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

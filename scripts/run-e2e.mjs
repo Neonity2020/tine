@@ -143,6 +143,12 @@ const suites = {
     // security boundary. The catalog checker now enforces both directions, so a
     // journey can no longer sit in the contract without a runner.
     ["publish-security", "scripts/e2e-publish-security.mjs", {}],
+    // Publish a query (static site + the read-only app over a baked snapshot).
+    // e2e-published-app spawns e2e-publish-query as its producer, but the
+    // catalog checker follows imports, not children, and the export journey
+    // has its own contract — so both are selected here.
+    ["publish-query", "scripts/e2e-publish-query.mjs", {}],
+    ["published-app", "scripts/e2e-published-app.mjs", {}],
     ["page-identity-links", "scripts/e2e-page-identity-links.mjs", {}],
     ["external-graph-wide-changes", "scripts/e2e-external-graph-wide-changes.mjs", {}],
     ["concord-focus-freshness", "scripts/e2e-concord-focus-freshness.mjs", {}],

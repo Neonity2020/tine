@@ -52,6 +52,62 @@ Campaign integration is still in progress: native availability producers,
 per-consumer native job cancellation and production traversal retirement remain
 required before RET2 acceptance.
 
+### Published query exports (Stage 2)
+
+A query export's `app/` runs this frontend over `app/snapshot.json` through
+`src/publishedBackend.ts`, selected by `backend()` when the document carries
+`<meta name="tine-published">`. Two typed refusals are specific to it:
+
+- `query-unavailable` with reason code `published_export_static` — `parseQuery`
+  or `queryRun` was asked for a query the export was not made with (a changed
+  text, dialect, `tine.*` view property, or current page; a run asked under a
+  view the export never ran gets the page's baked answer for that query, and a
+  run asked with no page at all — a query inside a sheet cell — gets the one
+  record of that query). Views are compared under `viewKey`: the engine
+  writes `ViewSettings` densely (`sort: []`, `columns: []`, `aggregates: []`
+  always present) and the app resolves a scoped draft sparsely, so an absent
+  field and an empty list are the same key (`wire_parse.rs`
+  `anchored_view_of_a_scoped_draft_serializes_densely` pins the producer
+  shape, `publishedBackend.test.ts` the consumer). The refusal can come from
+  either parse: the authored one, or the execution-side parse of a
+  `<% current page %>` argument substituted for a page the export never ran
+  it on (the macro shown in another page's Linked References); `Macro.tsx`
+  reads that resource's `error` before `latest` and shows the message where
+  the rows would be. Or `runGraphSearch`
+  was asked on any lane but the Quick Switcher's (`quick-switch*`), which get a
+  plain substring match over the snapshot's page names, aliases and block text
+  for navigation. The snapshot holds answers, not an index; no query is re-run
+  in a reader's browser. `detail.message` is "This export answers only the
+  queries it was made with."
+- `published-export-read-only` (`PublishedExportReadOnlyError`) — any `Backend`
+  method classified as refused in `PUBLISHED_REFUSED_METHODS` (writes, sync,
+  plugin install, capture, native pickers, OS access). The class lives in
+  `backend.ts` because `publishedBackend.ts` is imported by it.
+
+`src/publishedBackend.guard.test.ts` reads `interface Backend` through the
+TypeScript AST and requires every member to be in exactly one of answered /
+constant / refused / absent, so a new method cannot reach a reader's browser
+unclassified. Beyond the Quick Switcher lanes, the answered set deliberately
+includes two reader affordances that reach the browser, not the graph:
+clipboard copy (`writeText`/`writeRich`) and `confirm`. `queryFacets` and
+`referencedPageNames` answer empty: the export carries answers, not the
+facet or reference inventories a sentence builder would need. Asset reads
+answer only names inside the export's own `assets/` folder, under the rule
+the static copier applies (`AssetSink::asset_relative` in `publish.rs`) to the
+name after its `assets/` prefix: a `?` query or `#` fragment is dropped; a
+remote (`://`) reference, a backslash, an absolute path, a leading `.` step or
+a `..` step is refused without a request; empty and interior `.` steps
+collapse, and a colon inside a file name is a name. (A percent-encoded
+authored name is copied literally and requested literally by images and
+media; a clicked file link decodes it first, in the app and in an export
+alike — a pre-existing app-side difference, not an export rule.)
+Presentation limits of the baked home page: a
+sampled query shows "sample of N" beside its count, read from the anchored
+section's effective view — the one the run used — (the builder sentence that
+says so in the app is not offered), and an advanced (`#+BEGIN_QUERY`) home
+carries no host `tine.*` properties — the home runs under the query's own
+settings, as the app runs an advanced query.
+
 ## Command error boundary
 
 Every Tauri command and helper under `src-tauri/src` now rejects with
@@ -237,7 +293,7 @@ Exemplar to imitate: `android_media::call`.
 
 ### `Prose` census
 
-The syntactic census is 46 production sites (34 in `commands.rs`, 12 in
+The syntactic census is 47 production sites (35 in `commands.rs`, 12 in
 `state.rs`; test modules excluded). `CommandError::prose` is an identity
 adapter when a phase-B helper already returns `CommandError`, so those retained
 E2 call sites do not erase the typed variant. The rows below have no typed
@@ -246,14 +302,27 @@ wrong-reply outcomes.
 
 History: 113 → 116 (2026-09-05, P0-rust Wave B) added three managed
 wrong-reply arms; 116 → 119 (2026-09-07, P2) added the device-local notice
-store literals; 119 → 46 (2026-09-15, Managed Storage removal) retired the
+store literals; 119 → 47 (2026-09-15, Managed Storage removal) retired the
 managed command surface, its wrong-reply arms and the quit-preparation
-fixtures. No legacy prose site was reintroduced or converted back from a typed
+fixtures, net of the one query-export refusal pass-through merged the same
+day. No legacy prose site was reintroduced or converted back from a typed
 variant. A future growth entry belongs in this paragraph with the same three
 facts: which commands, which arms, and what did *not* regress.
 
+116 → 123 (2026-09-14, publish-query stage 1): `publish_query_plan` and
+`publish_query` each carry the three wrong-reply/deferred arms every
+`sparse_application_handle` command carries (`Published`/`Planned` wrong
+reply, `Refused { message }`, `Deferred`), and `query_publication_error` passes
+the core's `QueryPublicationError::Refused(String)` — a user-facing refusal
+composed in `tine-core` with no source error — through as prose. The budget
+refusal is NOT prose: it is a tagged `query-unavailable` /
+`export_asset_budget_exceeded` error. No legacy prose site was retained,
+reintroduced, or converted back from a typed variant; the retirement owners
+below are unchanged.
+
 | File | Enclosing symbols | Legacy template | Why no typed source exists | Retirement owner |
 | --- | --- | --- | --- | --- |
+| `commands.rs` | `publish_query_plan`, `publish_query`, `query_publication_error` | wrong-reply/deferred/refusal wording | enum outcome has no error value in that arm; core refusal is composed prose | outcome taxonomy follow-up |
 | `state.rs` | `bind` | authority/lease/binding literal or bounded contextual message | local state predicate, not a source error | typed state domain follow-up |
 | `state.rs` | `owned_graph_context`, `canonical_graph_root`, `slot_for_window`, `slot_for_bound_window`, `capture_quick_switch_slot`, `refresh_graph_for_label` | missing/stale/bound-window/canonical-path literal | local state predicate or E2b bridge | W4-E2b |
 | `commands.rs` | `load_workspaces`, `save_workspaces`, `open_page_file` | unchanged helper display | E2 compatibility adapter; typed phase-B errors pass through unchanged | phase-A adapter cleanup |
