@@ -1425,7 +1425,9 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("reserve_publish_stage", 1),
         ("reserve_publish_recovery", 3),
         ("commit_publish_stage", 1),
-        ("write_publish_stage_file", 8),
+        // 9: a query export's app bake adds the stage-root redirect script
+        // that sends an HTTP visitor from the static front door to `app/`.
+        ("write_publish_stage_file", 9),
         ("pending_projection_cleanup_bounded", 2),
         ("validate_pending_cleanup_round_root", 2),
         ("remove_mutation_authority_if_exact", 3),
