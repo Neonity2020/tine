@@ -237,11 +237,14 @@ export async function applyDivergenceVerdict(name: string, stored: StoredPageSta
   markDirty(name, { content: false });
 }
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
- *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
+ *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. A
+ *  second move into the same `dest` before it lands (a carry, then a drag onto
+ *  today) adds to the held set: replacing it stranded the first move's sources
+ *  in `heldSources` with nothing left to release them. */
 export function holdSourcesForDest(dest: string, sources: string[]) {
   const srcs = sources.filter((s) => s !== dest);
   if (srcs.length === 0) return;
-  heldByDest.set(dest, srcs);
+  heldByDest.set(dest, [...new Set([...(heldByDest.get(dest) ?? []), ...srcs])]);
   for (const s of srcs) heldSources.add(s);
 }
 

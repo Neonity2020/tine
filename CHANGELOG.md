@@ -41,6 +41,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Carrying unfinished tasks to today while today's journal had a sync conflict no longer lets a later edit to one of the earlier days delete those tasks from that day's file. Tine now keeps the earlier days unchanged on disk until today is saved, as it already did for other block moves. Moving blocks into the same page twice before it saved also no longer leaves the first move's source page unable to save.
 - Queries answer every comparison they accept. `like` on `task`, `priority`
   and `page.namespace` (for example `task like 'DO%'`), `page.journal != …`,
   `page.name not in (…)` and `content in (…)` / `not in (…)` used to return

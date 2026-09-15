@@ -33,6 +33,14 @@ between two of those writes leaves the blocks present in the destination AND
 still present in a source, silently, with nothing on disk saying a move was in
 flight.
 
+Until the destination is durable, no source is written at all: not by an
+unrelated edit to that source, and not by a conflict override (the source
+barrier, `holdSourcesForDest` in `src/persistence.ts`, audit C#1). The four move
+functions hold their sources through `persistCrossPage`, and carry holds its
+source days in `carryUnfinished`. Several moves into one destination are all
+released when it lands. `src/directMoveOrder.test.ts` pins the carry case and
+`src/persistenceMoveBarrier.test.ts` the barrier itself.
+
 Two or more `rename()` calls cannot be made atomic. The contract is therefore
 **not atomicity but convergence**:
 

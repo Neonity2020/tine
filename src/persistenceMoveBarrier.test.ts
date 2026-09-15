@@ -99,6 +99,24 @@ describe("cross-page move barrier vs keep-mine", () => {
   // rules guard different things. Overriding the conflict must not also
   // override the barrier — that writes the moved block out of existence in the
   // source before it is durable in the destination.
+  // Two moves into one destination before it lands. Today is the usual one: a
+  // carry, then a drag onto today. The second hold replaced the first's entry,
+  // so the first move's source stayed held after the destination saved and
+  // none of its later edits could ever be written.
+  it("releases every source held behind one destination, not only the latest move's", async () => {
+    holdSourcesForDest("Dest", ["First"]);
+    holdSourcesForDest("Dest", ["Second"]);
+    markDirty("First");
+    markDirty("Second");
+
+    markDirty("Dest");
+    await flushPage("Dest");
+    await flushPage("First");
+    await flushPage("Second");
+
+    expect(saved.map((entry) => entry.name)).toEqual(expect.arrayContaining(["First", "Second"]));
+  });
+
   it("defers a keep-mine on a held source, then applies it on release", async () => {
     holdSourcesForDest("Dest", ["Source"]);
     conflicted.add("Source");
