@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { backend, type PluginRegistryCacheLoad } from "../backend";
+import { isPublishedExport } from "../publishedBackend";
 import {
   PLUGIN_API_VERSION,
   PLUGIN_CAPABILITIES,
@@ -508,7 +509,9 @@ async function applyLiveSnapshot(
 export async function refreshCommunityRegistry(
   options: { timeoutMs?: number } = {}
 ): Promise<void> {
-  if (!COMMUNITY_REGISTRY_ENABLED) return;
+  // A published export never fetches the registry (startup skips it and so
+  // must every later retry).
+  if (!COMMUNITY_REGISTRY_ENABLED || isPublishedExport()) return;
   const generation = ++refreshGeneration;
   setRegistryState("loading");
   try {

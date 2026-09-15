@@ -1,3 +1,4 @@
+import type { ViewSettings } from "./editor/queryIr";
 // TS mirrors of the Rust DTOs (crates/logseq-core/src/model.rs).
 
 export type PageKind = "journal" | "page";
@@ -1129,6 +1130,57 @@ export interface PdfState {
   highlights: Highlight[];
   page: number | null;
   scale: number | null;
+}
+
+/** "Export query results…": what the query surface executed plus the user's
+ *  export choices. `query` is the EFFECTIVE source the surface ran. Mirrors
+ *  Rust `publish::query_export::QueryPublicationRequest` (camelCase). */
+export interface QueryPublicationRequest {
+  query: string;
+  advanced: boolean;
+  simpleDialect?: "og" | "tql";
+  currentPage?: string | null;
+  view?: ViewSettings | null;
+  hostBlockId?: string | null;
+  /** The host block's `tine.*` properties, as handed to `parseQuery`; the
+   *  export's home block carries them so it opens under the same display. */
+  hostProperties?: [string, string][];
+  name: string;
+  /** The exact reviewed leaf folder; carried back unchanged on confirm. */
+  folder?: string | null;
+  replace?: boolean;
+  /** Byte budget for copied assets (Settings → Graph); `null` = the backend default. */
+  assetBudgetBytes?: number | null;
+}
+
+export interface QueryPublicationPage {
+  path: string;
+  name: string;
+  journal: boolean;
+}
+
+/** The reviewed plan: shown by the dialog, its fingerprint echoed on confirm. */
+export interface QueryPublicationPlan {
+  anchor: "block" | "page";
+  rowCount: number;
+  sampled: boolean;
+  boundPage: string | null;
+  pages: QueryPublicationPage[];
+  folder: string;
+  path: string;
+  exists: boolean;
+  suggestedFolder: string | null;
+  fingerprint: string;
+}
+
+/** What a static export produced (`publish_query`). */
+export interface PublishOutcome {
+  path: string;
+  pages: number;
+  /** Where the previous occupant of the folder was retired, when there was one. */
+  retired: string | null;
+  /** Non-fatal omissions (an asset that was missing or over the size limit). */
+  warnings: string[];
 }
 
 /** Options for the print-to-PDF export (chosen in the pre-export dialog). Field

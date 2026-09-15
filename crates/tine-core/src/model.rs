@@ -25298,7 +25298,7 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
     }
 }
 
-fn page_dto_checked(entry: &PageEntry, doc: &Document) -> io::Result<PageDto> {
+pub(crate) fn page_dto_checked(entry: &PageEntry, doc: &Document) -> io::Result<PageDto> {
     Ok(PageDto {
         activation: None,
         name: entry.name.clone(),

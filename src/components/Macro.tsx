@@ -1,8 +1,10 @@
 import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
-import { backend, QueryPrintRefusedError, type QueryNotReadyError } from "../backend";
+import { backend, QueryPrintRefusedError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
+import { isPublishedExport } from "../publishedBackend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
-import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
+import { queryExportBudgetBytes } from "../queryExportBudget";
+import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openQueryExport, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, undo, undoTopTag, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
@@ -69,7 +71,7 @@ import { InlineText } from "../render/inline";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
 import { SheetContainer } from "./SheetContainer";
-import type { PageKind, RefGroup } from "../types";
+import type { PageKind, QueryPublicationRequest, RefGroup } from "../types";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
@@ -452,7 +454,10 @@ export function QueryMacro(props: {
     if (!currentPageMarker()) return null;
     const pageName = focusedQueryPage();
     if (!pageName) return null; // no focused page: leave verbatim, like templates
-    return arg().replace(/<%\s*current page\s*%>/gi, `[[${pageName}]]`);
+    // A function replacer: a page named `A$&B` must be spliced literally, not
+    // read as a `$&` replacement pattern (the native export substitutes the
+    // same text and must produce the same argument).
+    return arg().replace(/<%\s*current page\s*%>/gi, () => `[[${pageName}]]`);
   });
   const executionRequest = createMemo(() => {
     const argument = executionArg();
@@ -475,6 +480,12 @@ export function QueryMacro(props: {
    *  for as long as the projection needs — widens exactly that window. The
    *  displayed rows are unaffected: `groupResource` keeps its own `latest`. */
   const executionReading = (): ParsedQuery | undefined => {
+    // `latest` throws once the fetcher rejected (a published export refuses a
+    // substituted argument it never baked — the macro shown in another page's
+    // Linked References); with no error boundary above, that throw would blank
+    // the page. A rejected execution parse is "no runnable form", and the
+    // refusal is surfaced through `emptyResultsMessage` instead.
+    if (executionParsed.error) return undefined;
     const snapshot = executionParsed.latest;
     return snapshot && snapshot.request.argument === executionArg() ? snapshot.reading : undefined;
   };
@@ -490,6 +501,36 @@ export function QueryMacro(props: {
   // uses (never authoring rewrites): presentation and execution can't disagree
   // about what ran (GH #301).
   const friendlySearch = createMemo(() => savedDslToFriendlySearch(executableForm()));
+  /** Why "Export query results…" is not offered for this query, or null. A
+   *  Friendly saved search runs through a different execution path and is not
+   *  exportable yet; a query with no runnable reading has nothing to export. */
+  const exportRefusal = (): string | null => {
+    if (friendlySearch() !== null) return "Friendly searches can't be exported yet";
+    if (!runnable()) return "The query has not been read yet";
+    return null;
+  };
+  /** Exactly what this surface executed: the substituted form, the anchor's
+   *  effective view, the bound current page, and the host block — so the
+   *  export resolves the SAME rows the header count shows. */
+  const exportRequest = (): QueryPublicationRequest | null => {
+    const reading = runnable();
+    if (!reading || exportRefusal()) return null;
+    const kind = reading.query.source.kind;
+    const page = executionPage();
+    return {
+      query: executableForm(),
+      advanced: kind === "advanced",
+      simpleDialect: kind === "tql" ? "tql" : "og",
+      currentPage: page ?? null,
+      view: reading.query.anchor === "page" ? pageResultView() : blockResultView(),
+      hostBlockId: props.blockId ?? null,
+      hostProperties: blockDirectives(),
+      name: titleOption() ?? "",
+      folder: null,
+      replace: false,
+      assetBudgetBytes: queryExportBudgetBytes(),
+    };
+  };
   const sheet = createMemo(() => {
     if (!props.blockId || !doc.byId[props.blockId]) return null;
     return sheetConfig(facetsOf(doc.byId[props.blockId].raw, formatForBlock(props.blockId)).properties);
@@ -1270,9 +1311,25 @@ export function QueryMacro(props: {
    *  "why empty?" affordance describe an ANSWER; before the first operation
    *  lands (parse pending, engine rebuilding) there is no answer to explain. */
   const ranEmpty = () => !!displayedOperation() && !groupResource.loading && !groupResource.error && total() === 0;
+  /** The view the execution above actually ran under — the anchored section's
+   *  effective settings (a page-anchored query runs under the Pages settings,
+   *  a block-anchored one under the Blocks settings), NOT the singular
+   *  `displayView()`: a scoped `tine.block-sample::` is invisible there. */
+  const executedView = (): ViewSettings => runnable()?.query.anchor === "page" ? pageResultView() : blockResultView();
+  /** The typed refusal of either parse — authored or execution-side — when no
+   *  operation has landed: a published export answers only the queries it
+   *  was made with, and says so instead of "unavailable". */
+  const parseRefusal = (): QueryUnavailableError | null => {
+    if (displayedOperation()) return null;
+    for (const error of [parsedSnapshot.error, executionParsed.error]) {
+      if (error instanceof QueryUnavailableError) return error;
+    }
+    return null;
+  };
   const emptyResultsMessage = () => groupsPending()?.message ?? parsePending()?.message
-    ?? (groupResource.error || (!displayedOperation() && parsedSnapshot.error)
-      ? "Query results unavailable"
+    ?? (groupResource.error || (!displayedOperation() && (parsedSnapshot.error || executionParsed.error))
+      // A typed refusal explains itself; anything else stays generic.
+      ? (parseRefusal()?.message ?? "Query results unavailable")
       : groupResource.loading || !displayedOperation() ? "Loading query results…" : "No results");
   const groupsError = () => {
     const error = groupResource.error;
@@ -1542,10 +1599,14 @@ export function QueryMacro(props: {
   // The query text pane holds text that does not parse: the rows below are the
   // last reading that RAN, so they are greyed rather than blanked (§4.3.1).
   const [paneStale, setPaneStale] = createSignal(false);
+  /** A published export (Stage 2) shows each query exactly as it was baked:
+   *  no builder, no view switcher, no re-export — the snapshot cannot answer a
+   *  changed query, so the controls that would change one are not offered. */
+  const published = isPublishedExport();
   /** Whether the sentence-and-sheet builder is hosted for this block. The
    *  result count lives beside the sentence when it is, and in the header when
    *  it is not (§7.2). */
-  const showBuilder = () => !!props.blockId && !isAdvanced() && !!builderSession();
+  const showBuilder = () => !!props.blockId && !isAdvanced() && !!builderSession() && !published;
   /** **Where the inline Display panel is offered** (P5B).
    *
    *  It needs a block to write `tine.*` to and a builder to host it — and it is
@@ -1999,7 +2060,29 @@ export function QueryMacro(props: {
               <Show when={!showBuilder()}>
                 <span class="query-count">{total()}</span>
               </Show>
-              <Show when={props.blockId && !inlineDisplay()}>
+              {/* A published export has no builder sentence to say the rows
+                  are a sample; the header says it, so a reader knows the
+                  count is not the whole answer. */}
+              <Show when={published && executedView().sample !== undefined}>
+                <span class="query-sample-note" title="The export shows a sample of the matching rows">
+                  {" "}sample of {executedView().sample}
+                </span>
+              </Show>
+              <Show when={props.blockId && !exportRefusal() && !published}>
+                <button
+                  type="button"
+                  class="query-export-button"
+                  title="Export the pages containing these results as a static site"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const request = exportRequest();
+                    if (request) openQueryExport(request);
+                  }}
+                >
+                  Export…
+                </button>
+              </Show>
+              <Show when={props.blockId && !inlineDisplay() && !published}>
                 <div class="query-view-switcher" role="group" aria-label="Query view" onClick={stop}>
                   <For each={QUERY_VIEWS}>
                     {(view) => (

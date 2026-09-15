@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, PublishOutcome, QueryExecution, QueryExportBatch, QueryPublicationPlan, QueryPublicationRequest, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
 import { sourceOptions, sourceOriginal } from "./editor/queryIr";
 import { groupingToViewValue, resolveQueryGrouping } from "./editor/queryViewProperties";
 import type {
@@ -1341,6 +1341,25 @@ export function mockBackend(): Backend {
     },
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];
+    },
+    async publishQueryPlan(request: QueryPublicationRequest): Promise<QueryPublicationPlan> {
+      const folder = request.folder ?? (request.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "query");
+      return {
+        anchor: request.advanced ? "block" : "block",
+        rowCount: 3,
+        sampled: false,
+        boundPage: request.currentPage ?? null,
+        pages: all.slice(0, 3).map((p) => ({ path: `pages/${p.name}.md`, name: p.name, journal: false })),
+        folder,
+        path: `/mock/graph/published-queries/${folder}`,
+        exists: false,
+        suggestedFolder: null,
+        fingerprint: "mock-fingerprint",
+      };
+    },
+    async publishQuery(request: QueryPublicationRequest, _fingerprint: string): Promise<PublishOutcome> {
+      const folder = request.folder ?? "query";
+      return { path: `/mock/graph/published-queries/${folder}`, pages: 3, retired: null, warnings: [] };
     },
     async pagePrintHtml(name: string, _opts): Promise<string> {
       // Dev-preview stub: a small self-contained doc so the print harness/flow can

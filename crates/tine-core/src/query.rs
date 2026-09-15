@@ -59,6 +59,7 @@ pub(crate) mod export_results;
 pub(crate) mod friendly;
 pub(crate) mod tql;
 pub mod view;
+pub mod wire_parse;
 
 use eval::EvalCtx;
 use ir::{

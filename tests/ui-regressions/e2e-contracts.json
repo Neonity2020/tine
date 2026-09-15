@@ -1485,6 +1485,49 @@
    ],
    "stability": "quarantined",
    "quarantineReason": "2026-09-09: Initial parallel Direct run timed out creating its WebDriver session before the app launched; unchanged binary and script passed when rerun sequentially. Managed also passed. Retain as nonblocking until startup instability is resolved and sequential burn-in is recorded."
+  },
+  "scripts/e2e-publish-query.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "Export\u2026 on a block query publishes the whole owner pages of its results (and only those) into published-queries/<name>/, with outside page links inert and referenced assets copied into the folder.",
+     "blocking": false
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "The dialog lists the owner pages before anything is written and will not export a block query until whole-page export is acknowledged.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "Exact HTML structure, ordering and styling of the exported pages may vary while page membership, link inertness and asset copying hold."
+   ],
+   "nonRequirements": [
+    "No screenshots, geometry, toast wording or search-index contents are asserted."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-published-app.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A query export served over HTTP opens as the read-only Tine app: the root redirects to app/, the export's home page shows the exported query's rows, the Quick Switcher opens an exported page, and Linked References are the export's own.",
+     "blocking": false
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Tine published query export read-only contract (docs/contracts/typed-errors.md, Published query exports; ADR 0065)",
+     "userOutcome": "Nothing in the export can be edited: clicking a block opens no editor and keystrokes leave the exported text unchanged; ?static keeps the static site.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "The app's layout, styling and the exact row rendering may vary while page membership, query rows, navigation and read-only behaviour hold."
+   ],
+   "nonRequirements": [
+    "No screenshots, geometry, toast wording, search ranking or bundle file names are asserted."
+   ],
+   "stability": "stable"
   }
  }
 }

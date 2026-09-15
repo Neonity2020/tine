@@ -41,7 +41,7 @@ interface ConsoleSiteLocation extends ConsoleSite {
 // from (c) to (d): it keeps a failure's type, size and identity and drops its
 // message.
 type ConsoleBucket = "a" | "b" | "c" | "d";
-const CONSOLE_ALLOWLIST_SIZE = 21;
+const CONSOLE_ALLOWLIST_SIZE = 22;
 
 // Rows are keyed by CONTENT, not by line number, and that is the whole point of
 // the `anchor` column.
@@ -68,6 +68,7 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class:
   { file: "logbook.ts", anchor: "f27172cceded", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — the marker transition runs over the block's own text" },
   { file: "main.tsx", anchor: "3de353ced60a", method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
   { file: "main.tsx", anchor: "e4a2943c031b", method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
+  { file: "main.tsx", anchor: "9ea897047c15", method: "error", bucket: "d", class: "local-error", why: "published snapshot fetch failure is an HTTP status or a file:// refusal; no graph content is loaded yet" },
   { file: "pdfRenderCoordinator.ts", anchor: "0ad719767700", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pdf.js render rejections name the document they failed on" },
   { file: "persistence.ts", anchor: "56ce51bc820d", method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
   { file: "persistence.ts", anchor: "a6c2fe5eb40f", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a managed conflict capture error is prose about the saved page" },

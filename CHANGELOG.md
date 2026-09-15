@@ -8,6 +8,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Export…** on any query publishes the pages its results live on as a
+  standalone HTML site under `published-queries/<name>/`, regardless of
+  `public::`. The dialog reviews the page list first; a block query exports
+  whole pages and says so. Links to pages outside the export stay inert,
+  nested queries show only in-export results, and referenced images and files
+  are copied into the folder so it can be moved anywhere. An export that
+  would copy more than the new **Query export size limit** (Settings → Graph)
+  stops and offers the setting; a taken name can be replaced (the previous
+  export is kept in recovery) or given a separate folder. `published-queries/`
+  is never read back as pages. Queries inside the exported pages are run the
+  way the app runs them (`<% current page %>` resolves to the page, `#+BEGIN_QUERY`
+  blocks keep their table view).
+- A query export also ships an **app version**: served over HTTP, the folder
+  opens as a read-only copy of Tine over a snapshot baked at export time — the
+  query's results on the export's own home page, Ctrl+K page navigation,
+  Linked References and block previews, with every answer computed by Tine at
+  export time and nothing editable. Queries show the results they had when
+  exported, under the view they had; view changes and new queries are refused with a typed
+  reason. `index.html` opened from disk, or with `?static`, keeps the plain
+  static site.
+
 ## [0.6.983] - 2026-09-14
 
 ### Added

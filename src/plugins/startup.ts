@@ -1,6 +1,7 @@
 import { initThemeGallery } from "../themeGallery";
 import { initThemePackages } from "../themes/manager";
 import { platformKind } from "../platform";
+import { isPublishedExport } from "../publishedBackend";
 import { pluginManager } from "./manager";
 import {
   loadVerifiedCachedRegistry,
@@ -22,6 +23,11 @@ export async function startCommunityExtensions(
     platform?: "desktop" | "android" | "ios";
   } = {}
 ): Promise<CommunityExtensionStartup> {
+  // A published query export (Stage 2) ships no plugins or themes and must not
+  // fetch the community registry from a reader's browser.
+  if (isPublishedExport()) {
+    return { initialRevocations: new Set(), pluginInitialization: Promise.resolve(), liveRefresh: Promise.resolve() };
+  }
   const platform = options.platform ?? await platformKind();
   const cached = await loadVerifiedCachedRegistry(options.cacheTimeoutMs);
   const initialRevocations = seedCachedCommunityRegistry(cached);

@@ -1,5 +1,6 @@
 import { Match, Show, Suspense, Switch, createEffect, createMemo, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
+import { isPublishedExport } from "./publishedBackend";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
 import { QuickSwitcher } from "./components/QuickSwitcher";
@@ -37,6 +38,7 @@ import {
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
 import { PdfExportDialog } from "./components/PdfExportDialog";
+import { QueryExportDialog } from "./components/QueryExportDialog";
 import { StartupRecoveryLayer } from "./components/StartupRecovery";
 import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
@@ -129,6 +131,7 @@ import { initRefCompletionSettings } from "./refCompletionSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initSettingsLayout } from "./settingsLayout";
+import { initQueryExportBudget } from "./queryExportBudget";
 import {
   conflictPolicyAlwaysAsk,
   holdExternalChange,
@@ -1202,6 +1205,7 @@ export function App(): JSX.Element {
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
   onMount(() => void initSettingsLayout());
+  onMount(() => void initQueryExportBudget());
   onMount(() => void initConflictPolicy());
   // Demo gate for the screenshot harness (mirrors `?conflicts`): turn the
   // always-ask policy on and hold one external change, so the bar is visible
@@ -1786,6 +1790,7 @@ export function App(): JSX.Element {
             />
             {/* Settings sits apart at the far right (separated by a divider) so
                 it reads as app-level config, not another content control. */}
+            <Show when={!isPublishedExport()}>
             <span class="topbar-sep" />
             <button class="icon-btn" title="Settings (t s)" onClick={() => openSettings()}>
               <svg viewBox="0 0 24 24" class="nav-icon" aria-hidden="true">
@@ -1795,6 +1800,7 @@ export function App(): JSX.Element {
                 />
               </svg>
             </button>
+            </Show>
             {/* Frameless-window controls live at the very right, where the native
                 title bar's buttons used to be. Hidden when the OS draws its own
                 (macOS Overlay always; Linux/Windows when the native-frame toggle
@@ -1849,6 +1855,7 @@ export function App(): JSX.Element {
       <ExportModal />
       <UnsavedRecovery />
       <PdfExportDialog />
+      <QueryExportDialog />
       <Show when={settingsOpen()}>
         <Suspense>
           <Settings />

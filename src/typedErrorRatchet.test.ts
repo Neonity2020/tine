@@ -344,7 +344,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(contract).toContain("## `CommandError` boundary");
-    expect(contract).toContain("The phase-A syntactic census is 116 production sites");
+    expect(contract).toContain("The phase-A syntactic census is 123 production sites");
 
     const quitFixtures = commands.slice(
       commands.indexOf("mod prepare_tine_quit_tests"),
@@ -357,7 +357,9 @@ describe("I-9/I-11 typed backend error boundary", () => {
     // wrong-reply arm, the category the contract's Prose census already records
     // as having no typed source. The ratchet retires legacy untyped WORDING; it
     // is not a cap on the managed-command surface. See docs/contracts/typed-errors.md.
-    expect(proseSites).toBe(116);
+    // 123, not 116 (2026-09-14): publish_query_plan/publish_query carry the
+    // same three arms each, plus the core's composed Refused(String) pass-through.
+    expect(proseSites).toBe(123);
 
     const phaseB = parity.slice(
       parity.indexOf("const PHASE_B_COMMANDS"),

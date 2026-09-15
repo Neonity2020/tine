@@ -1200,13 +1200,20 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/publish.rs", "cap.create_dir", 2),
-        ("crates/tine-core/src/publish.rs", "cap.create_dir_all", 1),
-        ("crates/tine-core/src/publish.rs", "cap.rename", 2),
+        // Stage-side parents: the recovery slot, a query export's parent
+        // (`published-queries/`) and copied-asset subdirectories, all inside
+        // bound handles.
+        ("crates/tine-core/src/publish.rs", "cap.create_dir_all", 3),
+        // Retire a previous occupant into recovery, plus the create-only
+        // path's own-stage retirement when another export appeared.
+        ("crates/tine-core/src/publish.rs", "cap.rename", 3),
         // Owner-private temporary query storage: Unix creates through a mode
         // 0700 builder; Windows creates with an explicit protected DACL.
         ("crates/tine-core/src/publish.rs", "fs.dir_builder", 1),
         ("crates/tine-core/src/publish.rs", "fs.remove_dir_all", 1),
-        ("crates/tine-core/src/publish.rs", "open.create_new", 1),
+        // Page files and copied assets are each written create-new into the
+        // stage handle.
+        ("crates/tine-core/src/publish.rs", "open.create_new", 2),
         (
             "crates/tine-core/src/publish/private_directory.rs",
             "fs.remove_dir",
@@ -1416,9 +1423,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("create_projection_chain_component", 2),
         ("empty_asset_trash", 1),
         ("reserve_publish_stage", 1),
-        ("reserve_publish_recovery", 2),
+        ("reserve_publish_recovery", 3),
         ("commit_publish_stage", 1),
-        ("write_publish_stage_file", 8),
+        // 9: a query export's app bake adds the stage-root redirect script
+        // that sends an HTTP visitor from the static front door to `app/`.
+        ("write_publish_stage_file", 9),
         ("pending_projection_cleanup_bounded", 2),
         ("validate_pending_cleanup_round_root", 2),
         ("remove_mutation_authority_if_exact", 3),
