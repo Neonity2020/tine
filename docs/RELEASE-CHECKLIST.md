@@ -36,29 +36,6 @@ may tag, publish, comment, and close issues.
    against the production-protocol candidate binary. Retain screenshots, DOM,
    console/backend logs, graph diff, JUnit, and JSON on failure. See
    `docs/UI-REGRESSION-TESTING.md` for the exact binary and evidence contract.
-   This catalog must include the two-device managed-storage journey: two real
-   Tine processes with separate private app data discover/join one synchronized
-   graph, exchange edits in both directions, cold-reopen, and prove the explicit
-   Return-to-Direct-Files escape path.
-   The frozen candidate's full CI must also pass the Android app-UID managed
-   runtime journey: activate on shared storage, save exact bytes, stop without
-   a clean drain, recover those bytes on reopen, prepare sharing, cleanly stop,
-   and reopen again.
-   Also run the private-corpus Linux managed-storage gate locally against the
-   same exact candidate and receipt (never in GitHub Actions, and never against
-   the source corpus itself):
-
-   ```bash
-   TINE_MANAGED_REAL_GRAPH=/path/to/read-only/real-scale-anonymized-graph \
-   TINE_APP=/path/to/exact-candidate/tine \
-   TINE_E2E_BUILD_RECEIPT=/path/to/exact-candidate/tine.build.json \
-     npm run e2e:linux:managed-real-release
-   ```
-
-   It copies the corpus into disposable roots, proves two consecutive visible
-   edit / ten-second settle / SIGKILL / same-state reopen cycles, then proves a
-   fresh second installation can join and exchange visible edits in both
-   directions without manual actor ticks. Retain both scenario receipts.
 6. As soon as that frozen candidate passes its local exact-commit gates, deploy
    that exact tested artifact to `~/research/tine` without waiting to be asked.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual
@@ -81,30 +58,7 @@ may tag, publish, comment, and close issues.
    not permission to weaken the budget. Also run `npm run bench:startup` against
    the immutable v0.4.7 native binary, retain its timing JSON and early-frame
    sequence, and inspect those frames for new blank, intermediate, or corrupt
-   paints before shipping. While Tine-managed storage is present, also run the
-   exact candidate against a copied real-scale graph (at least 1,000 text
-   files), not merely the small synthetic fixture:
-
-   ```bash
-   TINE_STORAGE_MODE_SEED_GRAPH=/path/to/real-scale-anonymized-graph \
-     xvfb-run -a dbus-run-session -- npm run bench:storage-mode -- \
-       --app /path/to/exact-candidate/tine \
-       --output-dir test-results/storage-mode
-   npm run check:bench:storage-mode -- \
-     --storage-mode test-results/storage-mode/storage-mode.json
-   npm run bench:managed-native -- \
-     --real-graph /path/to/real-scale-anonymized-graph \
-     --secondary-graph /path/to/second-representative-graph \
-     --output-dir test-results/managed-storage-perf
-   ```
-
-   These are release-only gates, not between-release tax. They cover paired
-   Direct/managed cold open, edit-to-durable-file, input-handler and scheduling
-   latency; aged crash reopen and forced SQLite rebuild; real-graph reads;
-   ordinary and maximum 511-block saves; Tine's two-device application latency;
-   broad reconciliation and safe shutdown. A changed source commit invalidates
-   both receipts. Keep the `<50 ms` managed 511-block save p95 and `<10 s`
-   recurring rebuild ceilings; do not weaken either to ship.
+   paints before shipping.
 9. Push the frozen exact candidate, manually dispatch `ci.yml` with
    `scope=full`, and require all nine full jobs to succeed on that SHA,
    including the Linux nextest inventory contract and all four hash shards plus

@@ -29,7 +29,7 @@
 //
 // It also fixes, once, three things that were right in some copies and wrong in
 // others: block hits are excluded (a block whose text contains the page title
-// outranked the page itself and broke the hosted Windows managed-storage
+// outranked the page itself and broke the hosted Windows reporter-scale
 // journey), names are compared NFC-normalized (macOS/Linux filename twins), and
 // `[[ ]]` link decoration is tolerated when routing through a rendered link,
 // since `:ui/show-brackets?` defaults to on.

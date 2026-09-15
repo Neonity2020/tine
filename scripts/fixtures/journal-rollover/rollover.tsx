@@ -1,7 +1,7 @@
 import { render } from "solid-js/web";
 import { PageView } from "../../../src/components/Page";
 import { backend } from "../../../src/backend";
-import { managedStorageRuntime } from "../../../src/managedStorageRuntime";
+import { graphBindingRuntime } from "../../../src/graphBindingRuntime";
 import { initParser } from "../../../src/render/parse";
 import { journalTitle, localDayKey } from "../../../src/journal";
 import { doc, setRaw } from "../../../src/store";
@@ -9,7 +9,7 @@ import { editingId, startEditing } from "../../../src/editorController";
 import "../../../src/styles/app.css";
 
 await initParser();
-managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
 const oldTitle = journalTitle(new Date());
 let reads = 0;
 backend().journalFeedPage = async () => {

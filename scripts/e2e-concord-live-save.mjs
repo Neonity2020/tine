@@ -1,6 +1,6 @@
 // Harvest B3 live-conflict capsule matrix.
 //
-// For Direct Files and Tine-managed storage, two retained drafts race external
+// Two retained Direct Files drafts race external
 // atomic replacements. A full process restart must restore both exact drafts;
 // one is resolved to the retained draft and one to the current storage owner.
 // The graph-keyed native capsule is observed before restart, shrinks after the
@@ -120,11 +120,7 @@ function assertCapsuleRecord(capsule, item, mode, expectedBaseRev) {
     || (expectedBaseRev !== undefined && capsule.live.base_rev !== expectedBaseRev)) {
     throw new Error(`${mode}:${item.name}: exact load baseline is missing or changed`);
   }
-  if (mode === "managed") {
-    if (capsule.live.disk_rev !== undefined || capsule.live.conflict_epoch !== -1) {
-      throw new Error(`${mode}:${item.name}: replacement authority leaked into the durable capsule`);
-    }
-  } else if (typeof capsule.live.disk_rev !== "string") {
+  if (typeof capsule.live.disk_rev !== "string") {
     throw new Error(`${mode}:${item.name}: durable Direct disk revision is missing`);
   }
 }
@@ -134,49 +130,6 @@ async function visibleButtonContaining(browser, text) {
     if (await button.isDisplayed() && (await button.getText()).includes(text)) return button;
   }
   return undefined;
-}
-
-async function acceptNativeConfirmation(env, label, before) {
-  const dialog = await waitFor(
-    () => windowIds(env).find((id) => !before.has(id)),
-    30_000,
-    `${label} did not show its native confirmation`,
-  );
-  execFileSync("xdotool", ["windowactivate", "--sync", dialog], { env });
-  execFileSync("xdotool", ["key", "--clearmodifiers", "alt+y"], { env });
-  await waitFor(() => !windowIds(env).includes(dialog), 30_000, `${label} confirmation did not close`);
-}
-
-async function enableManagedStorage(browser, env) {
-  const trigger = await browser.$('button[title^="Settings"]');
-  await trigger.waitForDisplayed({ timeout: 30_000 });
-  await trigger.click();
-  await browser.$(".settings-modal").waitForDisplayed({ timeout: 30_000 });
-  const tab = await waitFor(
-    () => visibleButtonContaining(browser, "Backups & recovery"),
-    30_000,
-    "Backups & recovery settings tab was absent",
-  );
-  await tab.click();
-  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
-  await experimental.waitForDisplayed({ timeout: 30_000 });
-  if ((await experimental.getAttribute("aria-expanded")) !== "true") await experimental.click();
-  const action = await waitFor(
-    () => visibleButtonContaining(browser, "Enable Tine-managed storage..."),
-    30_000,
-    "managed activation action was absent",
-  );
-  const before = new Set(windowIds(env));
-  await action.click();
-  await acceptNativeConfirmation(env, "managed activation", before);
-  await browser.waitUntil(async () => (await browser.$("body").getText()).includes("Tine-managed storage active"), {
-    timeout: 300_000,
-    interval: 250,
-    timeoutMsg: "managed activation did not reach active",
-  });
-  const close = await browser.$(".settings-pane-head .icon-btn:not(.settings-maximize)");
-  await close.click();
-  await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 30_000 });
 }
 
 async function openPage(browser, title) {
@@ -271,7 +224,7 @@ async function waitForApp(browser, phase) {
 }
 
 async function runBackend(mode) {
-  const suffix = MISSING_TARGET ? "direct-missing" : mode === "managed" ? "managed" : "direct";
+  const suffix = MISSING_TARGET ? "direct-missing" : "direct";
   const graph = `/tmp/tgraph-concord-live-save-${suffix}`;
   const xdg = `/tmp/txdg-concord-live-save-${suffix}`;
   const data = `${xdg}/data`;
@@ -386,7 +339,6 @@ async function runBackend(mode) {
     await startDriver("initial");
     browser = await newSession();
     await waitForApp(browser, `${suffix}:initial`);
-    if (mode === "managed") await enableManagedStorage(browser, env);
 
     const cases = [
       {
@@ -551,8 +503,7 @@ try {
     supportingWindow: execFileSync("xprop", ["-root", "_NET_SUPPORTING_WM_CHECK"], { encoding: "utf8" }).trim(),
   }, null, 2));
   await runBackend("direct");
-  if (!MISSING_TARGET) await runBackend("managed");
-  console.log("PASS: Harvest B3 Direct/Managed restart capsule matrix");
+  console.log("PASS: Harvest B3 Direct restart capsule matrix");
 } catch (error) {
   failure = error;
   console.error("FAIL:", error?.stack ?? error);

@@ -6,10 +6,6 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  ONE_RELEASE_CI_EXCEPTION_VERSION,
-  releaseE2eScenarioIsNonblocking,
-} from "./release-ci-exception.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
 import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
 import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release-proof-reuse-lib.mjs";
@@ -20,15 +16,8 @@ const suiteName = process.argv[2] ?? "linux-smoke";
 const only = process.argv.find((arg) => arg.startsWith("--scenario="))?.slice("--scenario=".length);
 const app = path.resolve(process.env.TINE_APP || path.join(root, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine"));
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
-const longFocusedWindows = suiteName === "windows-smoke"
-  && ["windows-managed-storage", "windows-direct-large-open"].includes(only);
-const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (
-  only === "windows-managed-storage"
-    ? 35 * 60_000
-    : longFocusedWindows
-      ? 15 * 60_000
-      : 180_000
-));
+const longFocusedWindows = suiteName === "windows-smoke" && only === "windows-direct-large-open";
+const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (longFocusedWindows ? 15 * 60_000 : 180_000));
 const suiteStartedAt = new Date().toISOString();
 function gitOutput(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
@@ -97,59 +86,6 @@ const suites = {
   "og-parity-pilot": [
     ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
   ],
-  // Experimental candidate gate: intentionally separate from broad release
-  // coverage so it is run only with the exact sparse-v2 candidate receipt.
-  "sparse-v2-recovery": [
-    ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
-    // Direct Files and Tine-managed storage are peers, so BOTH joining-device
-    // starting states are first-class legs of this gate. Neither is a smoke
-    // test of the other and neither may be dropped to save wall clock.
-    ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
-    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
-      TINE_E2E_JOIN_ORDERING: "join-from-managed",
-      // This leg deliberately exercises three partial provider deliveries,
-      // declines adoption, and proves the original managed history again after
-      // a clean reopen. It takes ~177s locally, so the ordinary 180s scenario
-      // ceiling is not a meaningful product gate on slower hosted runners.
-      E2E_SCENARIO_TIMEOUT_MS: "240000",
-    }],
-  ],
-  "managed-journal-feed": [
-    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
-  ],
-  // A per-block (P4) Managed store must be preserved and rebuilt from
-  // Markdown/Org. The journey needs a P4-built producer in TINE_P4_APP beside
-  // the exact candidate, so it is its own suite rather than a hosted one.
-  "managed-p4-rebuild": [
-    ["managed-p4-rebuild", "scripts/e2e-managed-p4-rebuild.mjs", {}],
-  ],
-  "absence-sweeps": [
-    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
-  ],
-  // Release-only local proof on a copied private corpus. This suite is kept
-  // separate from hosted coverage so neither the source graph nor a derivative
-  // can enter GitHub Actions artifacts.
-  "linux-managed-real-release": [
-    ["managed-force-close-recovery", "scripts/e2e-managed-force-close-recovery.mjs", {
-      TINE_MANAGED_RECOVERY_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
-      TINE_MANAGED_RECOVERY_SETTLE_MS: "10000",
-      TINE_MANAGED_RECOVERY_KILL_CYCLES: "2",
-    }],
-    ["sparse-v2-two-device-real", "scripts/e2e-sparse-v2-two-device.mjs", {
-      TINE_MANAGED_SYNC_GRAPH: process.env.TINE_MANAGED_REAL_GRAPH,
-      // Deliberately NO E2E_SCENARIO_TIMEOUT_MS here. A per-scenario entry is
-      // merged AFTER process.env (see `env` below), so it OVERRIDES the suite's
-      // own ceiling rather than raising a bare default. This suite is invoked as
-      // `npm run e2e:linux:managed-real-release`, which already exports
-      // E2E_SCENARIO_TIMEOUT_MS=1800000 for the whole run; an entry of "240000"
-      // here silently cut this leg from 30 minutes to 4. That is exactly what
-      // this line used to do, and it is why the leg was SIGKILLed at 240.1s on
-      // 2026-09-10 while passing standalone at 157-164s.
-      //
-      // If you are running this scenario by hand, set the ceiling on the
-      // PROCESS, the way the npm script does — do not add it here.
-    }],
-  ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
@@ -170,8 +106,6 @@ const suites = {
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["journal-format", "scripts/e2e-journal-format.mjs", {}],
     ["journal-future-feed", "scripts/e2e-journal-future-feed.mjs", {}],
-    ["managed-journal-feed", "scripts/e2e-managed-journal-feed.mjs", {}],
-    ["absence-sweeps", "scripts/e2e-absence-sweeps.mjs", {}],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["formula-builder", "scripts/probe-formula-builder.mjs", {}],
@@ -186,19 +120,10 @@ const suites = {
     ["plugin-revocation", "scripts/e2e-plugin-revocation.mjs", {}],
     ["plugin-graph-ownership", "scripts/e2e-plugin-graph-ownership.mjs", {}],
     ["external-assets", "scripts/e2e-external-assets.mjs", {}],
-    ["sparse-v2-two-device", "scripts/e2e-sparse-v2-two-device.mjs", {}],
-    ["sparse-v2-two-device-managed-join", "scripts/e2e-sparse-v2-two-device.mjs", {
-      TINE_E2E_JOIN_ORDERING: "join-from-managed",
-      E2E_SCENARIO_TIMEOUT_MS: "240000",
-    }],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: process.env.E2E_WINDOW_MANAGER || "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
-    // Print answers queries from the current main SQLite image on BOTH backends,
-    // so the contract's both-backend claim needs two selected arms, not one run
-    // by hand. Managed differs only in where the page body comes from.
-    ["print-security-managed", "scripts/e2e-print-security.mjs", { E2E_PRINT_MANAGED: "1" }],
     ["block-embed", "scripts/e2e-block-embed.mjs", {}],
     ["compat-home-current-page", "scripts/e2e-compat-home-current-page.mjs", {}],
     ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
@@ -273,7 +198,6 @@ const suites = {
     // Fixing that is a precondition for attempt four being cheaper than these.
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
     ["windows-direct-large-open", "scripts/e2e-windows-direct-large-open.mjs", {}],
-    ["windows-managed-storage", "scripts/e2e-windows-managed-storage.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
     ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
   ],
@@ -282,14 +206,6 @@ const suites = {
 if (!suites[suiteName]) {
   console.error(`unknown suite ${suiteName}; choose ${Object.keys(suites).join(", ")}`);
   process.exit(2);
-}
-if (suiteName === "linux-managed-real-release") {
-  if (e2eMode !== "release") {
-    throw new Error("linux-managed-real-release must run with TINE_E2E_MODE=release");
-  }
-  if (!process.env.TINE_MANAGED_REAL_GRAPH) {
-    throw new Error("linux-managed-real-release requires TINE_MANAGED_REAL_GRAPH pointing at a read-only local corpus");
-  }
 }
 
 function loadSelectedContracts(scenarios) {
@@ -482,7 +398,6 @@ function failureIsBlocking(status, contractEntry, scenarioId) {
   // deterministic semantic readiness predicate again.
   if (contractEntry.stability === "quarantined") return false;
   if (e2eMode === "release") {
-    if (releaseE2eScenarioIsNonblocking(suiteName, scenarioId)) return false;
     return contractEntry.contracts.some((contract) => contract.class !== "flexible-presentation-heuristic");
   }
   return contractEntry.contracts.some((contract) => contract.blocking);
@@ -657,9 +572,6 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       archiveInfrastructureAttempt(dir, attempt);
       continue;
     }
-    const releaseException = status === "failed"
-      && e2eMode === "release"
-      && releaseE2eScenarioIsNonblocking(suiteName, id);
     const record = {
       id,
       script,
@@ -674,12 +586,6 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       infrastructureRetries: attempt - 1,
       durationMs: Date.now() - started,
       blocking: failureIsBlocking(status, contractEntry, id),
-      ...(releaseException ? {
-        releaseException: {
-          version: ONE_RELEASE_CI_EXCEPTION_VERSION,
-          scenarioKey: `${suiteName}:${id}`,
-        },
-      } : {}),
     };
     if (status === "failed") {
       const failurePath = path.join(dir, "failure.json");

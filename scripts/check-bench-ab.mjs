@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { evaluateStorageMode } from "./lib/storage-mode-policy.mjs";
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -7,30 +6,7 @@ function arg(name) {
   return process.argv[i + 1];
 }
 
-function optionalArg(name) {
-  const i = process.argv.indexOf(name);
-  return i < 0 ? undefined : process.argv[i + 1];
-}
-
 const policy = JSON.parse(readFileSync(arg("--policy"), "utf8"));
-
-// Storage mode is a paired Direct-vs-managed release axis. Its budgets are
-// tripwires around measured current behavior, not declarations that the
-// managed tax is desirable. A breach is a regression to diagnose; budgets may
-// only tighten after a faster receipt, never advance automatically.
-const storageModePath = optionalArg("--storage-mode");
-if (storageModePath) {
-  const report = JSON.parse(readFileSync(storageModePath, "utf8"));
-  const { failures, lines } = evaluateStorageMode(policy, report);
-  for (const line of lines) console.log(line);
-  if (failures.length) {
-    console.error("\nStorage-mode report is incomplete:");
-    for (const failure of failures) console.error(`- ${failure}`);
-    process.exit(1);
-  }
-  console.log("Storage-mode Direct-vs-managed budgets passed.");
-  process.exit(0);
-}
 
 const candidate = JSON.parse(readFileSync(arg("--candidate"), "utf8"));
 const immutable = JSON.parse(readFileSync(arg("--immutable"), "utf8"));

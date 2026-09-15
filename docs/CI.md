@@ -108,37 +108,14 @@ ordinary Tine releases do not pay for it again.
 
 Windows is a deliberately narrower, blocking compatibility gate: it compiles
 every `tine-core` test target against the pin and runs a declared cross-layer
-smoke selection under nextest isolation. The selection contains every explicitly Windows-named core test plus the
-bootstrap-capture, current activation/seal, durability, and lifecycle witnesses.
+smoke selection under nextest isolation. The selection contains every
+explicitly Windows-named core test.
 
 `scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke` lists the
 actual Windows core inventory before executing the smoke. It fails if an
-explicitly Windows-named core test or declared witness is added, renamed,
-removed, or omitted; it then runs that verified core/storage integration set
-with nextest's zero-retry, fail-on-timeout profile. This is neither an advisory
-subset nor a retry mask.
-
-The 0.6.983 inventory replaces four removed witnesses, without carrying the
-0.6.982 missing-name waiver forward. Detached bootstrap preparation was retired
-in `9f24d985`: its preparation file/directory flush and exact preseal/repeated
-preparation tests no longer name a current operation. The selected regular-file
-sync, no-follow publication/directory-flush, and source-capture sealing tests
-remain. Current activation abort/retry is checked by
-`managed_activation_abort_cuts_retire_unmarked_generation_and_retry`; current
-sealed-baseline reopening and corruption rejection by
-`lazy_genesis_seal_reopens_and_detects_payload_corruption`. Unmarked activation
-generations are retired on retry; reusing the old detached preparation directory
-is not a current contract. Durable publication, unchanged user bytes, bounded
-retry, and validated sealed state remain required.
-
-The old enrollment writer/session API was retired in `d3707944`. Its exclusive
-writer/drop-release obligation is now selected through
-`one_workspace_runtime_lease_vends_one_applier_slot_at_a_time` and
-`lease_contention_and_drop_recovery_are_process_scoped`. The separate-process
-workspace contention/crash-release witness remains selected too. These four
-current witnesses replace the four absent names; no existing Windows or capture
-witness is removed. Actual compiled-inventory verification and execution remain
-blocking, with the same finite timeouts and zero retries.
+explicitly Windows-named core test is added, renamed, removed, or omitted; it
+then runs that verified core integration set with nextest's zero-retry,
+fail-on-timeout profile. This is neither an advisory subset nor a retry mask.
 
 Full runtime parity for all `tine-core` tests on Windows is explicitly deferred.
 Some platform-neutral core fixtures encode Unix-like file/identity assumptions;
@@ -165,8 +142,6 @@ not a quiet gate expansion during a release.
   screenshot pixels; it is hardware-equivalent evidence only, not OEM WebView
   or IME coverage. A red or unrun method remains unverified and cannot support
   a release or public fixed claim.
-- The frozen `scope=full` release gate includes the Android app-UID managed
-  activation, crash-recovery, sharing, clean-shutdown, and reopen journey.
 - Dispatch the Flatpak workflow for offline packaging changes.
 - Do not dispatch `scope=full` as a routine completion ritual. It is the frozen
   release gate.

@@ -1,7 +1,7 @@
 import { render } from "solid-js/web";
 import { PageView } from "../../../src/components/Page";
 import { backend } from "../../../src/backend";
-import { managedStorageRuntime } from "../../../src/managedStorageRuntime";
+import { graphBindingRuntime } from "../../../src/graphBindingRuntime";
 import { initParser } from "../../../src/render/parse";
 import { journalTitle, localDayKey } from "../../../src/journal";
 import { ensureLsShimStyle } from "../../../src/lsShim";
@@ -13,7 +13,7 @@ import "../../../src/styles/theme.css";
 import "../../../src/styles/app.css";
 await initParser();
 ensureLsShimStyle(); ensureThemeStyle();
-managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
 const name=journalTitle(new Date());
 const targetId="39400000-0000-4000-8000-000000000001";
 const blocks=MARKERS.map((marker,i)=>({id:`task-${marker.toLowerCase()}`,raw:`${marker} Task ${i+1}: plain **bold** and [[linked page]]`,marker,collapsed:false,children:[]}));

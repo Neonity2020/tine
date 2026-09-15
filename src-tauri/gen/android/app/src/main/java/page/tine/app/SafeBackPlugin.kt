@@ -10,7 +10,7 @@ import app.tauri.plugin.Plugin
  * One deliberately narrow bridge between Android's permanent Back owner and
  * the frontend dispatcher. Tauri's built-in AppPlugin falls through to WebView
  * history or Activity finish when it has no JS listener; that is never an
- * acceptable fallback while Tine has not verified managed-storage shutdown.
+ * acceptable fallback while Tine has not verified a clean shutdown.
  */
 internal object SafeBackBridge {
   private var plugin: SafeBackPlugin? = null

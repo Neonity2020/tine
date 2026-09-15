@@ -16,7 +16,6 @@ import {
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
-import { enableManagedStorage } from "./lib/e2e-managed-activation.mjs";
 
 await ensureDisplay();
 
@@ -25,13 +24,11 @@ const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32"
 const TD = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver") : "tauri-driver");
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4510);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4511);
-const managed = process.env.E2E_PRINT_MANAGED === "1";
-const backendName = managed ? "Managed" : "Direct";
-const TMP = path.join(os.tmpdir(), `tine-print-security-e2e-${backendName.toLowerCase()}`);
+const TMP = path.join(os.tmpdir(), "tine-print-security-e2e-direct");
 const GRAPH = path.join(TMP, "graph");
 
-// One fixed directory per backend arm, cleared on entry: the two arms never share
-// a path, and the last run's driver log survives for post-mortem.
+// One fixed directory, cleared on entry, so the last run's driver log survives
+// for post-mortem.
 fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(path.join(GRAPH, dir), { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
@@ -72,13 +69,6 @@ const env = {
 };
 const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
 const log = fs.openSync(path.join(TMP, "tauri-driver.log"), "w");
-// Managed activation drives a native confirmation through xdotool, which needs a
-// window manager that answers _NET_ACTIVE_WINDOW; bare Xvfb does not. Only the
-// Managed arm needs it, so this journey self-provisions one the way
-// e2e-query-export.mjs does rather than relying on a runner env var.
-const wm = managed ? spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
-  detached: true, stdio: ["ignore", log, log],
-}) : undefined;
 const driverArgs = webdriverServerArgs(
   DRIVER_PORT,
   NATIVE_PORT,
@@ -96,7 +86,6 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
-  if (managed) await enableManagedStorage(browser);
   // The contract starts at the named page's menu, not at today's journal.
   // Route through the visible application search control so a different valid
   // startup surface cannot fail the safety journey before it begins.
@@ -187,7 +176,6 @@ try {
     if (process.platform === "win32") td.kill("SIGKILL");
     else process.kill(-td.pid, "SIGKILL");
   } catch {}
-  try { if (wm?.pid) process.kill(-wm.pid, "SIGKILL"); } catch {}
   stopWebdriverApplication(webviewTarget);
   fs.closeSync(log);
 }

@@ -54,10 +54,6 @@ const packageJson = fs.readFileSync(path.join(process.cwd(), "package.json"), "u
 const viteConfig = fs.readFileSync(path.join(process.cwd(), "vite.config.ts"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
-const androidManagedRuntimeScript = fs.readFileSync(
-  path.join(process.cwd(), ".github/scripts/android-managed-storage-runtime.sh"),
-  "utf8"
-);
 const androidUiRuntimeScript = fs.readFileSync(
   path.join(process.cwd(), ".github/scripts/android-ui-runtime.sh"),
   "utf8"
@@ -75,10 +71,6 @@ const windowsWebviewDriverInstaller = fs.readFileSync(
 );
 const issue295Scenario = fs.readFileSync(
   path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
-  "utf8"
-);
-const windowsManagedScenario = fs.readFileSync(
-  path.join(process.cwd(), "scripts/e2e-windows-managed-storage.mjs"),
   "utf8"
 );
 const navigationContract = fs.readFileSync(
@@ -191,42 +183,7 @@ assert.match(
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
 assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
-assert.match(
-  uiE2eWorkflow,
-  /managed_current_only:[\s\S]*?inputs\.windows_scenario == 'windows-managed-storage' && inputs\.managed_current_only != 'true'[\s\S]*?E2E_MANAGED_CURRENT_ONLY: \$\{\{ inputs\.managed_current_only \}\}/,
-  "the focused Windows managed-storage lane cannot compare current-only activation and reopen without restoring the historical binary"
-);
 assert.match(uiE2eWorkflow, /windows-smoke:[\s\S]*?timeout-minutes: 75/);
-assert.match(
-  uiE2eWorkflow,
-  /E2E_MANAGED_ACTIVATION_TIMEOUT_MS: "900000"[\s\S]*?E2E_MANAGED_COLD_INDEX_TIMEOUT_MS: "300000"[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "2700000"/,
-  "the Windows managed-storage activation deadline can outrun its scenario failure capsule"
-);
-assert.match(
-  uiE2eWorkflow,
-  /scenarioResultPath = Join-Path[\s\S]*?scenarioStatus = \(Get-Content -Raw \$scenarioResultPath \| ConvertFrom-Json\)\.status[\s\S]*?\$scenarioStatus -eq "passed"[\s\S]*?if \(\$scenarioStatus -ne "passed"\)/,
-  "a quarantined Windows managed-storage failure must stop burn-in even when the ordinary runner exits zero"
-);
-assert.match(
-  uiE2eWorkflow,
-  /retainedRelativePath = "tested-binary\\tine\.exe"[\s\S]*?Copy-Item -LiteralPath \$app -Destination \$retainedPath -Force[\s\S]*?Get-FileHash -Algorithm SHA256 \$retainedPath[\s\S]*?retained candidate executable hash mismatch/,
-  "the exact post-burn-in Windows executable must be retained and verified in the evidence artifact"
-);
-assert.match(
-  windowsManagedScenario,
-  /CURRENT_ONLY !== \(candidateExecutable === activationExecutable\)[\s\S]*?sha256:[\s\S]*?if \(CURRENT_ONLY\) \{[\s\S]*?await openPage\(nestedTitle\);\s*receipt\.milestones\.baselineManagedPageBodyVisible = true;\s*receipt\.milestones\.managedPageSwitch/,
-  "current-only managed evidence is not bound to the candidate executable and strict post-activation page visibility"
-);
-assert.match(
-  windowsManagedScenario,
-  /pageBody\(nestedMarker, ordinaryTitle\)[\s\S]*?pageBody\([\s\S]*?index \+ 1 < PAGE_COUNT \? index \+ 1 : 1/,
-  "the reporter-scale page-switch fixture collapsed back into one pathological graph-wide backlink hub"
-);
-assert.match(
-  windowsManagedScenario,
-  /COLD_INDEX_TIMEOUT_MS[\s\S]*?coldIndexStarted = Date\.now\(\);\s*await openPage\(nestedTitle, \{ timeout: COLD_INDEX_TIMEOUT_MS \}\);\s*receipt\.milestones\.directFilesColdReady = \{[\s\S]*?elapsedMs:[\s\S]*?maxMs: COLD_INDEX_TIMEOUT_MS[\s\S]*?directFilesPageSwitch = await measurePageSwitches\(\)/,
-  "reporter-scale cold readiness must have a finite recorded bound distinct from warm page-switch measurements"
-);
 // `affe9be1` moved page navigation into ONE implementation, so this property no
 // longer lives in the journey: the scenario calls `openPageByName` and the row
 // selection is in `scripts/lib/e2e-navigation.mjs`. Pin it where it actually is,
@@ -240,11 +197,6 @@ assert.match(
   navigationContract,
   /!candidate\.classList\.contains\("block-result"\)[\s\S]*?\.switcher-name[\s\S]*?=== target/,
   "reporter-scale navigation must choose the exact page result, not a block-search hit containing its title"
-);
-assert.match(
-  windowsManagedScenario,
-  /import \{[^}]*openPageByName[^}]*\} from "\.\/lib\/e2e-navigation\.mjs"/,
-  "the Windows managed scenario must navigate through the shared page-navigation contract"
 );
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await target\.click\(\)/);
@@ -899,7 +851,6 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
-const androidManagedRuntime = yamlBlock(ciJobs, "android-managed-storage-runtime", 2);
 const androidUiRuntime = yamlBlock(ciJobs, "android-ui-runtime", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
@@ -915,33 +866,6 @@ assert.match(
   ).join("\n"),
   /android_group_commit[\s\S]*android_promoted_receipt/,
   "the focused Android compile lane must execute both host-testable durability branches",
-);
-assert.equal(
-  yamlScalar(androidManagedRuntime, "name", 4),
-  "Android runtime / managed activation, share, join, reopen, and Return to Direct Files"
-);
-assert.equal(
-  yamlScalar(androidManagedRuntime, "if", 4),
-  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')"
-);
-assert.match(
-  androidManagedRuntimeScript,
-  /grep -Fq 'FAILURES!!!'/,
-  "Android instrumentation must fail closed on a JUnit failure summary"
-);
-assert.ok(
-  androidManagedRuntimeScript.includes("grep -Eq 'OK \\([0-9]+ tests?\\)'"),
-  "Android instrumentation must require the runner's explicit passing summary"
-);
-assert.match(
-  androidManagedRuntimeScript,
-  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest[\s\S]*run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
-  "independent Android native/activity contracts must use separate instrumentation lifetimes"
-);
-assert.match(
-  androidManagedRuntimeScript,
-  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
-  "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "name", 4),
@@ -1283,36 +1207,9 @@ assert.match(
 );
 assert.match(
   e2eRunner,
-  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device", "scripts\/e2e-sparse-v2-two-device\.mjs", \{\}\]/,
-  "the mandatory Linux release catalog does not prove real two-device managed sync"
-);
-assert.match(
-  e2eRunner,
-  /"linux-release": \[[\s\S]*?\["sparse-v2-two-device-managed-join", "scripts\/e2e-sparse-v2-two-device\.mjs", \{[\s\S]*?TINE_E2E_JOIN_ORDERING: "join-from-managed",[\s\S]*?E2E_SCENARIO_TIMEOUT_MS: "240000",[\s\S]*?\}\]/,
-  "the mandatory Linux release catalog does not prove joining from a device that already runs Tine-managed storage"
-);
-assert.match(
-  e2eRunner,
   /const scenarioTimeoutMs = Number\(env\.E2E_SCENARIO_TIMEOUT_MS \|\| timeoutMs\);[\s\S]*?setTimeout\([\s\S]*?scenarioTimeoutMs\);/,
   "per-scenario E2E timeout budgets are declared but not applied to the spawned scenario"
 );
-assert.match(
-  e2eRunner,
-  /"linux-managed-real-release": \[[\s\S]*?TINE_MANAGED_RECOVERY_KILL_CYCLES: "2"[\s\S]*?\["sparse-v2-two-device-real", "scripts\/e2e-sparse-v2-two-device\.mjs"/,
-  "the local private-corpus release suite does not prove repeated forced-close recovery and real two-device sync"
-);
-assert.match(
-  packageJson,
-  /"e2e:linux:managed-real-release": "TINE_E2E_MODE=release E2E_SCENARIO_TIMEOUT_MS=1800000 node scripts\/run-e2e\.mjs linux-managed-real-release"/,
-  "the private-corpus managed release suite is not exposed as a strict local command"
-);
-for (const workflow of [ciWorkflow, uiE2eWorkflow, releaseWorkflow]) {
-  assert.doesNotMatch(
-    workflow,
-    /TINE_MANAGED_REAL_GRAPH|linux-managed-real-release/,
-    "a hosted workflow must not reference the private-corpus managed release gate"
-  );
-}
 assert.match(
   uiE2eWorkflow,
   /Snapshot Linux E2E candidate inputs[\s\S]*?Write Linux E2E candidate receipt[\s\S]*?Snapshot Windows E2E candidate inputs[\s\S]*?Write Windows E2E candidate receipt/,

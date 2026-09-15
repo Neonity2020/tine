@@ -155,7 +155,7 @@ test("DUP-12b keeps every private server wait on waitForHttpServer", () => {
 
 test("webdriver lifecycle finds only the exact tagged process tree", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-e2e-proc-"));
-  const token = webdriverSessionToken("managed feed", 4724, 4725);
+  const token = webdriverSessionToken("journal feed", 4724, 4725);
   for (const [pid, environment] of [
     ["101", `A=1\0TINE_E2E_WEBDRIVER_SESSION=${token}\0`],
     ["102", `TINE_E2E_WEBDRIVER_SESSION=${token}-other\0`],

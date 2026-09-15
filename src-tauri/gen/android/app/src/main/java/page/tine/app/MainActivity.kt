@@ -19,7 +19,7 @@ class MainActivity : TauriActivity() {
     override fun handleOnBackPressed() {
       // Never disable this callback or delegate to the lower AppPlugin: its
       // no-listener fallback can navigate WebView history or finish Activity
-      // before managed storage has proved a clean process stop.
+      // before Tine has proved a clean process stop.
       if (!SafeBackBridge.dispatchIfReady()) showBlockedBackNotice()
     }
   }

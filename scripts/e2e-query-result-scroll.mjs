@@ -6,7 +6,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { openPageByName } from "./lib/e2e-navigation.mjs";
-import { enableManagedStorage } from "./lib/e2e-managed-activation.mjs";
 import { tauriCapabilities, webdriverServerArgs } from "./e2e-capabilities.mjs";
 await ensureDisplay();
 const tmp = fs.mkdtempSync("/tmp/tine-query-result-scroll-");
@@ -14,7 +13,6 @@ const graph = path.join(tmp, "graph");
 const hostPage = process.env.E2E_QUERY_HOST === "source" ? "Source 10" : "Dashboard";
 const queryText = process.env.E2E_QUERY_TEXT || "(task TODO)";
 const flatQuery = process.env.E2E_QUERY_FLAT === "1";
-const managed = process.env.E2E_QUERY_MANAGED === "1";
 for (const dir of ["pages", "journals", "logseq"]) fs.mkdirSync(path.join(graph, dir), { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(tmp, "xdg", dir), { recursive: true });
 fs.writeFileSync(path.join(graph, "logseq/config.edn"), "{}\n");
@@ -36,22 +34,18 @@ const app = process.env.TINE_APP || `${process.env.HOME}/research/tine-query`;
 const tdPath = process.env.TAURI_DRIVER || (process.env.CARGO_HOME ? `${process.env.CARGO_HOME}/bin/tauri-driver` : "tauri-driver");
 const port = Number(process.env.E2E_DRIVER_PORT || 4590);
 const log = fs.openSync(path.join(tmp,"driver.log"),"w");
-const wm = managed ? spawn(process.env.E2E_WINDOW_MANAGER || "openbox", ["--sm-disable"], {
-  detached: true, stdio: ["ignore", log, log], env: process.env,
-}) : undefined;
 const td = spawn(tdPath, webdriverServerArgs(port,port+1,"/usr/bin/WebKitWebDriver"), {
   detached: true, stdio:["ignore",log,log], env:{...process.env,TINE_GRAPH:graph,
     XDG_DATA_HOME:path.join(tmp,"xdg/data"),XDG_CONFIG_HOME:path.join(tmp,"xdg/config"),XDG_CACHE_HOME:path.join(tmp,"xdg/cache"),
     WEBKIT_DISABLE_DMABUF_RENDERER:"1",WEBKIT_DISABLE_COMPOSITING_MODE:"1",LIBGL_ALWAYS_SOFTWARE:"1",GDK_BACKEND:"x11"},
 });
-console.log(JSON.stringify({artifact:tmp,app,managed}));
+console.log(JSON.stringify({artifact:tmp,app}));
 let browser;
 try {
   await sleep(2500);
   browser = await remote({hostname:"127.0.0.1",port,path:"/",logLevel:"error",connectionRetryCount:1,connectionRetryTimeout:60000,
     capabilities:tauriCapabilities(app,"query-result-scroll")});
   await browser.$(".ls-block, .page-title").waitForExist({timeout:20000});
-  if (managed) await enableManagedStorage(browser);
   await openPageByName(browser,hostPage);
   await browser.waitUntil(async () => Number(await browser.$(".query-count").getText())===120,{timeout:20000});
   // A real scroll activates intermediate lazy groups; jumping straight to the
@@ -136,7 +130,7 @@ try {
       anchorConnected:old.isConnected,groupConnected:window.__queryScrollGroup.isConnected,
       count:document.querySelector(".query-count")?.textContent};
   });
-  const report={app,managed,hostPage,queryText,flatQuery,before,duringGrace,after,anchorDrift:after.anchorTop-before.anchorTop};
+  const report={app,hostPage,queryText,flatQuery,before,duringGrace,after,anchorDrift:after.anchorTop-before.anchorTop};
   fs.writeFileSync(path.join(tmp,"report.json"),JSON.stringify(report,null,2));
   console.log(JSON.stringify(report));
   if(!after.anchorConnected || !after.groupConnected || Math.abs(report.anchorDrift)>24) throw new Error("Unchanged result anchor moved or remounted after task completion");
@@ -151,6 +145,5 @@ try {
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid,"SIGKILL"); } catch {}
-  try { if (wm?.pid) process.kill(-wm.pid, "SIGKILL"); } catch {}
   fs.closeSync(log);
 }

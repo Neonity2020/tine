@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The Android UI lane is intentionally separate from managed-storage runtime
-# proof. Each method gets a new app/WebView lifetime: Android's WebView graphics
+# The Android UI lane is intentionally separate from the compile gate. Each
+# method gets a new app/WebView lifetime: Android's WebView graphics
 # teardown has previously poisoned the following instrumentation method, and an
 # absent receipt must stay visible rather than becoming a green aggregate job.
 

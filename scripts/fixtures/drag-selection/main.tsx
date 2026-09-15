@@ -2,13 +2,13 @@ import { render } from "solid-js/web";
 import { Block } from "../../../src/components/Block";
 import { initParser } from "../../../src/render/parse";
 import { loadSingle } from "../../../src/store";
-import { managedStorageRuntime } from "../../../src/managedStorageRuntime";
+import { graphBindingRuntime } from "../../../src/graphBindingRuntime";
 import "../../../src/styles/app.css";
 import "../../../src/styles/inter.css";
 import "@fontsource-variable/noto-emoji/wght.css";
 
 await initParser();
-managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
 const params = new URLSearchParams(location.search);
 const sentence = "This is a long multiline block containing several ordinary words that wrap naturally over many lines. ";
 const shape = params.get("shape");

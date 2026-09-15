@@ -96,7 +96,7 @@ try {
 
   // Replace the approved external file exactly as a filesystem synchronizer
   // does (temp + rename). The native asset-observation lane must invalidate the
-  // image cache without importing the bytes into graph text or managed state.
+  // image cache without importing the bytes into graph text or private state.
   phase = "replacement";
   fs.writeFileSync(`${EXTERNAL}/pixel.replacement`, Buffer.from(PNG, "base64"));
   fs.renameSync(`${EXTERNAL}/pixel.replacement`, `${EXTERNAL}/pixel.png`);

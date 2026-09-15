@@ -186,30 +186,23 @@ try {
   await overlay.waitForExist({ reverse: true, timeout: 10_000 });
   console.log(`PASS: expanded MP3 streamed, played, and released on close through ${overlayState.src}`);
 
-  // Necessity gate for B5m: activate Managed Storage through the real native
-  // command, then make a range request through the registered tine-media
-  // protocol. The request URL carries the replacement slot's generation, so a
-  // 403 here is the managed-authority gate itself rather than stale binding.
+  // Containment and binding-authority gate: resolve the graph's current Direct
+  // Files binding through the real native command, then make a range request
+  // through the registered tine-media protocol. The request URL carries the
+  // binding generation, so a 403 here is the binding gate itself rather than
+  // stale state.
   await browser.setTimeout({ script: 300_000 });
-  const managed = await browser.executeAsync((graph, done) => {
+  const direct = await browser.executeAsync((graph, done) => {
     const { invoke, convertFileSrc } = globalThis.__TAURI_INTERNALS__;
     invoke("load_graph", { path: graph }).then((loaded) => {
       if (!Number.isSafeInteger(loaded?.binding_generation)) {
         throw new Error(`load_graph exposed no binding: ${JSON.stringify(loaded)}`);
       }
-      return invoke("activate_sparse_v2", {
-        bindingGeneration: loaded.binding_generation,
-      });
-    }).then((activation) => {
-      if (activation?.state !== "active"
-          || !Number.isSafeInteger(activation?.binding_generation)) {
-        throw new Error(`managed activation failed: ${JSON.stringify(activation)}`);
-      }
       return invoke("stream_asset_path", {
         name: "supported.mp3",
-        bindingGeneration: activation.binding_generation,
+        bindingGeneration: loaded.binding_generation,
       }).then((streamPath) => ({
-        bindingGeneration: activation.binding_generation,
+        bindingGeneration: loaded.binding_generation,
         url: convertFileSrc(streamPath, "tine-media"),
       }));
     }).then(({ bindingGeneration, url }) => {
@@ -246,50 +239,35 @@ try {
   }, GRAPH);
   await sleep(200);
   const debugText = fs.readFileSync(`${TMP}/tine-debug.log`, "utf8");
-  const managedStatuses = [...debugText.matchAll(/media_protocol status=(\d+) authority=managed/g)];
-  if (managedStatuses.length) {
-    managed.status = Number(managedStatuses.at(-1)[1]);
+  const directStatuses = [...debugText.matchAll(/media_protocol status=(\d+) authority=direct/g)];
+  if (directStatuses.length) {
+    direct.status = Number(directStatuses.at(-1)[1]);
   }
-  console.log(`B5m managed protocol observation: ${JSON.stringify(managed)}`);
-  if (managed?.status !== 200 && managed?.status !== 206) {
-    throw new Error(`managed media protocol expected status 200/206: ${JSON.stringify(managed)}`);
+  console.log(`B5 direct protocol observation: ${JSON.stringify(direct)}`);
+  if (direct?.status !== 200 && direct?.status !== 206) {
+    throw new Error(`direct media protocol expected status 200/206: ${JSON.stringify(direct)}`);
   }
-  console.log(`PASS: Managed Storage served media range through ${managed.url}`);
+  console.log(`PASS: Direct Files served media range through ${direct.url}`);
 
   for (const [label, streamPath] of [
-    ["traversal", `${managed.bindingGeneration}/../outside.mp3`],
-    ["absolute", `${managed.bindingGeneration}/${GRAPH}/outside.mp3`],
-    ["outside symlink", `${managed.bindingGeneration}/escape.mp3`],
+    ["traversal", `${direct.bindingGeneration}/../outside.mp3`],
+    ["absolute", `${direct.bindingGeneration}/${GRAPH}/outside.mp3`],
+    ["outside symlink", `${direct.bindingGeneration}/escape.mp3`],
   ]) {
     const refused = await observeProtocolStatus(streamPath);
-    if (refused.status !== 404 || refused.authority !== "managed") {
-      throw new Error(`Managed ${label} refusal drifted: ${JSON.stringify(refused)}`);
+    if (refused.status !== 404 || refused.authority !== "direct") {
+      throw new Error(`Direct ${label} refusal drifted: ${JSON.stringify(refused)}`);
     }
-    console.log(`PASS: Managed ${label} asset path refused with 404`);
+    console.log(`PASS: Direct ${label} asset path refused with 404`);
   }
 
   const stale = await observeProtocolStatus(
-    `${managed.bindingGeneration - 1}/supported.mp3`,
+    `${direct.bindingGeneration - 1}/supported.mp3`,
   );
   if (stale.status !== 403 || stale.authority !== "stale") {
     throw new Error(`stale media binding refusal drifted: ${JSON.stringify(stale)}`);
   }
   console.log("PASS: stale media binding refused with 403");
-
-  const shutdown = await browser.executeAsync((bindingGeneration, done) => {
-    globalThis.__TAURI_INTERNALS__.invoke("sparse_v2_clean_shutdown", { bindingGeneration })
-      .then(done, (error) => done({ error: String(error) }));
-  }, managed.bindingGeneration);
-  if (shutdown?.error || shutdown?.lifecycle !== "stopped_safe") {
-    throw new Error(`managed shutdown fixture failed: ${JSON.stringify(shutdown)}`);
-  }
-  const unavailable = await observeProtocolStatus(
-    `${managed.bindingGeneration}/supported.mp3`,
-  );
-  if (unavailable.status !== 403 || unavailable.authority !== "managed_unavailable") {
-    throw new Error(`managed-unavailable refusal drifted: ${JSON.stringify(unavailable)}`);
-  }
-  console.log("PASS: managed-unavailable media authority refused with 403");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}

@@ -324,27 +324,6 @@
    ],
    "stability": "stable"
   },
-  "scripts/e2e-managed-journal-feed.mjs": {
-   "contracts": [
-    {
-     "class": "core-operation",
-     "userOutcome": "After managed-storage activation, the Journals surface opens the newest bounded day window, paginates backward in newest-first order, shows a newly accepted journal edit when the feed is reopened, and accepts a rapid uninterrupted block move across several day boundaries without losing commands or flooding errors.",
-     "blocking": true
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "A 20-root cut from one ordinary page and paste into another commits all selected roots durably without partial source/destination state or error notifications.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Journal title formatting, feed layout, activation duration, and the exact completion latency of queued moves may vary while the same days, order, accepted content, and complete command sequence remain visible."
-   ],
-   "nonRequirements": [
-    "Exact pixels, DOM nesting beyond the semantic Journals surface, internal feed-index layout, millisecond timing, or a particular internal queue implementation."
-   ],
-   "stability": "stable"
-  },
   "scripts/e2e-media.mjs": {
    "contracts": [
     {
@@ -360,12 +339,12 @@
     },
     {
      "class": "core-operation",
-     "userOutcome": "Graph media is served and plays under a Managed Storage binding through the native media protocol, not only under Direct Files.",
+     "userOutcome": "Graph media is served and plays through the native media protocol under the graph's current Direct Files binding resolved by the real native command.",
      "blocking": true
     },
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "Asset containment and binding authority hold under both authorities: traversal, absolute, and symlink asset paths refuse, and stale or unavailable bindings refuse.",
+     "userOutcome": "Asset containment and binding authority hold: traversal, absolute, and symlink asset paths refuse, and a stale binding generation refuses.",
      "blocking": true,
      "authority": "Media protocol containment (Graph::stream_asset_path) and binding-generation gate"
     }
@@ -667,7 +646,7 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "On Direct and Managed, page-menu PDF export includes complete OG/TQL query descendants, private matches and query tables in a static, script-disabled print frame.",
+     "userOutcome": "Page-menu PDF export includes complete OG/TQL query descendants, private matches and query tables in a static, script-disabled print frame.",
      "blocking": true,
      "authority": "Tine print-export script isolation contract"
     }
@@ -852,118 +831,6 @@
    ],
    "stability": "stable"
   },
-  "scripts/e2e-sparse-v2-recovery.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Explicit sparse-v2 activation and return to standard Markdown mode preserve the graph's authority transition and user-visible Markdown continuity across real native restarts.",
-     "blocking": true,
-     "authority": "Tine sparse-v2 local authority-transition and Markdown interoperability contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "Users can edit an existing UTF-named page and create a new page in sparse v2, then reopen both saved edits after restart and after returning to standard Markdown mode.",
-     "blocking": true
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "A managed save conflict keeps the editor draft, refuses Keep mine after a newer winner, resolves against the re-observed exact revision, and also resolves a competing winner at a newly activated page's exact path without losing the retained draft.",
-     "blocking": true,
-     "authority": "Tine managed application save, Tauri IPC, serialized actor conflict-resolution, and durable Markdown continuity contract"
-    }
-   ],
-   "acceptableVariations": [
-    "Settings layout, native dialog decoration, page-list order, and restart timing may vary while visible content and Markdown continuity remain intact."
-   ],
-   "nonRequirements": [
-    "Sparse private-storage layout, internal digests, exact native-dialog pixels, or animation timing."
-   ],
-   "stability": "burn-in"
-  },
-  "scripts/e2e-managed-p4-rebuild.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Opening a graph whose Tine-managed storage was written by the per-block (P4) layout leaves every Markdown/Org source byte unchanged and preserves every original private-store byte in a backup, without asking the user anything.",
-     "blocking": true,
-     "authority": "Rebaselining v2 packet P1 and the Tine-managed storage one-current-format contract: a superseded containing format is preserved and rebuilt from text, never migrated"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "After the automatic rebuild, Tine-managed storage is active again, the earlier edits are visible, and a new edit saves to Markdown and is still visible after a restart.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Progress wording, Settings layout and rebuild duration may vary while source bytes, private-byte preservation and the saved edit remain exact."
-   ],
-   "nonRequirements": [
-    "Exact pixels, DOM nesting, the number of startup phases, the backup directory's basename or internal layout, millisecond timing, migration or replay of history that exists only in the backup, or any new notice."
-   ],
-   "stability": "burn-in",
-   "notes": "Needs a P4-built producer in TINE_P4_APP beside the exact candidate in TINE_APP; without both it stops as HARNESS UNAVAILABLE. Undrained journal files are recorded as preserved evidence only."
-  },
-  "scripts/e2e-managed-force-close-recovery.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "On a real-scale graph, an existing-page edit saved through the visible managed editor survives a ten-second settle, SIGKILL of the actual Tine process, and restart with the same graph and private state; managed storage reopens actively and the exact edit remains in both UI and Markdown.",
-     "blocking": true,
-     "authority": "Tine managed-storage process-crash recovery and Markdown projection contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "Native recovery remains visibly observable and reaches a usable graph without native.unavailable, a refusal loop, a silent hang, or recurring error notifications.",
-     "blocking": true
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Emergency return remains actionable while managed recovery is still running, publishes Direct Files without waiting for managed recovery or changing managed evidence, and preserves a subsequent Direct edit across restart.",
-     "blocking": true,
-     "authority": "Native StorageModeSupervisor priority, Direct-selection receipt, and stale-publication contract"
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "A healthy Settings return drains managed storage, confirms the Markdown projection, switches to Direct Files, and preserves the next Direct edit across restart.",
-     "blocking": true,
-     "authority": "Graceful managed-to-Direct transition contract"
-    }
-   ],
-   "acceptableVariations": [
-    "Activation, driver startup, and recovery durations may vary with corpus size and machine speed while progress remains observable and recovery completes within the scenario timeout."
-   ],
-   "nonRequirements": [
-    "Exact progress wording, phase count, toast styling, DOM structure, process ID, or millisecond timing. Managed provider bytes may remain in place after emergency return because the private Direct-selection receipt is authoritative."
-   ],
-   "stability": "burn-in"
-  },
-  "scripts/e2e-absence-sweeps.mjs": {
-   "contracts": [
-    {
-     "class": "core-operation",
-     "userOutcome": "Reopening a managed graph after a large external group deletion surfaces the affected pages and lets the user Restore their exact Markdown content through the real application.",
-     "blocking": true
-    },
-    {
-     "class": "stateful-ux",
-     "userOutcome": "Closing the group-deletion warning or recovery panel records no decision; the sweep remains waiting, and an explicit Restore remains visible afterward as disposed history without live action controls.",
-     "blocking": true
-    },
-    {
-     "class": "stateful-ux",
-     "userOutcome": "A quit through the app's own close path with all managed slots verified stopped is not reported as an unclean close on the next launch.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Warning and dock wording, control placement, and panel presentation may evolve while the deletion group remains reviewable and its durable state is visible.",
-    "Managed activation, reopen, and Restore durations may vary while the journey reaches each semantic state within its polling bounds."
-   ],
-   "nonRequirements": [
-    "Pixels, geometry, palette, animation timing, DOM nesting, exact toast wording beyond the group-deletion label family, or generated sweep and page identifiers."
-   ],
-   "stability": "stable"
-  },
   "scripts/e2e-search-parity.mjs": {
    "contracts": [
     {
@@ -1142,70 +1009,6 @@
    ],
    "stability": "burn-in"
   },
-  "scripts/e2e-sparse-v2-two-device.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "Two installations with separate private app data can explicitly discover and join one filesystem-synchronized managed graph, exchange managed edits in both directions, and the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
-     "blocking": true,
-     "authority": "Tine cross-device managed-storage enrollment, provider synchronization, and Direct Files recovery contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "A fresh second device remains in Direct Files until the user explicitly asks to join, then discovers the provider state and becomes a writable managed-sync member.",
-     "blocking": true
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "While a file-sync tool is still delivering the shared provider tree, asking to join says the data is not ready yet rather than calling it unsafe, says it once instead of repeating, and the same running app joins successfully once the remaining bytes arrive, without a restart.",
-     "blocking": true
-    },
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "A device that already runs Tine-managed storage on its own graph is offered the same explicit join action, is told what happens to its own history, and its own post-activation edit stays readable across the attempt and the next restart.",
-     "blocking": true,
-     "authority": "Tine cross-device managed-storage enrollment and local managed-history retention contract"
-    }
-   ],
-   "acceptableVariations": [
-    "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout.",
-    "The exact wording of the not-ready-yet notice, and the label of the join action in either storage mode.",
-    "The order in which a provider delivers files outside the canonical enrollment prefix."
-   ],
-   "nonRequirements": [
-    "Android UI chrome, a physical network provider, exact progress wording, exact synchronization latency, or exact internal private-storage layout.",
-    "Enumerating every possible provider delivery ordering; the journey drives one fixed order through the enrollment prefix the discovery path keys on."
-   ],
-   "stability": "burn-in"
-  },
-  "scripts/e2e-windows-managed-storage.mjs": {
-   "contracts": [
-    {
-     "class": "exact-safety-interoperability",
-     "userOutcome": "On Windows, explicit managed-storage activation and return to Direct Files preserve every captured Markdown and Org source byte.",
-     "blocking": true,
-     "authority": "Tine managed-storage authority transition and Direct Files interoperability contract"
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after v0.6.94 managed activation, forced process death, candidate upgrade/reopen, and return to Direct Files; when the old release serves pages, the predecessor journey also attempts a real managed edit.",
-     "blocking": true
-    },
-    {
-     "class": "core-operation",
-     "userOutcome": "In current-candidate mode, Windows activation, forced-close reopen, and repeated user-visible switching between ordinary and nested Unicode pages complete on a reporter-scale graph while recording comparable Direct Files and Managed Storage timing summaries.",
-     "blocking": true
-    }
-   ],
-   "acceptableVariations": [
-    "Hosted Windows filesystem speed, WebView2 startup timing, managed-storage activation duration, and individual page-switch timings may vary."
-   ],
-   "nonRequirements": [
-    "Exact native confirmation-dialog appearance, internal private-storage layout, exact progress wording, or equality between Direct Files and Managed Storage timing samples."
-   ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-31: MS-17 exhausted the two-attempt hosted Windows E2E stop-loss without completing the current-candidate timing comparison. Run 33349270671 reached exact-candidate managed activation in 99.36 seconds, then the synthetic fixture's accidental 119,990-backlink hub monopolized the serialized actor and blocked the next page load. Run 33350869828 distributed those references but exposed a separate harness selector bug before activation: Ctrl+K chose a block-search hit containing the requested page title instead of the exact page result. The selector is now structurally corrected to require a page/journal row with an exact displayed name, but a prohibited third debugging run was not used to promote unburned evidence. The scenario remains diagnostic and must complete an unchanged-binary Windows burn-in before returning to release-blocking status."
-  },
   "scripts/e2e-windows-page-reference-latency.mjs": {
    "contracts": [
     {
@@ -1353,13 +1156,13 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule, without persisting Managed replacement authority.",
-     "userOutcome": "On Direct Files and Tine-managed storage, a local draft racing an external replacement survives SIGKILL and restart with its exact draft, baseline, and graph/page binding; a newer owner arriving during the outage is re-observed, both resolution actions use one semantic surface, and the on-disk capsule is removed before success is shown.",
+     "authority": "Concord live-save contract and Harvest B3: a guarded save refusal retains the exact editor draft, load baseline, and graph/page binding in one app-private durable capsule.",
+     "userOutcome": "A local draft racing an external replacement survives SIGKILL and restart with its exact draft, baseline, and graph/page binding; a newer owner arriving during the outage is re-observed, both resolution actions use one semantic surface, and the on-disk capsule is removed before success is shown.",
      "blocking": true
     },
     {
      "class": "stateful-ux",
-     "userOutcome": "Both storage modes use the same in-page resolver and queue; after restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
+     "userOutcome": "After restart the current owner is re-observed before resolution rather than restored as stale overwrite authority.",
      "blocking": true
     }
    ],
@@ -1484,7 +1287,7 @@
     "No clipboard permissions, screenshots, download dialogs or exact geometry are asserted."
    ],
    "stability": "quarantined",
-   "quarantineReason": "2026-09-09: Initial parallel Direct run timed out creating its WebDriver session before the app launched; unchanged binary and script passed when rerun sequentially. Managed also passed. Retain as nonblocking until startup instability is resolved and sequential burn-in is recorded."
+   "quarantineReason": "2026-09-09: Initial parallel Direct run timed out creating its WebDriver session before the app launched; unchanged binary and script passed when rerun sequentially. Retain as nonblocking until startup instability is resolved and sequential burn-in is recorded."
   }
  }
 }
