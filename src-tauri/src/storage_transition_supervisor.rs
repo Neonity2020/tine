@@ -688,8 +688,10 @@ mod tests {
         let graph = include_str!("graph.rs");
         assert!(!state.contains("graph_load: Mutex"));
         assert!(!graph.contains(".graph_load.lock()"));
-        assert!(state.contains(
-            "storage_supervisor: crate::storage_transition_supervisor::StorageTransitionSupervisor"
+        // Whitespace-insensitive: rustfmt may wrap the field's type.
+        let state_tokens: String = state.split_whitespace().collect();
+        assert!(state_tokens.contains(
+            "storage_supervisor:crate::storage_transition_supervisor::StorageTransitionSupervisor"
         ));
         let global_lock_field = ["transition", "Mutex<()>"].join(": ");
         assert!(!include_str!("storage_transition_supervisor.rs").contains(&global_lock_field));
