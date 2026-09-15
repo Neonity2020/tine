@@ -29,9 +29,7 @@ const SOURCE = /\.(rs|ts|tsx|mjs|js|css)$/;
 const SKIPPED_DIRS = new Set(["node_modules", "target", "dist", "vendor", "gen"]);
 
 /** Files above their cap when the ratchet landed, pinned at that length. */
-const PINNED: Record<string, number> = {
-  "src/store.ts": 6_370,
-};
+const PINNED: Record<string, number> = {};
 
 export function isTestFile(relative: string): boolean {
   return /_tests\.rs$/.test(relative)

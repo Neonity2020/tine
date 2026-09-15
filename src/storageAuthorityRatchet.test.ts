@@ -49,11 +49,21 @@ const CENSUS: readonly { file: string; count: number; class: "b"; why: string }[
   },
   {
     file: "store.ts",
-    count: 5,
+    count: 1,
     class: "b",
-    why: "the test-only Direct bootstrap plus value captures and their I-20 re-checks: "
-      + "createPageMutationPlan/pageMutationPlanCurrent and "
-      + "captureBulkRouteFence/bulkRouteFenceCurrent.",
+    why: "the test-only Direct bootstrap.",
+  },
+  {
+    file: "store/mutationPlans.ts",
+    count: 2,
+    class: "b",
+    why: "createPageMutationPlan captures authority and pageMutationPlanCurrent performs its I-20 re-check.",
+  },
+  {
+    file: "store/paste.ts",
+    count: 2,
+    class: "b",
+    why: "captureBulkRouteFence captures authority and bulkRouteFenceCurrent performs its I-20 re-check.",
   },
 ];
 
