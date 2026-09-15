@@ -1211,7 +1211,11 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
     let repo = repository_root();
     let files = production_rust();
     let representatives = [
-        ("PC-1", "crates/tine-core/src/model.rs", "fnsave_page("),
+        (
+            "PC-1",
+            "crates/tine-core/src/model/save_path.rs",
+            "fnsave_page(",
+        ),
         (
             "PC-7",
             "src-tauri/src/watcher.rs",
