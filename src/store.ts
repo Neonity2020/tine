@@ -27,9 +27,9 @@ import { clearPendingBlockRefStamps, existingBlockId } from "./store/blockRefs";
 import { clearSeededFacets } from "./render/facets";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { cycleMarkerSmart } from "./editor/repeat";
-import { dispatchCrossPageMove } from "./storageDispatch";
+import { requestCrossPageMove } from "./crossPageMove";
 import { editingId, endEdit, startEditing } from "./editorController";
-import { flushPage, flushPageToQuiescence, forgetSaveState, graphBinding, holdSourcesForDest, isDirty, isSaving, resetSaveState, tombstoneIfQuiescent, untombstone } from "./persistence";
+import { flushPageToQuiescence, forgetSaveState, graphBinding, resetSaveState, tombstoneIfQuiescent, untombstone } from "./persistence";
 import { graphBindingRuntime } from "./graphBindingRuntime";
 import { isBuiltinHidden, isPropertiesOnly, joinProps, splitProps } from "./editor/properties";
 import { isOrdered, orderListTypeFromRaw, rawWithCollapsed, rawWithInheritedOrderListType, rawWithOrderListType, registerSelectedIds } from "./store/properties";
@@ -54,6 +54,8 @@ export { blockExternalId, blockRef, clearPendingBlockRefStamps, ensureBlockId, e
 export type { LoadedBlockRef } from "./store/blockRefs";
 export { BULK_INSERTION_UNAVAILABLE_TOAST, appendToTodayJournal, bulkRouteFenceCurrent, captureBulkRouteFence, captureToPage, pasteClipboardPayload } from "./store/paste";
 export type { BulkInsertionPreflight, BulkRouteFence } from "./store/paste";
+export { CROSS_PAGE_MOVE_BLOCKED_TOAST, prepareCrossPageSources, settleDirectMovesForTest, withDirectMoveRecord } from "./crossPageMove";
+export type { CrossPageMoveIntent, CrossPageMoveOutcome } from "./crossPageMove";
 
 
 /** Install the isolated quick-capture scratch DTO without touching core.
@@ -1972,6 +1974,15 @@ export function selectionMarkdown(): string {
 /** Move a block under `newParent` (or, when `newParent` is null, to the roots of
  *  `targetPage` — pass the drop target's page so a root-to-root drop across pages
  *  lands on the RIGHT page instead of defaulting back to the source). */
+/** Everything a drag-move needs, computed from the CURRENT document. */
+interface DragMovePlan {
+  oldPage: string;
+  newPage: string;
+  /** The block's parent BEFORE the move, whose child list loses it. */
+  parent: string | null;
+  movedRaw: string;
+}
+
 export async function moveBlock(
   id: string,
   newParent: string | null,
@@ -1979,85 +1990,87 @@ export async function moveBlock(
   targetPage?: string,
   dropTargetId?: string,
 ) {
-  const node = doc.byId[id];
-  if (!node) return;
-  // Don't drop a block into its own descendant.
-  let p = newParent;
-  while (p !== null) {
-    if (p === id) return;
-    p = doc.byId[p].parent;
-  }
-  const oldPage = node.page;
-  // A root drop has no parent to read the page from — use the explicit target
-  // page (the day/page the drop landed on); fall back to the source page only if
-  // the caller didn't supply one (a same-page reorder).
-  const newPage = newParent ? doc.byId[newParent].page : (targetPage ?? oldPage);
-  if (!pageWritable(oldPage) || !pageWritable(newPage)) return;
-  const sourceFormat = formatForBlock(id);
-  const destinationFormat = formatForPage(newPage);
-  const inheritanceTarget = dropTargetId ?? newParent;
-  // A cross-format move already preserves the source raw verbatim; only a newly
-  // inherited property is emitted in the destination page's syntax.
-  const movedRaw = orderListTypeFromRaw(doc.byId[id].raw, sourceFormat) !== null
-    ? doc.byId[id].raw
-    : rawWithInheritedOrderListType(doc.byId[id].raw, destinationFormat, inheritanceTarget);
-  if (newPage !== oldPage) {
-    // Authority is selected once, by the dispatcher (I-6). The arms below are
-    // the arms this function always had; only the branch moved.
-    const handled = await dispatchCrossPageMove<boolean>(
-      { sourcePages: [oldPage], destinationPage: newPage, roots: [id] },
-      {
-        unavailable: () => true,
-        // Direct falls through to the frontend choreography below, which also
-        // serves the same-page reorder — so it is not lifted into this arm.
-        direct: () => false,
-      },
+  const dragPlan = (): DragMovePlan | null => {
+    const node = doc.byId[id];
+    if (!node) return null;
+    // Don't drop a block into its own descendant.
+    let p = newParent;
+    while (p !== null) {
+      if (p === id) return null;
+      const ancestor = doc.byId[p];
+      if (!ancestor) return null;
+      p = ancestor.parent;
+    }
+    if (newParent !== null && !doc.byId[newParent]) return null;
+    const oldPage = node.page;
+    // A root drop has no parent to read the page from — use the explicit target
+    // page (the day/page the drop landed on); fall back to the source page only if
+    // the caller didn't supply one (a same-page reorder).
+    const newPage = newParent ? doc.byId[newParent].page : (targetPage ?? oldPage);
+    if (!pageWritable(oldPage) || !pageWritable(newPage)) return null;
+    const sourceFormat = formatForBlock(id);
+    const destinationFormat = formatForPage(newPage);
+    const inheritanceTarget = dropTargetId ?? newParent;
+    // A cross-format move already preserves the source raw verbatim; only a newly
+    // inherited property is emitted in the destination page's syntax.
+    const movedRaw = orderListTypeFromRaw(node.raw, sourceFormat) !== null
+      ? node.raw
+      : rawWithInheritedOrderListType(node.raw, destinationFormat, inheritanceTarget);
+    return { oldPage, newPage, parent: node.parent, movedRaw };
+  };
+
+  const applyDragMove = (current: DragMovePlan): boolean => {
+    const { oldPage, newPage, movedRaw } = current;
+    // Drag-move can cross pages → snapshot both source and destination.
+    pushUndo("move", [...new Set([oldPage, newPage])]);
+    setDoc(
+      produce((s) => {
+        const oldArr =
+          current.parent === null
+            ? s.pages[s.pages.findIndex((x) => x.name === oldPage)].roots
+            : s.byId[current.parent].children;
+        const from = oldArr.indexOf(id);
+        oldArr.splice(from, 1);
+        s.byId[id].parent = newParent;
+        s.byId[id].raw = movedRaw;
+        const newArr =
+          newParent === null
+            ? s.pages[s.pages.findIndex((x) => x.name === newPage)].roots
+            : s.byId[newParent].children;
+        let idx = index;
+        if (oldArr === newArr && from < idx) idx -= 1;
+        newArr.splice(Math.max(0, Math.min(idx, newArr.length)), 0, id);
+        // Reassign the moved subtree to the target page.
+        if (newPage !== oldPage) {
+          const reassign = (bid: string) => {
+            s.byId[bid].page = newPage;
+            s.byId[bid].children.forEach(reassign);
+          };
+          reassign(id);
+        }
+      })
     );
-    if (handled) return;
-  }
-  // Cross-page drag: flush the source while it still holds the block, so a
-  // pre-existing pending save can't write the removal before the destination
-  // lands. Abort (no move) if the source can't be saved.
-  if (newPage !== oldPage && !(await prepareCrossPageSources([oldPage]))) {
-    pushToast(`Couldn't move — “${oldPage}” has unsaved changes that need resolving first.`, "error");
+    // Cross-page persistence is the front door's; a same-page reorder is one
+    // ordinary save.
+    if (newPage === oldPage) markDirty(oldPage);
+    return true;
+  };
+
+  const first = dragPlan();
+  if (!first) return;
+  if (first.newPage === first.oldPage) {
+    applyDragMove(first);
     return;
   }
-  if (!doc.byId[id]) return; // block vanished during the async flush
-  // Drag-move can cross pages → snapshot both source and destination.
-  pushUndo("move", [...new Set([oldPage, newPage])]);
-  setDoc(
-    produce((s) => {
-      const oldArr =
-        node.parent === null
-          ? s.pages[s.pages.findIndex((x) => x.name === oldPage)].roots
-          : s.byId[node.parent!].children;
-      const from = oldArr.indexOf(id);
-      oldArr.splice(from, 1);
-      s.byId[id].parent = newParent;
-      s.byId[id].raw = movedRaw;
-      const newArr =
-        newParent === null
-          ? s.pages[s.pages.findIndex((x) => x.name === newPage)].roots
-          : s.byId[newParent].children;
-      let idx = index;
-      if (oldArr === newArr && from < idx) idx -= 1;
-      newArr.splice(Math.max(0, Math.min(idx, newArr.length)), 0, id);
-      // Reassign the moved subtree to the target page.
-      if (newPage !== oldPage) {
-        const reassign = (bid: string) => {
-          s.byId[bid].page = newPage;
-          s.byId[bid].children.forEach(reassign);
-        };
-        reassign(id);
-      }
-    })
-  );
-  if (newPage !== oldPage) {
-    // Cross-page drag: persist the destination before the source removal.
-    persistCrossPage(newPage, [oldPage]);
-  } else {
-    markDirty(oldPage);
-  }
+  await requestCrossPageMove<DragMovePlan>({
+    plan: dragPlan,
+    intent: (current) => ({
+      sourcePages: [current.oldPage],
+      destinationPage: current.newPage,
+      roots: [id],
+    }),
+    apply: applyDragMove,
+  });
 }
 
 interface RelativeMovePlan {
@@ -2210,41 +2223,34 @@ export async function moveBlocksRelative(
       for (const id of plan!.roots) reassign(id);
     }));
 
+    // Same-page only: a cross-page move's persistence belongs to the front door.
     const persistenceSources = plan!.sourcePages.filter((page) => page !== plan!.destinationPage);
-    if (persistenceSources.length) persistCrossPage(plan!.destinationPage, persistenceSources);
-    else markDirty(plan!.destinationPage);
+    if (!persistenceSources.length) markDirty(plan!.destinationPage);
     return true;
   };
 
   if (!crossSources.length) return applyRelativeMove();
 
-  // Authority is selected once, by the dispatcher (I-6).
-  return dispatchCrossPageMove<boolean>(
-    { sourcePages: crossSources, destinationPage: plan.destinationPage, roots: plan.roots },
-    {
-      unavailable: () => false,
-      direct: async () => {
-        if (!(await prepareCrossPageSources(crossSources))) {
-          pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
-          return false;
-        }
-        const rebuilt = relativeMovePlan(capturedIds, targetId);
-        if (!rebuilt) return false;
-        // Every non-destination source in the rebuilt plan must be one we flushed
-        // while it still contained its roots. A concurrent cross-page reparent is a
-        // safe abort, not permission to mutate a newly unprepared source.
-        const rebuiltCross = rebuilt.sourcePages.filter((page) => page !== rebuilt.destinationPage);
-        if (rebuilt.destinationPage !== plan!.destinationPage
-          || rebuilt.roots.length !== plan!.roots.length
-          || rebuilt.roots.some((id, index) => id !== plan!.roots[index])
-          || rebuilt.sourcePageByRoot.some((page, index) => page !== plan!.sourcePageByRoot[index])
-          || rebuiltCross.length !== crossSources.length
-          || rebuiltCross.some((page, index) => page !== crossSources[index])) return false;
-        plan = rebuilt;
-        return applyRelativeMove();
-      },
+  // The front door owns admission, the pre-flush, the re-plan comparison and
+  // persistence; this function keeps only WHAT moves and how (I-12).
+  const outcome = await requestCrossPageMove<RelativeMovePlan>({
+    plan: () => relativeMovePlan(capturedIds, targetId),
+    intent: (current) => ({
+      sourcePages: current.sourcePages.filter((page) => page !== current.destinationPage),
+      destinationPage: current.destinationPage,
+      roots: current.roots,
+    }),
+    // A de-duplicated source LIST cannot say which root came from which page, so
+    // a concurrent reparent that preserves the SET must still abort.
+    unchanged: (before, after) =>
+      before.sourcePageByRoot.length === after.sourcePageByRoot.length
+      && before.sourcePageByRoot.every((page, index) => page === after.sourcePageByRoot[index]),
+    apply: (current) => {
+      plan = current;
+      return applyRelativeMove();
     },
-  );
+  });
+  return outcome.applied;
 }
 
 /** Move a block up/down among its siblings (mod+Up/Down). Keyed <For> keeps the
@@ -2388,132 +2394,8 @@ function crossMoveBlocks(ids: string[], fromPage: string, toPage: string, dir: 1
       }
     })
   );
-  persistCrossPage(toPage, [fromPage]);
 }
 
-/** Open the durable recovery record for a Direct cross-page move, run the
- *  choreography inside it, and retire the record once every participant is
- *  durably terminal.
- *
- *  **Why this exists (I-3, I-2).** A Direct cross-page move writes N+1 files.
- *  Ordering keeps the damage one-sided — the addition always lands before any
- *  removal — but the process can die between two of those writes, and the graph
- *  is then left with the blocks in the destination AND still in a source, with
- *  nothing on disk saying so. The record makes the move CONVERGENT instead:
- *  composed before the first write, it lets the next open complete the move or
- *  roll it back. See `docs/contracts/direct-move-recovery.md`.
- *
- *  This is the ONE place the bracket is expressed (I-12); `persistCrossPage`
- *  and `carry.ts` both run their unchanged choreography through it. The
- *  durable-step order it emits — record, destination, each source, retire — is
- *  the order `crate::direct_move_recovery::direct_move_durable_steps` names and
- *  the crash matrix cuts between; `src/directMoveOrder.test.ts` pins it.
- *
- *  A record is never required: `null` (a degenerate move, a firewalled DTO, an
- *  unavailable app-private root, or a binding the native side refuses)
- *  simply leaves the move exactly as convergent as it was before B2. Refusing
- *  to move a page because device-private state is unavailable would be an
- *  availability bug, not hardening. */
-const inFlightDirectMoves = new Set<Promise<unknown>>();
-
-/** Test seam. The cross-page move bracket is deliberately fire-and-forget — a
- *  drag must not await disk I/O — so a test that asserts on what the move wrote
- *  needs a way to wait for it. Production never calls this; `dirty` remains the
- *  only thing `flushAll` consults, exactly as before B2. */
-export async function settleDirectMovesForTest(): Promise<void> {
-  while (inFlightDirectMoves.size) await Promise.all([...inFlightDirectMoves]);
-}
-
-function trackDirectMove(work: Promise<unknown>): void {
-  const tracked = work.catch(() => {}).finally(() => {
-    inFlightDirectMoves.delete(tracked);
-  });
-  inFlightDirectMoves.add(tracked);
-}
-
-export async function withDirectMoveRecord(
-  destinationPage: string,
-  sourcePages: readonly string[],
-  choreography: () => Promise<boolean>,
-): Promise<boolean> {
-  const moveId = await openDirectMoveRecord(destinationPage, sourcePages);
-  const landed = await choreography();
-  if (moveId && landed) {
-    try {
-      await backend().finishDirectCrossPageMove(moveId);
-    } catch {
-      // A record we could not retire is not a failure: the next open sees every
-      // participant already terminal and retires it without writing anything.
-    }
-  }
-  return landed;
-}
-
-async function openDirectMoveRecord(
-  destinationPage: string,
-  sourcePages: readonly string[],
-): Promise<string | null> {
-  const sources = [...new Set(sourcePages)].filter((name) => name !== destinationPage);
-  if (!sources.length) return null; // same-page/degenerate: one ordinary save, already safe
-  const destination = pageToDto(destinationPage);
-  if (!destination) return null;
-  const sourceDtos: PageDto[] = [];
-  for (const name of sources) {
-    const dto = pageToDto(name);
-    if (!dto) return null;
-    sourceDtos.push(dto);
-  }
-  try {
-    return await backend().beginDirectCrossPageMove(destination, sourceDtos);
-  } catch {
-    return null;
-  }
-}
-
-/** Persist a cross-page move so the ADDITION side (`dest`) lands on disk BEFORE
- *  any REMOVAL side (`sources`). If dest fails to save (e.g. an external
- *  conflict), the sources are NOT written, so disk is never left with the block
- *  removed from its source but never written to its destination (the data-losing
- *  state). dest is marked dirty immediately; each source only once dest succeeds. */
-function persistCrossPage(dest: string, sources: string[]) {
-  // Hold the sources' saves until `dest` is durable (audit C#1), so a concurrent edit to
-  // a source during the dest-write window can't write its post-removal state before the
-  // block exists in the dest. On dest success, doSave → releaseSourcesFor frees +
-  // reschedules the sources; on dest conflict/failure they stay held (the block is kept
-  // on disk in the source) until the dest conflict is resolved and it saves durably.
-  holdSourcesForDest(dest, sources);
-  // Marked dirty SYNCHRONOUSLY, before the record round-trip: `flushAll` (graph
-  // switch, window close) must see this page as unsaved from the instant the
-  // move mutates memory. The debounce can therefore publish the destination
-  // before the record exists — a window that converges anyway, because the
-  // record then observes an already-terminal destination and recovery carries
-  // the move FORWARD, which is the safe direction (contract §3, and
-  // `record_composed_after_the_destination_landed_still_completes_forward`).
-  markDirty(dest);
-  trackDirectMove(withDirectMoveRecord(dest, sources, async () => {
-    if (!(await flushPage(dest))) return false;
-    // `releaseSourcesFor(dest)` has already re-dirtied and rescheduled the held
-    // sources; flushing them here only awaits that work (a clean page is an
-    // instant no-op) so the record is retired on a durably terminal graph.
-    const held = [...new Set(sources)].filter((name) => name !== dest);
-    const results = await Promise.all(held.map((name) => flushPage(name)));
-    return results.every(Boolean);
-  }));
-}
-
-/** Before a cross-page move mutates memory, durably flush every SOURCE page while
- *  it still contains the blocks. Otherwise a save that was ALREADY pending/in-flight
- *  for a source (from an earlier, unrelated edit) can fire right after the in-memory
- *  removal and write the post-removal state to disk before the destination is saved
- *  — a removal-only, data-losing state that dest-first persistence alone can't
- *  prevent. Returns false if any source can't be flushed (an unresolved conflict);
- *  the caller MUST then abort the move. Clean sources flush as instant no-ops. */
-export async function prepareCrossPageSources(sources: string[]): Promise<boolean> {
-  for (const s of new Set(sources)) {
-    if ((isDirty(s) || isSaving(s)) && !(await flushPage(s))) return false;
-  }
-  return true;
-}
 
 /** Resolve the adjacent feed day for a root block at the page boundary, loading
  *  older days if a down-move runs off the last loaded one. Returns the target
@@ -2567,20 +2449,23 @@ async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "cr
   if (node.parent !== null) return "none"; // nested block at a child-list edge: stop
   const target = await feedNeighbor(node.page, dir);
   if (!target || !pageWritable(target)) return "none";
-  // Authority is selected once, by the dispatcher (I-6).
-  return dispatchCrossPageMove<"within" | "crossed" | "none">(
-    { sourcePages: [node.page], destinationPage: target, roots: [id] },
-    {
-      unavailable: () => "none",
-      direct: async () => {
-        if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
-        if (!doc.byId[id]) return "none"; // vanished during the flush
-        pushUndo("move-cross", [node.page, target]);
-        crossMoveBlocks([id], node.page, target, dir);
-        return "crossed";
-      },
+  const outcome = await requestCrossPageMove<{ page: string }>({
+    plan: () => {
+      // Re-read the LIVE node: it may have vanished, been nested, or already
+      // crossed while the pre-flush awaited.
+      const live = doc.byId[id];
+      if (!live || !blockWritable(id) || live.parent !== null) return null;
+      if (live.page === target) return null;
+      return { page: live.page };
     },
-  );
+    intent: (current) => ({ sourcePages: [current.page], destinationPage: target, roots: [id] }),
+    apply: (current) => {
+      pushUndo("move-cross", [current.page, target]);
+      crossMoveBlocks([id], current.page, target, dir);
+      return true;
+    },
+  });
+  return outcome.applied ? "crossed" : "none";
 }
 
 export function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
@@ -2631,18 +2516,25 @@ export async function moveSelectionItems(dir: 1 | -1) {
   if (ids.some((id) => doc.byId[id].parent !== null || doc.byId[id].page !== page)) return;
   const target = await feedNeighbor(page, dir);
   if (!target || !pageWritable(target)) return;
-  // Authority is selected once, by the dispatcher (I-6).
-  await dispatchCrossPageMove<void>(
-    { sourcePages: [page], destinationPage: target, roots: ids },
-    {
-      unavailable: () => {},
-      direct: async () => {
-        if (!(await prepareCrossPageSources([page]))) return; // source has unsaved edits → abort
-        pushUndo("move-sel-cross", [page, target]);
-        crossMoveBlocks(ids, page, target, dir);
-      },
+  // The door re-runs this plan after the pre-flush await and compares it. That
+  // is what stops a second key repeat from appending roots the target day
+  // already holds (H3): by then the roots live on `target`, so the plan is null.
+  await requestCrossPageMove<{ page: string; ids: string[] }>({
+    plan: () => {
+      const live = topSelected();
+      if (!live.length || live.some((sel) => !blockWritable(sel))) return null;
+      const from = doc.byId[live[0]]?.page;
+      if (!from || from === target) return null;
+      if (live.some((sel) => doc.byId[sel].parent !== null || doc.byId[sel].page !== from)) return null;
+      return { page: from, ids: live };
     },
-  );
+    intent: (current) => ({ sourcePages: [current.page], destinationPage: target, roots: current.ids }),
+    apply: (current) => {
+      pushUndo("move-sel-cross", [current.page, target]);
+      crossMoveBlocks(current.ids, current.page, target, dir);
+      return true;
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2740,13 +2632,8 @@ export function carryUnfinished(
       todayPage.roots.push(...carried);
     })
   );
-  // Mark ONLY today (the destination) dirty here, and HOLD the source days behind
-  // it (audit C#1), as `persistCrossPage` does for every other cross-page move.
-  // carry.ts marks and flushes the sources after today saves, but an unrelated
-  // edit to a source day would mark it dirty on its own; without the hold, a
-  // conflicted today let that edit write the carried tasks out of the only file
-  // that still had them.
-  holdSourcesForDest(today, [...new Set(plan.map((item) => item.from))]);
-  markDirty(today);
+  // Persistence — the barrier, the destination-first order and the record — is
+  // the front door's, exactly as it is for every other cross-page shape. This
+  // function is pure tree surgery and reports how much of it happened.
   return plan.length;
 }

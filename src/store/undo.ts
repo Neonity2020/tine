@@ -3,6 +3,7 @@ import type { HistorySidebarContext } from "../ui";
 import type { Route } from "../router";
 import { FeedPage, Node, doc, hasLoadedIdentityCollision, pageByName, pageInstanceGeneration, pageWritable, peekPageInstanceGeneration, purgePageNodes, setDoc, storeMutationObserverForTest } from "./doc";
 import { addDirty, scheduleSave } from "../persistence";
+import { persistCrossPage } from "../crossPageMove";
 import { captureHistoryEditorContext, captureRawHistoryViewport, editingId, endEdit, restoreHistoryEditorContext } from "../editorController";
 import { captureHistorySidebarContext, pushToast, restoreHistorySidebarContext } from "../ui";
 import { createSignal } from "solid-js";
@@ -592,6 +593,48 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
   }
 }
 
+/**
+ * Is applying `e` itself a cross-page move, and if so which page GAINS?
+ *
+ * **H2 (K6 move census §1.3).** Undo of a move A→B *is* a cross-page move, B→A:
+ * it writes N+1 files and needs the same destination-first order, the same
+ * source barrier and the same recovery record as the forward move. It had none
+ * of them — `applyEntry` restored both page snapshots, marked both dirty, and
+ * `scheduleSave` wrote them in PARALLEL. So an undo whose gaining page was
+ * refused (an external write landed there meanwhile) could still land the losing
+ * page's removal, leaving the blocks in NEITHER file.
+ *
+ * The direction is **derived here, not recorded at `pushUndo` time**, for two
+ * reasons: a future structural command cannot forget to declare something it
+ * never has to declare, and redo gets identical treatment from this same code
+ * rather than a mirrored copy. A root whose snapshot page differs from the page
+ * it occupies right now is moving back — its snapshot page gains, its current
+ * page loses.
+ *
+ * Called BEFORE `applyEntry`, because afterwards the document no longer shows
+ * where the roots came from.
+ */
+function crossPageRestore(e: UndoEntry): { destinationPage: string; sourcePages: string[] } | null {
+  if (e.kind !== "snap" || !e.pages || e.pages.length < 2) return null;
+  const scope = new Set(e.pages);
+  const gaining = new Set<string>();
+  const losing = new Set<string>();
+  for (const id in e.nodes) {
+    const to = e.nodes[id].page;
+    const from = doc.byId[id]?.page;
+    if (from === undefined || from === to) continue;
+    if (!scope.has(to) || !scope.has(from)) continue;
+    gaining.add(to);
+    losing.add(from);
+  }
+  // Exactly one destination, or this is not a shape the record can describe —
+  // leave it on the ordinary save path rather than invent a destination.
+  if (gaining.size !== 1) return null;
+  const destinationPage = [...gaining][0];
+  const sourcePages = [...losing].filter((name) => name !== destinationPage);
+  return sourcePages.length ? { destinationPage, sourcePages } : null;
+}
+
 function performUndo(): void {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
@@ -602,10 +645,16 @@ function performUndo(): void {
     return;
   }
   const restoreViewport = entry.kind === "raw" ? captureRawHistoryViewport(entry.id) : undefined;
+  const restore = crossPageRestore(entry);
   redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
-  scheduleSave();
+  // A cross-page restore is a cross-page move: destination-first, behind the
+  // barrier, inside the record (H2). `persistCrossPage` marks the destination
+  // dirty itself and `releaseSourcesFor` reschedules the held sources once it
+  // lands, so this replaces the blanket `scheduleSave` rather than joining it.
+  if (restore) void persistCrossPage(restore.destinationPage, restore.sourcePages);
+  else scheduleSave();
   restoreEntryContext(entry.context);
   restoreViewport?.();
   return;
@@ -629,10 +678,13 @@ function performRedo(): void {
     return;
   }
   const restoreViewport = entry.kind === "raw" ? captureRawHistoryViewport(entry.id) : undefined;
+  const restore = crossPageRestore(entry);
   undoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("redo");
-  scheduleSave();
+  // Redo of a cross-page move is the same shape as undo of one (H2).
+  if (restore) void persistCrossPage(restore.destinationPage, restore.sourcePages);
+  else scheduleSave();
   restoreEntryContext(entry.context);
   restoreViewport?.();
   return;

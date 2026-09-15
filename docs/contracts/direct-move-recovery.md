@@ -23,9 +23,20 @@ call in `src-tauri/src/graph.rs`, and `withDirectMoveRecord` in `src/store.ts`.
 ## 1. What this exists for
 
 A Direct Files cross-page move writes **N + 1 files**: the destination, which
-GAINS the blocks, and the N sources, which lose them. Every shape produces it —
-`moveBlock`, `moveBlocksRelative`, `moveBlockFeedNow`, `moveSelectionItems`, and
-carry, which gathers N journal days into today.
+GAINS the blocks, and the N sources, which lose them. Six shapes produce it —
+`moveBlocksRelative` (a drag), `moveBlockFeedNow` and `moveSelectionItems` (the
+journal-feed day boundary), carry, which gathers N journal days into today, the
+test-only `moveBlock`, and **undo or redo of any of them**, which moves the same
+roots back and is therefore the same write pattern with the gaining and losing
+pages exchanged.
+
+All six reach storage through **one front door**, `src/crossPageMove.ts`. It
+reads the admission once, pre-flushes the sources, re-runs and compares the
+caller's plan across that await, lets the caller apply the move to memory, and
+then owns the barrier, the destination-first order and the record bracket. Undo
+and redo derive their direction in `src/store/undo.ts` (`crossPageRestore`) and
+hand it to the same persistence, so the sixth shape cannot drift from the other
+five the way five hand-written copies of this choreography previously did.
 
 The frontend already saves the destination first, so a removal never lands
 before its addition. That bounds the damage but does not remove it: a crash
@@ -35,10 +46,10 @@ flight.
 
 Until the destination is durable, no source is written at all: not by an
 unrelated edit to that source, and not by a conflict override (the source
-barrier, `holdSourcesForDest` in `src/persistence.ts`, audit C#1). The four move
-functions hold their sources through `persistCrossPage`, and carry holds its
-source days in `carryUnfinished`. Several moves into one destination are all
-released when it lands. `src/directMoveOrder.test.ts` pins the carry case and
+barrier, `holdSourcesForDest` in `src/persistence.ts`, audit C#1). Every shape — moves, carry, and undo/redo alike —
+holds its sources through the one `persistCrossPage` in `src/crossPageMove.ts`.
+Several moves into one destination are all released when it lands.
+`src/directMoveOrder.test.ts` pins the carry and undo cases and
 `src/persistenceMoveBarrier.test.ts` the barrier itself.
 
 Two or more `rename()` calls cannot be made atomic. The contract is therefore

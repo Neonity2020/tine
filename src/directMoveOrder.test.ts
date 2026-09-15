@@ -25,6 +25,7 @@ import { backend, SaveConflictError } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
 import { resetStorageDispatchCounters } from "./storageDispatch";
 import {
+  flushAll,
   flushPage,
   isDirty,
   loadFeed,
@@ -36,6 +37,7 @@ import {
   selectBlock,
   setRaw,
   settleDirectMovesForTest,
+  undo,
 } from "./store";
 import { carryDay, carryDaysBack } from "./carry";
 import { journalTitle } from "./journal";
@@ -307,5 +309,80 @@ describe("a record that could not be composed", () => {
     ]);
     expect(pageByName("Destination")!.roots).toContain("source-a");
     expect(pageByName("Source")!.roots).toEqual(["source-b"]);
+  });
+});
+
+describe("undo of a cross-page move", () => {
+  // H2 (K6 move census §1.3). `applyEntry` restores both page snapshots, marks
+  // both dirty, and `scheduleSave` writes them in parallel: no destination-first
+  // order, no source barrier, no recovery record. Undoing a move A→B makes A the
+  // page that GAINS the blocks, so if B's removal lands while A's save is
+  // refused, the blocks are in neither file. The five forward shapes are all
+  // held; undo is the sixth shape `docs/contracts/direct-move-recovery.md` §1
+  // does not name.
+  it("does not write the losing page while the gaining page's save is refused", async () => {
+    await loadTwoPages();
+    let refuseSource = false;
+    const writes: string[] = [];
+    vi.spyOn(backend(), "beginDirectCrossPageMove").mockResolvedValue(MOVE_ID);
+    vi.spyOn(backend(), "finishDirectCrossPageMove").mockResolvedValue(true);
+    vi.spyOn(backend(), "savePage").mockImplementation(async (dto: PageDto) => {
+      if (refuseSource && dto.name === "Source") throw new SaveConflictError(7);
+      writes.push(dto.name);
+      return { revision: `${dto.rev ?? "r"}-next` } as any;
+    });
+
+    await moveBlock("source-a", null, 1, "Destination");
+    await settleDirectMovesForTest();
+    expect(pageByName("Destination")!.roots).toContain("source-a");
+
+    // The user changes their mind. Source is now the gaining page, and an
+    // external write has landed on it in the meantime, so its save is refused.
+    refuseSource = true;
+    writes.length = 0;
+    undo();
+    await flushAll();
+    await settleDirectMovesForTest();
+
+    expect(pageByName("Source")!.roots).toContain("source-a");
+    // Destination is the losing page: its removal must not reach disk while the
+    // block is not back in Source's file.
+    expect(writes).not.toContain("Destination");
+  });
+});
+
+describe("two cross-page selection moves in one burst", () => {
+  // H3 (K6 move census §1.3). `moveSelectionItems` captures the page and the
+  // root check BEFORE awaiting `feedNeighbor` and `prepareCrossPageSources`, and
+  // `crossMoveBlocks` then pushes the ids into the target's roots
+  // unconditionally. A second keypress arriving while the first is still
+  // awaiting a real flush re-adds ids the target already holds, so the block
+  // renders twice and serializes twice — a duplicate `id::` if it carries one.
+  it("never leaves the same root twice in the target day", async () => {
+    clearConflict("Sep 1st, 2026");
+    clearConflict("Sep 2nd, 2026");
+    await loadFeed([
+      page("Sep 2nd, 2026", "journals/2026_09_02.md", "d2-r1", [block("newer", "newer")], "journal"),
+      page("Sep 1st, 2026", "journals/2026_09_01.md", "d1-r1", [block("older", "older")], "journal"),
+    ]);
+    vi.spyOn(backend(), "beginDirectCrossPageMove").mockResolvedValue(MOVE_ID);
+    vi.spyOn(backend(), "finishDirectCrossPageMove").mockResolvedValue(true);
+    vi.spyOn(backend(), "savePage").mockImplementation(async (dto: PageDto) => {
+      return { revision: `${dto.rev ?? "r"}-next` } as any;
+    });
+    // The source day is dirty, which is the ordinary state right after the user
+    // stopped typing: the pre-flush then really awaits, and the repeated key
+    // lands inside that window.
+    setRaw("newer", "newer, edited");
+    selectBlock("newer");
+
+    const first = moveSelectionItems(1);
+    const second = moveSelectionItems(1);
+    await Promise.all([first, second]);
+    await settleDirectMovesForTest();
+
+    const roots = pageByName("Sep 1st, 2026")!.roots;
+    expect(roots.filter((id) => id === "newer")).toHaveLength(1);
+    expect(new Set(roots).size).toBe(roots.length);
   });
 });

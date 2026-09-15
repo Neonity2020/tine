@@ -2,22 +2,26 @@
 // (carryUnfinished) does the tree surgery; this orchestrates loading the days it
 // needs into the working set, then surfaces the result. Days are passed
 // newest→oldest so the newest carried tasks end up on top of today.
+//
+// Carry is an N-source cross-page move, so it goes through the ONE front door
+// (`src/crossPageMove.ts`) like every other shape: the door reads admission,
+// pre-flushes the source days while they still hold the tasks, re-checks the
+// plan across that await, and owns the source barrier, the destination-first
+// order and the durable recovery record.
+//
+// This file used to keep its own copy of that choreography, and the copy was
+// missing the barrier (K6 census H1): a conflicted today toasted "your moved
+// tasks are kept in the editor", and then any later edit to a source day let the
+// ordinary debounced save write the post-removal file — carrying the tasks out
+// of the only file that still had them. Nothing held those sources, because only
+// the other four shapes went through `persistCrossPage`.
 
 import { backend } from "./backend";
-import {
-  pageByName,
-  ensurePageLoaded,
-  carryUnfinished,
-  flushPage,
-  isDirty,
-  markDirty,
-  prepareCrossPageSources,
-  withDirectMoveRecord,
-} from "./store";
+import { carryUnfinished, ensurePageLoaded, pageByName } from "./store";
 import { journalTitle } from "./journal";
-import { dispatchCarry } from "./storageDispatch";
+import { requestCrossPageMove } from "./crossPageMove";
 import { graphBinding } from "./persistence";
-import { carryKeepsContext, carryHeaderText, pushToast } from "./ui";
+import { carryHeaderText, carryKeepsContext, pushToast } from "./ui";
 import { openJournals } from "./router";
 import type { PageDto } from "./types";
 
@@ -52,42 +56,49 @@ async function ensureToday(): Promise<string | null> {
   return t;
 }
 
-// Persist the touched pages to disk NOW, before any feed reload — otherwise
-// navigating to journals reloads the (still-old) files and clobbers the move.
-// Returns whether every dirty touched page actually saved.
-// Persist `today` (the ADDITION side) FIRST and only flush the source days once it
-// lands — so a today-conflict can't leave the carried blocks removed from their
-// source files but never written to today (a removal-only, data-losing state).
-async function persist(today: string, sources: string[]): Promise<boolean> {
-  // Carry is an N-source cross-page move, so it runs inside the same durable
-  // recovery record every other Direct cross-page move uses (I-3/I-2): composed
-  // before today's journal is written, retired once every day file is durably
-  // terminal, and completed or rolled back by the next open if the process dies
-  // in between. See `docs/contracts/direct-move-recovery.md`.
-  return withDirectMoveRecord(today, sources, async () => {
-    // Destination (today) must land first. carryUnfinished intentionally left the
-    // source days NOT dirty, so nothing can save a source removal until today is
-    // safely written — only THEN do we mark + flush the sources.
-    if (isDirty(today) && !(await flushPage(today))) return false;
-    const uniq = [...new Set(sources)].filter((n) => n !== today);
-    for (const n of uniq) markDirty(n);
-    const results = await Promise.all(uniq.map((n) => flushPage(n)));
-    return results.every(Boolean);
+/**
+ * The one carry choreography: state the intent, do the tree surgery when the
+ * door says the plan still holds, then report on durability.
+ *
+ * Carry is the one shape that AWAITS durability (`outcome.landed`) rather than
+ * firing and forgetting: it reloads the journals feed on success, and a reload
+ * re-reads the files, so reloading before the write landed would drop the
+ * carried blocks out of memory.
+ */
+async function runCarry(today: string, days: readonly string[], blockedToast: string): Promise<void> {
+  let moved = 0;
+  let surgeryRan = false;
+  const outcome = await requestCrossPageMove<string[]>({
+    operation: "carry",
+    blockedToast,
+    plan: () => {
+      const live = [...new Set(days)].filter((day) => day !== today && pageByName(day));
+      return live.length ? live : null;
+    },
+    intent: (live) => ({ sourcePages: live, destinationPage: today, roots: [] }),
+    apply: (live) => {
+      surgeryRan = true;
+      moved = carryUnfinished(live, carryKeepsContext(), carryHeaderText());
+      // "Nothing to carry" is a successful no-op, not a move: it must not open a
+      // recovery record or write a file.
+      return moved > 0;
+    },
   });
-}
 
-async function report(n: number, today: string, sources: string[]): Promise<void> {
+  if (!outcome.applied) {
+    if (surgeryRan && moved === 0) pushToast("No unfinished tasks to carry");
+    return;
+  }
   // If a touched page couldn't be saved (conflict / disk error), DON'T reload the
   // journals feed — that would re-read the old files and drop the carried blocks
   // from memory. Leave the move in memory and surface the failure.
-  const saved = await persist(today, sources);
-  if (!saved) {
+  if (!(await outcome.landed)) {
     pushToast("Carry couldn't be saved — resolve the conflict; your moved tasks are kept in the editor.", "error");
     return;
   }
   // TODO(S2): explicit pane handle for the journals feed pane.
   openJournals({ inPlace: true }); // a carry reloads the feed in place, not a new tab
-  pushToast(n ? `Carried ${n} item${n === 1 ? "" : "s"} to today` : "No unfinished tasks to carry");
+  pushToast(`Carried ${moved} item${moved === 1 ? "" : "s"} to today`);
 }
 
 /** Carry unfinished tasks from the previous *non-empty* day to today. "Previous
@@ -118,23 +129,7 @@ export async function carryDay(pageName: string): Promise<void> {
   if (!today) return;
   if (pageName === today) return;
   if (!(await ensureLoaded(pageName, "journal"))) return;
-  await dispatchCarry<void>(
-    { destinationPage: today, sourcePages: [pageName] },
-    {
-      unavailable: () => {}, // the front door already raised the shared refusal
-      direct: async () => {
-        // Flush the source day (while it still holds the tasks) before the in-memory
-        // move, so a save already pending for it can't write the removal before today
-        // is saved. Abort if it can't be flushed (unresolved conflict).
-        if (!(await prepareCrossPageSources([pageName]))) {
-          pushToast("Couldn't carry — that day has unsaved changes to resolve first.", "error");
-          return;
-        }
-        const n = carryUnfinished([pageName], carryKeepsContext(), carryHeaderText());
-        await report(n, today, [pageName]);
-      },
-    },
-  );
+  await runCarry(today, [pageName], "Couldn't carry — that day has unsaved changes to resolve first.");
 }
 
 /** Carry unfinished tasks from the last `days` days (today−1 … today−days) to
@@ -152,19 +147,5 @@ export async function carryDaysBack(days: number): Promise<void> {
   // Load all the day files in parallel rather than one IPC round-trip at a time.
   const loaded = await Promise.all(candidates.map((t) => ensureLoaded(t, "journal")));
   const titles = candidates.filter((_, i) => loaded[i]); // skip days with no file
-  await dispatchCarry<void>(
-    { destinationPage: today, sourcePages: titles },
-    {
-      unavailable: () => {},
-      direct: async () => {
-        // Flush source days (with their tasks intact) before the in-memory move — see carryDay.
-        if (!(await prepareCrossPageSources(titles))) {
-          pushToast("Couldn't carry — a day has unsaved changes to resolve first.", "error");
-          return;
-        }
-        const n = carryUnfinished(titles, carryKeepsContext(), carryHeaderText());
-        await report(n, today, titles);
-      },
-    },
-  );
+  await runCarry(today, titles, "Couldn't carry — a day has unsaved changes to resolve first.");
 }

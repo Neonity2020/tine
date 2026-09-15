@@ -9964,7 +9964,7 @@
         "scenario": "direct-save.typed-disposition-and-banner-routing",
         "failBefore": "proven"
       },
-      "notes": "Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text. Fail-before: a permanent precheck failure on a page the user is entitled to name conflict_authority.notes was substring-matched into the authority handler, which deletes the epoch, re-dirties the page and fire-and-forgets another save, so one user request became four backend calls; log under tine-agents/evidence/wave4/e4/. Proven at the save-policy layer, which owns the banner STATE (markConflict/isConflicted); the rendered banner component is not driven here, so this row asserts that the banner is never raised, not how it looks when it is."
+      "notes": "Fail-before evidence: tine-agents/evidence/move-front-door/h2-h3-fail-before.log (pass-after: h2-h3-pass-after.log). Exact safety: only a typed SaveConflictError reaches conflict resolution; DirectSaveFailureError follows its producer reasonCode even when detail contains conflict-like page text. Fail-before: a permanent precheck failure on a page the user is entitled to name conflict_authority.notes was substring-matched into the authority handler, which deletes the epoch, re-dirties the page and fire-and-forgets another save, so one user request became four backend calls; log under tine-agents/evidence/wave4/e4/. Proven at the save-policy layer, which owns the banner STATE (markConflict/isConflicted); the rendered banner component is not driven here, so this row asserts that the banner is never raised, not how it looks when it is."
     },
     {
       "id": "UI-HARVEST-W4-P1-SHEET-SORT-KEY-DERIVATION",
@@ -11362,6 +11362,52 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: a user typing with an IME (the report: Chinese on Windows 11) can enter a workspace name in the switcher's New workspace / Rename field. Classification: blocking stateful UX for CJK users; the name cannot be entered at all. Root cause: the form rendered under <Show when={edit()} keyed> and onInput called setEdit({...state, value}), so every input event created a new key and Solid rebuilt the form and its <input>; the first composition input destroyed the composing element and Windows TSF cancelled it. Latin typing survived because the value was re-seeded and the caret landed at the end. Present since the component was created (9f6a3f3b); not a 0.6.982 regression. Fix: the typed text lives in its own signal, the keyed Show changes only when an edit opens or closes, the input keeps its initial value so nothing rewrites input.value mid-composition, and Escape ignores isComposing/keyCode 229 like the other text fields. Fail-before on master: the <input> element was replaced after the first input event. jsdom proves element identity, not Windows TSF behaviour; a Windows IME check was not run."
+    },
+    {
+      "id": "UI-MOVE-UNDO-CROSS-PAGE-DURABLE-ORDER-001",
+      "title": "Undoing or redoing a move of blocks between two pages never leaves those blocks in neither file: the page that regains them is written first and the other page's write is held until it lands",
+      "family": "history",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "tine-agents/subagent-tasks/notes/2026-09-15-k6-store-move-census.md \u00a71.3 hazard H2 (internal store-move census; no reporter)"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/directMoveOrder.test.ts::undo of a cross-page move::does not write the losing page while the gaining page's save is refused"
+        ],
+        "scenario": "move.undo-cross-page-durable-order",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before evidence: tine-agents/evidence/move-front-door/h2-h3-fail-before.log (pass-after: h2-h3-pass-after.log). Exact safety: this is a data-loss shape, not a presentation one. User outcome: undo of a drag, a journal-day move or a carry that had crossed pages, at a moment when the page regaining the blocks cannot be saved (an external editor or a sync service changed that file, or a concurrent Tine instance holds it), left the blocks written out of the page that had them and never written into the page getting them back \u2014 present in neither file on disk, with only the editor's memory holding them. Root cause: undo/redo was the ONE cross-page-move shape that never went through the move choreography. applyEntry restored both pages and marked both dirty, and scheduleSave wrote them in parallel: no source barrier, no destination-first order, no crash-recovery record. The other five shapes had all been converged on that choreography; the census found undo/redo had simply never been counted as a sixth shape (docs/contracts/direct-move-recovery.md \u00a71 omitted it). Fix: crossPageRestore in src/store/undo.ts derives the direction from the entry itself \u2014 the scoped page whose snapshot holds blocks that currently live on another scoped page is the one regaining them \u2014 and hands it to the same persistCrossPage every other shape uses, so the barrier, the destination-first order and the record bracket are shared rather than re-implemented. Derived rather than recorded at pushUndo: it covers undo and redo symmetrically and no future pushUndo call site can forget it. jsdom + backend spies observe the literal write order; the contract doc's step list and the Rust crash matrix already cover recovery from the record."
+    },
+    {
+      "id": "UI-MOVE-SELECTION-BURST-DUPLICATE-001",
+      "title": "Repeating the move-selection shortcut across a journal-day boundary before the first move has saved does not put the same blocks in the target day twice",
+      "family": "journals",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "tine-agents/subagent-tasks/notes/2026-09-15-k6-store-move-census.md \u00a71.3 hazard H3 (internal store-move census; no reporter)"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/directMoveOrder.test.ts::two cross-page selection moves in one burst::never leaves the same root twice in the target day"
+        ],
+        "scenario": "move.selection-burst-duplicate",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before evidence: tine-agents/evidence/move-front-door/h2-h3-fail-before.log (pass-after: h2-h3-pass-after.log). Blocking core operation with a durable consequence: the duplicate was rendered twice AND serialized twice, so it reached the file. User outcome: pressing the move shortcut twice in quick succession on a selection in the journal feed added the selected blocks to the target day, then added them again. Root cause: moveSelectionItems captured the selected ids, awaited the source pre-flush, and then applied the stale capture; the underlying crossMoveBlocks unconditionally pushes into the destination's root list, so the second pass appended ids the first pass had already placed. moveBlocksRelative was immune only because it happened to re-plan and compare after its await \u2014 the same accident was absent from all three other shapes. Fix: the one front door src/crossPageMove.ts re-runs the caller's plan() after the await and compares it against the intent captured before, so a plan that no longer describes the same roots, sources and destination is abandoned instead of applied; moveSelectionItems re-reads topSelected() there and aborts when the selection has already reached the target. This makes the stale-capture class unwritable for every shape that goes through the door rather than fixing the one call site. jsdom + backend spies assert both that no root appears twice in the target day's serialized roots and that the root list holds no duplicates at all."
     }
   ]
 }

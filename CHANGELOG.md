@@ -41,6 +41,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Undoing a move between pages can no longer lose the moved blocks.** Undo and
+  redo of a cross-page move (a drag, a journal-day move, or a carry) now write
+  the page that regains the blocks first and hold the other page's save until it
+  lands, inside the same crash-recovery record the original move used. Before,
+  both pages were saved at once, so if the regaining page's save was refused —
+  for example because another program had changed that file — the other page's
+  removal could still be written and the blocks were left in neither file.
+- **Two quick nudges of a selection across a journal-day boundary no longer
+  duplicate a block.** Repeating the move shortcut while the first move was still
+  saving could add the same blocks to the target day twice, which then appeared
+  twice and was written to the file twice.
+- A move between pages that cannot start because a page has unsaved changes now
+  always says so. Keyboard moves across a journal-day boundary failed silently.
 - Typing a workspace name with Chinese or another input method (IME) now works. The name field used to be rebuilt on every keystroke, which cancelled the character being composed. (GH #498)
 - Returning to the browser tab of a published export no longer shows a "couldn't finish checking for external changes" error. The read-only export has nothing to re-check, so it no longer tries. An export also no longer shows a stray “⊞ Table” button on every page, or an error after zooming or scrolling a PDF. (GH #549)
 - Carrying unfinished tasks to today while today's journal had a sync conflict no longer lets a later edit to one of the earlier days delete those tasks from that day's file. Tine now keeps the earlier days unchanged on disk until today is saved, as it already did for other block moves. Moving blocks into the same page twice before it saved also no longer leaves the first move's source page unable to save.
