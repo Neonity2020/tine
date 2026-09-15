@@ -254,7 +254,7 @@
   "tests": [
    "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_quantifies_the_physical_page_forest_with_full_block_semantics",
    "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_keeps_invalid_and_wrong_scope_inputs_empty",
-   "crates/tine-core/src/query/sql.rs::tests::page_blocks_bounds_only_from_a_selective_positive_block_predicate",
+   "crates/tine-core/src/query/sql_tests.rs::page_blocks_bounds_only_from_a_selective_positive_block_predicate",
    "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_supports_finite_page_blocks_reentry"
   ],
   "scenario": "query-engine.page-blocks-physical-page-semantics",

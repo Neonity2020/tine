@@ -39,7 +39,6 @@ const PINNED: Record<string, number> = {
   "src-tauri/src/watcher.rs": 4_625,
   "src-tauri/src/commands.rs": 4_419,
   "src/components/Block.tsx": 4_093,
-  "crates/tine-core/src/query/sql.rs": 4_074,
 };
 
 export function isTestFile(relative: string): boolean {
