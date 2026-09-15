@@ -1439,6 +1439,8 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // model.rs's imports through `use super::*`; the inventory now follows
     // that inheritance. With model/*.rs read as model.rs, the surface hashes
     // to the K4 digest above: paths moved, nothing else.
+    // 2026-09-15: K7 split watcher.rs and commands.rs after K0 had removed
+    // their tine-storage surface; zero inventory rows moved, so the digest held.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "d72792b40312484f7a82147334ce4624de2b710afd4f30633bafedceb94b8583",

@@ -1,6 +1,21 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { readBlockModuleSource } from "./testSource";
+
+function rustModuleSource(path: string): string {
+  const files = [path];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = path.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 
 describe("Android voice-recording bounds", () => {
   it("caps duration and bytes, then hands the native temp to Rust without base64", () => {
@@ -21,7 +36,7 @@ describe("Android voice-recording bounds", () => {
     expect(source.indexOf("recorder = rec")).toBeLessThan(source.indexOf("rec.prepare()"));
     expect(source).toMatch(/listFiles\(\)[\s\S]*startsWith\("tine_memo_"\)[\s\S]*forEach \{ it\.delete\(\) \}/);
 
-    const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
+    const commands = rustModuleSource("src-tauri/src/commands.rs");
     expect(commands).toMatch(/pub\(crate\) fn import_native_capture/);
     expect(commands).toMatch(/import_asset_file\(&mut capture, &name, max_bytes\)/);
     const bridge = readFileSync("src-tauri/src/android_media.rs", "utf8");
@@ -48,7 +63,7 @@ describe("Android voice-recording bounds", () => {
     expect(photo).not.toContain("Base64.encodeToString");
     expect(source).toMatch(/copyPickedPhoto[\s\S]*MAX_PHOTO_BYTES/);
 
-    const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
+    const commands = rustModuleSource("src-tauri/src/commands.rs");
     expect(commands).toMatch(/tine_photo_/);
     expect(commands).toMatch(/MAX_PHOTO_BYTES/);
     const block = readBlockModuleSource();

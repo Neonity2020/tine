@@ -1096,6 +1096,8 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    use crate::test_support::rust_module_source;
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tine-graph-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1220,13 +1222,13 @@ mod tests {
             "graph.rs attaches the projection in `attach_direct_files_services` only"
         );
         for (name, source) in [
-            ("state.rs", include_str!("state.rs")),
-            ("commands.rs", include_str!("commands.rs")),
-            ("backup.rs", include_str!("backup.rs")),
-            ("watcher.rs", include_str!("watcher.rs")),
+            ("state.rs", include_str!("state.rs").to_owned()),
+            ("commands.rs", rust_module_source("commands.rs")),
+            ("backup.rs", include_str!("backup.rs").to_owned()),
+            ("watcher.rs", rust_module_source("watcher.rs")),
         ] {
             assert_eq!(
-                production_sites(source, "attach_direct_projection(").len(),
+                production_sites(&source, "attach_direct_projection(").len(),
                 0,
                 "{name} must attach through `attach_direct_files_services`"
             );

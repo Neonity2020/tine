@@ -580,6 +580,8 @@ pub(crate) fn poke_watcher(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_support::rust_module_source;
     use std::time::Instant;
 
     fn graph(root: &Path) -> Arc<GraphSlot> {
@@ -907,7 +909,7 @@ mod tests {
         assert!(registry.owner(&candidate.root_key).is_none());
         assert_ne!(candidate.binding_generation, serving.binding_generation);
 
-        let watcher = include_str!("watcher.rs");
+        let watcher = rust_module_source("watcher.rs");
         assert!(watcher.contains("app.state::<AppState>().graphs.read().unwrap().entries()"));
         let _ = std::fs::remove_dir_all(base);
     }

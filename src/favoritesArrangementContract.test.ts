@@ -2,16 +2,31 @@
 // docs/contracts/config-live-reload.md. A contract that can drift silently is
 // not a contract; this fails CI instead of letting the documents rot
 // (AGENTS.md §2, living contracts).
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { modelModuleSource } from "./rustModelSource.test-helpers";
+
+function rustModuleSource(path: string): string {
+  const files = [path];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = path.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 
 const arrangement = readFileSync("docs/contracts/favorites-arrangement.md", "utf8");
 const reload = readFileSync("docs/contracts/config-live-reload.md", "utf8");
 const layout = readFileSync("src/favoritesLayout.ts", "utf8");
 const store = readFileSync("src/favoritesStore.ts", "utf8");
 const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
-const watcher = readFileSync("src-tauri/src/watcher.rs", "utf8");
+const watcher = rustModuleSource("src-tauri/src/watcher.rs");
 const model = modelModuleSource();
 const graph = readFileSync("src/graph.ts", "utf8");
 
