@@ -234,13 +234,6 @@ pub enum CmpOp {
     IsBlank,
 }
 
-impl CmpOp {
-    /// Whether this operator takes `Value::None` — and only `Value::None` (C1).
-    pub fn is_presence(self) -> bool {
-        matches!(self, CmpOp::IsSet | CmpOp::IsNotSet | CmpOp::IsBlank)
-    }
-}
-
 /// A comparison operand. `Date` carries the UNRESOLVED literal (`-7d`,
 /// `today`, `2026-09-04`); resolution happens at evaluation time in local time
 /// from the evaluation's `today`, so a cached IR does not pin a day.
