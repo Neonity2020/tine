@@ -1430,14 +1430,18 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-15: K2 made the query walk and Direct `property_owner_rows`
     // test-only; their storage calls left the production surface, by deletion
     // only.
+    // 2026-09-15: K4 made the SQL lowering decide on the operator first, so
+    // `=` and `<>` (and the day comparisons) share one bind each: query/sql.rs
+    // has one fewer `PhysicalQueryValue::Integer(` (12 → 11) and one fewer
+    // `PhysicalQueryValue::Text(` (25 → 24) call site, and nothing else moved.
     // 2026-09-15: K3 moved model.rs's storage calls verbatim into the model/
     // seam modules (atomic_copy, projection_rename, trash), which reach
     // model.rs's imports through `use super::*`; the inventory now follows
     // that inheritance. With model/*.rs read as model.rs, the surface hashes
-    // to the previous digest: paths moved, nothing else.
+    // to the K4 digest above: paths moved, nothing else.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a3cc16ac263c9e35f283c3880b454f81890714862b559fd73a48077c44662e3b",
+        "d72792b40312484f7a82147334ce4624de2b710afd4f30633bafedceb94b8583",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

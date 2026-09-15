@@ -254,7 +254,7 @@
   "tests": [
    "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_quantifies_the_physical_page_forest_with_full_block_semantics",
    "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_keeps_invalid_and_wrong_scope_inputs_empty",
-   "crates/tine-core/src/query/sql.rs::tests::page_blocks_bounds_only_from_a_selective_positive_block_predicate",
+   "crates/tine-core/src/query/sql_tests.rs::page_blocks_bounds_only_from_a_selective_positive_block_predicate",
    "crates/tine-core/src/query/sql_gates_tests.rs::page_blocks_supports_finite_page_blocks_reentry"
   ],
   "scenario": "query-engine.page-blocks-physical-page-semantics",
@@ -4117,6 +4117,31 @@
   "failBefore": "proven"
  },
  "notes": "Blocking stateful UX: one answer to 'which property keys does this graph have' in both index states. Fail-before on base 37226c0b: the fallback offered [fenced, status] where the projection offers [owner, status]. Evidence: tine-agents/evidence/consolidation/k2/autocomplete-fail-before.log."
+},
+{
+ "id": "REG-QUERY-MATRIX-OPERATORS-001",
+ "title": "Every comparison the TQL operator matrix accepts answers in both engines: like on task, priority and page.namespace, page.journal !=, page.name not in, and content in / not in return their matches, and like on a date or checkbox attribute is refused with a syntax diagnostic",
+ "family": "query-correctness",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "tine-agents/specs/campaigns/2026-09-consolidation/PLAN.md (K4); query-engine SPEC.md §4.2.3"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/sql_gates_tests.rs::every_operator_the_matrix_accepts_answers_in_both_engines",
+   "crates/tine-core/src/query/tql.rs::tests::like_on_a_date_or_checkbox_attribute_is_a_syntax_diagnostic",
+   "crates/tine-core/tests/query_lowering_guards.rs::every_operator_decision_in_the_query_engines_names_every_operator"
+  ],
+  "scenario": "query.matrix-operators",
+  "failBefore": "proven"
+ },
+ "notes": "Blocking core operation: a query the parser accepted silently matched nothing, and like on a date was accepted instead of refused. Found by the K4 census of CmpOp wildcard arms. Both engines are asserted against an explicit expected set, so a shared wrong answer cannot pass as parity. Fail-before on a2aaae07 + K4.1: the walk for task like 'DO%' returned {} and scheduled like '2026%' carried no diagnostic. Evidence: tine-agents/evidence/consolidation/k4/matrix-fail-before.log and matrix-pass-after.log."
 }
 ]
 }

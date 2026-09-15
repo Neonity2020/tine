@@ -87,11 +87,6 @@ export const CMP_OPS: readonly CmpOp[] = [
   "is_set", "is_not_set", "is_blank",
 ];
 
-/** Whether this operator takes the `none` operand — and only that one (C1). */
-export function isPresenceOp(op: CmpOp): boolean {
-  return op === "is_set" || op === "is_not_set" || op === "is_blank";
-}
-
 /** Why a query is (partly) not understood. Every kind names an in-scope
  *  scenario: unknown vocabulary, malformed input, or an I-22 refusal. */
 export type DiagnosticKind =

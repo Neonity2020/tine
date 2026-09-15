@@ -34,7 +34,6 @@ import {
   assertMirrorsIr,
   forEachFilter,
   isInvalid,
-  isPresenceOp,
   sourceOptions,
   sourceOriginal,
 } from "./queryIr";
@@ -206,11 +205,6 @@ describe("the TypeScript mirror of the Rust query IR", () => {
       ...query,
       diagnostics: [{ kind: "syntax", message: "x", disabled: true }],
     })).toBe(false);
-  });
-
-  it("mirrors the presence operators, and only those (C1)", () => {
-    const presence = CMP_OPS.filter(isPresenceOp);
-    expect(presence).toEqual(["is_set", "is_not_set", "is_blank"]);
   });
 
   it("mirrors the two result anchors as a discriminated union (K16)", () => {

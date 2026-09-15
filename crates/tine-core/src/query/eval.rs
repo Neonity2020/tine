@@ -164,13 +164,25 @@ pub(crate) fn eval_page(filter: &Filter, ctx: &EvalCtx) -> bool {
             Leaf::Attr { attr, op, value } => match attr {
                 Attr::Name => eval_page_name(*op, value, ctx.page_name),
                 Attr::Journal => {
-                    matches!(
-                        (op, value),
-                        (CmpOp::Eq, Value::Bool { value: true }) if ctx.is_journal
-                    ) || matches!(
-                        (op, value),
-                        (CmpOp::Eq, Value::Bool { value: false }) if !ctx.is_journal
-                    )
+                    let wanted = value.as_bool();
+                    match op {
+                        CmpOp::Eq => wanted.is_some_and(|wanted| ctx.is_journal == wanted),
+                        CmpOp::NotEq => wanted.is_some_and(|wanted| ctx.is_journal != wanted),
+                        CmpOp::Lt
+                        | CmpOp::Le
+                        | CmpOp::Gt
+                        | CmpOp::Ge
+                        | CmpOp::Between
+                        | CmpOp::In
+                        | CmpOp::NotIn
+                        | CmpOp::Like
+                        | CmpOp::StartsWith
+                        | CmpOp::Match
+                        | CmpOp::Regex
+                        | CmpOp::IsSet
+                        | CmpOp::IsNotSet
+                        | CmpOp::IsBlank => false,
+                    }
                 }
                 Attr::Day => eval_day(*op, value, ctx.journal, ctx.today),
                 Attr::Namespace => {
@@ -423,7 +435,16 @@ fn eval_atom_count_test(test: &Filter, present: bool, count: usize) -> Option<bo
                 CmpOp::Ge => count >= *number,
                 CmpOp::Lt => count < *number,
                 CmpOp::Le => count <= *number,
-                _ => return None,
+                CmpOp::Between
+                | CmpOp::In
+                | CmpOp::NotIn
+                | CmpOp::Like
+                | CmpOp::StartsWith
+                | CmpOp::Match
+                | CmpOp::Regex
+                | CmpOp::IsSet
+                | CmpOp::IsNotSet
+                | CmpOp::IsBlank => return None,
             };
             // Cardinality is scoped by presence: an absent key has no blank value.
             Some(present && hit)
@@ -603,23 +624,29 @@ fn compare_atom_as_og(
             .og_string_len
             .is_some_and(|len| og_string_contains(len, needle))
     };
-    match (op, value) {
-        (CmpOp::In, Value::List { items }) => items
+    let listed = |items: &[Value]| {
+        items
             .iter()
             .filter_map(|item| literal(item))
-            .any(|needle| equal(&needle)),
-        (CmpOp::NotIn, Value::List { items }) => !items
-            .iter()
-            .filter_map(|item| literal(item))
-            .any(|needle| equal(&needle)),
-        (op, value) => match literal(value) {
-            None => false,
-            Some(needle) => match op {
-                CmpOp::Eq => equal(&needle),
-                CmpOp::NotEq => !equal(&needle),
-                _ => false,
-            },
-        },
+            .any(|needle| equal(&needle))
+    };
+    match op {
+        CmpOp::In => value.as_list().is_some_and(listed),
+        CmpOp::NotIn => value.as_list().is_some_and(|items| !listed(items)),
+        CmpOp::Eq => literal(value).is_some_and(|needle| equal(&needle)),
+        CmpOp::NotEq => literal(value).is_some_and(|needle| !equal(&needle)),
+        CmpOp::Lt
+        | CmpOp::Le
+        | CmpOp::Gt
+        | CmpOp::Ge
+        | CmpOp::Between
+        | CmpOp::Like
+        | CmpOp::StartsWith
+        | CmpOp::Match
+        | CmpOp::Regex
+        | CmpOp::IsSet
+        | CmpOp::IsNotSet
+        | CmpOp::IsBlank => false,
     }
 }
 
@@ -630,32 +657,35 @@ fn compare_number(op: CmpOp, value: &Value, num: f64) -> bool {
         Value::Date { literal } => literal.trim().parse::<f64>().ok().filter(|n| n.is_finite()),
         _ => None,
     };
-    match (op, value) {
-        (CmpOp::Between, Value::List { items }) if items.len() == 2 => {
-            match (operand(&items[0]), operand(&items[1])) {
-                (Some(low), Some(high)) => {
-                    let (low, high) = if low > high { (high, low) } else { (low, high) };
-                    num >= low && num <= high
+    let listed = |items: &[Value]| items.iter().any(|item| operand(item) == Some(num));
+    match op {
+        CmpOp::Between => match value {
+            Value::List { items } if items.len() == 2 => {
+                match (operand(&items[0]), operand(&items[1])) {
+                    (Some(low), Some(high)) => {
+                        let (low, high) = if low > high { (high, low) } else { (low, high) };
+                        num >= low && num <= high
+                    }
+                    _ => false,
                 }
-                _ => false,
             }
-        }
-        (CmpOp::In, Value::List { items }) => items.iter().any(|item| operand(item) == Some(num)),
-        (CmpOp::NotIn, Value::List { items }) => {
-            !items.iter().any(|item| operand(item) == Some(num))
-        }
-        (op, value) => match operand(value) {
-            None => false,
-            Some(bound) => match op {
-                CmpOp::Eq => num == bound,
-                CmpOp::NotEq => num != bound,
-                CmpOp::Lt => num < bound,
-                CmpOp::Le => num <= bound,
-                CmpOp::Gt => num > bound,
-                CmpOp::Ge => num >= bound,
-                _ => false,
-            },
+            _ => false,
         },
+        CmpOp::In => value.as_list().is_some_and(listed),
+        CmpOp::NotIn => value.as_list().is_some_and(|items| !listed(items)),
+        CmpOp::Eq => operand(value).is_some_and(|bound| num == bound),
+        CmpOp::NotEq => operand(value).is_some_and(|bound| num != bound),
+        CmpOp::Lt => operand(value).is_some_and(|bound| num < bound),
+        CmpOp::Le => operand(value).is_some_and(|bound| num <= bound),
+        CmpOp::Gt => operand(value).is_some_and(|bound| num > bound),
+        CmpOp::Ge => operand(value).is_some_and(|bound| num >= bound),
+        CmpOp::Like
+        | CmpOp::StartsWith
+        | CmpOp::Match
+        | CmpOp::Regex
+        | CmpOp::IsSet
+        | CmpOp::IsNotSet
+        | CmpOp::IsBlank => false,
     }
 }
 
@@ -671,25 +701,30 @@ fn compare_atom_text(op: CmpOp, value: &Value, key: &str) -> bool {
         }),
         _ => None,
     };
-    match (op, value) {
-        (CmpOp::In, Value::List { items }) => items
+    let listed = |items: &[Value]| {
+        items
             .iter()
-            .any(|item| operand(item).is_some_and(|item| item == key)),
-        (CmpOp::NotIn, Value::List { items }) => !items
-            .iter()
-            .any(|item| operand(item).is_some_and(|item| item == key)),
-        (CmpOp::Like, value) => operand(value).is_some_and(|pattern| like_matches(key, &pattern)),
-        (CmpOp::StartsWith, value) => operand(value).is_some_and(|prefix| key.starts_with(&prefix)),
-        (op, value) => match operand(value) {
-            None => false,
-            Some(operand) => match op {
-                CmpOp::Eq => key == operand,
-                // K3: `!=` is "coercible AND unequal"; a text atom always
-                // coerces, so this is plain inequality on the comparison key.
-                CmpOp::NotEq => key != operand,
-                _ => false,
-            },
-        },
+            .any(|item| operand(item).is_some_and(|item| item == key))
+    };
+    match op {
+        CmpOp::In => value.as_list().is_some_and(listed),
+        CmpOp::NotIn => value.as_list().is_some_and(|items| !listed(items)),
+        CmpOp::Like => operand(value).is_some_and(|pattern| like_matches(key, &pattern)),
+        CmpOp::StartsWith => operand(value).is_some_and(|prefix| key.starts_with(&prefix)),
+        CmpOp::Eq => operand(value).is_some_and(|operand| key == operand),
+        // K3: `!=` is "coercible AND unequal"; a text atom always
+        // coerces, so this is plain inequality on the comparison key.
+        CmpOp::NotEq => operand(value).is_some_and(|operand| key != operand),
+        CmpOp::Lt
+        | CmpOp::Le
+        | CmpOp::Gt
+        | CmpOp::Ge
+        | CmpOp::Between
+        | CmpOp::Match
+        | CmpOp::Regex
+        | CmpOp::IsSet
+        | CmpOp::IsNotSet
+        | CmpOp::IsBlank => false,
     }
 }
 
@@ -698,15 +733,26 @@ fn compare_atom_text(op: CmpOp, value: &Value, key: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn eval_content(op: CmpOp, value: &Value, block: &DocBlock, ctx: &EvalCtx) -> bool {
-    let Value::Text { text } = value else {
-        return false;
-    };
     let projection = block.projection();
+    let folded = || value.as_text().map(canonical_fold);
+    // `content in (…)` is `=` against any one of the listed texts (§4.2.3).
+    let listed = |items: &[Value]| {
+        items.iter().any(|item| {
+            item.as_text()
+                .is_some_and(|text| projection.visible_lower == canonical_fold(text))
+        })
+    };
     match op {
-        CmpOp::Like => like_matches(&projection.visible_lower, &canonical_fold(text)),
-        CmpOp::StartsWith => projection.visible_lower.starts_with(&canonical_fold(text)),
-        CmpOp::Eq => projection.visible_lower == canonical_fold(text),
-        CmpOp::NotEq => projection.visible_lower != canonical_fold(text),
+        CmpOp::Like => {
+            folded().is_some_and(|pattern| like_matches(&projection.visible_lower, &pattern))
+        }
+        CmpOp::StartsWith => {
+            folded().is_some_and(|prefix| projection.visible_lower.starts_with(&prefix))
+        }
+        CmpOp::Eq => folded().is_some_and(|text| projection.visible_lower == text),
+        CmpOp::NotEq => folded().is_some_and(|text| projection.visible_lower != text),
+        CmpOp::In => value.as_list().is_some_and(listed),
+        CmpOp::NotIn => value.as_list().is_some_and(|items| !listed(items)),
         // §5.10: an empty or invalid-regex Match is a FALSE leaf, exactly as
         // today. `Matcher::matches` answers false for `Empty` and
         // `InvalidRegex`, and `is_some_and` answers false for a leaf whose
@@ -714,64 +760,99 @@ fn eval_content(op: CmpOp, value: &Value, block: &DocBlock, ctx: &EvalCtx) -> bo
         // is classically true (§3.4). It is deliberately not an enabled
         // whole-query diagnostic; the matcher's own error message may be
         // displayed without changing that truth rule.
-        CmpOp::Match => ctx
-            .compiled
-            .match_program(text)
-            .is_some_and(|m| m.matches(&projection.visible_lower, &projection.visible)),
+        CmpOp::Match => value.as_text().is_some_and(|text| {
+            ctx.compiled
+                .match_program(text)
+                .is_some_and(|m| m.matches(&projection.visible_lower, &projection.visible))
+        }),
         // An invalid regex is retained but deliberately matches nothing.
-        CmpOp::Regex => ctx
-            .compiled
-            .regex(text)
-            .is_some_and(|r| r.is_match(&projection.visible)),
-        _ => false,
+        CmpOp::Regex => value.as_text().is_some_and(|text| {
+            ctx.compiled
+                .regex(text)
+                .is_some_and(|r| r.is_match(&projection.visible))
+        }),
+        CmpOp::Lt
+        | CmpOp::Le
+        | CmpOp::Gt
+        | CmpOp::Ge
+        | CmpOp::Between
+        | CmpOp::IsSet
+        | CmpOp::IsNotSet
+        | CmpOp::IsBlank => false,
     }
 }
 
 /// A comparison on an OPTIONAL text attribute (`task`, `priority`, page
 /// `namespace`). Absent makes every comparison false (§3.4).
 fn eval_optional_text(op: CmpOp, value: &Value, actual: Option<&str>) -> bool {
-    match (op, actual) {
-        (CmpOp::IsSet, _) => actual.is_some(),
-        (CmpOp::IsNotSet, _) => actual.is_none(),
-        (_, None) => false,
-        (CmpOp::Eq, Some(actual)) => match value {
-            Value::Text { text } => actual.eq_ignore_ascii_case(text),
-            _ => false,
-        },
-        (CmpOp::NotEq, Some(actual)) => match value {
-            Value::Text { text } => !actual.eq_ignore_ascii_case(text),
-            _ => false,
-        },
-        (CmpOp::In, Some(actual)) => match value {
-            Value::List { items } => items.iter().any(|item| match item {
-                Value::Text { text } => actual.eq_ignore_ascii_case(text),
-                _ => false,
-            }),
-            _ => false,
-        },
-        (CmpOp::NotIn, Some(actual)) => match value {
-            Value::List { items } => !items.iter().any(|item| match item {
-                Value::Text { text } => actual.eq_ignore_ascii_case(text),
-                _ => false,
-            }),
-            _ => false,
-        },
-        _ => false,
+    let text = value.as_text();
+    let listed = |actual: &str| {
+        value.as_list().map(|items| {
+            items.iter().any(|item| {
+                item.as_text()
+                    .is_some_and(|text| actual.eq_ignore_ascii_case(text))
+            })
+        })
+    };
+    match op {
+        CmpOp::IsSet => actual.is_some(),
+        CmpOp::IsNotSet => actual.is_none(),
+        CmpOp::Eq => actual
+            .zip(text)
+            .is_some_and(|(actual, text)| actual.eq_ignore_ascii_case(text)),
+        CmpOp::NotEq => actual
+            .zip(text)
+            .is_some_and(|(actual, text)| !actual.eq_ignore_ascii_case(text)),
+        CmpOp::In => actual.and_then(listed).unwrap_or(false),
+        CmpOp::NotIn => actual.and_then(listed).is_some_and(|hit| !hit),
+        // `like` folds ASCII case on both sides, as `=` does.
+        CmpOp::Like => actual.zip(text).is_some_and(|(actual, text)| {
+            like_matches(&actual.to_ascii_lowercase(), &text.to_ascii_lowercase())
+        }),
+        CmpOp::StartsWith => actual.zip(text).is_some_and(|(actual, text)| {
+            actual
+                .to_ascii_lowercase()
+                .starts_with(&text.to_ascii_lowercase())
+        }),
+        CmpOp::Lt
+        | CmpOp::Le
+        | CmpOp::Gt
+        | CmpOp::Ge
+        | CmpOp::Between
+        | CmpOp::Match
+        | CmpOp::Regex
+        | CmpOp::IsBlank => false,
     }
 }
 
 fn eval_page_name(op: CmpOp, value: &Value, page_name: &str) -> bool {
     let key = refs::page_key(page_name);
-    match (op, value) {
-        (CmpOp::Eq, Value::Text { text }) => key == refs::page_key(text),
-        (CmpOp::NotEq, Value::Text { text }) => key != refs::page_key(text),
-        (CmpOp::StartsWith, Value::Text { text }) => key.starts_with(&page_prefix_key(text)),
-        (CmpOp::Like, Value::Text { text }) => like_matches(&key, &canonical_fold(text)),
-        (CmpOp::In, Value::List { items }) => items.iter().any(|item| match item {
-            Value::Text { text } => key == refs::page_key(text),
-            _ => false,
-        }),
-        _ => false,
+    let text = value.as_text();
+    let listed = || {
+        value.as_list().map(|items| {
+            items.iter().any(|item| {
+                item.as_text()
+                    .is_some_and(|text| key == refs::page_key(text))
+            })
+        })
+    };
+    match op {
+        CmpOp::Eq => text.is_some_and(|text| key == refs::page_key(text)),
+        CmpOp::NotEq => text.is_some_and(|text| key != refs::page_key(text)),
+        CmpOp::StartsWith => text.is_some_and(|text| key.starts_with(&page_prefix_key(text))),
+        CmpOp::Like => text.is_some_and(|text| like_matches(&key, &canonical_fold(text))),
+        CmpOp::In => listed().unwrap_or(false),
+        CmpOp::NotIn => listed().is_some_and(|hit| !hit),
+        CmpOp::Lt
+        | CmpOp::Le
+        | CmpOp::Gt
+        | CmpOp::Ge
+        | CmpOp::Between
+        | CmpOp::Match
+        | CmpOp::Regex
+        | CmpOp::IsSet
+        | CmpOp::IsNotSet
+        | CmpOp::IsBlank => false,
     }
 }
 
@@ -792,10 +873,11 @@ fn page_prefix_key(text: &str) -> String {
 
 /// A date comparison on a page's journal day ordinal.
 fn eval_day(op: CmpOp, value: &Value, day: Option<i64>, today: JournalDate) -> bool {
-    match op {
-        CmpOp::IsSet => return day.is_some(),
-        CmpOp::IsNotSet => return day.is_none(),
-        _ => {}
+    if op == CmpOp::IsSet {
+        return day.is_some();
+    }
+    if op == CmpOp::IsNotSet {
+        return day.is_none();
     }
     let Some(day) = day else { return false };
     compare_day(op, value, day, today)
@@ -808,10 +890,11 @@ fn eval_day(op: CmpOp, value: &Value, day: Option<i64>, today: JournalDate) -> b
 /// malformed `<2026-13-45 …>` has presence but no day (E1). This replaces the
 /// old raw-text `raw.contains("SCHEDULED:")` scan, which saw both.
 fn eval_planning(op: CmpOp, value: &Value, text: Option<&str>, ctx: &EvalCtx) -> bool {
-    match op {
-        CmpOp::IsSet => return text.is_some(),
-        CmpOp::IsNotSet => return text.is_none(),
-        _ => {}
+    if op == CmpOp::IsSet {
+        return text.is_some();
+    }
+    if op == CmpOp::IsNotSet {
+        return text.is_none();
     }
     let Some(day) = text.and_then(planning_day) else {
         return false;
@@ -825,24 +908,36 @@ fn compare_day(op: CmpOp, value: &Value, day: i64, today: JournalDate) -> bool {
         Value::Number { number } => Some(*number as i64),
         _ => None,
     };
-    match (op, value) {
-        (CmpOp::Between, Value::List { items }) if items.len() == 2 => {
-            // OG's `build-between-two-arg` sorts its two resolved bounds, so
-            // `(between END START)` is the same inclusive interval.
-            let (low, high) = (resolve(&items[0]), resolve(&items[1]));
-            let (low, high) = match (low, high) {
-                (Some(low), Some(high)) if low > high => (Some(high), Some(low)),
-                pair => pair,
-            };
-            low.is_none_or(|low| day >= low) && high.is_none_or(|high| day <= high)
-        }
-        (CmpOp::Ge, value) => resolve(value).is_none_or(|bound| day >= bound),
-        (CmpOp::Le, value) => resolve(value).is_none_or(|bound| day <= bound),
-        (CmpOp::Gt, value) => resolve(value).is_some_and(|bound| day > bound),
-        (CmpOp::Lt, value) => resolve(value).is_some_and(|bound| day < bound),
-        (CmpOp::Eq, value) => resolve(value).is_some_and(|bound| day == bound),
-        (CmpOp::NotEq, value) => resolve(value).is_some_and(|bound| day != bound),
-        _ => false,
+    match op {
+        CmpOp::Between => match value {
+            Value::List { items } if items.len() == 2 => {
+                // OG's `build-between-two-arg` sorts its two resolved bounds, so
+                // `(between END START)` is the same inclusive interval.
+                let (low, high) = (resolve(&items[0]), resolve(&items[1]));
+                let (low, high) = match (low, high) {
+                    (Some(low), Some(high)) if low > high => (Some(high), Some(low)),
+                    pair => pair,
+                };
+                low.is_none_or(|low| day >= low) && high.is_none_or(|high| day <= high)
+            }
+            _ => false,
+        },
+        CmpOp::Ge => resolve(value).is_none_or(|bound| day >= bound),
+        CmpOp::Le => resolve(value).is_none_or(|bound| day <= bound),
+        CmpOp::Gt => resolve(value).is_some_and(|bound| day > bound),
+        CmpOp::Lt => resolve(value).is_some_and(|bound| day < bound),
+        CmpOp::Eq => resolve(value).is_some_and(|bound| day == bound),
+        CmpOp::NotEq => resolve(value).is_some_and(|bound| day != bound),
+        // Presence is answered by the callers before a day exists.
+        CmpOp::In
+        | CmpOp::NotIn
+        | CmpOp::Like
+        | CmpOp::StartsWith
+        | CmpOp::Match
+        | CmpOp::Regex
+        | CmpOp::IsSet
+        | CmpOp::IsNotSet
+        | CmpOp::IsBlank => false,
     }
 }
 
