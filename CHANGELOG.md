@@ -54,6 +54,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   twice and was written to the file twice.
 - A move between pages that cannot start because a page has unsaved changes now
   always says so. Keyboard moves across a journal-day boundary failed silently.
+- Typing ``` to start a code block lets you set its language again. The three backticks used to drop the cursor straight inside the block, which hides the line the language goes on, so there was no way to choose one except the `/Code block` command. The language list now opens on that line; pressing Escape puts the cursor inside the block as before. (GH #507)
 - Typing a workspace name with Chinese or another input method (IME) now works. The name field used to be rebuilt on every keystroke, which cancelled the character being composed. (GH #498)
 - Returning to the browser tab of a published export no longer shows a "couldn't finish checking for external changes" error. The read-only export has nothing to re-check, so it no longer tries. An export also no longer shows a stray “⊞ Table” button on every page, or an error after zooming or scrolling a PDF. (GH #549)
 - Carrying unfinished tasks to today while today's journal had a sync conflict no longer lets a later edit to one of the earlier days delete those tasks from that day's file. Tine now keeps the earlier days unchanged on disk until today is saved, as it already did for other block moves. Moving blocks into the same page twice before it saved also no longer leaves the first move's source page unable to save.

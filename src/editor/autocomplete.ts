@@ -184,8 +184,9 @@ export function detectTrigger(
   }
 
   // Opening Markdown fence language. Do not pop a menu for a bare fence typed
-  // by hand (Enter keeps its established behavior); one language character is
-  // enough. The /Code block command explicitly opens the empty picker instead.
+  // inside other content (Enter keeps its established behavior); one language
+  // character is enough. /Code block and the whole-block ``` scaffold open the
+  // empty picker explicitly instead (Block.tsx `openFenceLanguagePicker`).
   const fence = /^( {0,3})(`{3,}|~{3,})([\w+#.-]+)$/.exec(before);
   if (fence && !insideFenceBefore(raw, lineStart)) {
     const start = lineStart + fence[1].length + fence[2].length;
