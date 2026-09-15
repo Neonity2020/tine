@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { readBlockModuleSource } from "./testSource";
 
 const read = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
@@ -27,7 +28,8 @@ describe("frontend-staleness living contract", () => {
     ] as const;
     for (const [contractName, path, identifier] of exemplars) {
       expect(contract).toContain(contractName);
-      expect(read(path)).toContain(identifier);
+      const source = path === "src/components/Block.tsx" ? readBlockModuleSource() : read(path);
+      expect(source).toContain(identifier);
     }
 
     expect(contract).toContain("`persistence.ts:362`");

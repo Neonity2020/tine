@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
-import { readFileSync } from "node:fs";
+import { readAppStylesheet } from "../testSource";
 import { Block, SurfaceContext } from "./Block";
 import { SheetGrid } from "./SheetGrid";
 import { ContextMenu } from "./ContextMenu";
@@ -247,7 +247,7 @@ function activeEditor(root: HTMLElement): HTMLTextAreaElement {
 
 function installAppStyles(): HTMLStyleElement {
   const style = document.createElement("style");
-  style.textContent = readFileSync("src/styles/app.css", "utf8");
+  style.textContent = readAppStylesheet();
   document.head.appendChild(style);
   return style;
 }

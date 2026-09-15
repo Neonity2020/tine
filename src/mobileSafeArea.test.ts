@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readAppStylesheet } from "./testSource";
 
 /**
  * The system-inset contract for viewport-fixed overlays, checked as text.
@@ -9,7 +10,7 @@ import { describe, expect, it } from "vitest";
  * every machine has. These assertions are the part that can run anywhere.
  */
 describe("mobile safe-area insets", () => {
-  const css = readFileSync("src/styles/app.css", "utf8");
+  const css = readAppStylesheet();
   const main = readFileSync("src/main.tsx", "utf8");
 
   it("centralizes each platform inset behind one system token", () => {

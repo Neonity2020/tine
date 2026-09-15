@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { editableEmojiPlatform } from "./editableEmoji";
+import { readAppStylesheet } from "./testSource";
 
 describe("editable emoji crash guard", () => {
   it("loads a bundled monochrome emoji font", () => {
@@ -16,7 +17,7 @@ describe("editable emoji crash guard", () => {
   });
 
   it("uses platform color emoji before the safe fallback except on desktop Linux", () => {
-    const css = readFileSync("src/styles/app.css", "utf8");
+    const css = readAppStylesheet();
     expect(css).toContain('--tine-editable-emoji-font: "Noto Emoji Variable"');
     expect(css).toContain('--tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable"');
     expect(css).toContain('--tine-editable-emoji-font: "Apple Color Emoji", "Noto Emoji Variable"');

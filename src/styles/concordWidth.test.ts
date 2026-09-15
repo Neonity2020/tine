@@ -1,9 +1,7 @@
-import fs from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { readAppStylesheet } from "../testSource";
 
-const root = path.resolve(import.meta.dirname, "../..");
-const app = fs.readFileSync(path.join(root, "src/styles/app.css"), "utf8");
+const app = readAppStylesheet();
 
 function ruleBody(selectorPattern: RegExp): string {
   return app.match(selectorPattern)?.[1] ?? "";
