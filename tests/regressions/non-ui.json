@@ -4142,6 +4142,32 @@
   "failBefore": "proven"
  },
  "notes": "Blocking core operation: a query the parser accepted silently matched nothing, and like on a date was accepted instead of refused. Found by the K4 census of CmpOp wildcard arms. Both engines are asserted against an explicit expected set, so a shared wrong answer cannot pass as parity. Fail-before on a2aaae07 + K4.1: the walk for task like 'DO%' returned {} and scheduled like '2026%' carried no diagnostic. Evidence: tine-agents/evidence/consolidation/k4/matrix-fail-before.log and matrix-pass-after.log."
+},
+{
+ "id": "REG-CONCORD-LEDGER-EXIT-DRAIN-001",
+ "title": "Quitting right after a save keeps that save's Concord merge base: every exit path waits, at most 200 ms in total, for the queued ledger updates of every open graph",
+ "family": "concord-base-ledger",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "tine-agents/specs/campaigns/2026-09-consolidation/PLAN.md §7 (Concord exit wait); Martin 2026-09-15 (T2)"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core-tauri-boundary",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/concord_ledger.rs::tests::exit_drain_lands_every_queued_update",
+   "crates/tine-core/src/concord_ledger.rs::tests::exit_drain_never_starts_the_worker",
+   "crates/tine-core/src/concord_ledger.rs::tests::storage_contract_names_the_concord_ledger_and_its_schema",
+   "src-tauri/src/lib.rs::concord_exit_drain_tests::every_exit_path_drains_the_concord_ledgers"
+  ],
+  "scenario": "concord.ledger-exit-drain",
+  "failBefore": "proven"
+ },
+ "notes": "Flexible degraded behaviour, not data loss: the ledger is a merge hint and no note text is ever lost. ConcordLedger::flush() had only test callers, so app.exit(0) dropped queued Record/Pin/DropPin/Prune jobs and the next conflict on that page merged against an older base (more lines to review by hand). Quitting right after a save is the ordinary multi-device case Concord serves, so Martin chose a bounded exit wait over a doc-only fix. Fail-before: the lib.rs exit-path guard failed on base a36724c7 because the RunEvent::Exit arm did not drain. Evidence: tine-agents/evidence/concord-exit-flush/."
 }
 ]
 }

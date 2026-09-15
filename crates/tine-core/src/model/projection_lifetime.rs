@@ -122,6 +122,14 @@ impl Graph {
         self.concord_ledger.get()
     }
 
+    /// Quitting: wait until `deadline` for this graph's queued ledger updates.
+    /// True when there was nothing to wait for or the queue drained in time.
+    pub fn drain_concord_ledger_for_exit(&self, deadline: std::time::Instant) -> bool {
+        self.concord_ledger
+            .get()
+            .is_none_or(|ledger| ledger.drain_for_exit(deadline))
+    }
+
     /// Best-effort ledger update: `content` is now the exact text Tine and the
     /// disk agree on for `path`. Called after a successful save commit and
     /// after an external-change admission. Foreground cost is one channel send;
