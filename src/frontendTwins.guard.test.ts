@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { serializedWrites } from "./serializedWrites";
+import { readStoreModuleSource } from "./testSource";
 
 /** Every non-test frontend source under `src/`, so an ownership rule cannot be
  *  escaped by putting the offending copy in a directory the scan forgot. */
@@ -125,16 +126,16 @@ describe("frontend twin ownership guards", () => {
     // the same block further down the page. Every `startEditing` call in the
     // store therefore passes a surface (usually a forwarded `editingSurface`
     // parameter); `indentBlock` is the exemplar to imitate.
-    const lines = readFileSync("src/store.ts", "utf8").split("\n");
+    const lines = readStoreModuleSource().split("\n");
     const calls = lines
       .map((line, index) => ({ line: line.trim(), number: index + 1 }))
       .filter((entry) => entry.line.startsWith("startEditing("));
     // Non-vacuity: this guard is worthless if the scan stops finding the calls.
-    expect(calls.length, "I-12: the startEditing scan of src/store.ts found nothing").toBeGreaterThanOrEqual(6);
+    expect(calls.length, "I-11/I-12: the startEditing scan of the store layer found nothing").toBeGreaterThanOrEqual(6);
     for (const call of calls) {
       expect(
         call.line.split(",").length,
-        `I-12: src/store.ts:${call.number} reopens the editor without naming a surface, so the caret `
+        `I-11/I-12: store-layer source line ${call.number} reopens the editor without naming a surface, so the caret `
           + `leaves a block embed for the source copy (GH #477). Take an \`editingSurface\` parameter and `
           + `forward it as the 4th argument, like indentBlock does.`,
       ).toBeGreaterThanOrEqual(4);

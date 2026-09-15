@@ -34,3 +34,16 @@ export function readBlockModuleSource(): string {
   ];
   return files.map((file) => `// ${file}\n${readFileSync(path.join(root, file), "utf8")}`).join("\n");
 }
+
+/** Store's implementation boundary: its public façade plus every extracted child module. */
+export function readStoreModuleSource(): string {
+  const directory = path.join(root, "src/store");
+  const files = [
+    "src/store.ts",
+    ...readdirSync(directory)
+      .filter((file) => /\.tsx?$/.test(file) && !/\.(test|spec)\.tsx?$/.test(file))
+      .sort()
+      .map((file) => `src/store/${file}`),
+  ];
+  return files.map((file) => `// ${file}\n${readFileSync(path.join(root, file), "utf8")}`).join("\n");
+}
