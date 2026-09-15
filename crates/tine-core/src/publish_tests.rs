@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn no_refs() -> RefIndex {
@@ -428,12 +427,25 @@ fn publish_macros_never_expand_private_graph_content() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The publish module's production source: publish.rs, then every
+/// `publish/*.rs`, as raw text (comments included). A source guard that reads
+/// publish.rs alone goes blind when code moves into a child module, so the
+/// guards below read the whole module instead (I-11; the K3 lesson).
+fn publish_module_production() -> String {
+    crate::projection_producer_census::production_rust()
+        .iter()
+        .filter(|file| {
+            file.relative == "crates/tine-core/src/publish.rs"
+                || file.relative.starts_with("crates/tine-core/src/publish/")
+        })
+        .map(|file| file.raw.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn static_query_selection_has_only_the_supplied_main_reader() {
-    let production = include_str!("publish.rs")
-        .split_once("#[cfg(test)]\nmod tests")
-        .unwrap()
-        .0;
+    let production = publish_module_production();
     for retired in [
         "attach_snapshot_query_projection",
         "index_queries(",
@@ -462,11 +474,7 @@ fn static_query_selection_has_only_the_supplied_main_reader() {
 
 #[test]
 fn query_hydration_has_one_shared_source_owner() {
-    let source = include_str!("publish.rs");
-    let production = source
-        .split_once("#[cfg(test)]\nmod tests")
-        .expect("publish tests module marker")
-        .0;
+    let production = publish_module_production();
     assert_eq!(
             production.matches("fn with_hydrated_query_groups(").count(),
             1,

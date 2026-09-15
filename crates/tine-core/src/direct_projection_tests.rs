@@ -1,4 +1,3 @@
-
 #[test]
 fn direct_query_producer_has_no_saved_edit_or_answer_cache_protocol() {
     let source = include_str!("direct_projection.rs");
