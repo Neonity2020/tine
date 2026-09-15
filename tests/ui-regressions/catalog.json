@@ -11312,6 +11312,58 @@
       "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page + the view compared under viewKey, which folds the engine's dense ViewSettings and the app's sparse resolution together) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export…, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. The Playwright journey passed a five-round sequential unchanged-binary burn-in (Direct and Managed exports, 27/27 each round, binary built from 5ab70870) on 2026-09-15 and runs in linux-release."
     },
     {
+      "id": "UI-PUBLISH-FOCUS-NO-RESCAN-549",
+      "title": "Returning to a published export's tab shows no error: the read-only app does not ask for a rescan it cannot run",
+      "family": "publishing",
+      "sources": {
+        "issues": [
+          549
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx",
+          "src/components/PdfViewer.test.tsx",
+          "src/reloadOnFocus.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a reader of a published export (ADR 0065 Stage 2) who switches away and back sees no toast. Classification: flexible presentation, but a false error ('Editing is available, but reopen the page…') in an app that has no editing at all, shown on every refocus. Root cause: App.tsx installs the Concord L0 reload-on-focus fallback unconditionally; in a published export refreshOnReturnToWindow reached backend().rescanGraphNow(), which the published backend refuses (PUBLISHED_REFUSED_METHODS), and the catch toasted the refusal. Fix: refreshOnReturnToWindow returns at once and installReloadOnFocus does not install when isPublishedExport(). Fail-before on master 6db9d7e5: rescanGraphNow called once on focus with the published meta tag present. Evidence: tine-agents/evidence/shell-quick-fixes/. Sibling sweep (every refused backend call that fires without a user action in the published app): two more were visible and are fixed here. (1) TagTableToggle ran `runQuery` on every ordinary page; the refusal counted as a reason to show the button, so each page carried a stray '⊞ Table' whose tooltip was the refusal text. It no longer queries or renders in an export, and a page whose author enabled the tag table falls back to its baked linked references. (2) PdfViewer's debounced view-position save after a zoom or scroll, and its flush on close, were refused and toasted. The export no longer schedules it. Fail-before proven for both. Left as follow-ups: creating a PDF highlight in an export is still offered and fails with an honest toast (user action, not automatic); Macro 'why empty?' shows the refusal text on click; several Settings-only ui.ts setters lack a published gate, but the Settings entry is hidden."
+    },
+    {
+      "id": "UI-WORKSPACE-NAME-IME-498",
+      "title": "Chinese and other IME input works when naming or renaming a workspace",
+      "family": "workspaces",
+      "sources": {
+        "issues": [
+          498
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/WorkspaceSwitcher.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a user typing with an IME (the report: Chinese on Windows 11) can enter a workspace name in the switcher's New workspace / Rename field. Classification: blocking stateful UX for CJK users; the name cannot be entered at all. Root cause: the form rendered under <Show when={edit()} keyed> and onInput called setEdit({...state, value}), so every input event created a new key and Solid rebuilt the form and its <input>; the first composition input destroyed the composing element and Windows TSF cancelled it. Latin typing survived because the value was re-seeded and the caret landed at the end. Present since the component was created (9f6a3f3b); not a 0.6.982 regression. Fix: the typed text lives in its own signal, the keyed Show changes only when an edit opens or closes, the input keeps its initial value so nothing rewrites input.value mid-composition, and Escape ignores isComposing/keyCode 229 like the other text fields. Fail-before on master: the <input> element was replaced after the first input event. jsdom proves element identity, not Windows TSF behaviour; a Windows IME check was not run."
+    },
+    {
       "id": "UI-CODE-FENCE-LANGUAGE-507",
       "title": "A language can be set on a code block typed with three backticks",
       "family": "editor-typing",
