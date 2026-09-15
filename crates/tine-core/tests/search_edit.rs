@@ -774,7 +774,10 @@ fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
 
 #[test]
 fn resolve_blocks_uses_hinted_page_lookup_without_per_hint_linear_scans() {
-    let src = include_str!("../src/query.rs");
+    let src = production_source::module_source(
+        &production_source::repo_root(),
+        "crates/tine-core/src/query.rs",
+    );
     assert!(
         !src.contains("pages.iter().find(|(e, _)| &e.name == page)"),
         "hinted resolve_blocks lookup must not linearly scan all pages per hinted page"

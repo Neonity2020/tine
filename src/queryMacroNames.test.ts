@@ -74,18 +74,40 @@ function sourceFiles(dir: string, extensions: RegExp, acc: string[] = []): strin
     }
     if (!extensions.test(entry)) continue;
     // Test sources are excluded: a test's job is to spell literal document bytes.
-    if (/\.test\.tsx?$/.test(entry)) continue;
+    // A Rust `X_tests.rs` is the body of `#[cfg(test)] #[path = "X_tests.rs"] mod
+    // tests;`, test code by the same convention the tine-core census uses
+    // (`projection_producer_census::scan_production_rust`).
+    if (/\.test\.tsx?$/.test(entry) || /_tests\.rs$/.test(entry)) continue;
     acc.push(full);
   }
   return acc;
 }
 
-/** Rust `#[cfg(test)]` modules are test code in a production file. Strip from the
- *  first `#[cfg(test)]` to end of file so a test fixture's literal is not read as
- *  a production matcher. */
-function productionRust(text: string): string {
-  const at = text.indexOf("#[cfg(test)]");
-  return at === -1 ? text : text.slice(0, at);
+/** Rust `#[cfg(test)]` items are test code in a production file. Strip each such
+ *  item and nothing else. A one-line item (`use …;`, `mod tests;`) ends at its
+ *  line. A block item (`mod tests {`, `fn … {`) ends at the next column-0 `}`,
+ *  which is where rustfmt closes a top-level item. Cutting from the first
+ *  `#[cfg(test)]` to end of file instead would hide every production line after a
+ *  test-only `use` near the top, and the guard would pass blind (I-11). */
+export function productionRust(text: string): string {
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== "#[cfg(test)]") {
+      kept.push(lines[i]);
+      continue;
+    }
+    let j = i + 1;
+    while (j < lines.length && /^\s*#\[/.test(lines[j])) j++;
+    if (j < lines.length && /[{]\s*$/.test(lines[j])) {
+      const indent = /^\s*/.exec(lines[j])![0];
+      while (j < lines.length && lines[j] !== `${indent}}`) j++;
+    } else {
+      while (j < lines.length && !/;\s*$/.test(lines[j])) j++;
+    }
+    i = j;
+  }
+  return kept.join("\n");
 }
 
 /** A `{{query`-shaped matcher or writer: a literal macro opening, or a regex

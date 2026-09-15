@@ -94,12 +94,10 @@ fn audited_write_guard_rejects_import_alias_and_constructor_evasions() {
     }
 }
 
-/// A Rust module read as one logical source: the module file plus every `.rs`
-/// file below its sibling directory (`commands.rs` + `commands/**/*.rs`).
-/// Source guards read through this, so code a seam cut moves into a child
-/// module stays visible to them (I-11; exemplar: tine-core's
-/// `projection_producer_census::production_rust`).
-pub(crate) fn rust_module_source_at(root: &std::path::Path) -> String {
+/// Every `.rs` file of the module whose root file is `root`: the root first,
+/// then everything below its sibling directory (`commands.rs` + `commands/**`),
+/// in path order.
+fn rust_module_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn visit(directory: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(directory).expect("module directory is readable") {
             let path = entry.expect("module entry is readable").path();
@@ -111,32 +109,90 @@ pub(crate) fn rust_module_source_at(root: &std::path::Path) -> String {
         }
     }
 
-    let mut paths = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
     let module_directory = root.with_extension("");
     if module_directory.is_dir() {
         visit(&module_directory, &mut paths);
     }
     paths.sort();
+    paths.insert(0, root.to_path_buf());
     paths
+}
+
+/// A Rust module read as one logical source. Source guards read through this,
+/// so code a seam cut moves into a child module stays visible to them (I-11;
+/// the exemplar is tine-core's `projection_producer_census::production_rust`).
+/// `src/rustModelSourceGuard.test.ts` fails on a guard that reads a split
+/// module's root file alone.
+pub(crate) fn rust_module_source_at(root: &std::path::Path) -> String {
+    rust_module_paths(root)
         .into_iter()
         .map(|path| std::fs::read_to_string(path).expect("module source is readable"))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+fn source_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
 /// [`rust_module_source_at`] for a module file under `src-tauri/src`.
 pub(crate) fn rust_module_source(file: &str) -> String {
-    rust_module_source_at(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join(file),
-    )
+    rust_module_source_at(&source_dir().join(file))
+}
+
+/// [`rust_module_source`] with each file's `#[cfg(test)]` items removed: the
+/// module's production code, for guards whose own test data would otherwise
+/// match.
+pub(crate) fn rust_module_production_source(file: &str) -> String {
+    rust_module_paths(&source_dir().join(file))
+        .into_iter()
+        .map(|path| {
+            without_cfg_test_items(
+                &std::fs::read_to_string(path).expect("module source is readable"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `source` without its `#[cfg(test)]` items. A one-line item (`use …;`,
+/// `mod tests;`) ends at its line. A block item ends at the next line holding
+/// only its indentation and `}`, which is where rustfmt closes it. The
+/// TypeScript twin is `productionRust` in `src/queryMacroNames.test.ts`.
+pub(crate) fn without_cfg_test_items(source: &str) -> String {
+    let lines: Vec<&str> = source.split('\n').collect();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() != "#[cfg(test)]" {
+            kept.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].trim_start().starts_with("#[") {
+            j += 1;
+        }
+        if j < lines.len() && lines[j].trim_end().ends_with('{') {
+            let indent = &lines[j][..lines[j].len() - lines[j].trim_start().len()];
+            let close = format!("{indent}}}");
+            while j < lines.len() && lines[j] != close {
+                j += 1;
+            }
+        } else {
+            while j < lines.len() && !lines[j].trim_end().ends_with(';') {
+                j += 1;
+            }
+        }
+        i = j + 1;
+    }
+    kept.join("\n")
 }
 
 /// Every top-level module under `src-tauri/src`, child files folded in.
 pub(crate) fn rust_module_sources() -> Vec<(String, String)> {
-    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut roots = std::fs::read_dir(&source_dir)
+    let mut roots = std::fs::read_dir(source_dir())
         .expect("src-tauri/src must be readable")
         .map(|entry| entry.expect("source entry is readable").path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
