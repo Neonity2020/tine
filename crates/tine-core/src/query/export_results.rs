@@ -25,7 +25,7 @@
 //! actor or graph lock, reads no source document, and performs no recovery or
 //! retry. It receives the SAME `&mut` snapshot the selection ran on, plus the
 //! identity policy the caller captured beside it. Capacity, snapshot
-//! acquisition, the public Direct/Managed command adapters, the final
+//! acquisition, the public command adapters, the final
 //! cancellation check and releasing the transactions all stay with the caller.
 //! [`ResultReadError`] is the shared failure vocabulary.
 //!

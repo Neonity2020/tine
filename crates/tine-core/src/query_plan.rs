@@ -311,8 +311,8 @@ impl FriendlyDisplayOptions {
 
 /// **The one Friendly graph-search plan builder** (I-12, D-4).
 ///
-/// Every public Friendly route — Direct's `run_graph_search*`, the Managed
-/// `application_navigation` GraphSearch arm — asks THIS function which plan a
+/// Every public Friendly route — Direct's `run_graph_search*` — asks THIS
+/// function which plan a
 /// `(source, limits, routed scope, Display)` request means. Each used to spell
 /// the same `match scope { … }` itself, and a routed search that forgot to
 /// carry a section's sample or membership scope would have been a difference

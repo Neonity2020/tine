@@ -687,7 +687,6 @@ fn cancellation_after_complete_construction_returns_no_partial_batch() {
 fn executor_source_owns_no_snapshot_open_graph_walk_or_second_export_algorithm() {
     let source = include_str!("export_execute.rs");
     assert!(!source.contains("open_direct"));
-    assert!(!source.contains("open_managed"));
     assert!(!source.contains("Graph::"));
     assert!(!source.contains("Document"));
     assert_eq!(source.matches("select_located_export_queries(").count(), 1);

@@ -14,7 +14,6 @@
 //! |---|---|---|
 //! | Direct Files, projection ready | `SqliteGraphProjectionRead::property_facet_rows_after(false, …)` | `pages(page_id, path, name)` in the same snapshot |
 //! | Direct Files, not ready | [`crate::query::property_owner_rows`] over the document cache | the page entry's `rel_path` / name |
-//! | Managed Storage | `SqliteMaterializedRead::property_facet_rows_after(false, …)` masked, then the overlay iterator | masked and overlaid identically (C4) |
 //!
 //! The three `Vec<(key, Vec<value>)>` facet wrappers that exist today are NOT
 //! sources: they aggregate owner identity away, and owner identity is what
@@ -40,12 +39,9 @@ pub enum OwnerType {
     Page,
 }
 
-/// One property row exactly as `MaterializedPropertyFacetRow`
-/// (`oplog::sqlite_materialization::MaterializedPropertyFacetRow`) streams it,
-/// with the ids widened to
-/// opaque snapshot-scoped strings so ONE producer serves all three sources:
-/// Managed identifies owners by `PageId`/`BlockId` UUIDs, the Direct Files
-/// projection by `[u8; 16]`, and the cold document walk has no stored id at all.
+/// One property row, with the ids widened to opaque snapshot-scoped strings so
+/// ONE producer serves both sources: the Direct Files projection identifies
+/// owners by `[u8; 16]`, and the cold document walk has no stored id at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerRow {
     pub owner_type: OwnerType,
@@ -174,8 +170,8 @@ impl Registry {
     }
 
     /// Rebuild a registry from a wire snapshot (§7.1). The command layer reads
-    /// the snapshot through whichever storage mode it is bound to and hands it
-    /// back to the parser for suggestions; the digest is not part of the wire
+    /// the snapshot and hands it back to the parser for suggestions; the digest
+    /// is not part of the wire
     /// shape, so a reconstructed registry carries the default config's digest
     /// and must never be used as a cache key.
     pub fn from_snapshot(snapshot: &RegistrySnapshot) -> Registry {

@@ -1188,8 +1188,8 @@ impl DirectProjection {
     /// answering a registry read by walking every hydrated document is exactly
     /// the graph-wide scan the ready projection exists to avoid. This is an
     /// ADAPTER onto the one `build_registry` aggregator, not a competing
-    /// registry producer: it yields the same [`OwnerRow`] stream the Managed
-    /// materialized read and the cold document iterator yield, and the
+    /// registry producer: it yields the same [`OwnerRow`] stream the cold document
+    /// iterator yields, and the
     /// aggregator downstream is byte-for-byte the same function.
     ///
     /// `None` means "not ready, or the read refused" — the caller falls back to
@@ -2687,7 +2687,7 @@ fn projection_source_revision(
 /// The Direct Files producer, reachable from the cross-backend parity guard.
 ///
 /// Named as a seam rather than widened: the guard has to compare the rows this
-/// exact function emits against the Managed Storage producer's and the walk's,
+/// exact function emits against the walk's,
 /// and a reimplementation in the test would prove only that the test agrees
 /// with itself (§5.8 G1, I-19).
 #[cfg(test)]
@@ -4821,9 +4821,7 @@ mod tests {
     ///
     /// The obligation the hatch protected is kept as an assertion, not as a
     /// route: on the unselective shape the dispatched path must load exactly the
-    /// RESULT's pages and must not enter the whole-graph evaluator. The hatch
-    /// itself is still alive for Managed Storage's candidate route and goes with
-    /// it (P1-e).
+    /// RESULT's pages and must not enter the whole-graph evaluator.
     #[test]
     fn an_unselective_shape_answers_through_the_statement_without_a_candidate_superset() {
         let _serial = serialize_projection_tests();

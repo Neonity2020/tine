@@ -140,11 +140,10 @@ pub struct BoundedGroups {
     pub exceeded: bool,
 }
 
-/// The ONE result-construction accounting rule, shared by Direct Files and
-/// managed storage.
+/// The ONE result-construction accounting rule.
 ///
 /// It exists as a type rather than as an open-coded pair of counters because
-/// the two storage modes had drifted apart on exactly this: Direct charged
+/// two producers had drifted apart on exactly this: Direct charged
 /// `payload + page name + 256` per admitted row and latched `exceeded`, while
 /// the managed block-referrer loop probed a group overhead per row but
 /// accumulated it once per emitted group -- so the same `max_bytes` admitted a
@@ -398,8 +397,7 @@ impl BoundedReferenceGroups {
 ///
 /// It has exactly one production call site --
 /// [`BoundedReferenceGroups::finish`] -- because every reference surface
-/// (Direct occurrences, managed backlinks, managed unlinked references, managed
-/// block referrers) reaches display order through that one accumulator. A
+/// reaches display order through that one accumulator. A
 /// second caller would mean a second producer of this answer (I-12).
 fn reference_group_display_order(
     a: &BoundedReferenceGroup,
@@ -417,17 +415,13 @@ fn reference_group_display_order(
 ///
 /// This is NOT the producer of "what day is this journal page". That question
 /// has one config-aware owner, [`crate::date::JournalFormat::parse`], which is
-/// what fills `PageEntry::date_key` for Direct Files and
-/// `ApplicationQueryPage::journal` for the managed adapters. Deriving the day
-/// from the title with the default format instead is what made managed
-/// journal-range queries answer empty on every graph configuring a custom
-/// `:journal/page-title-format` (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001).
+/// what fills `PageEntry::date_key`. Deriving the day from the title with the
+/// default format instead is what made journal-range queries answer empty on
+/// every graph configuring a custom `:journal/page-title-format`
+/// (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001).
 ///
-/// ONE caller survives, and it cannot make the two backends disagree:
-/// [`resolve_date_token`], which reads a `(between …)` BOUND LITERAL the user
-/// typed rather than a page's day, in code shared by both backends. The second
-/// caller — the sparse task-candidate evaluator — went with the sparse family
-/// the RET2 correction deleted.
+/// ONE caller survives: [`resolve_date_token`], which reads a `(between …)`
+/// BOUND LITERAL the user typed rather than a page's day.
 ///
 /// Giving it the configured format is a follow-up, not a parity defect.
 fn journal_ordinal(title: &str) -> Option<i64> {
@@ -1526,10 +1520,8 @@ pub fn backlink_filter_context(
                         } else {
                             bytes += estimated;
                             // Same flag propagation as the ordinary-root loop
-                            // below and the managed twin: an entry truncated at
-                            // its own text/facet budget must mark the context,
-                            // or Direct reports truncated=false where managed
-                            // reports true for identical content (DUP-6).
+                            // below: an entry truncated at its own text/facet
+                            // budget must mark the context (DUP-6).
                             context.truncated |= entry.truncated;
                             context.entries.push(entry);
                         }
@@ -2214,14 +2206,12 @@ fn run_query_bounded_over_dialect(
     run_pred_bounded_over(source, &query, &view, today, max_rows, max_bytes)
 }
 
-/// One page as the shared query drivers see it, borrowed from whichever backend
-/// produced it.
+/// One page as the shared query drivers see it, borrowed from the page cache.
 ///
 /// Deliberately borrowed rather than owned. Direct Files holds an
-/// `Arc<Document>` per page and managed storage holds an `Arc<Vec<DocBlock>>`;
-/// an owned page shape (an `ApplicationQueryPage`, say) would force Direct to
-/// construct and clone a whole `DocBlock` forest per query per page just to
-/// satisfy the shared signature. `roots` is a borrowed slice for exactly that
+/// `Arc<Document>` per page; an owned page shape would force it to construct
+/// and clone a whole `DocBlock` forest per query per page. `roots` is a
+/// borrowed slice for exactly that
 /// reason, and `recency` is a callback because Direct Files answers it with a
 /// filesystem `stat` that must not run for a page the query never matched.
 pub(crate) struct QueryPageView<'a> {
@@ -2230,9 +2220,8 @@ pub(crate) struct QueryPageView<'a> {
     pub(crate) kind: PageKind,
     pub(crate) pre_block: Option<&'a str>,
     pub(crate) roots: &'a [DocBlock],
-    /// The page's journal ordinal as its own backend already knows it: Direct
-    /// Files from the filename it parsed at inventory time, managed storage
-    /// from the page title.
+    /// The page's journal ordinal, from the filename Direct Files parsed at
+    /// inventory time.
     pub(crate) journal: Option<i64>,
     /// The page's on-disk format. The property atomizer parses a value with the
     /// page's own inline grammar (§6.2 E4), so an `Outline.ORG` page's values
@@ -2389,9 +2378,8 @@ impl QueryPageSource for GraphQueryPages<'_> {
 //
 // WHAT MAY BE DELETED: `run_pred_bounded_over` together with the whole
 // page-scanning evaluator it drives (`crate::query::eval`, `collect_og_query_roots`'s
-// query use, the per-mode `QueryPageSource` implementations that exist only to
-// feed it) and the `ApplicationProjectionCache` that keeps its managed input
-// warm. The IR, the parsers, the printers and `finish_query_groups` stay: they
+// query use, and the `QueryPageSource` implementations that exist only to
+// feed it). The IR, the parsers, the printers and `finish_query_groups` stay: they
 // are shared with the SQL route.
 //
 // CONDITION FOR DELETION: the private queue card `PVTI_lAHOAAbLVc4BhPsyzg5gS_0`
@@ -2407,9 +2395,9 @@ impl QueryPageSource for GraphQueryPages<'_> {
 // projection that is not ready and one whose read failed no longer walk; they
 // return `QueryExecutionError::NotReady` (the frontend retries) or
 // `Unavailable` (the frontend says so), and a failed read repairs once and
-// retries the SAME statement. What remains is ONE live answer — Managed
-// Storage's unaccepted local overlay, whose pages have no materialized rows at
-// all — and the reason the walk outlives even that.
+// retries the SAME statement. The last live walk answer, Managed Storage's
+// unaccepted local overlay, went with that subsystem (ADR 0066). What keeps
+// the walk alive is the following.
 //
 // That reason: the walk is not merely a fallback, it is the CORRECTNESS ORACLE
 // for the SQL lowering that replaced it, and no external oracle exists
@@ -2708,8 +2696,8 @@ impl ConstructionProfile {
     }
 }
 
-/// The ONE simple-query evaluator. Both storage modes reach it through
-/// [`QueryPageSource`]; neither owns a second copy of the budget, the page loop,
+/// The ONE simple-query evaluator, reached through [`QueryPageSource`]. Nothing
+/// else owns a copy of the budget, the page loop,
 /// the OG top-level-root filter, the sample cap or the recency axis.
 fn run_pred_bounded_over(
     source: &dyn QueryPageSource,
@@ -3038,8 +3026,8 @@ pub(crate) fn finish_result_view_groups<B: ResultViewBlock>(
 /// page 1). Within a page the blocks keep the document order the construction
 /// emitted them in.
 ///
-/// The source traversal is path-stable in both Direct Files and the managed
-/// application gateway. Make the displayed base order stable before sampling and
+/// The source traversal is path-stable. Make the displayed base order stable
+/// before sampling and
 /// before it becomes the tie-breaker for an explicit sort.
 ///
 /// This is base order, not a view directive, so §5.9's cache stores rows that
@@ -3366,13 +3354,6 @@ pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandida
     }
 }
 
-// RET1 deleted `run_application_query_result` and
-// `explain_application_empty_query`, the two Managed adapters that resolved the
-// IR and then handed `ApplicationQueryPages` to the shared driver. §7.1's two IR
-// commands now bind on the actor turn and execute against the projection off it
-// (`sync_runtime::RuntimeActor::application_captured_query_turn`); the same driver is
-// still reached with the same page source by the RECOVERY walk, which is the one
-// remaining caller and is what RET2 retires.
 
 /// `query_run` over a Direct Files graph when the IR is already parsed (the
 /// §7.1 command hands the IR, not text).
@@ -3656,8 +3637,8 @@ pub(crate) fn resolve_advanced_source(
 }
 
 /// The ONE advanced-query evaluator: the resolve above, the `ran`/`ignored`
-/// report and delegation to the shared simple-query driver all live here, so the
-/// two storage modes cannot answer an advanced query differently (I-12, I-19).
+/// report and delegation to the shared simple-query driver all live here, so an
+/// advanced query has one answer (I-12, I-19).
 fn run_advanced_query_bounded_over(
     source: &dyn QueryPageSource,
     query_src: &str,
@@ -4389,7 +4370,7 @@ fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
         children: b.children.iter().map(|c| template_dto(c, false)).collect(),
         breadcrumb: Vec::new(),
         // DUP-8: every non-content field is deliberately reset at insertion;
-        // both Direct and Managed template walks delegate to this one leaf.
+        // every template walk delegates to this one leaf.
         page_property: false,
         marker: None,
         priority: None,

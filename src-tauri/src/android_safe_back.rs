@@ -1,6 +1,6 @@
 //! Android's permanent Back owner. Tauri's stock AppPlugin reasonably falls
 //! back to WebView history or activity finish when JavaScript has no listener;
-//! that fallback is unsafe while a managed-storage shutdown is unverified.
+//! that fallback is unsafe while the graph's clean shutdown is unverified.
 
 #[cfg(target_os = "android")]
 use serde::de::DeserializeOwned;

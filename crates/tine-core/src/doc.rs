@@ -360,7 +360,7 @@ pub(crate) const CRUMB_MAX_CHARS: usize = 60;
 /// of its visible text, trimmed, elided with `…` past [`CRUMB_MAX_CHARS`].
 ///
 /// DUP-8: this used to exist three times -- byte-identical in `query.rs` and
-/// `query_plan.rs`, and a third time in `sync_runtime.rs` over a synthesized
+/// `query_plan.rs`, and a third time over a synthesized
 /// `DocBlock`. Three copies of a truncation rule is three places for the rule
 /// to drift.
 pub(crate) fn crumb_line(block: &DocBlock) -> String {
@@ -1804,11 +1804,9 @@ mod promoted_heading_tests {
     /// This is not a hypothetical layout: real Logseq journals contain it. A
     /// journal page in Martin's graph opens with a bulleted `- # A` and then
     /// carries unbulleted `# B` / `# C` siblings, each owning tab-indented
-    /// children — both forms in one file, written by Logseq itself. Managed
-    /// storage has to accept every shape Direct Markdown accepts, so a
-    /// canonicalisation that re-bulleted the later headings would both churn
-    /// those bytes and shrink managed storage to a subset of the graphs that
-    /// already work.
+    /// children — both forms in one file, written by Logseq itself. A
+    /// canonicalisation that re-bulleted the later headings would churn those
+    /// bytes on save.
     #[test]
     fn a_page_mixing_bulleted_and_unbulleted_headings_round_trips_byte_for_byte() {
         let source =

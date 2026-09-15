@@ -4472,11 +4472,8 @@ pub fn page_print_html(
         .map(Some)
 }
 
-/// Render one already-authoritative page document. Managed storage uses this
-/// after loading the exact current page through its actor, so printing an edit
-/// does not wait for the filesystem projection or construct the Direct Files
-/// parsed graph. Direct Files enters through [`page_print_html`] and therefore
-/// shares this renderer byte-for-byte.
+/// Render one already-authoritative page document. [`page_print_html`] enters
+/// here after reading the page.
 pub(crate) fn page_print_html_document(
     graph: &Graph,
     name: &str,
@@ -5346,9 +5343,8 @@ pub fn publish_query(
     })?
 }
 
-/// Publish one already-authoritative graph snapshot. Managed storage obtains
-/// these documents in a single actor turn; Direct Files parses its fresh files
-/// immediately before entering the same renderer.
+/// Publish one already-authoritative graph snapshot. Direct Files parses its
+/// fresh files immediately before entering the same renderer.
 #[cfg(test)]
 fn publish_graph_documents(
     graph: &Graph,

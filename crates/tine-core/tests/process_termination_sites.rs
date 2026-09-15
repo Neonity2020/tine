@@ -4,9 +4,8 @@
 //! `std::process::abort()` and `std::process::exit()` end the process with no
 //! unwinding: no destructor runs, no in-flight save completes, no lock is
 //! released. Tine's crash-cut tests deliberately use `abort()` to prove that
-//! recovery works — W4-R2 added three such cuts to the Managed activation
-//! commit path, and `oplog/sqlite.rs` carries four more. Every one of them is
-//! `#[cfg(test)]`-gated, so none exists in a shipped binary.
+//! recovery works. Every one of them is `#[cfg(test)]`-gated, so none exists
+//! in a shipped binary.
 //!
 //! Nothing enforced that. Dropping one `#[cfg(test)]` would compile cleanly,
 //! pass every suite, and ship a binary that aborts mid-save on a real graph.

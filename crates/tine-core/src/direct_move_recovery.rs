@@ -50,8 +50,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The record schema. Managed Storage is blank-slate until 0.7 and so is this:
-/// there is exactly ONE current format, no dual readers and no migration. A
+/// The record schema. There is exactly ONE current format, no dual readers and
+/// no migration. A
 /// record whose schema is not this one is unrecognized private state — it is
 /// preserved as quarantine and the graph is rebuilt from the files (I-7).
 pub const RECORD_SCHEMA: u32 = 1;

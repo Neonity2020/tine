@@ -1062,10 +1062,6 @@ mod tests {
         assert!(!production.contains("fields.insert(\"detail\""));
         assert!(production.contains("verboseDebugLogIncluded\": false"));
         assert!(production.contains("record_fixed_event(\"watcher.batch\", fields)"));
-        assert!(
-            !production.contains("managed."),
-            "Managed Storage receipts were retired with the subsystem (2026-09-15)"
-        );
     }
 
     #[test]

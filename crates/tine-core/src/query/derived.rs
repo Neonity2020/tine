@@ -1,9 +1,8 @@
 //! The derived projection rows `block_path_refs` and `property_atoms`, built
-//! ONCE here and written by BOTH physical producers (SPEC §5.8, D-4/N14/M6).
+//! ONCE here (SPEC §5.8, D-4/N14/M6).
 //!
-//! Direct Files reaches this from `direct_projection::physical_page`; Managed
-//! Storage from `oplog::sqlite_materialization::lower_pages_with_derived_rows`.
-//! Neither computes a row of its own: a second implementation that agreed by
+//! Direct Files reaches this from `direct_projection::physical_page`. No
+//! caller computes a row of its own: a second implementation that agreed by
 //! inspection is exactly the parity defect §5.8 guard (b) exists to catch.
 
 use std::collections::HashMap;

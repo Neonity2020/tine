@@ -2,9 +2,9 @@
 //! walk that maintains it.
 //!
 //! OG materializes `:block/path-refs` per block: the block's own references,
-//! every ancestor's, and the page it lives on. Three consumers need exactly
-//! that set — the document walk's `refs` leaf, Direct Files' `block_path_refs`
-//! rows and Managed Storage's — and a second implementation of it would be a
+//! every ancestor's, and the page it lives on. Two consumers need exactly
+//! that set — the document walk's `refs` leaf and Direct Files'
+//! `block_path_refs` rows — and a second implementation of it would be a
 //! parity defect waiting to happen (I-19, I-12). So the counted ancestor
 //! multiset, the membership rule and the traversal that maintains them live
 //! here, and every consumer is a thin adapter over [`dfs_path_refs`].

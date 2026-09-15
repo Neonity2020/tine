@@ -45,7 +45,7 @@ fn page_header_rule_stays_deliberately_distinct_from_block_rule() {
 
 // I-12: every production `DocBlock` literal is a reviewed constructor boundary.
 // This is syntax-aware so a renamed `uuid: dto.id.clone()` mapping cannot evade
-// the old substring check. Managed DTO conversions use
+// the old substring check. Wire DTO conversions use
 // `dto_block_to_doc_block`; cheap raw-only leaves use `DocBlock::new`.
 #[test]
 fn production_docblock_struct_literals_are_reviewed() {
@@ -158,7 +158,7 @@ fn production_docblock_struct_literals_are_reviewed() {
     expected.sort();
     assert_eq!(
         actual, expected,
-        "I-12: every production DocBlock literal is reviewed; graph DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
+        "I-12: every production DocBlock literal is reviewed; wire DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
     );
 }
 
@@ -10490,8 +10490,7 @@ fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
 /// name, the destination gains one — so the depth of either chain is free.
 ///
 /// This drives the Direct Files path deliberately: `rename_file_to_page`
-/// is a real user operation on a Direct graph, and the chain helpers are
-/// shared by both storage modes.
+/// is a real user operation on a Direct graph.
 #[test]
 fn a_cross_directory_move_flushes_one_directory_per_side() {
     fn move_barriers(tag: &str, source_rel: &str, new_name: &str) -> u64 {
@@ -14961,10 +14960,9 @@ fn concurrent_readers_never_observe_a_half_built_registry() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// O11, extended in Wave D to §6.2's THIRD source (CLOSURE §4): the registry
-/// built from the Direct Files READY PROJECTION STREAM, the one built from the
-/// Direct Files cold document iterator, and the one built from the Managed
-/// per-page owner rows are one table. The three producers disagree only about
+/// O11: the registry built from the Direct Files READY PROJECTION STREAM and the
+/// one built from the Direct Files cold document iterator are one table. The
+/// producers disagree only about
 /// opaque owner identity and page identity, neither of which the aggregation
 /// carries.
 #[test]

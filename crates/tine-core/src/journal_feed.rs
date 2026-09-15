@@ -1,10 +1,9 @@
 //! Journal-feed selection: which journal pages the Journals surface shows, in
 //! what order, and how its day cursor paginates.
 //!
-//! Both storage modes select the feed through the rules here. Direct Files
-//! supplies candidates from its warmed page cache (`Graph::journals_desc`, which
-//! calls [`journal_feed_candidates_desc`] below); managed storage supplies them
-//! from the actor's retained journal index. One implementation is the point: the
+//! Direct Files selects the feed through the rules here, supplying candidates
+//! from its warmed page cache (`Graph::journals_desc`, which calls
+//! [`journal_feed_candidates_desc`] below). One implementation is the point: the
 //! feed's dedup/ordering/cursor rules are exactly where a silent divergence would
 //! drop a day out of a user's journal history, and two hand-kept copies agreeing
 //! only by inspection is how that happens.
@@ -149,8 +148,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The module header says both storage modes select the feed through this
-    /// file. Direct Files reaches it through `Graph::journals_desc`, which used
+    /// The module header says the feed is selected through this file. Direct
+    /// Files reaches it through `Graph::journals_desc`, which used
     /// to carry its own copy of the dedup rule instead. A comment cannot hold
     /// that; this can.
     #[test]

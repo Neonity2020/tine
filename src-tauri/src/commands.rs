@@ -4413,19 +4413,12 @@ mod query_command_surface_tests {
             "`query_explain_empty`'s Direct Files branch calls the database explain entry"
         );
 
-        // The retired actor-side producers, by name: RET1 deleted both, and a
-        // command naming one again would be reconnecting the oracle.
-        for retired in [
-            "run_application_query_result",
-            "explain_application_empty_query",
-            "ApplicationQueryPages",
-            "GraphQueryPages",
-        ] {
-            assert!(
-                !source.contains(retired),
-                "the command layer names the retired/oracle producer `{retired}`"
-            );
-        }
+        // The walk source is the oracle: a command naming it would be
+        // reconnecting the walk.
+        assert!(
+            !source.contains("GraphQueryPages"),
+            "the command layer names the oracle walk source `GraphQueryPages`"
+        );
     }
 
     /// K16: a `@page` query answers with page rows and never loads a document.

@@ -782,7 +782,7 @@ pub struct PageDto {
     /// activations in a registry keyed by page identity and stamps this field when
     /// it builds the DTO.
     ///
-    /// `None` is an editor-less writer (managed projection, external import,
+    /// `None` is an editor-less writer (external import,
     /// sync-id migration, PDF-highlight write) or a pre-increment-3 caller. Legal
     /// on the ordinary path, where the base-revision guard is the authority;
     /// refused on the override path. (GH #254 increment 3.)
@@ -1126,7 +1126,7 @@ struct ConflictEditorEpisode {
     loaded_revision: Option<String>,
     /// The editor activation that observed the conflict.
     ///
-    /// `None` is the editor-less writer (managed projection, external import,
+    /// `None` is the editor-less writer (external import,
     /// sync-id migration, PDF-highlight write) and the pre-increment-3 caller.
     /// Those are legal on the ordinary path — the base-revision guard is their
     /// authority — and refused on the override path.
@@ -1478,14 +1478,14 @@ pub struct Graph {
     /// The canonical filesystem capability used for every asset operation. For
     /// ordinary graphs this is `<root>/assets`; when the runtime has explicitly
     /// approved an external assets symlink/junction it is that exact resolved
-    /// directory. No other managed graph path may use this capability.
+    /// directory. No other graph path may use this capability.
     assets_root: PathBuf,
     pub config: Config,
     /// Sole versioned eligibility policy for normal graph text discovery and
     /// exact existing-file access. It grants no creation/projection authority.
     graph_text_scope: GraphTextScope,
     /// Exact bytes from which this scan-capable instance derived its scope and
-    /// managed roots. A scan must require a fresh Graph when the case-insensitive
+    /// configured text roots. A scan must require a fresh Graph when the case-insensitive
     /// on-disk config path no longer has this description.
     reconciliation_scan_open_config_description: Option<BlobDescription>,
     /// Digest of the configuration bytes THIS instance last published.
@@ -1605,7 +1605,7 @@ pub struct Graph {
     /// Concord base ledger (ADR 0056): the per-page last text Tine agreed on
     /// with the disk, updated best-effort after successful saves and external-
     /// change admissions. A disposable cache stored OUTSIDE the sync tree;
-    /// unset (managed regime, most tests) makes every hook a no-op. Never
+    /// unset (most tests) makes every hook a no-op. Never
     /// consulted on the save critical path — only by conflict diffs.
     concord_ledger: std::sync::OnceLock<Arc<crate::concord_ledger::ConcordLedger>>,
     /// The exact page files currently being rewritten as the DIRECT result of a
@@ -1651,7 +1651,7 @@ pub struct Graph {
     /// Lock order is ALWAYS page_lock → cache → disk_revs; never the reverse.
     page_locks:
         std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
-    /// Resource-scoped shared admission boundary for all managed page/journal
+    /// Resource-scoped shared admission boundary for all page/journal
     /// writers. Identity acquisition failure is retained as an error so an open
     /// can never fall back to an unshared gate.
     graph_text_write_binding: io::Result<GraphTextWriteBinding>,
@@ -2859,7 +2859,7 @@ impl FindEntryIndex {
 /// directories, but an absolute path, traversal component, or symlinked existing
 /// ancestor outside the graph would turn ordinary save/delete/restore operations
 /// into writes against unrelated files.
-fn validate_graph_text_dir(root: &Path, raw: &str, label: &str) -> io::Result<()> {
+fn validate_graph_dir(root: &Path, raw: &str, label: &str) -> io::Result<()> {
     if raw.is_empty() || raw.contains('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2905,7 +2905,7 @@ fn path_stays_within_root(root: &Path, target: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Managed graph directories must retain their own identity, not merely land
+/// Graph directories Tine reads or writes must retain their own identity, not merely land
 /// somewhere under the graph after canonicalization. An in-graph symlink such as
 /// `publish -> assets` passes a plain containment check but redirects generated
 /// output onto user assets. Compare the deepest existing ancestor with its
@@ -3590,10 +3590,10 @@ impl Graph {
         approved_assets: Option<&Path>,
     ) -> io::Result<Graph> {
         let mut graph = Self::open(root);
-        validate_graph_text_dir(&graph.root, &graph.config.journals_dir, "journals")?;
-        validate_graph_text_dir(&graph.root, &graph.config.pages_dir, "pages")?;
-        validate_graph_text_dir(&graph.root, "logseq", "logseq")?;
-        validate_graph_text_dir(&graph.root, "publish", "publish")?;
+        validate_graph_dir(&graph.root, &graph.config.journals_dir, "journals")?;
+        validate_graph_dir(&graph.root, &graph.config.pages_dir, "pages")?;
+        validate_graph_dir(&graph.root, "logseq", "logseq")?;
+        validate_graph_dir(&graph.root, "publish", "publish")?;
         // `.tine-sync` (left behind by the removed Managed Storage mode) is not
         // part of Direct Files authority: a graph open must neither inspect nor
         // require its shape, and never modifies it.
@@ -3625,7 +3625,7 @@ impl Graph {
             }
             graph.assets_root = resolved;
         } else {
-            validate_graph_text_dir(&graph.root, "assets", "assets")?;
+            validate_graph_dir(&graph.root, "assets", "assets")?;
             graph.assets_root = graph.root.join("assets");
         }
         let summary = graph.recover_interrupted_publishes()?;
@@ -3861,8 +3861,7 @@ impl Graph {
     /// Pure containment: the target must resolve inside this graph root. Split
     /// out of `ensure_write_target` so the asset capability can reuse the check
     /// without inheriting the graph-text read-only refusal -- `assets/` is
-    /// outside the oplog's document domain and stays writable in a read-only
-    /// view.
+    /// not graph text and stays writable in a read-only view.
     fn ensure_within_graph_root(&self, target: &Path) -> io::Result<()> {
         if path_stays_within_root(&self.root, target)
             && !path_uses_graph_text_alias(&self.root, target)
@@ -3878,14 +3877,9 @@ impl Graph {
 
     /// Graph configuration has its own capability boundary.
     ///
-    /// `logseq/config.edn` is **not** oplog-owned. The managed reconciliation
-    /// scanner classifies it `GraphTextScanPathClass::Configuration`
-    /// (`model.rs`, `capture_reconciliation_scan_pass`) and the baseline adapter
-    /// drops every such row as "not graph content" that "cannot be represented
-    /// as a `GraphTextPath`" (`oplog/reconciliation_baseline_adapter.rs`), so no
-    /// import, expected-path row or projection ever covers it. Configuration is
-    /// therefore writable in a read-only view — a Settings toggle is not a
-    /// write behind the oplog's back.
+    /// `logseq/config.edn` is **not** graph text: no page read, save or projection
+    /// ever covers it. Configuration is therefore writable in a read-only view — a
+    /// Settings toggle is not a page edit.
     ///
     /// Narrowed to that one exact path so the capability can never widen into a
     /// general `logseq/` write.
@@ -3906,8 +3900,8 @@ impl Graph {
     ///
     /// `logseq/.tine-trash` sits beside `assets`, `publish` and `.tine-sync` in
     /// `graph_text_scope::fixed_excluded`, so nothing under it is ever scanned,
-    /// imported or projected: it is outside the oplog's document domain exactly
-    /// the way `assets/` is. Only the *destination* is covered here. Page and
+    /// imported or projected: it is not graph text, exactly the way `assets/` is.
+    /// Only the *destination* is covered here. Page and
     /// journal trashing still passes through [`Graph::admit_graph_text_writer`]
     /// because their sources are graph text. A recognized sync-conflict copy is
     /// excluded from the document domain too, so its explicit discard path uses
@@ -5643,7 +5637,7 @@ impl Graph {
         sync_projection_chain_required(&target.chain)
     }
 
-    /// Recursively enumerate the configured managed-text trees through the exact
+    /// Recursively enumerate the configured page/journal trees through the exact
     /// retained root carried by `permit`. Returned paths are lexical names under
     /// `self.root`, but every directory decision comes from a no-follow retained
     /// directory handle, so replacing the ambient graph pathname cannot change
@@ -6696,7 +6690,7 @@ impl Graph {
         Ok((out, out_charge.reservation, graph_file_identities))
     }
 
-    /// Return the non-overlapping roots that must be walked for a managed-text
+    /// Return the non-overlapping roots that must be walked for a configured-root
     /// inventory.  Nested roots are discovered through their outer root, then
     /// classified by their exact graph-relative path below; equal roots have no
     /// unambiguous owner and fail before any file is parsed or mutated.
@@ -6895,8 +6889,8 @@ impl Graph {
         Ok((semantic, format, graph_text_document_node_count(&document)?))
     }
 
-    /// Interpret one already-validated managed path exactly as existing import
-    /// and managed-inventory callers expect.
+    /// Interpret one already-validated graph-text path exactly as the inventory
+    /// callers expect.
     ///
     /// A path under a configured `pages/`/`journals/` root keeps the exact
     /// configured-root interpretation this authority has always produced.
@@ -8608,7 +8602,7 @@ impl Graph {
     /// does NOT reject a leading-dot name — `is_graph_text_path` only requires a
     /// non-empty stem and a graph-text extension — so this validation is the
     /// boundary, not a redundant second check.
-    /// `graph_text_path_accepts_leading_dot_name` in `oplog::receipt` keeps that
+    /// `graph_text_path_accepts_leading_dot_name` in `graph_text_path` keeps that
     /// statement honest.
     fn graph_text_move_editor_recovery_noreplace(
         &self,
@@ -8794,7 +8788,7 @@ impl Graph {
         read_projection_optional(parent.final_dir(), &target.filename)
     }
 
-    /// Classify one exact managed path against this graph's configured text
+    /// Classify one exact graph-text path against this graph's configured text
     /// roots. The longest component-boundary match wins; equal roots are
     /// ambiguous and therefore rejected instead of guessed.
     pub(crate) fn classify_graph_text_path(
@@ -8829,7 +8823,7 @@ impl Graph {
 
     /// Capture the resource retained by this Graph even when its ambient path
     /// has subsequently been moved or reserved by a replacement graph. The
-    /// managed-write gate and retained directory capability are the authority;
+    /// graph-text write gate and retained directory capability are the authority;
     /// checking the ambient path here would both reject supported moves and
     /// accidentally inspect the replacement resource.
     fn capture_retained_graph_text_identity_with_limits(
@@ -9635,7 +9629,7 @@ impl Graph {
     /// Digest of the configuration bytes this instance last wrote, if any.
     ///
     /// `None` on an instance that has published nothing — including every
-    /// short-lived managed capability, whose refresh is cheap enough not to
+    /// short-lived capability, whose refresh is cheap enough not to
     /// need the distinction.
     pub fn recent_config_write(&self) -> Option<BlobDescription> {
         *self.recent_config_write.read().unwrap()
@@ -10006,7 +10000,7 @@ impl Graph {
     /// A loaded page's recorded relative path always wins (including nested and
     /// duplicate-name files); a newly saved page without a refreshed path may
     /// fall back to normal name resolution. The final canonical-file check keeps
-    /// symlinks from escaping the managed pages/journals directories.
+    /// symlinks from escaping the configured pages/journals directories.
     pub fn page_source_file(
         &self,
         name: &str,
@@ -10056,8 +10050,7 @@ impl Graph {
         let canonical = self.journal_format.file_stem(date);
         // Every Logseq text extension, not a hand-written md/org pair. `.markdown`
         // is a first-class page extension (LOGSEQ_TEXT_EXTENSIONS, and OG accepts
-        // it case-insensitively), and the managed twin of this function already
-        // asked all three. The direct path asking only two meant a title-named
+        // it case-insensitively). Asking only two meant a title-named
         // leftover coexisting with a canonical `2026_06_26.markdown` was NOT
         // recognised as a shadow, so it was reconciled into the (kind,name) cache
         // and name resolution served the WRONG file for that day — exactly the #21
@@ -10850,7 +10843,7 @@ impl Graph {
     /// file, and only as the direct consequence of the resolution the user just
     /// confirmed in the in-page resolver.
     ///
-    /// Same guards as [`Graph::resolve_sync_conflict`]: managed-write admission,
+    /// Same guards as [`Graph::resolve_sync_conflict`]: graph-text write admission,
     /// page lock, `base_rev` staleness guard (here against the whole marker
     /// file), org round-trip firewall. The merge itself is
     /// `sync_diff::merge_blocks` over the SAME alignment the diff published, so a
@@ -11376,7 +11369,7 @@ impl Graph {
     }
 
     /// Read one explicitly recognized provider conflict copy through the same
-    /// confined, no-follow point capability used by managed projections.
+    /// confined, no-follow point capability used by graph-text reads.
     pub(crate) fn read_sync_conflict_copy(&self, conflict_rel: &str) -> io::Result<Option<String>> {
         let conflict = self
             .resolve_configured_rel_lexical(conflict_rel)
@@ -11843,7 +11836,7 @@ impl Graph {
         let dir = self.pages_path();
         let mut existing_identity = self.retained_legacy_page_identity_exists(&write, name)?;
         // Historical page filenames can be non-portable and therefore cannot
-        // enter the strict managed-path admission index. Keep the retained
+        // enter the strict graph-text path admission index. Keep the retained
         // filename walk above as their compatibility authority, then use the
         // exact no-follow reader and canonical parser for portable admitted
         // graph text so an explicit title cannot be rescued over.
@@ -12080,7 +12073,7 @@ impl Graph {
 
     /// Create one named top-level asset without replacing an existing file. The
     /// approved asset capability is revalidated at the actual write target so a
-    /// managed-directory symlink/junction swap cannot redirect this creation.
+    /// graph-directory symlink/junction swap cannot redirect this creation.
     pub(crate) fn create_asset_if_absent(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
         top_level_asset_name(name)?;
         let path = self.assets_path().join(name);
@@ -16691,8 +16684,8 @@ impl Graph {
         }
     }
 
-    /// The shared page-write commit protocol, written ONCE so editor saves,
-    /// highlight saves, and oplog projections cannot drift on marker lifecycle
+    /// The shared page-write commit protocol, written ONCE so editor saves and
+    /// highlight saves cannot drift on marker lifecycle
     /// or cross the mutation boundary through a second writer:
     ///   record self-write marker → optional parent preparation / last-moment
     ///   baseline recheck → the selected guarded publication strategy.
@@ -16808,8 +16801,7 @@ impl Graph {
         // byte mismatch before reporting the conflict. Reading the live name in
         // `commit_write` immediately beforehand duplicated a full-file read
         // without closing an additional race. Keep that earlier recheck for
-        // creates, unpinned auxiliary writes, and reconstructible managed
-        // projections; this cut is deliberately Direct Files only.
+        // creates and unpinned auxiliary writes.
         let commit_recheck = recheck
             && !(publication_authority == EditorPublicationAuthority::DirectFile
                 && expected_identity.is_some());
@@ -16924,7 +16916,7 @@ impl Graph {
         let lock = self.page_lock(path);
         let _guard = lock.lock().unwrap();
         self.revoke_conflict_authority(path);
-        // Watch events are untrusted path inputs. Lexically reject non-managed
+        // Watch events are untrusted path inputs. Lexically reject non-graph-text
         // names first; the retained capability traversal below then performs the
         // component-wise no-follow containment and file-shape checks.
         // Concord ledger: a conflict copy just appeared for its winner. Pin the
@@ -17554,7 +17546,7 @@ impl Graph {
     /// alternate extension appears), so the frontend cannot safely infer the
     /// path from the request it sent. Returning the core's live record lets the
     /// exact issuing editor adopt that result without minting on ordinary
-    /// re-saves. Managed storage never calls this legacy-graph operation.
+    /// re-saves.
     pub fn finish_saved_editor_activation(
         &self,
         activation: EditorActivation,
@@ -18488,7 +18480,7 @@ impl Graph {
     }
 
     /// The one page serialization and corruption-firewall boundary used by
-    /// ordinary editor saves and oplog projections.
+    /// ordinary editor saves.
     fn serialize_page_document(
         &self,
         mut doc: Document,
@@ -19627,11 +19619,11 @@ pub fn block_to_shallow_dto(b: &DocBlock) -> BlockDto {
 }
 
 /// The ONE `BlockDto` → `DocBlock` field mapping (2026-08-25 duplication
-/// audit, DUP-application-query-twin). Every managed path that rehydrates a
+/// audit, DUP-application-query-twin). Every path that rehydrates a
 /// parseable block from its wire DTO goes through this constructor, so a new
 /// `DocBlock` field is initialized in exactly one place. The tree walkers
 /// around it deliberately differ — [`dto_blocks_to_doc_checked`] is iterative,
-/// depth-bounded, and allocation-guarded because it validates untrusted managed
+/// depth-bounded, and allocation-guarded because it validates untrusted wire
 /// page loads, while the query/projection walkers recurse over block trees that
 /// are already inside the trusted process — but the per-block field mapping
 /// must not diverge. A source guard in this module's tests pins the invariant.
@@ -19645,7 +19637,7 @@ pub(crate) fn dto_block_to_doc_block(block: &BlockDto, is_org: bool) -> DocBlock
     }
 }
 
-/// Bounded tree walker over [`dto_block_to_doc_block`] for untrusted managed
+/// Bounded tree walker over [`dto_block_to_doc_block`] for untrusted wire
 /// page loads: iterative (no recursion), depth-limited, allocation-guarded.
 pub(crate) fn dto_blocks_to_doc_checked(
     blocks: &[BlockDto],
@@ -21016,7 +21008,7 @@ fn read_open_projection_regular_with_limit(
     Ok((file, bytes))
 }
 
-/// Read a managed body while reserving each retained byte before it enters the
+/// Read a graph-text body while reserving each retained byte before it enters the
 /// returned vector. The chunked path closes the metadata/read growth gap: a
 /// file that grows after metadata cannot make the preparation allocation exceed
 /// the aggregate budget before it is rejected.
@@ -21253,7 +21245,7 @@ const MAX_INITIAL_SHADOW_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GRAPH_TEXT_ADMISSION_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GRAPH_TEXT_ADMISSION_BUILD_PEAK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES: u64 = 64 * 1024 * 1024;
-/// Peak content retained while mutable managed-text preparation has both parsed
+/// Peak content retained while mutable graph-text preparation has both parsed
 /// and raw/projection representations alive. This matches the 512 MiB initial
 /// shadow raw-byte ceiling, while accounting for those simultaneous copies.
 const MAX_GRAPH_TEXT_RETAINED_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
@@ -21594,7 +21586,7 @@ fn usize_to_u64(value: usize) -> io::Result<u64> {
     u64::try_from(value).map_err(|_| allocation_overflow())
 }
 
-/// Managed page input is accepted only through depth 128. All operation-time
+/// Page input is accepted only through depth 128. All operation-time
 /// nested walks use this fixed root-to-leaf frame ceiling, so traversal does
 /// not consume attacker-controlled call stack or an uncharged all-node stack.
 pub(crate) const MAX_BLOCK_DEPTH: usize = 128;

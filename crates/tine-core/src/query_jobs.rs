@@ -18,9 +18,8 @@
 //!   a snapshot nobody will finish. This is the in-scope scenario (D-3, I-8): a
 //!   torn projection being rebuilt under a live reader, not a hostile one.
 //!
-//! The owner is backend-agnostic on purpose: Direct Files composes one in its
-//! projection today (R3); the Managed Storage actor composes the same type in
-//! R4. There is no second admission policy to disagree with this one (D-14).
+//! Direct Files composes one in its projection. There is no second admission
+//! policy to disagree with this one (D-14).
 //!
 //! Lock discipline: the owner's mutex guards only its own bookkeeping and is
 //! never held while SQLite runs or while any graph/actor lock is taken. A job

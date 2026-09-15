@@ -3137,9 +3137,8 @@ fn checked_direct_graph_open_ignores_the_separate_managed_sync_namespace() {
     std::fs::create_dir_all(&outside).unwrap();
     symlink(&outside, root.join(".tine-sync")).unwrap();
 
-    // Direct Files neither trusts nor owns `.tine-sync`; managed activation and
-    // join validate it at their explicit boundary. A stale/broken managed
-    // namespace must therefore not make an otherwise healthy Direct graph
+    // Direct Files neither trusts nor owns `.tine-sync`: a stale or broken
+    // leftover namespace must not make an otherwise healthy Direct graph
     // unavailable.
     assert!(Graph::open_checked(&root).is_ok());
 

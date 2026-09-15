@@ -5139,7 +5139,6 @@ dependencies = [
  "fs2",
  "gdkwayland-sys",
  "gtk",
- "jni 0.21.1",
  "libc",
  "notify",
  "reqwest",

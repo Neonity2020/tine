@@ -671,7 +671,7 @@ fn q3_friendly_scope_membership_and_evidence() {
         "a page matching both keeps its NAMES evidence"
     );
 
-    // ---- Managed and Direct answer the same ordered identities ------------
+    // ---- Stored and structural identities order the same pages -----------
     for scope in [
         FriendlyPageMatchScope::Names,
         FriendlyPageMatchScope::Content,
@@ -683,12 +683,12 @@ fn q3_friendly_scope_membership_and_evidence() {
         assert_eq!(
             page_identities(&stored),
             page_identities(&direct),
-            "{scope:?}: both backends order the same page identities"
+            "{scope:?}: both identity policies order the same pages"
         );
         assert_eq!(
             block_identities(&stored).len(),
             block_identities(&direct).len(),
-            "{scope:?}: both backends admit the same blocks"
+            "{scope:?}: both identity policies admit the same blocks"
         );
         // Scope changes page membership ONLY: the Blocks section is the
         // ordinary Friendly block predicate on every scope.

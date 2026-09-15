@@ -83,7 +83,7 @@ pub(crate) enum BackendOrder {
 /// captured ONCE per job, beside the snapshot, and is never re-read from live
 /// state while an answer is being built.
 pub(crate) enum ResultIdentity {
-    /// Managed Storage, and Direct rows produced in THIS session: the stored
+    /// Direct rows produced in THIS session: the stored
     /// `query_block_results.result_id` IS the public id.
     Stored,
     /// Direct Files in a FRESH session: a page nobody edited in this session
@@ -176,10 +176,9 @@ pub(crate) struct ResultReadInputs<'a> {
     pub(crate) max_rows: usize,
     pub(crate) max_bytes: usize,
     pub(crate) profile: ConstructionProfile,
-    /// The recency axis for `(sort-by modified …)`, by page: each backend's
-    /// EXISTING walk producer — Direct Files' `page_recency_secs_for` over the
-    /// stored journal day and path, Managed Storage's
-    /// `JournalFormat::page_recency_secs` over the page's kind and NAME — given
+    /// The recency axis for `(sort-by modified …)`, by page: the EXISTING walk
+    /// producer — Direct Files' `page_recency_secs_for` over the stored journal
+    /// day and path — given
     /// everything the descriptor row knows about the page. It is a callback
     /// because it is a filesystem `stat` that must not run for a page the
     /// answer did not admit, and because only the caller knows the graph root

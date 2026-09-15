@@ -1412,8 +1412,7 @@ fn reconcile_pending(
 /// whose configuration actually moved.
 ///
 /// A separate pass rather than a branch inside the reconcile loops, because
-/// configuration is not graph text: it is the same plain file under both
-/// storage engines -- never in `GraphTextScope`, never in the oplog, never
+/// configuration is not graph text: never in `GraphTextScope`, never
 /// projected.
 ///
 /// Returns true when a refresh was deferred and wants another cycle.

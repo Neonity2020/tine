@@ -33,11 +33,10 @@ use crate::config::FileNameFormat;
 /// references), and Tine's Favorites layout page, whose `[[links]]` are a
 /// sidebar arrangement rather than a mention.
 ///
-/// Both reference engines share this ONE predicate. Direct Files and managed
-/// storage previously open-coded `refs::page_key(name) == excluded` at eight
-/// separate sites, which is exactly how the two engines drift apart: a rule
-/// added to one is silently absent from the other. Keep it that way — a new
-/// exclusion belongs in this type, not at a call site.
+/// This is the ONE predicate. Eight sites previously open-coded
+/// `refs::page_key(name) == excluded`, which is exactly how copies drift apart:
+/// a rule added to one is silently absent from another. Keep it that way — a
+/// new exclusion belongs in this type, not at a call site.
 #[derive(Clone, Debug, Default)]
 pub struct ReferenceSourceExclusions {
     keys: Vec<String>,

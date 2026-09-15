@@ -2327,7 +2327,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
         "a page nobody edited must resolve the structural id"
     );
 
-    // And `Stored` is the Managed policy: always the stored id.
+    // And `Stored` always answers the stored id.
     let stored = read(&ResultIdentity::Stored).expect("the stored read answers");
     assert_eq!(
         stored
@@ -2620,10 +2620,8 @@ fn journals_and_pages_keep_their_kind() {
     );
 }
 
-/// The common constructor consumes one caller-owned projection snapshot. The
-/// concurrent Managed adapter may still name the retired merged API in this
-/// packet's base, but the common reader itself must not retain source arrays,
-/// source indices, or descriptor buffering for them.
+/// The common constructor consumes one caller-owned projection snapshot. It
+/// must not retain source arrays, source indices, or descriptor buffering.
 #[test]
 fn the_common_result_reader_has_one_snapshot_and_no_source_buffer() {
     let source = include_str!("results.rs");

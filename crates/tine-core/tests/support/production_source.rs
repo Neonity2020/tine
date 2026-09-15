@@ -205,9 +205,8 @@ fn rs_files_beside(directory: Option<&Path>) -> Vec<PathBuf> {
 /// The search must be REPOSITORY-WIDE, because neither the declaration nor its
 /// gating is visible from the included file or from its own directory.
 /// `src/query.rs` declares its two oracle modules from the directory ABOVE
-/// them, and `sync_runtime_tests.rs` declares `mod rebaselining_layout;` with
-/// no `#[cfg(test)]` of its own — it does not need one, being itself reached
-/// only under `cfg(test)`. A per-file sibling scan misses both shapes and
+/// them, and a module declared inside a test-only file needs no
+/// `#[cfg(test)]` of its own. A per-file sibling scan misses both shapes and
 /// reports their `eprintln!` calls as production print sites, which is exactly
 /// what it did.
 pub fn test_only_include(path: &Path) -> bool {
