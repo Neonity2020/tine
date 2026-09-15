@@ -131,7 +131,7 @@ beforeEach(() => {
   resetStorageDispatchCounters();
   setToasts([]);
   graphBindingRuntime.clear();
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
 });
 
 afterEach(() => {

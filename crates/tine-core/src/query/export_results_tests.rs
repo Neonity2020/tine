@@ -29,7 +29,7 @@ use crate::query::export_results::{
 };
 use crate::query::results::{
     read_located_results, reset_result_read_census, result_read_census,
-    set_before_export_payload_batch_hook, BackendOrder, RecencyPage, ResultIdentity, ResultLocator,
+    set_before_export_payload_batch_hook, RecencyPage, ResultIdentity, ResultLocator,
     ResultReadError, ResultReadInputs,
 };
 use crate::query::sql::sql_gates_tests::{scratch, serialize, Corpus};
@@ -210,7 +210,6 @@ fn export_over(
             let (_block_query, statement) = corpus.lower_block_anchored(&spec.query, dialect);
             let inputs = ResultReadInputs {
                 statement: &statement,
-                order: BackendOrder::Direct,
                 identity,
                 max_rows: QUERY_EXPORT_CONSTRUCTION_ROWS,
                 max_bytes: QUERY_EXPORT_CONSTRUCTION_BYTES,

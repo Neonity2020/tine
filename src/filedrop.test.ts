@@ -55,7 +55,7 @@ describe("file-drop admission", () => {
       pre_block: null,
       blocks: [{ id: TARGET, raw: "target", collapsed: false, children: [] }],
     });
-    graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+    graphBindingRuntime.bind(1, { binding_generation: 1 });
     const order: string[] = [];
     vi.spyOn(backend(), "importAsset").mockImplementation(async () => {
       order.push("asset");

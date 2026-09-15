@@ -6,8 +6,8 @@ use crate::state::{
     canonical_graph_root, poke_watcher, slot_for_window, AppState, ApplicationPageAdmission,
     GraphSlot,
 };
-use crate::storage_mode_supervisor::{
-    StableStorageMode, StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
+use crate::storage_transition_supervisor::{
+    StorageTransitionKind, StorageTransitionOutcome, StorageTransitionPhase,
 };
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
@@ -137,7 +137,6 @@ pub(crate) async fn startup_graph_path(
             lookup_id,
             StorageTransitionOutcome::Succeeded,
             None,
-            None,
         ) {
             crate::debug::diag(error);
         }
@@ -151,7 +150,6 @@ pub(crate) async fn startup_graph_path(
                 &app,
                 lookup_id,
                 StorageTransitionOutcome::Failed,
-                None,
                 Some("worker_join_failed".into()),
             ) {
                 crate::debug::diag(error);
@@ -665,7 +663,6 @@ pub(crate) fn load_graph_for_label(
                 lookup_id,
                 StorageTransitionOutcome::Succeeded,
                 None,
-                None,
             )?;
             return Ok(LoadGraphResult::AlreadyCurrent {
                 meta: slot.graph_meta(),
@@ -693,7 +690,6 @@ pub(crate) fn load_graph_for_label(
             lookup_id,
             StorageTransitionOutcome::Succeeded,
             None,
-            None,
         )?;
         return Ok(LoadGraphResult::FocusedExisting {
             window_label: owner,
@@ -703,7 +699,6 @@ pub(crate) fn load_graph_for_label(
         app,
         lookup_id,
         StorageTransitionOutcome::Succeeded,
-        None,
         None,
     )?;
     let direct_id = state.storage_supervisor.begin_transition(
@@ -729,7 +724,6 @@ pub(crate) fn load_graph_for_label(
                 app,
                 direct_id,
                 StorageTransitionOutcome::Failed,
-                None,
                 Some("direct_open_failed".into()),
             );
             return Err(error);
@@ -745,7 +739,6 @@ pub(crate) fn load_graph_for_label(
                 app,
                 direct_id,
                 StorageTransitionOutcome::Failed,
-                None,
                 Some("direct_open_failed".into()),
             );
             return Err(error);
@@ -755,7 +748,6 @@ pub(crate) fn load_graph_for_label(
         app,
         direct_id,
         StorageTransitionOutcome::Succeeded,
-        Some(StableStorageMode::Direct),
         None,
     )?;
     graph_load_phase(started, &mut previous, "Direct Files publish");
@@ -929,9 +921,7 @@ pub(crate) async fn begin_direct_cross_page_move(
         let slot =
             crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))
                 .map_err(crate::command_error::CommandError::from)?;
-        let graph = slot
-            .legacy_graph()
-            .map_err(crate::command_error::CommandError::from)?;
+        let graph = slot.graph();
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             crate::debug::diag(
                 "Direct move recovery store unavailable; this cross-page move is unbracketed"
@@ -990,9 +980,7 @@ pub(crate) async fn finish_direct_cross_page_move(
         let slot =
             crate::state::slot_for_bound_window(&app_state, &label, Some(binding_generation))
                 .map_err(crate::command_error::CommandError::from)?;
-        let graph = slot
-            .legacy_graph()
-            .map_err(crate::command_error::CommandError::from)?;
+        let graph = slot.graph();
         let Some(store_root) = crate::backup::direct_move_recovery_dir(&app, &graph.root) else {
             return Ok(false);
         };
@@ -1043,9 +1031,7 @@ pub(crate) fn warm_cache_async(
     slot: Arc<GraphSlot>,
     warm_generation: u64,
 ) -> Result<(), crate::command_error::CommandError> {
-    let graph = slot
-        .legacy_graph_cloned()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
@@ -1143,7 +1129,8 @@ mod tests {
     fn direct_test_state() -> AppState {
         AppState {
             graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
             watch_ctl: std::sync::Mutex::new(None),
             last_focused: std::sync::Mutex::new(None),
             capture_graph: std::sync::Mutex::new(Default::default()),
@@ -1394,10 +1381,6 @@ mod tests {
             warm_generation,
             "the installed Direct slot owns the scheduled warm generation"
         );
-        assert!(
-            installed.legacy_graph().is_ok(),
-            "ordinary publish must install a Direct Files registry binding"
-        );
         assert_eq!(std::fs::read(&page).unwrap(), page_before);
         assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
         assert_eq!(tree_bytes(&v1), v1_before);
@@ -1433,12 +1416,7 @@ mod tests {
             .expect("an inert non-directory v1 child must not reject Direct Files");
         let v1_file_root = std::fs::canonicalize(&v1_file).unwrap();
         let loaded = open_graph_for_load(v1_file.to_str().unwrap(), None).unwrap();
-        let (slot, _) =
-            publish_direct_files_slot(&state, "inert-v1-file", loaded.graph, v1_file_root).unwrap();
-        assert!(
-            slot.legacy_graph().is_ok(),
-            "the malformed legacy child still installs an ordinary Direct Files slot"
-        );
+        publish_direct_files_slot(&state, "inert-v1-file", loaded.graph, v1_file_root).unwrap();
         assert_eq!(
             tree_bytes(&v1_file),
             v1_file_before,

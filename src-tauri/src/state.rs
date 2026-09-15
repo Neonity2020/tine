@@ -1,6 +1,5 @@
 use crate::command_error::CommandError;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::Sender;
@@ -13,28 +12,12 @@ use tine_core::model::Graph;
 pub(crate) type WindowKey = String;
 static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
 
-/// The save route the current graph binding accepts, as the frontend wire
-/// record `{ binding_generation, authority }`.
+/// The current graph binding's page-write admission, as the frontend wire
+/// record `{ binding_generation }`. Its presence admits page writes; the
+/// generation fences a queued mutation against a window that was rebound.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ApplicationPageAdmission {
     pub(crate) binding_generation: u64,
-    #[serde(flatten)]
-    pub(crate) authority: ApplicationPageAdmissionAuthority,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "authority", rename_all = "snake_case")]
-pub(crate) enum ApplicationPageAdmissionAuthority {
-    Direct,
-}
-
-impl ApplicationPageAdmission {
-    pub(crate) fn direct(binding_generation: u64) -> Self {
-        Self {
-            binding_generation,
-            authority: ApplicationPageAdmissionAuthority::Direct,
-        }
-    }
 }
 
 /// Read-only graph lease used by the auxiliary Quick Capture WebView. Capture
@@ -50,19 +33,6 @@ pub(crate) struct CaptureGraphBinding {
 #[derive(Debug)]
 pub(crate) enum AssetStreamError {
     InvalidAsset,
-}
-
-/// A use of the graph authority admitted by `GraphSlot::legacy_graph`.
-pub(crate) struct LegacyGraphLease {
-    graph: Arc<Graph>,
-}
-
-impl Deref for LegacyGraphLease {
-    type Target = Graph;
-
-    fn deref(&self) -> &Self::Target {
-        &self.graph
-    }
 }
 
 pub(crate) struct GraphSlot {
@@ -99,21 +69,18 @@ impl GraphSlot {
         }
     }
 
-    /// Lease this binding's graph for one command.
-    pub(crate) fn legacy_graph(&self) -> Result<LegacyGraphLease, CommandError> {
-        Ok(LegacyGraphLease {
-            graph: Arc::clone(&self.graph),
-        })
-    }
-
-    /// Clone the legacy writer only after the authority gate has admitted it.
-    pub(crate) fn legacy_graph_cloned(&self) -> Result<LegacyGraphLease, CommandError> {
-        self.legacy_graph()
+    /// This binding's graph. The slot owns exactly one graph for its whole
+    /// life, so the handle is infallible; callers that outlive the command
+    /// (watchers, warm and backup workers) keep the returned `Arc`.
+    pub(crate) fn graph(&self) -> Arc<Graph> {
+        Arc::clone(&self.graph)
     }
 
     /// Report the selected save route for this exact graph binding.
     pub(crate) fn application_page_admission(&self) -> ApplicationPageAdmission {
-        ApplicationPageAdmission::direct(self.binding_generation)
+        ApplicationPageAdmission {
+            binding_generation: self.binding_generation,
+        }
     }
 
     /// Resolve one range-streamed asset without borrowing graph-text write
@@ -277,7 +244,8 @@ pub(crate) struct AppState {
     pub(crate) graphs: RwLock<GraphRegistry>,
     /// Sole owner of serialized open/switch/storage-mode transitions and their
     /// typed native operation model.
-    pub(crate) storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor,
+    pub(crate) storage_supervisor:
+        crate::storage_transition_supervisor::StorageTransitionSupervisor,
     pub(crate) watch_ctl: Mutex<Option<Sender<()>>>,
     pub(crate) last_focused: Mutex<Option<WindowKey>>,
     pub(crate) capture_graph: Mutex<CaptureShow>,
@@ -582,7 +550,7 @@ pub(crate) fn reopen_legacy_for_refresh(
     approved_assets: Option<&Path>,
     services: crate::graph::DirectFilesServicePaths,
 ) -> Result<GraphSlot, CommandError> {
-    let old_graph = old.legacy_graph()?;
+    let old_graph = old.graph();
     // The replacement attaches a projection at the SAME path; the old worker
     // must have released the writer lease first or the new one races it.
     if !old_graph.detach_direct_projection(Duration::from_secs(15)) {
@@ -696,18 +664,15 @@ mod tests {
         crate::graph::attach_direct_files_services(&graph, services());
         graph.warm_cache();
         let old = Arc::new(GraphSlot::new(graph, root.clone()));
-        let before = when_ready(&old.legacy_graph().unwrap()).expect("queries answer before");
+        let before = when_ready(&old.graph()).expect("queries answer before");
         assert!(before > 0, "the fixture has referring blocks");
 
         // What `set_guide_announced` does: a config write, then a refresh.
-        old.legacy_graph()
-            .unwrap()
-            .set_guide_announced(true)
-            .unwrap();
+        old.graph().set_guide_announced(true).unwrap();
         let replacement = reopen_legacy_for_refresh(&old, None, services()).unwrap();
         // The open path warms through `warm_cache_async`; the refresh core hands
         // that to its caller, so warm here exactly as the caller would.
-        let reopened = replacement.legacy_graph().unwrap();
+        let reopened = replacement.graph();
         reopened.warm_cache();
         let after = when_ready(&reopened);
         let _ = std::fs::remove_dir_all(&root);
@@ -747,9 +712,7 @@ mod tests {
     fn graph_slots_are_send_sync() {
         let base =
             std::env::temp_dir().join(format!("tine-slot-authority-{}", uuid::Uuid::new_v4()));
-        let slot = graph(&base);
-
-        assert!(slot.legacy_graph().is_ok());
+        let _slot = graph(&base);
 
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GraphSlot>();
@@ -761,7 +724,8 @@ mod tests {
     fn explicit_graph_activation_updates_capture_routing_idempotently() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("graph-1".into())),
             capture_graph: Mutex::new(Default::default()),
@@ -806,7 +770,8 @@ mod tests {
     fn capture_binding_retains_the_selected_graph_lease() {
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(Default::default()),
@@ -864,7 +829,8 @@ mod tests {
         let new_root = base.join("new");
         let state = AppState {
             graphs: RwLock::new(GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(Default::default()),

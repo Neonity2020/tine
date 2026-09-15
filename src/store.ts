@@ -1317,7 +1317,7 @@ export function resetStore() {
   // opening a graph. Seed the binding once; tests that exercise the binding
   // boundary rebind explicitly after reset.
   if (import.meta.env.MODE === "test" && graphBindingRuntime.snapshot().bindingGeneration === null) {
-    graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+    graphBindingRuntime.bind(1, { binding_generation: 1 });
   }
   // Every identity belongs to the graph being left. The core drops its own
   // registry with the Graph, so clearing locally is sufficient and avoids a
@@ -1783,7 +1783,7 @@ interface InternalPageMutationPlan<T> extends PageMutationPlan<T> {
   editorTransactionGeneration: number;
   saveBaseline: string | null;
   bindingGeneration: number;
-  authority: "direct" | "missing";
+  admitted: boolean;
   captured: Readonly<Record<string, PageMutationDraftNode>>;
   capturedPage: PageMutationDraftPage;
   uiAuthority?: PageMutationAuthority<T>;
@@ -1985,7 +1985,7 @@ export function createPageMutationPlan<T>(
     editorTransactionGeneration: editorTransactionGeneration(pageName),
     saveBaseline: saveBaselineFor(pageName),
     bindingGeneration: admission?.binding_generation ?? -1,
-    authority: admission?.authority ?? "missing",
+    admitted: admission != null,
     captured,
     capturedPage,
     uiAuthority: uiAuthority
@@ -2123,7 +2123,6 @@ function pageMutationPlanCurrent(
     || editorTransactionGeneration(plan.pageName) !== plan.editorTransactionGeneration
     || saveBaselineFor(plan.pageName) !== plan.saveBaseline
     || admission?.binding_generation !== plan.bindingGeneration
-    || admission?.authority !== plan.authority
   ) return false;
   const page = pageByName(plan.pageName);
   if (!page || JSON.stringify(mutablePage(page)) !== JSON.stringify(mutablePage(plan.capturedPage))) return false;
@@ -2182,10 +2181,10 @@ export function applyPageMutationPlan<T>(
 ): PageMutationDispatch<T> {
   const plan = publicPlan as InternalPageMutationPlan<T>;
   if (!plan[pageMutationPlanSeal] || startedPageMutationPlans.has(plan)) {
-    return { kind: "refused", claimed: plan.authority !== "direct" };
+    return { kind: "refused", claimed: !plan.admitted };
   }
   startedPageMutationPlans.add(plan);
-  if (plan.authority !== "direct") {
+  if (!plan.admitted) {
     pushToast(pageMutationRefusedToast, "error");
     return { kind: "refused", claimed: true };
   }
@@ -3716,7 +3715,6 @@ export interface BulkRouteFence {
   targetNode: Node;
   targetPage: string;
   targetGeneration: number;
-  routeAuthority: string | null;
   routeBindingGeneration: number | null;
 }
 
@@ -3733,7 +3731,6 @@ export function captureBulkRouteFence(targetId: string): BulkRouteFence | null {
     targetNode: unwrap(target),
     targetPage: target.page,
     targetGeneration,
-    routeAuthority: route?.authority ?? null,
     routeBindingGeneration: route?.binding_generation ?? null,
   };
 }
@@ -3748,7 +3745,6 @@ export function bulkRouteFenceCurrent(fence: BulkRouteFence): boolean {
     && unwrap(target) === fence.targetNode
     && target.page === fence.targetPage
     && pageInstanceGeneration(fence.targetPage) === fence.targetGeneration
-    && (route?.authority ?? null) === fence.routeAuthority
     && (route?.binding_generation ?? null) === fence.routeBindingGeneration;
 }
 

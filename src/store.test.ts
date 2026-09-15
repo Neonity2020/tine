@@ -352,7 +352,7 @@ beforeEach(() => {
   setWorkflow("now");
   setGraphMeta(null);
   graphBindingRuntime.clear();
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
   resetPaneLayoutToSingle({
     tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
     activeIndex: 0,

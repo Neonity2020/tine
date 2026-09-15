@@ -12,7 +12,7 @@ use super::ir::{Anchor, Bounds, ExecutionContext, Query, QueryResult, QueryRows,
 use super::rank::PageRecencyPrograms;
 use super::registry::Registry;
 use super::results::{
-    probe_fts_ready, read_page_results, BackendOrder, PageReadInputs, RecencyPage, ResultIdentity,
+    probe_fts_ready, read_page_results, PageReadInputs, RecencyPage, ResultIdentity,
     ResultReadInputs,
 };
 use super::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
@@ -24,7 +24,6 @@ use super::{
 pub(crate) struct SnapshotQueryInputs<'a> {
     pub(crate) registry: &'a Registry,
     pub(crate) identity: &'a ResultIdentity,
-    pub(crate) order: BackendOrder,
     pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
     pub(crate) page_recency: &'a PageRecencyPrograms,
     pub(crate) today: crate::date::JournalDate,
@@ -55,7 +54,6 @@ impl<'a> SnapshotQueryReader<'a> {
             &super::export_execute::SubtreeSelectionInputs {
                 registry: self.inputs.registry,
                 identity: self.inputs.identity,
-                order: self.inputs.order,
                 recency: self.inputs.recency,
                 today: self.inputs.today,
                 fts_ready: self.fts_ready,
@@ -136,7 +134,6 @@ impl<'a> SnapshotQueryReader<'a> {
                     &mut snapshot,
                     &PageReadInputs {
                         statement: &statement,
-                        order: self.inputs.order,
                         view,
                         max_rows: bounds.max_rows,
                         max_bytes: bounds.max_bytes,
@@ -156,7 +153,6 @@ impl<'a> SnapshotQueryReader<'a> {
                     &mut snapshot,
                     &ResultReadInputs {
                         statement: &statement,
-                        order: self.inputs.order,
                         identity: self.inputs.identity,
                         max_rows: bounds.max_rows,
                         max_bytes: bounds.max_bytes,

@@ -12,8 +12,8 @@ use crate::query::ir::{
 };
 use crate::query::registry::Registry;
 use crate::query::results::{
-    probe_fts_ready, read_located_results, BackendOrder, RecencyPage, ResultIdentity,
-    ResultLocator, ResultReadError, ResultReadInputs,
+    probe_fts_ready, read_located_results, RecencyPage, ResultIdentity, ResultLocator,
+    ResultReadError, ResultReadInputs,
 };
 use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use crate::query::{
@@ -70,7 +70,6 @@ pub(crate) struct PreparedExportBatch {
 pub(crate) struct ExportExecutionInputs<'a> {
     pub(crate) registry: &'a Registry,
     pub(crate) identity: &'a ResultIdentity,
-    pub(crate) order: BackendOrder,
     pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
     pub(crate) max_roots: usize,
     pub(crate) max_nodes: usize,
@@ -80,7 +79,6 @@ pub(crate) struct ExportExecutionInputs<'a> {
 pub(crate) struct SubtreeSelectionInputs<'a> {
     pub(crate) registry: &'a Registry,
     pub(crate) identity: &'a ResultIdentity,
-    pub(crate) order: BackendOrder,
     pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
     pub(crate) today: crate::date::JournalDate,
     pub(crate) fts_ready: bool,
@@ -193,7 +191,6 @@ fn select_subtree_roots(
         snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: inputs.order,
             identity: inputs.identity,
             max_rows: bounds.max_rows,
             max_bytes: bounds.max_bytes,
@@ -306,7 +303,6 @@ impl PreparedExportBatch {
                 &SubtreeSelectionInputs {
                     registry: inputs.registry,
                     identity: inputs.identity,
-                    order: inputs.order,
                     recency: inputs.recency,
                     today: self.today,
                     fts_ready,

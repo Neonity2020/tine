@@ -1182,7 +1182,7 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
         (
             "PC-7",
             "src-tauri/src/watcher.rs",
-            "fnobserve_legacy_graph_text_event(",
+            "fnobserve_graph_text_event(",
         ),
         ("PC-8", "crates/tine-core/src/model.rs", "fnpublish_html("),
         (
@@ -1231,8 +1231,8 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
     let restore = function_bodies(&files, "restore_backup");
     assert_eq!(restore.len(), 1, "PC-13 restore entry remains unique");
     assert!(
-        restore[0].contains("slot.legacy_graph_cloned("),
-        "PC-13 restore must remain gated to a Direct-Files graph"
+        restore[0].contains("slot.graph("),
+        "PC-13 restore reads its source from the bound slot\'s graph"
     );
 }
 

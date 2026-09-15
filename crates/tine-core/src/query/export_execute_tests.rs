@@ -4,7 +4,7 @@ use tine_storage::sqlite::PhysicalProjectionQuerySnapshot;
 
 use super::{set_after_construction_hook, ExportExecutionInputs, PreparedExportBatch};
 use crate::query::export_query_subtrees;
-use crate::query::results::{BackendOrder, RecencyPage, ResultIdentity, ResultReadError};
+use crate::query::results::{RecencyPage, ResultIdentity, ResultReadError};
 use crate::query::sql::sql_gates_tests::{scratch, serialize, Corpus};
 use crate::query::{QueryDialect, QueryExportBatch, QueryExportSpec};
 
@@ -17,17 +17,12 @@ fn print_snapshot(
     let registry = corpus.graph.property_registry();
     let identity = ResultIdentity::session_owned();
     let recency = |_page: RecencyPage<'_>| 0;
-    let page_recency = crate::query::rank::PageRecencyPrograms::new(
-        crate::query::rank::JournalRankInput::StoredDay,
-        |_| 0,
-        |_| 0,
-    );
+    let page_recency = crate::query::rank::PageRecencyPrograms::new(|_| 0, |_| 0);
     let reader = crate::query::read_execute::SnapshotQueryReader::new(
         snapshot,
         crate::query::read_execute::SnapshotQueryInputs {
             registry: &registry,
             identity: &identity,
-            order: BackendOrder::Direct,
             recency: &recency,
             page_recency: &page_recency,
             today: corpus.today(),
@@ -378,7 +373,6 @@ fn read_export(
     corpus: &Corpus,
     specs: &[QueryExportSpec],
     caps: Caps,
-    order: BackendOrder,
 ) -> Result<QueryExportBatch, ResultReadError> {
     let prepared = PreparedExportBatch::prepare(specs, caps.queries, corpus.today());
     if let Some(answer) = prepared.all_refused_result(caps.roots) {
@@ -393,7 +387,6 @@ fn read_export(
         &ExportExecutionInputs {
             registry: &registry,
             identity: &identity,
-            order,
             recency: &recency,
             max_roots: caps.roots,
             max_nodes: caps.nodes,
@@ -461,8 +454,8 @@ fn one_executor_matches_the_walk_for_og_tql_advanced_and_mixed_batches() {
     assert!(prepared.requires_registry());
     assert!(prepared.all_refused_result(64).is_none());
     let expected = walk_export(&corpus, &specs, Caps::default());
-    let actual = read_export(&corpus, &specs, Caps::default(), BackendOrder::Direct)
-        .expect("the common executor answers");
+    let actual =
+        read_export(&corpus, &specs, Caps::default()).expect("the common executor answers");
     assert_same_batch(&expected, &actual);
 }
 
@@ -518,8 +511,7 @@ fn every_nonzero_budget_boundary_matches_the_existing_global_budget() {
         },
     ] {
         let expected = walk_export(&corpus, &specs, caps);
-        let actual = read_export(&corpus, &specs, caps, BackendOrder::Direct)
-            .expect("the bounded export answers");
+        let actual = read_export(&corpus, &specs, caps).expect("the bounded export answers");
         assert_same_batch(&expected, &actual);
     }
 }
@@ -538,8 +530,8 @@ fn all_zero_limits_keep_the_existing_clamps_and_complete_subtree_accounting() {
         bytes: 0,
     };
     let expected = walk_export(&corpus, &specs, caps);
-    let actual = read_export(&corpus, &specs, caps, BackendOrder::Direct)
-        .expect("zero limits are clamped by the shared owners");
+    let actual =
+        read_export(&corpus, &specs, caps).expect("zero limits are clamped by the shared owners");
     assert_same_batch(&expected, &actual);
 }
 
@@ -554,7 +546,7 @@ fn sort_sample_and_both_backend_orders_use_the_same_executor() {
         "(and (task TODO) (sort-by page desc) (sample 2))",
     )];
     let expected = walk_export(&corpus, &specs, Caps::default());
-    let actual = read_export(&corpus, &specs, Caps::default(), BackendOrder::Direct)
+    let actual = read_export(&corpus, &specs, Caps::default())
         .expect("the selected ordering policy answers");
     assert_same_batch(&expected, &actual);
 }
@@ -578,8 +570,7 @@ fn physical_locator_wins_when_a_property_id_collides_with_the_selected_root() {
     .expect("Dup");
     let corpus = Corpus::open(root, true);
     let specs = vec![spec("collision", "(task TODO)")];
-    let answer = read_export(&corpus, &specs, Caps::default(), BackendOrder::Direct)
-        .expect("the physical root answers");
+    let answer = read_export(&corpus, &specs, Caps::default()).expect("the physical root answers");
     let root = &answer.results[0].groups[0].blocks[0];
     assert_eq!(root.raw, "TODO real target");
     assert_eq!(root.children.len(), 1);
@@ -641,7 +632,6 @@ fn missing_required_descendant_payload_fails_the_whole_batch() {
         &ExportExecutionInputs {
             registry: &registry,
             identity: &identity,
-            order: BackendOrder::Direct,
             recency: &recency,
             max_roots: 64,
             max_nodes: 4_096,
@@ -672,7 +662,6 @@ fn cancellation_after_complete_construction_returns_no_partial_batch() {
         &ExportExecutionInputs {
             registry: &registry,
             identity: &identity,
-            order: BackendOrder::Direct,
             recency: &recency,
             max_roots: 64,
             max_nodes: 4_096,

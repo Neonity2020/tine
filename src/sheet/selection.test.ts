@@ -31,7 +31,7 @@ beforeAll(() => initParser());
 
 beforeEach(() => {
   resetCellSelectionForTests();
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
   __setBackendForTest(null);
   __setStoreMutationObserverForTest(null);
 });

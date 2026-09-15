@@ -804,7 +804,7 @@ export function mockBackend(): Backend {
       return {
         kind: "loaded" as const,
         binding_generation: 1,
-        application_page_admission: { binding_generation: 1, authority: "direct" as const },
+        application_page_admission: { binding_generation: 1 },
         meta: {
         root: "/mock/graph",
         journals_dir: "journals",

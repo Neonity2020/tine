@@ -119,7 +119,6 @@ beforeEach(() => {
   resetStore();
   graphBindingRuntime.bind(++bindingCounter, {
     binding_generation: bindingCounter,
-    authority: "direct",
   });
   setToasts([]);
   __setStoreMutationObserverForTest(null);

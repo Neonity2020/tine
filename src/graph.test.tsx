@@ -25,7 +25,7 @@ const META: GraphMeta = {
   guide_announced: true,
 };
 
-const DIRECT_ADMISSION = { binding_generation: 1, authority: "direct" as const };
+const DIRECT_ADMISSION = { binding_generation: 1 };
 
 async function loadHarness(
   existing: PageDto | null,
@@ -606,7 +606,7 @@ describe("PDF graph ownership", () => {
         kind: "loaded" as const,
         meta: nextMeta,
         binding_generation: 2,
-        application_page_admission: { binding_generation: 2, authority: "direct" as const },
+        application_page_admission: { binding_generation: 2 },
       };
     });
 

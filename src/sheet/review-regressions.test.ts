@@ -23,7 +23,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   resetStore();
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
 });
 
 function page(name: string, kind: "page" | "journal", roots: string[], readOnly = false): FeedPage {

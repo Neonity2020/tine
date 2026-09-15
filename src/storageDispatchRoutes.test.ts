@@ -55,7 +55,7 @@ function block(id: string, raw: string): BlockDto {
 
 function direct(): void {
   graphBindingRuntime.clear();
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
 }
 
 /** No admission published: the graph is still opening or switching. */

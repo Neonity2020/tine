@@ -24,9 +24,7 @@ pub(crate) fn backup_async(
     app: tauri::AppHandle,
     slot: Arc<GraphSlot>,
 ) -> Result<(), crate::command_error::CommandError> {
-    let graph = slot
-        .legacy_graph()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     let source = BackupSource::from_graph(&graph);
     drop(graph);
     std::thread::spawn(move || {
@@ -426,9 +424,7 @@ pub(crate) fn set_backup_keep(
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
     let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
-    let graph = slot
-        .legacy_graph()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     if let Some(base) = backup_base(&app, &graph) {
         prune_backups(&base, keep);
     }
@@ -483,8 +479,7 @@ pub(crate) async fn list_backups(
 ) -> Result<Vec<BackupInfo>, crate::command_error::CommandError> {
     let root = slot_for_context(&state)
         .map_err(crate::command_error::CommandError::from)?
-        .legacy_graph()
-        .map_err(crate::command_error::CommandError::from)?
+        .graph()
         .root
         .clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -549,9 +544,7 @@ pub(crate) async fn restore_backup(
         ));
     }
     let slot = slot_for_context(&state).map_err(crate::command_error::CommandError::from)?;
-    let graph = slot
-        .legacy_graph_cloned()
-        .map_err(crate::command_error::CommandError::from)?;
+    let graph = slot.graph();
     let source = BackupSource::from_graph(&graph);
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {

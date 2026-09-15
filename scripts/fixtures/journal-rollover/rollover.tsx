@@ -9,7 +9,7 @@ import { editingId, startEditing } from "../../../src/editorController";
 import "../../../src/styles/app.css";
 
 await initParser();
-graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+graphBindingRuntime.bind(1, { binding_generation: 1 });
 const oldTitle = journalTitle(new Date());
 let reads = 0;
 backend().journalFeedPage = async () => {

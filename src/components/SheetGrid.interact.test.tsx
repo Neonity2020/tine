@@ -52,7 +52,7 @@ afterEach(() => {
   resetCellSelectionForTests();
   __setBackendForTest(null);
   __setStoreMutationObserverForTest(null);
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
   setFocusedPaneId("main");
   resetStore();
   document.body.innerHTML = "";

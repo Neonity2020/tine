@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
-use crate::state::{AppState, ApplicationPageAdmissionAuthority};
+use crate::state::AppState;
 
 // `diag` is the existing opt-in detailed trace (`TINE_DEBUG=1` / `--debug`).
 // It may contain a path or an OS error chosen for a directed investigation, so
@@ -476,7 +476,7 @@ fn enum_token<T: Serialize>(value: T) -> Value {
 }
 
 pub(crate) fn record_storage_transition(
-    event: &crate::storage_mode_supervisor::StorageTransitionEvent,
+    event: &crate::storage_transition_supervisor::StorageTransitionEvent,
 ) {
     let mut fields = Map::new();
     fields.insert("operationId".into(), json!(event.operation_id));
@@ -709,11 +709,7 @@ fn build_diagnostic_report(
     let mut graph_state_unavailable = false;
     match state.graphs.read() {
         Ok(graphs) => {
-            for (_, slot) in graphs.entries() {
-                match slot.application_page_admission().authority {
-                    ApplicationPageAdmissionAuthority::Direct => direct += 1,
-                }
-            }
+            direct = graphs.entries().len() as u64;
         }
         Err(_) => graph_state_unavailable = true,
     }

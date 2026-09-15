@@ -1,7 +1,6 @@
 use crate::settings::{settings_path, update_settings};
 use crate::state::{
-    refresh_graph_for_label, slot_for_window, AppState, GraphSlot, LegacyGraphLease,
-    RefreshLaneWait, RefreshOutcome,
+    refresh_graph_for_label, slot_for_window, AppState, GraphSlot, RefreshLaneWait, RefreshOutcome,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -111,10 +110,8 @@ struct Pending {
 /// Resolve the filesystem watcher inputs for an existing Direct Files binding.
 fn direct_watch_paths(
     slot: &GraphSlot,
-) -> Result<(LegacyGraphLease, PathBuf), crate::command_error::CommandError> {
-    let graph = slot
-        .legacy_graph_cloned()
-        .map_err(crate::command_error::CommandError::from)?;
+) -> Result<(Arc<Graph>, PathBuf), crate::command_error::CommandError> {
+    let graph = slot.graph();
     let root = slot.root_key.clone();
     Ok((graph, root))
 }
@@ -1445,12 +1442,13 @@ fn refresh_changed_configs(
         // a second whole-graph reopen -- which discards every cache the graph
         // has built.
         let disk = tine_core::model::config_file_description(root);
-        let unchanged = slot.legacy_graph().is_ok_and(|lease| {
+        let unchanged = {
+            let lease = slot.graph();
             // Either the graph was opened with these exact bytes, or it
             // published them itself. The second case is what keeps a star
             // toggled in the sidebar from reading as an outside change.
             lease.open_config_description() == disk || lease.recent_config_write() == disk
-        });
+        };
         if unchanged {
             continue;
         }
@@ -1511,7 +1509,7 @@ fn full_scan_owner_for_graph(paths: &HashSet<PathBuf>, graph: &Graph) -> HashSet
 }
 
 #[derive(Default)]
-struct LegacyGraphTextObservation {
+struct GraphTextObservation {
     exact_paths: Vec<PathBuf>,
     uncertain: bool,
     relevant: bool,
@@ -1527,25 +1525,25 @@ fn relative_graph_text_event_path(root: &Path, path: &Path) -> Option<String> {
         .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
-fn legacy_graph_text_observation(
+fn graph_text_observation(
     graph: &Graph,
     root: &Path,
     event: Option<&notify::Event>,
-) -> LegacyGraphTextObservation {
+) -> GraphTextObservation {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
 
     let Some(event) = event else {
-        return LegacyGraphTextObservation {
+        return GraphTextObservation {
             uncertain: true,
             relevant: true,
-            ..LegacyGraphTextObservation::default()
+            ..GraphTextObservation::default()
         };
     };
     if event.paths.is_empty() {
-        return LegacyGraphTextObservation {
+        return GraphTextObservation {
             uncertain: true,
             relevant: true,
-            ..LegacyGraphTextObservation::default()
+            ..GraphTextObservation::default()
         };
     }
 
@@ -1555,13 +1553,13 @@ fn legacy_graph_text_observation(
         .filter(|path| path.starts_with(root))
         .collect::<Vec<_>>();
     if owned.is_empty() {
-        return LegacyGraphTextObservation::default();
+        return GraphTextObservation::default();
     }
 
-    let mut observation = LegacyGraphTextObservation {
+    let mut observation = GraphTextObservation {
         relevant: true,
         uncertain: event.need_rescan(),
-        ..LegacyGraphTextObservation::default()
+        ..GraphTextObservation::default()
     };
     if observation.uncertain {
         return observation;
@@ -1672,12 +1670,8 @@ fn legacy_graph_text_observation(
     observation
 }
 
-fn observe_legacy_graph_text_event(
-    graph: &Graph,
-    root: &Path,
-    event: Option<&notify::Event>,
-) -> bool {
-    let observation = legacy_graph_text_observation(graph, root, event);
+fn observe_graph_text_event(graph: &Graph, root: &Path, event: Option<&notify::Event>) -> bool {
+    let observation = graph_text_observation(graph, root, event);
     if !observation.relevant {
         return false;
     }
@@ -1713,7 +1707,7 @@ fn observe_legacy_graph_text_event(
 /// the same resource-scoped mutation authority that `Graph::save_page` uses.
 /// Exact candidates for a Tine self echo take a bounded two-open identity+bytes
 /// proof; debounced reconciliation still captures each final path once.
-fn observe_legacy_graph_text_callback(
+fn observe_graph_text_callback(
     app: &tauri::AppHandle,
     event: Option<&notify::Event>,
 ) -> Vec<(PathBuf, GraphTextExternalObservationTicket)> {
@@ -1727,7 +1721,7 @@ fn observe_legacy_graph_text_callback(
         let Ok((graph, root)) = direct_watch_paths(&slot) else {
             continue;
         };
-        if observe_legacy_graph_text_event(&graph, &root, event) {
+        if observe_graph_text_event(&graph, &root, event) {
             observations.push((root, graph.graph_text_external_observation_ticket()));
         }
     }
@@ -1735,7 +1729,7 @@ fn observe_legacy_graph_text_callback(
 }
 
 struct WatchedGraph {
-    legacy_graph: LegacyGraphLease,
+    graph: Arc<Graph>,
     root: PathBuf,
     assets: AssetWatchState,
     snap: HashMap<PathBuf, FileStamp>,
@@ -1780,14 +1774,14 @@ fn route_drained_direct_frontiers(
         match graphs.get_mut(&label) {
             Some(current) if current.root == root => {
                 if !current
-                    .legacy_graph
+                    .graph
                     .owns_graph_text_external_observation_ticket(ticket)
                 {
                     current.assets = asset_root
                         .clone()
                         .map(AssetWatchState::new)
                         .unwrap_or_default();
-                    current.legacy_graph = latest_graph;
+                    current.graph = latest_graph;
                     current.snap.clear();
                     current.baseline = false;
                     current.last_reconcile_error = None;
@@ -1803,7 +1797,7 @@ fn route_drained_direct_frontiers(
                             .clone()
                             .map(AssetWatchState::new)
                             .unwrap_or_default(),
-                        legacy_graph: latest_graph,
+                        graph: latest_graph,
                         root,
                         snap: HashMap::new(),
                         baseline: false,
@@ -1866,11 +1860,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             graphs.retain(|label, _| live.contains(label));
             for (label, slot) in entries {
                 let asset_root = asset_root_for_slot(&app, &slot);
-                let Ok((legacy_graph, root)) = direct_watch_paths(&slot) else {
+                let Ok((slot_graph, root)) = direct_watch_paths(&slot) else {
                     graphs.remove(&label);
                     continue;
                 };
-                let image = legacy_graph.observe_direct_projection_commits(tx.clone());
+                let image = slot_graph.observe_direct_projection_commits(tx.clone());
                 let observed = (slot.binding_generation, image);
                 if query_images.insert(label.clone(), observed) != Some(observed) && image.is_some()
                 {
@@ -1880,11 +1874,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 match graphs.get_mut(&label) {
                     Some(current) if current.root == root => {
                         if current.pending_observation_epoch.is_some_and(|ticket| {
-                            !legacy_graph.owns_graph_text_external_observation_ticket(ticket)
+                            !slot_graph.owns_graph_text_external_observation_ticket(ticket)
                         }) {
                             current.pending_observation_epoch = None;
                         }
-                        current.legacy_graph = legacy_graph;
+                        current.graph = slot_graph;
                         if asset_root.as_ref() != current.assets.active_root() {
                             current.assets = asset_root
                                 .clone()
@@ -1900,7 +1894,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                     .clone()
                                     .map(AssetWatchState::new)
                                     .unwrap_or_default(),
-                                legacy_graph,
+                                graph: slot_graph,
                                 root,
                                 snap: HashMap::new(),
                                 baseline: false,
@@ -1960,10 +1954,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             }
                             if let Ok(mut p) = pendingc.lock() {
                                 let observations = match &res {
-                                    Ok(event) => {
-                                        observe_legacy_graph_text_callback(&appc, Some(event))
-                                    }
-                                    Err(_) => observe_legacy_graph_text_callback(&appc, None),
+                                    Ok(event) => observe_graph_text_callback(&appc, Some(event)),
+                                    Err(_) => observe_graph_text_callback(&appc, None),
                                 };
                                 p.add_legacy_observations(observations);
                                 match res {
@@ -2140,7 +2132,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             for (label, graph) in graphs.iter_mut() {
                 if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
                     if graph
-                        .legacy_graph
+                        .graph
                         .owns_graph_text_external_observation_ticket(epoch)
                     {
                         graph.pending_observation_epoch =
@@ -2154,14 +2146,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     // No baseline yet, so nothing about the graph's text identity
                     // is known. Once per graph, not once per cycle.
                     let _ = graph
-                        .legacy_graph
+                        .graph
                         .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
-                    graph.snap = collect_graph_text_files(&graph.legacy_graph).files;
+                    graph.snap = collect_graph_text_files(&graph.graph).files;
                     graph.baseline = true;
                 }
                 let retry_due = graph.retry.take_due(Instant::now());
-                let owned = pending_for_graph(&paths, &graph.legacy_graph);
-                let full_owned = full_scan_owner_for_graph(&full_paths, &graph.legacy_graph);
+                let owned = pending_for_graph(&paths, &graph.graph);
+                let full_owned = full_scan_owner_for_graph(&full_paths, &graph.graph);
                 let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
                 let mut cycle_failed = false;
                 let mut attempted = false;
@@ -2169,7 +2161,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     attempted = true;
                     let reconcile_started = Instant::now();
                     let (changes, conflicts_dirty, used_full, errors) = reconcile_pending(
-                        &graph.legacy_graph,
+                        &graph.graph,
                         &mut graph.snap,
                         &owned,
                         need_full,
@@ -2226,7 +2218,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     graph.last_reconcile_error = None;
                     if let Some(epoch) = graph.pending_observation_epoch.take() {
                         graph
-                            .legacy_graph
+                            .graph
                             .acknowledge_graph_text_external_observations(epoch);
                     }
                 }
@@ -2403,7 +2395,7 @@ mod tests {
         graph_dir.write("pages/TINE版本更新提示词.md", "- 中文内容\n");
         let path = graph_dir.path("pages/TINE版本更新提示词.md");
         let create = event(EventKind::Create(CreateKind::Any), vec![path.clone()]);
-        assert!(observe_legacy_graph_text_event(
+        assert!(observe_graph_text_event(
             &graph,
             &graph_dir.root,
             Some(&create),
@@ -2478,7 +2470,7 @@ mod tests {
                 } else {
                     vec![first_path.clone()]
                 };
-                assert!(observe_legacy_graph_text_event(
+                assert!(observe_graph_text_event(
                     &graph,
                     &graph_dir.root,
                     Some(&event(kind, paths)),
@@ -2492,7 +2484,7 @@ mod tests {
             graph
                 .sync_file_checked(&first_path)
                 .expect("debounced self-write reconciliation");
-            assert!(observe_legacy_graph_text_event(
+            assert!(observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 Some(&event(EventKind::Modify(ModifyKind::Any), vec![first_path],)),
@@ -2538,7 +2530,7 @@ mod tests {
                 std::fs::write(&first_path, "- external winner\n").unwrap();
             }
 
-            assert!(observe_legacy_graph_text_event(
+            assert!(observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 Some(&event(EventKind::Modify(ModifyKind::Any), vec![first_path],)),
@@ -3454,14 +3446,14 @@ mod tests {
         graph_dir.write("pages/Anchor.md", "- anchor\n");
 
         let old_slot = GraphSlot::new(Graph::open(&graph_dir.root), graph_dir.root.clone());
-        let old_graph = old_slot.legacy_graph_cloned().unwrap();
+        let old_graph = old_slot.graph();
         warm_direct_graph(&old_graph);
         let old_ticket = old_graph.note_graph_text_external_observation();
         let mut graphs = HashMap::from([(
             "main".to_owned(),
             WatchedGraph {
                 assets: AssetWatchState::new(old_graph.assets_path()),
-                legacy_graph: old_graph,
+                graph: old_graph,
                 root: graph_dir.root.clone(),
                 snap: HashMap::new(),
                 baseline: true,
@@ -3475,7 +3467,7 @@ mod tests {
             Graph::open(&graph_dir.root),
             graph_dir.root.clone(),
         ));
-        let replacement = replacement_slot.legacy_graph_cloned().unwrap();
+        let replacement = replacement_slot.graph();
         warm_direct_graph(&replacement);
         graph_dir.write(
             "pages/Replacement Event.md",
@@ -3489,25 +3481,25 @@ mod tests {
             &mut graphs,
             vec![("main".to_owned(), replacement_slot)],
             &drained,
-            |slot| slot.legacy_graph().ok().map(|graph| graph.assets_path()),
+            |slot| Some(slot.graph().assets_path()),
         );
 
         let routed = graphs.get_mut("main").unwrap();
         assert!(routed
-            .legacy_graph
+            .graph
             .owns_graph_text_external_observation_ticket(replacement_ticket));
         assert!(!routed.baseline);
         assert!(routed.last_reconcile_error.is_none());
         assert!(routed.pending_observation_epoch.is_none());
 
         routed.pending_observation_epoch = Some(replacement_ticket);
-        routed.legacy_graph.sync_file_checked(&external).unwrap();
+        routed.graph.sync_file_checked(&external).unwrap();
         let reconciled = routed.pending_observation_epoch.take().unwrap();
         assert!(routed
-            .legacy_graph
+            .graph
             .acknowledge_graph_text_external_observations(reconciled));
         routed
-            .legacy_graph
+            .graph
             .save_page(&new_page("Creation After Refresh"), None)
             .unwrap();
         assert!(graph_dir.path("pages/Creation After Refresh.md").exists());
@@ -3618,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_graph_root_text_create_delete_rename_and_semantics_reach_guarded_identity() {
+    fn graph_root_text_create_delete_rename_and_semantics_reach_guarded_identity() {
         use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 
         for extension in ["md", "org"] {
@@ -3632,7 +3624,7 @@ mod tests {
                 &created_rel,
                 &format!("title:: Created {extension}\n\n- external\n"),
             );
-            assert!(observe_legacy_graph_text_event(
+            assert!(observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 Some(&event(
@@ -3646,7 +3638,7 @@ mod tests {
 
             let deleted_rel = format!("nonstandard/deep/Delete {extension}.{extension}");
             graph_dir.write(&deleted_rel, "- external\n");
-            observe_legacy_graph_text_event(
+            observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 Some(&event(
@@ -3662,11 +3654,10 @@ mod tests {
                 EventKind::Remove(RemoveKind::File),
                 vec![graph_dir.path(&deleted_rel)],
             );
-            let deletion =
-                legacy_graph_text_observation(&graph, &graph_dir.root, Some(&delete_event));
+            let deletion = graph_text_observation(&graph, &graph_dir.root, Some(&delete_event));
             assert!(!deletion.uncertain);
             assert_eq!(deletion.exact_paths, vec![graph_dir.path(&deleted_rel)]);
-            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&delete_event));
+            observe_graph_text_event(&graph, &graph_dir.root, Some(&delete_event));
             assert_new_page_waits_for_reconciliation(&graph, &format!("Delete {extension}"));
             let delete_epoch = graph.graph_text_external_observation_ticket();
             graph
@@ -3677,7 +3668,7 @@ mod tests {
             let old_rel = format!("nonstandard/deep/Old {extension}.{extension}");
             let new_rel = format!("nonstandard/deep/New {extension}.{extension}");
             graph_dir.write(&old_rel, "- external\n");
-            observe_legacy_graph_text_event(
+            observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 Some(&event(
@@ -3693,14 +3684,13 @@ mod tests {
                 EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
                 vec![graph_dir.path(&old_rel), graph_dir.path(&new_rel)],
             );
-            let rename =
-                legacy_graph_text_observation(&graph, &graph_dir.root, Some(&rename_event));
+            let rename = graph_text_observation(&graph, &graph_dir.root, Some(&rename_event));
             assert!(!rename.uncertain);
             assert_eq!(
                 rename.exact_paths,
                 vec![graph_dir.path(&old_rel), graph_dir.path(&new_rel)]
             );
-            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&rename_event));
+            observe_graph_text_event(&graph, &graph_dir.root, Some(&rename_event));
             assert_new_page_waits_for_reconciliation(&graph, &format!("New {extension}"));
             let rename_epoch = graph.graph_text_external_observation_ticket();
             graph
@@ -3729,7 +3719,7 @@ mod tests {
 
         graph_dir.write("pages/External A.md", "- external A\n");
         let path_a = graph_dir.path("pages/External A.md");
-        assert!(observe_legacy_graph_text_event(
+        assert!(observe_graph_text_event(
             &graph,
             &graph_dir.root,
             Some(&event(
@@ -3745,7 +3735,7 @@ mod tests {
 
         graph_dir.write("pages/External B.md", "- external B\n");
         let path_b = graph_dir.path("pages/External B.md");
-        assert!(observe_legacy_graph_text_event(
+        assert!(observe_graph_text_event(
             &graph,
             &graph_dir.root,
             Some(&event(
@@ -3824,11 +3814,10 @@ mod tests {
                 "notify-error" => None,
                 _ => unreachable!(),
             };
-            let observation =
-                legacy_graph_text_observation(&graph, &graph_dir.root, event.as_ref());
+            let observation = graph_text_observation(&graph, &graph_dir.root, event.as_ref());
             assert!(observation.relevant, "{case}");
             assert!(observation.uncertain, "{case}");
-            assert!(observe_legacy_graph_text_event(
+            assert!(observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 event.as_ref(),
@@ -3863,7 +3852,7 @@ mod tests {
             EventKind::Create(CreateKind::Any),
             EventKind::Modify(ModifyKind::Any),
         ] {
-            let observation = legacy_graph_text_observation(
+            let observation = graph_text_observation(
                 &graph,
                 &graph_dir.root,
                 Some(&event(kind, vec![path.clone()])),
@@ -3880,7 +3869,7 @@ mod tests {
         // the sub-kind is missing -- the arm discriminates against the live
         // filesystem, not against the event kind.
         std::fs::create_dir_all(graph_dir.path("pages/sub")).unwrap();
-        let directory = legacy_graph_text_observation(
+        let directory = graph_text_observation(
             &graph,
             &graph_dir.root,
             Some(&event(
@@ -3895,7 +3884,7 @@ mod tests {
 
         // Removal stays conservative: the path is gone, so its kind is unknowable.
         std::fs::remove_file(&path).unwrap();
-        let removed = legacy_graph_text_observation(
+        let removed = graph_text_observation(
             &graph,
             &graph_dir.root,
             Some(&event(EventKind::Remove(RemoveKind::Any), vec![path])),
@@ -3908,7 +3897,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_graph_root_observation_routes_only_to_the_owning_graph() {
+    fn graph_root_observation_routes_only_to_the_owning_graph() {
         use notify::event::{CreateKind, EventKind};
 
         let graph_a_dir = TempGraph::new("root-owner-a");
@@ -3927,17 +3916,17 @@ mod tests {
             EventKind::Create(CreateKind::File),
             vec![graph_a_dir.path("nonstandard/deep/A.md")],
         );
-        assert!(observe_legacy_graph_text_event(
+        assert!(observe_graph_text_event(
             &graph_a,
             &graph_a_dir.root,
             Some(&event_a),
         ));
         let graph_b_observation =
-            legacy_graph_text_observation(&graph_b, &graph_b_dir.root, Some(&event_a));
+            graph_text_observation(&graph_b, &graph_b_dir.root, Some(&event_a));
         assert!(!graph_b_observation.relevant);
         assert!(!graph_b_observation.uncertain);
         assert!(graph_b_observation.exact_paths.is_empty());
-        assert!(!observe_legacy_graph_text_event(
+        assert!(!observe_graph_text_event(
             &graph_b,
             &graph_b_dir.root,
             Some(&event_a),
@@ -3962,11 +3951,11 @@ mod tests {
                 EventKind::Create(CreateKind::File),
                 vec![graph_dir.path(relative)],
             );
-            let observation = legacy_graph_text_observation(&graph, &graph_dir.root, Some(&event));
+            let observation = graph_text_observation(&graph, &graph_dir.root, Some(&event));
             assert!(observation.relevant, "{relative}");
             assert!(!observation.uncertain, "{relative}");
             assert!(observation.exact_paths.is_empty(), "{relative}");
-            assert!(observe_legacy_graph_text_event(
+            assert!(observe_graph_text_event(
                 &graph,
                 &graph_dir.root,
                 Some(&event)
@@ -3982,10 +3971,10 @@ mod tests {
             EventKind::Create(CreateKind::File),
             vec![graph_dir.path("nonstandard/deep/image.png")],
         );
-        let observation = legacy_graph_text_observation(&graph, &graph_dir.root, Some(&non_text));
+        let observation = graph_text_observation(&graph, &graph_dir.root, Some(&non_text));
         assert!(!observation.uncertain);
         assert!(observation.exact_paths.is_empty());
-        assert!(observe_legacy_graph_text_event(
+        assert!(observe_graph_text_event(
             &graph,
             &graph_dir.root,
             Some(&non_text)
@@ -3997,7 +3986,7 @@ mod tests {
                 vec![graph_dir.path(relative)],
             );
             let observation =
-                legacy_graph_text_observation(&graph, &graph_dir.root, Some(&private_directory));
+                graph_text_observation(&graph, &graph_dir.root, Some(&private_directory));
             assert!(!observation.uncertain, "{relative}");
             assert!(observation.exact_paths.is_empty(), "{relative}");
         }

@@ -119,7 +119,7 @@ use crate::doc::property_key_norm;
 use crate::query::atom::atom_key;
 use crate::query::eval::{format_number, CompiledLeaves};
 use crate::query::ir::{Anchor, Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Query, Rel, Value};
-use crate::query::rank::{JournalRankInput, PageRecencyPrograms, QueryRankPrograms};
+use crate::query::rank::{PageRecencyPrograms, QueryRankPrograms};
 use crate::query::registry::Registry;
 use crate::refs;
 use crate::search_query::{canonical_fold, AndGroup, Matcher, Term};
@@ -618,7 +618,6 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
 /// their rows are consumed exactly as they are today.
 pub(crate) fn descriptor_view_statement(
     statement: &SqlQuery,
-    order: crate::query::results::BackendOrder,
     ordered: Option<(&crate::query::ir::ViewSettings, &PageRecencyPrograms)>,
 ) -> Result<RankedPageStatement, MaterializationError> {
     let block_anchor = format!("{BLOCK_ANCHOR_SELECT} {BLOCK_ANCHOR_FROM}");
@@ -642,9 +641,7 @@ pub(crate) fn descriptor_view_statement(
         "" => "WITH".to_string(),
         ctes => format!("{ctes},"),
     };
-    let base = match order {
-        crate::query::results::BackendOrder::Direct => "o.position",
-    };
+    let base = "o.position";
     let mut params = statement.params.clone();
     let mut ranks = QueryRankPrograms::default();
     let mut terms = Vec::new();
@@ -891,9 +888,7 @@ fn recency_order_expression(
     let bound = recency.bind(ranks);
     let journal = bind_page_param(params, PhysicalQueryValue::Integer(bound.journal_id as i64));
     let file = bind_page_param(params, PhysicalQueryValue::Integer(bound.file_id as i64));
-    match bound.journal_input {
-        JournalRankInput::StoredDay => format!("CASE WHEN {alias}.text_kind = 1 AND {alias}.journal_day IS NOT NULL THEN tine_query_rank({journal}, CAST({alias}.journal_day AS TEXT)) ELSE tine_query_rank({file}, {alias}.path) END"),
-    }
+    format!("CASE WHEN {alias}.text_kind = 1 AND {alias}.journal_day IS NOT NULL THEN tine_query_rank({journal}, CAST({alias}.journal_day AS TEXT)) ELSE tine_query_rank({file}, {alias}.path) END")
 }
 
 /// Narrow authored values, never atom expansion or DTO payload. Each scalar
@@ -962,7 +957,6 @@ pub(crate) struct RankedPageStatement {
 
 pub(crate) fn page_statement(
     statement: &SqlQuery,
-    order: crate::query::results::BackendOrder,
     view: &crate::query::ir::ViewSettings,
     max_rows: usize,
     recency: &PageRecencyPrograms,
@@ -979,9 +973,7 @@ pub(crate) fn page_statement(
         "" => "WITH".to_string(),
         ctes => format!("{ctes},"),
     };
-    let base = match order {
-        crate::query::results::BackendOrder::Direct => "o.position",
-    };
+    let base = "o.position";
     let mut params = statement.params.clone();
     let mut ranks = QueryRankPrograms::default();
     let mut lowercase = None;

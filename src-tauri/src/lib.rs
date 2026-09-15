@@ -31,7 +31,7 @@ mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
-mod storage_mode_supervisor;
+mod storage_transition_supervisor;
 #[cfg(test)]
 mod test_support;
 mod watcher;
@@ -749,7 +749,8 @@ pub fn run() {
         })
         .manage(AppState {
             graphs: RwLock::new(state::GraphRegistry::default()),
-            storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor::default(),
+            storage_supervisor:
+                crate::storage_transition_supervisor::StorageTransitionSupervisor::default(),
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(Default::default()),

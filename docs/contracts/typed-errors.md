@@ -233,7 +233,7 @@ would discard its closed reason code and conflict epoch.
 | platform/host source | `CommandError::platform` | `Platform` | unchanged source/context display | platform opener and capture-host helpers |
 | graph-verification source | `CommandError::graph_verification` | `GraphVerification` | unchanged source/context display | verification task, dialog, and report helpers (non-JSON) |
 | graph lifecycle source | `CommandError::graph` | `Graph` | unchanged source/context display | `graph.rs` and `watcher.rs` lifecycle helpers |
-| storage transition source | `CommandError::storage_transition` | `StorageTransition` | unchanged source/context display | `storage_mode_supervisor.rs` helpers |
+| storage transition source | `CommandError::storage_transition` | `StorageTransition` | unchanged source/context display | `storage_transition_supervisor.rs` helpers |
 | settings source | `CommandError::settings` | `Settings` | unchanged source/context display | settings validation/load helpers |
 | diagnostic source | `CommandError::diagnostic` | `Diagnostic` | unchanged source/context display | diagnostic recorder and dialog helpers |
 | backup source | `CommandError::backup` | `Backup` | unchanged source/context display | backup validation and restore helpers |
@@ -339,5 +339,5 @@ below are unchanged.
 | `platform.rs` | `external_open_plan`, `open_external`, `reveal_page_source` | unsupported URL/platform/path literal | local validation branch | platform outcome taxonomy follow-up |
 | `plugins.rs` | `install_plugin`, `install_plugin_package_at`, `manifest_identity`, `package_dir`, `plugins_dir`, `read_plugin_entry`, `set_plugin_enabled`, `set_plugin_enabled_at`, `store_plugin_registry_cache`, `store_plugin_registry_cache_at`, `uninstall_package`, `validate_uninstall_target`, `verify_plugin_registry` | plugin identity/bounds/availability literal | local validation branch, not a source error | plugin outcome taxonomy follow-up |
 | `settings.rs` | `atomic_write_workspaces`, `load_notices`, `load_session`, `load_workspaces`, `migrate_legacy_session_at`, `reveal_known_graph`, `save_notices`, `save_notices_at`, `save_session`, `save_session_at`, `save_workspaces`, `update_settings`, `validate_workspaces_json` | settings shape/availability literal | local validation branch, not a source error | settings outcome taxonomy follow-up |
-| `storage_mode_supervisor.rs` | `commit_if_current` | superseded-transition literal | local state predicate | transition outcome taxonomy follow-up |
+| `storage_transition_supervisor.rs` | `commit_if_current` | superseded-transition literal | local state predicate | transition outcome taxonomy follow-up |
 

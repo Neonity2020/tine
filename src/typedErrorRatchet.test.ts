@@ -376,7 +376,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     for (const file of [
       "backup.rs", "conflict_capsule.rs", "debug.rs", "graph.rs",
       "graph_verification.rs", "platform.rs", "plugins.rs", "settings.rs",
-      "storage_mode_supervisor.rs",
+      "storage_transition_supervisor.rs",
     ]) expect(contract).toContain(`\`${file}\``);
 
     const proseStart = contract.indexOf("### `Prose` census");

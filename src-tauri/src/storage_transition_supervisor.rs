@@ -10,24 +10,9 @@ pub(crate) type StorageOperationId = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum StableStorageMode {
-    Direct,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum StorageTransitionKind {
     Lookup,
     OpenDirect,
-}
-
-impl StorageTransitionKind {
-    fn stable_mode(self) -> Option<StableStorageMode> {
-        match self {
-            Self::Lookup => None,
-            Self::OpenDirect => Some(StableStorageMode::Direct),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -102,7 +87,8 @@ pub(crate) enum StorageSupervisorError {
     RootBusy,
     OperationIdExhausted,
     AlreadyTerminal,
-    MismatchedStableMode,
+    RootRebound,
+    OpenWithoutRoot,
 }
 
 #[derive(Clone, Debug)]
@@ -196,7 +182,7 @@ impl StorageSupervisorModel {
             return Ok(());
         }
         if previous_root.is_some() {
-            return Err(StorageSupervisorError::MismatchedStableMode);
+            return Err(StorageSupervisorError::RootRebound);
         }
         if self
             .active_root_owner
@@ -236,7 +222,6 @@ impl StorageSupervisorModel {
         &mut self,
         operation_id: StorageOperationId,
         outcome: StorageTransitionOutcome,
-        stable_mode: Option<StableStorageMode>,
         outcome_code: Option<String>,
         now_ms: u64,
     ) -> Result<StorageTransitionEvent, StorageSupervisorError> {
@@ -252,14 +237,12 @@ impl StorageSupervisorModel {
             .ok_or(StorageSupervisorError::StaleOperation)?;
         let active = self.active_by_window.get(&window).unwrap();
         if outcome == StorageTransitionOutcome::Succeeded {
-            // A lookup publishes no stable mode; a direct open publishes
-            // exactly Direct. Anything else is a caller confusing the two.
-            let expected = active.operation.kind.stable_mode();
-            if stable_mode != expected {
-                return Err(StorageSupervisorError::MismatchedStableMode);
-            }
-            if stable_mode.is_some() && active.operation.canonical_root.is_none() {
-                return Err(StorageSupervisorError::MismatchedStableMode);
+            // A graph open publishes a binding for exactly one root, so it
+            // cannot succeed before `bind_root` has named that root.
+            if active.operation.kind == StorageTransitionKind::OpenDirect
+                && active.operation.canonical_root.is_none()
+            {
+                return Err(StorageSupervisorError::OpenWithoutRoot);
             }
         }
         let active = self.active_by_window.remove(&window).unwrap();
@@ -339,7 +322,7 @@ fn legal_phase_transition(
 /// Since the Managed Storage removal (2026-09-15) the only transitions are the
 /// selection lookup and the Direct Files open.
 #[derive(Debug)]
-pub(crate) struct StorageModeSupervisor {
+pub(crate) struct StorageTransitionSupervisor {
     root_transitions: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
     /// The short linearization lane shared only by operation start and final
     /// graph-registry publication. Long work never holds it. This lets us
@@ -351,7 +334,7 @@ pub(crate) struct StorageModeSupervisor {
     clock_origin: Instant,
 }
 
-impl Default for StorageModeSupervisor {
+impl Default for StorageTransitionSupervisor {
     fn default() -> Self {
         Self {
             root_transitions: Mutex::new(HashMap::new()),
@@ -362,7 +345,7 @@ impl Default for StorageModeSupervisor {
     }
 }
 
-impl StorageModeSupervisor {
+impl StorageTransitionSupervisor {
     pub(crate) fn transition_lane(&self, canonical_root: &Path) -> Arc<Mutex<()>> {
         let mut gates = self.root_transitions.lock().unwrap();
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -452,20 +435,13 @@ impl StorageModeSupervisor {
         app: &tauri::AppHandle,
         operation_id: StorageOperationId,
         outcome: StorageTransitionOutcome,
-        stable_mode: Option<StableStorageMode>,
         outcome_code: Option<String>,
     ) -> Result<(), crate::command_error::CommandError> {
         let event = self
             .model
             .lock()
             .unwrap()
-            .finish(
-                operation_id,
-                outcome,
-                stable_mode,
-                outcome_code,
-                self.now_ms(),
-            )
+            .finish(operation_id, outcome, outcome_code, self.now_ms())
             .map_err(|error| {
                 crate::command_error::CommandError::storage_transition(format!(
                     "storage transition completion refused: {error:?}"
@@ -561,24 +537,12 @@ mod tests {
             assert!(!update.terminal);
         }
         let terminal = model
-            .finish(
-                id,
-                StorageTransitionOutcome::Succeeded,
-                kind.stable_mode(),
-                None,
-                100,
-            )
+            .finish(id, StorageTransitionOutcome::Succeeded, None, 100)
             .unwrap();
         assert!(terminal.terminal);
         assert_eq!(terminal.outcome, Some(StorageTransitionOutcome::Succeeded));
         assert_eq!(
-            model.finish(
-                id,
-                StorageTransitionOutcome::Succeeded,
-                kind.stable_mode(),
-                None,
-                101
-            ),
+            model.finish(id, StorageTransitionOutcome::Succeeded, None, 101),
             Err(StorageSupervisorError::AlreadyTerminal)
         );
     }
@@ -596,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_results_cannot_advance_finish_or_change_mode() {
+    fn stale_results_cannot_advance_or_finish() {
         let mut model = StorageSupervisorModel::default();
         let old = model
             .begin("main", Some(root()), StorageTransitionKind::OpenDirect, 0)
@@ -625,7 +589,6 @@ mod tests {
             .finish(
                 newer.operation.operation_id,
                 StorageTransitionOutcome::Succeeded,
-                Some(StableStorageMode::Direct),
                 None,
                 3,
             )
@@ -665,34 +628,25 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_cannot_finish_as_a_direct_open() {
+    fn a_graph_open_succeeds_only_for_the_one_root_it_bound() {
         let mut model = StorageSupervisorModel::default();
-        let lookup = model
-            .begin("main", Some(root()), StorageTransitionKind::Lookup, 0)
-            .unwrap();
-        assert_eq!(
-            model.finish(
-                lookup.operation.operation_id,
-                StorageTransitionOutcome::Succeeded,
-                Some(StableStorageMode::Direct),
-                None,
-                1,
-            ),
-            Err(StorageSupervisorError::MismatchedStableMode)
-        );
         let open = model
-            .begin("main", Some(root()), StorageTransitionKind::OpenDirect, 2)
+            .begin("main", None, StorageTransitionKind::OpenDirect, 0)
             .unwrap();
+        let id = open.operation.operation_id;
         assert_eq!(
-            model.finish(
-                open.operation.operation_id,
-                StorageTransitionOutcome::Succeeded,
-                None,
-                None,
-                3,
-            ),
-            Err(StorageSupervisorError::MismatchedStableMode)
+            model.finish(id, StorageTransitionOutcome::Succeeded, None, 1),
+            Err(StorageSupervisorError::OpenWithoutRoot)
         );
+        model.bind_root(id, root()).unwrap();
+        model.bind_root(id, root()).unwrap();
+        assert_eq!(
+            model.bind_root(id, PathBuf::from("/other")),
+            Err(StorageSupervisorError::RootRebound)
+        );
+        model
+            .finish(id, StorageTransitionOutcome::Succeeded, None, 2)
+            .unwrap();
     }
 
     #[test]
@@ -705,7 +659,6 @@ mod tests {
             .finish(
                 first.operation.operation_id,
                 StorageTransitionOutcome::Failed,
-                None,
                 Some("missing_graph".into()),
                 1,
             )
@@ -723,7 +676,6 @@ mod tests {
                 first.operation.operation_id,
                 StorageTransitionOutcome::Failed,
                 None,
-                None,
                 3,
             ),
             Err(StorageSupervisorError::AlreadyTerminal)
@@ -736,10 +688,11 @@ mod tests {
         let graph = include_str!("graph.rs");
         assert!(!state.contains("graph_load: Mutex"));
         assert!(!graph.contains(".graph_load.lock()"));
-        assert!(state
-            .contains("storage_supervisor: crate::storage_mode_supervisor::StorageModeSupervisor"));
+        assert!(state.contains(
+            "storage_supervisor: crate::storage_transition_supervisor::StorageTransitionSupervisor"
+        ));
         let global_lock_field = ["transition", "Mutex<()>"].join(": ");
-        assert!(!include_str!("storage_mode_supervisor.rs").contains(&global_lock_field));
+        assert!(!include_str!("storage_transition_supervisor.rs").contains(&global_lock_field));
     }
 
     #[test]
@@ -747,7 +700,7 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let supervisor = Arc::new(StorageModeSupervisor::default());
+        let supervisor = Arc::new(StorageTransitionSupervisor::default());
         let graph_a = supervisor.transition_lane(Path::new("/graph-a"));
         let held_a = graph_a.lock().unwrap();
         let (sent, received) = mpsc::channel();
@@ -776,7 +729,7 @@ mod tests {
 
     #[test]
     fn superseded_operations_cannot_enter_the_publication_closure() {
-        let supervisor = StorageModeSupervisor::default();
+        let supervisor = StorageTransitionSupervisor::default();
         let mut model = supervisor.model.lock().unwrap();
         let old = model
             .begin("main", Some(root()), StorageTransitionKind::OpenDirect, 0)

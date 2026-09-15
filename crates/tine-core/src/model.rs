@@ -4629,7 +4629,6 @@ impl Graph {
         };
         let inputs = crate::query::results::ResultReadInputs {
             statement: &statement,
-            order: crate::query::results::BackendOrder::Direct,
             identity: &identity,
             max_rows,
             max_bytes,
@@ -4642,7 +4641,6 @@ impl Graph {
             Some(view) => {
                 let root = self.root.clone();
                 let page_recency = crate::query::rank::PageRecencyPrograms::new(
-                    crate::query::rank::JournalRankInput::StoredDay,
                     |day| {
                         crate::query::page_recency_secs_for(
                             day.parse().ok(),
@@ -4713,7 +4711,6 @@ impl Graph {
                         &ExportExecutionInputs {
                             registry: &registry,
                             identity: &identity,
-                            order: crate::query::results::BackendOrder::Direct,
                             recency: &recency,
                             max_roots,
                             max_nodes,
@@ -4733,9 +4730,9 @@ impl Graph {
         sources: &[(PageEntry, String)],
         publish: impl FnOnce(&crate::query::read_execute::SnapshotQueryReader<'_>) -> io::Result<T>,
     ) -> io::Result<T> {
-        use crate::query::rank::{JournalRankInput, PageRecencyPrograms};
+        use crate::query::rank::PageRecencyPrograms;
         use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
-        use crate::query::results::{BackendOrder, RecencyPage, ResultIdentity};
+        use crate::query::results::{RecencyPage, ResultIdentity};
         // The dispatcher can repair a failed acquisition before publication
         // starts. Once the callback starts, its IO outcome is final; the writer
         // is never re-entered as a query retry.
@@ -4764,7 +4761,6 @@ impl Graph {
                     };
                     let root = self.root.clone();
                     let page_recency = PageRecencyPrograms::new(
-                        JournalRankInput::StoredDay,
                         |day| {
                             crate::query::page_recency_secs_for(
                                 day.parse::<i64>().ok(),
@@ -4778,7 +4774,6 @@ impl Graph {
                         SnapshotQueryInputs {
                             registry: &registry,
                             identity: &identity,
-                            order: BackendOrder::Direct,
                             recency: &recency,
                             page_recency: &page_recency,
                             today: crate::date::JournalDate::today(),
@@ -5026,7 +5021,6 @@ impl Graph {
             // Valid empty selections still fold requested empty statistics.
             let root = self.root.clone();
             let page_recency = crate::query::rank::PageRecencyPrograms::new(
-                crate::query::rank::JournalRankInput::StoredDay,
                 |day| {
                     crate::query::page_recency_secs_for(
                         day.parse::<i64>().ok(),
@@ -5039,7 +5033,6 @@ impl Graph {
                 &mut job.snapshot,
                 &crate::query::results::PageReadInputs {
                     statement: &statement,
-                    order: crate::query::results::BackendOrder::Direct,
                     view,
                     max_rows: bounds.max_rows,
                     max_bytes: bounds.max_bytes,
@@ -5115,7 +5108,6 @@ impl Graph {
             };
             let root = self.root.clone();
             let page_recency = crate::query::rank::PageRecencyPrograms::new(
-                crate::query::rank::JournalRankInput::StoredDay,
                 |day| {
                     crate::query::page_recency_secs_for(
                         day.parse::<i64>().ok(),
@@ -5136,7 +5128,6 @@ impl Graph {
                         &mut job.snapshot,
                         &crate::query::results::PageReadInputs {
                             statement,
-                            order: crate::query::results::BackendOrder::Direct,
                             view: &page_count_view,
                             max_rows: 0,
                             max_bytes: 0,
@@ -5150,7 +5141,6 @@ impl Graph {
                         &mut job.snapshot,
                         &crate::query::results::ResultReadInputs {
                             statement,
-                            order: crate::query::results::BackendOrder::Direct,
                             identity: &identity,
                             max_rows: bounds.max_rows,
                             max_bytes: bounds.max_bytes,
@@ -14143,9 +14133,9 @@ impl Graph {
             &crate::query::read_execute::SnapshotQueryReader<'_>,
         ) -> Result<T, crate::publish::PrintPreparationError>,
     ) -> Result<T, crate::publish::PrintPreparationError> {
-        use crate::query::rank::{JournalRankInput, PageRecencyPrograms};
+        use crate::query::rank::PageRecencyPrograms;
         use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
-        use crate::query::results::{BackendOrder, RecencyPage, ResultIdentity};
+        use crate::query::results::{RecencyPage, ResultIdentity};
         let render = std::cell::RefCell::new(Some(render));
         let today = crate::date::JournalDate::today();
         self.dispatch_direct_query(|request| {
@@ -14166,7 +14156,6 @@ impl Graph {
                     };
                     let root = self.root.clone();
                     let page_recency = PageRecencyPrograms::new(
-                        JournalRankInput::StoredDay,
                         |day| {
                             crate::query::page_recency_secs_for(
                                 day.parse::<i64>().ok(),
@@ -14180,7 +14169,6 @@ impl Graph {
                         SnapshotQueryInputs {
                             registry: &registry,
                             identity: &identity,
-                            order: BackendOrder::Direct,
                             recency: &recency,
                             page_recency: &page_recency,
                             today,

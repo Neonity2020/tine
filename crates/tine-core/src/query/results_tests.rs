@@ -29,11 +29,11 @@ use crate::date::JournalDate;
 use crate::model::{block_dto_estimated_bytes, BlockDto, PageKind};
 use crate::query::ir::{Anchor, Bounds, ExecutionContext, Field, SortDir};
 use crate::query::ir::{Query, ViewSettings};
-use crate::query::rank::{JournalRankInput, PageRecencyPrograms, QueryRankPrograms};
+use crate::query::rank::{PageRecencyPrograms, QueryRankPrograms};
 use crate::query::results::{
     read_page_results, read_results, reset_result_read_census, result_read_census,
-    set_before_page_payload_batch_hook, set_before_payload_batch_hook, BackendOrder,
-    PageReadInputs, RecencyPage, ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
+    set_before_page_payload_batch_hook, set_before_payload_batch_hook, PageReadInputs, RecencyPage,
+    ResultIdentity, ResultReadError, ResultReadInputs, PAYLOAD_BATCH,
 };
 use crate::query::sql::sql_gates_tests::{
     scratch, serialize, write_fast_corpus, Corpus, CONTENT_PLAN_SHAPES, IDENTITY_SHAPES,
@@ -133,7 +133,6 @@ fn recency_for(root: &Path) -> impl Fn(RecencyPage<'_>) -> i64 + '_ {
 fn page_recency_for(root: &Path) -> PageRecencyPrograms {
     let file_root = root.to_path_buf();
     PageRecencyPrograms::new(
-        JournalRankInput::StoredDay,
         |day| page_recency_secs_for(day.parse::<i64>().ok(), Path::new("")),
         move |path| page_recency_secs_for(None, &file_root.join(path)),
     )
@@ -158,7 +157,6 @@ fn database_page_answer(
         &mut snapshot,
         &PageReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             view,
             max_rows,
             max_bytes,
@@ -238,7 +236,6 @@ fn read_answer(
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             identity,
             max_rows,
             max_bytes,
@@ -425,7 +422,6 @@ fn operation_snapshot_driver_reuses_readers_without_retaining_answers() {
         SnapshotQueryInputs {
             registry: &registry,
             identity: &identity,
-            order: BackendOrder::Direct,
             recency: &recency,
             page_recency: &page_recency,
             today: corpus.today(),
@@ -727,7 +723,6 @@ fn q4_unsorted_sample_uses_complete_base_order() {
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             identity: &ResultIdentity::session_owned(),
             max_rows: 2,
             max_bytes: usize::MAX,
@@ -982,32 +977,29 @@ fn q4_statistics_read_census_keeps_rejected_payload_unread() {
     assert_eq!(result_read_census().payload_block_rows, 1);
     assert_eq!(result_read_census().statistics_rows, 3);
     assert_eq!(result_read_census().statistics_values, 6);
-    for order in [BackendOrder::Direct] {
-        let mut snapshot = corpus.snapshot();
-        reset_result_read_census();
-        let result = q4_snapshot_order(
-            &corpus,
-            &mut snapshot,
-            Bounds {
-                max_rows: 1,
-                max_bytes: usize::MAX,
-            },
-            order,
-        )
-        .unwrap();
-        assert_eq!(wire(&result)["statistics"], answer["statistics"]);
-        let census = result_read_census();
-        assert_eq!(
-            (
-                census.statistics_rows,
-                census.statistics_values,
-                census.payload_block_rows,
-                census.payload_statements
-            ),
-            (3, 6, 1, 3)
-        );
-        assert_eq!(census.page_payload_statements, 0);
-    }
+    let mut snapshot = corpus.snapshot();
+    reset_result_read_census();
+    let result = q4_snapshot_run(
+        &corpus,
+        &mut snapshot,
+        Bounds {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        },
+    )
+    .unwrap();
+    assert_eq!(wire(&result)["statistics"], answer["statistics"]);
+    let census = result_read_census();
+    assert_eq!(
+        (
+            census.statistics_rows,
+            census.statistics_values,
+            census.payload_block_rows,
+            census.payload_statements
+        ),
+        (3, 6, 1, 3)
+    );
+    assert_eq!(census.page_payload_statements, 0);
 }
 
 #[test]
@@ -1033,23 +1025,13 @@ fn q4_snapshot_run(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     bounds: Bounds,
 ) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
-    q4_snapshot_order(corpus, snapshot, bounds, BackendOrder::Direct)
-}
-
-fn q4_snapshot_order(
-    corpus: &Corpus,
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
-    bounds: Bounds,
-    order: BackendOrder,
-) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
-    q4_snapshot_query(corpus, snapshot, bounds, order, "@block")
+    q4_snapshot_query(corpus, snapshot, bounds, "@block")
 }
 
 fn q4_snapshot_query(
     corpus: &Corpus,
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     bounds: Bounds,
-    order: BackendOrder,
     source: &str,
 ) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
     use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
@@ -1062,7 +1044,6 @@ fn q4_snapshot_query(
         SnapshotQueryInputs {
             registry: &registry,
             identity: &identity,
-            order,
             recency: &recency,
             page_recency: &page_recency,
             today: corpus.today(),
@@ -1241,7 +1222,6 @@ fn q4_commit_between_rows_and_statistics_uses_one_snapshot() {
         &corpus,
         &mut snapshot,
         Bounds::unbounded(),
-        BackendOrder::Direct,
         "@block and task = 'TODO'",
     );
     set_before_payload_batch_hook(None);
@@ -1261,7 +1241,6 @@ fn q4_commit_between_rows_and_statistics_uses_one_snapshot() {
             &corpus,
             &mut next,
             Bounds::unbounded(),
-            BackendOrder::Direct,
             "@block and task = 'TODO'",
         )
         .unwrap(),
@@ -1559,7 +1538,6 @@ fn direct_page_recency_uses_file_mtime_for_undated_journals_and_ordinary_pages()
         &mut snapshot,
         &PageReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             view: &view,
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -1692,7 +1670,6 @@ fn cancelling_page_selection_or_a_later_payload_batch_returns_no_partial_answer(
     });
     let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let recency = PageRecencyPrograms::new(
-        JournalRankInput::StoredDay,
         |_| 0,
         move |_| {
             if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -1711,7 +1688,6 @@ fn cancelling_page_selection_or_a_later_payload_batch_returns_no_partial_answer(
         &mut selecting,
         &PageReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             view: &view,
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -1738,7 +1714,6 @@ fn cancelling_page_selection_or_a_later_payload_batch_returns_no_partial_answer(
         &mut between,
         &PageReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             view: &ViewSettings::default(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -1941,7 +1916,6 @@ fn read_damaged(
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             identity: &ResultIdentity::session_owned(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -1985,7 +1959,6 @@ fn read_damaged_page(
         &mut snapshot,
         &PageReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             view: &ViewSettings::default(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -2225,7 +2198,6 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
             &mut snapshot,
             &ResultReadInputs {
                 statement: &statement,
-                order: BackendOrder::Direct,
                 identity,
                 max_rows: usize::MAX,
                 max_bytes: usize::MAX,
@@ -2367,7 +2339,6 @@ fn an_impossible_stored_estimate_fails_the_read() {
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             identity: &ResultIdentity {
                 session_pages: Arc::new(HashSet::new()),
                 all_session: false,
@@ -2429,7 +2400,6 @@ fn cancelling_between_batches_stops_the_read_and_releases_the_snapshot() {
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             identity: &ResultIdentity::session_owned(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -2477,7 +2447,6 @@ fn a_cancelled_job_reads_nothing() {
         &mut snapshot,
         &ResultReadInputs {
             statement: &statement,
-            order: BackendOrder::Direct,
             identity: &ResultIdentity::session_owned(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
@@ -2501,7 +2470,7 @@ fn the_descriptor_statement_wraps_every_lowered_shape() {
     let mut snapshot = corpus.snapshot();
     for (source, dialect) in every_shape() {
         let (_query, statement) = corpus.lower_block_anchored(source, dialect);
-        let descriptor = descriptor_view_statement(&statement, BackendOrder::Direct, None)
+        let descriptor = descriptor_view_statement(&statement, None)
             .map(|ranked| ranked.query)
             .unwrap_or_else(|error| panic!("{source}: {error}"));
         assert_eq!(
@@ -2543,7 +2512,7 @@ fn a_page_anchored_statement_has_no_block_descriptor() {
         corpus.lower("@page and name like 'proj/%'", QueryDialect::Tql, false);
     assert_eq!(anchor, crate::query::ir::Anchor::Page);
     assert!(
-        descriptor_view_statement(&statement, BackendOrder::Direct, None).is_err(),
+        descriptor_view_statement(&statement, None).is_err(),
         "a page-anchored statement has no block descriptor read"
     );
 }

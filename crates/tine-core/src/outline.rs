@@ -569,7 +569,29 @@ mod tests {
                 .any(|pair| pair[0].line.start >= pair[1].line.start)
     }
 
-    fn assert_differential(label: &str, input: &str, format: OutlineFormat) {
+    /// Markdown inputs whose format-preserving canonical save reshapes the
+    /// outline. Direct Files has no Markdown read-only gate: that refusal was
+    /// Managed Storage's import admission, removed with it (ADR 0066). So each
+    /// entry is a page that an edit elsewhere restructures on save. A new entry
+    /// is a serializer regression and a vanished one is a fix; update the list
+    /// deliberately either way.
+    const MARKDOWN_SAVE_RESHAPES: &[&str] = &[];
+    /// Generated layouts: the three indented lone-CR variants reshape on
+    /// canonical save, the shape minimized in
+    /// `lone_cr_fence_reclassification_reshapes_the_outline_on_canonical_save`.
+    /// No file of the anonymized real graph changes structure on save.
+    const GENERATED_MARKDOWN_SAVE_RESHAPES: &[&str] = &[
+        "generated-md-\"    \"-cr",
+        "generated-md-\"  \"-cr",
+        "generated-md-\"\\t\"-cr",
+    ];
+
+    /// Runs the parser differential for one input and reports whether the
+    /// format-preserving canonical save would reshape a Markdown outline. An
+    /// Org mismatch must be refused by the production read-only gate
+    /// (`org::org_editable`); Markdown has no such gate, so the caller pins
+    /// the exact set instead of excusing it with a predicate nothing consults.
+    fn assert_differential(label: &str, input: &str, format: OutlineFormat) -> bool {
         let direct = lsdoc::parse_outline(input, format.lsdoc_name())
             .unwrap_or_else(|error| panic!("{label}: lsdoc ownership failure: {error}"));
         let parsed = match parse_document(input, format) {
@@ -580,7 +602,7 @@ mod tests {
                     "{label}: unexpected adapter refusal {error}; events={:?}",
                     direct.headers
                 );
-                return;
+                return false;
             }
         };
         assert!(
@@ -630,16 +652,28 @@ mod tests {
         };
         let reparsed = parse_document(&canonical, format)
             .unwrap_or_else(|error| panic!("{label}: canonical output refused: {error}"));
-        if reparsed.document != parsed.document {
-            let safely_refused = match format {
-                OutlineFormat::Markdown => !doc::markdown_structurally_round_trips(input),
-                OutlineFormat::Org => !crate::org::org_editable(input),
-            };
-            assert!(
-                safely_refused,
-                "{label}: semantic canonicalization mismatch was not refused"
-            );
+        if reparsed.document == parsed.document {
+            return false;
         }
+        match format {
+            OutlineFormat::Markdown => true,
+            OutlineFormat::Org => {
+                assert!(
+                    !crate::org::org_editable(input),
+                    "{label}: Org canonicalization mismatch was not refused by the read-only gate"
+                );
+                false
+            }
+        }
+    }
+
+    fn assert_pinned_reshapes(mut reshaped: Vec<String>, pinned: &[&str]) {
+        reshaped.sort();
+        assert_eq!(
+            reshaped, pinned,
+            "the set of Markdown inputs whose canonical save reshapes the outline changed; \
+             a new entry is a serializer regression (Direct Files saves it), a missing one is a fix"
+        );
     }
 
     #[test]
@@ -673,6 +707,7 @@ mod tests {
         assert!(corpus.provenance.selection.contains("tracked public cases"));
         assert_eq!(corpus.cases.len(), 1_895);
 
+        let mut reshaped = Vec::new();
         for case in corpus.cases {
             assert!(
                 corpus.provenance.sources.contains(&case.source),
@@ -684,8 +719,12 @@ mod tests {
             } else {
                 OutlineFormat::Markdown
             };
-            assert_differential(&format!("{}:{}", case.source, case.id), &case.input, format);
+            let label = format!("{}:{}", case.source, case.id);
+            if assert_differential(&label, &case.input, format) {
+                reshaped.push(label);
+            }
         }
+        assert_pinned_reshapes(reshaped, MARKDOWN_SAVE_RESHAPES);
     }
 
     #[test]
@@ -717,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_layout_mutations_preserve_topology_or_refuse_safely() {
+    fn generated_layout_mutations_preserve_topology_or_are_pinned() {
         let markdown = concat!(
             "title:: café Ω\n",
             "\n",
@@ -749,21 +788,26 @@ mod tests {
             "#+BEGIN_NOTE\n",
             "* parser decides this\n",
         );
+        let mut reshaped = Vec::new();
         for indent in ["\t", "  ", "    "] {
             let markdown = markdown.replace("{i}", indent);
             for (ending_name, ending) in [("lf", "\n"), ("crlf", "\r\n"), ("cr", "\r")] {
-                assert_differential(
-                    &format!("generated-md-{indent:?}-{ending_name}"),
+                let label = format!("generated-md-{indent:?}-{ending_name}");
+                if assert_differential(
+                    &label,
                     &with_line_endings(&markdown, ending),
                     OutlineFormat::Markdown,
-                );
-                assert_differential(
+                ) {
+                    reshaped.push(label);
+                }
+                assert!(!assert_differential(
                     &format!("generated-org-{indent:?}-{ending_name}"),
                     &with_line_endings(org, ending),
                     OutlineFormat::Org,
-                );
+                ));
             }
         }
+        assert_pinned_reshapes(reshaped, GENERATED_MARKDOWN_SAVE_RESHAPES);
     }
 
     #[test]
@@ -783,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn lone_cr_fence_reclassification_is_a_minimized_safe_refusal() {
+    fn lone_cr_fence_reclassification_reshapes_the_outline_on_canonical_save() {
         let input = "- root\r  ```\r  - fake\r  ```";
         let parsed = parse_document(input, OutlineFormat::Markdown)
             .expect("source events are representable");

@@ -249,7 +249,7 @@ export interface VcsMarkerConflict {
 /** Native, binding-scoped admission envelope stamped into plans and fences
  * so an async continuation can prove it still targets the binding it was
  * planned against (I-20). Direct Files is the only authority. */
-export type ApplicationPageAdmission = { binding_generation: number; authority: "direct" };
+export type ApplicationPageAdmission = { binding_generation: number };
 
 export type StorageTransitionKind = "lookup" | "open_direct";
 

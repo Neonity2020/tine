@@ -18,27 +18,19 @@ pub(crate) struct QueryRankPrograms {
     bindings: Vec<Arc<RankProgram>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JournalRankInput {
-    StoredDay,
-}
-
 /// The two existing recency producers captured into owned statement inputs.
 #[derive(Clone)]
 pub(crate) struct PageRecencyPrograms {
-    journal_input: JournalRankInput,
     journal: Arc<dyn Fn(&str) -> i64 + Send + Sync + 'static>,
     file: Arc<dyn Fn(&str) -> i64 + Send + Sync + 'static>,
 }
 
 impl PageRecencyPrograms {
     pub(crate) fn new(
-        journal_input: JournalRankInput,
         journal: impl Fn(&str) -> i64 + Send + Sync + 'static,
         file: impl Fn(&str) -> i64 + Send + Sync + 'static,
     ) -> Self {
         Self {
-            journal_input,
             journal: Arc::new(journal),
             file: Arc::new(file),
         }
@@ -58,7 +50,6 @@ impl PageRecencyPrograms {
             Ok(Some(ordered_i64(file(text))))
         });
         BoundPageRecency {
-            journal_input: self.journal_input,
             journal_id,
             file_id,
         }
@@ -67,7 +58,6 @@ impl PageRecencyPrograms {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoundPageRecency {
-    pub(crate) journal_input: JournalRankInput,
     pub(crate) journal_id: u64,
     pub(crate) file_id: u64,
 }

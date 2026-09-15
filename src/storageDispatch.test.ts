@@ -27,7 +27,7 @@ import {
 import { setToasts, toasts } from "./ui";
 import type { ApplicationPageAdmission } from "./types";
 
-const DIRECT: ApplicationPageAdmission = { binding_generation: 11, authority: "direct" };
+const DIRECT: ApplicationPageAdmission = { binding_generation: 11 };
 
 function bind(admission: ApplicationPageAdmission | null): void {
   graphBindingRuntime.clear();

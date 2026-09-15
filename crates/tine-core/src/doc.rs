@@ -1311,8 +1311,9 @@ pub fn markdown_round_trips(content: &str) -> bool {
 /// document model, even when insignificant source trivia is canonicalized.
 ///
 /// Harmless whitespace normalization passes; a change to block content or
-/// ancestry does not. The outline differential and serializer tests use it as
-/// their refusal oracle.
+/// ancestry does not. Serializer tests use it as their round-trip oracle. It is
+/// test-only because Direct Files has no Markdown read-only gate; the outline
+/// differential pins the inputs whose canonical save reshapes the outline.
 #[cfg(test)]
 pub(crate) fn markdown_structurally_round_trips(content: &str) -> bool {
     let Ok(parsed) = try_parse_with_source_spans(content) else {

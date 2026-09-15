@@ -168,7 +168,7 @@ async function countStoreMutations<T>(run: () => T | Promise<T>) {
 beforeEach(() => {
   // Legacy clipboard fixtures exercise Direct Files behavior explicitly. A
   // missing route record is now intentionally fail-closed during transitions.
-  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1 });
   vi.spyOn(backend(), "writeRich").mockResolvedValue();
   vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "saved-rev" });
   vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map(() => null));

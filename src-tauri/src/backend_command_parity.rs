@@ -825,7 +825,7 @@ mod tests {
             ),
             ("graph_verification", &["graph_verification.rs"]),
             ("graph", &["graph.rs", "watcher.rs"]),
-            ("storage_transition", &["storage_mode_supervisor.rs"]),
+            ("storage_transition", &["storage_transition_supervisor.rs"]),
             ("settings", &["settings.rs"]),
             ("diagnostic", &["debug.rs"]),
             ("backup", &["backup.rs"]),

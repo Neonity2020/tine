@@ -8,7 +8,7 @@ import "../../../src/styles/inter.css";
 import "@fontsource-variable/noto-emoji/wght.css";
 
 await initParser();
-graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+graphBindingRuntime.bind(1, { binding_generation: 1 });
 const params = new URLSearchParams(location.search);
 const sentence = "This is a long multiline block containing several ordinary words that wrap naturally over many lines. ";
 const shape = params.get("shape");

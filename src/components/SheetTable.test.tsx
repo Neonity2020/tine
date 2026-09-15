@@ -32,7 +32,6 @@ beforeAll(async () => {
 beforeEach(() => {
   graphBindingRuntime.bind(++bindingCounter, {
     binding_generation: bindingCounter,
-    authority: "direct",
   });
   __setBackendForTest(null);
 });

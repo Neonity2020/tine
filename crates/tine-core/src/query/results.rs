@@ -70,13 +70,6 @@ pub(crate) const PAYLOAD_BATCH: usize = 128;
 /// the page's own facets share these two tables under owner type 0.
 const OWNER_BLOCK: i64 = 1;
 
-/// The backend construction order, also the final tie within equal display
-/// page keys: `query_page_order`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BackendOrder {
-    Direct,
-}
-
 /// Where an admitted row's PUBLIC id comes from (WARM-IDENTITY-ORDER-CONTRACT).
 ///
 /// Physical selection ids and public result ids are separate. This policy is
@@ -179,7 +172,6 @@ pub(crate) struct LocatedPreViewGroups {
 pub(crate) struct ResultReadInputs<'a> {
     /// The compiler's statement, unchanged (`lower_query`).
     pub(crate) statement: &'a SqlQuery,
-    pub(crate) order: BackendOrder,
     pub(crate) identity: &'a ResultIdentity,
     pub(crate) max_rows: usize,
     pub(crate) max_bytes: usize,
@@ -400,7 +392,6 @@ pub(crate) struct PageAnswer {
 
 pub(crate) struct PageReadInputs<'a> {
     pub(crate) statement: &'a SqlQuery,
-    pub(crate) order: BackendOrder,
     pub(crate) view: &'a crate::query::ir::ViewSettings,
     pub(crate) max_rows: usize,
     pub(crate) max_bytes: usize,
@@ -424,7 +415,6 @@ pub(crate) fn read_page_results(
     let mut statistics = super::statistics::StatisticsFold::new(inputs.view, inputs.max_bytes)?;
     let statement = page_statement(
         inputs.statement,
-        inputs.order,
         inputs.view,
         if statistics.is_some() {
             usize::MAX
@@ -458,7 +448,7 @@ pub(crate) fn read_page_results(
             } else {
                 row
             };
-            let decoded = match decode_page_row(descriptor, inputs.order) {
+            let decoded = match decode_page_row(descriptor) {
                 Ok(decoded) => decoded,
                 Err(what) => {
                     damage = Some(what);
@@ -568,10 +558,7 @@ mod page_column {
 /// One page row: validate its identity, its kind and its order key. A row that
 /// does not decode is damage and fails the read; it is never a page silently
 /// missing from the answer (D-3).
-fn decode_page_row(
-    row: &[PhysicalQueryValue],
-    order: BackendOrder,
-) -> Result<PageResultDescriptor, String> {
+fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, String> {
     use page_column as column;
     if row.len() != column::COLUMNS {
         return Err(format!(
@@ -590,7 +577,7 @@ fn decode_page_row(
     let path = text(row, column::PATH, "pages.path")?;
     let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
     // Direct Files' page order IS this column (see `decode_descriptor`).
-    if order == BackendOrder::Direct && position.is_none() {
+    if position.is_none() {
         return Err("query_page_order has no position for a matched page".to_string());
     }
     Ok(PageResultDescriptor {
@@ -926,7 +913,7 @@ fn read_descriptors<C: ResultCarrier>(
     if snapshot.cancellation().is_cancelled() {
         return Err(ResultReadError::Cancelled);
     }
-    let statement = super::sql::descriptor_view_statement(inputs.statement, inputs.order, ordered)
+    let statement = super::sql::descriptor_view_statement(inputs.statement, ordered)
         .map_err(ResultReadError::Sql)?;
     snapshot
         .set_query_rank_function(statement.ranks.function(snapshot.cancellation()))
@@ -1097,7 +1084,7 @@ fn decode_descriptor(
     // Direct Files' cross-page order IS this column; a NULL would silently
     // sort a page to one end of the answer, which changes which rows survive a
     // truncated budget.
-    if inputs.order == BackendOrder::Direct && position.is_none() {
+    if position.is_none() {
         return Err("query_page_order has no position for a result page".to_string());
     }
     let (result_id, estimated_bytes) = resolve_identity(

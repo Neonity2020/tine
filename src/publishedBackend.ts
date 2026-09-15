@@ -278,7 +278,7 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
       return {
         kind: "loaded",
         binding_generation: 1,
-        application_page_admission: { binding_generation: 1, authority: "direct" },
+        application_page_admission: { binding_generation: 1 },
         meta: {
           root: snapshot.name,
           journals_dir: "journals",
