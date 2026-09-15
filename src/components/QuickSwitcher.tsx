@@ -17,7 +17,6 @@ import type { QueryPageScope } from "../types";
 import { blockDtoExternalId } from "../blockIdentity";
 import { createLongPress } from "../render/longPress";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
-import { managedStorageRuntime } from "../managedStorageRuntime";
 import { graphBinding } from "../persistence";
 import { captureGraphScope, landAsyncOrToast } from "../landAsync";
 
@@ -539,11 +538,6 @@ export function QuickSwitcher(): JSX.Element {
             }}
           />
           <div id="switcher-results" class="switcher-results" role="listbox" ref={resultsRef}>
-            <Show when={query().trim() && managedStorageRuntime.snapshot().status?.runtime?.search_index_building}>
-              <div class="switcher-empty" data-search-index-building>
-                Search index building… Results remain complete but may be slower for a moment.
-              </div>
-            </Show>
             <For each={sections()}>
               {(section, sIdx) => (
                 <div class="switcher-section" role="group" aria-labelledby={`switcher-group-${sIdx()}`}>

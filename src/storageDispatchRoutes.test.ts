@@ -6,21 +6,15 @@
 //
 //   - instrumentation gate: each semantic operation records a dispatch, with
 //     the intent it stated, on the route its admission selects;
-//   - capability gate: under a managed binding a cross-page move never reaches
-//     the Direct persistence entry points (`backend().savePage`, dirty marks);
-//   - staleness gate (I-20): a binding that changes between the intent's
-//     capture and its async landing makes the operation refuse — it does NOT
-//     fall back to the other backend.
-//
-// B1 is behaviour-preserving, so nothing here asserts a NEW outcome: every
-// expectation is the behaviour master already had, now pinned to the front door.
+//   - capability gate: with no admission published a cross-page move never
+//     reaches the Direct persistence entry points (`backend().savePage`, dirty
+//     marks).
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { initParser } from "./render/parse";
 import { backend } from "./backend";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { graphBindingRuntime } from "./graphBindingRuntime";
 import {
-  dispatchBulkInsertion,
   lastStorageDispatch,
   resetStorageDispatchCounters,
   storageDispatchCounters,
@@ -28,15 +22,12 @@ import {
 import {
   __setStoreMutationObserverForTest,
   captureToPage,
-  consumeManagedBulkInsertionAdmission,
   loadFeed,
-  managedBulkOutlinePlan,
   moveBlock,
   moveBlockFeed,
   moveBlocksRelative,
   moveSelectionItems,
   pageByName,
-  preflightManagedBulkInsertion,
   resetStore,
   selectBlock,
   settleDirectMovesForTest,
@@ -47,8 +38,6 @@ import { journalTitle } from "./journal";
 import { clearConflict, setToasts, toasts } from "./ui";
 import { resetPaneLayoutToSingle } from "./panes";
 import type { BlockDto, PageDto } from "./types";
-
-const GENERATION = 7;
 
 function page(
   name: string,
@@ -64,41 +53,19 @@ function block(id: string, raw: string): BlockDto {
   return { id, raw, collapsed: false, children: [] };
 }
 
-function managedWritable(generation = GENERATION): void {
-  managedStorageRuntime.clear();
-  managedStorageRuntime.bind(generation);
-  managedStorageRuntime.receiveStatus({
-    state: "active",
-    runtime: null,
-    can_activate: false,
-    can_retry: false,
-    can_cancel: false,
-    cancel_reason: null,
-    binding_generation: generation,
-    application_page_admission: {
-      binding_generation: generation,
-      authority: "managed_writable",
-      application_save_page_blocks: 511,
-      application_page_request_text_bytes: 1_048_576,
-      application_page_max_depth: 128,
-    },
-  } as any);
-}
-
-function managedUnavailable(): void {
-  managedStorageRuntime.clear();
-  managedStorageRuntime.bind(GENERATION, {
-    binding_generation: GENERATION,
-    authority: "managed_unavailable",
-  });
-}
-
 function direct(): void {
-  managedStorageRuntime.clear();
-  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.clear();
+  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
 }
 
-/** Every Direct persistence entry point a managed binding must not reach. */
+/** No admission published: the graph is still opening or switching. */
+function unavailable(): void {
+  graphBindingRuntime.clear();
+}
+
+const UNAVAILABLE_TOAST = "Can't move between pages while the graph is changing.";
+
+/** Every Direct persistence entry point an unadmitted slot must not reach. */
 function watchDirectPersistence() {
   const save = vi.spyOn(backend(), "savePage");
   const counts = { dirtyMarks: 0, publications: 0 };
@@ -111,9 +78,8 @@ function watchDirectPersistence() {
     assertUnreached() {
       expect(
         { saves: save.mock.calls.length, dirtyMarks: counts.dirtyMarks },
-        "I-6: a managed-bound slot reached Direct persistence. Semantic storage "
-        + "operations dispatch through src/storageDispatch.ts, whose managed arm "
-        + "is the native request — see storageDispatch.test.ts.",
+        "I-6: a slot with no admission reached Direct persistence. Semantic storage "
+        + "operations dispatch through src/storageDispatch.ts — see storageDispatch.test.ts.",
       ).toEqual({ saves: 0, dirtyMarks: 0 });
     },
   };
@@ -139,18 +105,6 @@ async function loadTwoDays(): Promise<void> {
   ]);
 }
 
-/** The managed actor, always refusing with a typed no-commit: the route is what
- *  is under test, not the actor's success path. */
-function refusingActor() {
-  return vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(
-    async (_binding: any, request: any) => ({
-      binding_generation: GENERATION,
-      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
-      outcome: { status: "no_commit", episode_id: request.episode_id, reason: "stale_source" },
-    }) as any,
-  );
-}
-
 beforeAll(() => initParser());
 
 beforeEach(() => {
@@ -166,43 +120,27 @@ beforeEach(() => {
 
 afterEach(() => {
   __setStoreMutationObserverForTest(null);
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   setToasts([]);
   vi.restoreAllMocks();
 });
 
 describe("cross-page move dispatch — the four move shapes", () => {
   describe("moveBlock (drag across pages)", () => {
-    it("routes managed, states its intent, and never reaches Direct persistence", async () => {
-      await loadTwoPages();
-      managedWritable();
-      const actor = refusingActor();
-      const persistence = watchDirectPersistence();
-
-      await moveBlock("source", null, 1, "Destination");
-
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
-      expect(lastStorageDispatch("cross-page-move")).toEqual({
-        operation: "cross-page-move",
-        route: "managed",
-        request: { sourcePages: ["Source"], destinationPage: "Destination", roots: ["source"] },
-      });
-      expect(actor).toHaveBeenCalledTimes(1);
-      persistence.assertUnreached();
-      expect(pageByName("Source")!.roots).toEqual(["source"]);
-    });
-
     it("routes unavailable, refuses with the shared toast, and mutates nothing", async () => {
       await loadTwoPages();
-      managedUnavailable();
+      unavailable();
       const persistence = watchDirectPersistence();
 
       await moveBlock("source", null, 1, "Destination");
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
-      expect(toasts().map((toast) => toast.message)).toEqual([
-        "Can't move between pages while managed storage is changing state.",
-      ]);
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 0, unavailable: 1 });
+      expect(lastStorageDispatch("cross-page-move")).toEqual({
+        operation: "cross-page-move",
+        route: "unavailable",
+        request: { sourcePages: ["Source"], destinationPage: "Destination", roots: ["source"] },
+      });
+      expect(toasts().map((toast) => toast.message)).toEqual([UNAVAILABLE_TOAST]);
       persistence.assertUnreached();
       expect(pageByName("Source")!.roots).toEqual(["source"]);
     });
@@ -214,7 +152,7 @@ describe("cross-page move dispatch — the four move shapes", () => {
       await moveBlock("source", null, 1, "Destination");
       await settleDirectMovesForTest();
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 1, unavailable: 0 });
       expect(pageByName("Source")!.roots).toEqual([]);
       expect(pageByName("Destination")!.roots).toEqual(["target", "source"]);
       expect(save).toHaveBeenCalled();
@@ -225,40 +163,25 @@ describe("cross-page move dispatch — the four move shapes", () => {
         page("Source", "pages/source.md", "source-r1", [block("a", "a"), block("b", "b")]),
       ]);
       await moveBlock("b", null, 0, "Source");
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 0, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 0, unavailable: 0 });
     });
   });
 
   describe("moveBlocksRelative (selection dropped next to a target)", () => {
-    it("routes managed and never reaches Direct persistence", async () => {
-      await loadTwoPages();
-      managedWritable();
-      const actor = refusingActor();
-      const persistence = watchDirectPersistence();
-
-      await moveBlocksRelative(["source"], "target", "after");
-
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
-      expect(lastStorageDispatch("cross-page-move")).toEqual({
-        operation: "cross-page-move",
-        route: "managed",
-        request: { sourcePages: ["Source"], destinationPage: "Destination", roots: ["source"] },
-      });
-      expect(actor).toHaveBeenCalledTimes(1);
-      persistence.assertUnreached();
-    });
-
     it("routes unavailable and refuses", async () => {
       await loadTwoPages();
-      managedUnavailable();
+      unavailable();
       const persistence = watchDirectPersistence();
 
       expect(await moveBlocksRelative(["source"], "target", "after")).toBe(false);
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
-      expect(toasts().map((toast) => toast.message)).toEqual([
-        "Can't move between pages while managed storage is changing state.",
-      ]);
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 0, unavailable: 1 });
+      expect(lastStorageDispatch("cross-page-move")).toEqual({
+        operation: "cross-page-move",
+        route: "unavailable",
+        request: { sourcePages: ["Source"], destinationPage: "Destination", roots: ["source"] },
+      });
+      expect(toasts().map((toast) => toast.message)).toEqual([UNAVAILABLE_TOAST]);
       persistence.assertUnreached();
     });
 
@@ -268,7 +191,7 @@ describe("cross-page move dispatch — the four move shapes", () => {
 
       expect(await moveBlocksRelative(["source"], "target", "after")).toBe(true);
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 1, unavailable: 0 });
       expect(pageByName("Destination")!.roots).toEqual(["target", "source"]);
       expect(pageByName("Source")!.roots).toEqual([]);
     });
@@ -278,44 +201,29 @@ describe("cross-page move dispatch — the four move shapes", () => {
         page("Source", "pages/source.md", "source-r1", [block("a", "a"), block("b", "b")]),
       ]);
       expect(await moveBlocksRelative(["a"], "b", "after")).toBe(true);
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 0, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 0, unavailable: 0 });
     });
   });
 
   describe("moveBlockFeed (single block across a journal-day boundary)", () => {
-    it("routes managed and never reaches Direct persistence", async () => {
+    it("routes unavailable and refuses", async () => {
       await loadTwoDays();
-      managedWritable();
-      const actor = refusingActor();
+      unavailable();
       const persistence = watchDirectPersistence();
 
       expect(await moveBlockFeed("newer", 1)).toBe("none");
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 0, unavailable: 1 });
       expect(lastStorageDispatch("cross-page-move")).toEqual({
         operation: "cross-page-move",
-        route: "managed",
+        route: "unavailable",
         request: {
           sourcePages: ["Sep 2nd, 2026"],
           destinationPage: "Sep 1st, 2026",
           roots: ["newer"],
         },
       });
-      expect(actor).toHaveBeenCalledTimes(1);
-      persistence.assertUnreached();
-    });
-
-    it("routes unavailable and refuses", async () => {
-      await loadTwoDays();
-      managedUnavailable();
-      const persistence = watchDirectPersistence();
-
-      expect(await moveBlockFeed("newer", 1)).toBe("none");
-
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
-      expect(toasts().map((toast) => toast.message)).toEqual([
-        "Can't move between pages while managed storage is changing state.",
-      ]);
+      expect(toasts().map((toast) => toast.message)).toEqual([UNAVAILABLE_TOAST]);
       persistence.assertUnreached();
     });
 
@@ -325,47 +233,31 @@ describe("cross-page move dispatch — the four move shapes", () => {
 
       expect(await moveBlockFeed("newer", 1)).toBe("crossed");
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 1, unavailable: 0 });
       expect(pageByName("Sep 1st, 2026")!.roots).toEqual(["newer", "older"]);
     });
   });
 
   describe("moveSelectionItems (whole selection across a journal-day boundary)", () => {
-    it("routes managed and never reaches Direct persistence", async () => {
+    it("routes unavailable and refuses", async () => {
       await loadTwoDays();
       selectBlock("newer");
-      managedWritable();
-      const actor = refusingActor();
+      unavailable();
       const persistence = watchDirectPersistence();
 
       await moveSelectionItems(1);
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 0, unavailable: 1 });
       expect(lastStorageDispatch("cross-page-move")).toEqual({
         operation: "cross-page-move",
-        route: "managed",
+        route: "unavailable",
         request: {
           sourcePages: ["Sep 2nd, 2026"],
           destinationPage: "Sep 1st, 2026",
           roots: ["newer"],
         },
       });
-      expect(actor).toHaveBeenCalledTimes(1);
-      persistence.assertUnreached();
-    });
-
-    it("routes unavailable and refuses", async () => {
-      await loadTwoDays();
-      selectBlock("newer");
-      managedUnavailable();
-      const persistence = watchDirectPersistence();
-
-      await moveSelectionItems(1);
-
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
-      expect(toasts().map((toast) => toast.message)).toEqual([
-        "Can't move between pages while managed storage is changing state.",
-      ]);
+      expect(toasts().map((toast) => toast.message)).toEqual([UNAVAILABLE_TOAST]);
       persistence.assertUnreached();
     });
 
@@ -376,32 +268,9 @@ describe("cross-page move dispatch — the four move shapes", () => {
 
       await moveSelectionItems(1);
 
-      expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+      expect(storageDispatchCounters("cross-page-move")).toEqual({ direct: 1, unavailable: 0 });
       expect(pageByName("Sep 1st, 2026")!.roots).toEqual(["newer", "older"]);
     });
-  });
-});
-
-describe("stale binding across an async managed move (I-20)", () => {
-  it("refuses the landing and does NOT fall back to the Direct backend", async () => {
-    await loadTwoPages();
-    managedWritable();
-    const actor = vi.spyOn(backend(), "moveManagedApplicationSubtrees");
-    const persistence = watchDirectPersistence();
-
-    // The intent is captured synchronously against generation 7; the queued run
-    // executes a microtask later. Rebinding in between is exactly the staleness
-    // the binding_generation check exists for.
-    const pending = moveBlock("source", null, 1, "Destination");
-    managedWritable(GENERATION + 2);
-    await pending;
-
-    expect(actor).not.toHaveBeenCalled();
-    persistence.assertUnreached();
-    expect(pageByName("Source")!.roots).toEqual(["source"]);
-    expect(pageByName("Destination")!.roots).toEqual(["target"]);
-    // The route was still decided once, on the admission live at the time.
-    expect(storageDispatchCounters("cross-page-move")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
   });
 });
 
@@ -416,7 +285,7 @@ describe("bulk insertion dispatch", () => {
 
     expect(await captureToPage("Bulk", "- direct child")).toBe(true);
 
-    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ direct: 1, unavailable: 0 });
     expect(lastStorageDispatch("bulk-insertion")).toEqual({
       operation: "bulk-insertion",
       route: "direct",
@@ -426,31 +295,14 @@ describe("bulk insertion dispatch", () => {
     expect(save).toHaveBeenCalledTimes(1);
   });
 
-  it("routes a real managed capture through the bulk verb", async () => {
-    await loadBulkTarget();
-    managedWritable();
-    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "managed-r2" });
-
-    expect(await captureToPage("Bulk", "- managed child")).toBe(true);
-
-    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
-    expect(lastStorageDispatch("bulk-insertion")).toEqual({
-      operation: "bulk-insertion",
-      route: "managed",
-      request: { targetId: "target", targetPageName: "Bulk" },
-    });
-    expect(pageByName("Bulk")!.roots).toHaveLength(2);
-    expect(save).toHaveBeenCalledTimes(1);
-  });
-
   it("routes an unavailable capture through the bulk verb and refuses without mutation", async () => {
     await loadBulkTarget();
-    managedUnavailable();
+    unavailable();
     const save = vi.spyOn(backend(), "savePage");
 
     expect(await captureToPage("Bulk", "- refused child")).toBe(false);
 
-    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
+    expect(storageDispatchCounters("bulk-insertion")).toEqual({ direct: 0, unavailable: 1 });
     expect(lastStorageDispatch("bulk-insertion")).toEqual({
       operation: "bulk-insertion",
       route: "unavailable",
@@ -460,36 +312,6 @@ describe("bulk insertion dispatch", () => {
     expect(save).not.toHaveBeenCalled();
     expect(toasts()).toHaveLength(1);
   });
-
-  it("refuses a managed token minted at generation g when consumed at g+1 (I-20)", async () => {
-    await loadBulkTarget();
-    managedWritable();
-    const admission = dispatchBulkInsertion(
-      { targetId: "target" },
-      {
-        direct: () => null,
-        unavailable: () => null,
-        managed: (managedAdmission) => preflightManagedBulkInsertion(
-          managedAdmission,
-          "target",
-          (limits) => managedBulkOutlinePlan(
-            [{ raw: "late child", children: [] }],
-            2,
-            0,
-            limits,
-          ),
-        ),
-      },
-    );
-    expect(admission?.kind).toBe("admitted");
-    if (!admission || admission.kind !== "admitted") throw new Error("expected managed admission token");
-
-    managedWritable(GENERATION + 1);
-
-    expect(consumeManagedBulkInsertionAdmission(admission.token, "target")).toBe(false);
-    expect(storageDispatchCounters("bulk-insertion")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
-    expect(pageByName("Bulk")!.roots).toEqual(["target"]);
-  });
 });
 
 describe("dropped-file insertion dispatch", () => {
@@ -497,29 +319,19 @@ describe("dropped-file insertion dispatch", () => {
     await loadFeed([page("Drop", "pages/drop.md", "drop-r1", [block("target", "target")])]);
   }
 
-  it("routes managed", async () => {
+  it("routes unavailable and reports through the bulk-insertion refusal", async () => {
     await loadDropTarget();
-    managedWritable();
-    vi.spyOn(backend(), "importAsset").mockResolvedValue("../assets/a.png" as any);
-
-    await insertDroppedFiles("target", ["/tmp/a.png"]);
-
-    expect(storageDispatchCounters("dropped-file-insertion")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
-    expect(lastStorageDispatch("dropped-file-insertion")).toEqual({
-      operation: "dropped-file-insertion",
-      route: "managed",
-      request: { afterId: "target", paths: ["/tmp/a.png"] },
-    });
-  });
-
-  it("routes unavailable and reports through the bulk-insertion preflight", async () => {
-    await loadDropTarget();
-    managedUnavailable();
+    unavailable();
     const importAsset = vi.spyOn(backend(), "importAsset");
 
     await insertDroppedFiles("target", ["/tmp/a.png"]);
 
-    expect(storageDispatchCounters("dropped-file-insertion")).toEqual({ managed: 0, direct: 0, unavailable: 1 });
+    expect(storageDispatchCounters("dropped-file-insertion")).toEqual({ direct: 0, unavailable: 1 });
+    expect(lastStorageDispatch("dropped-file-insertion")).toEqual({
+      operation: "dropped-file-insertion",
+      route: "unavailable",
+      request: { afterId: "target", paths: ["/tmp/a.png"] },
+    });
     expect(importAsset).not.toHaveBeenCalled();
     expect(toasts().length).toBe(1);
   });
@@ -530,16 +342,14 @@ describe("dropped-file insertion dispatch", () => {
 
     await insertDroppedFiles("target", ["/tmp/a.png"]);
 
-    expect(storageDispatchCounters("dropped-file-insertion")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+    expect(storageDispatchCounters("dropped-file-insertion")).toEqual({ direct: 1, unavailable: 0 });
   });
 });
 
-describe("carry dispatch — B2 gave carry a route", () => {
-  // B1 asserted the opposite of these: carry ran the Direct choreography under a
-  // managed binding and B1 pinned that gap so B2 had to delete the assertion
-  // deliberately. It is deleted here. The refusal is taken at the OPERATION
-  // boundary, before the in-memory carry, so a managed binding is never left
-  // holding a mutation storage did not accept.
+describe("carry dispatch", () => {
+  // The refusal is taken at the OPERATION boundary, before the in-memory
+  // carry, so an unadmitted slot is never left holding a mutation storage did
+  // not accept.
   async function loadCarryDays(): Promise<string> {
     const today = journalTitle(new Date());
     const yesterday = "Aug 31st, 2026";
@@ -552,23 +362,20 @@ describe("carry dispatch — B2 gave carry a route", () => {
     return yesterday;
   }
 
-  it("refuses under a managed binding: no Direct write, and memory is untouched", async () => {
+  it("refuses with no admission: no Direct write, and memory is untouched", async () => {
     const yesterday = await loadCarryDays();
-    managedWritable();
+    unavailable();
     const save = vi.spyOn(backend(), "savePage").mockResolvedValue(null as any);
 
     await carryDay(yesterday);
 
-    expect(storageDispatchCounters("carry")).toEqual({ managed: 1, direct: 0, unavailable: 0 });
+    expect(storageDispatchCounters("carry")).toEqual({ direct: 0, unavailable: 1 });
     expect(lastStorageDispatch("carry")).toEqual({
       operation: "carry",
-      route: "managed",
+      route: "unavailable",
       request: { destinationPage: journalTitle(new Date()), sourcePages: [yesterday] },
     });
-    // I-6: a managed-bound slot must never reach Direct persistence.
     expect(save).not.toHaveBeenCalled();
-    // And the refusal is taken BEFORE `carryUnfinished`, so the editor is not
-    // left holding a move managed storage never accepted.
     expect(pageByName(yesterday)!.roots).toEqual(["task"]);
     expect(pageByName(journalTitle(new Date()))!.roots).not.toContain("task");
   });
@@ -579,7 +386,7 @@ describe("carry dispatch — B2 gave carry a route", () => {
 
     await carryDay(yesterday);
 
-    expect(storageDispatchCounters("carry")).toEqual({ managed: 0, direct: 1, unavailable: 0 });
+    expect(storageDispatchCounters("carry")).toEqual({ direct: 1, unavailable: 0 });
     expect(pageByName(journalTitle(new Date()))!.roots).toContain("task");
     expect(pageByName(yesterday)!.roots).toEqual([]);
   });

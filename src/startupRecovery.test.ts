@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStartupRecoveryController, type StartupRecoveryDeps } from "./startupRecovery";
-import type { SparseV2CancelResult, StorageTransitionEvent } from "./types";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -15,23 +14,6 @@ async function settle() {
   await Promise.resolve();
 }
 
-function fakeCancelResult(): SparseV2CancelResult {
-  return {
-    status: {
-      state: "legacy_default",
-      runtime: null,
-      can_activate: true,
-      can_retry: false,
-      can_cancel: false,
-      cancel_reason: null,
-      binding_generation: 9,
-      application_page_admission: { binding_generation: 9, authority: "direct" },
-    },
-    binding_generation: 9,
-    recovery_statement: "Direct Files is active.",
-  };
-}
-
 function dependencies(overrides: Partial<StartupRecoveryDeps> = {}): StartupRecoveryDeps {
   return {
     lookupGraphPath: vi.fn(async () => "/graphs/alpha"),
@@ -39,23 +21,9 @@ function dependencies(overrides: Partial<StartupRecoveryDeps> = {}): StartupReco
     persistedGraphPath: () => "/graphs/alpha",
     openGraph: vi.fn(async () => ({ kind: "loaded" as const, root: "/graphs/alpha" })),
     pickGraph: vi.fn(async () => ({ kind: "loaded" as const, root: "/graphs/beta" })),
-    coldReturn: vi.fn(async () => fakeCancelResult()),
-    acceptColdReturn: vi.fn(),
     copyText: vi.fn(async () => {}),
     notify: vi.fn(),
     completeFirstLoad: vi.fn(),
-    ...overrides,
-  };
-}
-
-function transition(overrides: Partial<StorageTransitionEvent> = {}): StorageTransitionEvent {
-  return {
-    operationId: 1,
-    window: "main",
-    kind: "open_managed",
-    phase: "opening_managed",
-    elapsedMs: 10,
-    terminal: false,
     ...overrides,
   };
 }
@@ -100,65 +68,6 @@ describe("native-supervised startup recovery", () => {
     controller.dispose();
   });
 
-  it("renders only the newest native operation identity", async () => {
-    const lookup = deferred<string | null>();
-    const controller = createStartupRecoveryController(dependencies({
-      lookupGraphPath: vi.fn(() => lookup.promise),
-    }));
-    controller.start();
-    controller.receiveTransition(transition({ operationId: 4, phase: "opening_managed" }));
-    controller.receiveTransition(transition({ operationId: 3, phase: "looking_up_selection" }));
-    expect(controller.snapshot()).toMatchObject({
-      operationId: 4,
-      transitionKind: "open_managed",
-      phase: "opening_managed",
-    });
-    controller.dispose();
-  });
-
-  it("uses native-selected emergency return without a frontend authority token", async () => {
-    const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
-    const openGraph = vi.fn()
-      .mockImplementationOnce(() => firstOpen.promise)
-      .mockResolvedValueOnce({ kind: "already_current", root: "/graphs/alpha" });
-    const coldReturn = vi.fn(async () => fakeCancelResult());
-    const deps = dependencies({ openGraph, coldReturn });
-    const controller = createStartupRecoveryController(deps);
-    controller.start();
-    await settle();
-
-    await controller.returnToDirectFiles();
-    expect(coldReturn).toHaveBeenCalledWith("/graphs/alpha");
-    expect(openGraph).toHaveBeenNthCalledWith(2, "/graphs/alpha", true);
-    expect(controller.snapshot().mode).toBe("idle");
-
-    firstOpen.resolve({ kind: "already_current", root: "/graphs/alpha" });
-    await settle();
-    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
-    controller.dispose();
-  });
-
-  it("keeps stale managed transition events inert after emergency return", async () => {
-    const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
-    const openGraph = vi.fn()
-      .mockImplementationOnce(() => firstOpen.promise)
-      .mockResolvedValueOnce({ kind: "already_current", root: "/graphs/alpha" });
-    const controller = createStartupRecoveryController(dependencies({ openGraph }));
-    controller.start();
-    await settle();
-    controller.receiveTransition(transition({ operationId: 7 }));
-    await controller.returnToDirectFiles();
-    controller.receiveTransition(transition({
-      operationId: 7,
-      phase: "opening_managed",
-      terminal: true,
-      outcome: "succeeded",
-      elapsedMs: 30_000,
-    }));
-    expect(controller.snapshot().mode).toBe("idle");
-    controller.dispose();
-  });
-
   it("reports an actual command refusal and keeps recovery actions available", async () => {
     vi.useFakeTimers();
     const deps = dependencies({ openGraph: vi.fn(async () => { throw new Error("missing graph"); }) });
@@ -170,23 +79,6 @@ describe("native-supervised startup recovery", () => {
     const terminalElapsed = controller.snapshot().elapsedMs;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(controller.snapshot().elapsedMs).toBe(terminalElapsed);
-    controller.dispose();
-  });
-
-  it("keeps the managed-open cause shareable instead of replacing it with readiness text", async () => {
-    const deps = dependencies({
-      openGraph: vi.fn(async () => {
-        throw new Error(
-          "Managed storage could not serve this workspace: clean managed runtime open failed: SQLite checkpoint is stale",
-        );
-      }),
-    });
-    const controller = createStartupRecoveryController(deps);
-    controller.start();
-    await settle();
-    expect(controller.snapshot().detail).toBe(
-      "Managed storage could not serve this workspace: clean managed runtime open failed: SQLite checkpoint is stale",
-    );
     controller.dispose();
   });
 });

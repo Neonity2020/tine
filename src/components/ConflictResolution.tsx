@@ -48,7 +48,7 @@ import {
   dropObservation,
   graphBinding,
   flushPageToQuiescence,
-  holdManagedMovePages,
+  holdPageSaves,
   isDirty,
   isSaving,
   reobserve,
@@ -442,7 +442,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject; unavai
           return;
         }
         const draftToResolve = detached || live.restored ? live.page : reviewedDraft!;
-        releasePageSaves = holdManagedMovePages([pageName]);
+        releasePageSaves = holdPageSaves([pageName]);
         const authority = capsuleAuthority();
         if (!authority) {
           void refetch();
@@ -524,7 +524,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject; unavai
           pushToast("Your latest edit was saved. Review the updated comparison, then apply it again.", "info");
           return;
         }
-        releasePageSaves = holdManagedMovePages([pageName]);
+        releasePageSaves = holdPageSaves([pageName]);
         // A duplicate journal day reaches the same two-file reconciliation
         // through its own guarded command: the guard is what keeps it from
         // being a merge-any-two-pages surface. Everything around it — the

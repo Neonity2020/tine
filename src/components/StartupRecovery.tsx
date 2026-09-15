@@ -22,9 +22,6 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
     || (current().mode === "working" && current().elapsedMs >= STARTUP_PROGRESS_VISIBLE_MS);
   const phase = () => current().phase;
   const targetName = () => current().target ? startupGraphName(current().target) : null;
-  const canReturnToDirectFiles = () => Boolean(current().target)
-    && (current().mode === "recovery"
-      || (current().mode === "working" && current().operation === "graph_open"));
   const canOpenAnother = () => current().mode !== "idle";
 
   return (
@@ -58,11 +55,11 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
           <Show when={current().mode === "recovery"}>
             <p class="startup-recovery-detail">{current().detail}</p>
             <p class="startup-recovery-safety">
-              Tine has not discarded managed-storage data. You can retry, choose another graph,
-              or close and relaunch Tine before attempting manual recovery.
+              Tine has not changed anything in this workspace. You can retry, choose another
+              graph, or close and relaunch Tine.
             </p>
           </Show>
-          <Show when={canOpenAnother() || canReturnToDirectFiles()}>
+          <Show when={canOpenAnother()}>
             <div class="startup-recovery-actions">
               <Show when={current().mode === "recovery"}>
                 <button type="button" class="settings-btn primary" onClick={() => props.controller.retry()}>
@@ -72,11 +69,6 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
               <Show when={canOpenAnother()}>
                 <button type="button" class="settings-btn" onClick={() => void props.controller.openAnother()}>
                   Open another graph…
-                </button>
-              </Show>
-              <Show when={canReturnToDirectFiles()}>
-                <button type="button" class="settings-btn danger" onClick={() => void props.controller.returnToDirectFiles()}>
-                  Forget managed mode and open {targetName()} in Direct Files now
                 </button>
               </Show>
               <Show when={current().mode === "recovery"}>

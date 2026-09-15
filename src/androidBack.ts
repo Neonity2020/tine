@@ -136,7 +136,7 @@ export interface AndroidRootCloseCoordinator {
   phase(): AndroidRootClosePhase;
 }
 
-/** Android's managed root-close path has two native operations with distinct
+/** Android's root-close path has two native operations with distinct
  * retry semantics. A typed zero-progress refusal may re-arm the editor;
  * partial/unknown native progress can only retry native preparation. */
 export async function requestAndroidRootClose(
@@ -152,8 +152,8 @@ export async function requestAndroidRootClose(
   }
   if (state.phase === AndroidRootClosePhase.NativePartiallyPrepared) {
     state.phase = AndroidRootClosePhase.PreparingNative;
-    // A previous Partial or transport failure may already have stopped one
-    // managed slot. Even a later typed refusal cannot unmake that progress.
+    // A previous Partial or transport failure may already have made native
+    // progress. Even a later typed refusal cannot unmake that progress.
     return requestAndroidNativePreparation(
       safeClose,
       state,
@@ -237,7 +237,7 @@ async function requestAndroidNativePreparation(
     return requestAndroidActivityExit(finishActivity, finishActivityFailed);
   }
   if (preparation.status === "refused" && !mayAlreadyHaveNativeProgress) {
-    // A typed zero-progress refusal proves that no managed slot crossed the
+    // A typed zero-progress refusal proves that nothing crossed the
     // native-safe boundary. It is therefore safe to reopen the editor and let
     // the next Back perform the complete frontend + native transaction.
     safeClose.reset();

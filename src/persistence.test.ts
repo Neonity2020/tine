@@ -3,7 +3,6 @@ import {
   __setBackendForTest,
   classifyNativeCallError,
   DirectSaveFailureError,
-  ManagedActorRefusalError,
   type Backend,
   SaveConflictError,
 } from "./backend";
@@ -11,13 +10,11 @@ import {
   dirtyPages,
   flushAll,
   flushPage,
-  holdManagedMovePages,
+  holdPageSaves,
   isSaveConflictFailure,
   isRetryableSaveFailure,
   markDirty,
-  requireManagedRuntimeReopen,
   resetSaveState,
-  saveFailureDisposition,
   scheduleLiveSaveConflictDraftRefresh,
   trackAssetWrite,
 } from "./persistence";
@@ -141,10 +138,10 @@ describe("asset write close barrier", () => {
   });
 });
 
-describe("managed move persistence barrier", () => {
-  it("refuses close and defers an ordinary page save until actor ownership releases", async () => {
+describe("page save hold", () => {
+  it("refuses close and defers an ordinary page save until the hold releases", async () => {
     resetSaveState();
-    const release = holdManagedMovePages(["Held page"]);
+    const release = holdPageSaves(["Held page"]);
     markDirty("Held page");
 
     await expect(flushPage("Held page")).resolves.toBe(false);
@@ -156,14 +153,6 @@ describe("managed move persistence barrier", () => {
     expect([...dirtyPages()]).not.toContain("Held page");
   });
 
-  it("fails closed after unresolved actor recovery until the graph is reopened", async () => {
-    resetSaveState();
-    requireManagedRuntimeReopen();
-    await expect(flushAll()).resolves.toBe(false);
-
-    resetSaveState();
-    await expect(flushAll()).resolves.toBe(true);
-  });
 });
 
 describe("save failure classification", () => {
@@ -181,8 +170,6 @@ describe("save failure classification", () => {
 
   it("recognizes only bounded content-conflict contracts", () => {
     expect(isSaveConflictFailure(new SaveConflictError(17))).toBe(true);
-    expect(isSaveConflictFailure("managed.conflict: stale_base")).toBe(true);
-    expect(isSaveConflictFailure(new ManagedActorRefusalError("managed.conflict"))).toBe(true);
     expect(isSaveConflictFailure(new DirectSaveFailureError("precheck.portable_collision", "AlreadyExists"))).toBe(false);
     expect(isSaveConflictFailure("ordinary prose says conflict or already exists")).toBe(false);
     expect(isSaveConflictFailure("conflict:17")).toBe(false);
@@ -203,20 +190,9 @@ describe("save failure classification", () => {
       "identity.owned_elsewhere",
       // A name collision is real, but no number of retries frees the name.
       "identity.name_taken",
-      // Managed storage refused the save because the page moved underneath it.
-      // This used to arrive as "conflict: {Reason}", which matched neither the
-      // conflict banner (an exact comparison) nor any bounded code, so it
-      // retried silently forever and the user could quit believing the page
-      // had been written.
-      "trusted_local.append_outcome_unknown",
     ]) {
-      expect(isRetryableSaveFailure(
-        code === "trusted_local.append_outcome_unknown"
-          ? new ManagedActorRefusalError(code)
-          : new DirectSaveFailureError(code, "Other"),
-      )).toBe(false);
+      expect(isRetryableSaveFailure(new DirectSaveFailureError(code, "Other"))).toBe(false);
     }
-    expect(isRetryableSaveFailure("managed.conflict: something specific")).toBe(false);
   });
 
   it("still retries failures that a later attempt can succeed at", () => {
@@ -224,7 +200,6 @@ describe("save failure classification", () => {
     // was replaced and the watcher has not re-pinned its identity yet. Both
     // resolve on their own.
     expect(isRetryableSaveFailure(new DirectSaveFailureError("precheck.interrupted", "Interrupted"))).toBe(true);
-    expect(isRetryableSaveFailure(new DirectSaveFailureError("identity.changed_since_load", "AlreadyExists"))).toBe(true);
     expect(
       isRetryableSaveFailure(new DirectSaveFailureError("conflict_retry.replace_pre_retirement", "WouldBlock"))
     ).toBe(true);
@@ -232,23 +207,6 @@ describe("save failure classification", () => {
     expect(isRetryableSaveFailure(new Error("EBUSY"))).toBe(true);
   });
 
-  it("classifies append uncertainty from the actor reason-code envelope before retry policy", () => {
-    expect(
-      saveFailureDisposition("trusted_local.append_outcome_unknown: storage receipt did not escape")
-    ).toBe("ordinary");
-    const actorFailure = new ManagedActorRefusalError("trusted_local.append_outcome_unknown");
-    expect(saveFailureDisposition(actorFailure)).toBe("append_outcome_unknown");
-    expect(isRetryableSaveFailure(actorFailure)).toBe(false);
-    expect(
-      saveFailureDisposition("ordinary failure mentions trusted_local.append_outcome_unknown in prose")
-    ).toBe("ordinary");
-    expect(
-      saveFailureDisposition("ordinary prose (reason code: trusted_local.append_outcome_unknown)")
-    ).toBe("ordinary");
-    expect(
-      isRetryableSaveFailure("ordinary failure mentions trusted_local.append_outcome_unknown in prose")
-    ).toBe(true);
-  });
 });
 
 // Direct Files data-safety audit, 2026-08-09, finding 6.

@@ -91,15 +91,13 @@ describe("frontend twin ownership guards", () => {
     expect(writes.scope).toBe("guard-fixture");
   });
 
-  it("pins the two specialized tails and the PDF tracking non-fit", () => {
+  it("pins the one specialized tail and the PDF tracking non-fit", () => {
     const pluginManager = readFileSync("src/plugins/manager.ts", "utf8");
-    const store = readFileSync("src/store.ts", "utf8");
     const pdfOwnership = readFileSync("src/pdfOwnership.ts", "utf8");
 
-    const rule = "I-12: promise-tail serialization has one owner, src/serializedWrites.ts; the two specialized "
-      + "tails and the PDF mutation set are the pinned exceptions (see the exception comments in each file)";
+    const rule = "I-12: promise-tail serialization has one owner, src/serializedWrites.ts; the plugin "
+      + "persistence tail and the PDF mutation set are the pinned exceptions (see the exception comments in each file)";
     expect(pluginManager, rule).toContain("persistenceChains = new Map<string, Promise<void>>()");
-    expect(store, rule).toContain("let managedMoveQueue: Promise<void> = Promise.resolve()");
     expect(pdfOwnership, rule).toContain("const mutations = new Map<number, Set<Promise<boolean>>>()");
     expect(pdfOwnership, rule).not.toContain("serializedWrites");
   });

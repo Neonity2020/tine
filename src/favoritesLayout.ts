@@ -4,8 +4,8 @@
 // Why a page rather than a JSON/EDN blob: a blob has no merge semantics, so two
 // devices editing favorites is last-writer-wins, which is the documented cause
 // of Obsidian's total bookmark loss across Sync. A page is a block tree, so it
-// merges deterministically through the oplog on Managed Storage and reaches the
-// Concord conflict UI on Direct Files, for free. It also costs no new write
+// reaches the Concord conflict UI on Direct Files for free, and a future sync
+// can merge it like any other page. It also costs no new write
 // path: it saves through the audited `save_page` like any other page.
 //
 // Why `[[links]]` rather than plain text: renames follow them for free. GH #79

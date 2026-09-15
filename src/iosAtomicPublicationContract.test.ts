@@ -3,8 +3,6 @@ import { describe, expect, it } from "vitest";
 
 const sources = [
   "crates/tine-core/src/model.rs",
-  "crates/tine-core/src/oplog/enrollment.rs",
-  "crates/tine-core/src/oplog/projection_store.rs",
 ];
 
 describe("iOS atomic publication platform boundary", () => {

@@ -14,10 +14,6 @@ import type {
   BlockDto,
   EditorActivationHandle,
   Format,
-  ManagedApplicationMovePlacement,
-  ManagedApplicationMoveRoot,
-  ManagedApplicationMoveSubtreesOutcome,
-  ManagedApplicationMoveSubtreesRequest,
   PageDto,
   PageKind,
   RefGroup,
@@ -30,17 +26,11 @@ import {
 } from "./clipboard";
 import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
-import { failureShape } from "./failureShape";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
 import { clearHeldExternalChanges } from "./conflictPolicy";
-import { managedStorageRuntime } from "./managedStorageRuntime";
-import {
-  dispatchBulkInsertion,
-  dispatchCrossPageMove,
-  MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST,
-  type ManagedWritableAdmission,
-} from "./storageDispatch";
+import { graphBindingRuntime } from "./graphBindingRuntime";
+import { dispatchBulkInsertion, dispatchCrossPageMove } from "./storageDispatch";
 import { resetReferenceSectionState } from "./referenceSectionState";
 import {
   isConflicted,
@@ -108,8 +98,6 @@ import {
   isTombstonedFile,
   tombstoneCovers,
   graphBinding,
-  holdManagedMovePages,
-  requireManagedRuntimeReopen,
   saveBaselineFor,
   forgetSaveState,
   resetSaveState,
@@ -318,7 +306,7 @@ const editGenerations = new Map<string, number>();
 // user saw without authorising a new local transaction begun during an await.
 let editorTransactionClock = 0;
 const editorTransactionGenerations = new Map<string, number>();
-const [managedMoveBusyPages, setManagedMoveBusyPages] = createSignal<ReadonlySet<string>>(new Set());
+const [mutationBusyPages, setMutationBusyPages] = createSignal<ReadonlySet<string>>(new Set());
 const [visibleMutationBusyPages, setVisibleMutationBusyPages] = createSignal<ReadonlySet<string>>(new Set());
 // Monotonic per-block count of SOURCE collapse writes (setCollapsed /
 // setCollapsedDeep / setCollapsedDescendants via writeCollapsed). Surfaces
@@ -335,26 +323,6 @@ function bumpCollapseEpochs(ids: readonly string[]) {
     for (const id of ids) epochs[id] = (epochs[id] ?? 0) + 1;
   }));
 }
-let managedMoveQueue: Promise<void> = Promise.resolve();
-let managedMoveQueueEpoch = 0;
-let managedMoveQueuePending = 0;
-const MANAGED_MOVE_QUEUE_LIMIT = 256;
-type ManagedMoveAcknowledgement = {
-  epoch: number;
-  graphBinding: number;
-  bindingGeneration: number;
-  episodeId: string;
-  batchId: string;
-  attempt: number;
-};
-const managedMoveAcknowledgements: ManagedMoveAcknowledgement[] = [];
-let managedMoveAcknowledgementEpoch = 0;
-let managedMoveAcknowledgementRunnerEpoch: number | null = null;
-const MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT = 256;
-const MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS = 3;
-let managedHistoryReplayRunning = false;
-let managedHistoryReplayEpoch = 0;
-const managedHistoryCommands: Array<"undo" | "redo"> = [];
 
 /** Current content-edit generation for a page. */
 export function editGeneration(name: string): number {
@@ -371,12 +339,12 @@ export function editorTransactionGeneration(name: string): number {
 }
 
 export function pageMutationBusy(name: string): boolean {
-  return managedMoveBusyPages().has(name);
+  return mutationBusyPages().has(name);
 }
 
 /** Whether the page should visibly present a destructive/replacement hold.
- * Managed cross-page moves still hold persistence and replacement, but their
- * accepted result is an ordinary outline movement and must not dim the feed. */
+ * Persistence holds alone do not dim the feed; only explicit native mutations
+ * (holdPageMutationUi) do. */
 export function pageMutationVisiblyBusy(name: string): boolean {
   return visibleMutationBusyPages().has(name);
 }
@@ -385,14 +353,14 @@ export function pageMutationVisiblyBusy(name: string): boolean {
  * This is UI ownership only; callers drain then separately hold persistence. */
 export function holdPageMutationUi(pages: readonly string[]): () => void {
   const held = [...new Set(pages)];
-  setManagedMoveBusy(held, true);
+  setMutationBusy(held, true);
   setVisibleMutationBusy(held, true);
   let released = false;
   return () => {
     if (released) return;
     released = true;
     setVisibleMutationBusy(held, false);
-    setManagedMoveBusy(held, false);
+    setMutationBusy(held, false);
     // Releasing explicit ownership is a real replacement-gate transition, just
     // like ending an edit or draining a save. A winner-file watcher event can
     // arrive while Concord owns the page and be deferred by
@@ -404,10 +372,10 @@ export function holdPageMutationUi(pages: readonly string[]): () => void {
   };
 }
 
-function setManagedMoveBusy(pages: readonly string[], busy: boolean): void {
-  const next = new Set(managedMoveBusyPages());
+function setMutationBusy(pages: readonly string[], busy: boolean): void {
+  const next = new Set(mutationBusyPages());
   for (const page of pages) busy ? next.add(page) : next.delete(page);
-  setManagedMoveBusyPages(next);
+  setMutationBusyPages(next);
 }
 
 function setVisibleMutationBusy(pages: readonly string[], busy: boolean): void {
@@ -1150,17 +1118,6 @@ export async function reloadPage(
   return ensurePageLoaded(dto, { ...options, bypassReplacementGate: true });
 }
 
-/** Install the managed actor's current DTO after an explicit discard choice.
- *
- * Managed conflicts have revision authority of their own and deliberately do
- * not mint Direct Files editor activations or observation epochs. Keep this
- * narrow installer separate from the Direct read → activate → present protocol.
- */
-export function installManagedConflictVersion(dto: PageDto): void {
-  upsertPage(dto);
-  evictIfNeeded();
-}
-
 /** Apply a watcher-driven disk reload only if it is STILL safe at this instant.
  *
  *  `reloadDisposition` is correct, but the watcher sites read its verdict and
@@ -1357,27 +1314,19 @@ function evictIfNeeded() {
  *  can be written after a switch. */
 export function resetStore() {
   // Pure node tests historically exercise the synchronous Direct store without
-  // opening a graph. Seed that authority once; managed-boundary tests explicitly
-  // rebind to the authority they exercise after reset.
-  if (import.meta.env.MODE === "test" && managedStorageRuntime.snapshot().bindingGeneration === null) {
-    managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  // opening a graph. Seed the binding once; tests that exercise the binding
+  // boundary rebind explicitly after reset.
+  if (import.meta.env.MODE === "test" && graphBindingRuntime.snapshot().bindingGeneration === null) {
+    graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   }
   // Every identity belongs to the graph being left. The core drops its own
   // registry with the Graph, so clearing locally is sufficient and avoids a
   // storm of per-page retirements against a graph that is going away.
   clearAllEditorActivations();
   clearAllEditorLeases();
-  setManagedMoveBusyPages(new Set<string>());
-  managedMoveQueueEpoch++;
-  managedMoveQueue = Promise.resolve();
-  managedMoveQueuePending = 0;
-  managedMoveAcknowledgementEpoch++;
-  managedMoveAcknowledgements.length = 0;
+  setMutationBusyPages(new Set<string>());
   setVisibleMutationBusyPages(new Set<string>());
   setCollapseEpochState("byId", {});
-  managedHistoryReplayEpoch++;
-  managedHistoryReplayRunning = false;
-  managedHistoryCommands.length = 0;
   clearDeferredExternalReloads();
   clearHeldExternalChanges(); // Concord P5: a held change belongs to its graph
   clearPendingHlsRefreshes();
@@ -1834,8 +1783,7 @@ interface InternalPageMutationPlan<T> extends PageMutationPlan<T> {
   editorTransactionGeneration: number;
   saveBaseline: string | null;
   bindingGeneration: number;
-  authority: "direct" | "managed_writable" | "managed_unavailable" | "missing";
-  pendingKey: string;
+  authority: "direct" | "missing";
   captured: Readonly<Record<string, PageMutationDraftNode>>;
   capturedPage: PageMutationDraftPage;
   uiAuthority?: PageMutationAuthority<T>;
@@ -1843,10 +1791,8 @@ interface InternalPageMutationPlan<T> extends PageMutationPlan<T> {
 
 export type PageMutationDispatch<T> =
   | { kind: "applied"; value: T }
-  | { kind: "pending"; value: T; settled: Promise<boolean> }
   | { kind: "refused"; claimed: boolean };
 
-const pendingPageMutations = new Map<string, object>();
 const startedPageMutationPlans = new WeakSet<object>();
 const appliedPageMutationPlans = new WeakSet<object>();
 let pageMutationEffectFailureForTest = false;
@@ -2020,7 +1966,7 @@ export function createPageMutationPlan<T>(
   const candidate = projectPageDto(replay.page, replay.nodes, false);
   if (!candidate) return null;
   const value = immutableClone(builtValue);
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const admission = graphBindingRuntime.snapshot().applicationPageAdmission;
   const graphRoot = graphMeta()?.root ?? "";
   const epoch = graphEpoch();
   const binding = graphBinding();
@@ -2040,7 +1986,6 @@ export function createPageMutationPlan<T>(
     saveBaseline: saveBaselineFor(pageName),
     bindingGeneration: admission?.binding_generation ?? -1,
     authority: admission?.authority ?? "missing",
-    pendingKey: `${graphRoot}\0${epoch}\0${binding}\0${generation}\0${pageName}`,
     captured,
     capturedPage,
     uiAuthority: uiAuthority
@@ -2167,7 +2112,7 @@ function pageMutationPlanCurrent(
   plan: InternalPageMutationPlan<unknown>,
   checkUiAuthority = true,
 ): boolean {
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const admission = graphBindingRuntime.snapshot().applicationPageAdmission;
   if (
     graphTransitioning()
     || (graphMeta()?.root ?? "") !== plan.graphRoot
@@ -2227,12 +2172,10 @@ function applyPageMutationPlanNow<T>(
   return true;
 }
 
-const managedPageMutationBusyToast = "This Sheet is still checking its previous change. Nothing was changed.";
-const managedPageMutationRefusedToast = "Tine-managed storage could not accept this Sheet change. Nothing was changed.";
+const pageMutationRefusedToast = "This Sheet change could not be applied. Nothing was changed.";
 
-/** Apply Direct plans synchronously. Managed plans claim one per-page slot,
- * await exact native preparation, recheck every captured authority and relation,
- * then publish once. */
+/** Apply a plan synchronously. Direct Files is the only authority; a plan whose
+ * page has no writable authority is refused without touching the store. */
 export function applyPageMutationPlan<T>(
   publicPlan: PageMutationPlan<T>,
   afterApply?: (value: T) => void,
@@ -2242,46 +2185,13 @@ export function applyPageMutationPlan<T>(
     return { kind: "refused", claimed: plan.authority !== "direct" };
   }
   startedPageMutationPlans.add(plan);
-  if (plan.authority === "direct") {
-    if (!applyPageMutationPlanNow(plan, false)) return { kind: "refused", claimed: false };
-    afterApply?.(plan.value);
-    return { kind: "applied", value: plan.value };
-  }
-  if (plan.authority !== "managed_writable") {
-    pushToast(managedPageMutationRefusedToast, "error");
+  if (plan.authority !== "direct") {
+    pushToast(pageMutationRefusedToast, "error");
     return { kind: "refused", claimed: true };
   }
-  if (!pageMutationPlanCurrent(plan) || !replayMatchesCandidate(plan)) {
-    return { kind: "refused", claimed: true };
-  }
-  if (pendingPageMutations.has(plan.pendingKey)) {
-    pushToast(managedPageMutationBusyToast, "error");
-    return { kind: "refused", claimed: true };
-  }
-  pendingPageMutations.set(plan.pendingKey, plan);
-  const settled = backend()
-    .preflightManagedPageMutation(plan.candidate, plan.saveBaseline, plan.bindingGeneration)
-    .then((acceptance) => {
-      const accepted = acceptance.status === "accepted"
-        && acceptance.binding_generation === plan.bindingGeneration
-        && acceptance.page_name === plan.candidate.name
-        && acceptance.page_path === plan.candidate.path
-        && acceptance.base_revision === plan.saveBaseline;
-      if (!accepted || !applyPageMutationPlanNow(plan, true)) {
-        pushToast(managedPageMutationRefusedToast, "error");
-        return false;
-      }
-      if (!plan.uiAuthority || plan.uiAuthority.isCurrent(plan.value)) afterApply?.(plan.value);
-      return true;
-    })
-    .catch(() => {
-      pushToast(managedPageMutationRefusedToast, "error");
-      return false;
-    })
-    .finally(() => {
-      if (pendingPageMutations.get(plan.pendingKey) === plan) pendingPageMutations.delete(plan.pendingKey);
-    });
-  return { kind: "pending", value: plan.value, settled };
+  if (!applyPageMutationPlanNow(plan, false)) return { kind: "refused", claimed: false };
+  afterApply?.(plan.value);
+  return { kind: "applied", value: plan.value };
 }
 
 // ---------------------------------------------------------------------------
@@ -2495,267 +2405,14 @@ export function depthOf(id: string): number {
   return d;
 }
 
-export interface ManagedBulkInsertionPlan {
-  insertedDescendants: number;
-  removedOrReusedDescendants: number;
-  insertionRootDepth: number;
-  maximumInputRelativeDepth: number;
-  insertedRawTextUtf8Bytes: number;
-}
+export const BULK_INSERTION_UNAVAILABLE_TOAST =
+  "Can't insert while the graph is changing. Nothing was changed.";
 
-interface ManagedBulkAdmissionLimits {
-  applicationSavePageBlocks: number;
-  applicationPageRequestTextBytes: number;
-  applicationPageMaxDepth: number;
-}
-
-type BulkOutlineLike = { raw: string; children: readonly BulkOutlineLike[] };
-
-/** Count only input already materialized by a selected caller. The limits cap
- * this pure work: no PageDto clone, actor call, block-id allocation, or scan of
- * any other page is involved. */
-export function managedBulkOutlinePlan(
-  nodes: readonly BulkOutlineLike[],
-  insertionRootDepth: number,
-  removedOrReusedDescendants: number,
-  limits: ManagedBulkAdmissionLimits,
-): ManagedBulkInsertionPlan {
-  const blockCap = limits.applicationSavePageBlocks + 1;
-  const textCap = limits.applicationPageRequestTextBytes + 1;
-  let insertedDescendants = 0;
-  let maximumInputRelativeDepth = 0;
-  let insertedRawTextUtf8Bytes = 0;
-  const stack = nodes.map((node) => ({ node, relativeDepth: 1 }));
-  while (stack.length) {
-    const { node, relativeDepth } = stack.pop()!;
-    insertedDescendants = Math.min(blockCap, insertedDescendants + 1);
-    maximumInputRelativeDepth = Math.max(maximumInputRelativeDepth, relativeDepth);
-    insertedRawTextUtf8Bytes = Math.min(
-      textCap,
-      insertedRawTextUtf8Bytes + new TextEncoder().encode(node.raw).byteLength,
-    );
-    if (insertedDescendants === blockCap || insertedRawTextUtf8Bytes === textCap) break;
-    for (let index = node.children.length - 1; index >= 0; index--) {
-      stack.push({ node: node.children[index], relativeDepth: relativeDepth + 1 });
-    }
-  }
-  return {
-    insertedDescendants,
-    removedOrReusedDescendants,
-    insertionRootDepth,
-    maximumInputRelativeDepth,
-    insertedRawTextUtf8Bytes,
-  };
-}
-
-const bulkInsertionAdmissionSeal = Symbol("bulk-insertion-admission");
-
-export interface BulkInsertionAdmission {
-  readonly [bulkInsertionAdmissionSeal]: true;
-}
-
-interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
-  consumed: boolean;
-  targetId: string | null;
-  targetNode: Node | null;
-  targetPage: string;
-  targetGeneration: number;
-  graphEpoch: number;
-  graphRoot: string;
-  bindingGeneration: number;
-  authority: "managed_writable";
-  plan: ManagedBulkInsertionPlan;
-  limits: ManagedBulkAdmissionLimits;
-  insertionRootDepthOffset: number;
-}
-
-export type ManagedBulkInsertionLimitCheck =
-  | { kind: "admitted"; token: BulkInsertionAdmission }
-  | { kind: "refused"; toast: string };
-
-export type ManagedBulkInsertionPreflight =
+/** Result of the synchronous route decision a bulk insertion makes before any
+ * await. Direct Files is the only authority; a refusal names its toast. */
+export type BulkInsertionPreflight =
   | { kind: "direct" }
-  | ManagedBulkInsertionLimitCheck;
-
-const managedBulkOverflowToast = (limit: number): string =>
-  `Can't insert: this page would exceed Tine-managed storage's ${limit}-block or request-size limit. Nothing was changed.`;
-
-export const MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST =
-  "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
-
-interface BoundedPageCensus {
-  blocks: number;
-  requestTextUtf8Bytes: number;
-}
-
-/** One bounded walk answering both page-sized questions an admission asks.
- *
- * `requestTextUtf8Bytes` is a deliberate LOWER BOUND on what the native
- * validator charges for saving this page (`validate_editor_save_request`,
- * crates/tine-core/src/sync_runtime.rs). That charge is per block — its key,
- * its parent's key, and its content — plus the page name/id, the base revision
- * and any preamble. Existing blocks are counted here with all three per-block
- * terms; the page-level terms and the inserted blocks' request-local keys are
- * not modelled, because they are not known here and omitting them keeps this a
- * lower bound rather than a guess. Under-counting means we may still admit
- * something the actor refuses; over-counting would refuse saves that are
- * genuinely fine, which is the worse error (GH #323). */
-function boundedPageCensus(
-  page: FeedPage,
-  blockCap: number,
-  textByteCap: number,
-): BoundedPageCensus {
-  const encoder = new TextEncoder();
-  let blocks = 0;
-  let requestTextUtf8Bytes = 0;
-  const stack = [...page.roots];
-  while (stack.length && blocks < blockCap && requestTextUtf8Bytes < textByteCap) {
-    const id = stack.pop()!;
-    const node = doc.byId[id];
-    if (!node) continue;
-    blocks++;
-    requestTextUtf8Bytes = Math.min(
-      textByteCap,
-      requestTextUtf8Bytes
-        + encoder.encode(node.raw).byteLength
-        + id.length
-        + (node.parent === null ? 0 : node.parent.length),
-    );
-    for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
-  }
-  return { blocks, requestTextUtf8Bytes };
-}
-
-/** The absolute depth an insertion's roots land at, derived from the live tree.
- * Callers state their own root depth relative to the target; a token records the
- * offset so the same question can be re-asked after an await (GH #322). */
-function insertionRootDepthBasis(targetId: string | null): number {
-  return targetId === null ? 1 : depthOf(targetId) + 1;
-}
-
-/** Re-answerable overflow question. Every input the caller can no longer affect
- * lives in `plan`; everything that can move while a bulk route awaits — the
- * page's current size and the target's depth — is read live here, so preflight
- * and consumption apply the identical rule to different instants (GH #322). */
-function bulkInsertionOverflows(
-  pageName: string,
-  insertionRootDepth: number,
-  plan: ManagedBulkInsertionPlan,
-  limits: ManagedBulkAdmissionLimits,
-): boolean {
-  const page = pageByName(pageName);
-  if (!page) return true;
-  const census = boundedPageCensus(
-    page,
-    limits.applicationSavePageBlocks + 1,
-    limits.applicationPageRequestTextBytes + 1,
-  );
-  const exceedsBlockLimit =
-    census.blocks - plan.removedOrReusedDescendants + plan.insertedDescendants
-      > limits.applicationSavePageBlocks;
-  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
-    && insertionRootDepth + plan.maximumInputRelativeDepth - 1 > limits.applicationPageMaxDepth;
-  // The save request carries the WHOLE page, so an insertion is charged on top
-  // of what the page already holds. `>=` rather than `>`: the native charge also
-  // includes the page name/id and base revision, which are never empty, so a
-  // lower bound that merely reaches the limit is already over it (GH #323).
-  const exceedsTextLimit =
-    census.requestTextUtf8Bytes + plan.insertedRawTextUtf8Bytes
-      >= limits.applicationPageRequestTextBytes;
-  return exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit;
-}
-
-/**
- * Advisory, side-effect-free limit check for a bulk route already selected as
- * managed. The exact dispatcher-provided admission is stamped into the token;
- * consumption re-proves it immediately before publication (I-20).
- */
-export function preflightManagedBulkInsertion(
-  admission: ManagedWritableAdmission,
-  targetId: string | null,
-  buildPlan: (limits: ManagedBulkAdmissionLimits) => ManagedBulkInsertionPlan,
-  targetPageName?: string,
-): ManagedBulkInsertionLimitCheck {
-  const target = targetId === null ? null : doc.byId[targetId];
-  if (targetId !== null && (!target || !blockWritable(targetId))) {
-    return { kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST };
-  }
-  const pageName = target?.page ?? targetPageName;
-  if (!pageName || !pageWritable(pageName)) {
-    return { kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST };
-  }
-  const page = pageByName(pageName);
-  const targetGeneration = pageInstanceGeneration(pageName);
-  if (!page || targetGeneration === null) {
-    return { kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST };
-  }
-  const limits: ManagedBulkAdmissionLimits = {
-    applicationSavePageBlocks: admission.application_save_page_blocks,
-    applicationPageRequestTextBytes: admission.application_page_request_text_bytes,
-    applicationPageMaxDepth: admission.application_page_max_depth,
-  };
-  const plan = buildPlan(limits);
-  if (bulkInsertionOverflows(pageName, plan.insertionRootDepth, plan, limits)) {
-    return { kind: "refused", toast: managedBulkOverflowToast(limits.applicationSavePageBlocks) };
-  }
-
-  const token: InternalBulkInsertionAdmission = {
-    [bulkInsertionAdmissionSeal]: true,
-    consumed: false,
-    targetId,
-    targetNode: target ? unwrap(target) : null,
-    targetPage: pageName,
-    targetGeneration,
-    graphEpoch: graphEpoch(),
-    graphRoot: graphMeta()?.root ?? "",
-    bindingGeneration: admission.binding_generation,
-    authority: admission.authority,
-    plan,
-    limits,
-    insertionRootDepthOffset: plan.insertionRootDepth - insertionRootDepthBasis(targetId),
-  };
-  return { kind: "admitted", token };
-}
-
-/** Consume an admission immediately before its selected store publication. */
-export function consumeManagedBulkInsertionAdmission(
-  token: BulkInsertionAdmission,
-  targetId: string | null,
-): boolean {
-  const internal = token as InternalBulkInsertionAdmission;
-  if (!internal[bulkInsertionAdmissionSeal] || internal.consumed || internal.targetId !== targetId) return false;
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  const target = targetId === null ? null : doc.byId[targetId];
-  if (
-    !admission
-    || admission.authority !== "managed_writable"
-    || admission.binding_generation !== internal.bindingGeneration
-    || internal.authority !== admission.authority
-    || (targetId === null
-      ? internal.targetNode !== null
-      : !target
-        || unwrap(target) !== internal.targetNode
-        || target.page !== internal.targetPage)
-    || pageInstanceGeneration(internal.targetPage) !== internal.targetGeneration
-    || graphEpoch() !== internal.graphEpoch
-    || (graphMeta()?.root ?? "") !== internal.graphRoot
-    // The page may have grown, or the target moved deeper, while the caller
-    // awaited. Identity checks alone cannot see that, so ask the limit question
-    // again against the tree we are about to mutate (GH #322).
-    || bulkInsertionOverflows(
-      internal.targetPage,
-      insertionRootDepthBasis(targetId) + internal.insertionRootDepthOffset,
-      internal.plan,
-      internal.limits,
-    )
-  ) return false;
-  internal.consumed = true;
-  return true;
-}
-
-export function reportManagedBulkInsertionRefusal(toast: string): void {
-  pushToast(toast, "error");
-}
+  | { kind: "refused"; toast: string };
 
 // ---------------------------------------------------------------------------
 // Undo / redo (snapshot-based; typing in one block coalesces to one step)
@@ -2798,27 +2455,12 @@ interface RawEntry {
   instances: Record<string, number>;
   preservedIds?: string[];
 }
-interface ManagedMoveHistorySpec {
-  sourcePage: string;
-  destinationPage: string;
-  roots: string[];
-  forwardPlacement: ManagedApplicationMovePlacement;
-  inversePlacement: ManagedApplicationMovePlacement;
-  forwardRewrites: Map<string, string>;
-  inverseRewrites: Map<string, string>;
-}
-interface ManagedMoveEntry extends ManagedMoveHistorySpec {
-  kind: "managed-move";
-  tag?: string;
-  context: HistoryContext;
-  instances: Record<string, number>;
-}
 /** **The tag is on the ENTRY, not in a module global.** `lastUndoTag` is a
  *  typing-coalesce marker that any unrelated event resets, so it cannot answer
  *  "is the change Undo would take back the one I am offering to take back?" —
  *  the question the §7.5 crossing notice has to ask before it enables its
  *  button. {@link undoTopTag} answers it off the entry itself. */
-type UndoEntry = SnapEntry | RawEntry | ManagedMoveEntry;
+type UndoEntry = SnapEntry | RawEntry;
 const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
 let lastUndoTag: string | null = null;
@@ -3016,7 +2658,6 @@ export function clearUndoHistory() {
  *  every page including this one). */
 function entryTouchesPage(e: UndoEntry, name: string): boolean {
   if (e.kind === "raw") return e.page === name;
-  if (e.kind === "managed-move") return e.sourcePage === name || e.destinationPage === name;
   return e.pages === null || e.pages.includes(name);
 }
 
@@ -3241,9 +2882,6 @@ function pushRawUndo(id: string, prevRaw: string) {
 
 /** Apply one entry and return its inverse (to push onto the opposite stack). */
 function applyEntry(e: UndoEntry): UndoEntry {
-  if (e.kind === "managed-move") {
-    throw new Error("managed move history must replay through the native actor");
-  }
   if (e.kind === "raw") {
     const node = doc.byId[e.id];
     const rootIndex = node?.originatedFromPageHeader
@@ -3357,63 +2995,14 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
   }
 }
 
-function pushManagedMoveHistory(spec: ManagedMoveHistorySpec): void {
-  endMoveSelectionBurst();
-  advanceHistoryEpoch();
-  const pages = [spec.sourcePage, spec.destinationPage];
-  undoStack.push({
-    kind: "managed-move",
-    ...spec,
-    roots: [...spec.roots],
-    forwardRewrites: new Map(spec.forwardRewrites),
-    inverseRewrites: new Map(spec.inverseRewrites),
-    context: captureHistoryContext(),
-    instances: captureInstances(pages),
-  });
-  if (undoStack.length > 200) undoStack.shift();
-  redoStack = [];
-  lastUndoTag = "managed-move";
-}
-
-async function replayManagedMoveHistory(entry: ManagedMoveEntry, direction: "undo" | "redo") {
-  const undoing = direction === "undo";
-  const sourcePage = undoing ? entry.destinationPage : entry.sourcePage;
-  const destinationPage = undoing ? entry.sourcePage : entry.destinationPage;
-  const placement = undoing ? entry.inversePlacement : entry.forwardPlacement;
-  const rewrites = undoing ? entry.inverseRewrites : entry.forwardRewrites;
-  const success = await enqueueManagedCrossPageMove(
-    sourcePage,
-    destinationPage,
-    entry.roots,
-    placement,
-    rewrites,
-    false,
-  );
-  if (!success) {
-    (undoing ? undoStack : redoStack).push(entry);
-    return;
-  }
-  (undoing ? redoStack : undoStack).push({
-    ...entry,
-    context: captureHistoryContext(),
-    instances: captureInstances([entry.sourcePage, entry.destinationPage]),
-  });
-  lastUndoTag = null;
-  endEdit(direction);
-  restoreEntryContext(entry.context);
-}
-
-function performUndo(): Promise<void> | null {
+function performUndo(): void {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
   const entry = popHistoryEntry(undoStack);
-  if (!entry) return null;
+  if (!entry) return;
   if (!entryIsReplayable(entry)) {
     discardStaleHistory(entry);
-    return null;
-  }
-  if (entry.kind === "managed-move") {
-    return replayManagedMoveHistory(entry, "undo");
+    return;
   }
   const restoreViewport = entry.kind === "raw" ? captureRawHistoryViewport(entry.id) : undefined;
   redoStack.push(applyEntry(entry));
@@ -3422,20 +3011,17 @@ function performUndo(): Promise<void> | null {
   scheduleSave();
   restoreEntryContext(entry.context);
   restoreViewport?.();
-  return null;
+  return;
 }
 
-function performRedo(): Promise<void> | null {
+function performRedo(): void {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
   const entry = popHistoryEntry(redoStack);
-  if (!entry) return null;
+  if (!entry) return;
   if (!entryIsReplayable(entry)) {
     discardStaleHistory(entry);
-    return null;
-  }
-  if (entry.kind === "managed-move") {
-    return replayManagedMoveHistory(entry, "redo");
+    return;
   }
   if (entry.preservedIds && hasLoadedIdentityCollision(entry.preservedIds)) {
     // The selected prerequisite is already popped. A later redo snapshot cannot
@@ -3443,7 +3029,7 @@ function performRedo(): Promise<void> | null {
     // entry may have been selected from the middle of the global stack.
     redoStack = [];
     pushToast("Redo skipped: a block with the same id now exists", "error");
-    return null;
+    return;
   }
   const restoreViewport = entry.kind === "raw" ? captureRawHistoryViewport(entry.id) : undefined;
   undoStack.push(applyEntry(entry));
@@ -3452,39 +3038,15 @@ function performRedo(): Promise<void> | null {
   scheduleSave();
   restoreEntryContext(entry.context);
   restoreViewport?.();
-  return null;
-}
-
-function submitHistoryCommand(direction: "undo" | "redo"): void {
-  if (managedHistoryReplayRunning) {
-    managedHistoryCommands.push(direction);
-    return;
-  }
-  const pending = direction === "undo" ? performUndo() : performRedo();
-  if (!pending) return;
-  managedHistoryReplayRunning = true;
-  const epoch = managedHistoryReplayEpoch;
-  void (async () => {
-    try {
-      await pending;
-      while (epoch === managedHistoryReplayEpoch) {
-        const next = managedHistoryCommands.shift();
-        if (!next) break;
-        const replay = next === "undo" ? performUndo() : performRedo();
-        if (replay) await replay;
-      }
-    } finally {
-      if (epoch === managedHistoryReplayEpoch) managedHistoryReplayRunning = false;
-    }
-  })();
+  return;
 }
 
 export function undo() {
-  submitHistoryCommand("undo");
+  performUndo();
 }
 
 export function redo() {
-  submitHistoryCommand("redo");
+  performRedo();
 }
 
 /** Data replay and opposite-stack insertion are complete before this function is
@@ -4141,12 +3703,12 @@ function liveDocReferences(id: string): boolean {
  * instance, the same graph AND the same storage route.
  *
  * The storage route is part of it because a route is selected synchronously and
- * acted on later: a drop or paste that chose Direct Files can still be reading
- * a file while the user finishes turning managed storage on, and would then
- * insert without the admission the managed route requires (GH #325). Graph
- * activation flips this authority inside its own transitioning window, so
- * `graphTransitioning` alone stops only continuations that resume DURING the
- * switch, not the ones that resume just after it. */
+ * acted on later: a drop or paste can still be reading a file while the graph
+ * binding changes underneath it, and would then insert against a binding it was
+ * never admitted to (GH #325). Graph activation flips the binding inside its
+ * own transitioning window, so `graphTransitioning` alone stops only
+ * continuations that resume DURING the switch, not the ones that resume just
+ * after it. */
 export interface BulkRouteFence {
   epoch: number;
   root: string;
@@ -4163,7 +3725,7 @@ export function captureBulkRouteFence(targetId: string): BulkRouteFence | null {
   if (!target || graphTransitioning()) return null;
   const targetGeneration = pageInstanceGeneration(target.page);
   if (targetGeneration === null) return null;
-  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const route = graphBindingRuntime.snapshot().applicationPageAdmission;
   return {
     epoch: graphEpoch(),
     root: graphMeta()?.root ?? "",
@@ -4178,7 +3740,7 @@ export function captureBulkRouteFence(targetId: string): BulkRouteFence | null {
 
 export function bulkRouteFenceCurrent(fence: BulkRouteFence): boolean {
   const target = doc.byId[fence.targetId];
-  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const route = graphBindingRuntime.snapshot().applicationPageAdmission;
   return !graphTransitioning()
     && graphEpoch() === fence.epoch
     && (graphMeta()?.root ?? "") === fence.root
@@ -4280,25 +3842,15 @@ export function pasteClipboardPayload(
   // into (GH #322). Assuming the host survives keeps the admitted block count an
   // upper bound on the realized one either way; the cost is refusing a paste
   // into an empty host on a page already exactly at the limit.
-  const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+  const admission = dispatchBulkInsertion<BulkInsertionPreflight>(
     { targetId },
     {
       direct: () => ({ kind: "direct" }),
-      unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
-      managed: (managedAdmission) => preflightManagedBulkInsertion(
-        managedAdmission,
-        targetId,
-        (limits) => managedBulkOutlinePlan(
-          slot.blocks,
-          depthOf(targetId) + 1,
-          0,
-          limits,
-        ),
-      ),
+      unavailable: () => ({ kind: "refused", toast: BULK_INSERTION_UNAVAILABLE_TOAST }),
     },
   );
   if (admission.kind === "refused") {
-    reportManagedBulkInsertionRefusal(admission.toast);
+    pushToast(admission.toast, "error");
     return Promise.resolve(null);
   }
 
@@ -4355,9 +3907,6 @@ export function pasteClipboardPayload(
       }
       preserveIds = cutSourcePagesRetired(grant!.sourcePages)
         && !hasLoadedIdentityCollision(normalizedIds);
-    }
-    if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, targetId)) {
-      return null;
     }
     const reuseEmptyHost = clipboardTargetReusesEmptyHost(
       doc.byId[targetId],
@@ -4416,32 +3965,17 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
   const page = pageByName(name);
   if (!page || !pageWritable(name)) return false;
   const insertionTarget = page.roots.length ? page.roots[page.roots.length - 1] : null;
-  const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+  const admission = dispatchBulkInsertion<BulkInsertionPreflight>(
     { targetId: insertionTarget, targetPageName: name },
     {
       direct: () => ({ kind: "direct" }),
-      unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
-      managed: (managedAdmission) => preflightManagedBulkInsertion(
-        managedAdmission,
-        insertionTarget,
-        (limits) => managedBulkOutlinePlan(
-          nodes,
-          insertionTarget === null ? 1 : depthOf(insertionTarget) + 1,
-          0,
-          limits,
-        ),
-        name,
-      ),
+      unavailable: () => ({ kind: "refused", toast: BULK_INSERTION_UNAVAILABLE_TOAST }),
     },
   );
   if (admission.kind === "refused") {
-    reportManagedBulkInsertionRefusal(admission.toast);
+    pushToast(admission.toast, "error");
     return false;
   }
-  if (
-    admission.kind === "admitted"
-    && !consumeManagedBulkInsertionAdmission(admission.token, insertionTarget)
-  ) return false;
   if (page.roots.length) {
     // Append after the last top-level block (end of the page).
     insertOutlineAfter(insertionTarget!, nodes);
@@ -6051,20 +5585,6 @@ export async function moveBlock(
       { sourcePages: [oldPage], destinationPage: newPage, roots: [id] },
       {
         unavailable: () => true,
-        managed: async () => {
-          const rewrites = new Map<string, string>();
-          if (movedRaw !== doc.byId[id].raw) rewrites.set(id, movedRaw);
-          await enqueueManagedCrossPageMove(
-            oldPage,
-            newPage,
-            [id],
-            newParent === null
-              ? { placement: "root", position: index }
-              : { placement: "child", parent_identity: newParent, position: index },
-            rewrites,
-          );
-          return true;
-        },
         // Direct falls through to the frontend choreography below, which also
         // serves the same-page reorder — so it is not lifted into this arm.
         direct: () => false,
@@ -6275,40 +5795,11 @@ export async function moveBlocksRelative(
 
   if (!crossSources.length) return applyRelativeMove();
 
-  // Authority is selected once, by the dispatcher (I-6). Both arms are the arms
-  // this function always had, including the Managed single-source refusal —
-  // that asymmetry is B2's to lift, not B1's.
+  // Authority is selected once, by the dispatcher (I-6).
   return dispatchCrossPageMove<boolean>(
     { sourcePages: crossSources, destinationPage: plan.destinationPage, roots: plan.roots },
     {
       unavailable: () => false,
-      managed: () => {
-        const movedRaw = movedRawFor(plan!);
-        if (crossSources.length !== 1 || plan!.sourcePages.includes(plan!.destinationPage)) {
-          pushToast(MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST, "error");
-          return false;
-        }
-        const target = doc.byId[targetId];
-        const siblings = position === "child"
-          ? target.children
-          : target.parent === null
-            ? pageByName(target.page)!.roots
-            : doc.byId[target.parent].children;
-        const positionIndex = position === "child"
-          ? siblings.length
-          : siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
-        return enqueueManagedCrossPageMove(
-          crossSources[0],
-          plan!.destinationPage,
-          plan!.roots,
-          position === "child"
-            ? { placement: "child", parent_identity: targetId, position: positionIndex }
-            : target.parent === null
-              ? { placement: "root", position: positionIndex }
-              : { placement: "child", parent_identity: target.parent, position: positionIndex },
-          movedRaw,
-        );
-      },
       direct: async () => {
         if (!(await prepareCrossPageSources(crossSources))) {
           pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
@@ -6495,7 +5986,7 @@ function crossMoveBlocks(ids: string[], fromPage: string, toPage: string, dir: 1
  *  the crash matrix cuts between; `src/directMoveOrder.test.ts` pins it.
  *
  *  A record is never required: `null` (a degenerate move, a firewalled DTO, an
- *  unavailable app-private root, or a managed binding the native side refuses)
+ *  unavailable app-private root, or a binding the native side refuses)
  *  simply leaves the move exactly as convergent as it was before B2. Refusing
  *  to move a page because device-private state is unavailable would be an
  *  availability bug, not hardening. */
@@ -6586,492 +6077,6 @@ function persistCrossPage(dest: string, sources: string[]) {
   }));
 }
 
-interface ManagedCrossPageMoveIntent {
-  sourcePage: string;
-  destinationPage: string;
-  roots: string[];
-  placement: ManagedApplicationMovePlacement;
-  rewrites: Map<string, string>;
-  graphBinding: number;
-  bindingGeneration: number;
-  sourceInstance: number;
-  destinationInstance: number;
-  sourceEditorGeneration: number;
-  destinationEditorGeneration: number;
-  rootNodes: Node[];
-  targetParentNode: Node | null;
-  history: ManagedMoveHistorySpec | null;
-  editorContext: HistoryEditorContext | null;
-}
-
-function managedMoveAdmission() {
-  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  return admission?.authority === "managed_writable" ? admission : null;
-}
-
-function blockTreeMetrics(ids: readonly string[]): { count: number; bytes: number; depth: number } | null {
-  let count = 0;
-  let bytes = 0;
-  let depth = 0;
-  const seen = new Set<string>();
-  const stack = ids.map((id) => ({ id, depth: 1 }));
-  while (stack.length) {
-    const current = stack.pop()!;
-    const node = doc.byId[current.id];
-    if (!node || seen.has(current.id)) return null;
-    seen.add(current.id);
-    count++;
-    bytes += new TextEncoder().encode(node.raw).byteLength;
-    depth = Math.max(depth, current.depth);
-    for (const child of node.children) stack.push({ id: child, depth: current.depth + 1 });
-  }
-  return { count, bytes, depth };
-}
-
-function pageTreeMetrics(pageName: string): { count: number; bytes: number; depth: number } | null {
-  const page = pageByName(pageName);
-  return page ? blockTreeMetrics(page.roots) : null;
-}
-
-function blockDepth(id: string): number | null {
-  let depth = 1;
-  let node = doc.byId[id];
-  const seen = new Set<string>();
-  while (node?.parent !== null) {
-    if (!node || seen.has(node.id)) return null;
-    seen.add(node.id);
-    node = doc.byId[node.parent];
-    depth++;
-  }
-  return node ? depth : null;
-}
-
-function applyManagedMoveToLoadedState(intent: ManagedCrossPageMoveIntent): boolean {
-  let applied = false;
-  setDoc(produce((state) => {
-    const sourcePage = state.pages.find((page) => page.name === intent.sourcePage);
-    const destinationPage = state.pages.find((page) => page.name === intent.destinationPage);
-    const first = state.byId[intent.roots[0]];
-    if (!sourcePage || !destinationPage || !first) return;
-    const source = first.parent === null ? sourcePage.roots : state.byId[first.parent]?.children;
-    const destination = intent.placement.placement === "root"
-      ? destinationPage.roots
-      : state.byId[intent.placement.parent_identity]?.children;
-    if (!source
-      || !destination
-      || intent.roots.some((id) => !state.byId[id] || !source.includes(id))) return;
-    const moved = new Set(intent.roots);
-    source.splice(0, source.length, ...source.filter((id) => !moved.has(id)));
-    const position = Math.max(0, Math.min(intent.placement.position, destination.length));
-    destination.splice(position, 0, ...intent.roots);
-    for (const id of intent.roots) {
-      const node = state.byId[id]!;
-      node.parent = intent.placement.placement === "root" ? null : intent.placement.parent_identity;
-      const rewrite = intent.rewrites.get(id);
-      if (rewrite !== undefined) node.raw = rewrite;
-      reassignPage(state, id, intent.destinationPage);
-    }
-    applied = true;
-  }));
-  return applied;
-}
-
-/** Publish an accepted actor move as the same semantic store delta the Direct
- * path uses. Reconstructing both DTO trees discarded the mounted textarea and
- * created a blank frame between journal days. The actor response remains the
- * authority: exact revisions are adopted, and an unexpected normalization
- * mismatch falls back to the ordinary replacement installer. */
-function installManagedMovedPages(
-  intent: ManagedCrossPageMoveIntent,
-  source: PageDto,
-  destination: PageDto,
-): void {
-  const applied = applyManagedMoveToLoadedState(intent);
-  const sourcePage = pageByName(source.name);
-  const destinationPage = pageByName(destination.name);
-  if (!applied
-    || !sourcePage
-    || !destinationPage
-    || !pageContentMatches(source, sourcePage)
-    || !pageContentMatches(destination, destinationPage)) {
-    upsertPage(source);
-    upsertPage(destination);
-  } else {
-    setBaseRev(source.name, source.rev ?? null);
-    setBaseRev(destination.name, destination.rev ?? null);
-  }
-  invalidateUndoForPage(source.name);
-  invalidateUndoForPage(destination.name);
-  clearConflict(source.name);
-  clearConflict(destination.name);
-  invalidateAllMatrixDimensions();
-  bumpDataRev();
-}
-
-function managedMoveStillOwns(intent: ManagedCrossPageMoveIntent): boolean {
-  const admission = managedMoveAdmission();
-  return !!admission
-    && graphBinding() === intent.graphBinding
-    && admission.binding_generation === intent.bindingGeneration
-    && pageInstanceGeneration(intent.sourcePage) === intent.sourceInstance
-    && pageInstanceGeneration(intent.destinationPage) === intent.destinationInstance
-    && intent.roots.every((id, index) => {
-      const node = doc.byId[id];
-      return !!node && node.page === intent.sourcePage && unwrap(node) === intent.rootNodes[index];
-    })
-    && (intent.placement.placement === "root"
-      ? intent.targetParentNode === null
-      : !!doc.byId[intent.placement.parent_identity]
-        && unwrap(doc.byId[intent.placement.parent_identity]) === intent.targetParentNode
-        && doc.byId[intent.placement.parent_identity].page === intent.destinationPage);
-}
-
-function moveRefusal(outcome: ManagedApplicationMoveSubtreesOutcome): string {
-  if (outcome.status === "no_commit") return `Couldn't move blocks (${outcome.reason.replaceAll("_", " ")}). Nothing was changed.`;
-  return "Couldn't finish the managed move. Reopen Tine to recover the exact result safely.";
-}
-
-async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Promise<boolean> {
-  if (!managedMoveStillOwns(intent)) return false;
-  if (hasEditorLease(intent.sourcePage) || hasEditorLease(intent.destinationPage)) {
-    pushToast("Finish editing the affected page before moving blocks between pages.", "error");
-    return false;
-  }
-  setManagedMoveBusy([intent.sourcePage, intent.destinationPage], true);
-  let releaseSaves = () => {};
-  let resolved = true;
-  try {
-    if (!managedMoveStillOwns(intent)
-      || editorTransactionGeneration(intent.sourcePage) !== intent.sourceEditorGeneration
-      || editorTransactionGeneration(intent.destinationPage) !== intent.destinationEditorGeneration
-      || hasEditorLease(intent.sourcePage)
-      || hasEditorLease(intent.destinationPage)) return false;
-    if (!(await flushPageToQuiescence(intent.sourcePage))
-      || !(await flushPageToQuiescence(intent.destinationPage))) {
-      pushToast("Couldn't move — finish saving the affected pages first.", "error");
-      return false;
-    }
-    if (!managedMoveStillOwns(intent)) return false;
-    releaseSaves = holdManagedMovePages([intent.sourcePage, intent.destinationPage]);
-    const admission = managedMoveAdmission()!;
-    const source = pageByName(intent.sourcePage);
-    const destination = pageByName(intent.destinationPage);
-    const sourceRevision = saveBaselineFor(intent.sourcePage);
-    const destinationRevision = saveBaselineFor(intent.destinationPage);
-    if (!source?.path || !destination?.path || !sourceRevision || !destinationRevision) return false;
-    const roots = blockTreeMetrics(intent.roots);
-    const destinationMetrics = pageTreeMetrics(intent.destinationPage);
-    const insertionDepth = intent.placement.placement === "root"
-      ? 1
-      : (() => {
-          const parentDepth = blockDepth(intent.placement.parent_identity);
-          return parentDepth === null ? null : parentDepth + 1;
-        })();
-    if (!roots || !destinationMetrics
-      || insertionDepth === null
-      || destinationMetrics.count + roots.count > admission.application_save_page_blocks
-      || destinationMetrics.bytes + roots.bytes > admission.application_page_request_text_bytes
-      || Math.max(destinationMetrics.depth, insertionDepth + roots.depth - 1) > admission.application_page_max_depth) {
-      pushToast("Can't move: the destination would exceed managed storage's page limits. Nothing was changed.", "error");
-      return false;
-    }
-    const request: ManagedApplicationMoveSubtreesRequest = {
-      episode_id: crypto.randomUUID(),
-      source_path: source.path,
-      source_revision: sourceRevision,
-      destination_path: destination.path,
-      destination_revision: destinationRevision,
-      roots: intent.roots.map((identity): ManagedApplicationMoveRoot => ({
-        identity,
-        raw_rewrite: intent.rewrites.has(identity)
-          ? { expected_raw: doc.byId[identity].raw, desired_raw: intent.rewrites.get(identity)! }
-          : null,
-      })),
-      placement: intent.placement,
-      admission: {
-        application_save_page_blocks: admission.application_save_page_blocks,
-        application_page_request_text_bytes: admission.application_page_request_text_bytes,
-        application_page_max_depth: admission.application_page_max_depth,
-      },
-    };
-    let result = await backend().moveManagedApplicationSubtrees(intent.bindingGeneration, request);
-    for (let recoveryTurns = 0; result.outcome.status === "deferred"; recoveryTurns++) {
-      if (recoveryTurns >= 8) {
-        resolved = false;
-        requireManagedRuntimeReopen();
-        pushToast(moveRefusal(result.outcome), "error");
-        return false;
-      }
-      const recovered = await backend().recoverManagedApplicationSubtrees(
-        result.binding_generation,
-        request,
-      );
-      if (recovered.binding_generation !== result.binding_generation
-        && !managedStorageRuntime.transitionMoveRecovery(
-          recovered,
-          request.episode_id,
-          result.binding_generation,
-          () => managedMoveStillOwns(intent),
-        )) {
-        resolved = false;
-        requireManagedRuntimeReopen();
-        pushToast(moveRefusal(recovered.outcome), "error");
-        return false;
-      }
-      result = {
-        binding_generation: recovered.binding_generation,
-        application_page_admission: recovered.application_page_admission,
-        outcome: recovered.outcome,
-      };
-      intent.bindingGeneration = recovered.binding_generation;
-      if (result.outcome.status === "deferred" && result.outcome.state.status === "blocked_recovery") {
-        resolved = false;
-        requireManagedRuntimeReopen();
-        pushToast(moveRefusal(result.outcome), "error");
-        return false;
-      }
-    }
-    if (result.outcome.status !== "committed") {
-      pushToast(moveRefusal(result.outcome), "error");
-      return false;
-    }
-    if (!managedMoveStillOwns(intent)) {
-      // A graph switch owns its replacement and may discard this old response.
-      // A same-graph page replacement cannot: the actor committed, but the
-      // frontend no longer knows whether that replacement is pre- or post-move.
-      // Keep both save lanes closed until reopen resolves the durable truth.
-      if (graphBinding() === intent.graphBinding
-        && managedMoveAdmission()?.binding_generation === intent.bindingGeneration) {
-        resolved = false;
-        requireManagedRuntimeReopen();
-        pushToast(moveRefusal({
-          status: "deferred",
-          episode_id: request.episode_id,
-          state: {
-            status: "blocked_recovery",
-            batch_id: result.outcome.batch_id,
-            phase: "projection_drain",
-            retained_publication: true,
-          },
-        }), "error");
-      }
-      return false;
-    }
-    // The actor has committed and the response still owns both loaded page
-    // instances. End the inert window before the store delta remounts the block
-    // under the adjacent journal, and re-arm the captured caret for that mount.
-    setManagedMoveBusy([intent.sourcePage, intent.destinationPage], false);
-    if (intent.editorContext) {
-      const editor = doc.byId[intent.editorContext.blockId];
-      if (editor) restoreHistoryEditorContext(intent.editorContext, editor.raw.length);
-    }
-    installManagedMovedPages(
-      intent,
-      { ...result.outcome.source.page, rev: result.outcome.source.revision },
-      { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
-    );
-    if (intent.history) pushManagedMoveHistory(intent.history);
-    // Replay-evidence retirement has its own bounded, graph-bound retry lane.
-    // The next physical move does not wait for those cleanup barriers after
-    // both authoritative page DTOs have already been installed.
-    enqueueManagedMoveAcknowledgement(
-      result.binding_generation,
-      result.outcome.episode_id,
-      result.outcome.batch_id,
-    );
-    return true;
-  } catch (error) {
-    pushToast(`Couldn't move blocks. (${String(error)})`, "error");
-    return false;
-  } finally {
-    if (resolved) {
-      releaseSaves();
-      setManagedMoveBusy([intent.sourcePage, intent.destinationPage], false);
-    }
-  }
-}
-
-function prepareManagedCrossPageMoveIntent(
-  sourcePage: string,
-  destinationPage: string,
-  roots: readonly string[],
-  placement: ManagedApplicationMovePlacement,
-  rewrites: Map<string, string>,
-  recordHistory = true,
-): ManagedCrossPageMoveIntent | null {
-  const admission = managedMoveAdmission();
-  const sourceInstance = pageInstanceGeneration(sourcePage);
-  const destinationInstance = pageInstanceGeneration(destinationPage);
-  if (!admission || sourceInstance === null || destinationInstance === null) return null;
-  const nodes = roots.map((id) => doc.byId[id]);
-  if (nodes.some((node) => !node || node.page !== sourcePage)) return null;
-  const originalParent = nodes[0].parent;
-  if (nodes.some((node) => node.parent !== originalParent)) {
-    pushToast("Managed multi-block moves require the selected roots to share one parent.", "error");
-    return null;
-  }
-  const originalSiblings = originalParent === null
-    ? pageByName(sourcePage)?.roots
-    : doc.byId[originalParent]?.children;
-  const originalPositions = nodes.map((node) => originalSiblings?.indexOf(node.id) ?? -1);
-  if (!originalSiblings
-    || originalPositions.some((position) => position < 0)
-    || originalPositions.some((position, index) => index > 0 && position !== originalPositions[index - 1] + 1)) {
-    pushToast("Managed multi-block moves require one contiguous selection.", "error");
-    return null;
-  }
-  const history: ManagedMoveHistorySpec | null = recordHistory ? {
-    sourcePage,
-    destinationPage,
-    roots: [...roots],
-    forwardPlacement: placement,
-    inversePlacement: originalParent === null
-      ? { placement: "root", position: originalPositions[0] }
-      : { placement: "child", parent_identity: originalParent, position: originalPositions[0] },
-    forwardRewrites: new Map(rewrites),
-    inverseRewrites: new Map(
-      roots
-        .filter((id) => rewrites.has(id))
-        .map((id) => [id, doc.byId[id].raw]),
-    ),
-  } : null;
-  return {
-    sourcePage,
-    destinationPage,
-    roots: [...roots],
-    placement,
-    rewrites,
-    graphBinding: graphBinding(),
-    bindingGeneration: admission.binding_generation,
-    sourceInstance,
-    destinationInstance,
-    sourceEditorGeneration: editorTransactionGeneration(sourcePage),
-    destinationEditorGeneration: editorTransactionGeneration(destinationPage),
-    rootNodes: nodes.map((node) => unwrap(node)),
-    targetParentNode: placement.placement === "child"
-      ? (doc.byId[placement.parent_identity] ? unwrap(doc.byId[placement.parent_identity]) : null)
-      : null,
-    history,
-    editorContext: (() => {
-      const context = captureHistoryEditorContext();
-      if (!context) return null;
-      let node = doc.byId[context.blockId];
-      while (node?.parent) node = doc.byId[node.parent];
-      return node && roots.includes(node.id) ? context : null;
-    })(),
-  };
-}
-
-function enqueueManagedMove<T>(run: () => Promise<T>, stale: T): Promise<T> {
-  const epoch = managedMoveQueueEpoch;
-  const binding = graphBinding();
-  if (managedMoveQueuePending >= MANAGED_MOVE_QUEUE_LIMIT
-    || managedMoveAcknowledgements.length >= MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT) {
-    return Promise.resolve(stale);
-  }
-  managedMoveQueuePending++;
-  const result = managedMoveQueue.then(async () => {
-    if (epoch !== managedMoveQueueEpoch || binding !== graphBinding()) return stale;
-    return run();
-  }).finally(() => {
-    if (epoch === managedMoveQueueEpoch) {
-      managedMoveQueuePending = Math.max(0, managedMoveQueuePending - 1);
-    }
-  });
-  managedMoveQueue = result.then(() => undefined, () => undefined);
-  return result;
-}
-
-function removeManagedMoveAcknowledgement(item: ManagedMoveAcknowledgement): void {
-  const index = managedMoveAcknowledgements.indexOf(item);
-  if (index >= 0) managedMoveAcknowledgements.splice(index, 1);
-}
-
-function managedMoveAcknowledgementDelay(attempt: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 50 * (2 ** Math.max(0, attempt - 1))));
-}
-
-async function drainManagedMoveAcknowledgements(): Promise<void> {
-  const runnerEpoch = managedMoveAcknowledgementEpoch;
-  if (managedMoveAcknowledgementRunnerEpoch === runnerEpoch) return;
-  managedMoveAcknowledgementRunnerEpoch = runnerEpoch;
-  try {
-    while (runnerEpoch === managedMoveAcknowledgementEpoch
-      && managedMoveAcknowledgements.length > 0) {
-      const item = managedMoveAcknowledgements[0];
-      if (item.epoch !== managedMoveAcknowledgementEpoch
-        || item.graphBinding !== graphBinding()
-        || item.bindingGeneration !== managedMoveAdmission()?.binding_generation) {
-        removeManagedMoveAcknowledgement(item);
-        continue;
-      }
-      try {
-        await backend().acknowledgeManagedApplicationMove(
-          item.bindingGeneration,
-          item.episodeId,
-          item.batchId,
-        );
-        removeManagedMoveAcknowledgement(item);
-      } catch (error) {
-        item.attempt++;
-        if (item.attempt >= MANAGED_MOVE_ACKNOWLEDGEMENT_ATTEMPTS) {
-          removeManagedMoveAcknowledgement(item);
-          // The move is already authoritative. Without a durable native ack,
-          // its pair deliberately remains exact crash-response evidence; do
-          // not turn cleanup failure into a false move failure or retry the
-          // semantic transaction.
-          console.warn("Could not retire managed move replay evidence", failureShape(error));
-          continue;
-        }
-        await managedMoveAcknowledgementDelay(item.attempt);
-      }
-    }
-  } finally {
-    if (managedMoveAcknowledgementRunnerEpoch === runnerEpoch) {
-      managedMoveAcknowledgementRunnerEpoch = null;
-      if (managedMoveAcknowledgements.length > 0) void drainManagedMoveAcknowledgements();
-    }
-  }
-}
-
-function enqueueManagedMoveAcknowledgement(
-  bindingGeneration: number,
-  episodeId: string,
-  batchId: string,
-): void {
-  if (managedMoveAcknowledgements.some((item) => item.episodeId === episodeId)) return;
-  if (managedMoveAcknowledgements.length >= MANAGED_MOVE_ACKNOWLEDGEMENT_LIMIT) return;
-  managedMoveAcknowledgements.push({
-    epoch: managedMoveAcknowledgementEpoch,
-    graphBinding: graphBinding(),
-    bindingGeneration,
-    episodeId,
-    batchId,
-    attempt: 0,
-  });
-  void drainManagedMoveAcknowledgements();
-}
-
-function enqueueManagedCrossPageMove(
-  sourcePage: string,
-  destinationPage: string,
-  roots: readonly string[],
-  placement: ManagedApplicationMovePlacement,
-  rewrites: Map<string, string>,
-  recordHistory = true,
-): Promise<boolean> {
-  const intent = prepareManagedCrossPageMoveIntent(
-    sourcePage,
-    destinationPage,
-    roots,
-    placement,
-    rewrites,
-    recordHistory,
-  );
-  if (!intent) return Promise.resolve(false);
-  return enqueueManagedMove(() => runManagedCrossPageMove(intent), false);
-}
-
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while
  *  it still contains the blocks. Otherwise a save that was ALREADY pending/in-flight
  *  for a source (from an earlier, unrelated edit) can fire right after the in-memory
@@ -7138,24 +6143,11 @@ async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "cr
   if (node.parent !== null) return "none"; // nested block at a child-list edge: stop
   const target = await feedNeighbor(node.page, dir);
   if (!target || !pageWritable(target)) return "none";
-  // Authority is selected once, by the dispatcher (I-6). This shape runs INSIDE
-  // the managed move queue (see moveBlockFeed), so its managed arm submits the
-  // intent inline instead of enqueueing a second time.
+  // Authority is selected once, by the dispatcher (I-6).
   return dispatchCrossPageMove<"within" | "crossed" | "none">(
     { sourcePages: [node.page], destinationPage: target, roots: [id] },
     {
       unavailable: () => "none",
-      managed: async () => {
-        const position = dir === -1 ? pageByName(target)!.roots.length : 0;
-        const intent = prepareManagedCrossPageMoveIntent(
-          node.page,
-          target,
-          [id],
-          { placement: "root", position },
-          new Map(),
-        );
-        return intent && await runManagedCrossPageMove(intent) ? "crossed" : "none";
-      },
       direct: async () => {
         if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
         if (!doc.byId[id]) return "none"; // vanished during the flush
@@ -7167,15 +6159,8 @@ async function moveBlockFeedNow(id: string, dir: 1 | -1): Promise<"within" | "cr
   );
 }
 
-/** Managed commands are queued before resolving their source/destination. Key
- * repeat can otherwise capture several intents against the same pre-move page;
- * the first commits and every later intent becomes stale (or reaches the actor
- * as a missing/foreign root). Re-evaluating each command after its predecessor
- * publishes preserves the user's complete rapid movement sequence. */
 export function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
-  return managedMoveAdmission()
-    ? enqueueManagedMove(() => moveBlockFeedNow(id, dir), "none")
-    : moveBlockFeedNow(id, dir);
+  return moveBlockFeedNow(id, dir);
 }
 
 /** Move every top-level selected block up/down by one slot, preserving the
@@ -7227,16 +6212,6 @@ export async function moveSelectionItems(dir: 1 | -1) {
     { sourcePages: [page], destinationPage: target, roots: ids },
     {
       unavailable: () => {},
-      managed: async () => {
-        const position = dir === -1 ? pageByName(target)!.roots.length : 0;
-        await enqueueManagedCrossPageMove(
-          page,
-          target,
-          ids,
-          { placement: "root", position },
-          new Map(),
-        );
-      },
       direct: async () => {
         if (!(await prepareCrossPageSources([page]))) return; // source has unsaved edits → abort
         pushUndo("move-sel-cross", [page, target]);

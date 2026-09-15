@@ -2,7 +2,7 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { graphBindingRuntime } from "./graphBindingRuntime";
 import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
 import { resetStore, flushAll } from "./store";
@@ -20,21 +20,17 @@ import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
 import { openConfiguredHomePage } from "./homePage";
-import { safeManagedErrorDetail } from "./managedDiagnostics";
+import { safeErrorDetail } from "./safeErrorDetail";
 import { beginGraphOpenTrace, markGraphOpen } from "./graphOpenTrace";
 
 const GRAPH_KEY = "tine.graphPath";
-export const PARTIAL_PROVIDER_REFUSAL =
-  "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.";
 
 /** Keep a graph-open refusal visible until the user can retry the exact same
  * target. A picker has already returned its target at this point, so reopening
  * the picker would be a lossy and surprising substitute for Retry. */
 export function reportGraphOpenFailure(error: unknown, retry: () => void): void {
-  const detail = safeManagedErrorDetail(error);
-  const message = detail === PARTIAL_PROVIDER_REFUSAL
-    ? PARTIAL_PROVIDER_REFUSAL
-    : `Couldn't open the graph. (${detail})`;
+  const detail = safeErrorDetail(error);
+  const message = `Couldn't open the graph. (${detail})`;
   pushToast(message, "error", {
     sticky: true,
     action: { label: "Retry", run: retry },
@@ -55,9 +51,9 @@ export type LoadGraphPathOutcome =
   | { kind: "loaded" | "already_current"; root: string }
   | { kind: "focused_existing" | "aborted" };
 
-// Frontend continuations may overlap while native storage recovery is being
-// superseded (most importantly, emergency Direct Files during a managed open).
-// This is not storage authority: it only prevents an obsolete promise from
+// Frontend continuations may overlap while a graph open is being superseded by
+// a newer one (a second picker choice before the first finishes). This is not
+// storage authority: it only prevents an obsolete promise from
 // repainting/resetting the UI after a newer native operation has won.
 let graphLoadContinuation = 0;
 
@@ -163,11 +159,6 @@ export async function loadGraphPath(
   if (continuation !== graphLoadContinuation) return { kind: "aborted" };
 
   let result;
-  // Native graph replacement is asynchronous. Stop accepting watcher events
-  // from the retired binding before its completion can publish a new generation;
-  // otherwise an old runtime error can race the successful switch response.
-  const clearedManagedRuntime = hadGraph && (switching || options.forceRefresh === true);
-  if (clearedManagedRuntime) managedStorageRuntime.clear();
   try {
     result = await backend().loadGraph(graphPath);
   } catch (error) {
@@ -178,7 +169,6 @@ export async function loadGraphPath(
     if (rebindsPdfOwner && prev) {
       activatePdfOwnership(prev);
     }
-    if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
   if (continuation !== graphLoadContinuation) return { kind: "aborted" };
@@ -188,10 +178,9 @@ export async function loadGraphPath(
     if (rebindsPdfOwner && prev) {
       activatePdfOwnership(prev);
     }
-    if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     return { kind: "focused_existing" };
   }
-  managedStorageRuntime.bind(result.binding_generation, result.application_page_admission);
+  graphBindingRuntime.bind(result.binding_generation, result.application_page_admission);
   const meta = result.meta;
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };
@@ -371,20 +360,6 @@ export async function refreshPageIdentities(): Promise<void> {
       )
     : {};
   commitNavigationIndex();
-}
-
-/** React to native code atomically rebinding the same graph root to a new
- * storage-authority generation. This retires renderer objects from the former
- * generation, but never reopens the graph or independently decides whether the
- * native transition succeeded. */
-export function rebindCurrentStorageAuthority(): void {
-  if (!graphMeta()) throw new Error("the current graph identity disappeared during the storage transition");
-  resetStore();
-  resetNavigationIndex();
-  clearAssetBlobCache();
-  bumpGraphEpoch();
-  void loadAliases();
-  void pruneSidebarBlocks();
 }
 
 async function loadAliases(): Promise<void> {
@@ -732,10 +707,9 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
     // Match this graph's journal titles.
     setJournalTitleFormat(meta?.journal_page_title_format);
   }
-  // Comparing the FILE is not enough for favorites. A managed graph has no
-  // retained `Graph` for the watcher to ask, so it re-reads configuration after
-  // every settings write including Tine's own — and re-seeding would drop the
-  // arrangement and re-fetch its page on every star toggled in the sidebar.
+  // Comparing the FILE is not enough for favorites: configuration is re-read
+  // after every settings write including Tine's own, and re-seeding would drop
+  // the arrangement and re-fetch its page on every star toggled in the sidebar.
   // Compare what the user is actually being shown instead.
   const incoming = meta?.favorites ?? [];
   const shown = favorites().map((f) => f.name);

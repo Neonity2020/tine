@@ -12,14 +12,12 @@ afterEach(() => {
 });
 
 describe("graph open recovery", () => {
-  it("keeps a known partial-provider failure sticky and retries its same target", async () => {
+  it("keeps a graph open failure sticky and retries its same target", async () => {
     vi.spyOn(backend(), "listKnownGraphs").mockResolvedValue([
       { name: "Shared notes", path: "/graphs/shared-notes" },
     ]);
     const openKnown = vi.fn(async () => {
-      throw new Error(
-        "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
-      );
+      throw new Error("Permission denied (os error 13)");
     });
     const root = document.createElement("div");
     document.body.append(root);
@@ -39,9 +37,7 @@ describe("graph open recovery", () => {
       row.click();
       await vi.waitFor(() => expect(toasts()).toHaveLength(1));
       const failure = toasts()[0]!;
-      expect(failure.message).toBe(
-        "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
-      );
+      expect(failure.message).toBe("Couldn't open the graph. (Permission denied (os error 13))");
       expect(failure.sticky).toBe(true);
       expect(failure.action?.label).toBe("Retry");
 

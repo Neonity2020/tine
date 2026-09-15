@@ -1,15 +1,11 @@
 import { createSignal, type Accessor } from "solid-js";
 import type { LoadGraphPathOutcome } from "./graph";
-import { safeManagedErrorDetail } from "./managedDiagnostics";
-import type {
-  SparseV2CancelResult,
-  StorageTransitionEvent,
-  StorageTransitionKind,
-} from "./types";
+import { safeErrorDetail } from "./safeErrorDetail";
+import type { StorageTransitionEvent, StorageTransitionKind } from "./types";
 
 export const STARTUP_PROGRESS_VISIBLE_MS = 250;
 
-export type StartupOperation = "lookup" | "graph_open" | "graph_picker" | "cold_return";
+export type StartupOperation = "lookup" | "graph_open" | "graph_picker";
 
 export interface StartupRecoverySnapshot {
   mode: "idle" | "working" | "recovery";
@@ -31,8 +27,6 @@ export interface StartupRecoveryDeps {
   persistedGraphPath(): string;
   openGraph(path: string, supersedeCurrent?: boolean): Promise<LoadGraphPathOutcome>;
   pickGraph(): Promise<LoadGraphPathOutcome>;
-  coldReturn(path: string): Promise<SparseV2CancelResult>;
-  acceptColdReturn(result: SparseV2CancelResult): void;
   copyText(text: string): Promise<void>;
   notify(message: string, kind: "success" | "error"): void;
   completeFirstLoad(): void;
@@ -60,17 +54,9 @@ export function startupGraphName(path: string): string {
 export function startupPhaseLabel(phase: string): string {
   const known: Record<string, string> = {
     requested: "Starting storage operation",
-    waiting_for_transition: "Waiting for the current storage operation",
     looking_up_selection: "Finding the last workspace",
     validating_target: "Checking workspace access",
     opening_direct: "Opening Direct Files",
-    opening_managed: "Opening managed storage",
-    activating_managed: "Enabling managed storage",
-    joining_managed: "Joining the synced workspace",
-    draining_managed: "Finishing managed-storage edits",
-    confirming_projection: "Confirming the Markdown projection",
-    quarantining_managed_selection: "Selecting the current Markdown tree as Direct Files",
-    publishing_direct: "Opening Direct Files",
     "lookup.starting": "Finding the last workspace",
     "graph.access": "Checking workspace access",
     "graph.failed": "Workspace open failed",
@@ -88,12 +74,7 @@ export function validStorageTransition(event: StorageTransitionEvent): boolean {
 }
 
 function startupOperation(kind: StorageTransitionKind): StartupOperation {
-  switch (kind) {
-    case "lookup": return "lookup";
-    case "return_emergency":
-    case "return_gracefully": return "cold_return";
-    default: return "graph_open";
-  }
+  return kind === "lookup" ? "lookup" : "graph_open";
 }
 
 export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
@@ -101,7 +82,6 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
   start: () => void;
   retry: () => void;
   openAnother: () => Promise<void>;
-  returnToDirectFiles: () => Promise<void>;
   copyDetails: () => Promise<void>;
   receiveTransition: (event: StorageTransitionEvent) => void;
   dispose: () => void;
@@ -155,7 +135,7 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       mode: "recovery",
       phase: "graph.failed",
       target,
-      detail: safeManagedErrorDetail(detail),
+      detail: safeErrorDetail(detail),
       elapsedMs: Math.max(0, now() - current.startedAt),
     }));
   };
@@ -215,28 +195,6 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     }
   };
 
-  const returnToDirectFiles = async () => {
-    const previous = snapshot();
-    const eligible = previous.mode === "recovery"
-      || (previous.mode === "working" && previous.operation === "graph_open");
-    if (!eligible || !previous.target) return;
-    const attempt = invalidate();
-    // The button itself is the explicit emergency action. A native modal can
-    // be starved behind the very managed open this path must abandon, which
-    // leaves the user trapped before the native supervisor ever sees the
-    // request. Managed evidence is preserved, so immediate invocation is both
-    // the safer and the reversible failure-mode behavior.
-    begin(attempt, "cold_return", "quarantining_managed_selection", previous.target);
-    try {
-      const result = await deps.coldReturn(previous.target);
-      if (attempt !== sequence || disposed) return;
-      deps.acceptColdReturn(result);
-      await completeOpen(attempt, previous.target, true);
-    } catch (error) {
-      recover(attempt, previous.target, error);
-    }
-  };
-
   const receiveTransition = (event: StorageTransitionEvent) => {
     if (!validStorageTransition(event) || disposed) return;
     if (event.operationId < latestNativeOperation) return;
@@ -262,7 +220,7 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
       `Elapsed: ${Math.round(current.elapsedMs)} ms`,
     ];
     if (current.operationId) lines.push(`Native operation: ${current.operationId} (${current.transitionKind})`);
-    if (current.detail) lines.push(`Detail: ${safeManagedErrorDetail(current.detail)}`);
+    if (current.detail) lines.push(`Detail: ${safeErrorDetail(current.detail)}`);
     return lines.join("\n");
   };
 
@@ -271,13 +229,12 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     start: runLookup,
     retry: runLookup,
     openAnother,
-    returnToDirectFiles,
     copyDetails: async () => {
       try {
         await deps.copyText(diagnostics());
         deps.notify("Startup recovery details copied.", "success");
       } catch (error) {
-        deps.notify(`Couldn't copy startup recovery details: ${safeManagedErrorDetail(error)}`, "error");
+        deps.notify(`Couldn't copy startup recovery details: ${safeErrorDetail(error)}`, "error");
       }
     },
     receiveTransition,

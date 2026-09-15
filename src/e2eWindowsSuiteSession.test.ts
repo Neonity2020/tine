@@ -54,7 +54,7 @@ describe("every windows-smoke journey can open a WebView2 session", () => {
   // The scan is only as good as its input: if the suite table is renamed or
   // reshaped, this test must fail loudly rather than pass over an empty list.
   it("reads a non-empty windows-smoke suite out of run-e2e.mjs", () => {
-    expect(windowsSuite.length).toBeGreaterThanOrEqual(8);
+    expect(windowsSuite.length).toBeGreaterThanOrEqual(7);
     expect(windowsSuite.map((entry) => entry.name)).toContain("windows-core");
     expect(windowsSuite.map((entry) => entry.name)).toContain("page-properties");
   });

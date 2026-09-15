@@ -15,7 +15,7 @@ import {
   withDirectMoveRecord,
 } from "./store";
 import { journalTitle } from "./journal";
-import { dispatchCarry, MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST } from "./storageDispatch";
+import { dispatchCarry } from "./storageDispatch";
 import { graphBinding } from "./persistence";
 import { carryKeepsContext, carryHeaderText, pushToast } from "./ui";
 import { openJournals } from "./router";
@@ -76,23 +76,6 @@ async function persist(today: string, sources: string[]): Promise<boolean> {
   });
 }
 
-/** Managed storage has no carry arm.
- *
- *  Carry gathers unfinished tasks from N journal days into today, and the native
- *  managed move accepts exactly ONE source page — the same limit the multi-source
- *  relative move already refuses under. Until B1 this refusal did not exist:
- *  carry ran the Direct choreography under every admission, writing journal files
- *  directly beneath a managed binding. The refusal is taken at the operation
- *  boundary, before `carryUnfinished` touches memory, so the editor is never left
- *  holding a mutation storage never accepted.
- *
- *  Lifting the multi-source limit is an undecided product question (spec B), not
- *  an implementation gap — so this refuses rather than guessing at a managed
- *  carry. */
-function refuseManagedCarry(): void {
-  pushToast(MANAGED_MULTI_SOURCE_MOVE_UNAVAILABLE_TOAST, "error");
-}
-
 async function report(n: number, today: string, sources: string[]): Promise<void> {
   // If a touched page couldn't be saved (conflict / disk error), DON'T reload the
   // journals feed — that would re-read the old files and drop the carried blocks
@@ -138,7 +121,6 @@ export async function carryDay(pageName: string): Promise<void> {
   await dispatchCarry<void>(
     { destinationPage: today, sourcePages: [pageName] },
     {
-      managed: () => refuseManagedCarry(),
       unavailable: () => {}, // the front door already raised the shared refusal
       direct: async () => {
         // Flush the source day (while it still holds the tasks) before the in-memory
@@ -173,7 +155,6 @@ export async function carryDaysBack(days: number): Promise<void> {
   await dispatchCarry<void>(
     { destinationPage: today, sourcePages: titles },
     {
-      managed: () => refuseManagedCarry(),
       unavailable: () => {},
       direct: async () => {
         // Flush source days (with their tasks intact) before the in-memory move — see carryDay.

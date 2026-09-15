@@ -82,18 +82,14 @@ import {
   blockIsGridView,
   trackAssetWrite,
   formatForBlock,
+  BULK_INSERTION_UNAVAILABLE_TOAST,
   depthOf,
-  managedBulkOutlinePlan,
-  MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST,
-  preflightManagedBulkInsertion,
-  consumeManagedBulkInsertionAdmission,
-  reportManagedBulkInsertionRefusal,
   setHeading,
   collapsibleDescendantIds,
   setCollapsedDescendants,
   blockExternalId,
   takeEditorLease,
-  type ManagedBulkInsertionPreflight,
+  type BulkInsertionPreflight,
   type OutlineScope,
 } from "../store";
 import { dispatchBulkInsertion } from "../storageDispatch";
@@ -1413,28 +1409,15 @@ export function Editor(props: { id: string }): JSX.Element {
     setRaw(props.id, next, setRawOpts);
   };
 
-  const admitBulkOutlineInsertion = (
-    nodes: readonly OutlineNode[],
-    reusedHost: boolean,
-  ) => {
-    const admission = dispatchBulkInsertion<ManagedBulkInsertionPreflight>(
+  const admitBulkOutlineInsertion = () => {
+    const admission = dispatchBulkInsertion<BulkInsertionPreflight>(
       { targetId: props.id },
       {
         direct: () => ({ kind: "direct" }),
-        unavailable: () => ({ kind: "refused", toast: MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST }),
-        managed: (managedAdmission) => preflightManagedBulkInsertion(
-          managedAdmission,
-          props.id,
-          (limits) => managedBulkOutlinePlan(
-            nodes,
-            depthOf(props.id) + 1,
-            reusedHost ? 1 : 0,
-            limits,
-          ),
-        ),
+        unavailable: () => ({ kind: "refused", toast: BULK_INSERTION_UNAVAILABLE_TOAST }),
       },
     );
-    if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+    if (admission.kind === "refused") pushToast(admission.toast, "error");
     return admission;
   };
 
@@ -2384,9 +2367,8 @@ export function Editor(props: { id: string }): JSX.Element {
       const nodes = item.templateNodes.map((n) => templateToOutline(n, doc.byId[props.id]?.page));
       const wasEmpty =
         r.raw.trim() === "" && doc.byId[props.id].children.length === 0;
-      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      const admission = admitBulkOutlineInsertion();
       if (admission.kind === "refused") return;
-      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("template-insert", [doc.byId[props.id].page], () => {
         if (wasEmpty) return replaceTemplateTriggerWithOutline(props.id, nodes);
         commit(r.raw);
@@ -3872,9 +3854,8 @@ export function Editor(props: { id: string }): JSX.Element {
     if (htmlNodes) {
       e.preventDefault();
       const wasEmpty = ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
-      const admission = admitBulkOutlineInsertion(htmlNodes, wasEmpty);
+      const admission = admitBulkOutlineInsertion();
       if (admission.kind === "refused") return;
-      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("structured-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty
@@ -3903,9 +3884,8 @@ export function Editor(props: { id: string }): JSX.Element {
       if (!nodes.length) return;
       const wasEmpty =
         ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
-      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      const admission = admitBulkOutlineInsertion();
       if (admission.kind === "refused") return;
-      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("outline-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty

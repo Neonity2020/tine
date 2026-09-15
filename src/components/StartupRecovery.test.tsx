@@ -16,10 +16,8 @@ describe("startup recovery surface", () => {
       lookupGraphPath: async () => "/home/martin/private/Research graph",
       injectedGraphPath: () => "",
       persistedGraphPath: () => "/home/martin/private/Research graph",
-      openGraph: vi.fn(async () => { throw new Error("managed open refused"); }),
+      openGraph: vi.fn(async () => { throw new Error("open refused"); }),
       pickGraph: vi.fn(),
-      coldReturn: vi.fn(),
-      acceptColdReturn: vi.fn(),
       copyText,
       notify: vi.fn(),
       completeFirstLoad: vi.fn(),
@@ -35,7 +33,6 @@ describe("startup recovery surface", () => {
     expect(host.querySelector("[role=alertdialog]")).not.toBeNull();
     expect(host.textContent).toContain("Retry lookup");
     expect(host.textContent).toContain("Open another graph");
-    expect(host.textContent).toContain("Forget managed mode and open Research graph in Direct Files now");
     expect(host.textContent).toContain("Copy details");
     expect(host.textContent).not.toContain("/home/martin/private");
 
@@ -45,40 +42,6 @@ describe("startup recovery surface", () => {
     await Promise.resolve();
     expect(copyText).toHaveBeenCalledOnce();
     expect(copyText.mock.calls[0][0]).not.toContain("/home/martin/private");
-
-    controller.dispose();
-    dispose();
-  });
-
-  it("keeps the Direct Files escape visible while managed open is still progressing", async () => {
-    vi.useFakeTimers();
-    const controller = createStartupRecoveryController({
-      lookupGraphPath: async () => "/graphs/alpha",
-      injectedGraphPath: () => "",
-      persistedGraphPath: () => "/graphs/alpha",
-      openGraph: () => new Promise(() => {}),
-      pickGraph: vi.fn(),
-      coldReturn: vi.fn(),
-      acceptColdReturn: vi.fn(),
-      copyText: vi.fn(),
-      notify: vi.fn(),
-      completeFirstLoad: vi.fn(),
-    });
-    const host = document.createElement("div");
-    document.body.append(host);
-    const dispose = render(() => <StartupRecoveryLayer controller={controller} />, host);
-
-    controller.start();
-    await Promise.resolve();
-    await Promise.resolve();
-    // The elapsed-time signal updates on the controller's 100 ms ticker.
-    await vi.advanceTimersByTimeAsync(300);
-
-    const direct = [...host.querySelectorAll("button")]
-      .find((button) => button.textContent?.includes("open alpha in Direct Files now"));
-    expect(direct).toBeDefined();
-    expect(direct?.disabled).toBe(false);
-    expect(host.textContent).not.toContain("Retry lookup");
 
     controller.dispose();
     dispose();

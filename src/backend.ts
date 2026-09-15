@@ -23,9 +23,6 @@ import type {
   ActivationExpectedRevision,
   ActivationIntent,
   ApplicationPageAdmission,
-  ManagedApplicationMoveSubtreesRecoveryResult,
-  ManagedApplicationMoveSubtreesRequest,
-  ManagedApplicationMoveSubtreesResult,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
@@ -53,25 +50,7 @@ import type {
   LiveSaveConflictCapture,
   MarkerConflictDiff,
   MergeDecision,
-  ManagedPageMutationPreflightResult,
   PrintOpts,
-  SparseV2Status,
-  SparseV2CancelResult,
-  SparseV2AdoptionResult,
-  SparseV2ActivationProgressEvent,
-  SparseV2Tick,
-  SparseV2RuntimeStatusEvent,
-  SparseV2TickEvent,
-  SparseV2ErrorEvent,
-  SyncAbsenceSweepEvent,
-  SyncAbsenceSweepChangedEvent,
-  SyncAbsenceSweepActionOutcome,
-  SyncAbsenceSweepRestoreOutcome,
-  SparseV2QueryRequest,
-  SparseV2QueryReply,
-  SparseV2EditorLoadRequest,
-  SparseV2EditorSaveRequest,
-  SparseV2EditorOutcome,
   StorageTransitionEvent,
   PdfState,
   QueryExecution,
@@ -86,8 +65,7 @@ import { recordGraphOpenCommand } from "./graphOpenTrace";
 
 export type ConflictCapsuleAuthority =
   | { kind: "direct_durable"; expected_disk_rev: string }
-  | { kind: "direct_live"; conflict_epoch: number }
-  | { kind: "managed"; path: string; revision: string };
+  | { kind: "direct_live"; conflict_epoch: number };
 
 export interface ConflictCapsuleReview {
   diff: SyncConflictDiff;
@@ -189,13 +167,10 @@ export interface MediaCaptureResult {
   ext?: string | null;
 }
 
-/** Result of the process-wide native shutdown preparation. Android may request
- * an Activity exit only after `safe`; partial native progress must remain
- * shielded so retrying does not replay the frontend persistence transaction. */
-export type TineQuitPreparation =
-  | { status: "safe" }
-  | { status: "refused"; detail: string }
-  | { status: "partial"; safe_slots: string[]; detail: string };
+/** Result of the process-wide native shutdown preparation. Direct Files has no
+ * native runtime to drain, so the answer is always `safe`; the shape stays so
+ * Android's exit path keeps one typed question. */
+export type TineQuitPreparation = { status: "safe" };
 
 export interface KnownGraph {
   path: string;
@@ -220,14 +195,8 @@ export interface PluginRegistryCacheEnvelope {
 export type BackendErrorKind =
   | "save-conflict"
   | "direct-save-failure"
-  | "sync-data-unavailable"
-  | "managed-graph-mismatch"
-  | "shared-frontier-mismatch"
-  | "adoption-archived"
-  | "sparse-shutdown-refused"
   | "asset-too-large"
   | "operation-cancelled"
-  | "managed-actor-refusal"
   | "query-not-ready"
   | "query-unavailable"
   | "query-print-refused";
@@ -235,15 +204,10 @@ export type BackendErrorKind =
 const BACKEND_ERROR_MESSAGES: Record<
   Exclude<
     BackendErrorKind,
-    "save-conflict" | "direct-save-failure" | "managed-actor-refusal" | "query-print-refused" | "query-not-ready" | "query-unavailable"
+    "save-conflict" | "direct-save-failure" | "query-print-refused" | "query-not-ready" | "query-unavailable"
   >,
   string
 > = {
-  "sync-data-unavailable": "This graph does not yet contain sync data from another device.",
-  "managed-graph-mismatch": "The shared descriptor names another managed graph.",
-  "shared-frontier-mismatch": "This device's notes are not in the shared provider frontier.",
-  "adoption-archived": "Adoption stopped after this device's own history was archived.",
-  "sparse-shutdown-refused": "Tine-managed storage could not verify a clean stop.",
   "asset-too-large": "The asset exceeds the safe size limit.",
   "operation-cancelled": "The operation was cancelled.",
 };
@@ -261,61 +225,6 @@ export class BackendError extends Error {
   }
 }
 
-export class SyncDataUnavailableError extends BackendError {
-  constructor() {
-    super("sync-data-unavailable", BACKEND_ERROR_MESSAGES["sync-data-unavailable"]);
-    this.name = "SyncDataUnavailableError";
-  }
-}
-
-export class ManagedGraphMismatchError extends BackendError {
-  constructor() {
-    super("managed-graph-mismatch", BACKEND_ERROR_MESSAGES["managed-graph-mismatch"]);
-    this.name = "ManagedGraphMismatchError";
-  }
-}
-
-export type SharedFrontierMismatchSide = "local-only" | "shared-only" | "changed";
-export type SharedFrontierMismatchCategory = "kind" | "preamble" | "outline" | "explicit-ids";
-export interface SharedFrontierMismatchPath {
-  path: string;
-  side: SharedFrontierMismatchSide;
-  categories: SharedFrontierMismatchCategory[];
-}
-/** The bounded, typed detail a clean-join refusal carries so the user who
- * asked for the join can reconcile it: counts plus at most 32 relative note
- * paths with their side or changed categories. Never note content. */
-export interface SharedFrontierMismatchDetail {
-  localPages: number;
-  sharedPages: number;
-  localOnly: number;
-  sharedOnly: number;
-  changed: number;
-  paths: SharedFrontierMismatchPath[];
-  omitted: number;
-}
-export const SHARED_FRONTIER_MISMATCH_MAX_PATHS = 32;
-
-export class SharedFrontierMismatchError extends BackendError {
-  constructor(readonly detail: SharedFrontierMismatchDetail | null = null) {
-    super("shared-frontier-mismatch", BACKEND_ERROR_MESSAGES["shared-frontier-mismatch"]);
-    this.name = "SharedFrontierMismatchError";
-  }
-}
-
-export class AdoptionArchivedError extends BackendError {
-  constructor() {
-    super("adoption-archived", BACKEND_ERROR_MESSAGES["adoption-archived"]);
-    this.name = "AdoptionArchivedError";
-  }
-}
-
-export class SparseShutdownRefusedError extends BackendError {
-  constructor() {
-    super("sparse-shutdown-refused", BACKEND_ERROR_MESSAGES["sparse-shutdown-refused"]);
-    this.name = "SparseShutdownRefusedError";
-  }
-}
 
 export class AssetTooLargeError extends BackendError {
   constructor() {
@@ -380,12 +289,6 @@ export class QueryUnavailableError extends BackendError {
   }
 }
 
-export class ManagedActorRefusalError extends BackendError {
-  constructor(readonly reasonCode: string) {
-    super("managed-actor-refusal", `Managed storage refused the operation (reason code: ${reasonCode}).`);
-    this.name = "ManagedActorRefusalError";
-  }
-}
 
 export class DirectSaveFailureError extends BackendError {
   constructor(readonly reasonCode: string, readonly ioErrorKind: string) {
@@ -418,18 +321,6 @@ export function classifyNativeCallError(error: unknown): unknown {
 
 type TaggedBackendPayload = { kind: string; reason_code?: unknown; detail?: unknown };
 
-const SHARED_FRONTIER_SIDES: readonly SharedFrontierMismatchSide[] = ["local-only", "shared-only", "changed"];
-const SHARED_FRONTIER_CATEGORIES: readonly SharedFrontierMismatchCategory[] = [
-  "kind",
-  "preamble",
-  "outline",
-  "explicit-ids",
-];
-
-function nonNegativeCount(value: unknown): number | null {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
-}
-
 const REASON_CODE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*)*$/;
 
 function readIoErrorKind(detail: unknown): string | null {
@@ -438,42 +329,6 @@ function readIoErrorKind(detail: unknown): string | null {
   return typeof value === "string" && /^[A-Z][A-Za-z]{0,63}$/.test(value) ? value : null;
 }
 
-/** Validate the native detail object field by field; anything malformed
- * degrades to a detail-less refusal rather than trusting the payload. */
-function readSharedFrontierMismatchDetail(raw: unknown): SharedFrontierMismatchDetail | null {
-  if (!raw || typeof raw !== "object") return null;
-  const record = raw as Record<string, unknown>;
-  const localPages = nonNegativeCount(record.local_pages);
-  const sharedPages = nonNegativeCount(record.shared_pages);
-  const localOnly = nonNegativeCount(record.local_only);
-  const sharedOnly = nonNegativeCount(record.shared_only);
-  const changed = nonNegativeCount(record.changed);
-  const omitted = nonNegativeCount(record.omitted);
-  if (
-    localPages === null || sharedPages === null || localOnly === null
-    || sharedOnly === null || changed === null || omitted === null
-    || !Array.isArray(record.paths) || record.paths.length > SHARED_FRONTIER_MISMATCH_MAX_PATHS
-  ) {
-    return null;
-  }
-  const paths: SharedFrontierMismatchPath[] = [];
-  for (const entry of record.paths as unknown[]) {
-    if (!entry || typeof entry !== "object") return null;
-    const { path, side, categories } = entry as Record<string, unknown>;
-    if (typeof path !== "string" || path.length === 0) return null;
-    if (!SHARED_FRONTIER_SIDES.includes(side as SharedFrontierMismatchSide)) return null;
-    const known: SharedFrontierMismatchCategory[] = [];
-    if (categories !== undefined) {
-      if (!Array.isArray(categories)) return null;
-      for (const category of categories as unknown[]) {
-        if (!SHARED_FRONTIER_CATEGORIES.includes(category as SharedFrontierMismatchCategory)) return null;
-        known.push(category as SharedFrontierMismatchCategory);
-      }
-    }
-    paths.push({ path, side: side as SharedFrontierMismatchSide, categories: known });
-  }
-  return { localPages, sharedPages, localOnly, sharedOnly, changed, paths, omitted };
-}
 
 /** Read the structured `Diagnostic` a `query-print-refused` envelope carries.
  *
@@ -541,18 +396,6 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
         ? new SaveConflictError(epoch as number | null, payload.reason_code, ioErrorKind)
         : null;
     }
-    case "sync-data-unavailable":
-      return new SyncDataUnavailableError();
-    case "managed-graph-mismatch":
-      return new ManagedGraphMismatchError();
-    case "shared-frontier-mismatch":
-      return new SharedFrontierMismatchError(
-        payload.detail === undefined ? null : readSharedFrontierMismatchDetail(payload.detail),
-      );
-    case "adoption-archived":
-      return new AdoptionArchivedError();
-    case "sparse-shutdown-refused":
-      return new SparseShutdownRefusedError();
     case "asset-too-large":
       return new AssetTooLargeError();
     case "operation-cancelled":
@@ -570,10 +413,6 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
         ? new QueryUnavailableError(payload.reason_code, detail)
         : null;
     }
-    case "managed-actor-refusal":
-      return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
-        ? new ManagedActorRefusalError(payload.reason_code)
-        : null;
     case "query-print-refused":
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         ? new QueryPrintRefusedError(payload.reason_code, readPrintDiagnostic(payload.detail))
@@ -649,8 +488,8 @@ export interface Backend {
    *  the caller MUST have flushed pending edits first. Does not resolve — the
    *  process exits. */
   quit(): Promise<void>;
-  /** Verify every managed runtime can stop cleanly without exiting the app.
-   * Android calls this before handing the final activity exit to SafeBack. */
+  /** Process-wide shutdown preparation. Android calls this before handing the
+   * final activity exit to SafeBack. */
   prepareQuit(): Promise<TineQuitPreparation>;
   closeGraphWindow(): Promise<void>;
   /** Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
@@ -674,15 +513,13 @@ export interface Backend {
   /** Raw source text of every md/org file in the open graph (+journals when
    *  asked), for the "Help improve Tine" diff panel. Read-only, local. */
   graphSourceFiles(includeJournals: boolean): Promise<GraphSourceFile[]>;
-  /** Save a page. `baseRev` is the revision the editor loaded. Direct Files
-   *  binds `force` to `conflictEpoch`; managed storage binds it to the exact
-   *  managed path and revision observed after refusal. */
+  /** Save a page. `baseRev` is the revision the editor loaded; `force` is
+   *  bound to `conflictEpoch`, the live conflict the user chose to overwrite. */
   savePage(
     page: PageDto,
     baseRev: string | null,
     force?: boolean,
     conflictEpoch?: number | null,
-    managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
   /** Publish the durable recovery record for one Direct cross-page move BEFORE
    *  the first page is written (packet B2, I-3/I-2). `destination` and
@@ -694,58 +531,6 @@ export interface Backend {
   /** Retire that record once every participant is durably terminal. Resolves to
    *  whether it was retired; a record left behind is converged at the next open. */
   finishDirectCrossPageMove(moveId: string): Promise<boolean>;
-  /** X1 native bridge only. Production gesture routing remains disabled until
-   * X2 owns quiescence, leases, publication, and semantic history. */
-  moveManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ): Promise<ManagedApplicationMoveSubtreesResult>;
-  /** Retire response-replay evidence after the committed page pair is installed. */
-  acknowledgeManagedApplicationMove(
-    bindingGeneration: number,
-    episodeId: string,
-    batchId: string,
-  ): Promise<void>;
-  /** Resolve one exact deferred move episode without routing a new gesture. */
-  recoverManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ): Promise<ManagedApplicationMoveSubtreesRecoveryResult>;
-  preflightManagedPageMutation(
-    page: PageDto,
-    baseRevision: string | null,
-    bindingGeneration: number,
-  ): Promise<ManagedPageMutationPreflightResult>;
-  sparseV2Status(): Promise<SparseV2Status>;
-  onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
-  onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
-  onSparseV2Error(cb: (event: SparseV2ErrorEvent) => void): Promise<() => void>;
-  onSparseV2ActivationProgress(
-    bindingGeneration: number,
-    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
-  ): Promise<() => void>;
-  activateSparseV2(): Promise<SparseV2Status>;
-  cancelSparseV2(): Promise<SparseV2CancelResult>;
-  cancelSparseV2Cold(path: string): Promise<SparseV2CancelResult>;
-  prepareSparseV2Share(): Promise<SparseV2Status>;
-  joinSparseV2Shared(): Promise<SparseV2Status>;
-  /** Adopt another device's shared graph, archiving this device's own managed history. */
-  adoptSparseV2Shared(): Promise<SparseV2AdoptionResult>;
-  /** Where a set-aside managed history is archived, knowable before adoption runs. */
-  sparseV2RecoveryLocation(): Promise<string>;
-  sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
-  sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
-  sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
-  sparseV2Tick(): Promise<SparseV2Tick>;
-  listAbsenceSweeps(): Promise<SyncAbsenceSweepEvent[]>;
-  onAbsenceSweepChanged(
-    bindingGeneration: number,
-    cb: (sweep: SyncAbsenceSweepEvent) => void,
-  ): Promise<() => void>;
-  reapplyAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepActionOutcome>;
-  restoreAbsenceSweep(sweepId: string): Promise<SyncAbsenceSweepRestoreOutcome>;
-  keepAbsenceSweepDeletion(sweepId: string): Promise<void>;
-  sparseV2CleanShutdown(): Promise<import("./types").SparseV2RuntimeStatus>;
   /** Bundled read-only Guide pages, compiled from the same templates as the demo graph. */
   guidePages(): Promise<GuidePage[]>;
   /** Copy the bundled Guide into the real graph under `tine-guide/`. */
@@ -1159,21 +944,15 @@ export interface Backend {
    *  per reconcile cycle that changed more than the bulk threshold of pages. */
   onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void>;
   /** Subscribe to externally changed graph assets. This is cache observation,
-   *  not managed-storage or oplog admission. */
+   *  not save admission. */
   onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void>;
   /** Subscribe to `logseq/config.edn` being re-read after an outside change.
    *  Carries the fresh GraphMeta; a graph whose settings did not move emits
    *  nothing. */
   onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
-  /** Subscribe to an admitted aggregate managed-storage change. */
   /** A committed query image changed; does not reload or replace live editors. */
   onQueryProjectionChanged(cb: () => void): Promise<() => void>;
-  onSparseV2Changed(cb: () => void): Promise<() => void>;
-  /** Subscribe to deduplicated managed-sync reconciliation failures. */
-  onManagedSyncError(cb: (message: string) => void): Promise<() => void>;
-  /** Direct Markdown folder-watch reconcile failure. Distinct from
-   *  onManagedSyncError: managed graphs never emit it, so its copy must not
-   *  talk about managed storage. */
+  /** Direct Markdown folder-watch reconcile failure. */
   onGraphWatchError(cb: (message: string) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
   getBackupKeep(): Promise<number>;
@@ -1568,7 +1347,6 @@ class TauriBackend implements Backend {
     baseRev: string | null,
     force = false,
     conflictEpoch: number | null = null,
-    managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
       this.call<SavePageResult>("save_page", {
@@ -1576,7 +1354,6 @@ class TauriBackend implements Backend {
         baseRev,
         force,
         conflictEpoch,
-        managedConflictObservation,
       })
     );
   }
@@ -1585,139 +1362,6 @@ class TauriBackend implements Backend {
   }
   finishDirectCrossPageMove(moveId: string) {
     return this.call<boolean>("finish_direct_cross_page_move", { moveId });
-  }
-  moveManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ) {
-    return this.call<ManagedApplicationMoveSubtreesResult>("move_managed_application_subtrees", {
-      bindingGeneration,
-      request,
-    });
-  }
-  acknowledgeManagedApplicationMove(
-    bindingGeneration: number,
-    episodeId: string,
-    batchId: string,
-  ) {
-    return this.call<void>("acknowledge_managed_application_move", {
-      bindingGeneration,
-      episodeId,
-      batchId,
-    });
-  }
-  recoverManagedApplicationSubtrees(
-    bindingGeneration: number,
-    request: ManagedApplicationMoveSubtreesRequest,
-  ) {
-    return this.call<ManagedApplicationMoveSubtreesRecoveryResult>(
-      "recover_managed_application_subtrees",
-      { bindingGeneration, request },
-    );
-  }
-  preflightManagedPageMutation(
-    page: PageDto,
-    baseRevision: string | null,
-    bindingGeneration: number,
-  ) {
-    return this.call<ManagedPageMutationPreflightResult>("preflight_managed_page_mutation", {
-      page,
-      baseRevision,
-      bindingGeneration,
-    });
-  }
-  sparseV2Status() {
-    return this.call<SparseV2Status>("sparse_v2_status");
-  }
-  async onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2RuntimeStatusEvent>("sparse-v2-status", (event) => cb(event.payload));
-  }
-  async onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2TickEvent>("sparse-v2-tick", (event) => cb(event.payload));
-  }
-  async onSparseV2Error(cb: (event: SparseV2ErrorEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2ErrorEvent>("sparse-v2-error", (event) => cb(event.payload));
-  }
-  async onSparseV2ActivationProgress(
-    bindingGeneration: number,
-    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
-  ): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SparseV2ActivationProgressEvent>("sparse-v2-activation-progress", (event) => {
-      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.progress);
-    });
-  }
-  async activateSparseV2() {
-    const result = await this.call<SparseV2Status>("activate_sparse_v2");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async cancelSparseV2() {
-    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async cancelSparseV2Cold(path: string) {
-    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2_cold", { path });
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async prepareSparseV2Share() {
-    const result = await this.call<SparseV2Status>("prepare_sparse_v2_share");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async joinSparseV2Shared() {
-    const result = await this.call<SparseV2Status>("join_sparse_v2_shared");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  async adoptSparseV2Shared() {
-    const result = await this.call<SparseV2AdoptionResult>("adopt_sparse_v2_shared");
-    this.bindingGeneration = result.binding_generation;
-    return result;
-  }
-  sparseV2RecoveryLocation() {
-    return this.call<string>("sparse_v2_recovery_location");
-  }
-  sparseV2Query(request: SparseV2QueryRequest) {
-    return this.call<SparseV2QueryReply>("sparse_v2_query", { request });
-  }
-  sparseV2EditorLoad(request: SparseV2EditorLoadRequest) {
-    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_load", { request });
-  }
-  sparseV2EditorSave(request: SparseV2EditorSaveRequest) {
-    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_save", { request });
-  }
-  sparseV2Tick() {
-    return this.call<SparseV2Tick>("sparse_v2_tick");
-  }
-  listAbsenceSweeps() {
-    return this.call<SyncAbsenceSweepEvent[]>("list_absence_sweeps");
-  }
-  async onAbsenceSweepChanged(
-    bindingGeneration: number,
-    cb: (sweep: SyncAbsenceSweepEvent) => void,
-  ): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<SyncAbsenceSweepChangedEvent>("absence-sweep-changed", (event) => {
-      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.sweep);
-    });
-  }
-  reapplyAbsenceSweep(sweepId: string) {
-    return this.call<SyncAbsenceSweepActionOutcome>("reapply_absence_sweep", { sweepId });
-  }
-  restoreAbsenceSweep(sweepId: string) {
-    return this.call<SyncAbsenceSweepRestoreOutcome>("restore_absence_sweep", { sweepId });
-  }
-  keepAbsenceSweepDeletion(sweepId: string) {
-    return this.call<void>("keep_absence_sweep_deletion", { sweepId });
-  }
-  sparseV2CleanShutdown() {
-    return this.call<import("./types").SparseV2RuntimeStatus>("sparse_v2_clean_shutdown");
   }
   guidePages() {
     return this.call<GuidePage[]>("guide_pages");
@@ -2301,14 +1945,6 @@ class TauriBackend implements Backend {
       if (event.payload === this.bindingGeneration) cb();
     });
   }
-  async onSparseV2Changed(cb: () => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen("sparse-v2-changed", () => cb());
-  }
-  async onManagedSyncError(cb: (message: string) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<string>("managed-sync-error", (e) => cb(e.payload));
-  }
   async onGraphWatchError(cb: (message: string) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<string>("graph-watch-error", (e) => cb(e.payload));
@@ -2540,7 +2176,7 @@ export async function resolveConflictCapsule(
       preChoice,
     );
   }
-  throw new Error("the browser conflict demo has no managed actor");
+  throw new Error("the browser conflict demo has no durable capsule authority");
 }
 
 /** Test-only backend injection for delayed/rejected native-boundary proofs. */

@@ -22,7 +22,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { initParser } from "./render/parse";
 import { backend } from "./backend";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { graphBindingRuntime } from "./graphBindingRuntime";
 import { resetStorageDispatchCounters } from "./storageDispatch";
 import {
   loadFeed,
@@ -130,12 +130,12 @@ beforeEach(() => {
   });
   resetStorageDispatchCounters();
   setToasts([]);
-  managedStorageRuntime.clear();
-  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.clear();
+  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
 });
 
 afterEach(() => {
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   setToasts([]);
   vi.restoreAllMocks();
 });

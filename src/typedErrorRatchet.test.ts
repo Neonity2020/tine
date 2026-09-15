@@ -4,17 +4,11 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
-  AdoptionArchivedError,
   AssetTooLargeError,
   BackendError,
   DirectSaveFailureError,
-  ManagedActorRefusalError,
-  ManagedGraphMismatchError,
   OperationCancelledError,
   SaveConflictError,
-  SharedFrontierMismatchError,
-  SparseShutdownRefusedError,
-  SyncDataUnavailableError,
   classifyNativeCallError,
 } from "./backend";
 
@@ -209,11 +203,6 @@ function errorStringClassifierSites(): (Omit<ClassifierSite, "class" | "why"> & 
 describe("I-9/I-11 typed backend error boundary", () => {
   it("classifies every tagged native payload once at the backend funnel", () => {
     const cases: [string, new (...args: never[]) => BackendError][] = [
-      ["sync-data-unavailable", SyncDataUnavailableError],
-      ["managed-graph-mismatch", ManagedGraphMismatchError],
-      ["shared-frontier-mismatch", SharedFrontierMismatchError],
-      ["adoption-archived", AdoptionArchivedError],
-      ["sparse-shutdown-refused", SparseShutdownRefusedError],
       ["asset-too-large", AssetTooLargeError],
       ["operation-cancelled", OperationCancelledError],
     ];
@@ -221,13 +210,6 @@ describe("I-9/I-11 typed backend error boundary", () => {
       const classified = classifyNativeCallError(JSON.stringify({ kind }));
       expect(classified).toBeInstanceOf(Type);
     }
-    const actor = classifyNativeCallError(JSON.stringify({
-      kind: "managed-actor-refusal",
-      reason_code: "trusted_local.append_outcome_unknown",
-    }));
-    expect(actor).toBeInstanceOf(ManagedActorRefusalError);
-    expect(actor).toMatchObject({ reasonCode: "trusted_local.append_outcome_unknown" });
-
     const direct = classifyNativeCallError(JSON.stringify({
       kind: "direct-save-failure",
       reason_code: "precheck.symlink",
@@ -244,34 +226,6 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(conflict).toBeInstanceOf(SaveConflictError);
     expect(conflict).toMatchObject({ reasonCode: "conflict.base_rev", epoch: 23 });
 
-    // The one kind with a typed detail object: bounded counts and paths are
-    // validated field by field; a malformed detail degrades to no detail.
-    const mismatch = classifyNativeCallError(JSON.stringify({
-      kind: "shared-frontier-mismatch",
-      detail: {
-        local_pages: 2, shared_pages: 2, local_only: 1, shared_only: 0, changed: 1, omitted: 0,
-        paths: [
-          { path: "notes/local-only.md", side: "local-only" },
-          { path: "notes/changed.md", side: "changed", categories: ["outline"] },
-        ],
-      },
-    }));
-    expect(mismatch).toBeInstanceOf(SharedFrontierMismatchError);
-    expect(mismatch).toMatchObject({
-      detail: {
-        localOnly: 1,
-        paths: [
-          { path: "notes/local-only.md", side: "local-only", categories: [] },
-          { path: "notes/changed.md", side: "changed", categories: ["outline"] },
-        ],
-      },
-    });
-    const malformed = classifyNativeCallError(JSON.stringify({
-      kind: "shared-frontier-mismatch",
-      detail: { local_pages: 1, paths: [{ path: 7, side: "elsewhere" }] },
-    }));
-    expect(malformed).toBeInstanceOf(SharedFrontierMismatchError);
-    expect(malformed).toMatchObject({ detail: null });
   });
 
   it("has no prose-parsing classifier outside the one funnel", () => {
@@ -303,34 +257,24 @@ describe("I-9/I-11 typed backend error boundary", () => {
 
   it("keeps phase-B legacy literals compatible with the frontend funnel", () => {
     expect(classifyNativeCallError('{"kind":"operation-cancelled"}')).toBeInstanceOf(OperationCancelledError);
-    expect(classifyNativeCallError('{"kind":"sync-data-unavailable"}')).toBeInstanceOf(SyncDataUnavailableError);
-    expect(classifyNativeCallError('{"kind":"adoption-archived"}')).toBeInstanceOf(AdoptionArchivedError);
     for (const literal of [
       "denied", "asset not found: worker", "asset not found: tauri", "json failure",
       "plugin failure", "clipboard failure", "platform failure", "graph verification failure",
-      "graph failure", "sync runtime failure", "settings failure", "diagnostic failure",
+      "graph failure", "storage transition failure", "settings failure", "diagnostic failure",
       "backup failure", "phase-B prose",
     ]) expect(classifyNativeCallError(literal)).toBe(literal);
   });
 
   it("pins the Rust typed boundaries and the living contract", () => {
-    const wire = source("crates/tine-core/src/oplog/wire.rs");
-    const runtime = source("crates/tine-core/src/sync_runtime.rs");
     const model = source("crates/tine-core/src/model.rs");
     const contract = source("docs/contracts/typed-errors.md");
-    expect(wire).toContain("Io(std::io::ErrorKind)");
-    expect(wire).not.toMatch(/ScenarioError::Io\([^)]*(?:to_string|format!)/s);
     const directClassifier = model.slice(
       model.indexOf("pub fn direct_save_conflict_epoch"),
       model.indexOf("fn initial_shadow_limit_error"),
     );
     expect(directClassifier).toContain("downcast_ref::<DirectSaveError>()");
     expect(directClassifier).not.toMatch(/(?:to_string|contains|starts_with)\s*\(/);
-    // Clean-open failures stay typed until the single OpenRefused projection.
-    expect(runtime.match(/map_err\(display\)/g) ?? []).toHaveLength(0);
-    expect(runtime.match(/fn display\(/g) ?? []).toHaveLength(0);
-    expect(contract).toContain("10 BackendError subclasses");
-    expect(contract).toContain("Core-only clean-open boundary");
+    expect(contract).toContain("7 BackendError subclasses");
     expect(contract).not.toContain("item 3 checkpoint");
     expect(contract).toContain("TauriBackend.call");
 
@@ -344,27 +288,21 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(contract).toContain("## `CommandError` boundary");
-    expect(contract).toContain("The phase-A syntactic census is 116 production sites");
+    expect(contract).toContain("The syntactic census is 53 production sites");
 
-    const quitFixtures = commands.slice(
-      commands.indexOf("mod prepare_tine_quit_tests"),
-      commands.indexOf("pub(crate) fn read_local_image"),
-    );
-    const proseSites = (commands.match(/CommandError::prose/g) ?? []).length
-      - (quitFixtures.match(/CommandError::prose/g) ?? []).length
-      + (state.match(/CommandError::prose/g) ?? []).length;
-    // 116, not 113: P0-rust's three new managed query commands each add one
-    // wrong-reply arm, the category the contract's Prose census already records
-    // as having no typed source. The ratchet retires legacy untyped WORDING; it
-    // is not a cap on the managed-command surface. See docs/contracts/typed-errors.md.
-    expect(proseSites).toBe(116);
+    const proseSites = (withoutRustTestModules(commands).match(/CommandError::prose/g) ?? []).length
+      + (withoutRustTestModules(state).match(/CommandError::prose/g) ?? []).length;
+    // 53 after the Managed Storage removal (2026-09-15): the managed command
+    // surface and its wrong-reply arms are gone. The ratchet retires legacy
+    // untyped WORDING; see docs/contracts/typed-errors.md.
+    expect(proseSites).toBe(53);
 
     const phaseB = parity.slice(
       parity.indexOf("const PHASE_B_COMMANDS"),
       parity.indexOf("const INFALLIBLE"),
     );
     const phaseBRows = [...phaseB.matchAll(/\("([^"]+\.rs)", "([^"]+)"\)/g)];
-    expect(phaseBRows.length).toBeGreaterThan(50);
+    expect(phaseBRows.length).toBeGreaterThan(40);
     expect(contract).toContain("Every fallible command registered for desktop, Android, or iOS");
 
     for (const heading of ["### Conversion table", "### `Prose` census"]) {
@@ -376,49 +314,25 @@ describe("I-9/I-11 typed backend error boundary", () => {
       for (const row of rows) expect(row.split("|").length).toBe(7);
     }
 
-    const cleanEnum = runtime.slice(
-      runtime.indexOf("pub(crate) enum CleanOpenError"),
-      runtime.indexOf("impl CleanOpenError"),
-    );
-    expect(cleanEnum).not.toMatch(/\bString\b/);
-    const cleanImpl = runtime.slice(
-      runtime.indexOf("impl CleanOpenError"),
-      runtime.indexOf("impl fmt::Display for CleanOpenError"),
-    );
-    const cleanCodes = [...cleanImpl.matchAll(/"(clean_open\.[a-z_]+)"/g)]
-      .map((match) => match[1]);
-    expect(cleanCodes).toHaveLength(16);
-    expect(new Set(cleanCodes).size).toBe(16);
-    for (const code of cleanCodes) expect(contract).toContain(code);
-    expect(runtime.match(/fn clean_open_error_detail\(/g) ?? []).toHaveLength(1);
-    expect(runtime).toContain('tagged_backend_error("clean-open", Some(error.reason_code()))');
-
     const directImpl = model.slice(
       model.indexOf("impl DirectSaveFailureCode"),
       model.indexOf("/// Typed inner error", model.indexOf("impl DirectSaveFailureCode")),
     );
     const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority)\.[a-z_]+|unknown)"/g)]
       .map((match) => match[1]);
-    expect(directCodes).toHaveLength(36);
+    expect(directCodes).toHaveLength(35);
 
-    const managedImpl = runtime.slice(
-      runtime.indexOf("impl SyncEditorRefusalCode"),
-      runtime.indexOf("impl fmt::Display for SyncEditorRefusalCode"),
-    );
-    const managedCodes = [...managedImpl.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
-      .map((match) => match[1]);
-    expect(managedCodes).toHaveLength(23);
-    for (const code of [...directCodes, ...managedCodes]) expect(contract).toContain(code);
+    for (const code of directCodes) expect(contract).toContain(code);
 
     const persistence = source("src/persistence.ts");
     const policy = persistence.slice(
       persistence.indexOf("export function isRetryableSaveFailure"),
-      persistence.indexOf("export type SaveFailureDisposition"),
+      persistence.indexOf("function saveFailureCode"),
     );
     const frontendCodes = [...policy.matchAll(/"([a-z][a-z_]*(?:\.[a-z][a-z_]*)+)"/g)]
-      .map((match) => match[1])
-      .filter((code) => code !== "managed.conflict");
-    const producerUnion = new Set([...directCodes, ...managedCodes]);
+      .map((match) => match[1]);
+    expect(frontendCodes.length).toBeGreaterThan(0);
+    const producerUnion = new Set(directCodes);
     expect(frontendCodes.filter((code) => !producerUnion.has(code))).toEqual([]);
   });
 
@@ -456,12 +370,12 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(contract).not.toContain("### E2b phase-B pin");
     for (const family of [
       "Json", "Plugin", "Clipboard", "Platform", "GraphVerification", "Graph",
-      "SyncRuntime", "Settings", "Diagnostic", "Backup",
+      "StorageTransition", "Settings", "Diagnostic", "Backup",
     ]) expect(commandError).toContain(`${family} {`);
     for (const file of [
       "backup.rs", "conflict_capsule.rs", "debug.rs", "graph.rs",
       "graph_verification.rs", "platform.rs", "plugins.rs", "settings.rs",
-      "storage_mode_supervisor.rs", "sync_runtime.rs",
+      "storage_mode_supervisor.rs",
     ]) expect(contract).toContain(`\`${file}\``);
 
     const proseStart = contract.indexOf("### `Prose` census");
@@ -482,9 +396,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     const misplaced: string[] = [];
     for (const { file, text } of rustFiles) {
       if (["commands.rs", "state.rs", "command_error.rs", "backend_command_parity.rs"].includes(file)) continue;
-      const production = file === "sync_runtime.rs"
-        ? text.slice(0, text.indexOf("#[cfg(test)]\nmod tests"))
-        : withoutRustTestModules(text);
+      const production = withoutRustTestModules(text);
       for (const match of production.matchAll(/CommandError::prose\b/g)) {
         const symbol = enclosingRustSymbol(production, match.index);
         if (symbol === null || !allowedProse.get(file)?.has(symbol)) misplaced.push(`${file}::${symbol ?? "<none>"}`);

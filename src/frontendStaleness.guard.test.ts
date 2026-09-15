@@ -37,11 +37,11 @@ describe("I-20 graph identity guard", () => {
     const busySets = [...normalized.matchAll(/setBusy\(myKey\)/g)];
     expect(
       ownedClears.length,
-      "I-20: Settings PluginsTab must retain its five identity-owned busy clears; imitate managedStorageRuntime.ts",
+      "I-20: Settings PluginsTab must retain its five identity-owned busy clears; imitate graphBindingRuntime.ts",
     ).toBe(5);
     expect(
       ownedClears.length,
-      "I-20: every Settings PluginsTab busy-setting operation must have an identity-owned clear; imitate managedStorageRuntime.ts",
+      "I-20: every Settings PluginsTab busy-setting operation must have an identity-owned clear; imitate graphBindingRuntime.ts",
     ).toBeGreaterThanOrEqual(busySets.length);
     const unownedClears = [...normalized.matchAll(/(?:props\.)?setBusy\(null\)/g)]
       .filter((match) => {

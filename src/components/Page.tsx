@@ -69,7 +69,7 @@ function pageHasActiveEdit(name: string): boolean {
     || isSaving(name)
     || isConflicted(name)
     || isBlockMoving(name)
-    // An explicit native mutation (Concord resolution, managed move, etc.)
+    // An explicit native mutation (Concord resolution, etc.)
     // owns the exact live page until its committed DTO is installed. A watcher
     // restart that enters loadFeed during that window cannot install this day,
     // and loadFeed correctly publishes only successful installations — which

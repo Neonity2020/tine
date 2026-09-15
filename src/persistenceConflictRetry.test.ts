@@ -85,11 +85,9 @@ vi.mock("./ui", () => ({
 
 const {
   canForceSave,
-  flushPage,
   forceSave,
   markDirty,
   resetSaveState,
-  setBaseRev,
 } = await import("./persistence");
 
 // GH #254 increment 2, fourth correction-delta re-verification, HIGH. A Direct
@@ -226,104 +224,5 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     expect(conflicted.has("Notes")).toBe(true);
     expect(canForceSave("Notes")).toBe(false);
     expect(calls.length).toBe(1);
-  });
-});
-
-describe("managed save conflict resolution", () => {
-  beforeEach(() => {
-    calls.length = 0;
-    toasts.length = 0;
-    conflicted.clear();
-    nextResult = null;
-    observedManagedPage = null;
-    draftPath = "pages/Notes.md";
-    resetSaveState();
-  });
-
-  it("retains the draft and binds Keep mine to the exact managed revision it observed", async () => {
-    observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: stale_base");
-    setBaseRev("Notes", "managed-editor-base");
-    markDirty("Notes");
-
-    expect(await flushPage("Notes")).toBe(false);
-    expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(true);
-
-    nextResult = () => Promise.resolve({ revision: "managed-mine" });
-    expect(await forceSave("Notes")).toBe(true);
-    expect(calls[1]).toMatchObject({
-      force: true,
-      conflictEpoch: null,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-winner-a",
-      },
-    });
-  });
-
-  it("re-observes after a second managed winner and never upgrades an earlier click", async () => {
-    observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: stale_base");
-    setBaseRev("Notes", "managed-editor-base");
-    markDirty("Notes");
-    await flushPage("Notes");
-
-    observedManagedPage = { rev: "managed-winner-b", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: stale_base");
-    expect(await forceSave("Notes")).toBe(false);
-    expect(calls[1]).toMatchObject({
-      force: true,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-winner-a",
-      },
-    });
-
-    nextResult = () => Promise.resolve({ revision: "managed-mine" });
-    expect(await forceSave("Notes")).toBe(true);
-    expect(calls[2]).toMatchObject({
-      force: true,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-winner-b",
-      },
-    });
-  });
-
-  it("binds a losing new-page draft to the identifiable winner's exact path and revision", async () => {
-    draftPath = "";
-    observedManagedPage = { rev: "managed-created-winner", path: "pages/Notes.md" };
-    nextResult = () => Promise.reject("managed.conflict: page_already_exists");
-    markDirty("Notes");
-
-    expect(await flushPage("Notes")).toBe(false);
-    expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(true);
-
-    nextResult = () => Promise.resolve({ revision: "managed-new-draft-won" });
-    expect(await forceSave("Notes")).toBe(true);
-    expect(calls[1]).toMatchObject({
-      force: true,
-      conflictEpoch: null,
-      managedConflictObservation: {
-        path: "pages/Notes.md",
-        revision: "managed-created-winner",
-      },
-    });
-  });
-
-  it("fails closed when the exact managed owner was deleted or renamed", async () => {
-    observedManagedPage = null;
-    nextResult = () => Promise.reject("managed.conflict: missing_page");
-    setBaseRev("Notes", "managed-editor-base");
-    markDirty("Notes");
-
-    await flushPage("Notes");
-    expect(conflicted.has("Notes")).toBe(true);
-    expect(canForceSave("Notes")).toBe(false);
-    const before = calls.length;
-    expect(await forceSave("Notes")).toBe(false);
-    expect(calls).toHaveLength(before);
   });
 });

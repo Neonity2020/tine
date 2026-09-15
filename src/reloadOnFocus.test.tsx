@@ -8,8 +8,8 @@ import {
   resetFocusRescanThrottle,
 } from "./reloadOnFocus";
 import { onPageBecameReplaceable, resetStore, sweepReplaceable } from "./store";
-import { managedStorageRuntime } from "./managedStorageRuntime";
-import { setToasts, toasts } from "./ui";
+import { graphBindingRuntime } from "./graphBindingRuntime";
+import { setToasts } from "./ui";
 import { setGraphMeta } from "./ui";
 import { resetSaveState } from "./persistence";
 
@@ -29,7 +29,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   setToasts([]);
   setGraphMeta(null);
   installFocusFreshnessVerifier(async () => {});
@@ -68,16 +68,6 @@ describe("reload on focus", () => {
   it("survives a backend that refuses the rescan", async () => {
     vi.spyOn(backend(), "rescanGraphNow").mockRejectedValue(new Error("no watcher"));
     await expect(refreshOnReturnToWindow(100_000)).resolves.toBeUndefined();
-  });
-
-  it("leaves the terminal outcome to an active storage transition", async () => {
-    vi.spyOn(backend(), "rescanGraphNow").mockRejectedValue(
-      new Error("sync actor is unavailable"),
-    );
-    managedStorageRuntime.beginTransition();
-    await expect(refreshOnReturnToWindow(100_000)).resolves.toBeUndefined();
-    expect(toasts()).toEqual([]);
-    managedStorageRuntime.endTransition();
   });
 
   it("awaits the bounded visible-page verifier before completing", async () => {

@@ -457,13 +457,10 @@ export function registerLiveSaveConflict(
   baseRev: string | null,
   conflictEpoch: number,
   recovery?: { base_text: string | null; disk_rev: string },
-  storage: "direct" | "managed" = "direct",
 ): Promise<void> {
   const previous = liveSaveConflicts.get(page.name)?.live?.draft_version ?? 0;
   const conflict: ConflictObject = {
-    id: storage === "managed"
-      ? `live-managed:${page.path || page.name}`
-      : `live:${page.path || page.name}`,
+    id: `live:${page.path || page.name}`,
     source: "live-save",
     page_name: page.name,
     page_path: page.path ?? page.name,
@@ -1502,21 +1499,7 @@ export function resetShortcutOverride(id: string) {
 // Pages that failed to save because the file changed on disk (external edit /
 // Syncthing). Surfaced as a banner; the user resolves with reload or overwrite.
 export const [conflicts, setConflicts] = createSignal<string[]>([]);
-export function markConflict(
-  name: string,
-  capsule?: { page: PageDto; baseRev: string | null; storage: "managed" },
-): void | Promise<void> {
-  if (capsule) {
-    return registerLiveSaveConflict(
-      capsule.page,
-      capsule.baseRev,
-      -1,
-      undefined,
-      capsule.storage,
-    ).then(() => {
-      if (!conflicts().includes(name)) setConflicts([...conflicts(), name]);
-    });
-  }
+export function markConflict(name: string): void {
   if (!conflicts().includes(name)) setConflicts([...conflicts(), name]);
 }
 export function clearConflict(name: string) {

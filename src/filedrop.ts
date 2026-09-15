@@ -10,18 +10,13 @@ import { assetFileName, assetMarkdown } from "./media";
 import { matrixGridNode, delimitedCellCount } from "./sheet/conversions";
 import { parseDelimitedText, type DelimitedKind } from "./sheet/tsv";
 import {
+  BULK_INSERTION_UNAVAILABLE_TOAST,
   bulkRouteFenceCurrent,
   captureBulkRouteFence,
-  consumeManagedBulkInsertionAdmission,
-  depthOf,
   doc,
   formatForBlock,
   insertOutlineAfter,
-  MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST,
-  managedBulkOutlinePlan,
   pageByName,
-  preflightManagedBulkInsertion,
-  reportManagedBulkInsertionRefusal,
   trackAssetWrite,
   visibleOrder,
   withUndoUnit,
@@ -48,53 +43,11 @@ function titleWithoutExtension(path: string, kind: DelimitedKind): string {
   return name.slice(0, Math.max(0, name.length - kind.length - 1)) || "Dropped table";
 }
 
-type PlannedDrop =
-  | { kind: "grid"; node: OutlineNode }
-  | { kind: "asset"; path: string; originalName: string | undefined };
-
-async function planManagedDrop(paths: readonly string[]): Promise<PlannedDrop[]> {
-  const plan: PlannedDrop[] = [];
-  for (const path of paths) {
-    const kind = delimitedKind(path);
-    if (kind) {
-      const text = await backend().readTextFile(path);
-      const matrix = parseDelimitedText(text, kind);
-      const cells = delimitedCellCount(matrix);
-      if (cells > MAX_DROPPED_CELLS) {
-        pushToast(`"${basename(path)}" has ${cells} cells; CSV/TSV drops are limited to ${MAX_DROPPED_CELLS}.`, "error");
-        continue;
-      }
-      plan.push({ kind: "grid", node: matrixGridNode(titleWithoutExtension(path, kind), matrix) });
-      continue;
-    }
-    plan.push({ kind: "asset", path, originalName: basename(path) || undefined });
-  }
-  return plan;
-}
-
-async function materializeManagedDrop(afterId: string, plan: readonly PlannedDrop[]): Promise<OutlineNode[]> {
-  const page = pageByName(doc.byId[afterId].page);
-  const format = formatForBlock(afterId);
-  const nodes: OutlineNode[] = [];
-  for (const item of plan) {
-    if (item.kind === "grid") {
-      nodes.push(item.node);
-      continue;
-    }
-    const saved = await trackAssetWrite(backend().importAsset(item.path, assetFileName(item.originalName)));
-    nodes.push({
-      raw: assetMarkdown(saved, { label: item.originalName, pagePath: page?.path, format }),
-      children: [],
-    });
-  }
-  return nodes;
-}
-
 async function insertDroppedFilesDirect(afterId: string, paths: readonly string[]): Promise<void> {
   // Direct Files does its IO one file at a time, so this routine can be mid-read
-  // when the user finishes switching the graph to managed storage. The route it
-  // chose is only true for as long as the fence holds; resuming past it would
-  // insert an unbounded outline with no admission at all (GH #325).
+  // when the graph binding changes underneath it. The route it chose is only
+  // true for as long as the fence holds; resuming past it would insert an
+  // outline against a binding it was never admitted to (GH #325).
   const fence = captureBulkRouteFence(afterId);
   if (!fence) return;
   const nodes: OutlineNode[] = [];
@@ -136,50 +89,17 @@ async function insertDroppedFilesDirect(afterId: string, paths: readonly string[
   pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
 }
 
-/** Insert an already-native-resolved file drop. Managed bindings construct the
- * complete grid/asset-reference outline first so a certain cap refusal cannot
- * leave a preceding ordinary asset on disk. Direct Files retains its historical
- * sequential IO and unbounded page behavior. */
+/** Insert an already-native-resolved file drop. Direct Files does its IO
+ * sequentially under a route fence; the page has no size limits. */
 export async function insertDroppedFiles(afterId: string, paths: readonly string[]): Promise<void> {
   try {
-    // Authority is selected once, by the dispatcher (I-6). The three arms are
-    // the arms this function always had, including the unavailable arm's report
-    // through the managed bulk-insertion preflight rather than a shared toast.
+    // Authority is selected once, by the dispatcher (I-6).
     await dispatchDroppedFileInsertion<void>(
       { afterId, paths },
       {
         direct: () => insertDroppedFilesDirect(afterId, paths),
         unavailable: () => {
-          reportManagedBulkInsertionRefusal(MANAGED_BULK_INSERTION_UNAVAILABLE_TOAST);
-        },
-        managed: async (managedAdmission) => {
-          const plan = await planManagedDrop(paths);
-          if (!plan.length) return;
-          const plannedNodes = plan.map((item): OutlineNode => item.kind === "grid"
-            ? item.node
-            // Generated asset filename/path bytes are actor-authoritative. The one
-            // reference node is still a certain block-count fact before import.
-            : { raw: "", children: [] });
-          const admission = preflightManagedBulkInsertion(
-            managedAdmission,
-            afterId,
-            (limits) => managedBulkOutlinePlan(
-              plannedNodes,
-              depthOf(afterId) + 1,
-              0,
-              limits,
-            ),
-          );
-          if (admission.kind === "refused") {
-            reportManagedBulkInsertionRefusal(admission.toast);
-            return;
-          }
-
-          const nodes = await materializeManagedDrop(afterId, plan);
-          if (!nodes.length) return;
-          if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, afterId)) return;
-          withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
-          pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
+          pushToast(BULK_INSERTION_UNAVAILABLE_TOAST, "error");
         },
       },
     );

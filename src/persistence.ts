@@ -22,7 +22,7 @@ import {
   setEditorActivation,
   sweepReplaceable,
 } from "./store";
-import { ManagedActorRefusalError, backend } from "./backend";
+import { backend } from "./backend";
 import { favoritesPageChanged } from "./favoritesStore";
 import { onGraphRebound } from "./modeHooks";
 import {
@@ -39,7 +39,6 @@ import {
 } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
-import { failureShape } from "./failureShape";
 import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
 
 // ---------------------------------------------------------------------------
@@ -76,11 +75,6 @@ const saveChain = new Map<string, Promise<boolean>>();
 const transientFailures = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
-// An append outcome the managed runtime cannot prove is resolved only by
-// reopening and replaying the physical journal. This latch belongs to this
-// graph/process state, not to a page: continuing automatic saves could make a
-// draft look retryable when the actor has already terminally fenced mutation.
-let reopenRequired = false;
 // When the current run of edits first went dirty, so the debounce below can be
 // coalescing without being indefinitely postponable. Null whenever no save is
 // armed — every drain path (`flushAll`, `resetSaveState`, the timer itself)
@@ -103,32 +97,19 @@ const heldSources = new Set<string>();
 // override of the first must not override the second. Dropping the resolution
 // would strand the page (a conflicted page is skipped by the ordinary save
 // path), so remember it and re-issue it the moment the dest is durable.
-// A "keep mine" the move barrier deferred, WITH the Direct epoch or managed
-// revision the user clicked under. Re-issuing it later must present that exact
-// observation and not whatever is current by then: authority observed after the
-// click belongs to a winner the user never saw.
-type ConflictObservation =
-  | { kind: "direct"; epoch: number | null }
-  | {
-      kind: "managed";
-      identity: number;
-      observation: { path: string; revision: string } | null;
-    };
-
-export type ManagedConflictObservationSnapshot = {
-  readonly identity: number;
-  readonly observation:
-    | { readonly kind: "observed"; readonly path: string; readonly revision: string }
-    | { readonly kind: "unobserved" };
-};
+// A "keep mine" the move barrier deferred, WITH the Direct epoch the user
+// clicked under. Re-issuing it later must present that exact observation and
+// not whatever is current by then: authority observed after the click belongs
+// to a winner the user never saw.
+type ConflictObservation = { kind: "direct"; epoch: number | null };
 
 const heldForcedSaves = new Map<string, ConflictObservation | null>();
 const heldByDest = new Map<string, string[]>();
-// Managed cross-page moves are actor-owned semantic transactions. While one is
-// unresolved, neither page may enter any ordinary/force/reobserve save lane:
-// that would race the actor with a second per-page semantic intent.
-const managedMoveHeldPages = new Set<string>();
-const managedMoveDeferredIntents = new Map<string, SaveIntent[]>();
+// Pages whose saves are held while a native resolution (Concord) owns them.
+// While one is unresolved, the page may enter no ordinary/force/reobserve save
+// lane: that would race the resolution with a second per-page intent.
+const heldPageSaves = new Set<string>();
+const heldSaveIntents = new Map<string, SaveIntent[]>();
 // Which conflict observation each banner is showing. "Keep mine" presents this
 // back so the override answers the conflict the USER SAW. Without it, a second
 // force request issued under one banner — a double click, the button is not
@@ -136,7 +117,6 @@ const managedMoveDeferredIntents = new Map<string, SaveIntent[]>();
 // minted for a NEWER external winner, and overwrites bytes nobody was shown.
 // (GH #254 increment 2, adversarial implementation verification, finding 1.)
 const conflictObservation = new Map<string, ConflictObservation>();
-let managedConflictObservationClock = 0;
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -197,12 +177,8 @@ export interface StoredPageState {
 /** Has the stored page actually diverged from the baseline this editor loaded or
  *  last saved? This is the per-page proof that a change NOTIFICATION does not carry.
  *
- *  The managed runtime's `sparse-v2-changed` tick is a bare aggregate epoch — it
- *  names no page and carries no origin. (It no longer fires for an admission that
- *  committed nothing, which removed one source of spurious wake-ups, but a tick
- *  still cannot say WHICH page changed or whose write it was.)
- *  The legacy watcher event names a page but still cannot distinguish our
- *  own write echoing back from someone else's. So "a notification arrived while this
+ *  The watcher event names a page but cannot distinguish our own write echoing
+ *  back from someone else's. So "a notification arrived while this
  *  page was dirty" is not evidence of a conflict, and treating it as one is a false
  *  positive the user pays for: `doSave` refuses a conflicted page, which makes the
  *  banner's own claim ("your unsaved changes weren't written") true only BECAUSE of
@@ -269,20 +245,20 @@ export function holdSourcesForDest(dest: string, sources: string[]) {
   for (const s of srcs) heldSources.add(s);
 }
 
-/** Hold every save intent for the exact affected pages until one managed move
- * episode settles. The returned release is affine and safe to call repeatedly. */
-export function holdManagedMovePages(pages: readonly string[]): () => void {
+/** Hold every save intent for the exact affected pages until one native
+ * resolution settles. The returned release is affine and safe to call repeatedly. */
+export function holdPageSaves(pages: readonly string[]): () => void {
   const held = [...new Set(pages)];
-  for (const page of held) managedMoveHeldPages.add(page);
+  for (const page of held) heldPageSaves.add(page);
   let released = false;
   return () => {
     if (released) return;
     released = true;
     let scheduleOrdinary = false;
     for (const page of held) {
-      managedMoveHeldPages.delete(page);
-      const intents = managedMoveDeferredIntents.get(page) ?? [];
-      managedMoveDeferredIntents.delete(page);
+      heldPageSaves.delete(page);
+      const intents = heldSaveIntents.get(page) ?? [];
+      heldSaveIntents.delete(page);
       for (const intent of intents) {
         if (intent.kind === "ordinary") scheduleOrdinary = true;
         else void enqueueSave(page, intent);
@@ -290,12 +266,6 @@ export function holdManagedMovePages(pages: readonly string[]): () => void {
     }
     if (scheduleOrdinary) scheduleSave();
   };
-}
-
-/** An unresolved actor append is durable but cannot safely coexist with new
- * per-page saves. This also makes clean close/graph switch visibly refuse. */
-export function requireManagedRuntimeReopen(): void {
-  latchReopenRequired();
 }
 
 /** Track an optimistic asset write so flushAll/app-close waits for the bytes to
@@ -481,7 +451,6 @@ export function resetSaveState() {
     dataRevTimer = null;
   }
   graphToken++;
-  reopenRequired = false;
   graphBindingRev++; // a switch is also a rebind
   dirty.clear();
   baseRev.clear();
@@ -490,8 +459,8 @@ export function resetSaveState() {
   deletedPagePaths.clear();
   heldSources.clear();
   heldByDest.clear();
-  managedMoveHeldPages.clear();
-  managedMoveDeferredIntents.clear();
+  heldPageSaves.clear();
+  heldSaveIntents.clear();
   transientFailures.clear();
   for (const timer of retryTimers.values()) clearTimeout(timer);
   retryTimers.clear();
@@ -518,20 +487,6 @@ function clearTransientRetry(name: string) {
   retryTimers.delete(name);
 }
 
-function latchReopenRequired(): boolean {
-  if (reopenRequired) return false;
-  reopenRequired = true;
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-  }
-  burstStartedAt = null;
-  for (const timer of retryTimers.values()) clearTimeout(timer);
-  retryTimers.clear();
-  transientFailures.clear();
-  return true;
-}
-
 /** Save failures the backend reports with a bounded code that a retry cannot
  *  change: the graph has two files whose names collide on case-insensitive
  *  filesystems, two paths pointing at one physical file, a symlink where a page
@@ -549,22 +504,7 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     "precheck.limit",
     "identity.owned_elsewhere",
     "identity.name_taken",
-    // Managed storage refused the save because the page moved underneath it.
-    // Permanent until the page is reloaded — retrying just hides it.
-    "managed.conflict",
-    // The process cannot know whether this record was written. Reopen selects
-    // the complete physical prefix; a same-process retry could duplicate it.
-    "trusted_local.append_outcome_unknown",
   ].some((nonRetryable) => code === nonRetryable);
-}
-
-export type SaveFailureDisposition = "append_outcome_unknown" | "ordinary";
-
-/** Classify bounded backend failures before any generic retry policy. */
-export function saveFailureDisposition(error: unknown): SaveFailureDisposition {
-  return saveFailureCode(error) === "trusted_local.append_outcome_unknown"
-    ? "append_outcome_unknown"
-    : "ordinary";
 }
 
 /** Extract a bounded save-failure code from the typed backend contracts.
@@ -577,11 +517,8 @@ export function saveFailureDisposition(error: unknown): SaveFailureDisposition {
  *  `precheck.symlink` failure look like a spent override. (GH #254 increment 2,
  *  fourth correction-delta re-verification.)
  *
- *  The `managed.conflict` prefix below is a Managed producer's own tagged
- *  string, not Direct save prose; E2/E2b move it onto the shared typed carrier.
  *  Returns `""` when nothing typed is present. */
 function saveFailureCode(error: unknown): string {
-  if (error instanceof ManagedActorRefusalError) return error.reasonCode;
   if (typeof error === "object" && error !== null && "kind" in error && "reasonCode" in error) {
     const typed = error as { kind: unknown; reasonCode: unknown };
     if (
@@ -590,11 +527,6 @@ function saveFailureCode(error: unknown): string {
     ) {
       return typed.reasonCode;
     }
-  }
-  // Managed storage still owns this pre-existing tagged string producer; E2/E2b
-  // will move it through the shared typed carrier. It is not Direct save prose.
-  if (typeof error === "string" && error.startsWith("managed.conflict: ")) {
-    return "managed.conflict";
   }
   return "";
 }
@@ -619,11 +551,10 @@ function conflictObservationEpoch(error: unknown): number | null {
  * Consumers outside the persistence loop use this bounded contract instead of
  * searching arbitrary backend prose for words such as "conflict" or "exists". */
 export function isSaveConflictFailure(error: unknown): boolean {
-  return conflictObservationEpoch(error) !== null || saveFailureCode(error) === "managed.conflict";
+  return conflictObservationEpoch(error) !== null;
 }
 
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
-  if (reopenRequired) return;
   if (!isRetryableSaveFailure(error)) {
     transientFailures.delete(name);
     pushToast(`Couldn't save “${name}”. (${String(error)})`, "error");
@@ -647,7 +578,7 @@ function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (prior) clearTimeout(prior);
   const timer = setTimeout(() => {
     retryTimers.delete(name);
-    if (token === graphToken && !reopenRequired && dirty.has(name) && !isConflicted(name)) {
+    if (token === graphToken && dirty.has(name) && !isConflicted(name)) {
       void enqueueSave(name);
     }
   }, failures === 1 ? 100 : 300);
@@ -695,15 +626,12 @@ function forceIntent(name: string): SaveIntent {
   return { kind: "force", observation: conflictObservation.get(name) ?? null };
 }
 
-/** Whether the visible conflict has a safe Keep mine path. A managed page that
- * disappeared, was renamed, or could not be identified keeps Use current live
- * while refusing to invent replacement authority. */
+/** Whether the visible conflict has a safe Keep mine path: the banner must be
+ * showing a nameable observation epoch, or no override may be presented. */
 export function canForceSave(name: string): boolean {
   const observation = conflictObservation.get(name);
   if (!observation) return true;
-  return observation.kind === "direct"
-    ? observation.epoch !== null
-    : observation.observation !== null;
+  return observation.epoch !== null;
 }
 
 /** The exact observation the banner for `name` is showing, captured AT THE CLICK.
@@ -712,48 +640,7 @@ export function canForceSave(name: string): boolean {
  *  request replaces the entry with an epoch minted for a winner the user never
  *  saw, and answering with that would discard exactly that winner. */
 export function shownObservationFor(name: string): number | null {
-  const observation = conflictObservation.get(name);
-  return observation?.kind === "direct" ? observation.epoch : null;
-}
-
-/** Storage protocol represented by the conflict banner for `name`. */
-export function conflictObservationKindFor(name: string): ConflictObservation["kind"] | null {
-  return conflictObservation.get(name)?.kind ?? null;
-}
-
-/** Capture the exact managed observation represented by the current banner.
- *
- * The identity distinguishes two actor observations even when they report the
- * same path/revision (or are both explicitly unobserved). The returned value is
- * a detached typed snapshot, not the mutable map entry used by persistence.
- */
-export function managedConflictObservationSnapshotFor(
-  name: string,
-): ManagedConflictObservationSnapshot | null {
-  const current = conflictObservation.get(name);
-  if (current?.kind !== "managed") return null;
-  return {
-    identity: current.identity,
-    observation: current.observation
-      ? {
-          kind: "observed",
-          path: current.observation.path,
-          revision: current.observation.revision,
-        }
-      : { kind: "unobserved" },
-  };
-}
-
-/** Is `snapshot` still the exact managed observation shown for `name`? */
-export function managedConflictObservationMatches(
-  name: string,
-  snapshot: ManagedConflictObservationSnapshot,
-): boolean {
-  const current = conflictObservation.get(name);
-  if (current?.kind !== "managed" || current.identity !== snapshot.identity) return false;
-  if (snapshot.observation.kind === "unobserved") return current.observation === null;
-  return current.observation?.path === snapshot.observation.path
-    && current.observation.revision === snapshot.observation.revision;
+  return conflictObservation.get(name)?.epoch ?? null;
 }
 
 /**
@@ -933,14 +820,14 @@ async function doSave(
   // only when the caller enqueues it: another save may have been ahead of it.
   if (expectedCutSource && !cutSourceUsable(expectedCutSource)) return false;
   if (deletedPages.has(name)) return true; // tombstoned — never recreate a deleted page
-  if (managedMoveHeldPages.has(name)) {
-    const deferred = managedMoveDeferredIntents.get(name) ?? [];
+  if (heldPageSaves.has(name)) {
+    const deferred = heldSaveIntents.get(name) ?? [];
     // Flush loops may submit the same ordinary intent repeatedly while the
-    // actor owns the page. One retained ordinary intent is enough, while
+    // resolution owns the page. One retained ordinary intent is enough, while
     // reobserve/force intents keep their order and captured authority.
     if (intent.kind !== "ordinary" || !deferred.some((candidate) => candidate.kind === "ordinary")) {
       deferred.push(intent);
-      managedMoveDeferredIntents.set(name, deferred);
+      heldSaveIntents.set(name, deferred);
     }
     return false;
   }
@@ -1017,8 +904,7 @@ async function doSave(
         dto,
         baseline,
         force,
-        observation?.kind === "direct" ? observation.epoch : null,
-        observation?.kind === "managed" ? observation.observation : null,
+        observation?.epoch ?? null,
       )
     );
     const rev = saved.revision;
@@ -1072,18 +958,6 @@ async function doSave(
     }
     return true;
   } catch (e) {
-    if (saveFailureDisposition(e) === "append_outcome_unknown") {
-      if (token === graphToken) {
-        dirty.add(name); // the draft remains local until reopen resolves the frame
-        if (latchReopenRequired()) {
-          pushToast(
-            "Managed storage could not establish the append outcome. Reopen Tine before saving again.",
-            "error"
-          );
-        }
-      }
-      return false;
-    }
     // The backend says "conflict" and nothing else for a real base-revision
     // conflict. Match it exactly: a substring test used to catch every other
     // backend `AlreadyExists` too -- a portable-filename collision, a
@@ -1115,51 +989,6 @@ async function doSave(
         conflictObservation.set(name, { kind: "direct", epoch: null });
       }
       markConflict(name);
-    } else if (saveFailureCode(e) === "managed.conflict") {
-      // The refusal itself carries no overwrite authority. Observe the exact
-      // pinned managed page through the actor, but do not load it into the
-      // store: the retained draft stays intact until the user explicitly
-      // chooses Use current. Keep mine returns this revision to one serialized
-      // actor turn, which re-proves it before authoring anything.
-      clearTransientRetry(name);
-      let managedObservation: { path: string; revision: string } | null = null;
-      try {
-        const current = dto.path
-          ? await backend().getPageByPath(dto.path)
-          : await backend().getPage(name, dto.kind);
-        if (token !== graphToken) return false;
-        if (current?.path && current.rev && (!dto.path || current.path === dto.path)) {
-          managedObservation = { path: current.path, revision: current.rev };
-        }
-      } catch {
-        if (token !== graphToken) return false;
-        // Missing, renamed, ambiguous, or temporarily unobservable owners do
-        // not get replacement authority. The non-destructive draft remains
-        // parked and Use current remains available.
-      }
-      conflictObservation.set(name, {
-        kind: "managed",
-        identity: ++managedConflictObservationClock,
-        observation: managedObservation,
-      });
-      // Use the same semantic capture boundary as Direct Files. Managed returns
-      // no durable replacement authority: only the retained page and base below
-      // enter the app-private capsule.
-      try {
-        await backend().captureLiveSaveConflict(dto, baseline, 0);
-      } catch (error) {
-        // The capture only enriches the review; the retained draft below is
-        // the recovery material and must still reach the banner and capsule.
-        console.error("[tine] managed conflict capture failed", failureShape(error));
-      }
-      // Re-notify an already visible banner so its Keep mine enabled state
-      // reflects this newly observed (or now unobservable) managed owner. Clear
-      // before replacing the capsule so the newly persisted draft survives.
-      if (isConflicted(name)) clearConflict(name);
-      // Persist only the retained draft and its load baseline while raising the
-      // ordinary banner. The actor's replacement observation above remains
-      // session-scoped and must be minted again after restart.
-      await markConflict(name, { page: dto, baseRev: baseline, storage: "managed" });
     } else if (saveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the
@@ -1221,7 +1050,7 @@ const SAVE_DEBOUNCE_MS = 400;
 const MAX_SAVE_DELAY_MS = 3_000;
 
 export function scheduleSave() {
-  if (!doc.loaded || reopenRequired) return;
+  if (!doc.loaded) return;
   if (saveTimer) clearTimeout(saveTimer);
   else burstStartedAt = Date.now();
   const postponedBy = Date.now() - (burstStartedAt ?? Date.now());
@@ -1333,7 +1162,6 @@ export function cutSourcePagesRetired(sources: readonly ClipboardSourcePage[]): 
  *  landed (no conflicts or errors), so the caller can abort a destructive
  *  transition rather than discard the un-saved edit. */
 export async function flushAll(): Promise<boolean> {
-  if (reopenRequired) return false;
   if (saveTimer) {
     clearTimeout(saveTimer);
     saveTimer = null;
@@ -1360,8 +1188,7 @@ export async function flushAll(): Promise<boolean> {
   // Success only if nothing is still pending AND there are no unresolved
   // conflicts (a conflicted page's edit is NOT on disk) — so a destructive
   // transition (graph switch / restore / close) can abort instead of discarding it.
-  return !reopenRequired
-    && dirty.size === 0
+  return dirty.size === 0
     && assetWriteChain.size === 0
     && conflicts().length === 0;
 }
@@ -1369,9 +1196,6 @@ export async function flushAll(): Promise<boolean> {
 /** Explain a refused rename flush using the state that actually blocked it.
  * The guard remains graph-wide because rename reloads every mounted page. */
 export function renameFlushFailureMessage(): string {
-  if (reopenRequired) {
-    return "Couldn't rename: storage needs to reopen before pending edits can save. Your pending edits are still here.";
-  }
   const quoted = (names: readonly string[]) => {
     const shown = names.slice(0, 3).map((name) => `“${name}”`).join(", ");
     return names.length > 3 ? `${shown}, and ${names.length - 3} more` : shown;

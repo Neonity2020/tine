@@ -41,7 +41,7 @@ interface ConsoleSiteLocation extends ConsoleSite {
 // from (c) to (d): it keeps a failure's type, size and identity and drops its
 // message.
 type ConsoleBucket = "a" | "b" | "c" | "d";
-const CONSOLE_ALLOWLIST_SIZE = 21;
+const CONSOLE_ALLOWLIST_SIZE = 19;
 
 // Rows are keyed by CONTENT, not by line number, and that is the whole point of
 // the `anchor` column.
@@ -70,14 +70,12 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class:
   { file: "main.tsx", anchor: "e4a2943c031b", method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
   { file: "pdfRenderCoordinator.ts", anchor: "0ad719767700", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pdf.js render rejections name the document they failed on" },
   { file: "persistence.ts", anchor: "56ce51bc820d", method: "warn", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
-  { file: "persistence.ts", anchor: "a6c2fe5eb40f", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a managed conflict capture error is prose about the saved page" },
   { file: "persistence.ts", anchor: "d000164d69a2", method: "error", bucket: "d", class: "numeric-shape", why: "save refusal carries only a count" },
   { file: "print.ts", anchor: "2403b56e48d3", method: "error", bucket: "d", class: "local-error", why: "iframe print failure is a DOM/print-subsystem error over no page identity" },
   { file: "print.ts", anchor: "4411f8c9e188", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — a KaTeX/highlight rejection quotes the source it refused" },
   { file: "print.ts", anchor: "99eb03faa4fe", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pagePrintHtml errors name the page" },
   { file: "render/parse.ts", anchor: "1e8f76713ce3", method: "warn", bucket: "d", class: "build-token", why: "compares two public parser build tags" },
   { file: "sheet/formulaEval.ts", anchor: "8259b2f56d25", method: "warn", bucket: "d", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
-  { file: "store.ts", anchor: "1800fecf7cc1", method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — replay-evidence retirement errors carry the private store path" },
   { file: "ui.ts", anchor: "22fb47f1f860", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
   { file: "ui.ts", anchor: "350928478727", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
   { file: "ui.ts", anchor: "ebb833424c2f", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },

@@ -3,7 +3,6 @@ import { startEditing, endEdit } from "../editorController";
 import {
   doc,
   isSelected,
-  pageToDto,
   resetStore,
   selectBlock,
   setDoc,
@@ -17,16 +16,13 @@ import {
   colSeamSel,
   extendCellSelectionTo,
   handleCellSelectionKey,
-  handleSheetPasteEvent,
   installCellSelectionHooks,
   lastCellFor,
   resetCellSelectionForTests,
-  registerSheetViewAdapter,
   rowSeamSel,
   setCellSel,
 } from "./selection";
-import { managedStorageRuntime } from "../managedStorageRuntime";
-import { mockBackend } from "../mock";
+import { graphBindingRuntime } from "../graphBindingRuntime";
 import { __setBackendForTest } from "../backend";
 
 let disposeHooks: (() => void) | null = null;
@@ -35,7 +31,7 @@ beforeAll(() => initParser());
 
 beforeEach(() => {
   resetCellSelectionForTests();
-  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   __setBackendForTest(null);
   __setStoreMutationObserverForTest(null);
 });
@@ -111,51 +107,6 @@ function press(key: string, init: Partial<KeyboardEvent> = {}) {
 }
 
 describe("cell selection state", () => {
-  it.each(["selection-change", "surface-unmount"])(
-    "managed paste %s stales before publication and suppresses its selection callback",
-    async (stale) => {
-      loadGrid();
-      const before = pageToDto("Sheet");
-      managedStorageRuntime.bind(51, {
-        binding_generation: 51,
-        authority: "managed_writable",
-        application_save_page_blocks: 511,
-        application_page_request_text_bytes: 1024 * 1024,
-        application_page_max_depth: 128,
-      });
-      let resolve!: (value: Awaited<ReturnType<ReturnType<typeof mockBackend>["preflightManagedPageMutation"]>>) => void;
-      __setBackendForTest({
-        ...mockBackend(),
-        preflightManagedPageMutation: () => new Promise((accept) => { resolve = accept; }),
-      });
-      const dispose = registerSheetViewAdapter("grid", { bounds: () => ({ rows: 2, cols: 2 }) }, "surface");
-      setCellSel({ gridId: "grid", surfaceId: "surface", row: 0, col: 0 });
-      const event = {
-        clipboardData: { getData: () => "X\tY" },
-        preventDefault: vi.fn(),
-      } as unknown as ClipboardEvent;
-      expect(handleSheetPasteEvent(event)).toBe(true);
-      if (stale === "selection-change") {
-        setCellSel({ gridId: "grid", surfaceId: "surface", row: 1, col: 1 });
-      } else {
-        dispose();
-      }
-      resolve({
-        status: "accepted",
-        binding_generation: 51,
-        page_name: "Sheet",
-        page_path: "",
-        base_revision: null,
-      });
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(pageToDto("Sheet")).toEqual(before);
-      if (stale === "selection-change") {
-        expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 1, col: 1 });
-        dispose();
-      }
-    },
-  );
 
   it("sets and clears the active cell while remembering the last cell per grid", () => {
     const clearOutlineSelection = vi.fn();

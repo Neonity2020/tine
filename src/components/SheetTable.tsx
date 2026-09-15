@@ -195,7 +195,6 @@ export function SheetTable(props: {
   const [extraFields, setExtraFields] = createSignal<FieldId[]>([]);
   const [addingColumn, setAddingColumn] = createSignal(false);
   const [renamingField, setRenamingField] = createSignal<{ field: FieldId; value: string } | null>(null);
-  const [fieldRenamePending, setFieldRenamePending] = createSignal(false);
   const [editingProp, setEditingProp] = createSignal<{ rowId: string; field: FieldId; initial: string } | null>(null);
   const [hovering, setHovering] = createSignal(false);
   const [stableColumns, setStableColumns] = createSignal<string | null>(null);
@@ -1033,7 +1032,6 @@ export function SheetTable(props: {
     setRenamingField({ field, value: field.slice("prop:".length) });
   };
   const commitFieldRename = (field: FieldId, value: string): boolean => {
-    if (fieldRenamePending()) return false;
     const owner = doc.byId[props.ownerId];
     const home = schemaHome();
     if (!owner || home?.kind !== "block") return false;
@@ -1098,12 +1096,6 @@ export function SheetTable(props: {
       ));
       setRenamingField(null);
     });
-    if (dispatch.kind === "pending") {
-      setFieldRenamePending(true);
-      void dispatch.settled.finally(() => {
-        if (mounted) setFieldRenamePending(false);
-      });
-    }
     return dispatch.kind !== "refused";
   };
   const openFieldHeaderMenu = (e: MouseEvent, field: FieldId) => {
@@ -1424,7 +1416,6 @@ export function SheetTable(props: {
                 <input
                   class="sheet-prop-input sheet-header-rename-input"
                   autofocus
-                  disabled={fieldRenamePending()}
                   value={renamingField()?.value ?? ""}
                   aria-label={`Rename ${fieldLabel(field)} field`}
                   onClick={(e) => e.stopPropagation()}

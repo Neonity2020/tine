@@ -22,7 +22,6 @@ import {
   flushPage,
   forgetPage,
   historyPageOnlyMode,
-  insertEmptyChildBlock,
   loadFeed,
   loadSingle,
   markDirty,
@@ -42,7 +41,7 @@ import {
   undo,
 } from "./store";
 import { startEditing } from "./editorController";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { graphBindingRuntime } from "./graphBindingRuntime";
 import { initParser } from "./render/parse";
 import type { BlockDto, Format, PageDto } from "./types";
 import {
@@ -169,7 +168,7 @@ async function countStoreMutations<T>(run: () => T | Promise<T>) {
 beforeEach(() => {
   // Legacy clipboard fixtures exercise Direct Files behavior explicitly. A
   // missing route record is now intentionally fail-closed during transitions.
-  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   vi.spyOn(backend(), "writeRich").mockResolvedValue();
   vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "saved-rev" });
   vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map(() => null));
@@ -182,243 +181,16 @@ afterEach(() => {
   setGraphMeta(null);
   setGraphTransitioning(false);
   setGraphEpoch(0);
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   setToasts([]);
   vi.restoreAllMocks();
 });
 
-function bindManagedWritable(): void {
-  managedStorageRuntime.bind(1);
-  managedStorageRuntime.receiveStatus({
-    state: "active",
-    runtime: null,
-    can_activate: false,
-    can_retry: false,
-    can_cancel: false,
-    cancel_reason: null,
-    binding_generation: 1,
-    application_page_admission: {
-      binding_generation: 1,
-      authority: "managed_writable",
-      application_save_page_blocks: 511,
-      application_page_request_text_bytes: 1_048_576,
-      application_page_max_depth: 128,
-    },
-  } as any);
-}
-
-function receiveManagedUnavailableRuntime(
-  lifecycle: "stopped_safe" | "stopped_crashed" | "terminal",
-): boolean {
-  return managedStorageRuntime.receiveRuntimeStatus({
-    binding_generation: 1,
-    runtime: {
-      lifecycle,
-      recovery: null,
-      watcher: {
-        latest_enqueue: 0,
-        acknowledged: 0,
-        drain_in_flight: false,
-        pending: false,
-        pending_requires_full_scan: false,
-        deferred: false,
-        quiescing: false,
-        sequence_exhausted: false,
-      },
-      last_tick: null,
-      detail: null,
-      shared_role: null,
-      shared_phase: null,
-      provider_pending: 0,
-      provider_runnable: false,
-      search_index_building: false,
-    },
-    application_page_admission: {
-      binding_generation: 1,
-      authority: "managed_unavailable",
-    },
-  });
-}
-
 describe("clipboard payload insertion and identity validation", () => {
-  it("refuses a managed 512th clipboard block before it mutates the target", async () => {
-    const target = generatedId(99_999);
-    await seed([page("Paste", [
-      ...Array.from({ length: 510 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
-      block(target, "target"),
-    ])]);
-    managedStorageRuntime.bind(1);
-    managedStorageRuntime.receiveStatus({
-      state: "active",
-      runtime: null,
-      can_activate: false,
-      can_retry: false,
-      can_cancel: false,
-      cancel_reason: null,
-      binding_generation: 1,
-      application_page_admission: {
-        binding_generation: 1,
-        authority: "managed_writable",
-        application_save_page_blocks: 511,
-        application_page_request_text_bytes: 1_048_576,
-        application_page_max_depth: 128,
-      },
-    } as any);
-    await record("copy", "- incoming", {
-      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
-      sourcePages: [],
-    });
 
-    const mutations = await countStoreMutations(() => paste(target));
-
-    expect(pageNodeCount("Paste")).toBe(511);
-    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
-    expect(toasts().map(({ message }) => message)).toEqual([
-      "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
-    ]);
-  });
-
-  it("keeps an initially refused Cut grant and every source action untouched", async () => {
-    const fullTarget = generatedId(99_998);
-    const retryTarget = generatedId(99_997);
-    await seed([
-      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
-      page("Full", [
-        ...Array.from({ length: 510 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
-        block(fullTarget, "target"),
-      ]),
-      page("Retry", [block(retryTarget, "target")]),
-    ]);
-    const payload = buildClipboardPayload([ID1])!;
-    await record("cut", "- source", payload);
-    deleteBlock(ID1);
-    managedStorageRuntime.bind(1);
-    managedStorageRuntime.receiveStatus({
-      state: "active",
-      runtime: null,
-      can_activate: false,
-      can_retry: false,
-      can_cancel: false,
-      cancel_reason: null,
-      binding_generation: 1,
-      application_page_admission: {
-        binding_generation: 1,
-        authority: "managed_writable",
-        application_save_page_blocks: 511,
-        application_page_request_text_bytes: 1_048_576,
-        application_page_max_depth: 128,
-      },
-    } as any);
-    vi.clearAllMocks();
-
-    const mutations = await countStoreMutations(() => paste(fullTarget));
-
-    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
-    expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
-    expect(vi.mocked(backend().resolveBlocks)).not.toHaveBeenCalled();
-    expect(peekClipboardSlot()?.op).toBe("cut");
-
-    managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
-    await paste(retryTarget);
-
-    expect(peekClipboardSlot()?.op).toBe("copy");
-    expect(roots("Retry")).toEqual([retryTarget, ID1]);
-  });
-
-  it.each(["stopped_safe", "stopped_crashed", "terminal"] as const)(
-    "keeps a Cut grant untouched after a same-generation managed %s runtime event",
-    async (lifecycle) => {
-      await seed([
-        page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
-        page("Target", [block(HOST, "target")]),
-      ]);
-      const payload = buildClipboardPayload([ID1])!;
-      await record("cut", "- source", payload);
-      deleteBlock(ID1);
-      bindManagedWritable();
-      expect(receiveManagedUnavailableRuntime(lifecycle)).toBe(true);
-      vi.clearAllMocks();
-
-      const mutations = await countStoreMutations(() => paste(HOST));
-
-      expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
-      expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
-      expect(vi.mocked(backend().resolveBlocks)).not.toHaveBeenCalled();
-      expect(peekClipboardSlot()?.op).toBe("cut");
-      expect(roots("Target")).toEqual([HOST]);
-      expect(toasts().map(({ message }) => message)).toEqual([
-        "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
-      ]);
-    },
-  );
-
-  it("admits a small private copy through the active managed route", async () => {
+  it("refuses a private clipboard paste while no graph binding has published an admission", async () => {
     await seed([page("Paste", [block(HOST, "target")])]);
-    bindManagedWritable();
-    await record("copy", "- incoming", {
-      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
-      sourcePages: [],
-    });
-
-    await paste();
-
-    expect(roots("Paste")).toHaveLength(2);
-    expect(doc.byId[HOST].raw).toBe("target");
-  });
-
-  it("does not delete text typed into the empty host while a managed paste is awaiting", async () => {
-    await seed([
-      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
-      page("Target", [block(HOST, "")]),
-    ]);
-    const payload = buildClipboardPayload([ID1])!;
-    await record("cut", "- source", payload);
-    deleteBlock(ID1);
-    bindManagedWritable();
-    let release!: (value: (null)[]) => void;
-    vi.mocked(backend().resolveBlocks).mockReturnValue(new Promise((resolve) => { release = resolve; }));
-
-    const pending = paste(HOST);
-    await vi.waitFor(() => expect(backend().resolveBlocks).toHaveBeenCalled());
-    setRaw(HOST, "typed while the paste was in flight");
-    release([null]);
-    await pending;
-
-    expect(doc.byId[HOST]).toBeDefined();
-    expect(doc.byId[HOST].raw).toBe("typed while the paste was in flight");
-    expect(roots("Target")).toEqual([HOST, ID1]);
-  });
-
-  it("refuses an admitted managed paste when the page grows past the limit during its awaits", async () => {
-    const target = generatedId(99_996);
-    await seed([
-      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
-      page("Paste", [
-        ...Array.from({ length: 509 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
-        block(target, "target"),
-      ]),
-    ]);
-    const payload = buildClipboardPayload([ID1])!;
-    await record("cut", "- source", payload);
-    deleteBlock(ID1);
-    bindManagedWritable();
-    let release!: (value: (null)[]) => void;
-    vi.mocked(backend().resolveBlocks).mockReturnValue(new Promise((resolve) => { release = resolve; }));
-
-    const pending = paste(target);
-    await vi.waitFor(() => expect(backend().resolveBlocks).toHaveBeenCalled());
-    // 510 -> 511 blocks: the admitted one-block plan would now land on 512.
-    expect(insertEmptyChildBlock(target, 0)).not.toBeNull();
-    release([null]);
-
-    await expect(pending).resolves.toBeNull();
-    expect(pageNodeCount("Paste")).toBe(511);
-    expect(doc.byId[ID1]).toBeUndefined();
-  });
-
-  it("refuses a private clipboard paste while managed storage has no writable route", async () => {
-    await seed([page("Paste", [block(HOST, "target")])]);
-    managedStorageRuntime.bind(1);
+    graphBindingRuntime.clear();
     await record("copy", "- incoming", {
       blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
       sourcePages: [],
@@ -429,7 +201,7 @@ describe("clipboard payload insertion and identity validation", () => {
     expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
     expect(roots("Paste")).toEqual([HOST]);
     expect(toasts().map(({ message }) => message)).toEqual([
-      "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
+      "Can't insert while the graph is changing. Nothing was changed.",
     ]);
   });
 

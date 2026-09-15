@@ -20,13 +20,13 @@ import {
 import { endEdit, startEditing } from "./editorController";
 import { clearConflict, dataRev, isConflicted, pageInventoryRev, setToasts, toasts } from "./ui";
 import { markDirty, resetSaveState } from "./persistence";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { graphBindingRuntime } from "./graphBindingRuntime";
 
 const COUNT = 40; // comfortably above the backend's 32-page bulk threshold
 
 afterEach(() => {
   vi.restoreAllMocks();
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   resetSaveState();
   resetStore();
   setToasts([]);

@@ -1,9 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend, SaveConflictError } from "./backend";
 import {
-  acceptColdReturnManagedStorage,
   handleGraphChange,
-  handleSparseV2Changed,
   installMobileExternalLinkHandler,
   safeClose,
 } from "./App";
@@ -22,8 +20,8 @@ import {
 } from "./store";
 import { endEdit, startEditing } from "./editorController";
 import { clearConflict, isConflicted, pageInventoryRev } from "./ui";
-import { flushPage, forceSave, isDirty, markDirty, resetSaveState } from "./persistence";
-import { managedStorageRuntime } from "./managedStorageRuntime";
+import { forceSave, isDirty, markDirty, resetSaveState } from "./persistence";
+import { graphBindingRuntime } from "./graphBindingRuntime";
 import {
   applyHeldExternalChange,
   clearHeldExternalChanges,
@@ -32,7 +30,6 @@ import {
   heldExternalChangeFor,
   setConflictPolicyAlwaysAskForTest,
 } from "./conflictPolicy";
-import type { SparseV2CancelResult } from "./types";
 
 function addAnchor(href: string): HTMLAnchorElement {
   const a = document.createElement("a");
@@ -51,12 +48,12 @@ function click(el: Element): MouseEvent {
 afterEach(() => {
   document.body.innerHTML = "";
   vi.restoreAllMocks();
-  managedStorageRuntime.clear();
+  graphBindingRuntime.clear();
   resetStore();
   resetPaneLayoutToSingle({ tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }], activeIndex: 0 });
 });
 
-describe("cold managed recovery route installation", () => {
+describe("window close with unsaved changes", () => {
   it("identifies the affected page before asking to discard a failed save (GH #540)", async () => {
     setDoc({ pages: [page("Days of notes", "page", ["draft"])], feed: [],
       byId: { draft: node("draft", "Days of notes") }, loaded: true });
@@ -67,34 +64,6 @@ describe("cold managed recovery route installation", () => {
     await expect(safeClose.prepare()).resolves.toBe("rejected");
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Days of notes"), "Unsaved changes");
     expect(isDirty("Days of notes")).toBe(true);
-  });
-  it("binds the native Direct admission together with the returned generation", () => {
-    const result: SparseV2CancelResult = {
-      binding_generation: 42,
-      recovery_statement: "managed state archived",
-      status: {
-        state: "legacy_default",
-        runtime: null,
-        can_activate: true,
-        can_retry: false,
-        can_cancel: false,
-        cancel_reason: null,
-        binding_generation: 42,
-        application_page_admission: {
-          binding_generation: 42,
-          authority: "direct",
-        },
-      },
-    };
-
-    acceptColdReturnManagedStorage(result);
-
-    expect(managedStorageRuntime.snapshot().bindingGeneration).toBe(42);
-    expect(managedStorageRuntime.snapshot().applicationPageAdmission).toEqual({
-      binding_generation: 42,
-      authority: "direct",
-    });
-    expect(managedStorageRuntime.snapshot().status).toBe(result.status);
   });
 });
 
@@ -206,39 +175,8 @@ describe("watcher page inventory invalidation", () => {
   });
 });
 
-describe("managed watcher reconciliation", () => {
-  it("reloads a visible page and invalidates inventory after an admitted aggregate change", async () => {
-    const name = "Managed External";
-    resetPaneLayoutToSingle({
-      tabs: [{ history: [{ kind: "page", name, pageKind: "page" }], pos: 0, pinned: false }],
-      activeIndex: 0,
-    });
-    setDoc({ byId: { old: node("old", name) }, pages: [page(name, "page", ["old"])], feed: [name], loaded: true });
-    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue({
-      name,
-      kind: "page",
-      title: name,
-      pre_block: null,
-      blocks: [
-        { id: "one", raw: "accepted first", collapsed: false, children: [], breadcrumb: [] },
-        { id: "two", raw: "accepted external", collapsed: false, children: [], breadcrumb: [] },
-      ],
-    });
-    const before = pageInventoryRev();
-
-    await handleSparseV2Changed();
-
-    expect(getPage).toHaveBeenCalledWith(name, "page");
-    expect(pageInventoryRev()).toBeGreaterThan(before);
-    expect(pageByName(name)?.roots).toEqual(["one", "two"]);
-  });
-});
-
-// A change notification is not per-page divergence evidence. The managed runtime's
-// `sparse-v2-changed` tick is a bare aggregate epoch (no page, no origin — it no
-// longer fires for an admission that committed nothing, but which page and whose
-// write it was are still unknown); the legacy watcher event names a page but
-// still cannot tell our own write's echo from someone else's. Declaring a conflict
+// A change notification is not per-page divergence evidence. The watcher event
+// names a page but cannot tell our own write's echo from someone else's. Declaring a conflict
 // on the notification alone blocks `doSave` for that page, so the banner's claim —
 // "your unsaved changes weren't written" — comes true only BECAUSE of the banner.
 // These cover both directions: a false conflict must not appear, and a REAL external
@@ -356,58 +294,6 @@ describe("conflict requires per-page divergence, not just a notification", () =>
     return { calls, observe, hold, heldReachedBackend, settle };
   }
 
-  it("does not conflict a dirty page when the admitted epoch left it unchanged", async () => {
-    liveDirtyPage("rev-1");
-    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
-
-    await handleSparseV2Changed();
-
-    expect(isConflicted(name)).toBe(false);
-    // The unsaved edit is still live AND still savable — not replaced by the
-    // stored copy, and not frozen behind a conflict.
-    expect(isDirty(name)).toBe(true);
-    expect(pageByName(name)?.roots).toEqual(["one"]);
-  });
-
-  it("still conflicts a dirty page when the stored revision genuinely moved", async () => {
-    liveDirtyPage("rev-1");
-    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
-    refusingBackend(7);
-
-    await handleSparseV2Changed();
-
-    expect(isConflicted(name)).toBe(true);
-  });
-
-  it("still conflicts a dirty page whose file was deleted under it", async () => {
-    liveDirtyPage("rev-1");
-    vi.spyOn(backend(), "getPage").mockResolvedValue(null);
-    refusingBackend(7);
-
-    await handleSparseV2Changed();
-
-    expect(isConflicted(name)).toBe(true);
-  });
-
-  it("leaves an in-flight save alone — its own base_rev guard is the authority", async () => {
-    liveDirtyPage("rev-1");
-    let release: (result: { revision: string }) => void = () => {};
-    vi.spyOn(backend(), "savePage").mockReturnValue(
-      new Promise<{ revision: string }>((resolve) => {
-        release = resolve;
-      })
-    );
-    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
-    const saving = flushPage(name); // in flight: not yet durable, baseline not yet advanced
-
-    await handleSparseV2Changed();
-
-    expect(isConflicted(name)).toBe(false);
-    expect(getPage).not.toHaveBeenCalled();
-    release({ revision: "rev-2" });
-    await saving;
-  });
-
   it("does not conflict a dirty page on a legacy watcher echo of our own write", async () => {
     liveDirtyPage("rev-1");
     vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
@@ -477,7 +363,6 @@ describe("conflict requires per-page divergence, not just a notification", () =>
   // save, whatever noticed it.
   for (const [label, notice] of [
     ["a legacy watcher event", () => handleGraphChange({ name, kind: "page" as const, created: false, removed: false })],
-    ["a sparse-v2 epoch", () => handleSparseV2Changed()],
     ["an external delete", () => handleGraphChange({ name, kind: "page" as const, created: false, removed: true })],
   ] as const) {
     it(`gives "Keep mine" real authority after ${label}`, async () => {
@@ -506,11 +391,6 @@ describe("conflict requires per-page divergence, not just a notification", () =>
   // nothing. The page is conflicted and no longer dirty, which is exactly the
   // state an ordinary save declines, so nothing minted a replacement: the banner
   // was permanently disarmed and only the destructive button still worked.
-  //
-  // Scope note: the sparse-v2 case above models the composition, not a
-  // production journey. The managed command maps divergence to a non-banner
-  // `managed.conflict` and refuses force outright, which is a separate open
-  // limitation rather than something these tests cover.
   it("re-arms the banner when a second external change lands under it", async () => {
     liveDirtyPage("rev-1");
     const { calls, observe } = authoritativeBackend();

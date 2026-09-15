@@ -10,7 +10,6 @@ describe("native call error funnel", () => {
   it("classifies the exact legacy literals emitted by the phase-A producer manifest", () => {
     const conflict = '{"detail":{"epoch":7,"io_error_kind":"AlreadyExists"},"kind":"save-conflict","reason_code":"conflict.base_rev"}';
     const failure = '{"detail":{"io_error_kind":"PermissionDenied"},"kind":"direct-save-failure","reason_code":"unknown"}';
-    const shutdown = '{"kind":"sparse-shutdown-refused"}';
 
     const classifiedConflict = classifyNativeCallError(conflict);
     expect(classifiedConflict).toBeInstanceOf(SaveConflictError);
@@ -24,7 +23,6 @@ describe("native call error funnel", () => {
       reasonCode: "unknown",
       ioErrorKind: "PermissionDenied",
     });
-    expect(classifyNativeCallError(shutdown)).toMatchObject({ kind: "sparse-shutdown-refused" });
     expect(classifyNativeCallError("query-too-large: 2049 bytes")).toBe("query-too-large: 2049 bytes");
     expect(classifyNativeCallError("legacy prose")).toBe("legacy prose");
   });

@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, DiagnosticReport, GraphVerificationReport, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SparseV2Status, SyncConflictDiff } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, RenameOutcome, SavePageResult, SyncConflictDiff } from "./types";
 import { sourceOptions, sourceOriginal } from "./editor/queryIr";
 import { groupingToViewValue, resolveQueryGrouping } from "./editor/queryViewProperties";
 import type {
@@ -102,7 +102,6 @@ function mockViewFromProperties(properties: [string, string][]): ViewSettings {
   if (grouping !== undefined) view.group_by = grouping;
   return view;
 }
-
 
 /** Mock feed membership must use a Logseq journal-title parser, never the
  * host's permissive/non-portable Date string parser. Keep the same explicit
@@ -766,16 +765,6 @@ const mockActivations = new Map<string, number>();
 
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
-  let sparseV2: SparseV2Status = {
-    state: "legacy_default",
-    runtime: null,
-    can_activate: true,
-    can_retry: false,
-    can_cancel: false,
-    cancel_reason: null,
-    binding_generation: 1,
-    application_page_admission: { binding_generation: 1, authority: "direct" },
-  };
   const find = (name: string) =>
     all.find((p) => p.name.toLowerCase() === name.toLowerCase()) ?? null;
 
@@ -937,7 +926,7 @@ export function mockBackend(): Backend {
       // No-op in the mock/screenshot harness — there's no process to exit.
     },
     async prepareQuit() {
-      // No-op in the mock/screenshot harness — there is no managed runtime.
+      // No-op in the mock/screenshot harness — there is nothing to drain.
       return { status: "safe" as const };
     },
     async closeGraphWindow(): Promise<void> {
@@ -998,241 +987,13 @@ export function mockBackend(): Backend {
       return files.map((f) => ({ ...f, bytes: new TextEncoder().encode(f.text).length }));
     },
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
-      return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
+      return { revision: "mock-rev" }; // no-op in mock (no activation)
     },
     async beginDirectCrossPageMove(_destination: PageDto, _sources: PageDto[]): Promise<string | null> {
       return null; // the browser mock has no app-private root and no durable graph
     },
     async finishDirectCrossPageMove(_moveId: string): Promise<boolean> {
       return false;
-    },
-    async moveManagedApplicationSubtrees(
-      bindingGeneration: number,
-      request: ManagedApplicationMoveSubtreesRequest,
-    ): Promise<ManagedApplicationMoveSubtreesResult> {
-      return {
-        binding_generation: bindingGeneration,
-        application_page_admission: { binding_generation: bindingGeneration, authority: "direct" },
-        outcome: {
-          status: "no_commit",
-          episode_id: request.episode_id,
-          reason: "admission_changed",
-        },
-      };
-    },
-    async acknowledgeManagedApplicationMove(): Promise<void> {},
-    async recoverManagedApplicationSubtrees(
-      bindingGeneration: number,
-      request: ManagedApplicationMoveSubtreesRequest,
-    ): Promise<ManagedApplicationMoveSubtreesRecoveryResult> {
-      const applicationPageAdmission = {
-        binding_generation: bindingGeneration,
-        authority: "managed_unavailable" as const,
-      };
-      return {
-        previous_binding_generation: bindingGeneration,
-        binding_generation: bindingGeneration,
-        status: {
-          ...sparseV2,
-          binding_generation: bindingGeneration,
-          application_page_admission: applicationPageAdmission,
-        },
-        application_page_admission: applicationPageAdmission,
-        episode_id: request.episode_id,
-        outcome: {
-          status: "no_commit",
-          episode_id: request.episode_id,
-          reason: "admission_changed",
-        },
-      };
-    },
-    async preflightManagedPageMutation(page, baseRevision, bindingGeneration) {
-      if (sparseV2.application_page_admission.authority !== "managed_writable"
-          || sparseV2.binding_generation !== bindingGeneration) {
-        return { status: "refused" as const };
-      }
-      return {
-        status: "accepted" as const,
-        binding_generation: bindingGeneration,
-        page_name: page.name,
-        page_path: page.path ?? "",
-        base_revision: baseRevision,
-      };
-    },
-    async sparseV2Status() {
-      return sparseV2;
-    },
-    async onSparseV2Status() {
-      return () => {};
-    },
-    async onSparseV2Tick() {
-      return () => {};
-    },
-    async onSparseV2Error() {
-      return () => {};
-    },
-    async onSparseV2ActivationProgress() {
-      return () => {};
-    },
-    async activateSparseV2() {
-      sparseV2 = {
-        state: "active",
-        runtime: {
-          lifecycle: "active",
-          recovery: "first_promotion",
-          watcher: {
-            latest_enqueue: 0,
-            acknowledged: 0,
-            drain_in_flight: false,
-            pending: false,
-            pending_requires_full_scan: false,
-            deferred: false,
-            quiescing: false,
-            sequence_exhausted: false,
-          },
-          last_tick: null,
-          detail: null,
-          shared_role: null,
-          shared_phase: null,
-          provider_pending: 0,
-          provider_runnable: false,
-          search_index_building: false,
-        },
-        can_activate: false,
-        can_retry: false,
-        can_cancel: true,
-        cancel_reason: null,
-        binding_generation: sparseV2.binding_generation + 1,
-        application_page_admission: {
-          binding_generation: sparseV2.binding_generation + 1,
-          authority: "managed_writable",
-          application_save_page_blocks: 511,
-          application_page_request_text_bytes: 1_048_576,
-          application_page_max_depth: 128,
-        },
-      };
-      return sparseV2;
-    },
-    async cancelSparseV2() {
-      sparseV2 = {
-        state: "legacy_default",
-        runtime: null,
-        can_activate: true,
-        can_retry: false,
-        can_cancel: false,
-        cancel_reason: null,
-        binding_generation: sparseV2.binding_generation + 1,
-        application_page_admission: {
-          binding_generation: sparseV2.binding_generation + 1,
-          authority: "direct",
-        },
-      };
-      return {
-        status: sparseV2,
-        binding_generation: sparseV2.binding_generation,
-        recovery_statement:
-          "Direct file mode is active. Complete recovery state was preserved.",
-      };
-    },
-    async cancelSparseV2Cold() {
-      sparseV2 = {
-        state: "legacy_default",
-        runtime: null,
-        can_activate: true,
-        can_retry: false,
-        can_cancel: false,
-        cancel_reason: null,
-        binding_generation: sparseV2.binding_generation + 1,
-        application_page_admission: {
-          binding_generation: sparseV2.binding_generation + 1,
-          authority: "direct",
-        },
-      };
-      return {
-        status: sparseV2,
-        binding_generation: sparseV2.binding_generation,
-        recovery_statement:
-          "Direct file mode is active. Complete recovery state was preserved.",
-      };
-    },
-    async prepareSparseV2Share() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      sparseV2 = {
-        ...sparseV2,
-        runtime: {
-          ...sparseV2.runtime,
-          shared_role: "initiator",
-          shared_phase: "active",
-        },
-      };
-      return sparseV2;
-    },
-    async joinSparseV2Shared() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      sparseV2 = {
-        ...sparseV2,
-        runtime: {
-          ...sparseV2.runtime,
-          shared_role: "joiner",
-          shared_phase: "active",
-        },
-      };
-      return sparseV2;
-    },
-    async adoptSparseV2Shared() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      sparseV2 = {
-        ...sparseV2,
-        runtime: {
-          ...sparseV2.runtime,
-          shared_role: "joiner",
-          shared_phase: "active",
-        },
-      };
-      return {
-        status: sparseV2,
-        binding_generation: sparseV2.binding_generation,
-        archive_location: "/mock/app-data/managed-recovery/graph-0",
-        adoption_statement:
-          "This device now serves the graph shared by your other device. Its own previous Tine-managed history was archived and was not merged.",
-      };
-    },
-    async sparseV2RecoveryLocation() {
-      return "/mock/app-data/managed-recovery";
-    },
-    async sparseV2Query() {
-      return { kind: "pages", value: [] };
-    },
-    async sparseV2EditorLoad() {
-      return { status: "missing_page" };
-    },
-    async sparseV2EditorSave() {
-      return { status: "conflict", reason: "missing_page" };
-    },
-    async sparseV2Tick() {
-      return { state: "idle", detail: null, epoch: null };
-    },
-    async listAbsenceSweeps() {
-      return [];
-    },
-    async onAbsenceSweepChanged() {
-      return () => {};
-    },
-    async reapplyAbsenceSweep(sweepId) {
-      return { sweep_id: sweepId, action_id: "mock-reapply", authored_batch_ids: [] };
-    },
-    async restoreAbsenceSweep(sweepId) {
-      return { sweep_id: sweepId, action_id: "mock-restore", authored_batch_ids: [], fidelity: [] };
-    },
-    async keepAbsenceSweepDeletion() {},
-    async sparseV2CleanShutdown() {
-      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
-      const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
-      sparseV2 = {
-        ...sparseV2,
-        runtime,
-      };
-      return runtime;
     },
     async guidePages(): Promise<GuidePage[]> {
       return mockGuidePages().map((g) => ({ ...g, page: clonePage(g.page) }));
@@ -2310,12 +2071,6 @@ export function mockBackend(): Backend {
       return () => {};
     },
     async onQueryProjectionChanged(): Promise<() => void> {
-      return () => {};
-    },
-    async onSparseV2Changed(): Promise<() => void> {
-      return () => {};
-    },
-    async onManagedSyncError(): Promise<() => void> {
       return () => {};
     },
     async onGraphWatchError(): Promise<() => void> {

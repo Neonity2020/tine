@@ -15,7 +15,7 @@ import {
   type Node,
 } from "../store";
 import { journalTitle } from "../journal";
-import { managedStorageRuntime } from "../managedStorageRuntime";
+import { graphBindingRuntime } from "../graphBindingRuntime";
 import { setColumnAggregate } from "./mutations";
 
 beforeAll(async () => {
@@ -23,7 +23,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   resetStore();
-  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+  graphBindingRuntime.bind(1, { binding_generation: 1, authority: "direct" });
 });
 
 function page(name: string, kind: "page" | "journal", roots: string[], readOnly = false): FeedPage {
