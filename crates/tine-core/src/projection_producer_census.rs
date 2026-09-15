@@ -2748,11 +2748,6 @@ fn census_guard_itself_names_every_required_guard() {
         prefixes,
         BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h", "i"])
     );
-    assert!(
-        include_str!("oplog/mod.rs")
-            .contains("fn oplog_external_module_surface_is_exactly_the_named_consumers()"),
-        "G-14b-a public oplog surface guard must remain present"
-    );
 }
 
 /// I-11 guard: a comment may not point at another file by line number.

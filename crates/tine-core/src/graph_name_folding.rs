@@ -574,8 +574,6 @@ mod tests {
     /// in §2.10d stops being true with it.
     #[test]
     fn filesystem_folding_never_separates_names_tine_already_treats_as_one() {
-        use crate::oplog::LogicalPageName;
-
         let everything = GraphNameFolding {
             ascii_case: true,
             unicode_case: true,
@@ -597,8 +595,8 @@ mod tests {
                 "{left} / {right}"
             );
             assert_eq!(
-                LogicalPageName::parse(left).unwrap().key_digest(),
-                LogicalPageName::parse(right).unwrap().key_digest(),
+                crate::refs::page_key(left),
+                crate::refs::page_key(right),
                 "a filesystem fold must never split a pair Tine treats as one page: \
                  {left} / {right}"
             );

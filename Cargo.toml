@@ -11,8 +11,6 @@ members = [
 exclude = [
     "crates/lsdoc-wasm",
     "vendor/cap-primitives-4.0.2",
-    "vendor/loro-1.13.6",
-    "vendor/loro-internal-1.13.6",
 ]
 resolver = "2"
 

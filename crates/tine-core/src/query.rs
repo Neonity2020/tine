@@ -61,21 +61,22 @@ pub(crate) mod tql;
 pub mod view;
 
 use eval::EvalCtx;
-use ir::{
-    Anchor, Attr, CmpOp, Filter, Leaf, Quant, Query, Rel, SortDir, Source, Value, ViewSettings,
-};
+use ir::{Anchor, Attr, CmpOp, Filter, Quant, Query, Rel, SortDir, Source, Value, ViewSettings};
 
 use self::sort::{compare_sort_decorations, lexical_property_sort_text, SortDecor};
 use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{
-    block_to_shallow_dto, dto_block_to_doc_block, BacklinkFilterContext, BacklinkFilterEntry,
-    BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
-    RefGroup, ReferenceBlockEvidence, ReferenceDiagnosticTrace, ReferenceDiagnostics,
-    ReferenceKind, TemplateDto,
+    block_to_shallow_dto, BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget,
+    BlockDto, BlockPreview, Format, Graph, PageEntry, PageKind, RefGroup, ReferenceBlockEvidence,
+    ReferenceDiagnosticTrace, ReferenceDiagnostics, ReferenceKind, TemplateDto,
 };
 use crate::refs;
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use ir::Leaf;
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 /// Query source crosses several boundaries (live macros, native IPC, static
 /// publication, and export). Keep one shared ceiling so no caller can make the
@@ -469,38 +470,6 @@ fn walk_path_refs<'a>(
     f: &mut impl FnMut(&'a DocBlock, &PathRefCounts),
 ) {
     crate::query::path_refs::dfs_path_refs(blocks, &doc_children, &doc_refs, refs, track_refs, f);
-}
-
-/// The walk's own `block_path_refs` answer for one page, keyed by block
-/// content, in walk order.
-///
-/// Test-only, and deliberately built from the same `walk_path_refs` +
-/// `closure_names` pair `eval_refs` uses, so the cross-backend parity guard
-/// compares the walk's behaviour rather than a copy of it (§5.8 G1, I-19).
-#[cfg(test)]
-pub(crate) fn walk_closure_names_for_test(
-    page_name: &str,
-    blocks: &[DocBlock],
-) -> Vec<(String, Vec<String>)> {
-    let page_key = refs::normalize(page_name);
-    let mut counts = PathRefCounts::new();
-    let mut out = Vec::new();
-    walk_path_refs(
-        blocks,
-        &mut counts,
-        true,
-        &mut |block: &DocBlock, ancestors: &PathRefCounts| {
-            out.push((
-                block.raw.clone(),
-                crate::query::path_refs::closure_names(
-                    &page_key,
-                    &block.projection().refs_norm,
-                    ancestors,
-                ),
-            ));
-        },
-    );
-    out
 }
 
 /// Collect matches in document order while evaluating every candidate exactly
@@ -1051,132 +1020,6 @@ fn block_reference_evidence(
         total: result.total,
         truncated: result.truncated,
     })
-}
-
-/// Exact parser-owned reference matches from one application-gateway page.
-/// SQLite callers may restrict ordinary blocks by flattened parser index, but
-/// the evidence and frontend identities always come from `PageDto`.
-/// Reference matches within ONE page, over that page's projected forest.
-///
-/// `roots` is the page's `DocBlock` forest: Direct hands its cached
-/// `Arc<Document>` roots, managed reads hand the forest retained by
-/// `application_projection_roots`, so neither side converts a `BlockDto` tree
-/// here. The walk itself is [`collect_reference_matches`] -- the same visitor
-/// the Direct occurrence collector uses -- so pre-order block indexing,
-/// ancestor breadcrumbs and result-row shape have ONE owner (I-12).
-pub(crate) fn application_page_reference_matches(
-    roots: &[DocBlock],
-    page: &PageDto,
-    canonical: &str,
-    names_norm: &[String],
-    kind: ReferenceKind,
-    allowed_indices: Option<&std::collections::HashSet<usize>>,
-    allow_preamble: bool,
-    config: &crate::config::Config,
-) -> Vec<(BlockDto, ReferenceBlockEvidence)> {
-    let is_org = page.format == Format::Org;
-    let mut matches = Vec::new();
-    if allow_preamble {
-        if let Some(block) = page
-            .pre_block
-            .as_deref()
-            .and_then(|pre| page_property_block_parts(&page.name, page.kind, is_org, pre))
-        {
-            if let Some(hit) = block_reference_evidence(&block, canonical, names_norm, kind, config)
-            {
-                let mut dto = block_to_shallow_dto(&block);
-                dto.page_property = true;
-                matches.push((dto, hit));
-            }
-        }
-    }
-
-    // Pre-order position of the block being classified, which is the index
-    // `allowed_indices` is expressed in.
-    let index = std::cell::Cell::new(0_usize);
-    let mut path = Vec::new();
-    let mut found: Vec<()> = Vec::new();
-    collect_reference_matches(
-        roots,
-        &mut path,
-        &mut |block, _| {
-            let current = index.get();
-            index.set(current.saturating_add(1));
-            if allowed_indices.is_some_and(|allowed| !allowed.contains(&current)) {
-                return None;
-            }
-            block_reference_evidence(block, canonical, names_norm, kind, config)
-        },
-        &mut |block, ancestors, hit| {
-            let mut dto = result_dto(block);
-            dto.breadcrumb = ancestors
-                .iter()
-                .map(|ancestor| crate::doc::crumb_line(ancestor))
-                .collect();
-            matches.push((dto, hit));
-            None
-        },
-        &mut found,
-    );
-    matches
-}
-
-/// Block-level referrers within ONE managed page, over that page's projected
-/// forest and the same [`collect_reference_matches`] visitor.
-///
-/// Replaces the managed twin that flattened the `BlockDto` tree, re-parsed
-/// every block through `render::block_refs`, and built a throwaway `DocBlock`
-/// per block just to produce a breadcrumb. Here the match test reads the
-/// forest's memoized `block_refs` projection and breadcrumbs are computed only
-/// for admitted rows.
-pub(crate) fn application_page_block_referrers(
-    roots: &[DocBlock],
-    target: &str,
-    allowed_indices: Option<&std::collections::HashSet<usize>>,
-) -> Vec<BlockDto> {
-    let index = std::cell::Cell::new(0_usize);
-    let mut output = Vec::new();
-    let mut path = Vec::new();
-    let mut found: Vec<()> = Vec::new();
-    collect_reference_matches(
-        roots,
-        &mut path,
-        &mut |block, _| {
-            let current = index.get();
-            index.set(current.saturating_add(1));
-            if allowed_indices.is_some_and(|allowed| !allowed.contains(&current)) {
-                return None;
-            }
-            block
-                .projection()
-                .block_refs
-                .iter()
-                .any(|uuid| uuid == target)
-                .then_some(())
-        },
-        &mut |block, ancestors, ()| {
-            let mut dto = result_dto(block);
-            dto.breadcrumb = ancestors
-                .iter()
-                .map(|ancestor| crate::doc::crumb_line(ancestor))
-                .collect();
-            output.push(dto);
-            None
-        },
-        &mut found,
-    );
-    output
-}
-
-pub(crate) fn application_page_property_dto(page: &PageDto) -> Option<BlockDto> {
-    let mut dto = block_to_shallow_dto(&page_property_block_parts(
-        &page.name,
-        page.kind,
-        page.format == Format::Org,
-        page.pre_block.as_deref()?,
-    )?);
-    dto.page_property = true;
-    Some(dto)
 }
 
 fn block_has_reference(
@@ -2242,25 +2085,6 @@ pub struct ResolvedQuery {
 }
 
 impl ResolvedQuery {
-    /// Re-assemble a binding from the three things a Managed capture carries
-    /// across the actor boundary (RET1).
-    ///
-    /// It is NOT a second binding: `resolve_for_execution` is still the one
-    /// producer, and this only rebuilds the value it produced on the actor turn
-    /// so the off-actor executor and the recovery walk explain the same bound
-    /// tree, at the same execution day, under the same report.
-    pub(crate) fn from_parts(
-        query: Query,
-        report: ir::QueryReport,
-        today: JournalDate,
-    ) -> ResolvedQuery {
-        ResolvedQuery {
-            query,
-            report,
-            today,
-        }
-    }
-
     /// The bound IR — an advanced form's lowered filter, or the OG/TQL IR
     /// unchanged.
     pub fn query(&self) -> &Query {
@@ -2557,58 +2381,6 @@ impl QueryPageSource for GraphQueryPages<'_> {
     #[cfg(test)]
     fn note_predicate_evaluation(&self) {
         FULL_GRAPH_QUERY_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
-    }
-}
-
-/// Managed storage's page source: the already-narrowed candidate set, each page
-/// carrying the `DocBlock` forest the projection cache retained for it.
-pub(crate) struct ApplicationQueryPages<'a> {
-    pub(crate) pages: &'a [ApplicationQueryPage],
-    pub(crate) config: crate::config::ParseConfig,
-    pub(crate) registry: std::sync::Arc<crate::query::registry::Registry>,
-}
-
-impl QueryPageSource for ApplicationQueryPages<'_> {
-    fn for_each_page(&self, visit: &mut dyn FnMut(QueryPageView<'_>) -> std::ops::ControlFlow<()>) {
-        for source in self.pages {
-            let page = &source.page;
-            let recency = || source.recency;
-            let flow = visit(QueryPageView {
-                path: &page.path,
-                name: &page.name,
-                kind: page.kind,
-                pre_block: page.pre_block.as_deref(),
-                roots: source.roots.as_slice(),
-                journal: source.journal,
-                format: page.format.into(),
-                recency: &recency,
-            });
-            if flow.is_break() {
-                break;
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn with_hydration_pages(&self, run: &mut dyn FnMut(&[ExportHydrationPage<'_>])) {
-        let pages = self
-            .pages
-            .iter()
-            .map(|source| ExportHydrationPage {
-                kind: source.page.kind,
-                name: source.page.name.as_str(),
-                roots: source.roots.as_slice(),
-            })
-            .collect::<Vec<_>>();
-        run(&pages);
-    }
-
-    fn parse_config(&self) -> crate::config::ParseConfig {
-        self.config.clone()
-    }
-
-    fn registry(&self) -> std::sync::Arc<crate::query::registry::Registry> {
-        std::sync::Arc::clone(&self.registry)
     }
 }
 
@@ -3472,24 +3244,6 @@ pub(crate) fn apply_result_view_directives<B: ResultViewBlock>(
     groups
 }
 
-/// One exact parser-owned page selected by the managed query candidate plan.
-/// `recency` shares Direct Files' axis: journal midnight or projected-file mtime.
-pub(crate) struct ApplicationQueryPage {
-    pub(crate) page: PageDto,
-    /// The journal day this page evaluates as, or `None` for an ordinary page.
-    ///
-    /// Supplied by the caller from the graph's configured `JournalFormat` -- the
-    /// same producer that fills `PageEntry::date_key` on the Direct side -- so
-    /// the two backends answer journal-day predicates identically.
-    pub(crate) journal: Option<i64>,
-    /// The page's block tree already converted for evaluation. Supplied by the
-    /// caller from [`ApplicationProjectionCache`] so an unchanged page keeps its
-    /// memoized lsdoc projections across queries, the way Direct Files keeps
-    /// them in its cached `Arc<Document>`.
-    pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
-    pub(crate) recency: i64,
-}
-
 // Candidate planning exists only for the independent test oracle. Production
 // parses once and checks that IR's validity before acquiring its SQL snapshot.
 // The public executor census enforces that these declarations are test-only.
@@ -3643,248 +3397,6 @@ pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandida
         Some(sources) => SimpleQueryCandidatePlan::Indexed(sources.into_iter().collect()),
         None => SimpleQueryCandidatePlan::All,
     }
-}
-
-pub(crate) fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
-    let mut doc = dto_block_to_doc_block(block, is_org);
-    doc.children = block
-        .children
-        .iter()
-        .map(|child| application_query_doc_block(child, is_org))
-        .collect();
-    doc
-}
-
-/// Default bounds for [`ApplicationProjectionCache`].
-///
-/// The byte bound counts SOURCE raw text, not retained memory: a retained tree
-/// is roughly three to four times its raw text once every block's projection is
-/// filled (`visible` + `visible_lower` + reference vectors + per-block
-/// overhead), so 16 MiB of source is the order of 60 MiB retained at the very
-/// worst -- and only when a query actually projected every block of every
-/// cached page. Martin's real graph is 4.5 MiB across 1,045 files, so both
-/// bounds hold it whole; a graph larger than that degrades to LRU misses
-/// rather than to unbounded growth.
-pub(crate) const APPLICATION_PROJECTION_CACHE_MAX_PAGES: usize = 4_096;
-pub(crate) const APPLICATION_PROJECTION_CACHE_MAX_RAW_BYTES: usize = 16 * 1024 * 1024;
-
-struct ApplicationProjectionCacheEntry {
-    is_org: bool,
-    raw_bytes: usize,
-    used: u64,
-    roots: std::sync::Arc<Vec<DocBlock>>,
-}
-
-/// Converted managed page block trees, retained across managed query
-/// evaluations so an unchanged page is parsed once instead of once per query.
-///
-/// Why this exists at all: Direct Files gets projection memoization for free.
-/// `Graph::with_pages` hands out a cached `Arc<Document>` whose `DocBlock`s each
-/// memoize ONE lsdoc parse in a `OnceLock` ([`DocBlock::projection`]), so after
-/// the first query every Direct block projection is warm. The managed evaluator
-/// rebuilds a `PageDto` per request and used to call
-/// [`application_query_doc_block`] on it, allocating a fresh `OnceLock::new()`
-/// per block -- so managed re-parsed every block of every candidate page on
-/// EVERY query, on `{{query}}` re-render and on every search keystroke.
-///
-/// **Staleness is impossible by construction, and that is deliberate.** The
-/// cache is content-addressed by exact comparison rather than by a digest or a
-/// generation counter: a retained tree is reused only after
-/// [`doc_roots_match_dtos`] proves it structurally equal to the incoming DTO
-/// tree (raw text, block identity, child shape) at the same `is_org`, and a
-/// `BlockProjection` is a pure function of `(raw, is_org)`. There is therefore
-/// no generation window to get wrong, no digest collision to defend against,
-/// and no invalidation hook that a future write path can forget to call: a
-/// changed page simply fails the comparison and is rebuilt. The comparison is a
-/// length-guarded `memcmp` over the same bytes a parse would have read, i.e.
-/// cheaper than the parse it replaces by orders of magnitude.
-///
-/// Bounded by page count AND source bytes, evicting least-recently-used, so a
-/// graph larger than the bound degrades to the previous per-query rebuild for
-/// the evicted pages instead of growing without limit.
-pub(crate) struct ApplicationProjectionCache {
-    entries: HashMap<String, ApplicationProjectionCacheEntry>,
-    max_pages: usize,
-    max_raw_bytes: usize,
-    raw_bytes: usize,
-    clock: u64,
-    #[cfg(test)]
-    hits: usize,
-    #[cfg(test)]
-    misses: usize,
-}
-
-impl Default for ApplicationProjectionCache {
-    fn default() -> Self {
-        Self::new(
-            APPLICATION_PROJECTION_CACHE_MAX_PAGES,
-            APPLICATION_PROJECTION_CACHE_MAX_RAW_BYTES,
-        )
-    }
-}
-
-impl std::fmt::Debug for ApplicationProjectionCache {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ApplicationProjectionCache")
-            .field("pages", &self.entries.len())
-            .field("raw_bytes", &self.raw_bytes)
-            .finish()
-    }
-}
-
-impl ApplicationProjectionCache {
-    pub(crate) fn new(max_pages: usize, max_raw_bytes: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            max_pages,
-            max_raw_bytes,
-            raw_bytes: 0,
-            clock: 0,
-            #[cfg(test)]
-            hits: 0,
-            #[cfg(test)]
-            misses: 0,
-        }
-    }
-
-    /// The converted block tree for one exact managed page.
-    ///
-    /// `path` only selects which retained tree to COMPARE against; it never
-    /// substitutes for the comparison, so a path reused for different content
-    /// (rename, replacement, external edit) misses rather than lies.
-    pub(crate) fn roots(&mut self, path: &str, page: &PageDto) -> std::sync::Arc<Vec<DocBlock>> {
-        let is_org = page.format == Format::Org;
-        self.clock = self.clock.saturating_add(1);
-        let clock = self.clock;
-        if let Some(entry) = self.entries.get_mut(path) {
-            if entry.is_org == is_org && doc_roots_match_dtos(&entry.roots, &page.blocks) {
-                entry.used = clock;
-                #[cfg(test)]
-                {
-                    self.hits = self.hits.saturating_add(1);
-                }
-                return std::sync::Arc::clone(&entry.roots);
-            }
-        }
-        #[cfg(test)]
-        {
-            self.misses = self.misses.saturating_add(1);
-        }
-        let roots = std::sync::Arc::new(
-            page.blocks
-                .iter()
-                .map(|block| application_query_doc_block(block, is_org))
-                .collect::<Vec<_>>(),
-        );
-        let raw_bytes = dto_raw_bytes(&page.blocks);
-        if raw_bytes > self.max_raw_bytes || self.max_pages == 0 {
-            // One page bigger than the whole budget must not evict the rest of
-            // the graph to store an entry that the next insert would drop.
-            self.forget(path);
-            return roots;
-        }
-        if let Some(previous) = self.entries.insert(
-            path.to_owned(),
-            ApplicationProjectionCacheEntry {
-                is_org,
-                raw_bytes,
-                used: clock,
-                roots: std::sync::Arc::clone(&roots),
-            },
-        ) {
-            self.raw_bytes = self.raw_bytes.saturating_sub(previous.raw_bytes);
-        }
-        self.raw_bytes = self.raw_bytes.saturating_add(raw_bytes);
-        self.evict();
-        roots
-    }
-
-    fn forget(&mut self, path: &str) {
-        if let Some(previous) = self.entries.remove(path) {
-            self.raw_bytes = self.raw_bytes.saturating_sub(previous.raw_bytes);
-        }
-    }
-
-    fn evict(&mut self) {
-        while self.entries.len() > self.max_pages || self.raw_bytes > self.max_raw_bytes {
-            let Some(victim) = self
-                .entries
-                .iter()
-                .min_by_key(|(path, entry)| (entry.used, (*path).clone()))
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.forget(&victim);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn counters(&self) -> (usize, usize, usize) {
-        (self.hits, self.misses, self.entries.len())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_counters(&mut self) {
-        self.hits = 0;
-        self.misses = 0;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-        self.raw_bytes = 0;
-    }
-}
-
-fn dto_raw_bytes(blocks: &[BlockDto]) -> usize {
-    blocks
-        .iter()
-        .map(|block| {
-            block
-                .raw
-                .len()
-                .saturating_add(block.id.len())
-                .saturating_add(dto_raw_bytes(&block.children))
-        })
-        .sum()
-}
-
-/// Exact structural equality between a retained `DocBlock` tree and the DTO
-/// tree it was converted from. Only the fields [`application_query_doc_block`]
-/// reads participate, because only those can make the retained tree wrong:
-/// `raw` (which the memoized projection is a pure function of) and `id` (which
-/// becomes `DocBlock::uuid` and reaches the result DTO as its identity).
-fn doc_roots_match_dtos(cached: &[DocBlock], blocks: &[BlockDto]) -> bool {
-    cached.len() == blocks.len()
-        && cached.iter().zip(blocks).all(|(cached, block)| {
-            cached.raw == block.raw
-                && cached.uuid == block.id
-                && doc_roots_match_dtos(&cached.children, &block.children)
-        })
-}
-
-/// Evaluate one already-narrowed exact managed page set with the same predicate,
-/// OG top-level-root filter, result budgets, sorting and sampling as Direct Files.
-pub(crate) fn run_application_query_pages_bounded(
-    pages: &[ApplicationQueryPage],
-    query_src: &str,
-    max_rows: usize,
-    max_bytes: usize,
-    config: crate::config::ParseConfig,
-    registry: std::sync::Arc<registry::Registry>,
-) -> BoundedGroups {
-    run_query_bounded_over(
-        &ApplicationQueryPages {
-            pages,
-            config,
-            registry,
-        },
-        query_src,
-        max_rows,
-        max_bytes,
-    )
 }
 
 // RET1 deleted `run_application_query_result` and
@@ -4146,37 +3658,6 @@ pub fn run_advanced_query_bounded(
     #[cfg(not(test))]
     run_advanced_query_bounded_over(
         &GraphQueryPages(graph),
-        query_src,
-        current_page,
-        max_rows,
-        max_bytes,
-    )
-}
-
-/// The Managed advanced walk — **test-only since RET2-Managed-Advanced**.
-///
-/// The public Managed advanced query is a captured off-actor SQL execution
-/// (`sync_runtime::RuntimeActor::application_captured_query_turn`), so this has
-/// no production caller left. It survives as the INDEPENDENT parity oracle the
-/// captured route is compared against (user override Q18: traversal is an
-/// oracle, never a readiness or recovery answer), reached only from
-/// `RuntimeActor::application_complete_page_advanced_query`.
-#[cfg(test)]
-pub(crate) fn run_application_advanced_query_pages_bounded(
-    pages: &[ApplicationQueryPage],
-    query_src: &str,
-    current_page: Option<&str>,
-    max_rows: usize,
-    max_bytes: usize,
-    config: crate::config::ParseConfig,
-    registry: std::sync::Arc<registry::Registry>,
-) -> (AdvancedResult, bool, usize) {
-    run_advanced_query_bounded_over(
-        &ApplicationQueryPages {
-            pages,
-            config,
-            registry,
-        },
         query_src,
         current_page,
         max_rows,
@@ -4959,78 +4440,6 @@ pub fn templates(graph: &Graph) -> Vec<TemplateDto> {
     })
 }
 
-/// Extract templates from one exact application page. `allowed_indices` uses
-/// parser pre-order indices and is a candidate filter only; properties are
-/// always verified from the current parser DTO before a template is exposed.
-pub(crate) fn application_page_templates(
-    page: &PageDto,
-    allowed_indices: Option<&std::collections::HashSet<usize>>,
-) -> Vec<TemplateDto> {
-    fn visit_template_blocks(
-        blocks: &[BlockDto],
-        doc_blocks: &[DocBlock],
-        page: &PageDto,
-        allowed_indices: Option<&std::collections::HashSet<usize>>,
-        next_index: &mut usize,
-        out: &mut Vec<TemplateDto>,
-    ) {
-        for (block, doc_block) in blocks.iter().zip(doc_blocks) {
-            let index = *next_index;
-            *next_index = next_index.saturating_add(1);
-            if allowed_indices.is_none_or(|allowed| allowed.contains(&index)) {
-                if let Some(name) = doc_block
-                    .property("template")
-                    .filter(|name| !name.is_empty())
-                {
-                    let include_parent =
-                        doc_block.property("template-including-parent").as_deref() != Some("false");
-                    let blocks = if include_parent {
-                        vec![template_dto(doc_block, true)]
-                    } else {
-                        doc_block
-                            .children
-                            .iter()
-                            .map(|child| template_dto(child, false))
-                            .collect()
-                    };
-                    out.push(TemplateDto {
-                        name,
-                        blocks,
-                        page: page.name.clone(),
-                        kind: page.kind,
-                    });
-                }
-            }
-            visit_template_blocks(
-                &block.children,
-                &doc_block.children,
-                page,
-                allowed_indices,
-                next_index,
-                out,
-            );
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut next_index = 0;
-    let is_org = page.format == Format::Org;
-    let roots = page
-        .blocks
-        .iter()
-        .map(|block| application_query_doc_block(block, is_org))
-        .collect::<Vec<_>>();
-    visit_template_blocks(
-        &page.blocks,
-        &roots,
-        page,
-        allowed_indices,
-        &mut next_index,
-        &mut out,
-    );
-    out
-}
-
 /// Convert a template block subtree to a DTO, dropping `id::` (so inserted
 /// copies get fresh ids) and, at the root, the `template*` properties.
 fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
@@ -5234,67 +4643,6 @@ impl PropertyFacetAccumulator {
             self.exceeded,
         )
     }
-}
-
-/// The owner-preserving property rows of ONE Managed Storage overlay page
-/// (§6.2): the registry's Managed source is the masked materialized stream
-/// followed by this iterator over every unaccepted local overlay page, so a
-/// pending edit's properties are in the snapshot the walk coerces against.
-///
-/// `application_page_property_pairs` is a thin wrapper over this function —
-/// ONE producer, never a twin (D-4).
-pub(crate) fn application_page_property_owner_rows(
-    page: &PageDto,
-    page_id: &str,
-    include_page_properties: bool,
-) -> Vec<registry::OwnerRow> {
-    fn visit(blocks: &[BlockDto], page_id: &str, output: &mut Vec<registry::OwnerRow>) {
-        for block in blocks {
-            for (ordinal, (key, value)) in block.properties.iter().enumerate() {
-                output.push(registry::OwnerRow {
-                    owner_type: registry::OwnerType::Block,
-                    owner_id: format!("b:{}", block.id),
-                    page_id: page_id.to_owned(),
-                    source_name: key.clone(),
-                    normalized_name: property_key_norm(key),
-                    ordinal: ordinal as u32,
-                    value: value.clone(),
-                });
-            }
-            visit(&block.children, page_id, output);
-        }
-    }
-
-    let mut output = Vec::new();
-    if include_page_properties {
-        for (ordinal, (key, value)) in page_facets(page.pre_block.as_deref())
-            .0
-            .into_iter()
-            .enumerate()
-        {
-            output.push(registry::OwnerRow {
-                owner_type: registry::OwnerType::Page,
-                owner_id: format!("p:{page_id}"),
-                page_id: page_id.to_owned(),
-                source_name: key.clone(),
-                normalized_name: property_key_norm(&key),
-                ordinal: ordinal as u32,
-                value,
-            });
-        }
-    }
-    visit(&page.blocks, page_id, &mut output);
-    output
-}
-
-pub(crate) fn application_page_property_pairs(
-    page: &PageDto,
-    include_page_properties: bool,
-) -> Vec<(String, String)> {
-    application_page_property_owner_rows(page, page.name.as_str(), include_page_properties)
-        .into_iter()
-        .map(|row| (row.source_name, row.value))
-        .collect()
 }
 
 /// The Direct Files **document** row source (§6.2): the registry's iterator when
@@ -6462,121 +5810,6 @@ mod tests {
         )
     }
 
-    fn projection_cache_page(path: &str, format: Format, raws: &[&str]) -> PageDto {
-        PageDto {
-            name: path.into(),
-            kind: PageKind::Page,
-            title: path.into(),
-            pre_block: None,
-            blocks: raws
-                .iter()
-                .enumerate()
-                .map(|(index, raw)| BlockDto {
-                    id: format!("block-{index}"),
-                    raw: (*raw).into(),
-                    ..BlockDto::default()
-                })
-                .collect(),
-            rev: None,
-            format,
-            read_only: false,
-            path: path.into(),
-            activation: None,
-            guide: false,
-        }
-    }
-
-    /// The managed projection cache reuses a retained tree only for content it
-    /// has PROVED identical, and it stays inside both of its bounds.
-    ///
-    /// The path is a lookup key, never a substitute for the comparison. A path
-    /// that comes back with different content -- an external edit, a rename
-    /// that reuses a filename, a replacement page -- must miss, because the
-    /// retained tree carries memoized lsdoc projections of the OLD raw text and
-    /// the OLD block identities.
-    #[test]
-    fn application_projection_cache_reuses_only_proven_identical_content() {
-        let mut cache = ApplicationProjectionCache::default();
-        let page = projection_cache_page("a.md", Format::Md, &["- one", "- two"]);
-
-        let first = cache.roots("a.md", &page);
-        let second = cache.roots("a.md", &page);
-        assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.counters(), (1, 1, 1));
-
-        // Same path, changed raw text.
-        let edited = projection_cache_page("a.md", Format::Md, &["- one", "- CHANGED"]);
-        let third = cache.roots("a.md", &edited);
-        assert!(!std::sync::Arc::ptr_eq(&second, &third));
-        assert_eq!(third[1].raw, "- CHANGED");
-        assert_eq!(cache.counters(), (1, 2, 1));
-
-        // Same path and text, changed block identity: the id becomes
-        // `DocBlock::uuid` and reaches the result DTO, so it cannot be reused.
-        let mut reidentified = edited.clone();
-        reidentified.blocks[0].id = "block-renamed".into();
-        let fourth = cache.roots("a.md", &reidentified);
-        assert_eq!(fourth[0].uuid, "block-renamed");
-        assert_eq!(cache.counters(), (1, 3, 1));
-
-        // Same path, same text, different parser mode.
-        let org = projection_cache_page("a.md", Format::Org, &["- one", "- CHANGED"]);
-        let mut org = org;
-        org.blocks[0].id = "block-renamed".into();
-        let _ = cache.roots("a.md", &org);
-        assert_eq!(cache.counters(), (1, 4, 1));
-
-        // Changed child shape at identical parent raw text.
-        let mut nested = projection_cache_page("b.md", Format::Md, &["- parent"]);
-        nested.blocks[0].children = vec![BlockDto {
-            id: "child".into(),
-            raw: "- child".into(),
-            ..BlockDto::default()
-        }];
-        let _ = cache.roots("b.md", &nested);
-        let flat = projection_cache_page("b.md", Format::Md, &["- parent"]);
-        let _ = cache.roots("b.md", &flat);
-        assert_eq!(cache.counters(), (1, 6, 2));
-    }
-
-    /// Both bounds hold, and a page bigger than the whole byte budget is served
-    /// without evicting the graph to store something the next insert would drop.
-    #[test]
-    fn application_projection_cache_stays_inside_both_bounds() {
-        let mut cache = ApplicationProjectionCache::new(2, 1024);
-        for page in 0..4 {
-            let path = format!("p{page}.md");
-            let dto = projection_cache_page(&path, Format::Md, &["- small"]);
-            let _ = cache.roots(&path, &dto);
-        }
-        let (_, _, retained) = cache.counters();
-        assert_eq!(retained, 2, "the page bound must evict least-recently-used");
-
-        // The most recent two survive; the oldest was evicted and misses.
-        let oldest = projection_cache_page("p0.md", Format::Md, &["- small"]);
-        cache.reset_counters();
-        let _ = cache.roots("p0.md", &oldest);
-        assert_eq!(cache.counters().0, 0, "an evicted page must miss");
-
-        let mut cache = ApplicationProjectionCache::new(64, 64);
-        let huge = "- ".to_string() + &"x".repeat(4096);
-        let big = projection_cache_page("big.md", Format::Md, &[huge.as_str()]);
-        let roots = cache.roots("big.md", &big);
-        assert_eq!(roots.len(), 1, "an over-budget page is still served");
-        assert_eq!(
-            cache.counters().2,
-            0,
-            "an over-budget page must not be retained"
-        );
-        let small = projection_cache_page("small.md", Format::Md, &["- s"]);
-        let _ = cache.roots("small.md", &small);
-        assert_eq!(
-            cache.counters().2,
-            1,
-            "storing the over-budget page must not have evicted the budget"
-        );
-    }
-
     fn nested_boolean(head: &str, depth: usize, leaf: &str) -> String {
         format!(
             "{}{}{}",
@@ -6645,59 +5878,6 @@ mod tests {
             query_nesting_within_limit(&advanced_comment),
             "advanced EDN comments must not count delimiter text"
         );
-    }
-
-    #[test]
-    fn application_backlink_filter_truncates_past_the_managed_block_depth() {
-        let mut block = BlockDto {
-            id: "leaf".into(),
-            raw: "leaf-sentinel".into(),
-            ..BlockDto::default()
-        };
-        for depth in 0..=crate::model::MAX_MANAGED_BLOCK_DEPTH {
-            block = BlockDto {
-                id: format!("depth-{depth}"),
-                raw: format!("depth-{depth}"),
-                children: vec![block],
-                ..BlockDto::default()
-            };
-        }
-        let projected = application_query_doc_block(&block, false);
-        let entry = backlink_filter_entry(
-            "Hostile",
-            PageKind::Page,
-            &projected,
-            &std::collections::HashSet::new(),
-            usize::MAX,
-        );
-        assert!(entry.truncated);
-        assert!(!entry.text.contains("leaf-sentinel"));
-
-        let mut doc_block = DocBlock {
-            raw: "leaf-sentinel".into(),
-            children: Vec::new(),
-            uuid: "leaf".into(),
-            is_org: false,
-            proj: std::sync::OnceLock::new(),
-        };
-        for depth in 0..=crate::model::MAX_MANAGED_BLOCK_DEPTH {
-            doc_block = DocBlock {
-                raw: format!("depth-{depth}"),
-                children: vec![doc_block],
-                uuid: format!("doc-depth-{depth}"),
-                is_org: false,
-                proj: std::sync::OnceLock::new(),
-            };
-        }
-        let entry = backlink_filter_entry(
-            "Hostile",
-            PageKind::Page,
-            &doc_block,
-            &std::collections::HashSet::new(),
-            usize::MAX,
-        );
-        assert!(entry.truncated);
-        assert!(!entry.text.contains("leaf-sentinel"));
     }
 
     #[test]

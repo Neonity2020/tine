@@ -16,10 +16,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
-use tine_core::sync_runtime::{
-    inspect_shared_enrollment_for_cold_discovery, inspect_shared_provider_cold_prefix,
-    ManagedStorageRefusalScenario, SyncSharedProviderColdPrefix,
-};
 
 /// Reset the warm flag for a new graph load and return the new warm generation
 /// (passed to `warm_cache_async`, which only reports done if still current).
@@ -115,7 +111,6 @@ pub(crate) async fn startup_graph_path(
         }
     };
     let worker_app = app.clone();
-    let worker_label = label.clone();
     match tauri::async_runtime::spawn_blocking(move || {
         let worker_state = worker_app.state::<AppState>();
         if let Err(error) = worker_state.storage_supervisor.advance_transition(
@@ -132,13 +127,10 @@ pub(crate) async fn startup_graph_path(
         if let Some(root) = canonical_target.clone() {
             if let Err(error) = worker_state
                 .storage_supervisor
-                .bind_transition_root(lookup_id, root.clone())
+                .bind_transition_root(lookup_id, root)
             {
                 crate::debug::diag(error);
             }
-            worker_state
-                .storage_supervisor
-                .select_window_root(&worker_label, root);
         }
         if let Err(error) = worker_state.storage_supervisor.finish_transition(
             &worker_app,
@@ -243,114 +235,6 @@ pub(crate) fn capture_graph_binding(
 struct LoadedGraph {
     graph: Graph,
     meta: GraphMeta,
-}
-
-const PARTIAL_PROVIDER_REFUSAL: &str =
-    "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColdSparseArchive {
-    Absent,
-    Joinable,
-    Partial,
-    Refused(ManagedStorageRefusalScenario),
-}
-
-pub(crate) fn refuse_unclaimed_sparse_archive(
-    root: &Path,
-) -> Result<(), crate::command_error::CommandError> {
-    refuse_unclaimed_sparse_archive_with(root, |shared| match inspect_shared_provider_cold_prefix(
-        shared,
-    )
-    .map_err(crate::command_error::CommandError::graph)?
-    {
-        SyncSharedProviderColdPrefix::Partial => Ok(false),
-        SyncSharedProviderColdPrefix::ReadyForDescriptorInspection => {
-            inspect_shared_enrollment_for_cold_discovery(shared)
-                .map(|descriptor| descriptor.is_some())
-                // A descriptor file can be observed between the provider's
-                // create and final write/rename.  Its malformed bytes are an
-                // incomplete arrival, not proof of hostile graph state.
-                .or(Ok(false))
-        }
-        SyncSharedProviderColdPrefix::Refused => {
-            Err(crate::command_error::CommandError::graph(format!(
-                "shared provider namespace has an unsafe filesystem kind [scenario_id={}]",
-                ManagedStorageRefusalScenario::UnsafeFilesystemKind
-            )))
-        }
-    })
-}
-
-fn refuse_unclaimed_sparse_archive_with(
-    root: &Path,
-    inspect_shared: impl FnOnce(&Path) -> Result<bool, crate::command_error::CommandError>,
-) -> Result<(), crate::command_error::CommandError> {
-    match inspect_unclaimed_sparse_archive(root, inspect_shared)? {
-        ColdSparseArchive::Absent | ColdSparseArchive::Joinable => Ok(()),
-        ColdSparseArchive::Partial => {
-            crate::debug::diag(
-                "sparse-v2 cold discovery: phase=provider_evidence; outcome=partial_provider_refusal",
-            );
-            Err(crate::command_error::CommandError::prose(PARTIAL_PROVIDER_REFUSAL))
-        }
-        ColdSparseArchive::Refused(scenario) => Err(crate::command_error::CommandError::graph(format!(
-            "Tine-managed storage data has an unsafe filesystem kind, so this graph could not be opened safely. [scenario_id={scenario}]"
-        ))),
-    }
-}
-
-fn inspect_unclaimed_sparse_archive(
-    root: &Path,
-    inspect_shared: impl FnOnce(&Path) -> Result<bool, crate::command_error::CommandError>,
-) -> Result<ColdSparseArchive, crate::command_error::CommandError> {
-    let archive = root.join(".tine-sync/v2");
-    let metadata = match std::fs::symlink_metadata(&archive) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ColdSparseArchive::Absent)
-        }
-        Err(error) => {
-            return Err(crate::command_error::CommandError::graph(format!(
-                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-            )));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(ColdSparseArchive::Refused(
-            ManagedStorageRefusalScenario::UnsafeFilesystemKind,
-        ));
-    }
-    let shared = archive.join("shared");
-    let shared_metadata = match std::fs::symlink_metadata(&shared) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ColdSparseArchive::Partial)
-        }
-        Err(error) => {
-            return Err(crate::command_error::CommandError::graph(format!(
-                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-            )))
-        }
-    };
-    if shared_metadata.file_type().is_symlink() || !shared_metadata.is_dir() {
-        return Ok(ColdSparseArchive::Refused(
-            ManagedStorageRefusalScenario::UnsafeFilesystemKind,
-        ));
-    }
-    // The canonical shared directory is the only path that carries discovery
-    // authority.  Temporary or future sibling entries under v2 are inert.
-    match inspect_shared(&shared) {
-        Ok(true) => Ok(ColdSparseArchive::Joinable),
-        Ok(false) => Ok(ColdSparseArchive::Partial),
-        // Preserve a local filesystem/validation failure.  Collapsing this to
-        // Refused (and then to a generic recovery message) previously made a
-        // legitimate Android shared-storage incompatibility look exactly like
-        // provider bytes that were still arriving.
-        Err(error) => Err(crate::command_error::CommandError::graph(format!(
-            "Couldn't validate Tine-managed sync data on this device: {error}"
-        ))),
-    }
 }
 
 fn open_graph_for_load(
@@ -559,9 +443,7 @@ fn graph_load_phase(started: Option<Instant>, previous: &mut Option<Instant>, ph
     *previous = Some(now);
 }
 
-/// The one Direct Files publish lifecycle used by ordinary graph open and the
-/// cold managed-storage escape.  Callers must already have made their storage
-/// authority decision (and, for a cold return, preserved the managed state).
+/// The one Direct Files publish lifecycle used by ordinary graph open.
 /// It deliberately includes the normal backup, migration, remembered-graph,
 /// title, watcher, and cache scheduling work so a recovery binding is not a
 /// half-open graph that only happens to answer `AlreadyCurrent` later.
@@ -574,8 +456,7 @@ pub(crate) struct DirectFilesOpen {
 /// Install the ordinary Direct Files authority in the window registry.  This is
 /// intentionally the one testable sub-boundary of Direct Files publishing: a
 /// caller that reaches it has already made the storage decision, and the slot
-/// itself proves every later graph command is routed to Direct Files rather
-/// than a sparse-v2 actor.
+/// itself is the authority every later graph command is routed to.
 fn publish_direct_files_slot(
     state: &AppState,
     window_label: &str,
@@ -760,9 +641,6 @@ pub(crate) fn load_graph_for_label(
         )
     })?;
     let root_key = canonical_graph_root(&root).map_err(crate::command_error::CommandError::from)?;
-    state
-        .storage_supervisor
-        .select_window_root(window_label, root_key.clone());
     graph_load_phase(started, &mut previous, "canonical graph root");
     let transition_gate = state.storage_supervisor.transition_lane(&root_key);
     let _load = transition_gate.lock().unwrap();
@@ -821,236 +699,13 @@ pub(crate) fn load_graph_for_label(
             window_label: owner,
         });
     }
-    let mut rebuild_managed_after_direct = false;
-    let binding_record = match state.sync_runtime.binding_record(app, &root_key) {
-        Ok(binding_record) => binding_record,
-        // There is no pre-0.7 migration path. If the private opt-in record is
-        // readable but not the one current format, preserve the complete
-        // private root and rebuild managed state from the Markdown/Org tree.
-        Err(_) if state.sync_runtime.unrecognized_binding_file(app, &root_key) => {
-            if let Err(error) = state
-                .sync_runtime
-                .archive_unrecognized_private_state(app, &root_key)
-            {
-                // The archive helper published the durable Direct/rebuild
-                // intent first. Keep the Markdown/Org graph available now;
-                // automatic activation below will retry the archive, and a
-                // later open will retry again if that activation also fails.
-                crate::debug::diag(format!(
-                    "pre-0.7 managed-state archive deferred; opening Direct Files: {error}"
-                ));
-            }
-            rebuild_managed_after_direct = true;
-            None
-        }
-        Err(error) => {
-            let _ = state.storage_supervisor.finish_transition(
-                app,
-                lookup_id,
-                StorageTransitionOutcome::Failed,
-                None,
-                Some("private_storage_discovery_failed".into()),
-            );
-            return Err(error);
-        }
-    };
-    if binding_record.is_none()
-        && state
-            .sync_runtime
-            .blank_slate_rebuild_pending(app, &root_key)?
-    {
-        // This includes a crash after archival and a prior automatic rebuild
-        // attempt that failed while Direct Files remained safely available.
-        rebuild_managed_after_direct = true;
-    }
-    graph_load_phase(started, &mut previous, "private storage discovery");
-    let mut lookup_finished = false;
-    'managed: {
-        let Some(record) = binding_record else {
-            break 'managed;
-        };
-        state.storage_supervisor.finish_transition(
-            app,
-            lookup_id,
-            StorageTransitionOutcome::Succeeded,
-            None,
-            None,
-        )?;
-        lookup_finished = true;
-        let managed_id = state.storage_supervisor.begin_transition(
-            app,
-            window_label,
-            Some(root_key.clone()),
-            StorageTransitionKind::OpenManaged,
-        )?;
-        state.storage_supervisor.advance_transition(
-            app,
-            managed_id,
-            StorageTransitionPhase::ValidatingTarget,
-        )?;
-        state.storage_supervisor.advance_transition(
-            app,
-            managed_id,
-            StorageTransitionPhase::OpeningManaged,
-        )?;
-        let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
-        let binding = match state
-            .sync_runtime
-            .open_record_for_window(app, window_label, &record)
-        {
-            Ok(binding) => binding,
-            Err(error) => {
-                let _ = state.storage_supervisor.finish_transition(
-                    app,
-                    managed_id,
-                    StorageTransitionOutcome::Failed,
-                    None,
-                    Some("managed_open_failed".into()),
-                );
-                return Err(error);
-            }
-        };
-        graph_load_phase(started, &mut previous, "managed storage recovery");
-        if binding.requires_blank_slate_rebuild() {
-            // A readable outer binding can still lead to an unrecognized
-            // private store. Preserve it, publish a Direct Files source, then
-            // reconstruct the one current managed format automatically.
-            if let Err(error) = state
-                .sync_runtime
-                .archive_unrecognized_private_state(app, &root_key)
-            {
-                crate::debug::diag(format!(
-                    "pre-0.7 managed-state archive deferred; opening Direct Files: {error}"
-                ));
-                state.storage_supervisor.finish_transition(
-                    app,
-                    managed_id,
-                    StorageTransitionOutcome::Cancelled,
-                    None,
-                    Some("blank_slate_archive_deferred".into()),
-                )?;
-                rebuild_managed_after_direct = true;
-                break 'managed;
-            }
-            state.storage_supervisor.finish_transition(
-                app,
-                managed_id,
-                StorageTransitionOutcome::Cancelled,
-                None,
-                Some("blank_slate_rebuild_requested".into()),
-            )?;
-            rebuild_managed_after_direct = true;
-            break 'managed;
-        }
-        if let Some(detail) = binding.serving_failure_detail() {
-            let _ = state.storage_supervisor.finish_transition(
-                app,
-                managed_id,
-                StorageTransitionOutcome::Failed,
-                None,
-                Some("managed_open_not_serving".into()),
-            );
-            return Err(crate::command_error::CommandError::graph(format!(
-                "Managed storage could not serve this workspace: {detail}"
-            )));
-        }
-        let slot = Arc::new(GraphSlot::from_sparse_v2(
-            binding,
-            root_key.clone(),
-            meta.clone(),
-        ));
-        crate::sync_runtime::prove_managed_application_ready(&slot, None).map_err(|error| {
-            crate::command_error::CommandError::graph({
-                let _ = state.storage_supervisor.finish_transition(
-                    app,
-                    managed_id,
-                    StorageTransitionOutcome::Failed,
-                    None,
-                    Some("managed_readiness_failed".into()),
-                );
-                format!("Managed storage opened but its pages are not usable: {error}")
-            })
-        })?;
-        graph_load_phase(started, &mut previous, "managed application readiness");
-        if let Err(error) = state.storage_supervisor.commit_if_current(managed_id, || {
-            state
-                .graphs
-                .write()
-                .unwrap()
-                .bind(window_label.to_string(), Arc::clone(&slot))
-                .map_err(crate::command_error::CommandError::from)
-        }) {
-            // A newer operation (especially emergency Direct Files or a graph
-            // switch) owns publication now. Completing this stale managed
-            // worker is not a user-visible graph-open failure: report the
-            // binding that actually won, if one is already installed.
-            if !state.storage_supervisor.operation_is_current(managed_id) {
-                if let Ok(current) = slot_for_window(state, window_label) {
-                    return Ok(LoadGraphResult::AlreadyCurrent {
-                        meta: current.graph_meta(),
-                        binding_generation: current.binding_generation,
-                        application_page_admission: current.application_page_admission(),
-                    });
-                }
-            }
-            let _ = state.storage_supervisor.finish_transition(
-                app,
-                managed_id,
-                StorageTransitionOutcome::Failed,
-                None,
-                Some("managed_publish_failed".into()),
-            );
-            return Err(error);
-        }
-        state.storage_supervisor.finish_transition(
-            app,
-            managed_id,
-            StorageTransitionOutcome::Succeeded,
-            Some(StableStorageMode::Managed),
-            None,
-        )?;
-        graph_load_phase(started, &mut previous, "managed publish");
-        state.note_focused(window_label);
-        poke_watcher(state);
-        remember_graph(app, &meta.root)?;
-        if let Some(window) = app.get_webview_window(window_label) {
-            let name = Path::new(&meta.root)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("Graph");
-            let _ = window.set_title(&format!("Tine — {name}"));
-        }
-        return Ok(LoadGraphResult::Loaded {
-            meta,
-            binding_generation: slot.binding_generation,
-            application_page_admission: slot.application_page_admission(),
-        });
-    }
-    let explicit_direct = state
-        .sync_runtime
-        .direct_selection_is_active(app, &root_key)?;
-    if !explicit_direct {
-        if let Err(error) = refuse_unclaimed_sparse_archive(&root_key) {
-            let _ = state.storage_supervisor.finish_transition(
-                app,
-                lookup_id,
-                StorageTransitionOutcome::Failed,
-                None,
-                Some("unclaimed_managed_archive".into()),
-            );
-            return Err(error);
-        }
-    }
-    graph_load_phase(started, &mut previous, "shared storage discovery");
-    if !lookup_finished {
-        state.storage_supervisor.finish_transition(
-            app,
-            lookup_id,
-            StorageTransitionOutcome::Succeeded,
-            None,
-            None,
-        )?;
-    }
+    state.storage_supervisor.finish_transition(
+        app,
+        lookup_id,
+        StorageTransitionOutcome::Succeeded,
+        None,
+        None,
+    )?;
     let direct_id = state.storage_supervisor.begin_transition(
         app,
         window_label,
@@ -1104,35 +759,6 @@ pub(crate) fn load_graph_for_label(
         None,
     )?;
     graph_load_phase(started, &mut previous, "Direct Files publish");
-    if rebuild_managed_after_direct {
-        let source_generation = direct.binding_generation;
-        drop(_load);
-        return match crate::sync_runtime::activate_sparse_v2_blocking(
-            app,
-            window_label,
-            source_generation,
-        ) {
-            Ok(_) => {
-                let managed = slot_for_window(state, window_label)
-                    .map_err(crate::command_error::CommandError::from)?;
-                Ok(LoadGraphResult::Loaded {
-                    meta: managed.graph_meta(),
-                    binding_generation: managed.binding_generation,
-                    application_page_admission: managed.application_page_admission(),
-                })
-            }
-            Err(error) => {
-                crate::debug::diag(format!(
-                    "automatic managed-storage rebuild failed; Direct Files remains active: {error}"
-                ));
-                Ok(LoadGraphResult::Loaded {
-                    meta: direct.meta,
-                    binding_generation: direct.binding_generation,
-                    application_page_admission: direct.application_page_admission,
-                })
-            }
-        };
-    }
     Ok(LoadGraphResult::Loaded {
         meta: direct.meta,
         binding_generation: direct.binding_generation,
@@ -1492,17 +1118,6 @@ mod tests {
         dir
     }
 
-    fn assert_unsafe_provider_refusal(error: &crate::command_error::CommandError) {
-        assert!(
-            error.contains("unsafe filesystem kind"),
-            "the refusal must name the user-actionable class: {error}"
-        );
-        assert!(
-            error.contains(ManagedStorageRefusalScenario::UnsafeFilesystemKind.as_str()),
-            "the refusal must preserve its stable scenario ID: {error}"
-        );
-    }
-
     fn tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         fn collect(root: &Path, relative: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
             for entry in std::fs::read_dir(root.join(relative)).unwrap() {
@@ -1532,7 +1147,6 @@ mod tests {
             watch_ctl: std::sync::Mutex::new(None),
             last_focused: std::sync::Mutex::new(None),
             capture_graph: std::sync::Mutex::new(Default::default()),
-            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: std::sync::atomic::AtomicU64::new(1),
         }
@@ -1695,176 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn unclaimed_sparse_archive_refuses_legacy_graph_open() {
-        let dir = scratch("unclaimed-sparse");
-        assert_eq!(refuse_unclaimed_sparse_archive(&dir), Ok(()));
-        std::fs::create_dir_all(dir.join(".tine-sync/v2")).unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn honest_cold_provider_prefixes_are_retryable_before_the_descriptor_arrives() {
-        for (tag, prefix) in [
-            ("outbox-absent", 0_u8),
-            ("enrollment-absent", 1),
-            ("enrollment-empty", 2),
-        ] {
-            let dir = scratch(&format!("cold-provider-prefix-{tag}"));
-            let page = dir.join("pages/representative.md");
-            let recovery = dir.join(".tine-sync/recovery/returned/receipt");
-            let shared = dir.join(".tine-sync/v2/shared");
-            std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
-            std::fs::write(&page, b"- unchanged Direct Files bytes\n").unwrap();
-            std::fs::write(&recovery, b"unchanged recovery bytes\n").unwrap();
-            match prefix {
-                // Syncthing may create the sibling provider tree before outbox.
-                0 => std::fs::create_dir_all(shared.join("inbox")).unwrap(),
-                // The provider may deliver another recognized outbox namespace
-                // before it delivers enrollment.
-                1 => std::fs::create_dir_all(shared.join("outbox/objects")).unwrap(),
-                // The enrollment directory itself may arrive before its one
-                // canonical descriptor file.
-                2 => {
-                    std::fs::create_dir_all(shared.join("outbox/objects")).unwrap();
-                    std::fs::create_dir_all(shared.join("outbox/enrollment")).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            let page_before = std::fs::read(&page).unwrap();
-            let recovery_before = std::fs::read(&recovery).unwrap();
-
-            assert_eq!(
-                refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-                PARTIAL_PROVIDER_REFUSAL,
-                "{tag} is an honest provider prefix, not corrupt managed data"
-            );
-            assert_eq!(std::fs::read(&page).unwrap(), page_before);
-            assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
-            assert!(
-                !dir.join(".tine-sync/v1").exists(),
-                "a retryable cold refusal must not activate or create v1"
-            );
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn cold_provider_incomplete_descriptor_is_retryable() {
-        let dir = scratch("cold-provider-invalid-enrollment");
-        let enrollment = dir.join(".tine-sync/v2/shared/outbox/enrollment");
-        std::fs::create_dir_all(&enrollment).unwrap();
-        std::fs::write(enrollment.join("shared-enrollment-v1.json"), b"{").unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL,
-            "a descriptor observed before its final write is an incomplete provider arrival"
-        );
-        std::fs::write(
-            enrollment.join("shared-enrollment-v1.sync-conflict.json"),
-            b"{",
-        )
-        .unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL,
-            "a sibling provider artifact must not turn an incomplete canonical descriptor into a permanent refusal"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn cold_provider_unsafe_canonical_kinds_refuse_but_unrelated_entries_retry() {
-        let non_directory = scratch("cold-provider-outbox-file");
-        let shared = non_directory.join(".tine-sync/v2/shared");
-        std::fs::create_dir_all(&shared).unwrap();
-        std::fs::write(shared.join("outbox"), b"not a directory").unwrap();
-        assert_unsafe_provider_refusal(
-            &refuse_unclaimed_sparse_archive(&non_directory).unwrap_err(),
-        );
-        let _ = std::fs::remove_dir_all(non_directory);
-
-        let unknown = scratch("cold-provider-unknown-outbox-entry");
-        std::fs::create_dir_all(unknown.join(".tine-sync/v2/shared/outbox/unknown")).unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&unknown).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL
-        );
-        let _ = std::fs::remove_dir_all(unknown);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-
-            let symlinked = scratch("cold-provider-outbox-symlink");
-            let shared = symlinked.join(".tine-sync/v2/shared");
-            std::fs::create_dir_all(&shared).unwrap();
-            let target = symlinked.join("provider-outbox-target");
-            std::fs::create_dir_all(&target).unwrap();
-            symlink(&target, shared.join("outbox")).unwrap();
-            assert_unsafe_provider_refusal(
-                &refuse_unclaimed_sparse_archive(&symlinked).unwrap_err(),
-            );
-            let _ = std::fs::remove_dir_all(symlinked);
-        }
-    }
-
-    #[test]
-    fn cold_shared_discovery_uses_the_real_v2_shared_namespace() {
-        let dir = scratch("cold-shared-layout");
-        let v2 = dir.join(".tine-sync/v2");
-        let shared = v2.join("shared");
-        std::fs::create_dir_all(shared.join("outbox/enrollment")).unwrap();
-        std::fs::write(
-            shared.join("outbox/enrollment/shared-enrollment-v1.json"),
-            b"test descriptor bytes",
-        )
-        .unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |path| {
-                assert_eq!(path, shared);
-                Ok(true)
-            }),
-            Ok(())
-        );
-
-        std::fs::write(v2.join("unknown"), b"retain").unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)),
-            Ok(()),
-            "unrelated v2 provider artifacts do not override the canonical shared namespace"
-        );
-        std::fs::remove_file(v2.join("unknown")).unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(false)).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL
-        );
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Err(
-                crate::command_error::CommandError::prose("malformed")
-            ))
-            .unwrap_err(),
-            "Couldn't validate Tine-managed sync data on this device: malformed"
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            std::fs::remove_dir_all(&shared).unwrap();
-            let target = dir.join("provider-target");
-            std::fs::create_dir_all(&target).unwrap();
-            symlink(&target, &shared).unwrap();
-            assert_unsafe_provider_refusal(
-                &refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
-            );
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn graph_load_proposes_journal_renames_instead_of_performing_them() {
         let dir = scratch("pre-migrate-backup");
         std::fs::create_dir_all(dir.join("logseq")).unwrap();
@@ -1913,135 +1357,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_provider_arrival_refuses_before_direct_open_without_mutating_the_graph() {
-        let dir = scratch("partial-provider-arrival");
-        let page = dir.join("pages/representative.md");
-        let recovery = dir.join(".tine-sync/recovery/v2-returned-from-desktop/receipt");
-        let partial_shared = dir.join(".tine-sync/v2/shared");
-        std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&partial_shared).unwrap();
-        std::fs::write(&page, "- representative Direct Files bytes\n").unwrap();
-        std::fs::write(&recovery, "preserved recovery evidence\n").unwrap();
-        let page_before = std::fs::read(&page).unwrap();
-        let recovery_before = std::fs::read(&recovery).unwrap();
-
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
-        );
-        assert_eq!(std::fs::read(&page).unwrap(), page_before);
-        assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
-        assert!(
-            !dir.join(".tine-sync/v1").exists(),
-            "a partial v2 refusal must not invoke legacy activation"
-        );
-
-        let source = include_str!("graph.rs");
-        let load = &source[source
-            .find("pub(crate) fn load_graph_for_label")
-            .expect("ordinary graph-load decision")..];
-        assert!(
-            load.find("refuse_unclaimed_sparse_archive")
-                < load.find("let prepared = match prepare_direct_files_open"),
-            "partial provider evidence must be refused before a Direct Files binding is installed"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn managed_reopen_proves_pages_before_registry_publication() {
-        let source = include_str!("graph.rs");
-        let start = source
-            .find("pub(crate) fn load_graph_for_label")
-            .expect("graph load function");
-        let managed = &source[start..];
-        let readiness = managed
-            .find("prove_managed_application_ready(&slot, None)")
-            .expect("managed page readiness proof");
-        let publication = managed
-            .find("commit_if_current(managed_id")
-            .expect("managed registry publication");
-        assert!(readiness < publication);
-    }
-
-    #[test]
-    fn managed_reopen_reports_nonserving_binding_before_page_readiness() {
-        let source = include_str!("graph.rs");
-        let start = source
-            .find("pub(crate) fn load_graph_for_label")
-            .expect("graph load function");
-        let managed = &source[start..];
-        let refusal = managed
-            .find("serving_failure_detail()")
-            .expect("typed managed-open refusal");
-        let readiness = managed
-            .find("prove_managed_application_ready(&slot, None)")
-            .expect("managed page readiness proof");
-        assert!(refusal < readiness);
-    }
-
-    #[test]
-    fn pre_07_unknown_state_archives_then_rebuilds_without_manual_reactivation() {
-        let source = include_str!("graph.rs");
-        let start = source
-            .find("pub(crate) fn load_graph_for_label")
-            .expect("graph load function");
-        let body = &source[start
-            ..source[start..]
-                .find("#[tauri::command]")
-                .map(|offset| start + offset)
-                .expect("end of graph load function")];
-        let classification = body
-            .find("unrecognized_binding_file")
-            .expect("unrecognized private binding classification");
-        let archive = body[classification..]
-            .find("archive_unrecognized_private_state")
-            .map(|offset| classification + offset)
-            .expect("unrecognized private state archive");
-        assert!(body[archive..].contains("blank_slate_archive_deferred"));
-        assert!(body[archive..].contains("opening Direct Files"));
-        let mut archive_paths = body;
-        let mut checked_archive_paths = 0;
-        while let Some(archive_offset) = archive_paths.find("archive_unrecognized_private_state") {
-            let after_archive = &archive_paths[archive_offset..];
-            let retry_offset = after_archive
-                .find("rebuild_managed_after_direct = true")
-                .expect("archive path must schedule automatic rebuild");
-            assert!(
-                !after_archive[..retry_offset].contains("return Err(error)"),
-                "archive failure must fall through to Direct Files"
-            );
-            checked_archive_paths += 1;
-            archive_paths = &after_archive[retry_offset + 1..];
-        }
-        assert_eq!(checked_archive_paths, 2);
-        let durable_retry = body[archive..]
-            .find("blank_slate_rebuild_pending")
-            .map(|offset| archive + offset)
-            .expect("durable automatic-rebuild retry intent");
-        let direct = body[durable_retry..]
-            .find("Direct Files publish")
-            .map(|offset| durable_retry + offset)
-            .expect("safe Markdown/Org source publication");
-        let unlock = body[direct..]
-            .find("drop(_load)")
-            .map(|offset| direct + offset)
-            .expect("graph-open lane release before activation");
-        let rebuild = body[unlock..]
-            .find("activate_sparse_v2_blocking")
-            .map(|offset| unlock + offset)
-            .expect("automatic managed rebuild");
-        assert!(
-            classification < archive
-                && archive < durable_retry
-                && durable_retry < direct
-                && direct < unlock
-                && unlock < rebuild
-        );
-        assert!(body[rebuild..].contains("Direct Files remains active"));
-    }
-
-    #[test]
     fn ordinary_direct_publish_treats_v1_and_return_recovery_as_inert() {
         let dir = scratch("direct-with-inert-legacy-and-recovery");
         let page = dir.join("pages/representative.md");
@@ -2080,7 +1395,7 @@ mod tests {
             "the installed Direct slot owns the scheduled warm generation"
         );
         assert!(
-            !installed.is_sparse_v2() && installed.legacy_graph().is_ok(),
+            installed.legacy_graph().is_ok(),
             "ordinary publish must install a Direct Files registry binding"
         );
         assert_eq!(std::fs::read(&page).unwrap(), page_before);
@@ -2121,7 +1436,7 @@ mod tests {
         let (slot, _) =
             publish_direct_files_slot(&state, "inert-v1-file", loaded.graph, v1_file_root).unwrap();
         assert!(
-            !slot.is_sparse_v2() && slot.legacy_graph().is_ok(),
+            slot.legacy_graph().is_ok(),
             "the malformed legacy child still installs an ordinary Direct Files slot"
         );
         assert_eq!(

@@ -50,7 +50,7 @@ use crate::model::{
     PageKind, RefGroup, ShallowBlockFacets,
 };
 use crate::query::rank::PageRecencyPrograms;
-use crate::query::sql::{descriptor_statement, page_statement, SqlQuery};
+use crate::query::sql::{page_statement, SqlQuery};
 use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups, ResultViewGroup};
 
 // The gates. `#[path]` keeps the file beside this one so the shared
@@ -71,11 +71,10 @@ pub(crate) const PAYLOAD_BATCH: usize = 128;
 const OWNER_BLOCK: i64 = 1;
 
 /// The backend construction order, also the final tie within equal display
-/// page keys. Direct uses `query_page_order`; Managed uses binary `pages.path`.
+/// page keys: `query_page_order`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackendOrder {
     Direct,
-    Managed,
 }
 
 /// Where an admitted row's PUBLIC id comes from (WARM-IDENTITY-ORDER-CONTRACT).
@@ -189,14 +188,10 @@ pub(crate) struct ResultReadInputs<'a> {
 }
 
 /// What the descriptor row knows about one admitted page, handed to the
-/// caller's recency producer. The two backends' walks read different inputs
-/// (Direct the stored day and path; Managed the kind and name), so the read
-/// offers all four rather than choosing for them.
+/// caller's recency producer: the stored journal day and the path.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RecencyPage<'a> {
     pub(crate) journal_day: Option<i64>,
-    pub(crate) kind: PageKind,
-    pub(crate) name: &'a str,
     pub(crate) path: &'a str,
 }
 
@@ -861,8 +856,6 @@ impl<C: ResultCarrier> PageGroups<C> {
                     page.group.page.clone(),
                     (inputs.recency)(RecencyPage {
                         journal_day: page.journal_day,
-                        kind: page.group.kind,
-                        name: &page.group.page,
                         path: &page.path,
                     }),
                 );

@@ -4,7 +4,7 @@
 //! the readable/indexable text scope. It deliberately grants no creation,
 //! projection, enrollment, rename, or deletion authority.
 
-use crate::oplog::{
+use crate::graph_text_path::{
     managed_component_is_portable, CanonicalGraphResourceId, PortablePathKey,
     PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION, PORTABLE_PATH_KEY_VERSION,
     PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION,

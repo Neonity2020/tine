@@ -3,8 +3,6 @@
 //! spellcheck WebKit integration; platform OS bridges; commands thin IPC.
 
 mod android_folder_picker;
-#[cfg(all(target_os = "android", debug_assertions))]
-mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
@@ -14,6 +12,7 @@ mod android_system_bars;
 mod backend_command_parity;
 mod backup;
 mod command_error;
+mod command_surface;
 mod commands;
 mod conflict_capsule;
 mod data_home;
@@ -24,9 +23,6 @@ mod graph_verification;
 mod ios_folder_picker;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
-/// Enumeration of what every command can do under Tine-managed storage. The
-/// diagnostics boundary also uses it to reject invented/free-form IPC names.
-mod managed_command_surface;
 mod media_protocol;
 mod migrate_identifier;
 mod native_mouse_history;
@@ -36,33 +32,26 @@ mod settings;
 mod spellcheck;
 mod state;
 mod storage_mode_supervisor;
-/// Test-only: the storage-transition enums and their `src/types.ts` unions are
-/// one wire format written twice.
-#[cfg(test)]
-mod storage_transition_wire_parity;
-mod sync_runtime;
 #[cfg(test)]
 mod test_support;
 mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    acknowledge_managed_application_move, activate_absent_editor, activate_editor,
-    apply_journal_filename_migrations, asset_trash_stats, block_ref_counts, block_referrers,
-    capture_live_save_conflict, capture_quick_switch, close_graph_window, conflict_capsule_diff,
-    conflict_queue, copy_guide_into_graph, delete_page, detect_media_editor,
-    duplicate_journal_diff, durable_live_save_conflict_diff, edit_asset_external,
-    empty_asset_trash, existing_page_names, export_query_subtrees, get_backlink_filter_context,
-    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages,
-    import_asset, import_native_capture, journal_content_days, journal_feed_page,
-    list_journal_conflicts, list_journal_filename_migrations, list_orphan_assets, list_pages,
-    list_sync_conflicts, list_templates, list_vcs_marker_conflicts, live_save_conflict_diff,
-    load_workspaces, merge_pages, move_managed_application_subtrees, open_asset, open_page_file,
-    open_pdf, page_aliases, page_icons, page_print_html, preflight_managed_page_mutation,
-    prepare_tine_quit, present_conflict_override, preview_block, publish_html, query_explain_empty,
-    query_facets, query_og_expressible, query_parse, query_print, query_registry, query_run,
-    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
-    read_local_image, read_text_file, recover_managed_application_subtrees, referenced_page_names,
+    activate_absent_editor, activate_editor, apply_journal_filename_migrations, asset_trash_stats,
+    block_ref_counts, block_referrers, capture_live_save_conflict, capture_quick_switch,
+    close_graph_window, conflict_capsule_diff, conflict_queue, copy_guide_into_graph, delete_page,
+    detect_media_editor, duplicate_journal_diff, durable_live_save_conflict_diff,
+    edit_asset_external, empty_asset_trash, existing_page_names, export_query_subtrees,
+    get_backlink_filter_context, get_backlinks, get_page, get_page_by_path, get_unlinked_refs,
+    graph_source_files, guide_pages, import_asset, import_native_capture, journal_content_days,
+    journal_feed_page, list_journal_conflicts, list_journal_filename_migrations,
+    list_orphan_assets, list_pages, list_sync_conflicts, list_templates, list_vcs_marker_conflicts,
+    live_save_conflict_diff, load_workspaces, merge_pages, open_asset, open_page_file, open_pdf,
+    page_aliases, page_icons, page_print_html, prepare_tine_quit, present_conflict_override,
+    preview_block, publish_html, query_explain_empty, query_facets, query_og_expressible,
+    query_parse, query_print, query_registry, query_run, quick_switch, read_asset, read_custom_css,
+    read_highlights, read_journal_file, read_local_image, read_text_file, referenced_page_names,
     rename_file_to_page, rename_page, rescan_graph_now, resolve_block, resolve_blocks,
     resolve_conflict_capsule, resolve_duplicate_journal_day, resolve_durable_live_save_conflict,
     resolve_live_save_conflict, resolve_sync_conflict, resolve_vcs_marker_conflict,
@@ -108,13 +97,6 @@ use state::AppState;
 #[cfg(desktop)]
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
-use sync_runtime::{
-    activate_sparse_v2, adopt_sparse_v2_shared, cancel_sparse_v2, cancel_sparse_v2_cold,
-    join_sparse_v2_shared, keep_absence_sweep_deletion, list_absence_sweeps,
-    prepare_sparse_v2_share, reapply_absence_sweep, restore_absence_sweep,
-    sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query,
-    sparse_v2_recovery_location, sparse_v2_status, sparse_v2_tick,
-};
 #[cfg(desktop)]
 use tauri::Emitter;
 use tauri::Manager;
@@ -771,7 +753,6 @@ pub fn run() {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(Default::default()),
-            sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
         })
@@ -799,10 +780,9 @@ pub fn run() {
             #[cfg(desktop)]
             schedule_main_window_reveal_fallback(app.handle());
             // The themed WebView owns startup graph loading through the normal
-            // `load_graph` command. In particular, authenticated managed crash
-            // recovery may be legitimate work; running it here would block the
-            // native event loop before either the stable-frame reveal or the
-            // fallback can show a window.
+            // `load_graph` command; running it here would block the native
+            // event loop before either the stable-frame reveal or the fallback
+            // can show a window.
             diag("setup() defers graph open to the visible webview");
             // Watch for external changes (reads whichever graph is current).
             start_watcher(app.handle().clone());
@@ -863,27 +843,6 @@ pub fn run() {
             cancel_graph_verification,
             save_graph_verification_report,
             save_page,
-            move_managed_application_subtrees,
-            acknowledge_managed_application_move,
-            recover_managed_application_subtrees,
-            preflight_managed_page_mutation,
-            sparse_v2_status,
-            activate_sparse_v2,
-            cancel_sparse_v2,
-            cancel_sparse_v2_cold,
-            prepare_sparse_v2_share,
-            join_sparse_v2_shared,
-            adopt_sparse_v2_shared,
-            sparse_v2_recovery_location,
-            sparse_v2_query,
-            sparse_v2_editor_load,
-            sparse_v2_editor_save,
-            sparse_v2_tick,
-            list_absence_sweeps,
-            reapply_absence_sweep,
-            restore_absence_sweep,
-            keep_absence_sweep_deletion,
-            sparse_v2_clean_shutdown,
             guide_pages,
             copy_guide_into_graph,
             get_backlink_filter_context,
@@ -1053,9 +1012,7 @@ pub fn run() {
     // `RunEvent::Exit`, which Tauri delivers to this callback before exiting;
     // clearing it anywhere later never runs and every quit is falsely reported
     // as unclean on the next launch (the flight recorder's `session-active`
-    // marker survives). Enforced at the real boundary by
-    // `scripts/e2e-absence-sweeps.mjs`, which reopens the app mid-journey and
-    // asserts the unclean-exit toast is absent.
+    // marker survives).
     app.run(|_app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             mark_clean_shutdown();

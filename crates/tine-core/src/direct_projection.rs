@@ -1,10 +1,10 @@
 use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
-use crate::oplog::query_cursor::drain_after;
 use crate::query::registry_cache::{CommittedRegistryCache, RegistryCapture};
 use crate::query::registry_sql::{self, PageRegistryMetadata};
 use crate::query::PropertyFacetAccumulator;
+use crate::query_cursor::drain_after;
 use crate::query_jobs::{
     OwnedAdmission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY, QUERY_JOB_WAIT,
 };
@@ -1954,7 +1954,8 @@ impl DirectProjection {
     /// the ONE §5.9 state a public query must never repair or retry.
     #[cfg(test)]
     pub(crate) fn close_query_jobs_test(&self) {
-        self.shared.query_jobs.close();
+        let fence = self.shared.query_jobs.begin_close();
+        self.shared.query_jobs.wait_for_drain(fence);
     }
 
     #[cfg(test)]
@@ -2078,7 +2079,7 @@ fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
     #[cfg(test)]
     REPORTED_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
     eprintln!("[tine] Direct Files SQLite projection {family}");
-    if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+    if crate::backend_error::runtime_debug_diagnostics_enabled() {
         eprintln!("[tine] Direct Files SQLite projection {family}; directed detail: {detail}");
     }
 }
@@ -2456,7 +2457,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 shared.changed.notify_all();
                 if error.is_reportable_failure() {
                     report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
-                } else if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+                } else if crate::backend_error::runtime_debug_diagnostics_enabled() {
                     eprintln!("[tine] Direct Files SQLite projection deferred this turn: {error}");
                 }
                 continue;
@@ -8224,7 +8225,7 @@ mod tests {
     #[ignore = "child process for the retired class-(c) stderr probe"]
     fn w4_i5b_projection_failure_marker_child() {
         if std::env::var("TINE_I5B_SET_FLAG").as_deref() == Ok("1") {
-            crate::sync_runtime::set_runtime_debug_diagnostics(true);
+            crate::backend_error::set_runtime_debug_diagnostics(true);
         }
         // Exactly what `open_projection_database` returns: a free-form
         // `MaterializationError` payload.

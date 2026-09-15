@@ -554,11 +554,9 @@ fn sort_sample_and_both_backend_orders_use_the_same_executor() {
         "(and (task TODO) (sort-by page desc) (sample 2))",
     )];
     let expected = walk_export(&corpus, &specs, Caps::default());
-    for order in [BackendOrder::Direct, BackendOrder::Managed] {
-        let actual = read_export(&corpus, &specs, Caps::default(), order)
-            .expect("the selected ordering policy answers");
-        assert_same_batch(&expected, &actual);
-    }
+    let actual = read_export(&corpus, &specs, Caps::default(), BackendOrder::Direct)
+        .expect("the selected ordering policy answers");
+    assert_same_batch(&expected, &actual);
 }
 
 #[test]

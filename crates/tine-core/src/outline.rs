@@ -22,19 +22,6 @@ thread_local! {
 static MANAGED_PARSE_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static MANAGED_PARSE_CENSUS_CALLS: AtomicUsize = AtomicUsize::new(0);
-/// Cross-thread parser-primitive counter for the ignored MS cost census. Run
-/// that probe with one test thread; ordinary assertions remain thread-local.
-#[cfg(test)]
-pub(crate) fn start_managed_parse_census() {
-    MANAGED_PARSE_CENSUS_CALLS.store(0, Ordering::Relaxed);
-    MANAGED_PARSE_CENSUS_ENABLED.store(true, Ordering::Release);
-}
-
-#[cfg(test)]
-pub(crate) fn finish_managed_parse_census() -> usize {
-    MANAGED_PARSE_CENSUS_ENABLED.store(false, Ordering::Release);
-    MANAGED_PARSE_CENSUS_CALLS.swap(0, Ordering::AcqRel)
-}
 
 #[cfg(test)]
 pub(crate) fn reset_parse_attempts() {
@@ -253,23 +240,21 @@ fn attach(stack: &mut Vec<(u32, usize, DocBlock)>, roots: &mut Vec<DocBlock>, bl
     }
 }
 
-fn build_tree(flat: Vec<(u32, DocBlock)>) -> (Vec<DocBlock>, usize) {
+fn build_tree(flat: Vec<(u32, DocBlock)>) -> Vec<DocBlock> {
     let mut roots = Vec::new();
     let mut stack: Vec<(u32, usize, DocBlock)> = Vec::new();
-    let mut maximum_depth = 0_usize;
     for (level, block) in flat {
         while stack.last().is_some_and(|(open, _, _)| *open >= level) {
             let (_, _, done) = stack.pop().expect("checked nonempty");
             attach(&mut stack, &mut roots, done);
         }
         let depth = stack.len().saturating_add(1);
-        maximum_depth = maximum_depth.max(depth);
         stack.push((level, depth, block));
     }
     while let Some((_, _, done)) = stack.pop() {
         attach(&mut stack, &mut roots, done);
     }
-    (roots, maximum_depth)
+    roots
 }
 
 fn markdown_preamble(
@@ -367,8 +352,6 @@ fn parse_document_uncached(
             blank_lines_after_preamble: 0,
             leading_blank_lines: 0,
             promoted_heading_layout: None,
-            outline_nodes: 0,
-            outline_depth: 0,
         });
     }
 
@@ -477,8 +460,7 @@ fn parse_document_uncached(
         }
         _ => None,
     };
-    let outline_nodes = flat.len();
-    let (roots, outline_depth) = build_tree(flat);
+    let roots = build_tree(flat);
     Ok(ParsedDocument {
         document: Document { pre_block, roots },
         block_spans,
@@ -487,8 +469,6 @@ fn parse_document_uncached(
         blank_lines_after_preamble,
         leading_blank_lines,
         promoted_heading_layout,
-        outline_nodes,
-        outline_depth,
     })
 }
 
@@ -633,16 +613,6 @@ mod tests {
             event_locators(&direct.headers),
             "{label}: parser-level topology"
         );
-        assert_eq!(parsed.outline_nodes, direct.headers.len(), "{label}");
-        assert_eq!(
-            parsed.outline_depth,
-            blocks
-                .iter()
-                .map(|(locator, _)| locator.len())
-                .max()
-                .unwrap_or(0),
-            "{label}: tree depth"
-        );
 
         for (index, ((_, block), header)) in blocks.iter().zip(direct.headers.iter()).enumerate() {
             let expected_first_line = &input[header.structural_prefix.end..header.line_content.end];
@@ -740,8 +710,6 @@ mod tests {
 
         let parsed = parse_document(&source, OutlineFormat::Markdown)
             .expect("large flat parser-owned outline");
-        assert_eq!(parsed.outline_nodes, BLOCKS);
-        assert_eq!(parsed.outline_depth, 1);
         assert_eq!(parsed.document.roots.len(), BLOCKS);
         assert_eq!(parsed.document.roots[0].raw, "block 0");
         assert_eq!(

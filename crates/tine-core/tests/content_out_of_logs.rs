@@ -28,10 +28,10 @@ fn the_source_census_excludes_test_only_modules_declared_from_anywhere() {
     // Declared with no `#[cfg(test)]` of its own, by a file that is itself
     // reached only under `cfg(test)`.
     let through_a_test_only_declarer =
-        root.join("crates/tine-core/src/rebaselining_layout_tests.rs");
+        root.join("crates/tine-core/src/query/oracle_corpus_tests.rs");
     // A `#[path]` include that IS production, so the rule cannot simply be
     // "anything pulled in by `#[path]` is a test".
-    let production_by_path = root.join("crates/tine-core/src/oplog/sealed_document_map.rs");
+    let production_by_path = root.join("crates/lsdoc-block-parse.rs");
 
     for file in [&from_the_parent_directory, &through_a_test_only_declarer] {
         assert!(
@@ -131,39 +131,7 @@ const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/model.rs", function: "load_all_pages_with_permit", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "numeric-shape", why: "isolated search worker panic reports only a worker number", gate: "always-on reviewed failure" },
     AllowedSite { file: "crates/tine-core/src/model.rs", function: "save_page", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "fixed-debug", why: "Guide-page refusal messages are fixed literals", gate: "cfg(debug_assertions)" },
     AllowedSite { file: "crates/tine-core/src/model.rs", function: "sync_file", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "reconcile and isolated-parse failures contain no path, title, content, or raw error", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/oplog/batch.rs", function: "retained_bytes", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "batch composition contains public enum kinds and numeric sizes only", gate: "TINE_BATCH_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", function: "publisher_loop", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "checkpoint writer thread spawn carries only a std::io::Error", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", function: "publisher_loop", macro_name: "eprintln", occurrences: &[1], bucket: "d", class: "content-free-error", why: "orphan-image cleanup errors are bounded literals or capability errors over digest-named private checkpoint objects", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/checkpoint_generation.rs", function: "spawn_publisher", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "publish_capture's error is a bounded literal or an object-store error over digest-named private blobs", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "drain_staged", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "prepare_transaction_core", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "record_validation_phase", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "validate_and_apply phase timing contains a phase index and a duration", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "stage_ready_with_claim_source", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "validate_and_apply", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "validate_manifested_projection_transition", macro_name: "eprintln", occurrences: &[0, 1, 2], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/hot_engine.rs", function: "validate_prospective_references", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "engine diagnostics run only under explicit performance, CRDT, or activation trace flags", gate: "TINE_PHASE_TRACE/TINE_CRDT_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/import.rs", function: "open_or_rebuild_clean_genesis_projection", macro_name: "eprintln", occurrences: &[0, 1], bucket: "a", class: "fixed-debug", why: "clean-genesis recovery reports one of two fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/oplog/local_journal_drain.rs", function: "resume_managed_local_journal_drain_with_parts_and_superseding_projection", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "b", class: "numeric-trace", why: "managed-local drain timings contain fixed labels and durations", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/object_store.rs", function: "publish_immutable", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "enum-trace", why: "immutable publication reports only a fixed artifact class", gate: "TINE_PUBLISH_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", function: "execute_manifested_projection_work_located", macro_name: "eprintln", occurrences: &[0, 2, 3], bucket: "b", class: "directed-core-trace", why: "projection diagnostics are available only for an explicitly directed phase trace", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/projection.rs", function: "execute_manifested_projection_work_located", macro_name: "eprintln", occurrences: &[1], bucket: "b", class: "directed-core-content", why: "this one DOES render target bytes as lossy UTF-8; it is graph content and stays behind the directed trace", gate: "TINE_PHASE_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/semantic.rs", function: "encode_validated", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "semantic snapshot diagnostic contains counts and encoded byte sizes", gate: "TINE_SEMANTIC_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", function: "apply_engine_owned_accepted_with_stats", macro_name: "eprintln", occurrences: &[0, 1, 2, 3, 4, 5, 6], bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", function: "rebuild_stream", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/oplog/sqlite.rs", function: "trace_terminal_phase", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "SQLite construction diagnostics run only under explicit trace flags", gate: "TINE_PHASE_TRACE/TINE_ACTIVATION_TRACE" },
     AllowedSite { file: "crates/tine-core/src/publish.rs", function: "publish_graph_documents_inner", macro_name: "eprintln", occurrences: &[0, 1], bucket: "a", class: "content-free-debug", why: "publication refusals report only a fixed shape or collision count", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "advance_clean_foreground_pending_commit", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "advance_full_scan", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-trace", why: "watcher trace is explicitly enabled for a directed investigation", gate: "TINE_CLEAN_WATCHER_TRACE" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "execute_editor_transaction", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-core-detail", why: "foreground mutation detail is available only for explicitly enabled runtime debugging", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "execute_foreground_new_editor_transaction", macro_name: "eprintln", occurrences: &[0, 1], bucket: "b", class: "directed-core-detail", why: "foreground mutation detail is available only for explicitly enabled runtime debugging", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "finish_clean_foreground_editor_outcome", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "open_clean_runtime_resources_with_progress", macro_name: "eprintln", occurrences: &[0, 1, 2, 3], bucket: "d", class: "content-free-error", why: "disposable checkpoint fallbacks carry typed store/decode errors describing batch ids, sealed kinds and sequences", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "open_clean_runtime_resources_with_progress", macro_name: "eprintln", occurrences: &[4], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "phase", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "qualify_clean_writer_lanes", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "CRDT writer-lane qualification reports a fixed disposition, an incarnation number and id, and a causal counter", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "report_counters", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "numeric-debug", why: "clean-open stage and counter reports contain fixed names and numeric measurements", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "resolve_pending_conflict", macro_name: "eprintln", occurrences: &[0, 1, 2], bucket: "a", class: "content-free-debug", why: "receipt, pending-projection, and conflict-resolution reports contain only counts or fixed states", gate: "runtime_debug_diagnostics_enabled" },
-    AllowedSite { file: "crates/tine-core/src/sync_runtime.rs", function: "tick", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "numeric-trace", why: "actor tick report contains a fixed branch label, duration, and pending count", gate: "TINE_TICK_TRACE" },
     AllowedSite { file: "src-tauri/src/data_home.rs", function: "ensure_usable", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "fixed-terminal-failure", why: "fatal startup guidance is a fixed sentence plus the bounded ErrorKind token (I-9); the path and OS prose stay on diag", gate: "always-on fatal startup" },
     AllowedSite { file: "src-tauri/src/debug.rs", function: "debug_init", macro_name: "eprintln", occurrences: &[0, 1], bucket: "b", class: "directed-native-debug", why: "detailed native stderr, including the log path, is available only under the existing debug opt-in", gate: "debug_enabled" },
     AllowedSite { file: "src-tauri/src/debug.rs", function: "diag", macro_name: "eprintln", occurrences: &[0], bucket: "b", class: "directed-native-debug", why: "detailed native stderr, including the log path, is available only under the existing debug opt-in", gate: "debug_enabled" },
@@ -333,9 +301,9 @@ fn exactly_one_function_reads_the_debug_diagnostics_flag() {
     }
     let repair = "I-12: \"are runtime debug diagnostics on?\" must have ONE producer. \
          src-tauri's `debug_opt_in_requested` parses `TINE_DEBUG` / `--debug` once at startup \
-         and hands the answer to `tine_core::sync_runtime::set_runtime_debug_diagnostics`; \
+         and hands the answer to `tine_core::backend_error::set_runtime_debug_diagnostics`; \
          every diagnostic then asks the front door \
-         `tine_core::sync_runtime::runtime_debug_diagnostics_enabled()` \
+         `tine_core::backend_error::runtime_debug_diagnostics_enabled()` \
          (src-tauri's `debug_enabled()` is a thin delegate to it, and is the exemplar to \
          imitate). Do not re-read the environment in a second function: a per-crate parse \
          cannot be steered by the host process and drifts silently.";
@@ -349,7 +317,7 @@ fn exactly_one_function_reads_the_debug_diagnostics_flag() {
     );
     assert_eq!(
         reads,
-        vec!["crates/tine-core/src/sync_runtime.rs::runtime_debug_diagnostics_enabled".to_owned()],
+        vec!["crates/tine-core/src/backend_error.rs::runtime_debug_diagnostics_enabled".to_owned()],
         "{repair}"
     );
 }

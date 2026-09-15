@@ -171,12 +171,6 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
          consumer after RET2-Direct: `publish.rs`'s static export \
          (`Graph::run_advanced_query_bounded_cached` dispatches instead).",
     ),
-    (
-        "crates/tine-core/src/query.rs",
-        "run_application_query_pages_bounded",
-        1,
-        "RET3: `{{query}}` ranking over Managed storage",
-    ),
     // (`query.rs::run_application_advanced_query_pages_bounded` was here, on
     // RET3's list. RET2-Managed-Advanced reached it early: the Managed
     // advanced datalog query is a PUBLIC query command on the same captured

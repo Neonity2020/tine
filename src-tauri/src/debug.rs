@@ -59,7 +59,7 @@ fn debug_opt_in_requested() -> bool {
 /// `runtime_debug_diagnostics_enabled()`. Kept because 15 src-tauri callers
 /// read better against a local name; it computes nothing of its own.
 pub(crate) fn debug_enabled() -> bool {
-    tine_core::sync_runtime::runtime_debug_diagnostics_enabled()
+    tine_core::backend_error::runtime_debug_diagnostics_enabled()
 }
 
 fn debug_log_path() -> PathBuf {
@@ -74,7 +74,7 @@ pub(crate) fn debug_init() {
     // The one place the opt-in is parsed, and the one place the flag is set.
     // Everything downstream — in this crate and in `tine-core` — reads it back
     // through `runtime_debug_diagnostics_enabled()`.
-    tine_core::sync_runtime::set_runtime_debug_diagnostics(debug_opt_in_requested());
+    tine_core::backend_error::set_runtime_debug_diagnostics(debug_opt_in_requested());
     DEBUG_START.get_or_init(std::time::Instant::now);
     DEBUG_LOG.get_or_init(|| {
         if !debug_enabled() {
@@ -500,174 +500,6 @@ pub(crate) fn record_storage_transition(
     record_fixed_event("storage.transition", fields);
 }
 
-pub(crate) fn record_checkpoint_capture_skip(
-    reason: tine_core::sync_runtime::SyncCheckpointCaptureSkip,
-) {
-    let mut fields = Map::new();
-    fields.insert(
-        "reason".into(),
-        json!(match reason {
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::RuntimeNotAttached => {
-                "runtime_not_attached"
-            }
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::IndexedRuntime => "indexed_runtime",
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::BlockedRuntime => "blocked_runtime",
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::UnsettledRuntime => {
-                "unsettled_runtime"
-            }
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::DurableFrontierAhead => {
-                "durable_frontier_ahead"
-            }
-            tine_core::sync_runtime::SyncCheckpointCaptureSkip::CaptureFailed => "capture_failed",
-        }),
-    );
-    record_fixed_event("managed.checkpoint_capture_skipped", fields);
-}
-
-/// Record only closed vocabulary, identifiers and measurements. In particular,
-/// `retry_cause` is intentionally excluded because an OS error can contain a
-/// private path or document-derived text.
-pub(crate) fn record_history_recovery(
-    recovery: &tine_core::sync_runtime::SyncHistoryRecoveryStatus,
-) {
-    let diagnostics = &recovery.diagnostics;
-    let mut fields = Map::new();
-    fields.insert("attempt".into(), json!(recovery.attempt));
-    fields.insert("reason".into(), enum_token(recovery.reason));
-    fields.insert("phase".into(), enum_token(recovery.phase));
-    fields.insert(
-        "triggeringBatchId".into(),
-        json!(recovery.triggering_batch_id),
-    );
-    fields.insert(
-        "triggeringDocumentId".into(),
-        json!(recovery.triggering_document_id),
-    );
-    fields.insert("requestedFloor".into(), json!(recovery.requested_floor));
-    fields.insert("actualFloor".into(), json!(recovery.actual_floor));
-    fields.insert(
-        "retryClass".into(),
-        json!(recovery.retry_class.map(enum_token)),
-    );
-    fields.insert("journalFences".into(), json!(diagnostics.journal_fences));
-    fields.insert("acceptedCount".into(), json!(diagnostics.accepted_count));
-    fields.insert("pendingCount".into(), json!(diagnostics.pending_count));
-    fields.insert("replayedCount".into(), json!(diagnostics.replayed_count));
-    fields.insert("waitingMs".into(), json!(diagnostics.waiting_ms));
-    fields.insert(
-        "reconstructionMs".into(),
-        json!(diagnostics.reconstruction_ms),
-    );
-    if let Some(checkpoint_bytes) = diagnostics.checkpoint_bytes {
-        fields.insert("checkpointBytes".into(), json!(checkpoint_bytes));
-    }
-    fields.insert(
-        "publicationEdge".into(),
-        enum_token(diagnostics.publication_edge),
-    );
-    fields.insert(
-        "preservationCheck".into(),
-        enum_token(diagnostics.preservation_check),
-    );
-    record_fixed_event("managed.history_recovery", fields);
-}
-
-pub(crate) fn record_checkpoint_publication(
-    checkpoint: &tine_core::sync_runtime::SyncCheckpointPublicationDiagnostics,
-) {
-    let mut fields = Map::new();
-    fields.insert(
-        "measurementSequence".into(),
-        json!(checkpoint.measurement_sequence),
-    );
-    fields.insert(
-        "latestAcceptanceUtcMs".into(),
-        json!(checkpoint.latest_acceptance_utc_ms),
-    );
-    fields.insert("eligibleThrough".into(), json!(checkpoint.eligible_through));
-    if let Some(age_cutoff_utc_ms) = checkpoint.age_cutoff_utc_ms {
-        fields.insert("ageCutoffUtcMs".into(), json!(age_cutoff_utc_ms));
-    }
-    if let Some(clock_frozen) = checkpoint.clock_frozen {
-        fields.insert("clockFrozen".into(), json!(clock_frozen));
-    }
-    if let Some(clock_reset_utc_ms) = checkpoint.last_clock_reset_utc_ms {
-        fields.insert("lastClockResetUtcMs".into(), json!(clock_reset_utc_ms));
-    }
-    fields.insert("policyRevision".into(), json!(checkpoint.policy_revision));
-    fields.insert(
-        "minimumTailBytes".into(),
-        json!(checkpoint.minimum_tail_bytes),
-    );
-    fields.insert(
-        "liveSizeMultiplier".into(),
-        json!(checkpoint.live_size_multiplier),
-    );
-    fields.insert("documents".into(), json!(checkpoint.documents));
-    fields.insert(
-        "changedDocuments".into(),
-        json!(checkpoint.changed_documents),
-    );
-    fields.insert(
-        "exportedDocuments".into(),
-        json!(checkpoint.exported_documents),
-    );
-    fields.insert("reusedDocuments".into(), json!(checkpoint.reused_documents));
-    fields.insert(
-        "measurementExports".into(),
-        json!(checkpoint.measurement_exports),
-    );
-    fields.insert(
-        "candidateExports".into(),
-        json!(checkpoint.candidate_exports),
-    );
-    fields.insert(
-        "verificationImports".into(),
-        json!(checkpoint.verification_imports),
-    );
-    fields.insert(
-        "hotManifestReads".into(),
-        json!(checkpoint.hot_manifest_reads),
-    );
-    fields.insert(
-        "hotManifestBytes".into(),
-        json!(checkpoint.hot_manifest_bytes),
-    );
-    fields.insert("hotObjectReads".into(), json!(checkpoint.hot_object_reads));
-    fields.insert("hotObjectBytes".into(), json!(checkpoint.hot_object_bytes));
-    fields.insert(
-        "coldManifestReads".into(),
-        json!(checkpoint.cold_manifest_reads),
-    );
-    fields.insert(
-        "coldManifestBytes".into(),
-        json!(checkpoint.cold_manifest_bytes),
-    );
-    fields.insert(
-        "coldObjectReads".into(),
-        json!(checkpoint.cold_object_reads),
-    );
-    fields.insert(
-        "coldObjectBytes".into(),
-        json!(checkpoint.cold_object_bytes),
-    );
-    fields.insert("imagePhaseMs".into(), json!(checkpoint.image_phase_ms));
-    fields.insert("payloadPhaseMs".into(), json!(checkpoint.payload_phase_ms));
-    fields.insert(
-        "publicationPhaseMs".into(),
-        json!(checkpoint.publication_phase_ms),
-    );
-    if let Some(peak_rss_bytes) = checkpoint.peak_rss_bytes {
-        fields.insert("peakRssBytes".into(), json!(peak_rss_bytes));
-    }
-    fields.insert("checkpointBytes".into(), json!(checkpoint.checkpoint_bytes));
-    fields.insert(
-        "publicationEdge".into(),
-        enum_token(checkpoint.publication_edge),
-    );
-    record_fixed_event("managed.checkpoint_publication", fields);
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_direct_save(
     outcome: &'static str,
@@ -691,13 +523,6 @@ pub(crate) fn record_direct_save(
         fields.insert("lastBuildBytes".into(), json!(bytes));
     }
     record_fixed_event("direct.save", fields);
-}
-
-pub(crate) fn record_managed_save(outcome: &'static str, total_ms: u64) {
-    let mut fields = Map::new();
-    fields.insert("outcome".into(), json!(outcome));
-    fields.insert("totalMs".into(), json!(total_ms));
-    record_fixed_event("managed.save", fields);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,7 +550,7 @@ pub(crate) fn record_watcher_latency(
 
 #[tauri::command]
 pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u64) {
-    if !crate::managed_command_surface::is_known_command(&command)
+    if !crate::command_surface::is_known_command(&command)
         || matches!(
             command.as_str(),
             "diagnostic_ipc_event"
@@ -881,20 +706,12 @@ fn build_diagnostic_report(
     build_time: String,
 ) -> DiagnosticReport {
     let mut direct = 0u64;
-    let mut managed_writable = 0u64;
-    let mut managed_unavailable = 0u64;
     let mut graph_state_unavailable = false;
     match state.graphs.read() {
         Ok(graphs) => {
             for (_, slot) in graphs.entries() {
                 match slot.application_page_admission().authority {
                     ApplicationPageAdmissionAuthority::Direct => direct += 1,
-                    ApplicationPageAdmissionAuthority::ManagedWritable { .. } => {
-                        managed_writable += 1
-                    }
-                    ApplicationPageAdmissionAuthority::ManagedUnavailable => {
-                        managed_unavailable += 1
-                    }
                 }
             }
         }
@@ -943,10 +760,8 @@ fn build_diagnostic_report(
             "previousExitUnclean": PREVIOUS_EXIT_UNCLEAN.load(Ordering::Acquire),
             "verboseDebugEnabled": debug_enabled(),
             "graphStateUnavailable": graph_state_unavailable,
-            "graphBindings": direct + managed_writable + managed_unavailable,
+            "graphBindings": direct,
             "directBindings": direct,
-            "managedWritableBindings": managed_writable,
-            "managedUnavailableBindings": managed_unavailable,
         },
         "activeStorageTransitions": state.storage_supervisor.diagnostic_snapshot(),
         "watcherLatency": crate::watcher::diagnostic_latency_snapshot(),
@@ -1242,58 +1057,15 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("production diagnostics precede their tests");
-        let contract = include_str!("../../docs/contracts/diagnostics.md");
         assert!(!production.contains("fields.insert(\"message\""));
         assert!(!production.contains("fields.insert(\"path\""));
         assert!(!production.contains("fields.insert(\"detail\""));
         assert!(production.contains("verboseDebugLogIncluded\": false"));
-        assert!(production.contains("managed.checkpoint_capture_skipped"));
-        assert!(production.contains("managed.history_recovery"));
-        assert!(production.contains("managed.checkpoint_publication"));
-        assert!(production.contains("record_fixed_event(\"managed.save\", fields)"));
-        for field in [
-            "attempt",
-            "reason",
-            "phase",
-            "triggeringBatchId",
-            "triggeringDocumentId",
-            "requestedFloor",
-            "actualFloor",
-            "journalFences",
-            "acceptedCount",
-            "pendingCount",
-            "replayedCount",
-            "preservationCheck",
-            "policyRevision",
-            "minimumTailBytes",
-            "liveSizeMultiplier",
-            "changedDocuments",
-            "exportedDocuments",
-            "reusedDocuments",
-            "measurementExports",
-            "candidateExports",
-            "checkpointBytes",
-            "publicationEdge",
-        ] {
-            assert!(
-                production.contains(field),
-                "missing fixed diagnostic field {field}"
-            );
-        }
-        for reason in [
-            "runtime_not_attached",
-            "indexed_runtime",
-            "blocked_runtime",
-            "unsettled_runtime",
-            "durable_frontier_ahead",
-            "capture_failed",
-        ] {
-            assert!(production.contains(reason));
-            assert!(
-                contract.contains(reason),
-                "the bounded checkpoint-skip cause and diagnostics contract must change together"
-            );
-        }
+        assert!(production.contains("record_fixed_event(\"watcher.batch\", fields)"));
+        assert!(
+            !production.contains("managed."),
+            "Managed Storage receipts were retired with the subsystem (2026-09-15)"
+        );
     }
 
     #[test]

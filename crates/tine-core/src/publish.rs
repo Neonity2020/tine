@@ -193,7 +193,7 @@ impl PrintPreparationError {
         match self {
             Self::Query(error) => error.backend_wire_string(),
             Self::Budget(message) => {
-                crate::sync_runtime::tagged_backend_error_with_reason_and_detail(
+                crate::backend_error::tagged_backend_error_with_reason_and_detail(
                     "query-unavailable",
                     "print_query_budget_exceeded",
                     json!({ "message": message }),
@@ -4830,7 +4830,7 @@ fn publish_graph_documents_inner(
             .unwrap_or(0)
             != 1
         {
-            if crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+            if crate::backend_error::runtime_debug_diagnostics_enabled() {
                 eprintln!("tine export: refusing one ambiguous public page identity");
             }
             continue;
@@ -4859,7 +4859,7 @@ fn publish_graph_documents_inner(
     // overwrote (DS#4). `slug(name)` is never recomputed independently downstream.
     let names: Vec<&str> = public.iter().map(|(n, _, _)| *n).collect();
     let (slugs, collisions) = build_slug_map(&names);
-    if !collisions.is_empty() && crate::sync_runtime::runtime_debug_diagnostics_enabled() {
+    if !collisions.is_empty() && crate::backend_error::runtime_debug_diagnostics_enabled() {
         eprintln!(
             "tine export: resolved {} public-page slug collisions",
             collisions.len()
@@ -5975,33 +5975,6 @@ mod tests {
             .page_print_html("Report", PrintOpts::default())
             .unwrap()
             .expect("page exists");
-        let page = g
-            .load_named("Report", PageKind::Page)
-            .unwrap()
-            .expect("page DTO exists");
-        assert_eq!(
-            g.with_print_query_reader(|reader| g.page_print_html_page(
-                &page,
-                PrintOpts::default(),
-                reader
-            ))
-            .unwrap(),
-            html,
-            "actor-owned DTO and Direct Files source must share one renderer"
-        );
-        let mut current = page;
-        current.blocks[1].raw = "Actor-current text".into();
-        let current_html = g
-            .with_print_query_reader(|reader| {
-                g.page_print_html_page(&current, PrintOpts::default(), reader)
-            })
-            .unwrap();
-        assert!(current_html.contains("Actor-current text"));
-        assert!(
-            !current_html.contains("Some <strong>bold</strong> text"),
-            "printing an actor-owned edit must not fall back to projected disk bytes"
-        );
-
         // Self-contained: inlined stylesheet + inlined image, no sidebar / app scripts /
         // external style.css.
         assert!(html.contains("<style>"), "stylesheet inlined");

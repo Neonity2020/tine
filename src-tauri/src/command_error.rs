@@ -45,7 +45,7 @@ pub(crate) enum CommandError {
     Graph {
         message: String,
     },
-    SyncRuntime {
+    StorageTransition {
         message: String,
     },
     Settings {
@@ -63,18 +63,11 @@ pub(crate) enum CommandError {
 
 #[derive(Debug)]
 pub(crate) enum CoreCommandError {
-    SyncApplicationPageRequest(tine_core::sync_runtime::SyncApplicationPageRequestError),
-    SyncEditorRequest(tine_core::sync_runtime::SyncEditorRequestError),
-    SyncLocalMutationRequest(tine_core::sync_runtime::SyncLocalMutationRequestError),
-    SyncRuntimeRequest(tine_core::sync_runtime::SyncRuntimeRequestError),
-    FastCommit(tine_core::fast_commit::FastCommitError),
     MergeRefused(tine_core::sync_diff::MergeRefused),
-    /// RET2: the bounded availability of ONE query execution, independent of
-    /// which backend produced it. Managed storage reaches the wire through
-    /// `SyncApplicationPageRequestError::QueryExecution`, which forwards the
-    /// same encoder; this variant is what lets a Direct Files producer hand the
-    /// core error over directly, so the two backends cannot drift into two
-    /// spellings of "the query index is not ready".
+    /// RET2: the bounded availability of ONE query execution. This variant is
+    /// what lets a producer hand the core error over directly, so the command
+    /// layer cannot drift into a second spelling of "the query index is not
+    /// ready".
     QueryExecution(tine_core::query::QueryExecutionError),
 }
 
@@ -170,8 +163,8 @@ impl CommandError {
         }
     }
 
-    pub(crate) fn sync_runtime(error: impl fmt::Display) -> Self {
-        Self::SyncRuntime {
+    pub(crate) fn storage_transition(error: impl fmt::Display) -> Self {
+        Self::StorageTransition {
             message: Self::family(error),
         }
     }
@@ -206,17 +199,17 @@ impl CommandError {
                 detail,
             } => match (reason_code.as_deref(), detail.clone()) {
                 (Some(reason_code), Some(detail)) => {
-                    tine_core::sync_runtime::tagged_backend_error_with_reason_and_detail(
+                    tine_core::backend_error::tagged_backend_error_with_reason_and_detail(
                         kind,
                         reason_code,
                         detail,
                     )
                 }
                 (None, Some(detail)) => {
-                    tine_core::sync_runtime::tagged_backend_error_with_detail(kind, detail)
+                    tine_core::backend_error::tagged_backend_error_with_detail(kind, detail)
                 }
                 (reason_code, None) => {
-                    tine_core::sync_runtime::tagged_backend_error(kind, reason_code)
+                    tine_core::backend_error::tagged_backend_error(kind, reason_code)
                 }
             },
             Self::Coded { code, detail } => format!("{code}: {detail}"),
@@ -229,7 +222,7 @@ impl CommandError {
             | Self::Platform { message }
             | Self::GraphVerification { message }
             | Self::Graph { message }
-            | Self::SyncRuntime { message }
+            | Self::StorageTransition { message }
             | Self::Settings { message }
             | Self::Diagnostic { message }
             | Self::Backup { message }
@@ -277,11 +270,6 @@ impl Serialize for CommandError {
 impl fmt::Display for CoreCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SyncApplicationPageRequest(error) => error.fmt(formatter),
-            Self::SyncEditorRequest(error) => error.fmt(formatter),
-            Self::SyncLocalMutationRequest(error) => error.fmt(formatter),
-            Self::SyncRuntimeRequest(error) => error.fmt(formatter),
-            Self::FastCommit(error) => error.fmt(formatter),
             Self::MergeRefused(error) => error.fmt(formatter),
             Self::QueryExecution(error) => error.fmt(formatter),
         }
@@ -291,7 +279,6 @@ impl fmt::Display for CoreCommandError {
 impl CoreCommandError {
     fn wire(&self) -> String {
         match self {
-            Self::SyncApplicationPageRequest(error) => error.backend_wire_string(),
             // The canonical encoder, not a second spelling of it: the same
             // `query-not-ready` / `query-unavailable` / `operation-cancelled`
             // payloads `backend.ts` already classifies.
@@ -340,23 +327,6 @@ macro_rules! core_conversion {
     };
 }
 
-core_conversion!(
-    tine_core::sync_runtime::SyncApplicationPageRequestError,
-    SyncApplicationPageRequest
-);
-core_conversion!(
-    tine_core::sync_runtime::SyncEditorRequestError,
-    SyncEditorRequest
-);
-core_conversion!(
-    tine_core::sync_runtime::SyncLocalMutationRequestError,
-    SyncLocalMutationRequest
-);
-core_conversion!(
-    tine_core::sync_runtime::SyncRuntimeRequestError,
-    SyncRuntimeRequest
-);
-core_conversion!(tine_core::fast_commit::FastCommitError, FastCommit);
 core_conversion!(tine_core::sync_diff::MergeRefused, MergeRefused);
 core_conversion!(tine_core::query::QueryExecutionError, QueryExecution);
 
@@ -402,17 +372,6 @@ mod tests {
         },
         ProducerManifestRow {
             targets: "all",
-            file: "commands.rs",
-            enclosing_symbol: "close_graph_window",
-            source_error_type: "CleanShutdownSlot refusal",
-            required_variant: "Tagged",
-            production_mapper: "CommandError::tagged",
-            format_family: "tagged/kind",
-            legacy_wire_template: r#"{"kind":"sparse-shutdown-refused"}"#,
-            golden_test: "phase_a_production_wire_matches_legacy",
-        },
-        ProducerManifestRow {
-            targets: "all",
             file: "commands.rs,state.rs",
             enclosing_symbol: "io-returning Graph/filesystem sites",
             source_error_type: "std::io::Error",
@@ -447,12 +406,12 @@ mod tests {
         ProducerManifestRow {
             targets: "all",
             file: "commands.rs",
-            enclosing_symbol: "typed sync request sites",
+            enclosing_symbol: "typed core error sites",
             source_error_type: "tine_core typed errors",
             required_variant: "Core",
             production_mapper: "CommandError::from",
             format_family: "core display/tagged",
-            legacy_wire_template: "sync actor is unavailable",
+            legacy_wire_template: r#"{"kind":"operation-cancelled"}"#,
             golden_test: "phase_a_production_wire_matches_legacy",
         },
         ProducerManifestRow {
@@ -480,22 +439,20 @@ mod tests {
     ];
 
     const PHASE_B_PRODUCER_MANIFEST: &[ProducerManifestRow] = &[
-        ProducerManifestRow { targets: "all", file: "backup.rs,conflict_capsule.rs,graph.rs,settings.rs,sync_runtime.rs", enclosing_symbol: "filesystem and audited-publication sites", source_error_type: "std::io::Error", required_variant: "Io", production_mapper: "CommandError::from", format_family: "source-display", legacy_wire_template: "denied", golden_test: "phase_b_production_wire_matches_legacy" },
-        ProducerManifestRow { targets: "all", file: "backup.rs,graph.rs,platform.rs,sync_runtime.rs", enclosing_symbol: "spawn_blocking await sites", source_error_type: "tauri::Error::JoinError", required_variant: "Worker", production_mapper: "CommandError::worker", format_family: "worker-display", legacy_wire_template: "asset not found: worker", golden_test: "phase_b_production_wire_matches_legacy" },
+        ProducerManifestRow { targets: "all", file: "backup.rs,conflict_capsule.rs,graph.rs,settings.rs", enclosing_symbol: "filesystem and audited-publication sites", source_error_type: "std::io::Error", required_variant: "Io", production_mapper: "CommandError::from", format_family: "source-display", legacy_wire_template: "denied", golden_test: "phase_b_production_wire_matches_legacy" },
+        ProducerManifestRow { targets: "all", file: "backup.rs,graph.rs,platform.rs", enclosing_symbol: "spawn_blocking await sites", source_error_type: "tauri::Error::JoinError", required_variant: "Worker", production_mapper: "CommandError::worker", format_family: "worker-display", legacy_wire_template: "asset not found: worker", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "android_folder_picker.rs,android_media.rs,android_system_bars.rs,ios_folder_picker.rs,lib.rs", enclosing_symbol: "non-worker Tauri/mobile calls", source_error_type: "tauri::Error", required_variant: "Tauri", production_mapper: "CommandError::from", format_family: "tauri-display", legacy_wire_template: "asset not found: tauri", golden_test: "phase_b_production_wire_matches_legacy" },
-        ProducerManifestRow { targets: "all", file: "conflict_capsule.rs,graph_verification.rs,plugins.rs,settings.rs,sync_runtime.rs", enclosing_symbol: "JSON encode/decode sites", source_error_type: "serde_json::Error", required_variant: "Json", production_mapper: "CommandError::from or CommandError::json", format_family: "json-display", legacy_wire_template: "json failure", golden_test: "phase_b_production_wire_matches_legacy" },
+        ProducerManifestRow { targets: "all", file: "conflict_capsule.rs,graph_verification.rs,plugins.rs,settings.rs", enclosing_symbol: "JSON encode/decode sites", source_error_type: "serde_json::Error", required_variant: "Json", production_mapper: "CommandError::from or CommandError::json", format_family: "json-display", legacy_wire_template: "json failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "plugins.rs", enclosing_symbol: "plugin package/registry producers", source_error_type: "PackageStoreError or plugin validation", required_variant: "Plugin", production_mapper: "CommandError::plugin", format_family: "plugin-display", legacy_wire_template: "plugin failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "desktop,android,ios", file: "platform.rs", enclosing_symbol: "read_clipboard_files,copy_image_to_clipboard", source_error_type: "clipboard provider error", required_variant: "Clipboard", production_mapper: "CommandError::clipboard", format_family: "clipboard-display", legacy_wire_template: "clipboard failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "platform.rs,lib.rs,android_*.rs,ios_folder_picker.rs", enclosing_symbol: "platform and non-worker host producers", source_error_type: "platform error", required_variant: "Platform", production_mapper: "CommandError::platform", format_family: "platform-display", legacy_wire_template: "platform failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "graph_verification.rs", enclosing_symbol: "graph verification format/dialog producers", source_error_type: "graph-verification source error", required_variant: "GraphVerification", production_mapper: "CommandError::graph_verification", format_family: "graph-verification-display", legacy_wire_template: "graph verification failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "graph.rs,watcher.rs", enclosing_symbol: "graph lifecycle producers", source_error_type: "graph source error", required_variant: "Graph", production_mapper: "CommandError::graph", format_family: "graph-display", legacy_wire_template: "graph failure", golden_test: "phase_b_production_wire_matches_legacy" },
-        ProducerManifestRow { targets: "all", file: "storage_mode_supervisor.rs,sync_runtime.rs", enclosing_symbol: "managed lifecycle/context producers", source_error_type: "sync/runtime source error", required_variant: "SyncRuntime", production_mapper: "CommandError::sync_runtime", format_family: "sync-runtime-display", legacy_wire_template: "sync runtime failure", golden_test: "phase_b_production_wire_matches_legacy" },
+        ProducerManifestRow { targets: "all", file: "storage_mode_supervisor.rs", enclosing_symbol: "storage transition producers", source_error_type: "storage transition refusal", required_variant: "StorageTransition", production_mapper: "CommandError::storage_transition", format_family: "storage-transition-display", legacy_wire_template: "storage transition failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "settings.rs", enclosing_symbol: "settings UUID/lock/context producers", source_error_type: "settings source error", required_variant: "Settings", production_mapper: "CommandError::settings", format_family: "settings-display", legacy_wire_template: "settings failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "debug.rs", enclosing_symbol: "diagnostic dialog/recorder producers", source_error_type: "diagnostic source error", required_variant: "Diagnostic", production_mapper: "CommandError::diagnostic", format_family: "diagnostic-display", legacy_wire_template: "diagnostic failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "backup.rs", enclosing_symbol: "backup validation/restore producers", source_error_type: "backup source error", required_variant: "Backup", production_mapper: "CommandError::backup", format_family: "backup-display", legacy_wire_template: "backup failure", golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "graph_verification.rs", enclosing_symbol: "graph_verification_cancelled_error", source_error_type: "cancellation state", required_variant: "Tagged", production_mapper: "graph_verification_cancelled_error", format_family: "tagged-operation-cancelled", legacy_wire_template: r#"{"kind":"operation-cancelled"}"#, golden_test: "phase_b_production_wire_matches_legacy" },
-        ProducerManifestRow { targets: "all", file: "sync_runtime.rs", enclosing_symbol: "shared_enrollment_not_here_yet", source_error_type: "absent shared enrollment", required_variant: "Tagged", production_mapper: "shared_enrollment_not_here_yet", format_family: "tagged-sync-data-unavailable", legacy_wire_template: r#"{"kind":"sync-data-unavailable"}"#, golden_test: "phase_b_production_wire_matches_legacy" },
-        ProducerManifestRow { targets: "all", file: "sync_runtime.rs", enclosing_symbol: "adoption_archived_error", source_error_type: "post-archive join failure", required_variant: "Tagged", production_mapper: "adoption_archived_error", format_family: "tagged-adoption-archived", legacy_wire_template: r#"{"kind":"adoption-archived"}"#, golden_test: "phase_b_production_wire_matches_legacy" },
         ProducerManifestRow { targets: "all", file: "phase-B files", enclosing_symbol: "literal/context-only remainder", source_error_type: "no typed source", required_variant: "Prose", production_mapper: "CommandError::prose", format_family: "prose", legacy_wire_template: "phase-B prose", golden_test: "phase_b_production_wire_matches_legacy" },
     ];
 
@@ -512,7 +469,7 @@ mod tests {
             CommandError::Platform { .. } => "Platform",
             CommandError::GraphVerification { .. } => "GraphVerification",
             CommandError::Graph { .. } => "Graph",
-            CommandError::SyncRuntime { .. } => "SyncRuntime",
+            CommandError::StorageTransition { .. } => "StorageTransition",
             CommandError::Settings { .. } => "Settings",
             CommandError::Diagnostic { .. } => "Diagnostic",
             CommandError::Backup { .. } => "Backup",
@@ -545,36 +502,32 @@ mod tests {
                 PRODUCER_MANIFEST[1],
             ),
             (
-                CommandError::tagged("sparse-shutdown-refused", None::<String>, None),
-                PRODUCER_MANIFEST[2],
-            ),
-            (
                 CommandError::coded("query-too-large", "2049 bytes"),
-                PRODUCER_MANIFEST[7],
+                PRODUCER_MANIFEST[6],
             ),
             (
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied").into(),
-                PRODUCER_MANIFEST[3],
+                PRODUCER_MANIFEST[2],
             ),
             (
                 CommandError::Worker {
                     message: "task 7 panicked".into(),
                 },
-                PRODUCER_MANIFEST[4],
+                PRODUCER_MANIFEST[3],
             ),
             (
                 CommandError::Tauri {
                     message: "tauri failure".into(),
                 },
-                PRODUCER_MANIFEST[5],
+                PRODUCER_MANIFEST[4],
             ),
             (
-                CommandError::Core(CoreCommandError::SyncRuntimeRequest(
-                    tine_core::sync_runtime::SyncRuntimeRequestError::ActorUnavailable,
+                CommandError::Core(CoreCommandError::QueryExecution(
+                    tine_core::query::QueryExecutionError::Cancelled,
                 )),
-                PRODUCER_MANIFEST[6],
+                PRODUCER_MANIFEST[5],
             ),
-            (CommandError::prose("legacy prose"), PRODUCER_MANIFEST[8]),
+            (CommandError::prose("legacy prose"), PRODUCER_MANIFEST[7]),
         ];
         let mut proven = std::collections::BTreeSet::new();
         for (error, row) in families {
@@ -633,15 +586,11 @@ mod tests {
             CommandError::platform("platform failure"),
             CommandError::graph_verification("graph verification failure"),
             CommandError::graph("graph failure"),
-            CommandError::sync_runtime("sync runtime failure"),
+            CommandError::storage_transition("storage transition failure"),
             CommandError::settings("settings failure"),
             CommandError::diagnostic("diagnostic failure"),
             CommandError::backup("backup failure"),
             crate::graph_verification::graph_verification_cancelled_error(),
-            crate::sync_runtime::shared_enrollment_not_here_yet(std::path::Path::new(
-                "/not-on-wire",
-            )),
-            crate::sync_runtime::adoption_archived_error(),
             CommandError::prose("phase-B prose"),
         ];
         assert_eq!(cases.len(), PHASE_B_PRODUCER_MANIFEST.len());
@@ -670,11 +619,9 @@ mod tests {
         assert_eq!(proven.len(), PHASE_B_PRODUCER_MANIFEST.len());
     }
 
-    /// RET2: one query-execution error, two producers, ONE wire payload.
+    /// RET2: one query-execution error, ONE wire payload.
     ///
-    /// Managed storage reaches the boundary as
-    /// `SyncApplicationPageRequestError::QueryExecution`; a Direct Files
-    /// producer hands the core error over directly. Both are `Core`, both go
+    /// A producer hands the core error over directly as `Core`; it goes
     /// through `QueryExecutionError::backend_wire_string`, and what arrives is
     /// exactly the tagged JSON `backend.ts` classifies — `query-not-ready`
     /// (retried by `runQueryWhenReady`), `query-unavailable` (reported once,
@@ -684,7 +631,6 @@ mod tests {
     #[test]
     fn ret2_query_execution_reaches_the_wire_through_one_encoder() {
         use tine_core::query::{QueryExecutionError, QueryReadinessReason, QueryUnavailableReason};
-        use tine_core::sync_runtime::SyncApplicationPageRequestError;
 
         let cases = [
             (
@@ -715,44 +661,6 @@ mod tests {
                 tauri::ipc::InvokeError::from(direct).0,
                 wire,
                 "the Direct producer's payload",
-            );
-            let managed =
-                CommandError::from(SyncApplicationPageRequestError::QueryExecution(error));
-            assert_eq!(variant_name(&managed), "Core");
-            assert_eq!(
-                tauri::ipc::InvokeError::from(managed).0,
-                wire,
-                "the Managed producer's payload must be byte-identical",
-            );
-        }
-    }
-
-    /// Every OTHER application-page refusal keeps the wire it had before RET2
-    /// added a variant to the enum.
-    #[test]
-    fn ret2_preserves_the_other_application_page_error_wires() {
-        use tine_core::sync_runtime::{SyncApplicationPageRequestError, SyncEditorRefusalCode};
-
-        let cases: [(SyncApplicationPageRequestError, &str); 3] = [
-            (
-                SyncApplicationPageRequestError::ActorUnavailable,
-                "sync actor is unavailable",
-            ),
-            (
-                SyncApplicationPageRequestError::ActorRefusedAt("application_navigation"),
-                "sync actor refused application page intent at application_navigation",
-            ),
-            (
-                SyncApplicationPageRequestError::ActorRefusedWithCode(
-                    SyncEditorRefusalCode::FallbackReadmission,
-                ),
-                r#"{"kind":"managed-actor-refusal","reason_code":"fallback.readmission"}"#,
-            ),
-        ];
-        for (error, wire) in cases {
-            assert_eq!(
-                tauri::ipc::InvokeError::from(CommandError::from(error)).0,
-                wire
             );
         }
     }

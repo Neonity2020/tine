@@ -1,51 +1,19 @@
-//! Platform durability helpers shared by managed-storage bootstrap paths.
+//! Per-platform durability policy for directory barriers.
 //!
-//! Linux can cheaply flush the filesystem containing a complete private tree.
-//! Android exposes the same syscall, but some kernels and ROMs deny that
-//! filesystem-wide operation even though ordinary app-private file and
-//! directory synchronization works. In that case we synchronize the exact
-//! private tree instead of refusing managed-storage activation.
+//! Android app sandboxes and vendor filesystems can deny directory fsync even
+//! after permitting every exact file sync; desktop platforms keep the strict
+//! barrier. The policy is stated per artifact class, never as a blanket
+//! "ignore I/O errors".
 
+#[cfg(any(test, not(target_os = "linux")))]
 use std::fs;
 #[cfg(any(test, not(target_os = "linux")))]
 use std::fs::OpenOptions;
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::Path;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-
-pub(crate) fn sync_private_tree(path: &Path) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        return sync_filesystem(path);
-    }
-
-    #[cfg(target_os = "android")]
-    {
-        return finish_android_private_tree_sync(path, sync_filesystem(path));
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    sync_private_tree_exact(path)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn sync_filesystem(path: &Path) -> io::Result<()> {
-    crate::durability_counters::note(crate::durability_counters::Barrier::Filesystem);
-    let directory = fs::File::open(path)?;
-    // SAFETY: the opened descriptor names the filesystem containing the
-    // complete private tree. Android may reject this filesystem-wide operation
-    // and then takes the exact-tree path below.
-    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
 
 #[cfg(any(test, target_os = "android"))]
 const fn android_filesystem_sync_may_fallback(kind: io::ErrorKind) -> bool {
@@ -53,55 +21,6 @@ const fn android_filesystem_sync_may_fallback(kind: io::ErrorKind) -> bool {
         kind,
         io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
     )
-}
-
-/// Flush every dirty byte of the filesystem containing `directory` with one
-/// barrier.
-///
-/// This is the single durability point of a batched publication: after it
-/// returns, every byte written into that filesystem — including files this
-/// process has not individually `fsync`ed — is on stable storage. One syscall
-/// replaces one `fsync` per staged artifact, which is the whole point (the
-/// 2026-08-26 cost-model audit measured ten of those per ordinary edit).
-///
-/// The caller owns the fallback policy: this function reports the platform's
-/// refusal rather than deciding what to do about it, because the right answer
-/// differs between "flush a graph-sized private tree" and "flush the four
-/// files I just staged".
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn sync_filesystem_containing(directory: &Dir) -> io::Result<()> {
-    use std::os::fd::FromRawFd as _;
-
-    crate::durability_counters::note(crate::durability_counters::Barrier::Filesystem);
-    // cap-std may retain an O_PATH capability, which cannot be the subject of
-    // syncfs. Derive one real descriptor through the retained capability.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_fd().as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openat returned one newly owned directory descriptor.
-    let opened = unsafe { fs::File::from_raw_fd(fd) };
-    let result = unsafe { libc::syncfs(opened.as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Whether a platform refused a durability primitive as a capability, rather
-/// than reporting a real I/O failure. Android vendor filesystems deny
-/// filesystem-wide flush on app-private storage even where per-file flush
-/// works; every other errno stays fatal.
-#[cfg(any(test, target_os = "android"))]
-pub(crate) fn is_capability_refusal(error: &io::Error) -> bool {
-    android_filesystem_sync_may_fallback(error.kind())
 }
 
 /// Which durability class an artifact belongs to. Platform durability policy is

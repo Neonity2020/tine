@@ -12,8 +12,8 @@ use super::ir::{Anchor, Bounds, ExecutionContext, Query, QueryResult, QueryRows,
 use super::rank::PageRecencyPrograms;
 use super::registry::Registry;
 use super::results::{
-    probe_fts_ready, read_page_results, read_results, BackendOrder, PageReadInputs, RecencyPage,
-    ResultIdentity, ResultReadInputs,
+    probe_fts_ready, read_page_results, BackendOrder, PageReadInputs, RecencyPage, ResultIdentity,
+    ResultReadInputs,
 };
 use super::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use super::{

@@ -22,7 +22,6 @@ dirs = "6"
 regex = "1"
 ring = "0.17"
 crc32fast = "1"
-loro = { path = "../../vendor/loro-1.13.6", version = "=1.13.6" }
 libc = "0.2"
 cap-std = "4.0.2"
 same-file = "1.0.6"

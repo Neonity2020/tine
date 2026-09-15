@@ -65,11 +65,6 @@ pub(crate) struct ParsedDocument {
     /// preamble heading that remains unbulleted while owning following outline
     /// blocks as children. Org documents never have this Markdown-only layout.
     pub(crate) promoted_heading_layout: Option<PromotedHeadingLayout>,
-    /// Parser-owned outline event count and maximum representable tree depth.
-    /// Sync admission consumes these instead of running a second handwritten
-    /// structural grammar over the source.
-    pub(crate) outline_nodes: usize,
-    pub(crate) outline_depth: usize,
 }
 
 /// One receipt-proved association between a source structural locator and the

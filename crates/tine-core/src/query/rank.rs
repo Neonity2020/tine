@@ -21,7 +21,6 @@ pub(crate) struct QueryRankPrograms {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalRankInput {
     StoredDay,
-    DisplayName,
 }
 
 /// The two existing recency producers captured into owned statement inputs.

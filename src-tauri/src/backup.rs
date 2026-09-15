@@ -932,7 +932,7 @@ struct RestoreDirectoryBarriers {
     synced: std::sync::Mutex<
         std::collections::HashMap<
             (RestoreDirectoryRoot, std::path::PathBuf),
-            tine_core::oplog::object_store::ControlDirectoryIdentity,
+            tine_core::directory_identity::DirectoryIdentity,
         >,
     >,
 }
@@ -942,7 +942,7 @@ impl RestoreDirectoryBarriers {
         &self,
         root: RestoreDirectoryRoot,
         relative: &std::path::Path,
-        identity: tine_core::oplog::object_store::ControlDirectoryIdentity,
+        identity: tine_core::directory_identity::DirectoryIdentity,
         directory: &Dir,
         reprove_first_observation: bool,
     ) -> std::io::Result<()> {
@@ -965,7 +965,7 @@ impl RestoreDirectoryBarriers {
         &self,
         root: RestoreDirectoryRoot,
         relative: &std::path::Path,
-        identity: tine_core::oplog::object_store::ControlDirectoryIdentity,
+        identity: tine_core::directory_identity::DirectoryIdentity,
     ) -> std::io::Result<()> {
         self.synced
             .lock()
@@ -1050,7 +1050,7 @@ fn reserve_restore_recovery(
     sync_restore_directory(&parent)?;
     let dir = parent.open_dir(recovery_id)?;
     let recovery_relative = recovery_parent.join(recovery_id);
-    let recovery_identity = tine_core::oplog::object_store::control_directory_identity(&dir)
+    let recovery_identity = tine_core::directory_identity::directory_identity(&dir)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     directory_barriers.record_changed(
         RestoreDirectoryRoot::Live,
@@ -1096,7 +1096,7 @@ fn open_or_create_real_parent(
             ));
         }
         let child = current.open_dir(name)?;
-        let child_identity = tine_core::oplog::object_store::control_directory_identity(&child)
+        let child_identity = tine_core::directory_identity::directory_identity(&child)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let child_relative = current_relative.join(name);
         if created {

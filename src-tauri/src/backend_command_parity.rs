@@ -9,8 +9,8 @@
 //! call it. Nothing fails to compile, and no test notices.
 //!
 //! This module makes the two lists agree at test time. It re-derives both from
-//! the sources — `managed_command_surface.rs` is the house pattern — so the
-//! guard cannot drift from the code it guards.
+//! the sources — `command_surface.rs` is the sibling pattern — so the guard
+//! cannot drift from the code it guards.
 //!
 //! It pins *names*, not argument shapes or return types. Those are separate
 //! (and much larger) parity questions.
@@ -380,23 +380,6 @@ mod tests {
         ("settings.rs", "set_capture_enter_files"),
         ("settings.rs", "set_link_first_match"),
         ("settings.rs", "set_smooth_scroll"),
-        ("sync_runtime.rs", "activate_sparse_v2"),
-        ("sync_runtime.rs", "adopt_sparse_v2_shared"),
-        ("sync_runtime.rs", "cancel_sparse_v2"),
-        ("sync_runtime.rs", "cancel_sparse_v2_cold"),
-        ("sync_runtime.rs", "join_sparse_v2_shared"),
-        ("sync_runtime.rs", "keep_absence_sweep_deletion"),
-        ("sync_runtime.rs", "list_absence_sweeps"),
-        ("sync_runtime.rs", "prepare_sparse_v2_share"),
-        ("sync_runtime.rs", "reapply_absence_sweep"),
-        ("sync_runtime.rs", "restore_absence_sweep"),
-        ("sync_runtime.rs", "sparse_v2_clean_shutdown"),
-        ("sync_runtime.rs", "sparse_v2_editor_load"),
-        ("sync_runtime.rs", "sparse_v2_editor_save"),
-        ("sync_runtime.rs", "sparse_v2_query"),
-        ("sync_runtime.rs", "sparse_v2_recovery_location"),
-        ("sync_runtime.rs", "sparse_v2_status"),
-        ("sync_runtime.rs", "sparse_v2_tick"),
         ("watcher.rs", "set_watch_mode"),
     ];
 
@@ -629,17 +612,6 @@ mod tests {
                 && !direct_mapper.contains("CommandError::from"),
             "DirectSaveError must retain its closed code and epoch in Tagged, never Io/Prose"
         );
-        let close = commands
-            .split("pub(crate) fn close_graph_window")
-            .nth(1)
-            .unwrap()
-            .split("#[tauri::command]")
-            .next()
-            .unwrap();
-        assert!(
-            close.contains("CommandError::tagged(\"sparse-shutdown-refused\""),
-            "close_graph_window must delegate its refusal to the Tagged mapper"
-        );
 
         let worker_mapper = ".map_err(CommandError::worker)";
         let mut rest = commands;
@@ -755,7 +727,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (507, 14_473_554_860_106_952_223),
+            (248, 14_198_476_095_927_995_579),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \
@@ -853,10 +825,7 @@ mod tests {
             ),
             ("graph_verification", &["graph_verification.rs"]),
             ("graph", &["graph.rs", "watcher.rs"]),
-            (
-                "sync_runtime",
-                &["sync_runtime.rs", "storage_mode_supervisor.rs"],
-            ),
+            ("storage_transition", &["storage_mode_supervisor.rs"]),
             ("settings", &["settings.rs"]),
             ("diagnostic", &["debug.rs"]),
             ("backup", &["backup.rs"]),
@@ -867,7 +836,6 @@ mod tests {
                     "graph_verification.rs",
                     "plugins.rs",
                     "settings.rs",
-                    "sync_runtime.rs",
                 ],
             ),
         ];

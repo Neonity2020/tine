@@ -656,26 +656,6 @@ fn the_stored_page_order_is_the_walks_page_order_over_a_real_corpus() {
     );
 }
 
-/// Pages whose paths separate SQLite's BINARY collation from anything
-/// case-folding or locale-aware: ASCII case, a precomposed/decomposed pair, and
-/// two physical pages that share a DISPLAY name.
-fn write_ordering_corpus(root: &Path) {
-    std::fs::create_dir_all(root.join("pages")).expect("pages");
-    std::fs::create_dir_all(root.join("pages/nested")).expect("nested pages");
-    for (file, line) in [
-        ("Alpha.md", "- upper alpha marker"),
-        ("alpha.md", "- lower alpha marker"),
-        ("Zebra.md", "- upper zebra marker"),
-        ("_leading.md", "- underscore sorts after uppercase marker"),
-        ("Caf\u{e9}.md", "- precomposed cafe marker"),
-        ("Cafe\u{301}.md", "- decomposed cafe marker"),
-        ("nested/Alpha.md", "- a duplicate display name marker"),
-    ] {
-        std::fs::write(root.join("pages").join(file), format!("{line}\n"))
-            .unwrap_or_else(|error| panic!("{file}: {error}"));
-    }
-}
-
 fn write_page_result_corpus(root: &Path, pages: usize) {
     std::fs::create_dir_all(root.join("pages")).expect("pages");
     for at in 0..pages {
@@ -1002,7 +982,7 @@ fn q4_statistics_read_census_keeps_rejected_payload_unread() {
     assert_eq!(result_read_census().payload_block_rows, 1);
     assert_eq!(result_read_census().statistics_rows, 3);
     assert_eq!(result_read_census().statistics_values, 6);
-    for order in [BackendOrder::Direct, BackendOrder::Managed] {
+    for order in [BackendOrder::Direct] {
         let mut snapshot = corpus.snapshot();
         reset_result_read_census();
         let result = q4_snapshot_order(
@@ -1530,19 +1510,16 @@ fn direct_page_recency_uses_file_mtime_for_undated_journals_and_ordinary_pages()
     set_mtime(&undated, 200);
     let corpus = Corpus::open(root, true);
 
-    // Accepted inventory can retain an explicit Journal classification for a
-    // path whose filename supplies no day. The Direct physical producer stores
-    // that exact `(Journal, NULL journal_day)` shape.
-    let inventory = corpus
-        .graph
-        .projected_inventory_entry(
-            &crate::oplog::ManagedPath::parse("pages/Z-undated.md").unwrap(),
-            "Z-undated",
-            crate::oplog::ManagedTextKind::Journal,
-        )
-        .expect("the existing inventory decoder accepts an explicit journal kind");
-    assert_eq!(inventory.kind, PageKind::Journal);
-    assert_eq!(inventory.date_key, None);
+    // A Journal classification for a path whose filename supplies no day. The
+    // Direct physical producer stores that exact `(Journal, NULL journal_day)`
+    // shape.
+    let inventory = crate::model::PageEntry {
+        name: "Z-undated".to_owned(),
+        kind: PageKind::Journal,
+        date_key: None,
+        rel_path: "pages/Z-undated.md".to_owned(),
+        path: corpus.root.join("pages/Z-undated.md"),
+    };
     let mut document = crate::doc::parse("- undated journal\n");
     crate::model::assign_doc_runtime_ids(&mut document.roots, &inventory.rel_path);
     let physical = crate::direct_projection::physical_page_for_test(
@@ -1616,38 +1593,6 @@ fn direct_page_recency_uses_file_mtime_for_undated_journals_and_ordinary_pages()
         .expect("the undated journal is returned");
     assert_eq!(undated.kind, PageKind::Journal);
     assert_eq!(undated.journal_day, None);
-
-    let journal_format = crate::date::JournalFormat::new(None, None);
-    let managed_root = corpus.root.clone();
-    let managed_recency = PageRecencyPrograms::new(
-        JournalRankInput::DisplayName,
-        move |name| journal_format.page_recency_secs(true, name, Path::new("")),
-        move |path| page_recency_secs_for(None, &managed_root.join(path)),
-    );
-    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&database, || Ok(()))
-        .expect("the accepted projection copy opens again");
-    let managed = read_page_results(
-        &mut snapshot,
-        &PageReadInputs {
-            statement: &statement,
-            order: BackendOrder::Managed,
-            view: &view,
-            max_rows: usize::MAX,
-            max_bytes: usize::MAX,
-            recency: &managed_recency,
-        },
-    )
-    .expect("Managed display-name recency keeps its existing answer");
-    snapshot.finish();
-    assert_eq!(
-        managed
-            .pages
-            .iter()
-            .map(|page| page.path.as_str())
-            .collect::<Vec<_>>(),
-        ["pages/Z-undated.md", "pages/A-ordinary.md"],
-        "an unparseable Managed journal stays at MIN rather than using mtime"
-    );
     let _ = std::fs::remove_file(database);
 }
 
@@ -1802,107 +1747,6 @@ fn cancelling_page_selection_or_a_later_payload_batch_returns_no_partial_answer(
     set_before_page_payload_batch_hook(None);
     assert!(matches!(answer, Err(ResultReadError::Cancelled)));
     between.finish();
-}
-
-/// `BackendOrder::Managed` orders by `pages.path` under SQLite's default
-/// BINARY collation, which must be `String::cmp` on the UTF-8 bytes — no
-/// collation, no folding, no locale.
-#[test]
-fn the_managed_order_is_the_binary_path_order() {
-    let _serial = serialize();
-    let root = scratch("r3-managed-order");
-    write_ordering_corpus(&root);
-    let corpus = Corpus::open(root, true);
-    let mut snapshot = corpus.snapshot();
-    let rows = snapshot
-        .run_projection_query("SELECT path FROM pages ORDER BY path", &[])
-        .expect("the paths are readable through the snapshot");
-    snapshot.finish();
-    let sqlite_order: Vec<String> = rows
-        .iter()
-        .map(|row| match row.first() {
-            Some(PhysicalQueryValue::Text(path)) => path.clone(),
-            other => panic!("pages.path is text, got {other:?}"),
-        })
-        .collect();
-    let mut rust_order = sqlite_order.clone();
-    rust_order.sort_by(|left, right| left.cmp(right));
-    assert_eq!(
-        sqlite_order, rust_order,
-        "SQLite BINARY is not Rust's byte order on these paths"
-    );
-    assert!(
-        sqlite_order.len() >= 7,
-        "the ordering corpus lost pages: {}",
-        sqlite_order.len()
-    );
-
-    // The descriptor read under the Managed order visits pages in exactly that
-    // byte order. Asserted on the descriptor's own `pages.path` column, which
-    // is the ordering key itself — a group-level assertion could not see two
-    // physical pages that share a display name.
-    let (_query, statement) =
-        corpus.lower_block_anchored("content match 'marker'", QueryDialect::Tql);
-    let descriptor = descriptor_statement(&statement, BackendOrder::Managed)
-        .expect("the managed descriptor statement builds");
-    let mut snapshot = corpus.snapshot();
-    snapshot
-        .set_query_regex_predicate(statement.regexes.predicate())
-        .expect("the regex table installs");
-    let rows = snapshot
-        .run_projection_query(&descriptor.sql, &descriptor.params)
-        .expect("the managed descriptor statement runs");
-    snapshot.finish();
-    let visited: Vec<String> = rows
-        .iter()
-        .map(|row| match row.get(5) {
-            Some(PhysicalQueryValue::Text(path)) => path.clone(),
-            other => panic!("the descriptor selects pages.path, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(visited.len(), 7, "every ordering-corpus page has one match");
-    let mut sorted = visited.clone();
-    sorted.sort_by(|left, right| left.cmp(right));
-    assert_eq!(
-        visited, sorted,
-        "the managed descriptor order is not the binary path order"
-    );
-
-    // Two PHYSICAL pages that share a display name stay two groups here;
-    // `base_order_groups` merges for display, later and elsewhere.
-    let root = corpus.root.clone();
-    let recency = recency_for(&root);
-    let mut snapshot = corpus.snapshot();
-    let answer = read_results(
-        &mut snapshot,
-        &ResultReadInputs {
-            statement: &statement,
-            order: BackendOrder::Managed,
-            identity: &ResultIdentity::Stored,
-            max_rows: usize::MAX,
-            max_bytes: usize::MAX,
-            profile: ConstructionProfile::default(),
-            recency: &recency,
-        },
-    )
-    .expect("the managed-ordered read answers");
-    snapshot.finish();
-    let names: Vec<String> = answer
-        .groups
-        .iter()
-        .map(|group| group.page.clone())
-        .collect();
-    assert_eq!(names.len(), 7, "every matching page is its own group");
-    assert_eq!(
-        names.iter().filter(|name| name.as_str() == "Alpha").count(),
-        2,
-        "two physical pages sharing a display name stay two groups"
-    );
-    assert_eq!(
-        names.iter().filter(|name| name.as_str() == "alpha").count(),
-        1,
-        "case-distinct display names are distinct pages"
-    );
 }
 
 // ===== the huge page =====

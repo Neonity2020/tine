@@ -69,17 +69,17 @@ impl QueryExecutionError {
     pub fn backend_wire_string(self) -> String {
         match self {
             Self::NotReady(reason) => {
-                crate::sync_runtime::tagged_backend_error("query-not-ready", Some(reason.as_str()))
+                crate::backend_error::tagged_backend_error("query-not-ready", Some(reason.as_str()))
             }
             Self::Unavailable(reason) => {
-                crate::sync_runtime::tagged_backend_error_with_reason_and_detail(
+                crate::backend_error::tagged_backend_error_with_reason_and_detail(
                     "query-unavailable",
                     reason.as_str(),
                     serde_json::json!({ "message": reason.message() }),
                 )
             }
             Self::Cancelled => {
-                crate::sync_runtime::tagged_backend_error("operation-cancelled", None)
+                crate::backend_error::tagged_backend_error("operation-cancelled", None)
             }
         }
     }

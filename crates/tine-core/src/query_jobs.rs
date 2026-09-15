@@ -100,9 +100,7 @@ pub(crate) struct QueryJobLease<O: Deref<Target = QueryJobOwner>> {
     id: u64,
 }
 
-pub(crate) type Admission<'a> = QueryAdmission<&'a QueryJobOwner>;
 pub(crate) type OwnedAdmission = QueryAdmission<Arc<QueryJobOwner>>;
-pub(crate) type JobSlot<'a> = QueryJobLease<&'a QueryJobOwner>;
 pub(crate) type OwnedJobSlot = QueryJobLease<Arc<QueryJobOwner>>;
 
 impl QueryJobOwner {
@@ -127,24 +125,8 @@ impl QueryJobOwner {
         }
     }
 
-    /// Wait for a slot. The caller opens its snapshot only after this returns
-    /// `Slot`, and registers the snapshot's cancellation with [`JobSlot::register`].
-    pub(crate) fn acquire(&self) -> Admission<'_> {
-        self.acquire_within(QUERY_JOB_WAIT)
-    }
-
-    pub(crate) fn acquire_within(&self, wait: Duration) -> Admission<'_> {
-        self.acquire_at_within(self.capture_epoch(), wait)
-    }
-
     pub(crate) fn capture_epoch(&self) -> QueryJobEpoch {
         QueryJobEpoch(self.state.lock().unwrap().drain_epoch)
-    }
-
-    /// Refuse captures invalidated before their worker began waiting as well
-    /// as jobs invalidated while queued. No transaction is opened here.
-    pub(crate) fn acquire_at_within(&self, epoch: QueryJobEpoch, wait: Duration) -> Admission<'_> {
-        Self::acquire_lease_at(self, epoch, wait)
     }
 
     /// An owned lease can travel with an admitted producer capture. It shares
@@ -214,24 +196,6 @@ impl QueryJobOwner {
         }
     }
 
-    /// Cancel current work and retain the existing full-idle replacement
-    /// barrier. Callers using the split fence API instead control admission
-    /// to the replacement while its old readers drain off the actor.
-    pub(crate) fn cancel_all_and_drain(&self) {
-        let fence = self.begin_drain();
-        self.wait_for_drain(fence);
-        let mut state = self.state.lock().unwrap();
-        while !state.active.is_empty() {
-            state = self.changed.wait(state).unwrap();
-        }
-    }
-
-    /// Refuse every future admission, then drain. Used when the graph closes.
-    pub(crate) fn close(&self) {
-        let fence = self.begin_close();
-        self.wait_for_drain(fence);
-    }
-
     /// Close admission before the producer rejects its queued captures. The
     /// caller drops those leases before waiting outside its queue lock.
     pub(crate) fn begin_close(&self) -> QueryDrainFence {
@@ -297,79 +261,15 @@ impl<O: Deref<Target = QueryJobOwner>> Drop for QueryJobLease<O> {
     }
 }
 
-/// A job owner shared between a projection and the readers it admits.
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
-
-    fn fixture_projection() -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("tine-query-jobs-{}.sqlite", uuid::Uuid::new_v4()));
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 CREATE TABLE payload (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
-                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
-                 INSERT INTO payload (id, value) SELECT i, 'v' || i FROM n;",
-            )
-            .unwrap();
-        path
-    }
 
     fn owned(owner: &Arc<QueryJobOwner>) -> OwnedJobSlot {
         match owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO) {
             OwnedAdmission::Slot(slot) => slot,
             _ => panic!("owned admission"),
         }
-    }
-
-    #[test]
-    fn owned_and_borrowed_leases_share_capacity_and_drain_fences() {
-        let owner = Arc::new(QueryJobOwner::new(2));
-        let old_owned = owned(&owner);
-        let old_borrowed = match owner.acquire() {
-            Admission::Slot(slot) => slot,
-            _ => panic!("borrowed admission"),
-        };
-        assert!(matches!(
-            owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO),
-            OwnedAdmission::Busy
-        ));
-        let old_epoch = owner.capture_epoch();
-        let fence = owner.begin_drain();
-        assert!(old_owned.is_cancelled());
-        assert!(old_borrowed.is_cancelled());
-        assert!(matches!(
-            owner.acquire_owned_at_within(old_epoch, Duration::ZERO),
-            OwnedAdmission::Cancelled
-        ));
-        drop(old_borrowed);
-        let new_owned = owned(&owner);
-        let (waiting, observed) = mpsc::channel();
-        owner.state.lock().unwrap().drain_waiting_started = Some(waiting);
-        let drain_owner = Arc::clone(&owner);
-        let (done, finished) = mpsc::channel();
-        let drainer = std::thread::spawn(move || {
-            drain_owner.wait_for_drain(fence);
-            done.send(()).unwrap();
-        });
-        observed.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(matches!(
-            finished.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        std::thread::spawn(move || drop(old_owned)).join().unwrap();
-        finished.recv_timeout(Duration::from_secs(3)).unwrap();
-        drainer.join().unwrap();
-        assert_eq!(owner.active(), 1);
-        assert!(!new_owned.is_cancelled());
-        drop(new_owned);
-        assert_eq!(owner.active(), 0);
     }
 
     #[test]
@@ -381,208 +281,5 @@ mod tests {
         assert!(weak.upgrade().is_some());
         std::thread::spawn(move || drop(slot)).join().unwrap();
         assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn owned_lease_cancels_late_snapshot_registration_and_releases_once() {
-        let owner = Arc::new(QueryJobOwner::new(1));
-        let slot = owned(&owner);
-        let fence = owner.begin_drain();
-        let path = fixture_projection();
-        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-        assert!(!slot.register(snapshot.cancellation()));
-        assert!(snapshot.cancellation().is_cancelled());
-        assert!(snapshot.run_projection_query("SELECT 1", &[]).is_err());
-        drop(snapshot);
-        drop(slot);
-        owner.wait_for_drain(fence);
-        assert_eq!(owner.active(), 0);
-        let new = owned(&owner);
-        assert!(!new.is_cancelled());
-        drop(new);
-        owner.close();
-        assert!(matches!(
-            owner.acquire_owned_at_within(owner.capture_epoch(), Duration::ZERO),
-            OwnedAdmission::Cancelled
-        ));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn capacity_is_acquired_before_any_snapshot_and_released_exactly_once() {
-        let owner = QueryJobOwner::new(2);
-        let a = match owner.acquire() {
-            Admission::Slot(slot) => slot,
-            _ => panic!("first admission"),
-        };
-        let b = match owner.acquire() {
-            Admission::Slot(slot) => slot,
-            _ => panic!("second admission"),
-        };
-        assert_eq!(owner.active(), 2);
-        assert!(matches!(
-            owner.acquire_within(Duration::from_millis(20)),
-            Admission::Busy
-        ));
-        drop(a);
-        assert_eq!(owner.active(), 1);
-        let c = match owner.acquire_within(Duration::from_millis(20)) {
-            Admission::Slot(slot) => slot,
-            _ => panic!("a freed slot is re-admitted"),
-        };
-        drop(b);
-        drop(c);
-        assert_eq!(owner.active(), 0);
-    }
-
-    #[test]
-    fn drain_cancels_waiters_registered_jobs_and_late_registrations() {
-        let owner = QueryJobOwner::new(1);
-        let path = fixture_projection();
-        let held = match owner.acquire() {
-            Admission::Slot(slot) => slot,
-            _ => panic!("admission"),
-        };
-        let snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-        assert!(held.register(snapshot.cancellation()));
-        let cancelled = snapshot.cancellation();
-        let released = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            // A waiter that will be woken by the drain, not by a freed slot.
-            let (started, waiting) = mpsc::channel();
-            // Signal under the admission lock after capturing the drain epoch.
-            // A signal before acquire() only proves the thread was scheduled;
-            // the whole drain could finish before it actually starts waiting.
-            owner.state.lock().unwrap().waiting_started = Some(started);
-            let owner = &owner;
-            let waiter = scope.spawn(move || matches!(owner.acquire(), Admission::Cancelled));
-            waiting.recv().unwrap();
-            // The drain blocks until the held slot is released; release it
-            // from another thread once the drain has cancelled the snapshot.
-            let cancelled = &cancelled;
-            let released = &released;
-            let releaser = scope.spawn(move || {
-                let started = Instant::now();
-                while !cancelled.is_cancelled() {
-                    assert!(
-                        started.elapsed() < Duration::from_secs(5),
-                        "drain never cancelled"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                assert_eq!(owner.active(), 1, "drain must wait for the held slot");
-                released.store(true, Ordering::Release);
-                drop(held);
-            });
-            owner.cancel_all_and_drain();
-            assert!(
-                released.load(Ordering::Acquire),
-                "drain returned before the slot was released"
-            );
-            assert_eq!(owner.active(), 0);
-            assert!(waiter.join().unwrap(), "the waiter must observe Cancelled");
-            releaser.join().unwrap();
-        });
-
-        // A job admitted before the drain but registering after it is
-        // cancelled on registration, so a snapshot opened "just after" cannot
-        // outlive the file it was opened on.
-        let owner2 = QueryJobOwner::new(2);
-        let early = match owner2.acquire() {
-            Admission::Slot(slot) => slot,
-            _ => panic!("admission"),
-        };
-        owner2.begin_drain();
-        let late_snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-        let cancellation = late_snapshot.cancellation();
-        assert!(!early.register(cancellation.clone()));
-        assert!(cancellation.is_cancelled());
-        assert!(early.is_cancelled());
-        drop(early);
-        // Admission beginning after a drain belongs to the new generation.
-        assert!(matches!(owner2.acquire(), Admission::Slot(_)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_drain_fence_waits_for_unregistered_old_slots_but_not_new_admissions() {
-        let owner = QueryJobOwner::new(2);
-        let Admission::Slot(old) = owner.acquire() else {
-            panic!("old admission")
-        };
-        let fence = owner.begin_drain();
-        assert!(old.is_cancelled());
-        let Admission::Slot(new) = owner.acquire() else {
-            panic!("new admission")
-        };
-        let (finished, received) = mpsc::channel();
-        let (waiting, started) = mpsc::channel();
-        owner.state.lock().unwrap().drain_waiting_started = Some(waiting);
-        std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| {
-                owner.wait_for_drain(fence);
-                finished.send(()).unwrap();
-            });
-            let waited_for_old = started.recv_timeout(Duration::from_secs(5)).is_ok();
-            let not_finished_early = received.try_recv().is_err();
-            drop(old);
-            let completes_with_new_held = received.recv_timeout(Duration::from_secs(5)).is_ok();
-            let new_is_live = !new.is_cancelled();
-            // Release before assertions, including on failure, so the control
-            // cannot deadlock the scoped waiter on the new slot.
-            drop(new);
-            waiter.join().unwrap();
-            assert!(
-                waited_for_old && not_finished_early,
-                "old unregistered slot was not drained"
-            );
-            assert!(completes_with_new_held, "new work prolonged the old fence");
-            assert!(new_is_live, "waiting on the old fence cancelled new work");
-        });
-    }
-
-    #[test]
-    fn a_drained_job_sees_its_running_statement_interrupted() {
-        let owner = QueryJobOwner::new(1);
-        let path = fixture_projection();
-        let slot = match owner.acquire() {
-            Admission::Slot(slot) => slot,
-            _ => panic!("admission"),
-        };
-        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-        assert!(slot.register(snapshot.cancellation()));
-        std::thread::scope(|scope| {
-            let (tx, rx) = mpsc::channel();
-            let owner = &owner;
-            let drainer = scope.spawn(move || {
-                rx.recv().unwrap();
-                owner.cancel_all_and_drain();
-            });
-            // A cross join large enough that the progress handler fires.
-            let result = snapshot.visit_projection_query(
-                "SELECT a.id FROM payload a, payload b WHERE a.id = b.id + 1",
-                &[],
-                |row| {
-                    if let Some(PhysicalQueryValue::Integer(2)) = row.first() {
-                        let _ = tx.send(());
-                    }
-                    Ok(std::ops::ControlFlow::Continue(()))
-                },
-            );
-            assert!(result.is_err(), "the interrupted statement fails the read");
-            assert!(slot.is_cancelled());
-            drop(snapshot);
-            drop(slot);
-            drainer.join().unwrap();
-        });
-        assert_eq!(owner.active(), 0);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn close_refuses_every_later_admission() {
-        let owner = QueryJobOwner::new(2);
-        owner.close();
-        assert!(matches!(owner.acquire(), Admission::Cancelled));
     }
 }

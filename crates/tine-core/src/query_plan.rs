@@ -6,8 +6,12 @@
 //! block-query result contract.  The plan/result types are the seam that a
 //! durable query workspace can grow into later.
 
+#[cfg(test)]
 use crate::doc::DocBlock;
-use crate::model::{BlockDto, Graph, PageEntry, PageKind};
+#[cfg(test)]
+use crate::model::Graph;
+use crate::model::{BlockDto, PageEntry, PageKind};
+#[cfg(test)]
 use crate::refs;
 use crate::search_query::{canonical_fold, Matcher, Term};
 use regex::Regex;

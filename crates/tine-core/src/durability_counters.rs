@@ -13,7 +13,7 @@
 //! per-operation sum. Phase timers cannot see multiplicity; counters can. These
 //! counters therefore exist to make that sum a **testable budget** rather than
 //! an invisible property — see
-//! `sync_runtime::tests::managed_save_and_move_stay_within_their_barrier_budget`.
+//! `model::tests::direct_save_and_move_stay_within_their_barrier_budget`.
 //!
 //! ## What is counted, and what is not
 //!
@@ -108,21 +108,6 @@ fn attribute(kind: Barrier, count: u64) {
             counts[kind as usize].fetch_add(count, Ordering::Relaxed);
         }
     });
-}
-
-/// Record the two barriers that one `tine_storage` immutable publication
-/// performs: the temporary file's `fsync`, and the containing directory's
-/// `fsync` after the immutable name is installed.
-///
-/// Counting the storage crate's documented contract at its `tine-core` call
-/// site keeps the per-operation sum complete without a `tine-storage` API
-/// change. `tine_storage::publish_immutable_exact_impl` is the function whose
-/// contract this mirrors; if it ever stops performing exactly one file barrier
-/// and one directory barrier, this helper is what must change with it.
-#[inline]
-pub(crate) fn note_immutable_publication() {
-    note(Barrier::File);
-    note(Barrier::Directory);
 }
 
 /// A regular file or directory handle that can be forced to stable storage.
@@ -616,8 +601,6 @@ mod tests {
             vec![
                 ("durability_counters.rs".into(), ".sync_all("),
                 ("durability_counters.rs".into(), ".sync_all("),
-                ("filesystem_durability.rs".into(), "libc::syncfs("),
-                ("filesystem_durability.rs".into(), "libc::syncfs("),
             ],
             "a production durability primitive exists outside the counted \
              file/directory wrappers in durability_counters.rs or the counted \
@@ -656,16 +639,6 @@ mod tests {
         assert_eq!(counts.get(Barrier::Directory), 2);
         assert_eq!(counts.get(Barrier::Filesystem), 1);
         assert_eq!(counts.total(), 4);
-        BarrierSession::detach_current_thread();
-    }
-
-    #[test]
-    fn an_immutable_publication_costs_one_file_and_one_directory_barrier() {
-        let session = BarrierSession::begin();
-        note_immutable_publication();
-        let counts = session.counts();
-        assert_eq!(counts.get(Barrier::File), 1);
-        assert_eq!(counts.get(Barrier::Directory), 1);
         BarrierSession::detach_current_thread();
     }
 

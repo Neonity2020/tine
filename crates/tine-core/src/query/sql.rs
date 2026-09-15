@@ -651,7 +651,6 @@ pub(crate) fn descriptor_view_statement(
     };
     let base = match order {
         crate::query::results::BackendOrder::Direct => "o.position",
-        crate::query::results::BackendOrder::Managed => "p.path",
     };
     let mut params = statement.params.clone();
     let mut ranks = QueryRankPrograms::default();
@@ -901,7 +900,6 @@ fn recency_order_expression(
     let file = bind_page_param(params, PhysicalQueryValue::Integer(bound.file_id as i64));
     match bound.journal_input {
         JournalRankInput::StoredDay => format!("CASE WHEN {alias}.text_kind = 1 AND {alias}.journal_day IS NOT NULL THEN tine_query_rank({journal}, CAST({alias}.journal_day AS TEXT)) ELSE tine_query_rank({file}, {alias}.path) END"),
-        JournalRankInput::DisplayName => format!("CASE WHEN {alias}.text_kind = 1 THEN tine_query_rank({journal}, {alias}.name) ELSE tine_query_rank({file}, {alias}.path) END"),
     }
 }
 
@@ -993,7 +991,6 @@ pub(crate) fn page_statement(
     };
     let base = match order {
         crate::query::results::BackendOrder::Direct => "o.position",
-        crate::query::results::BackendOrder::Managed => "r.path",
     };
     let mut params = statement.params.clone();
     let mut ranks = QueryRankPrograms::default();
