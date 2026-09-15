@@ -297,27 +297,6 @@
       "notes": "The component layer proves the IR each gesture saves; it cannot prove geometry, touch, or that the saved tree round-trips through the block on disk. Outstanding manager work for the P6 controls packet: a 390px browser/native pass showing the handle, selection box, enabled switch, row menu and Group selected bar all reachable without horizontal overflow and without hover; a touch drag started from the handle only; and a save/reopen/undo journey showing a grouped or reordered query re-reading as the same tree with one undo step per gesture. Rust Off round-trip and oracle gates are also the manager's."
     },
     {
-      "id": "UI-QUERY-CANDIDATE-ORACLE-ONLY-20260908",
-      "title": "Production query requests do not run the retired candidate planner",
-      "family": "query-results",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "unit",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/tests/public_query_executor_census.rs::candidate_planning_is_only_an_oracle_and_the_cursor_owner_remains_shared"
-        ],
-        "failBefore": "proven"
-      },
-      "notes": "The production-source guard fails before retiring the candidate planner. Managed requests parse once and refuse invalid input before acquiring a database job; valid requests use the shared SQL executor. Candidate types and adapters remain test-only oracle support. Direct and oracle cursor consumers share the unchanged production drain helper."
-    },
-    {
       "id": "UI-QUERY-TODO-SCROLL-POSITION-20260907",
       "title": "Completing a TODO in a long multiline query should preserve the reader's place",
       "family": "query-results",
