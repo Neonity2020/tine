@@ -4168,6 +4168,30 @@
   "failBefore": "proven"
  },
  "notes": "Flexible degraded behaviour, not data loss: the ledger is a merge hint and no note text is ever lost. ConcordLedger::flush() had only test callers, so app.exit(0) dropped queued Record/Pin/DropPin/Prune jobs and the next conflict on that page merged against an older base (more lines to review by hand). Quitting right after a save is the ordinary multi-device case Concord serves, so Martin chose a bounded exit wait over a doc-only fix. Fail-before: the lib.rs exit-path guard failed on base a36724c7 because the RunEvent::Exit arm did not drain. Evidence: tine-agents/evidence/concord-exit-flush/."
+},
+{
+ "id": "REG-DIRECT-CARRY-SOURCE-BARRIER-001",
+ "title": "Carried or moved blocks are never written out of their source page before they are on disk in the destination: carry holds its source days behind today, and a second move into one page no longer strands the first move's sources",
+ "family": "direct-save-data-safety",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "tine-agents/subagent-tasks/notes/2026-09-15-k6-store-move-census.md (H1); tine-agents/specs/campaigns/2026-09-consolidation/PLAN.md §7"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/directMoveOrder.test.ts::does not write the task out of its source day when a later edit saves that day",
+   "src/persistenceMoveBarrier.test.ts::releases every source held behind one destination, not only the latest move's"
+  ],
+  "scenario": "direct-markdown.move-barrier",
+  "failBefore": "proven"
+ },
+ "notes": "Exact safety (data loss). Carry was the one cross-page move with no source barrier (audit C#1): carryUnfinished left the source days clean and carry.ts marked them only after today saved, but nothing held them, so when today's save conflicted (e.g. Syncthing delivered a newer today) an unrelated edit to a source day wrote the post-removal file and the carried tasks survived only in memory and the move record. Fail-before on base a36724c7: the source day was written as ['a note that stays, edited'] without the task. Neighbour: holdSourcesForDest replaced an earlier hold on the same destination, so the first move's sources stayed held after it landed and their edits could never save. Evidence: tine-agents/evidence/move-carry-barrier/."
 }
 ]
 }

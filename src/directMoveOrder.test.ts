@@ -21,10 +21,12 @@
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { initParser } from "./render/parse";
-import { backend } from "./backend";
+import { backend, SaveConflictError } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
 import { resetStorageDispatchCounters } from "./storageDispatch";
 import {
+  flushPage,
+  isDirty,
   loadFeed,
   moveBlock,
   moveBlocksRelative,
@@ -32,6 +34,7 @@ import {
   pageByName,
   resetStore,
   selectBlock,
+  setRaw,
   settleDirectMovesForTest,
 } from "./store";
 import { carryDay, carryDaysBack } from "./carry";
@@ -226,6 +229,50 @@ describe("the four durable steps, in contract order", () => {
     // removals, and recovery classifies each participant on its own).
     expect(new Set(emitted.slice(2, -1))).toEqual(new Set(days.map((day) => ["save", day] as Step)));
     expect(emitted[emitted.length - 1]).toEqual(["finish", MOVE_ID]);
+  });
+});
+
+describe("a carry whose destination save conflicts", () => {
+  // Carry is a cross-page move, so it needs the same barrier as the other four
+  // shapes (audit C#1): while today's write is not durable, nothing may save a
+  // source day's post-removal state. `carryUnfinished` leaves the source days
+  // clean and `carry.ts` marks them only after today lands, but nothing HELD
+  // them, so an unrelated edit to a source day while today sat conflicted wrote
+  // the carried task out of the only file that still had it.
+  it("does not write the task out of its source day when a later edit saves that day", async () => {
+    const today = journalTitle(new Date());
+    const day = new Date();
+    day.setDate(day.getDate() - 1);
+    const source = journalTitle(day);
+    for (const name of [today, source]) clearConflict(name);
+    await loadFeed([
+      page(today, "journals/today.md", "today-r1", [block("today-root", "")], "journal"),
+      page(source, "journals/back-1.md", "back-1-r1", [
+        block("carried-task", "TODO carry me"),
+        block("staying-note", "a note that stays"),
+      ], "journal"),
+    ]);
+    vi.spyOn(backend(), "beginDirectCrossPageMove").mockResolvedValue(MOVE_ID);
+    vi.spyOn(backend(), "finishDirectCrossPageMove").mockResolvedValue(true);
+    const sourceWrites: string[][] = [];
+    vi.spyOn(backend(), "savePage").mockImplementation(async (dto: PageDto) => {
+      // Syncthing delivered a newer today: every write of today is refused.
+      if (dto.name === today) throw new SaveConflictError(7);
+      if (dto.name === source) sourceWrites.push(dto.blocks.map((b) => b.raw));
+      return { revision: `${dto.rev ?? "r"}-next` } as any;
+    });
+
+    await carryDay(source);
+    expect(pageByName(today)!.roots).toContain("carried-task");
+
+    // An unrelated edit to the source day, flushed as the debounce would.
+    setRaw("staying-note", "a note that stays, edited");
+    await flushPage(source);
+
+    // Today is not on disk, so every write of the source must still hold the task…
+    for (const raws of sourceWrites) expect(raws).toContain("TODO carry me");
+    // …and the edit itself is written or still pending, never dropped.
+    expect(sourceWrites.some((raws) => raws.includes("a note that stays, edited")) || isDirty(source)).toBe(true);
   });
 });
 

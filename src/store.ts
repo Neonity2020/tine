@@ -2740,9 +2740,13 @@ export function carryUnfinished(
       todayPage.roots.push(...carried);
     })
   );
-  // Mark ONLY today (the destination) dirty here. The source days are marked +
-  // flushed by carry.ts AFTER today saves, so the debounced batch can't write a
-  // source removal while today is still unsaved/conflicted (removal-only loss).
+  // Mark ONLY today (the destination) dirty here, and HOLD the source days behind
+  // it (audit C#1), as `persistCrossPage` does for every other cross-page move.
+  // carry.ts marks and flushes the sources after today saves, but an unrelated
+  // edit to a source day would mark it dirty on its own; without the hold, a
+  // conflicted today let that edit write the carried tasks out of the only file
+  // that still had them.
+  holdSourcesForDest(today, [...new Set(plan.map((item) => item.from))]);
   markDirty(today);
   return plan.length;
 }
