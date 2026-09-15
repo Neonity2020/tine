@@ -3164,8 +3164,6 @@ pub(crate) fn reconciliation_scan_config_path_at_open(root: &Path) -> PathBuf {
     matching(&logseq, "config.edn").unwrap_or(exact)
 }
 
-impl Graph {}
-
 /// Canonical Markdown page-header property grammar mirrored from
 /// `src/editor/properties.ts`. It is deliberately narrower than OG's historical
 /// "first line contains `:: `" serializer heuristic, so ordinary prose/fences
