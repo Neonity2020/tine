@@ -814,7 +814,7 @@ keeps its place.
 8. The app-private graph-fact projection contains no authority state and grants no
    authority.
 9. Graph-text writes take two locks, and always in this order: the
-   **graph-text identity-mutation gate** (`ManagedTextWriteGate::lock_identity_mutation`,
+   **graph-text identity-mutation gate** (`GraphTextWriteGate::lock_identity_mutation`,
    graph-global, exclusive across threads, re-entrant per thread) first, then the
    **per-page lock** (`Graph::page_lock`, per path). A writer that holds a page
    lock and then reaches the gate deadlocks against every writer that takes them

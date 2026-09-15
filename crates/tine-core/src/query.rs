@@ -1413,7 +1413,7 @@ pub(crate) fn backlink_filter_entry(
         add_facet: &mut impl FnMut(&str),
         truncated: &mut bool,
     ) {
-        if depth > crate::model::MAX_MANAGED_BLOCK_DEPTH {
+        if depth > crate::model::MAX_BLOCK_DEPTH {
             *truncated = true;
             return;
         }

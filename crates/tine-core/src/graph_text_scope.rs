@@ -5,7 +5,7 @@
 //! projection, enrollment, rename, or deletion authority.
 
 use crate::graph_text_path::{
-    managed_component_is_portable, CanonicalGraphResourceId, PortablePathKey,
+    graph_text_component_is_portable, CanonicalGraphResourceId, PortablePathKey,
     PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION, PORTABLE_PATH_KEY_VERSION,
     PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION,
 };
@@ -609,7 +609,7 @@ fn lexical_components(relative: &str) -> Option<Vec<&str>> {
     let components = relative.split('/').collect::<Vec<_>>();
     components
         .iter()
-        .all(|component| managed_component_is_portable(component))
+        .all(|component| graph_text_component_is_portable(component))
         .then_some(components)
 }
 

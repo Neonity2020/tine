@@ -2794,7 +2794,7 @@ mod tests {
 
     #[test]
     fn managed_restore_collection_keeps_graph_relative_paths() {
-        let root = scratch("managed-restore-graph-wide");
+        let root = scratch("graph-restore-graph-wide");
         let graph = root.join("graph");
         std::fs::create_dir_all(graph.join("archive/自由")).unwrap();
         std::fs::write(graph.join("Root.md"), "- root\n").unwrap();

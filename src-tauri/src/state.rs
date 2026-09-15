@@ -196,7 +196,7 @@ impl GraphSlot {
     /// authority this slot holds.
     ///
     /// Trashing a page, journal or conflict copy is a graph-text deletion and
-    /// is admitted inside `tine-core`, at `Graph::admit_managed_text_writer`.
+    /// is admitted inside `tine-core`, at `Graph::admit_graph_text_writer`.
     pub(crate) fn with_trash_graph<T>(
         &self,
         f: impl FnOnce(&Graph) -> Result<T, CommandError>,

@@ -46,13 +46,13 @@ describe("I-22 hostile-content shape guard", () => {
     expect(contract).toContain("64 parse levels (`QUERY_NESTING_MAX`)");
     expect(contract).toContain("3 rendered levels (`MAX_QUERY_BUILDER_DEPTH`)");
     expect(contract).toContain("64 levels (`MAX_PEEK_BLOCK_DEPTH`)");
-    expect(contract).toContain("128 levels (`MAX_MANAGED_BLOCK_DEPTH`)");
+    expect(contract).toContain("128 levels (`MAX_BLOCK_DEPTH`)");
     expect(source("src/sheet/formula/eval.ts")).toContain("MAX_FORMULA_EVAL_DEPTH = 128");
     expect(source("src/editor/queryBuilder.ts")).toContain("MAX_QUERY_BUILDER_DEPTH = 3");
     expect(source("crates/tine-core/src/query.rs"))
       .toContain("QUERY_NESTING_MAX: usize = 64");
     expect(source("src/render/PeekPopup.tsx")).toContain("MAX_PEEK_BLOCK_DEPTH = 64");
     expect(source("crates/tine-core/src/model.rs"))
-      .toContain("pub(crate) const MAX_MANAGED_BLOCK_DEPTH: usize = 128");
+      .toContain("pub(crate) const MAX_BLOCK_DEPTH: usize = 128");
   });
 });

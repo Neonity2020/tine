@@ -47,12 +47,12 @@ impl std::error::Error for UnsafeGraphTextPath {}
 /// This type establishes portable lexical safety only. Whether an existing path
 /// is admitted is authorized by the graph capability and its graph-text scope.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ManagedPath(String);
+pub struct GraphTextPath(String);
 
-impl ManagedPath {
+impl GraphTextPath {
     pub fn parse(value: impl Into<String>) -> Result<Self, UnsafeGraphTextPath> {
         let value = value.into();
-        if is_managed_path(&value) {
+        if is_graph_text_path(&value) {
             Ok(Self(value))
         } else {
             Err(UnsafeGraphTextPath(value))
@@ -67,7 +67,7 @@ impl ManagedPath {
         self.0
             .rsplit('/')
             .next()
-            .expect("validated managed paths are nonempty")
+            .expect("validated graph paths are nonempty")
     }
 
     pub fn parent_relative(&self) -> Option<&str> {
@@ -76,7 +76,7 @@ impl ManagedPath {
 
     /// Form a graph-relative sibling without granting filesystem authority.
     pub fn join_sibling(&self, name: &str) -> Result<String, UnsafeGraphTextPath> {
-        if name.contains('/') || !managed_component_is_portable(name) {
+        if name.contains('/') || !graph_text_component_is_portable(name) {
             return Err(UnsafeGraphTextPath(name.to_owned()));
         }
         Ok(match self.parent_relative() {
@@ -89,7 +89,7 @@ impl ManagedPath {
         self.file_name()
             .rsplit_once('.')
             .map(|(_, extension)| extension)
-            .expect("validated managed paths have a text extension")
+            .expect("validated graph paths have a text extension")
     }
 
     pub fn is_markdown(&self) -> bool {
@@ -104,7 +104,7 @@ impl ManagedPath {
     /// Compute the versioned portable comparison key without changing the
     /// exact spelling retained and projected by this path.
     pub fn portable_key(&self) -> PortablePathKey {
-        PortablePathKey::from_managed_path(self)
+        PortablePathKey::from_graph_text_path(self.as_str())
     }
 }
 
@@ -117,10 +117,6 @@ impl ManagedPath {
 pub struct PortablePathKey(String);
 
 impl PortablePathKey {
-    fn from_managed_path(path: &ManagedPath) -> Self {
-        Self::from_components(path.as_str())
-    }
-
     /// Apply the canonical versioned fold to an already-validated graph text
     /// path without introducing a second approximation of the component fold.
     pub(crate) fn from_graph_text_path(path: &str) -> Self {
@@ -220,13 +216,13 @@ impl PortablePathKeyDigest {
     }
 }
 
-impl fmt::Display for ManagedPath {
+impl fmt::Display for GraphTextPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl FromStr for ManagedPath {
+impl FromStr for GraphTextPath {
     type Err = UnsafeGraphTextPath;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -234,7 +230,7 @@ impl FromStr for ManagedPath {
     }
 }
 
-impl Serialize for ManagedPath {
+impl Serialize for GraphTextPath {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -243,7 +239,7 @@ impl Serialize for ManagedPath {
     }
 }
 
-impl<'de> Deserialize<'de> for ManagedPath {
+impl<'de> Deserialize<'de> for GraphTextPath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -253,14 +249,14 @@ impl<'de> Deserialize<'de> for ManagedPath {
     }
 }
 
-fn is_managed_path(value: &str) -> bool {
+fn is_graph_text_path(value: &str) -> bool {
     if value.is_empty() || value != value.trim() || value.starts_with('/') || value.contains('\\') {
         return false;
     }
     let segments: Vec<_> = value.split('/').collect();
     if segments
         .iter()
-        .any(|part| !managed_component_is_portable(part))
+        .any(|part| !graph_text_component_is_portable(part))
     {
         return false;
     }
@@ -276,7 +272,7 @@ fn is_managed_path(value: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn managed_component_is_portable(component: &str) -> bool {
+pub(crate) fn graph_text_component_is_portable(component: &str) -> bool {
     if component.is_empty()
         || matches!(component, "." | "..")
         || component.ends_with(' ')
@@ -333,7 +329,7 @@ fn is_forbidden_win32_path_character(character: char) -> bool {
 /// roots, never inferred from a basename or a normalized spelling.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ManagedTextKind {
+pub enum GraphTextKind {
     Page,
     Journal,
 }
@@ -625,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_path_accepts_graph_relative_text_formats_and_preserves_spelling() {
+    fn graph_text_path_accepts_graph_relative_text_formats_and_preserves_spelling() {
         for path in [
             "Root.md",
             "Root.MD",
@@ -635,12 +631,12 @@ mod tests {
             "deep/nested/Page.markdown",
             "deep/nested/Page.Org",
         ] {
-            assert_eq!(ManagedPath::parse(path).unwrap().as_str(), path);
+            assert_eq!(GraphTextPath::parse(path).unwrap().as_str(), path);
         }
     }
 
     #[test]
-    fn managed_path_rejects_unsafe_components_extensions_and_empty_stems() {
+    fn graph_text_path_rejects_unsafe_components_extensions_and_empty_stems() {
         for path in [
             "",
             ".md",
@@ -655,31 +651,31 @@ mod tests {
             "nested/root.",
             "nested/CON.md",
         ] {
-            assert!(ManagedPath::parse(path).is_err(), "{path}");
+            assert!(GraphTextPath::parse(path).is_err(), "{path}");
         }
     }
 
-    // A comment in model.rs once claimed ManagedPath "deliberately rejects
+    // A comment in model.rs once claimed GraphTextPath "deliberately rejects
     // hidden graph-text names" — it does not, and that claim was load-bearing
     // for a storage design decision (whether a hidden dotfile could ever be a
     // graph-text file). Architectural facts live in tests, not comments: this
     // one pins the actual behaviour.
     #[test]
-    fn managed_path_accepts_leading_dot_name() {
+    fn graph_text_path_accepts_leading_dot_name() {
         for path in [".tine-favorites.md", "logseq/.hidden.md", ".a.org"] {
             assert!(
-                ManagedPath::parse(path).is_ok(),
+                GraphTextPath::parse(path).is_ok(),
                 "leading-dot names are accepted: {path}"
             );
         }
         // What IS rejected is an EMPTY stem — ".md" has no name before the
         // extension. That is the distinction the old comment blurred.
-        assert!(ManagedPath::parse(".md").is_err());
+        assert!(GraphTextPath::parse(".md").is_err());
     }
 
     #[test]
-    fn managed_path_root_safe_helpers_and_portable_key_v1_are_stable() {
-        let root = ManagedPath::parse("Root.MarkDown").unwrap();
+    fn graph_text_path_root_safe_helpers_and_portable_key_v1_are_stable() {
+        let root = GraphTextPath::parse("Root.MarkDown").unwrap();
         assert_eq!(root.file_name(), "Root.MarkDown");
         assert_eq!(root.parent_relative(), None);
         assert_eq!(
@@ -687,7 +683,7 @@ mod tests {
             ".Root.MarkDown.recovery"
         );
 
-        let nested = ManagedPath::parse("Pages/Cafe\u{301}.MD").unwrap();
+        let nested = GraphTextPath::parse("Pages/Cafe\u{301}.MD").unwrap();
         assert_eq!(nested.file_name(), "Cafe\u{301}.MD");
         assert_eq!(nested.parent_relative(), Some("Pages"));
         assert_eq!(

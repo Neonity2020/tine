@@ -1085,11 +1085,11 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
 fn g_b_choke_helper_caller_counts_are_pinned() {
     let files = production_rust();
     let roots = [
-        "managed_atomic_create_with_proof",
-        "managed_atomic_write_validated",
-        "managed_atomic_replace_bound",
+        "graph_text_atomic_create_with_proof",
+        "graph_text_atomic_write_validated",
+        "graph_text_atomic_replace_bound",
         "rename_projection_noreplace_platform",
-        "rename_managed_noreplace",
+        "rename_graph_text_noreplace",
         "atomic_publish",
         "atomic_write",
         "atomic_write_new",
@@ -1144,11 +1144,11 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         .map(|name| (name, call_count(&files, name)))
         .collect::<Vec<_>>();
     let expected = vec![
-        ("managed_atomic_create_with_proof", 2),
-        ("managed_atomic_write_validated", 2),
-        ("managed_atomic_replace_bound", 2),
+        ("graph_text_atomic_create_with_proof", 2),
+        ("graph_text_atomic_write_validated", 2),
+        ("graph_text_atomic_replace_bound", 2),
         ("rename_projection_noreplace_platform", 1),
-        ("rename_managed_noreplace", 2),
+        ("rename_graph_text_noreplace", 2),
         ("atomic_publish", 2),
         // +4 from `direct_move_recovery.rs` (packet B2): the record, each
         // content-addressed image blob, a quarantined record, and every page a

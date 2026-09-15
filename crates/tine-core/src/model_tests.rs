@@ -158,7 +158,7 @@ fn production_docblock_struct_literals_are_reviewed() {
     expected.sort();
     assert_eq!(
         actual, expected,
-        "I-12: every production DocBlock literal is reviewed; managed DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
+        "I-12: every production DocBlock literal is reviewed; graph DTO mappings must use dto_block_to_doc_block and raw-only leaves must use DocBlock::new"
     );
 }
 
@@ -639,7 +639,7 @@ fn projected_order_rejects_invalid_identity_metadata() {
             "{order:?}"
         );
     }
-    let deepest = vec!["00000000"; MAX_MANAGED_BLOCK_DEPTH].join("/");
+    let deepest = vec!["00000000"; MAX_BLOCK_DEPTH].join("/");
     assert!(doc_runtime_id_for_order("pages/a.md", &deepest).is_ok());
     assert!(doc_runtime_id_for_order("pages/a.md", &format!("{deepest}/00000000")).is_err());
     assert!(doc_runtime_id_for_order("../a.md", "00000000").is_err());
@@ -1162,76 +1162,76 @@ fn regular_file_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>
     out
 }
 
-fn set_managed_content_budget_limit(limit: u64) {
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-        *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+fn set_graph_text_content_budget_limit(limit: u64) {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+        *override_limits.borrow_mut() = Some(GraphTextInventoryLimits {
             retained_content_bytes: limit,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
 }
 
-fn clear_managed_content_budget_limit() {
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+fn clear_graph_text_content_budget_limit() {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         *override_limits.borrow_mut() = None;
     });
 }
 
-fn last_managed_content_budget_peak() -> u64 {
-    MANAGED_TEXT_BUDGET_LAST_PEAK.with(Cell::get)
+fn last_graph_text_content_budget_peak() -> u64 {
+    GRAPH_TEXT_BUDGET_LAST_PEAK.with(Cell::get)
 }
 
 #[test]
-fn publisher_p1_managed_text_classifier_uses_longest_component_root_and_preserves_exact_path() {
-    let dir = scratch("managed-text-classifier-longest-root");
+fn publisher_p1_graph_text_classifier_uses_longest_component_root_and_preserves_exact_path() {
+    let dir = scratch("graph-text-classifier-longest-root");
     let mut graph = Graph::open(&dir);
-    graph.config.pages_dir = "managed/text".to_owned();
-    graph.config.journals_dir = "managed/text/daily".to_owned();
+    graph.config.pages_dir = "graph/text".to_owned();
+    graph.config.journals_dir = "graph/text/daily".to_owned();
 
-    let nested = ManagedPath::parse("managed/text/daily/2026/07/naïve.md").unwrap();
+    let nested = GraphTextPath::parse("graph/text/daily/2026/07/naïve.md").unwrap();
     assert_eq!(
-        graph.classify_managed_text_path(&nested),
-        Ok(ManagedTextKind::Journal)
+        graph.classify_graph_text_path(&nested),
+        Ok(GraphTextKind::Journal)
     );
-    assert_eq!(nested.as_str(), "managed/text/daily/2026/07/naïve.md");
+    assert_eq!(nested.as_str(), "graph/text/daily/2026/07/naïve.md");
     assert_eq!(
-        graph.classify_managed_text_path(
-            &ManagedPath::parse("managed/text/projects/2026/roadmap.md").unwrap()
+        graph.classify_graph_text_path(
+            &GraphTextPath::parse("graph/text/projects/2026/roadmap.md").unwrap()
         ),
-        Ok(ManagedTextKind::Page)
+        Ok(GraphTextKind::Page)
     );
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn publisher_p1_managed_text_classifier_rejects_boundary_misses_outside_paths_and_equal_roots() {
-    let dir = scratch("managed-text-classifier-rejections");
+fn publisher_p1_graph_text_classifier_rejects_boundary_misses_outside_paths_and_equal_roots() {
+    let dir = scratch("graph-text-classifier-rejections");
     let mut graph = Graph::open(&dir);
     graph.config.pages_dir = "pages".to_owned();
     graph.config.journals_dir = "pages-journal".to_owned();
     for path in ["pages-old/file.md", "outside/file.md"] {
         assert!(
             graph
-                .classify_managed_text_path(&ManagedPath::parse(path).unwrap())
+                .classify_graph_text_path(&GraphTextPath::parse(path).unwrap())
                 .is_err(),
             "accepted {path}"
         );
     }
     assert_eq!(
-        graph.classify_managed_text_path(&ManagedPath::parse("pages-journal/a.md").unwrap()),
-        Ok(ManagedTextKind::Journal)
+        graph.classify_graph_text_path(&GraphTextPath::parse("pages-journal/a.md").unwrap()),
+        Ok(GraphTextKind::Journal)
     );
 
     graph.config.journals_dir = "pages".to_owned();
     assert!(graph
-        .classify_managed_text_path(&ManagedPath::parse("pages/a.md").unwrap())
+        .classify_graph_text_path(&GraphTextPath::parse("pages/a.md").unwrap())
         .is_err());
 
     for malformed_pages_root in ["bad*", "COM¹"] {
         graph.config.pages_dir = malformed_pages_root.to_owned();
         graph.config.journals_dir = "journals".to_owned();
         assert!(graph
-            .classify_managed_text_path(&ManagedPath::parse("journals/2026/07/24.md").unwrap())
+            .classify_graph_text_path(&GraphTextPath::parse("journals/2026/07/24.md").unwrap())
             .is_err());
     }
     let _ = fs::remove_dir_all(&dir);
@@ -1338,7 +1338,7 @@ fn assert_editor_save_identity_race(force: bool) {
     } else {
         None
     };
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         let replacement = replacement.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -1433,7 +1433,7 @@ fn assert_post_retirement_foreign_destination(restoration_branch: bool) {
         canonical_projection_file_resource_id(&fs::File::open(&replacement).unwrap()).unwrap();
 
     if restoration_branch {
-        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+        GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -1441,13 +1441,13 @@ fn assert_post_retirement_foreign_destination(restoration_branch: bool) {
                 ))
             }));
         });
-        MANAGED_WRITE_BEFORE_RESTORE.with(|hook| {
+        GRAPH_TEXT_WRITE_BEFORE_RESTORE.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::rename(replacement, path)));
         });
     } else {
-        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+        GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::rename(replacement, path)));
@@ -1750,7 +1750,7 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
         fs::write(directory.join(format!("P{index:02}.md")), "- page\n").unwrap();
     }
     let graph = Graph::open(&dir);
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
+    let permit = graph.admit_retained_graph_text_writer().unwrap();
     GRAPH_TEXT_INVENTORY_ENTRY_VISITS.with(|visits| visits.set(0));
     let entries = graph.graph_text_entries(&permit).unwrap();
     let visits = GRAPH_TEXT_INVENTORY_ENTRY_VISITS.with(Cell::get);
@@ -1762,29 +1762,29 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
     );
 
     for limits in [
-        ManagedTextInventoryLimits {
-            managed_files: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+        GraphTextInventoryLimits {
+            graph_text_files: 1,
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             directory_depth: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             all_entries: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             directories: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             pending_directories: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
-        ManagedTextInventoryLimits {
+        GraphTextInventoryLimits {
             path_bytes: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         },
     ] {
         assert!(graph
@@ -1792,10 +1792,10 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
             .is_err());
     }
     drop(permit);
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-        *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+        *override_limits.borrow_mut() = Some(GraphTextInventoryLimits {
             retained_content_bytes: 1,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
     assert_eq!(
@@ -1805,7 +1805,7 @@ fn graph_wide_inventory_is_bounded_and_visits_entries_linearly() {
             .kind(),
         io::ErrorKind::InvalidData
     );
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         *override_limits.borrow_mut() = None;
     });
     let _ = fs::remove_dir_all(&dir);
@@ -4020,14 +4020,14 @@ fn portable_prefix_branching_limit_fails_before_mutation() {
     let mut page = graph.load_by_path("External/Target.md").unwrap().unwrap();
     page.blocks[0].raw = "must not publish".into();
 
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-        *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+        *override_limits.borrow_mut() = Some(GraphTextInventoryLimits {
             directories: 2,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
     let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         *override_limits.borrow_mut() = None;
     });
 
@@ -4082,8 +4082,8 @@ fn wait_for_page_build_join(graph: &Graph) {
 fn wait_for_identity_mutation_waiter(graph: &Graph) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let gate = &graph
-        .managed_write_binding()
-        .expect("test graph has managed writer binding")
+        .graph_text_write_binding()
+        .expect("test graph has graph writer binding")
         .gate;
     let mut state = gate.identity_mutation.lock().unwrap();
     while state.waiters == 0 {
@@ -4245,7 +4245,7 @@ fn concurrent_direct_creation_proofs_join_one_build_without_graph_censuses() {
 
     let first_graph = Arc::clone(&graph);
     let first = std::thread::spawn(move || {
-        let permit = first_graph.admit_retained_managed_text_writer()?;
+        let permit = first_graph.admit_retained_graph_text_writer()?;
         first_graph.direct_creation_proof(
             &permit,
             &first_graph.root.join("pages/First Proof.md"),
@@ -4256,7 +4256,7 @@ fn concurrent_direct_creation_proofs_join_one_build_without_graph_censuses() {
     pause.reached.wait();
     let second_graph = Arc::clone(&graph);
     let second = std::thread::spawn(move || {
-        let permit = second_graph.admit_retained_managed_text_writer()?;
+        let permit = second_graph.admit_retained_graph_text_writer()?;
         second_graph.direct_creation_proof(
             &permit,
             &second_graph.root.join("pages/Second Proof.md"),
@@ -4395,7 +4395,7 @@ fn late_page_build_claim_after_completed_install_is_non_owner() {
         DirectCreationEvidence::Cold
     ));
     let expected_generation = graph.cache_generation();
-    let permit = graph.admit_retained_managed_text_writer().unwrap();
+    let permit = graph.admit_retained_graph_text_writer().unwrap();
 
     assert_eq!(
         graph.repair_page_cache_once(&permit),
@@ -4572,7 +4572,7 @@ fn install_built_publishes_only_at_its_exact_generation() {
         });
         fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
         let graph = Graph::open(&dir);
-        let permit = graph.admit_retained_managed_text_writer().unwrap();
+        let permit = graph.admit_retained_graph_text_writer().unwrap();
         let expected = graph.cache_generation();
         let built = graph.load_all_pages_with_permit(&permit);
         if drift {
@@ -5342,7 +5342,7 @@ fn windows_ambiguous_callback_cannot_interrupt_inflight_direct_creation() {
 
     let writer_graph = Arc::clone(&graph);
     let writer = std::thread::spawn(move || {
-        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+        GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 paused_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
@@ -8661,7 +8661,7 @@ fn direct_save_failure_codes_are_stable() {
             "precheck.symlink",
             Error::new(
                 ErrorKind::InvalidInput,
-                "managed text entry is a symlink or reparse point: pages/Note.md",
+                "graph text entry is a symlink or reparse point: pages/Note.md",
             ),
         ),
         // `capture_retained_graph_text_identity_with_limits` two-pass equality.
@@ -8669,7 +8669,7 @@ fn direct_save_failure_codes_are_stable() {
             "precheck.interrupted",
             Error::new(
                 ErrorKind::Interrupted,
-                "managed inventory changed during retained identity capture",
+                "graph inventory changed during retained identity capture",
             ),
         ),
         // `validate_current_graph_text_collision_strict`, portable-key arm.
@@ -8870,14 +8870,14 @@ fn direct_save_conflict_sites_produce_their_own_codes() {
 
 /// The same binding for the precheck helpers, which are free functions and so
 /// can be driven directly. `initial_shadow_limit_error` and
-/// `managed_text_inventory_limit_error` are the two the save path calls when a
+/// `graph_text_inventory_limit_error` are the two the save path calls when a
 /// bound is exceeded; both are `precheck.limit`, and neither may become a
 /// conflict.
 #[test]
 fn direct_save_precheck_helpers_produce_their_own_codes() {
     for error in [
         initial_shadow_limit_error("entries"),
-        managed_text_inventory_limit_error("bytes"),
+        graph_text_inventory_limit_error("bytes"),
     ] {
         assert_eq!(direct_save_failure_code(&error), "precheck.limit");
         assert_eq!(direct_save_conflict_epoch(&error), None);
@@ -9564,7 +9564,7 @@ fn external_exact_target_creator_wins_without_byte_change() {
     let graph = Graph::open(&dir);
     graph.warm_cache();
     let target = dir.join("pages/Raced.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let target = target.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(target, b"external winner\n")));
     });
@@ -9588,7 +9588,7 @@ fn external_portable_alias_creator_wins_before_creation_publication() {
     graph.warm_cache();
     let target = dir.join("pages/Raced.md");
     let alias = dir.join("pages/raced.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let alias = alias.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"external winner\n")));
     });
@@ -9611,7 +9611,7 @@ fn external_semantic_owner_creator_wins_before_creation_publication() {
     graph.warm_cache();
     let target = dir.join("pages/Raced Semantic.md");
     let owner = dir.join("pages/External.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let owner = owner.clone();
         let graph = Arc::clone(&graph);
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -9645,7 +9645,7 @@ fn external_portable_symlink_alias_refuses_creation_publication() {
     graph.warm_cache();
     let target = dir.join("pages/Raced.md");
     let alias = dir.join("pages/raced.md");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let alias = alias.clone();
         let outside = outside.clone();
         *hook.borrow_mut() = Some(Box::new(move || std::os::unix::fs::symlink(outside, alias)));
@@ -10485,7 +10485,7 @@ fn graph_text_byte_verification_uses_real_nested_sources_without_mutation() {
 }
 
 /// A cross-directory move syncs BOTH the source and the destination chain
-/// (`managed_move_noreplace_validated`). Each of those is one barrier on
+/// (`graph_text_move_noreplace_validated`). Each of those is one barrier on
 /// the directory whose entry list actually changed — the source loses a
 /// name, the destination gains one — so the depth of either chain is free.
 ///
@@ -10541,7 +10541,7 @@ fn projection_missing_capture_rejects_reparse_intermediate_without_escape() {
     let graph = Graph::open(&dir);
 
     assert!(graph
-        .read_projection_input(&ManagedPath::parse(relative).unwrap())
+        .read_projection_input(&GraphTextPath::parse(relative).unwrap())
         .is_err());
     assert!(graph
         .write_projection_exact(relative, None, b"- target\n")
@@ -10566,9 +10566,9 @@ fn configured_root_helper_stays_inert_while_private_present_decoder_uses_bytes()
     )
     .unwrap();
     let graph = Graph::open(&root);
-    let path = ManagedPath::parse("content/pages/25-07-2026.md").unwrap();
+    let path = GraphTextPath::parse("content/pages/25-07-2026.md").unwrap();
 
-    let configured = graph.managed_entry_for_managed_path(&path).unwrap();
+    let configured = graph.graph_text_entry_for_graph_text_path(&path).unwrap();
     assert_eq!(configured.kind, PageKind::Journal);
     assert_eq!(configured.name, "2026-07-25");
     assert!(configured.date_key.is_some());
@@ -10588,8 +10588,8 @@ fn configured_root_helper_stays_inert_while_private_present_decoder_uses_bytes()
 }
 
 #[test]
-fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
-    let root = scratch("managed-entry-nonstandard-layout");
+fn graph_text_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
+    let root = scratch("graph-entry-nonstandard-layout");
     fs::create_dir_all(root.join("logseq")).unwrap();
     fs::write(
         root.join("logseq/config.edn"),
@@ -10602,8 +10602,8 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     // OG walks the whole graph directory and derives the page title from the
     // last path component only, so a nested page outside the configured
     // roots keeps its exact nested spelling and its file-name title.
-    let nested = ManagedPath::parse("archive/2024/client notes/Ünicode Page.md").unwrap();
-    let entry = graph.managed_entry_for_managed_path(&nested).unwrap();
+    let nested = GraphTextPath::parse("archive/2024/client notes/Ünicode Page.md").unwrap();
+    let entry = graph.graph_text_entry_for_graph_text_path(&nested).unwrap();
     assert_eq!(entry.kind, PageKind::Page);
     assert_eq!(entry.name, "Ünicode Page");
     assert_eq!(entry.date_key, None);
@@ -10615,16 +10615,18 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
 
     // OG decides journal-ness by parsing that title as a date, never by the
     // containing directory.
-    let journal = ManagedPath::parse("archive/2024/25-07-2026.org").unwrap();
-    let entry = graph.managed_entry_for_managed_path(&journal).unwrap();
+    let journal = GraphTextPath::parse("archive/2024/25-07-2026.org").unwrap();
+    let entry = graph
+        .graph_text_entry_for_graph_text_path(&journal)
+        .unwrap();
     assert_eq!(entry.kind, PageKind::Journal);
     assert_eq!(entry.name, "2026-07-25");
     assert!(entry.date_key.is_some());
     assert_eq!(entry.rel_path, "archive/2024/25-07-2026.org");
 
     // A graph-root file is equally ordinary graph text for OG.
-    let top = ManagedPath::parse("Top Level.md").unwrap();
-    let entry = graph.managed_entry_for_managed_path(&top).unwrap();
+    let top = GraphTextPath::parse("Top Level.md").unwrap();
+    let entry = graph.graph_text_entry_for_graph_text_path(&top).unwrap();
     assert_eq!(entry.kind, PageKind::Page);
     assert_eq!(entry.name, "Top Level");
 
@@ -10638,8 +10640,8 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
         ("archive/Upper Markdown.MARKDOWN", "Upper Markdown"),
         ("archive/Upper Org.ORG", "Upper Org"),
     ] {
-        let path = ManagedPath::parse(relative).unwrap();
-        let entry = graph.managed_entry_for_managed_path(&path).unwrap();
+        let path = GraphTextPath::parse(relative).unwrap();
+        let entry = graph.graph_text_entry_for_graph_text_path(&path).unwrap();
         assert_eq!(entry.kind, PageKind::Page, "{relative}");
         assert_eq!(entry.name, expected_name, "{relative}");
         assert_eq!(entry.rel_path, relative, "{relative}");
@@ -10661,13 +10663,13 @@ fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
     ] {
         assert!(
             graph
-                .managed_entry_for_managed_path(&ManagedPath::parse(refused).unwrap())
+                .graph_text_entry_for_graph_text_path(&GraphTextPath::parse(refused).unwrap())
                 .is_err(),
             "accepted {refused}"
         );
     }
     for invalid in ["archive/note.txt", "archive/../escape.md"] {
-        assert!(ManagedPath::parse(invalid).is_err(), "accepted {invalid}");
+        assert!(GraphTextPath::parse(invalid).is_err(), "accepted {invalid}");
     }
 
     let _ = fs::remove_dir_all(&root);
@@ -10680,7 +10682,7 @@ fn graph_text_exact_path_authority_preserves_root_nested_and_markdown_spelling()
     let root_target = graph.graph_text_exact_path("Root.MarkDown", true).unwrap();
     assert!(root_target.parent_components.is_empty());
     assert_eq!(
-        root_target.managed_path.as_ref().unwrap().as_str(),
+        root_target.graph_text_path.as_ref().unwrap().as_str(),
         "Root.MarkDown"
     );
     assert_eq!(root_target.filename, "Root.MarkDown");
@@ -10703,7 +10705,7 @@ fn graph_text_exact_path_authority_preserves_root_nested_and_markdown_spelling()
         .unwrap();
     assert_eq!(nested.parent_components, ["archive", "client"]);
     assert_eq!(
-        nested.managed_path.as_ref().unwrap().as_str(),
+        nested.graph_text_path.as_ref().unwrap().as_str(),
         "archive/client/Plan.Markdown"
     );
     assert_eq!(nested.filename, "Plan.Markdown");
@@ -10889,7 +10891,7 @@ fn admission_persistent_avl_ordered_keys_stay_logarithmic_and_share_large_values
 fn admission_semantic_accounting_admits_large_ordinary_text_and_rejects_overlong_title() {
     let root = scratch("admission-realistic-semantic-accounting");
     let graph = Graph::open(&root);
-    let path = ManagedPath::parse("Ordinary.md").unwrap();
+    let path = GraphTextPath::parse("Ordinary.md").unwrap();
     let observed =
         graph_text_observed_semantic_name_upper_bound(&graph, &path, "- ordinary body\n")
             .unwrap()
@@ -11010,10 +11012,10 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
         hard link that shared storage refuses; imitate move_graph_text_exact_no_replace";
     let source = include_str!("model.rs");
     let create = source
-        .split_once("    fn managed_atomic_create_with_proof(")
+        .split_once("    fn graph_text_atomic_create_with_proof(")
         .expect("Direct Files create path")
         .1
-        .split_once("\n    fn managed_atomic_write_with_conflict(")
+        .split_once("\n    fn graph_text_atomic_write_with_conflict(")
         .expect("next Direct Files write function")
         .0;
     assert!(
@@ -11026,13 +11028,13 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     assert!(!create.contains(".move_exact_no_replace("), "{RULE}");
 
     let write = source
-        .split_once("    fn managed_atomic_write_validated(")
+        .split_once("    fn graph_text_atomic_write_validated(")
         .expect("Direct Files validated write path")
         .1
         .split_once("\n    /// Replace an existing editor target")
         .expect("Direct Files bounded replacement")
         .0;
-    assert!(write.contains("self.managed_atomic_replace_bound("));
+    assert!(write.contains("self.graph_text_atomic_replace_bound("));
     assert!(
         write.contains(
             "move_graph_text_exact_no_replace(target.parent(), &temp, &target.filename, bytes)"
@@ -11044,10 +11046,10 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     assert!(!write.contains("target.parent().rename("), "{RULE}");
 
     let replace = source
-        .split_once("    fn managed_atomic_replace_bound(")
+        .split_once("    fn graph_text_atomic_replace_bound(")
         .expect("Direct Files bounded replacement")
         .1
-        .split_once("\n    fn managed_move_noreplace(")
+        .split_once("\n    fn graph_text_move_noreplace(")
         .expect("next projection method")
         .0;
     // The retire/publish closure, the recovery set-aside, and the restore.
@@ -11498,7 +11500,7 @@ fn checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound() {
     struct LimitsReset;
     impl Drop for LimitsReset {
         fn drop(&mut self) {
-            MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
+            GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
                 *limits.borrow_mut() = None;
             });
         }
@@ -11506,10 +11508,10 @@ fn checked_open_fails_closed_when_the_recovery_name_walk_exceeds_its_bound() {
 
     let dir = scratch("editor-recovery-walk-bound");
     let _reset = LimitsReset;
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
-        *limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|limits| {
+        *limits.borrow_mut() = Some(GraphTextInventoryLimits {
             all_entries: 0,
-            ..MANAGED_TEXT_INVENTORY_LIMITS
+            ..GRAPH_TEXT_INVENTORY_LIMITS
         });
     });
 
@@ -11751,23 +11753,23 @@ fn published_queries_output_never_becomes_pages() {
 
 #[cfg(unix)]
 #[test]
-fn checked_open_rejects_managed_output_symlink_escapes() {
+fn checked_open_rejects_output_symlink_escapes() {
     use std::os::unix::fs::symlink;
-    for managed in ["assets", "logseq", "publish"] {
-        let dir = scratch(&format!("checked-open-{managed}-symlink"));
+    for output in ["assets", "logseq", "publish"] {
+        let dir = scratch(&format!("checked-open-{output}-symlink"));
         let outside = std::env::temp_dir().join(format!(
-            "tine-checked-open-{managed}-outside-{}",
+            "tine-checked-open-{output}-outside-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&outside).unwrap();
-        let managed_path = dir.join(managed);
-        let _ = fs::remove_dir_all(&managed_path);
-        symlink(&outside, &managed_path).unwrap();
+        let output_path = dir.join(output);
+        let _ = fs::remove_dir_all(&output_path);
+        symlink(&outside, &output_path).unwrap();
 
         assert!(
             Graph::open_checked(&dir).is_err(),
-            "accepted escaped {managed} directory"
+            "accepted escaped {output} directory"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -11870,9 +11872,9 @@ fn checked_open_accepts_an_approved_windows_assets_junction() {
 
 #[cfg(unix)]
 #[test]
-fn checked_open_rejects_managed_directories_aliased_inside_graph() {
+fn checked_open_rejects_graph_text_directories_aliased_inside_graph() {
     use std::os::unix::fs::symlink;
-    let dir = scratch("checked-open-managed-alias");
+    let dir = scratch("checked-open-graph-alias");
     symlink(dir.join("assets"), dir.join("publish")).unwrap();
     assert!(Graph::open_checked(&dir).is_err());
     let _ = fs::remove_dir_all(&dir);
@@ -12342,15 +12344,15 @@ fn rename_refuses_target_that_exists_in_other_format() {
 }
 
 #[test]
-fn managed_text_twin_refusal_includes_markdown_extension_variant() {
-    let dir = scratch("managed-markdown-twin");
+fn graph_text_twin_refusal_includes_markdown_extension_variant() {
+    let dir = scratch("graph-markdown-twin");
     fs::write(dir.join("pages/Twin.md"), "- md body\n").unwrap();
     fs::write(dir.join("pages/Twin.markdown"), "- markdown body\n").unwrap();
     let graph = Graph::open(&dir);
-    let write = graph.admit_managed_text_writer().unwrap();
+    let write = graph.admit_graph_text_writer().unwrap();
 
     assert!(graph
-        .managed_has_twin(&write, "Twin", PageKind::Page)
+        .graph_text_has_twin(&write, "Twin", PageKind::Page)
         .unwrap());
 
     let _ = fs::remove_dir_all(&dir);
@@ -12624,7 +12626,7 @@ fn root_replacement_after_admission_writes_retained_resource() {
     let moved = dir.with_file_name("tine-admission-root-race-moved");
     let _ = fs::remove_dir_all(&moved);
     let graph = Graph::open(&dir);
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
+    GRAPH_TEXT_WRITE_AFTER_ADMISSION.with(|hook| {
         let dir = dir.clone();
         let moved = moved.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -12660,7 +12662,7 @@ fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() 
     let writer = std::thread::spawn({
         let graph = Arc::clone(&graph);
         move || {
-            MANAGED_WRITE_AFTER_IDENTITY_CHECK.with(|hook| {
+            GRAPH_TEXT_WRITE_AFTER_IDENTITY_CHECK.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || admitted_tx.send(()).unwrap()));
             });
             graph.create_markdown_page_if_absent("page lock retained", "- retained\n")
@@ -12685,9 +12687,9 @@ fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() 
 
 #[test]
 fn retained_content_budget_failed_reservation_is_atomic_and_retryable() {
-    let budget = RetainedContentBudget::new(ManagedTextInventoryLimits {
+    let budget = RetainedContentBudget::new(GraphTextInventoryLimits {
         retained_content_bytes: 10,
-        ..MANAGED_TEXT_INVENTORY_LIMITS
+        ..GRAPH_TEXT_INVENTORY_LIMITS
     });
     let first = budget.reserve(6, "first").unwrap();
     assert_eq!(budget.retained(), 6);
@@ -12713,9 +12715,9 @@ fn budgeted_reader_retains_metadata_capacity_across_repeated_shrink_races() {
     let root = scratch("budgeted-reader-shrink-capacity");
     let path = root.join("pages/shrinking.md");
     let graph = Graph::open(&root);
-    let budget = RetainedContentBudget::new(ManagedTextInventoryLimits {
+    let budget = RetainedContentBudget::new(GraphTextInventoryLimits {
         retained_content_bytes: 64,
-        ..MANAGED_TEXT_INVENTORY_LIMITS
+        ..GRAPH_TEXT_INVENTORY_LIMITS
     });
     for _ in 0..3 {
         fs::write(&path, vec![b'x'; 64]).unwrap();
@@ -12766,15 +12768,15 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
     Graph::open(&probe)
         .rename_page("Project", "Archive")
         .unwrap();
-    let peak = last_managed_content_budget_peak();
+    let peak = last_graph_text_content_budget_peak();
 
     let accepted = scratch("budget-rename-b");
     populate(&accepted);
-    set_managed_content_budget_limit(peak);
+    set_graph_text_content_budget_limit(peak);
     Graph::open(&accepted)
         .rename_page("Project", "Archive")
         .unwrap();
-    clear_managed_content_budget_limit();
+    clear_graph_text_content_budget_limit();
     assert!(accepted.join("pages/Archive.md").exists());
     assert!(fs::read_to_string(accepted.join("pages/Refs.md"))
         .unwrap()
@@ -12782,7 +12784,7 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
 
     let rejected = scratch("budget-rename-c");
     populate(&rejected);
-    set_managed_content_budget_limit(peak - 1);
+    set_graph_text_content_budget_limit(peak - 1);
     let graph = Graph::open(&rejected);
     let error = graph.rename_page("Project", "Archive").unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -12794,9 +12796,9 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
     assert!(graph.cache.read().unwrap().is_none());
     assert!(graph.recent_writes.lock().unwrap().is_empty());
 
-    set_managed_content_budget_limit(peak);
+    set_graph_text_content_budget_limit(peak);
     graph.rename_page("Project", "Archive").unwrap();
-    clear_managed_content_budget_limit();
+    clear_graph_text_content_budget_limit();
     assert!(rejected.join("pages/Archive.md").exists());
     assert!(fs::read_to_string(rejected.join("pages/Refs.md"))
         .unwrap()
@@ -12827,21 +12829,21 @@ fn namespace_rename_many_small_entries_charges_container_state_before_mutation()
     Graph::open(&small)
         .rename_page("Project", "Archive")
         .unwrap();
-    let small_peak = last_managed_content_budget_peak();
+    let small_peak = last_graph_text_content_budget_peak();
 
     let many = scratch("rename-container-many-a");
     populate(&many, 32);
     Graph::open(&many)
         .rename_page("Project", "Archive")
         .unwrap();
-    let many_peak = last_managed_content_budget_peak();
+    let many_peak = last_graph_text_content_budget_peak();
     assert!(many_peak > small_peak);
 
     let rejected = scratch("rename-container-many-b");
     populate(&rejected, 32);
     let before = regular_file_tree(&rejected.join("pages"));
     let graph = Graph::open(&rejected);
-    set_managed_content_budget_limit(many_peak - 1);
+    set_graph_text_content_budget_limit(many_peak - 1);
     assert_eq!(
         graph.rename_page("Project", "Archive").unwrap_err().kind(),
         io::ErrorKind::InvalidData
@@ -12849,9 +12851,9 @@ fn namespace_rename_many_small_entries_charges_container_state_before_mutation()
     assert_eq!(regular_file_tree(&rejected.join("pages")), before);
     assert!(!rejected.join("pages/Archive.md").exists());
     assert!(graph.recent_writes.lock().unwrap().is_empty());
-    set_managed_content_budget_limit(many_peak);
+    set_graph_text_content_budget_limit(many_peak);
     graph.rename_page("Project", "Archive").unwrap();
-    clear_managed_content_budget_limit();
+    clear_graph_text_content_budget_limit();
     assert!(rejected.join("pages/Archive.md").exists());
     assert!(rejected.join("pages/Archive%2FTiny031.md").exists());
 
@@ -12912,14 +12914,14 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     let target_doc = nested_document(1, Some("- target"));
     let deepest_reference = format!("- [[Deep target]] and (({TARGET_ID}))");
 
-    let accepted = nested_document(MAX_MANAGED_BLOCK_DEPTH, Some(&deepest_reference));
+    let accepted = nested_document(MAX_BLOCK_DEPTH, Some(&deepest_reference));
     let accepted_dto = page_dto_checked(&entry, &accepted).unwrap();
     let mut accepted_walk = BlockDtoWalk::new(&accepted_dto.blocks);
     let mut accepted_count = 0_usize;
     while accepted_walk.next().unwrap().is_some() {
         accepted_count += 1;
     }
-    assert_eq!(accepted_count, MAX_MANAGED_BLOCK_DEPTH);
+    assert_eq!(accepted_count, MAX_BLOCK_DEPTH);
 
     let accepted_block = block_to_dto(&accepted.roots[0]).unwrap();
     let mut accepted_block_walk = BlockDtoWalk::new(std::slice::from_ref(&accepted_block));
@@ -12927,7 +12929,7 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     while accepted_block_walk.next().unwrap().is_some() {
         accepted_block_count += 1;
     }
-    assert_eq!(accepted_block_count, MAX_MANAGED_BLOCK_DEPTH);
+    assert_eq!(accepted_block_count, MAX_BLOCK_DEPTH);
 
     let accepted_snapshot = Graph::from_page_snapshot(
         &dir,
@@ -12956,10 +12958,10 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
         Some(Arc::new(vec![(entry.clone(), Arc::new(accepted))]));
     assert_eq!(
         accepted_graph.referenced_page_names().len(),
-        MAX_MANAGED_BLOCK_DEPTH,
+        MAX_BLOCK_DEPTH,
     );
 
-    let rejected = nested_document(MAX_MANAGED_BLOCK_DEPTH + 1, Some(&deepest_reference));
+    let rejected = nested_document(MAX_BLOCK_DEPTH + 1, Some(&deepest_reference));
     assert_eq!(
         page_dto_checked(&entry, &rejected).unwrap_err().kind(),
         io::ErrorKind::InvalidData,
@@ -13008,7 +13010,7 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     while accepted_markdown_walk.next().unwrap().is_some() {
         accepted_markdown_count += 1;
     }
-    assert_eq!(accepted_markdown_count, MAX_MANAGED_BLOCK_DEPTH);
+    assert_eq!(accepted_markdown_count, MAX_BLOCK_DEPTH);
     assert_eq!(
         markdown_page_dto("Depth 129", "Depth 129", &nested_markdown(129))
             .unwrap_err()
@@ -13371,7 +13373,7 @@ fn durable_draft_absence_apply_never_clobbers_a_late_creator() {
     fs::remove_file(&path).unwrap();
     let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
     let raced = path.clone();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || fs::write(&raced, "- external winner\n")));
     });
     let result = graph.resolve_durable_live_save_conflict(
@@ -13380,7 +13382,7 @@ fn durable_draft_absence_apply_never_clobbers_a_late_creator() {
         &std::collections::HashMap::new(),
         "mine",
     );
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
     assert!(result.is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
     assert_eq!(page.blocks[0].raw, "retained draft");
@@ -13397,7 +13399,7 @@ fn durable_draft_present_apply_checks_bytes_at_bound_publication() {
     page.blocks[0].raw = "retained draft".into();
     let diff = graph.durable_live_save_conflict_diff(&page, None).unwrap();
     let raced = path.clone();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || fs::write(&raced, "- external winner\n")));
     });
     let result = graph.resolve_durable_live_save_conflict(
@@ -13406,7 +13408,7 @@ fn durable_draft_present_apply_checks_bytes_at_bound_publication() {
         &std::collections::HashMap::new(),
         "mine",
     );
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
     assert!(result.is_err(), "a later write must refuse the stale merge");
     assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
     let _ = fs::remove_dir_all(root);
@@ -13424,7 +13426,7 @@ fn durable_draft_present_apply_refuses_a_late_same_bytes_new_identity() {
     let raced = path.clone();
     let replacement = root.join("external-replacement.tmp");
     fs::write(&replacement, "- original\n").unwrap();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
             fs::remove_file(&raced)?;
             fs::rename(&replacement, &raced)
@@ -13436,7 +13438,7 @@ fn durable_draft_present_apply_refuses_a_late_same_bytes_new_identity() {
         &std::collections::HashMap::new(),
         "mine",
     );
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
     assert!(
         result.is_err(),
         "same bytes must not substitute a different physical file"
@@ -13489,7 +13491,7 @@ fn gh254_force_binds_the_shown_bytes_not_only_the_revision_or_path() {
     let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
     // Preserve the inode while changing its bytes. Revision-only force used
     // to overwrite this unseen second winner.
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
             fs::write(path, "- unseen second winner\n")
@@ -14330,7 +14332,7 @@ fn gh254_s2_initial_absence_mints_absent() {
 #[test]
 fn gh254_s3_retired_snapshot_reads_bytes_and_identity_together() {
     let (root, path, graph, page) = gh254_loaded("s3");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s3 winner\n")));
     });
@@ -14348,7 +14350,7 @@ fn gh254_s4_pre_retirement_identity_change_observes_live_winner() {
     let (root, path, graph, page) = gh254_loaded("s4");
     let replacement = path.with_file_name(".s4-winner");
     fs::write(&replacement, "- s4 winner\n").unwrap();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || gh254_replace(&path, &replacement)));
     });
@@ -14370,7 +14372,7 @@ fn the_editor_displacement_hook_observes_the_unpublished_displaced_state() {
     let observed: std::sync::Arc<std::sync::Mutex<Option<(bool, Vec<(String, Vec<u8>)>)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let recorder = std::sync::Arc::clone(&observed);
-    MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+    GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
         let path = path.clone();
         let parent = parent.clone();
         *hook.borrow_mut() = Some(Box::new(move || {
@@ -14418,7 +14420,7 @@ fn the_editor_displacement_hook_observes_the_unpublished_displaced_state() {
 #[test]
 fn gh254_s5_retired_mismatch_mints_only_after_restore() {
     let (root, path, graph, page) = gh254_loaded("s5");
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s5 winner\n")));
     });
@@ -14439,12 +14441,12 @@ fn gh254_s6_publication_collision_observes_after_restore_outcome() {
         } else {
             "s6-live"
         });
-        MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+        GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s6 transient\n")));
         });
         if restore_succeeds {
-            MANAGED_WRITE_BEFORE_RESTORE.with(|hook| {
+            GRAPH_TEXT_WRITE_BEFORE_RESTORE.with(|hook| {
                 let path = path.clone();
                 *hook.borrow_mut() = Some(Box::new(move || fs::remove_file(path)));
             });
@@ -14510,7 +14512,7 @@ fn gh254_s7_absent_creation_losing_noreplace_race_mints_present() {
     let handle = graph.activate_absent_editor("New", PageKind::Page).unwrap();
     assert!(handle.prospective, "no file exists for New yet");
     page.activation = Some(handle.activation.as_u64());
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s7 winner\n")));
     });
@@ -14582,7 +14584,7 @@ fn gh254_tokenless_observation_failure_is_retryable_but_not_banner_class() {
     let (root, path, graph, page) = gh254_loaded("tokenless");
     let replacement = path.with_file_name(".tokenless-winner");
     fs::write(&replacement, "- winner\n").unwrap();
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
         let path = path.clone();
         *hook.borrow_mut() = Some(Box::new(move || gh254_replace(&path, &replacement)));
     });

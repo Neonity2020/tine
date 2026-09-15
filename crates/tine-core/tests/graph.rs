@@ -27,10 +27,10 @@ fn demo_graph() -> Graph {
 }
 
 #[test]
-#[ignore = "manual Wave 3 gate: aggregate managed-inventory kinds on the anonymized corpus"]
+#[ignore = "manual Wave 3 gate: aggregate graph-inventory kinds on the anonymized corpus"]
 fn managed_inventory_kind_census() {
-    let root = std::env::var("TINE_MANAGED_INVENTORY_CENSUS_GRAPH")
-        .expect("TINE_MANAGED_INVENTORY_CENSUS_GRAPH must name the corpus");
+    let root = std::env::var("TINE_GRAPH_TEXT_INVENTORY_CENSUS_GRAPH")
+        .expect("TINE_GRAPH_TEXT_INVENTORY_CENSUS_GRAPH must name the corpus");
     let inventory = Graph::open(root).list_pages();
     let pages = inventory
         .iter()

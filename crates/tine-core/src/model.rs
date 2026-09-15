@@ -10,8 +10,8 @@ use crate::config::{Config, FileNameFormat};
 use crate::date::{JournalDate, JournalFormat};
 use crate::doc::{self, DocBlock, Document, StructuralLayoutIdentity};
 use crate::graph_text_path::{
-    managed_component_is_portable, BlobDescription, CanonicalGraphResourceId, ManagedPath,
-    ManagedTextKind, PortablePathKey, UnsafeGraphTextPath,
+    graph_text_component_is_portable, BlobDescription, CanonicalGraphResourceId, GraphTextKind,
+    GraphTextPath, PortablePathKey, UnsafeGraphTextPath,
 };
 use crate::graph_text_scope::{GraphTextScope, GraphTextScopeBinding};
 use cap_std::ambient_authority;
@@ -302,7 +302,7 @@ fn projection_platform_error(operation: &str, location: &str, error: io::Error) 
 /// spelling, not an instruction to synthesize an `.md` or `.org` neighbor.
 #[derive(Clone, Debug)]
 struct GraphTextExactPath {
-    managed_path: Option<ManagedPath>,
+    graph_text_path: Option<GraphTextPath>,
     parent_components: Vec<String>,
     filename: String,
 }
@@ -822,7 +822,7 @@ impl PdfHighlightSidecarCommit {
 ///
 /// Every writer of one retained resource shares this gate, so graph-text
 /// identity transitions are totally ordered across all of them.
-struct ManagedTextWriteGate {
+struct GraphTextWriteGate {
     /// Resource-wide serialization for graph-text identity validation, the
     /// corresponding filesystem transition, and retained-index publication.
     ///
@@ -847,10 +847,10 @@ struct GraphTextIdentityMutationState {
 }
 
 struct GraphTextIdentityMutationGuard<'a> {
-    gate: &'a ManagedTextWriteGate,
+    gate: &'a GraphTextWriteGate,
 }
 
-impl ManagedTextWriteGate {
+impl GraphTextWriteGate {
     fn new() -> Self {
         Self {
             identity_mutation: std::sync::Mutex::new(GraphTextIdentityMutationState::default()),
@@ -938,23 +938,23 @@ impl Drop for GraphTextIdentityMutationGuard<'_> {
 
 /// Process-local weak registry of independent writer gates. A live graph keeps
 /// its gate alive; dead resources are pruned on the next open.
-static MANAGED_TEXT_WRITE_GATE_REGISTRY: std::sync::OnceLock<
+static GRAPH_TEXT_WRITE_GATE_REGISTRY: std::sync::OnceLock<
     std::sync::Mutex<
-        std::collections::HashMap<CanonicalGraphResourceId, std::sync::Weak<ManagedTextWriteGate>>,
+        std::collections::HashMap<CanonicalGraphResourceId, std::sync::Weak<GraphTextWriteGate>>,
     >,
 > = std::sync::OnceLock::new();
 
-struct ManagedTextWriteBinding {
+struct GraphTextWriteBinding {
     resource_id: CanonicalGraphResourceId,
-    gate: Arc<ManagedTextWriteGate>,
+    gate: Arc<GraphTextWriteGate>,
     root: Dir,
 }
 
-fn managed_text_write_binding_for_resource(
+fn graph_text_write_binding_for_resource(
     root: &Path,
     projection_root: Option<&Dir>,
-) -> io::Result<ManagedTextWriteBinding> {
-    managed_write_identity_acquisition_hook()?;
+) -> io::Result<GraphTextWriteBinding> {
+    graph_text_write_identity_acquisition_hook()?;
     let retained_root = match projection_root {
         Some(projection_root) => projection_root.try_clone()?,
         None => {
@@ -964,52 +964,52 @@ fn managed_text_write_binding_for_resource(
     };
     let resource_id = canonical_graph_resource_id(&retained_root)?;
 
-    let registry = MANAGED_TEXT_WRITE_GATE_REGISTRY
+    let registry = GRAPH_TEXT_WRITE_GATE_REGISTRY
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut registry = registry.lock().unwrap();
     registry.retain(|_, gate| gate.upgrade().is_some());
     if let Some(gate) = registry.get(&resource_id).and_then(|gate| gate.upgrade()) {
-        return Ok(ManagedTextWriteBinding {
+        return Ok(GraphTextWriteBinding {
             resource_id,
             gate,
             root: retained_root,
         });
     }
 
-    let gate = Arc::new(ManagedTextWriteGate::new());
+    let gate = Arc::new(GraphTextWriteGate::new());
     registry.insert(resource_id, Arc::downgrade(&gate));
-    Ok(ManagedTextWriteBinding {
+    Ok(GraphTextWriteBinding {
         resource_id,
         gate,
         root: retained_root,
     })
 }
 
-fn managed_write_identity_mismatch_error() -> io::Error {
+fn graph_text_write_identity_mismatch_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        "ambient graph root no longer names the retained managed text resource",
+        "ambient graph root no longer names the retained graph text resource",
     )
 }
 
 /// An admitted graph-text writer: the retained root capability every write
 /// resolves its paths under, bound to the resource identity it was admitted
 /// against.
-struct ManagedTextWritePermit {
+struct GraphTextWritePermit {
     root: Dir,
     resource_id: CanonicalGraphResourceId,
 }
 
-struct ManagedTextTarget {
+struct GraphTextTarget {
     chain: Vec<Dir>,
     filename: String,
 }
 
-impl ManagedTextTarget {
+impl GraphTextTarget {
     fn parent(&self) -> &Dir {
         self.chain
             .last()
-            .expect("managed text target retains its parent chain")
+            .expect("graph text target retains its parent chain")
     }
 }
 
@@ -1474,7 +1474,7 @@ pub struct Graph {
     /// Graph-relative live names whose editor-publication claimants could not
     /// be reconciled during the checked-open walk. Journal replay must never
     /// interpret one of these absences as an external deletion (I2c).
-    interrupted_publication_claimants: RwLock<std::collections::BTreeSet<ManagedPath>>,
+    interrupted_publication_claimants: RwLock<std::collections::BTreeSet<GraphTextPath>>,
     /// The canonical filesystem capability used for every asset operation. For
     /// ordinary graphs this is `<root>/assets`; when the runtime has explicitly
     /// approved an external assets symlink/junction it is that exact resolved
@@ -1654,7 +1654,7 @@ pub struct Graph {
     /// Resource-scoped shared admission boundary for all managed page/journal
     /// writers. Identity acquisition failure is retained as an error so an open
     /// can never fall back to an unshared gate.
-    managed_write_binding: io::Result<ManagedTextWriteBinding>,
+    graph_text_write_binding: io::Result<GraphTextWriteBinding>,
     /// Per-UI-lane cancellation epochs for whole-graph text searches. Starting a
     /// newer search makes its superseded prefix stop promptly.
     search_lanes: std::sync::Mutex<
@@ -1668,7 +1668,7 @@ pub struct Graph {
 #[derive(Debug, Default)]
 pub struct RecoverySummary {
     reconciled: usize,
-    claimants: std::collections::BTreeSet<ManagedPath>,
+    claimants: std::collections::BTreeSet<GraphTextPath>,
 }
 
 impl RecoverySummary {
@@ -1685,7 +1685,7 @@ impl RecoverySummary {
                 "editor recovery claimant target is not UTF-8",
             )
         })?;
-        let managed = ManagedPath::parse(relative).map_err(|error| {
+        let managed = GraphTextPath::parse(relative).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("editor recovery claimant target is not portable: {error}"),
@@ -2184,14 +2184,15 @@ struct CompleteGraphTextAdmissionIndex {
     scope_binding: GraphTextScopeBinding,
     graph_resource: CanonicalGraphResourceId,
     generation: u64,
-    files_by_exact_path: PersistentMap<ManagedPath, GraphTextAdmissionRecord>,
-    paths_by_portable_key: PersistentMap<PortablePathKey, std::collections::BTreeSet<ManagedPath>>,
+    files_by_exact_path: PersistentMap<GraphTextPath, GraphTextAdmissionRecord>,
+    paths_by_portable_key:
+        PersistentMap<PortablePathKey, std::collections::BTreeSet<GraphTextPath>>,
     paths_by_file_resource: PersistentMap<ContentDigest, std::collections::BTreeSet<String>>,
     file_resource_by_exact_relative: PersistentMap<String, ContentDigest>,
     file_link_count_by_exact_relative: PersistentMap<String, u64>,
     file_is_graph_text_by_exact_relative: PersistentMap<String, bool>,
-    paths_by_semantic_key: PersistentMap<(u8, String), std::collections::BTreeSet<ManagedPath>>,
-    tombstones_by_exact_path: PersistentMap<ManagedPath, GraphTextAdmissionTombstone>,
+    paths_by_semantic_key: PersistentMap<(u8, String), std::collections::BTreeSet<GraphTextPath>>,
+    tombstones_by_exact_path: PersistentMap<GraphTextPath, GraphTextAdmissionTombstone>,
     directories_by_exact_relative: PersistentMap<String, ContentDigest>,
     permanent_bytes: u64,
     permanent_limit: u64,
@@ -2204,7 +2205,7 @@ struct PreparedGraphTextAdmissionUpsert {
     file_resource_id: ContentDigest,
     link_count: u64,
     retained_growth: u64,
-    eligible: Option<(ManagedPath, GraphTextAdmissionRecord)>,
+    eligible: Option<(GraphTextPath, GraphTextAdmissionRecord)>,
 }
 
 struct PreparedGraphTextAdmissionRemove {
@@ -2356,7 +2357,7 @@ impl EffectiveIdentityIndex {
 /// only exact names and fingerprints; graph bytes are streamed through one
 /// fixed buffer and are never retained here.
 struct DirectCreationProof {
-    target: ManagedPath,
+    target: GraphTextPath,
     generation: u64,
 }
 
@@ -2534,7 +2535,7 @@ fn document_block_ref_counts(
     doc: &Document,
 ) -> io::Result<std::collections::HashMap<String, usize>> {
     let mut counts = std::collections::HashMap::new();
-    let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
+    let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_BLOCK_DEPTH] =
         std::array::from_fn(|_| None);
     let mut len = usize::from(!doc.roots.is_empty());
     if len != 0 {
@@ -2556,7 +2557,7 @@ fn document_block_ref_counts(
             *count = count.checked_add(1).ok_or_else(allocation_overflow)?;
         }
         if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
+            if len == MAX_BLOCK_DEPTH {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "cached document nesting exceeds 128 levels",
@@ -2858,7 +2859,7 @@ impl FindEntryIndex {
 /// directories, but an absolute path, traversal component, or symlinked existing
 /// ancestor outside the graph would turn ordinary save/delete/restore operations
 /// into writes against unrelated files.
-fn validate_managed_dir(root: &Path, raw: &str, label: &str) -> io::Result<()> {
+fn validate_graph_text_dir(root: &Path, raw: &str, label: &str) -> io::Result<()> {
     if raw.is_empty() || raw.contains('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2877,7 +2878,7 @@ fn validate_managed_dir(root: &Path, raw: &str, label: &str) -> io::Result<()> {
         ));
     }
     let candidate = root.join(rel);
-    if !path_stays_within_root(root, &candidate) || path_uses_managed_alias(root, &candidate) {
+    if !path_stays_within_root(root, &candidate) || path_uses_graph_text_alias(root, &candidate) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{label} directory escapes graph root: {raw:?}"),
@@ -2909,7 +2910,7 @@ fn path_stays_within_root(root: &Path, target: &Path) -> bool {
 /// `publish -> assets` passes a plain containment check but redirects generated
 /// output onto user assets. Compare the deepest existing ancestor with its
 /// expected canonical lexical location to reject any such alias.
-fn path_uses_managed_alias(root: &Path, target: &Path) -> bool {
+fn path_uses_graph_text_alias(root: &Path, target: &Path) -> bool {
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut existing = target;
     while fs::symlink_metadata(existing).is_err() {
@@ -2959,22 +2960,22 @@ thread_local! {
     static PROJECTION_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static FAIL_NEXT_PROJECTION_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROJECTION_EXACT_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static MANAGED_INVENTORY_READ_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_INVENTORY_READ_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static INITIAL_SHADOW_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE: std::cell::RefCell<Option<ManagedTextInventoryLimits>> = const { std::cell::RefCell::new(None) };
-    static MANAGED_TEXT_BUDGET_LAST_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE: std::cell::RefCell<Option<GraphTextInventoryLimits>> = const { std::cell::RefCell::new(None) };
+    static GRAPH_TEXT_BUDGET_LAST_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BOUNDED_READ_AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_IDENTITY_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_AFTER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_AFTER_IDENTITY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_BEFORE_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_AFTER_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_IDENTITY_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_AFTER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_AFTER_IDENTITY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_BEFORE_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_AFTER_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_AFTER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_AFTER_TARGET_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_RETIRED_CLEANUP: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
@@ -3186,8 +3187,8 @@ fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn managed_inventory_read_hook() -> io::Result<()> {
-    MANAGED_INVENTORY_READ_RACE.with(|hook| {
+fn graph_text_inventory_read_hook() -> io::Result<()> {
+    GRAPH_TEXT_INVENTORY_READ_RACE.with(|hook| {
         let hook = hook.borrow_mut().take();
         match hook {
             Some(hook) => hook(),
@@ -3197,7 +3198,7 @@ fn managed_inventory_read_hook() -> io::Result<()> {
 }
 
 #[cfg(not(test))]
-fn managed_inventory_read_hook() -> io::Result<()> {
+fn graph_text_inventory_read_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -3228,34 +3229,34 @@ fn bounded_read_after_metadata_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn managed_write_identity_acquisition_hook() -> io::Result<()> {
-    MANAGED_WRITE_IDENTITY_ACQUISITION.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_write_identity_acquisition_hook() -> io::Result<()> {
+    GRAPH_TEXT_WRITE_IDENTITY_ACQUISITION.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn managed_write_identity_acquisition_hook() -> io::Result<()> {
+fn graph_text_write_identity_acquisition_hook() -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
-fn managed_write_after_admission_hook() -> io::Result<()> {
-    MANAGED_WRITE_AFTER_ADMISSION.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_write_after_admission_hook() -> io::Result<()> {
+    GRAPH_TEXT_WRITE_AFTER_ADMISSION.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn managed_write_after_admission_hook() -> io::Result<()> {
+fn graph_text_write_after_admission_hook() -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
-fn managed_write_after_identity_check_hook() {
-    MANAGED_WRITE_AFTER_IDENTITY_CHECK.with(|hook| {
+fn graph_text_write_after_identity_check_hook() {
+    GRAPH_TEXT_WRITE_AFTER_IDENTITY_CHECK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();
         }
@@ -3263,18 +3264,18 @@ fn managed_write_after_identity_check_hook() {
 }
 
 #[cfg(not(test))]
-fn managed_write_after_identity_check_hook() {}
+fn graph_text_write_after_identity_check_hook() {}
 
 #[cfg(test)]
-fn managed_write_before_mutation_hook() -> io::Result<()> {
-    MANAGED_WRITE_BEFORE_MUTATION.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_write_before_mutation_hook() -> io::Result<()> {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn managed_write_before_mutation_hook() -> io::Result<()> {
+fn graph_text_write_before_mutation_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -3290,15 +3291,15 @@ fn managed_write_before_mutation_hook() -> io::Result<()> {
 ///
 /// PRODUCTION ARMS NOTHING: the non-test definition is a constant `Ok(())`.
 #[cfg(test)]
-fn managed_write_after_retire_hook() -> io::Result<()> {
-    MANAGED_WRITE_AFTER_RETIRE.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_write_after_retire_hook() -> io::Result<()> {
+    GRAPH_TEXT_WRITE_AFTER_RETIRE.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn managed_write_after_retire_hook() -> io::Result<()> {
+fn graph_text_write_after_retire_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -3316,28 +3317,28 @@ fn journal_projection_after_publish_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn managed_write_before_restore_hook() -> io::Result<()> {
-    MANAGED_WRITE_BEFORE_RESTORE.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_write_before_restore_hook() -> io::Result<()> {
+    GRAPH_TEXT_WRITE_BEFORE_RESTORE.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn managed_write_before_restore_hook() -> io::Result<()> {
+fn graph_text_write_before_restore_hook() -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
-fn managed_write_during_rollback_hook() -> io::Result<()> {
-    MANAGED_WRITE_DURING_ROLLBACK.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_write_during_rollback_hook() -> io::Result<()> {
+    GRAPH_TEXT_WRITE_DURING_ROLLBACK.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn managed_write_during_rollback_hook() -> io::Result<()> {
+fn graph_text_write_during_rollback_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -3589,10 +3590,10 @@ impl Graph {
         approved_assets: Option<&Path>,
     ) -> io::Result<Graph> {
         let mut graph = Self::open(root);
-        validate_managed_dir(&graph.root, &graph.config.journals_dir, "journals")?;
-        validate_managed_dir(&graph.root, &graph.config.pages_dir, "pages")?;
-        validate_managed_dir(&graph.root, "logseq", "logseq")?;
-        validate_managed_dir(&graph.root, "publish", "publish")?;
+        validate_graph_text_dir(&graph.root, &graph.config.journals_dir, "journals")?;
+        validate_graph_text_dir(&graph.root, &graph.config.pages_dir, "pages")?;
+        validate_graph_text_dir(&graph.root, "logseq", "logseq")?;
+        validate_graph_text_dir(&graph.root, "publish", "publish")?;
         // `.tine-sync` (left behind by the removed Managed Storage mode) is not
         // part of Direct Files authority: a graph open must neither inspect nor
         // require its shape, and never modifies it.
@@ -3624,7 +3625,7 @@ impl Graph {
             }
             graph.assets_root = resolved;
         } else {
-            validate_managed_dir(&graph.root, "assets", "assets")?;
+            validate_graph_text_dir(&graph.root, "assets", "assets")?;
             graph.assets_root = graph.root.join("assets");
         }
         let summary = graph.recover_interrupted_publishes()?;
@@ -3653,7 +3654,7 @@ impl Graph {
     /// moved intact to typed recovery trash. Multiple claims for one missing
     /// target stay untouched because choosing one would discard information.
     fn recover_interrupted_editor_publications(&self) -> io::Result<RecoverySummary> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let (claims, cleaned_retired) = self.editor_publication_recovery_claims(&write)?;
         let mut by_target = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
         for (artifact, target) in claims {
@@ -3665,7 +3666,7 @@ impl Graph {
             ..RecoverySummary::default()
         };
         for (target, artifacts) in by_target {
-            let target_present = self.managed_exists(&write, &target)?;
+            let target_present = self.graph_text_exists(&write, &target)?;
             if !target_present {
                 if artifacts.len() != 1 {
                     summary.record_claimant(self, &target)?;
@@ -3673,8 +3674,8 @@ impl Graph {
                 }
                 let artifact = &artifacts[0];
                 let identity =
-                    self.managed_move_editor_recovery_noreplace(&write, artifact, &target)?;
-                if self.managed_optional_file_identity(&write, &target)? == Some(identity) {
+                    self.graph_text_move_editor_recovery_noreplace(&write, artifact, &target)?;
+                if self.graph_text_optional_file_identity(&write, &target)? == Some(identity) {
                     summary.reconciled = summary.reconciled.saturating_add(1);
                 } else {
                     summary.record_claimant(self, &target)?;
@@ -3683,7 +3684,7 @@ impl Graph {
             }
 
             let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-            self.managed_create_dir_all(&write, &trash)?;
+            self.graph_text_create_dir_all(&write, &trash)?;
             for artifact in artifacts {
                 let Some(filename) = artifact.file_name().and_then(|name| name.to_str()) else {
                     return Err(io::Error::new(
@@ -3709,9 +3710,12 @@ impl Graph {
                     filename.trim_start_matches('.'),
                     extension
                 ));
-                let identity =
-                    self.managed_move_editor_recovery_noreplace(&write, &artifact, &destination)?;
-                if self.managed_optional_file_identity(&write, &destination)? == Some(identity) {
+                let identity = self.graph_text_move_editor_recovery_noreplace(
+                    &write,
+                    &artifact,
+                    &destination,
+                )?;
+                if self.graph_text_optional_file_identity(&write, &destination)? == Some(identity) {
                     summary.reconciled = summary.reconciled.saturating_add(1);
                 } else {
                     summary.record_claimant(self, &target)?;
@@ -3721,13 +3725,13 @@ impl Graph {
         Ok(summary)
     }
 
-    /// Discover only names emitted by `managed_atomic_replace_bound`, through
+    /// Discover only names emitted by `graph_text_atomic_replace_bound`, through
     /// the retained no-follow graph capability. This is not a suffix glob: the
     /// parser requires the complete producer shape, and the claimed target must
     /// be an eligible graph-text file in the same retained directory.
     fn editor_publication_recovery_claims(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
     ) -> io::Result<(Vec<(PathBuf, PathBuf)>, usize)> {
         struct PendingDirectory {
             directory: Dir,
@@ -3735,9 +3739,9 @@ impl Graph {
             depth: usize,
         }
 
-        let limits = managed_text_inventory_limits();
+        let limits = graph_text_inventory_limits();
         let mut pending = vec![PendingDirectory {
-            directory: self.managed_permit_root(permit)?.try_clone()?,
+            directory: self.graph_text_permit_root(permit)?.try_clone()?,
             relative: String::new(),
             depth: 0,
         }];
@@ -3756,9 +3760,9 @@ impl Graph {
             for entry in directory.entries()? {
                 all_entries = all_entries
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("all directory entries"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
                 if all_entries > limits.all_entries {
-                    return Err(managed_text_inventory_limit_error("all directory entries"));
+                    return Err(graph_text_inventory_limit_error("all directory entries"));
                 }
                 let entry = entry?;
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -3771,9 +3775,9 @@ impl Graph {
                 };
                 path_bytes = path_bytes
                     .checked_add(usize_to_u64(child_relative.len())?)
-                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
                 if path_bytes > limits.path_bytes {
-                    return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                    return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                 }
                 let file_type = entry.file_type()?;
                 if file_type.is_symlink() {
@@ -3783,19 +3787,17 @@ impl Graph {
                     if !self.graph_text_scope.should_descend(&child_relative) {
                         continue;
                     }
-                    let child_depth = depth.checked_add(1).ok_or_else(|| {
-                        managed_text_inventory_limit_error("managed directory depth")
-                    })?;
+                    let child_depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| graph_text_inventory_limit_error("graph directory depth"))?;
                     if child_depth > limits.directory_depth {
-                        return Err(managed_text_inventory_limit_error(
-                            "managed directory depth",
-                        ));
+                        return Err(graph_text_inventory_limit_error("graph directory depth"));
                     }
                     directories = directories
                         .checked_add(1)
-                        .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                        .ok_or_else(|| graph_text_inventory_limit_error("directory count"))?;
                     if directories > limits.directories {
-                        return Err(managed_text_inventory_limit_error("directory count"));
+                        return Err(graph_text_inventory_limit_error("directory count"));
                     }
                     projection_real_directory(&directory, &name)?;
                     pending.push(PendingDirectory {
@@ -3863,7 +3865,7 @@ impl Graph {
     /// view.
     fn ensure_within_graph_root(&self, target: &Path) -> io::Result<()> {
         if path_stays_within_root(&self.root, target)
-            && !path_uses_managed_alias(&self.root, target)
+            && !path_uses_graph_text_alias(&self.root, target)
         {
             Ok(())
         } else {
@@ -3879,8 +3881,8 @@ impl Graph {
     /// `logseq/config.edn` is **not** oplog-owned. The managed reconciliation
     /// scanner classifies it `GraphTextScanPathClass::Configuration`
     /// (`model.rs`, `capture_reconciliation_scan_pass`) and the baseline adapter
-    /// drops every such row as "not managed content" that "cannot be represented
-    /// as a `ManagedPath`" (`oplog/reconciliation_baseline_adapter.rs`), so no
+    /// drops every such row as "not graph content" that "cannot be represented
+    /// as a `GraphTextPath`" (`oplog/reconciliation_baseline_adapter.rs`), so no
     /// import, expected-path row or projection ever covers it. Configuration is
     /// therefore writable in a read-only view — a Settings toggle is not a
     /// write behind the oplog's back.
@@ -3906,7 +3908,7 @@ impl Graph {
     /// `graph_text_scope::fixed_excluded`, so nothing under it is ever scanned,
     /// imported or projected: it is outside the oplog's document domain exactly
     /// the way `assets/` is. Only the *destination* is covered here. Page and
-    /// journal trashing still passes through [`Graph::admit_managed_text_writer`]
+    /// journal trashing still passes through [`Graph::admit_graph_text_writer`]
     /// because their sources are graph text. A recognized sync-conflict copy is
     /// excluded from the document domain too, so its explicit discard path uses
     /// this point capability just like an asset does.
@@ -3932,7 +3934,7 @@ impl Graph {
             return self.ensure_within_graph_root(target);
         }
         if path_stays_within_root(&self.assets_root, target)
-            && !path_uses_managed_alias(&self.assets_root, target)
+            && !path_uses_graph_text_alias(&self.assets_root, target)
         {
             Ok(())
         } else {
@@ -3954,9 +3956,9 @@ impl Graph {
     fn open_inner(root: impl AsRef<Path>) -> Graph {
         let root = root.as_ref().to_path_buf();
         let projection_root = open_projection_root_nofollow(&root).ok();
-        let managed_write_binding =
-            managed_text_write_binding_for_resource(&root, projection_root.as_ref());
-        let guarded_resource_epoch = managed_write_binding
+        let graph_text_write_binding =
+            graph_text_write_binding_for_resource(&root, projection_root.as_ref());
+        let guarded_resource_epoch = graph_text_write_binding
             .as_ref()
             .ok()
             .map(|binding| binding.gate.identity_mutation_epoch());
@@ -4018,7 +4020,7 @@ impl Graph {
             conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
             editor_activations: std::sync::Mutex::new(EditorActivationState::default()),
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            managed_write_binding,
+            graph_text_write_binding,
             search_lanes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -4284,7 +4286,7 @@ impl Graph {
         generation: u64,
         paths: Vec<PathBuf>,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        let permit = self.admit_retained_managed_text_writer().ok()?;
+        let permit = self.admit_retained_graph_text_writer().ok()?;
         let mut pages = Vec::with_capacity(paths.len());
         for relative in paths {
             let absolute = self.root.join(&relative);
@@ -4293,7 +4295,7 @@ impl Graph {
                 return None;
             }
             let (content, _) = self
-                .managed_read_optional_text_with_identity(&permit, &entry.path)
+                .graph_text_read_optional_text_with_identity(&permit, &entry.path)
                 .ok()??;
             #[cfg(test)]
             self.page_build_test
@@ -5546,55 +5548,58 @@ impl Graph {
             .bind_graph_resource(self.canonical_resource_id()?))
     }
 
-    fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
-        let binding = self.managed_write_binding()?;
-        managed_write_after_admission_hook()?;
-        let permit = ManagedTextWritePermit {
+    fn admit_graph_text_writer(&self) -> io::Result<GraphTextWritePermit> {
+        let binding = self.graph_text_write_binding()?;
+        graph_text_write_after_admission_hook()?;
+        let permit = GraphTextWritePermit {
             root: binding.root.try_clone()?,
             resource_id: binding.resource_id,
         };
-        managed_write_after_identity_check_hook();
+        graph_text_write_after_identity_check_hook();
         Ok(permit)
     }
 
-    fn admit_retained_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
-        let binding = self.managed_write_binding()?;
+    fn admit_retained_graph_text_writer(&self) -> io::Result<GraphTextWritePermit> {
+        let binding = self.graph_text_write_binding()?;
         if self.canonical_resource_id()? != binding.resource_id {
-            return Err(managed_write_identity_mismatch_error());
+            return Err(graph_text_write_identity_mismatch_error());
         }
-        Ok(ManagedTextWritePermit {
+        Ok(GraphTextWritePermit {
             root: binding.root.try_clone()?,
             resource_id: binding.resource_id,
         })
     }
 
-    fn managed_write_binding(&self) -> io::Result<&ManagedTextWriteBinding> {
-        self.managed_write_binding.as_ref().map_err(|error| {
+    fn graph_text_write_binding(&self) -> io::Result<&GraphTextWriteBinding> {
+        self.graph_text_write_binding.as_ref().map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("managed text resource identity is unavailable: {error}"),
+                format!("graph text resource identity is unavailable: {error}"),
             )
         })
     }
 
     fn lock_graph_text_identity_mutation(&self) -> io::Result<GraphTextIdentityMutationGuard<'_>> {
-        Ok(self.managed_write_binding()?.gate.lock_identity_mutation())
+        Ok(self
+            .graph_text_write_binding()?
+            .gate
+            .lock_identity_mutation())
     }
 
-    fn managed_permit_root<'a>(&self, permit: &'a ManagedTextWritePermit) -> io::Result<&'a Dir> {
-        let binding = self.managed_write_binding()?;
+    fn graph_text_permit_root<'a>(&self, permit: &'a GraphTextWritePermit) -> io::Result<&'a Dir> {
+        let binding = self.graph_text_write_binding()?;
         if permit.resource_id != binding.resource_id {
-            return Err(managed_write_identity_mismatch_error());
+            return Err(graph_text_write_identity_mismatch_error());
         }
         Ok(&permit.root)
     }
 
-    fn managed_target(
+    fn graph_text_target(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         create_parent: bool,
-    ) -> io::Result<ManagedTextTarget> {
+    ) -> io::Result<GraphTextTarget> {
         let relative = path.strip_prefix(&self.root).map_err(|_| bad_path())?;
         let components = relative
             .components()
@@ -5608,11 +5613,11 @@ impl Graph {
             })
             .collect::<io::Result<Vec<_>>>()?;
         let (filename, parents) = components.split_last().ok_or_else(bad_path)?;
-        let mut chain = vec![self.managed_permit_root(permit)?.try_clone()?];
+        let mut chain = vec![self.graph_text_permit_root(permit)?.try_clone()?];
         for component in parents {
             let current = chain
                 .last()
-                .expect("managed text capability chain contains root");
+                .expect("graph text capability chain contains root");
             match projection_real_directory(current, component) {
                 Ok(()) => {}
                 Err(error) if create_parent && error.kind() == io::ErrorKind::NotFound => {
@@ -5622,19 +5627,19 @@ impl Graph {
             }
             chain.push(open_projection_dir_nofollow(current, component)?);
         }
-        Ok(ManagedTextTarget {
+        Ok(GraphTextTarget {
             chain,
             filename: filename.clone(),
         })
     }
 
-    fn managed_create_dir_all(
+    fn graph_text_create_dir_all(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<()> {
         let sentinel = path.join(".tine-capability-directory");
-        let target = self.managed_target(permit, &sentinel, true)?;
+        let target = self.graph_text_target(permit, &sentinel, true)?;
         sync_projection_chain_required(&target.chain)
     }
 
@@ -5643,48 +5648,48 @@ impl Graph {
     /// `self.root`, but every directory decision comes from a no-follow retained
     /// directory handle, so replacing the ambient graph pathname cannot change
     /// the selected mutation set.
-    fn managed_text_entries(
+    fn configured_text_entries(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         include_sync_conflicts: bool,
     ) -> io::Result<Vec<PageEntry>> {
         Ok(self
-            .managed_text_entries_with_limits_and_budget(
+            .configured_text_entries_with_limits_and_budget(
                 permit,
                 include_sync_conflicts,
-                managed_text_inventory_limits(),
+                graph_text_inventory_limits(),
                 None,
             )?
             .0)
     }
 
-    fn managed_text_entries_with_budget(
+    fn configured_text_entries_with_budget(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         include_sync_conflicts: bool,
         budget: &RetainedContentBudget,
     ) -> io::Result<BudgetedPageEntries> {
-        let (entries, reservation) = self.managed_text_entries_with_limits_and_budget(
+        let (entries, reservation) = self.configured_text_entries_with_limits_and_budget(
             permit,
             include_sync_conflicts,
-            managed_text_inventory_limits(),
+            graph_text_inventory_limits(),
             Some(budget),
         )?;
         Ok(BudgetedPageEntries {
             entries,
             _reservation: reservation
-                .expect("budgeted managed inventory returns its retained charge"),
+                .expect("budgeted graph inventory returns its retained charge"),
         })
     }
 
-    fn managed_text_entries_with_limits_and_budget(
+    fn configured_text_entries_with_limits_and_budget(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         include_sync_conflicts: bool,
-        limits: ManagedTextInventoryLimits,
+        limits: GraphTextInventoryLimits,
         budget: Option<&RetainedContentBudget>,
     ) -> io::Result<(Vec<PageEntry>, Option<RetainedContentReservation>)> {
-        let roots = self.managed_text_inventory_roots(permit)?;
+        let roots = self.configured_text_inventory_roots(permit)?;
         let (entries, reservation, _) = self.text_entries_with_limits_and_budget(
             permit,
             include_sync_conflicts,
@@ -5696,14 +5701,14 @@ impl Graph {
         Ok((entries, reservation))
     }
 
-    fn graph_text_entries(&self, permit: &ManagedTextWritePermit) -> io::Result<Vec<PageEntry>> {
+    fn graph_text_entries(&self, permit: &GraphTextWritePermit) -> io::Result<Vec<PageEntry>> {
         Ok(self.graph_text_inventory(permit)?.0)
     }
 
     /// Enumerate every user-visible Markdown/Org source file using the same
     /// scope and nested-layout rules as Tine's ordinary graph inventory.
     pub fn graph_text_source_paths(&self) -> io::Result<Vec<String>> {
-        let permit = self.admit_retained_managed_text_writer()?;
+        let permit = self.admit_retained_graph_text_writer()?;
         self.graph_text_entries(&permit)
             .map(|entries| entries.into_iter().map(|entry| entry.rel_path).collect())
     }
@@ -5724,7 +5729,7 @@ impl Graph {
                 crate::backend_error::tagged_backend_error("operation-cancelled", None),
             ));
         }
-        let managed = ManagedPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
+        let managed = GraphTextPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
         let absolute = self.root.join(managed.as_str());
         let Some(entry) = self.graph_inventory_entry(&absolute)? else {
             return Err(io::Error::new(
@@ -5736,8 +5741,8 @@ impl Graph {
             return Err(bad_path());
         }
 
-        let permit = self.admit_retained_managed_text_writer()?;
-        let target = self.managed_target(&permit, &absolute, false)?;
+        let permit = self.admit_retained_graph_text_writer()?;
+        let target = self.graph_text_target(&permit, &absolute, false)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let mut file = open_projection_file_nofollow(target.parent(), &target.filename)?;
         let before = file.metadata()?;
@@ -5787,12 +5792,12 @@ impl Graph {
     /// Check historical page filenames through the retained graph capability.
     ///
     /// Unlike graph-text inventory, this deliberately admits legacy filenames
-    /// which cannot be parsed as `ManagedPath`s. It is filename-only evidence:
+    /// which cannot be parsed as `GraphTextPath`s. It is filename-only evidence:
     /// parser-derived effective-title validation remains with the admitted
     /// graph-text inventory below the caller.
     fn retained_legacy_page_identity_exists(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         page_name: &str,
     ) -> io::Result<bool> {
         struct PendingDirectory {
@@ -5801,20 +5806,18 @@ impl Graph {
             depth: usize,
         }
 
-        let limits = managed_text_inventory_limits();
-        let root_depth = managed_root_components(&self.config.pages_dir)
+        let limits = graph_text_inventory_limits();
+        let root_depth = configured_root_components(&self.config.pages_dir)
             .ok_or_else(bad_path)?
             .len();
         if root_depth > limits.directory_depth {
-            return Err(managed_text_inventory_limit_error(
-                "managed directory depth",
-            ));
+            return Err(graph_text_inventory_limit_error("graph directory depth"));
         }
         let root = self.pages_path();
-        // `managed_target` opens every configured root component from the
+        // `graph_text_target` opens every configured root component from the
         // retained root capability and rejects a root-level pages symlink
         // before this scan can inspect an ambient pathname.
-        let target = match self.managed_target(
+        let target = match self.graph_text_target(
             permit,
             &root.join(".tine-capability-legacy-page-scan"),
             false,
@@ -5827,15 +5830,15 @@ impl Graph {
         let mut page_files = 0_usize;
         let mut directory_count = 1_usize;
         if directory_count > limits.directories {
-            return Err(managed_text_inventory_limit_error("directory count"));
+            return Err(graph_text_inventory_limit_error("directory count"));
         }
         let mut path_bytes = usize_to_u64(self.config.pages_dir.len())?;
         if path_bytes > limits.path_bytes {
-            return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+            return Err(graph_text_inventory_limit_error("aggregate path bytes"));
         }
         let mut pending = Vec::new();
         if pending.len() >= limits.pending_directories {
-            return Err(managed_text_inventory_limit_error("pending directories"));
+            return Err(graph_text_inventory_limit_error("pending directories"));
         }
         pending.push(PendingDirectory {
             directory: target.parent().try_clone()?,
@@ -5852,9 +5855,9 @@ impl Graph {
             for entry in directory.entries()? {
                 all_entries = all_entries
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("all directory entries"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
                 if all_entries > limits.all_entries {
-                    return Err(managed_text_inventory_limit_error("all directory entries"));
+                    return Err(graph_text_inventory_limit_error("all directory entries"));
                 }
                 let entry = entry?;
                 let name = entry.file_name();
@@ -5868,12 +5871,12 @@ impl Graph {
                     .len()
                     .checked_add(usize::from(!relative.is_empty()))
                     .and_then(|length| length.checked_add(name.len()))
-                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
                 path_bytes = path_bytes
                     .checked_add(usize_to_u64(child_relative_len)?)
-                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
                 if path_bytes > limits.path_bytes {
-                    return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                    return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                 }
                 let file_type = entry.file_type()?;
                 if file_type.is_symlink() {
@@ -5887,9 +5890,9 @@ impl Graph {
                     }
                     page_files = page_files
                         .checked_add(1)
-                        .ok_or_else(|| managed_text_inventory_limit_error("managed file count"))?;
-                    if page_files > limits.managed_files {
-                        return Err(managed_text_inventory_limit_error("managed file count"));
+                        .ok_or_else(|| graph_text_inventory_limit_error("graph file count"))?;
+                    if page_files > limits.graph_text_files {
+                        return Err(graph_text_inventory_limit_error("graph file count"));
                     }
                     let Some(stem) = Path::new(name).file_stem().and_then(|stem| stem.to_str())
                     else {
@@ -5914,17 +5917,15 @@ impl Graph {
                 }
                 let child_depth = depth
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("managed directory depth"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("graph directory depth"))?;
                 if child_depth > limits.directory_depth {
-                    return Err(managed_text_inventory_limit_error(
-                        "managed directory depth",
-                    ));
+                    return Err(graph_text_inventory_limit_error("graph directory depth"));
                 }
                 directory_count = directory_count
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("directory count"))?;
                 if directory_count > limits.directories {
-                    return Err(managed_text_inventory_limit_error("directory count"));
+                    return Err(graph_text_inventory_limit_error("directory count"));
                 }
                 // Both checks are required: metadata prevents a changed entry
                 // from being treated as a directory and the platform no-follow
@@ -5932,7 +5933,7 @@ impl Graph {
                 projection_real_directory(&directory, name)?;
                 let child = open_projection_dir_nofollow(&directory, name)?;
                 if pending.len() >= limits.pending_directories {
-                    return Err(managed_text_inventory_limit_error("pending directories"));
+                    return Err(graph_text_inventory_limit_error("pending directories"));
                 }
                 pending.push(PendingDirectory {
                     directory: child,
@@ -5946,7 +5947,7 @@ impl Graph {
 
     fn graph_text_inventory(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
     ) -> io::Result<(
         Vec<PageEntry>,
         std::collections::HashMap<PathBuf, ContentDigest>,
@@ -5954,7 +5955,7 @@ impl Graph {
         let (entries, _, identities) = self.text_entries_with_limits_and_budget(
             permit,
             false,
-            managed_text_inventory_limits(),
+            graph_text_inventory_limits(),
             None,
             vec![("", 0)],
             true,
@@ -5969,7 +5970,7 @@ impl Graph {
     fn guarded_graph_text_identity_index(
         &self,
     ) -> io::Result<Arc<CompleteGraphTextAdmissionIndex>> {
-        let binding = self.managed_write_binding()?;
+        let binding = self.graph_text_write_binding()?;
         let resource_epoch = binding.gate.identity_mutation_epoch_under_authority()?;
         {
             let state = self.guarded_graph_text_identity.read().unwrap();
@@ -6352,7 +6353,7 @@ impl Graph {
         &self,
         operation: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
-        let _write = self.admit_managed_text_writer()?;
+        let _write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         operation()
     }
@@ -6365,8 +6366,8 @@ impl Graph {
             .unwrap()
             .observed_resource_epoch;
         let resource = self
-            .managed_write_binding()
-            .expect("test graph has managed writer binding")
+            .graph_text_write_binding()
+            .expect("test graph has graph writer binding")
             .gate
             .identity_mutation_epoch();
         (observed, resource)
@@ -6374,9 +6375,9 @@ impl Graph {
 
     fn text_entries_with_limits_and_budget<'a>(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         include_sync_conflicts: bool,
-        limits: ManagedTextInventoryLimits,
+        limits: GraphTextInventoryLimits,
         budget: Option<&RetainedContentBudget>,
         roots: Vec<(&'a str, usize)>,
         graph_wide: bool,
@@ -6391,53 +6392,51 @@ impl Graph {
             depth: usize,
         }
 
-        self.managed_permit_root(permit)?;
+        self.graph_text_permit_root(permit)?;
         let mut out = Vec::new();
         let mut out_charge =
-            RetainedHeapCharge::new(budget, "managed inventory retained page entries")?;
+            RetainedHeapCharge::new(budget, "graph inventory retained page entries")?;
         let mut pending = Vec::new();
         let mut pending_slots =
-            RetainedHeapCharge::new(budget, "managed inventory pending vector capacity")?;
+            RetainedHeapCharge::new(budget, "graph inventory pending vector capacity")?;
         let mut pending_paths =
-            RetainedHeapCharge::new(budget, "managed inventory pending owned paths")?;
+            RetainedHeapCharge::new(budget, "graph inventory pending owned paths")?;
         let mut pending_slot_high_water = 0_usize;
         let mut all_entries = 0_usize;
         let mut directory_count = 0_usize;
         let mut path_bytes = 0_u64;
         let mut directory_resources = std::collections::BTreeMap::new();
         let mut directory_resources_charge =
-            RetainedHeapCharge::new(budget, "managed inventory directory identity map")?;
+            RetainedHeapCharge::new(budget, "graph inventory directory identity map")?;
         let mut file_resources = std::collections::BTreeMap::new();
         let mut graph_file_identities = std::collections::HashMap::new();
         let mut file_resources_charge =
-            RetainedHeapCharge::new(budget, "managed inventory file identity map")?;
+            RetainedHeapCharge::new(budget, "graph inventory file identity map")?;
         let mut portable_paths = std::collections::BTreeMap::new();
         let mut portable_paths_charge =
             RetainedHeapCharge::new(budget, "graph text portable path identity map")?;
         for (relative, depth) in roots {
             if depth > limits.directory_depth {
-                return Err(managed_text_inventory_limit_error(
-                    "managed directory depth",
-                ));
+                return Err(graph_text_inventory_limit_error("graph directory depth"));
             }
             path_bytes = path_bytes
                 .checked_add(usize_to_u64(relative.len())?)
-                .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
             if path_bytes > limits.path_bytes {
-                return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                return Err(graph_text_inventory_limit_error("aggregate path bytes"));
             }
             let path = self.root.join(relative);
             let sentinel = path.join(".tine-capability-inventory");
-            let target = match self.managed_target(permit, &sentinel, false) {
+            let target = match self.graph_text_target(permit, &sentinel, false) {
                 Ok(target) => target,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
             directory_count = directory_count
                 .checked_add(1)
-                .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                .ok_or_else(|| graph_text_inventory_limit_error("directory count"))?;
             if directory_count > limits.directories {
-                return Err(managed_text_inventory_limit_error("directory count"));
+                return Err(graph_text_inventory_limit_error("directory count"));
             }
             let directory = target.parent().try_clone()?;
             let resource = canonical_projection_directory_resource_id(&directory)?;
@@ -6446,30 +6445,30 @@ impl Graph {
                     conservative_btree_entry_bytes::<ContentDigest, String>()?,
                     owned_string_upper_bound(relative)?,
                 )?,
-                "managed inventory directory identity map",
+                "graph inventory directory identity map",
             )?;
             if let Some(first) = directory_resources.insert(resource, relative.to_owned()) {
-                return Err(managed_text_inventory_alias_error(
+                return Err(graph_text_inventory_alias_error(
                     "directories",
                     &first,
                     relative,
                 ));
             }
             if pending.len() == limits.pending_directories {
-                return Err(managed_text_inventory_limit_error("pending directories"));
+                return Err(graph_text_inventory_limit_error("pending directories"));
             }
             if pending.len() == pending_slot_high_water {
                 pending_slots.grow(
                     conservative_vec_entry_bytes::<PendingDirectory>()?,
-                    "managed inventory pending vector capacity",
+                    "graph inventory pending vector capacity",
                 )?;
                 pending_slot_high_water = pending_slot_high_water
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("pending directories"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("pending directories"))?;
             }
             pending_paths.grow(
                 owned_path_upper_bound(&path)?,
-                "managed inventory pending owned paths",
+                "graph inventory pending owned paths",
             )?;
             pending.push(PendingDirectory {
                 directory,
@@ -6493,20 +6492,20 @@ impl Graph {
                 }
                 all_entries = all_entries
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("all directory entries"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
                 if all_entries > limits.all_entries {
-                    return Err(managed_text_inventory_limit_error("all directory entries"));
+                    return Err(graph_text_inventory_limit_error("all directory entries"));
                 }
                 let entry = entry?;
                 let name = entry.file_name();
                 let Some(name_text) = name.to_str() else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "managed text entry name is not UTF-8",
+                        "graph text entry name is not UTF-8",
                     ));
                 };
                 let mut entry_scratch =
-                    RetainedHeapCharge::new(budget, "managed inventory entry path scratch")?;
+                    RetainedHeapCharge::new(budget, "graph inventory entry path scratch")?;
                 entry_scratch.grow(
                     checked_mul_bytes(
                         checked_add_bytes(
@@ -6515,15 +6514,15 @@ impl Graph {
                         )?,
                         3,
                     )?,
-                    "managed inventory entry path scratch",
+                    "graph inventory entry path scratch",
                 )?;
                 let child_path = path.join(&name);
                 let child_relative = self.rel_path(&child_path);
                 path_bytes = path_bytes
                     .checked_add(usize_to_u64(child_relative.len())?)
-                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
                 if path_bytes > limits.path_bytes {
-                    return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                    return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                 }
                 let file_type = entry.file_type()?;
                 if file_type.is_symlink() {
@@ -6535,7 +6534,7 @@ impl Graph {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
                             format!(
-                                "managed text entry is a symlink or reparse point: {child_relative}"
+                                "graph text entry is a symlink or reparse point: {child_relative}"
                             ),
                         ),
                     ));
@@ -6554,11 +6553,11 @@ impl Graph {
                             conservative_btree_entry_bytes::<ContentDigest, String>()?,
                             owned_string_upper_bound(&child_relative)?,
                         )?,
-                        "managed inventory file identity map",
+                        "graph inventory file identity map",
                     )?;
                     if let Some(first) = file_resources.insert(resource, child_relative.clone()) {
                         if !graph_wide {
-                            return Err(managed_text_inventory_alias_error(
+                            return Err(graph_text_inventory_alias_error(
                                 "files",
                                 &first,
                                 &child_relative,
@@ -6586,7 +6585,7 @@ impl Graph {
                     )?;
                     out_charge.grow(
                         page_candidate_charge,
-                        "managed inventory retained page entries",
+                        "graph inventory retained page entries",
                     )?;
                     if graph_wide {
                         let portable = self
@@ -6613,17 +6612,17 @@ impl Graph {
                     let page = if graph_wide {
                         self.graph_inventory_entry(&child_path)?
                     } else {
-                        self.managed_inventory_entry(&child_path)?
+                        self.graph_text_inventory_entry(&child_path)?
                     };
                     if let Some(page) = page {
-                        if out.len() == limits.managed_files {
-                            return Err(managed_text_inventory_limit_error("managed file count"));
+                        if out.len() == limits.graph_text_files {
+                            return Err(graph_text_inventory_limit_error("graph file count"));
                         }
                         out.push(page);
                     } else {
                         out_charge.shrink(
                             page_candidate_charge,
-                            "managed inventory retained page entries",
+                            "graph inventory retained page entries",
                         )?;
                     }
                     continue;
@@ -6631,7 +6630,7 @@ impl Graph {
                 if !file_type.is_dir() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("managed text entry is not a regular file: {child_relative}"),
+                        format!("graph text entry is not a regular file: {child_relative}"),
                     ));
                 }
                 if name_text.starts_with('.') {
@@ -6642,17 +6641,15 @@ impl Graph {
                 }
                 let child_depth = depth
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("managed directory depth"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("graph directory depth"))?;
                 if child_depth > limits.directory_depth {
-                    return Err(managed_text_inventory_limit_error(
-                        "managed directory depth",
-                    ));
+                    return Err(graph_text_inventory_limit_error("graph directory depth"));
                 }
                 directory_count = directory_count
                     .checked_add(1)
-                    .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                    .ok_or_else(|| graph_text_inventory_limit_error("directory count"))?;
                 if directory_count > limits.directories {
-                    return Err(managed_text_inventory_limit_error("directory count"));
+                    return Err(graph_text_inventory_limit_error("directory count"));
                 }
                 projection_real_directory(&directory, name_text)?;
                 let child = open_projection_dir_nofollow(&directory, name_text)?;
@@ -6662,30 +6659,30 @@ impl Graph {
                         conservative_btree_entry_bytes::<ContentDigest, String>()?,
                         owned_string_upper_bound(&child_relative)?,
                     )?,
-                    "managed inventory directory identity map",
+                    "graph inventory directory identity map",
                 )?;
                 if let Some(first) = directory_resources.insert(resource, child_relative.clone()) {
-                    return Err(managed_text_inventory_alias_error(
+                    return Err(graph_text_inventory_alias_error(
                         "directories",
                         &first,
                         &child_relative,
                     ));
                 }
                 if pending.len() == limits.pending_directories {
-                    return Err(managed_text_inventory_limit_error("pending directories"));
+                    return Err(graph_text_inventory_limit_error("pending directories"));
                 }
                 if pending.len() == pending_slot_high_water {
                     pending_slots.grow(
                         conservative_vec_entry_bytes::<PendingDirectory>()?,
-                        "managed inventory pending vector capacity",
+                        "graph inventory pending vector capacity",
                     )?;
                     pending_slot_high_water = pending_slot_high_water
                         .checked_add(1)
-                        .ok_or_else(|| managed_text_inventory_limit_error("pending directories"))?;
+                        .ok_or_else(|| graph_text_inventory_limit_error("pending directories"))?;
                 }
                 pending_paths.grow(
                     owned_path_upper_bound(&child_path)?,
-                    "managed inventory pending owned paths",
+                    "graph inventory pending owned paths",
                 )?;
                 pending.push(PendingDirectory {
                     directory: child,
@@ -6693,7 +6690,7 @@ impl Graph {
                     depth: child_depth,
                 });
             }
-            pending_paths.shrink(pending_path_charge, "managed inventory pending owned paths")?;
+            pending_paths.shrink(pending_path_charge, "graph inventory pending owned paths")?;
         }
         out.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         Ok((out, out_charge.reservation, graph_file_identities))
@@ -6703,17 +6700,17 @@ impl Graph {
     /// inventory.  Nested roots are discovered through their outer root, then
     /// classified by their exact graph-relative path below; equal roots have no
     /// unambiguous owner and fail before any file is parsed or mutated.
-    fn managed_text_inventory_roots(
+    fn configured_text_inventory_roots(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
     ) -> io::Result<Vec<(&str, usize)>> {
-        let page_root = managed_root_components(&self.config.pages_dir).ok_or_else(bad_path)?;
+        let page_root = configured_root_components(&self.config.pages_dir).ok_or_else(bad_path)?;
         let journal_root =
-            managed_root_components(&self.config.journals_dir).ok_or_else(bad_path)?;
+            configured_root_components(&self.config.journals_dir).ok_or_else(bad_path)?;
         if page_root == journal_root {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "managed page and journal roots must not be equal",
+                "graph page and journal roots must not be equal",
             ));
         }
 
@@ -6724,14 +6721,14 @@ impl Graph {
         let mut resources = std::collections::BTreeMap::new();
         for (root, _) in configured.iter() {
             let sentinel = self.root.join(root).join(".tine-capability-inventory");
-            let target = match self.managed_target(permit, &sentinel, false) {
+            let target = match self.graph_text_target(permit, &sentinel, false) {
                 Ok(target) => target,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
             let resource = canonical_projection_directory_resource_id(target.parent())?;
             if let Some(first) = resources.insert(resource, (*root).to_owned()) {
-                return Err(managed_text_inventory_alias_error("roots", &first, root));
+                return Err(graph_text_inventory_alias_error("roots", &first, root));
             }
         }
         Ok(configured
@@ -6748,21 +6745,21 @@ impl Graph {
     /// Construct a list entry only after assigning the exact path's canonical
     /// longest-root owner. This is also the only ownership rule used by cache
     /// paths through `entry_for_path`.
-    fn managed_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
+    fn graph_text_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         if !is_page_file(path) {
             return Ok(None);
         }
         let rel_path = self.rel_path(path);
-        let managed_path = ManagedPath::parse(rel_path.clone()).map_err(|_| bad_path())?;
+        let graph_text_path = GraphTextPath::parse(rel_path.clone()).map_err(|_| bad_path())?;
         let mut entry = self
-            .managed_entry_for_managed_path(&managed_path)
+            .graph_text_entry_for_graph_text_path(&graph_text_path)
             .map_err(|_| bad_path())?;
         entry.rel_path = rel_path;
         entry.path = path.to_path_buf();
         Ok(Some(entry))
     }
 
-    fn managed_entry_for_path(&self, path: &Path) -> io::Result<Option<PageEntry>> {
+    fn graph_text_entry_for_path(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         self.graph_inventory_entry(path)
     }
 
@@ -6813,9 +6810,9 @@ impl Graph {
     /// This is intentionally provisional: callers with present bytes must use
     /// `decode_present_graph_text`, which parses content title properties before
     /// assigning kind. Directories never choose Page versus Journal.
-    fn provisional_graph_entry_for_managed_path(
+    fn provisional_graph_entry_for_graph_text_path(
         &self,
-        path: &ManagedPath,
+        path: &GraphTextPath,
     ) -> io::Result<PageEntry> {
         if !self.graph_text_scope.is_eligible(path.as_str()) {
             return Err(bad_path());
@@ -6829,7 +6826,7 @@ impl Graph {
     /// extraction and exact source-span parse.
     pub(crate) fn parse_external_document(
         &self,
-        path: &ManagedPath,
+        path: &GraphTextPath,
         bytes: &[u8],
     ) -> io::Result<ParsedExternalDocument> {
         let content = std::str::from_utf8(bytes).map_err(|_| {
@@ -6838,14 +6835,14 @@ impl Graph {
                 format!("graph text is not UTF-8: {path}"),
             )
         })?;
-        let fallback = self.provisional_graph_entry_for_managed_path(path)?;
+        let fallback = self.provisional_graph_entry_for_graph_text_path(path)?;
         parse_external_document(self, fallback, content)
     }
 
     #[cfg(test)]
     fn decode_present_graph_text(
         &self,
-        path: &ManagedPath,
+        path: &GraphTextPath,
         bytes: &[u8],
         permit: GraphTextParseBudgetPermit,
     ) -> io::Result<(PageEntry, Format)> {
@@ -6874,7 +6871,7 @@ impl Graph {
     /// before this method returns.
     fn decode_present_graph_text_with_node_count(
         &self,
-        path: &ManagedPath,
+        path: &GraphTextPath,
         bytes: &[u8],
         permit: GraphTextParseBudgetPermit,
     ) -> io::Result<(PageEntry, Format, u64)> {
@@ -6913,12 +6910,12 @@ impl Graph {
     /// (`convert-page-if-journal`) decides journal-ness by parsing that title
     /// as a date. The containing directory therefore never
     /// chooses Page versus Journal, and the exact nested spelling is retained.
-    pub(crate) fn managed_entry_for_managed_path(
+    pub(crate) fn graph_text_entry_for_graph_text_path(
         &self,
-        path: &ManagedPath,
+        path: &GraphTextPath,
     ) -> Result<PageEntry, UnsafeGraphTextPath> {
-        match self.classify_managed_text_path(path) {
-            Ok(ManagedTextKind::Page | ManagedTextKind::Journal) => {}
+        match self.classify_graph_text_path(path) {
+            Ok(GraphTextKind::Page | GraphTextKind::Journal) => {}
             Err(outside) => return self.unmanaged_graph_text_entry(path, outside),
         }
         self.graph_entry_for_relative_path(path.as_str())
@@ -6931,7 +6928,7 @@ impl Graph {
     /// configured-root rejection instead of gaining new authority here.
     fn unmanaged_graph_text_entry(
         &self,
-        path: &ManagedPath,
+        path: &GraphTextPath,
         outside: UnsafeGraphTextPath,
     ) -> Result<PageEntry, UnsafeGraphTextPath> {
         if !is_logseq_text_extension(path.extension())
@@ -6943,14 +6940,14 @@ impl Graph {
             .map_err(|_| UnsafeGraphTextPath(path.as_str().to_owned()))
     }
 
-    fn managed_find_entry(
+    fn graph_text_find_entry(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         name: &str,
         kind: PageKind,
     ) -> io::Result<Option<PageEntry>> {
         let mut matching = self
-            .managed_text_entries(permit, false)?
+            .configured_text_entries(permit, false)?
             .into_iter()
             .filter(|entry| entry.kind == kind && crate::refs::same_page(&entry.name, name));
         let Some(mut winner) = matching.next() else {
@@ -6964,9 +6961,9 @@ impl Graph {
         Ok(Some(winner))
     }
 
-    fn managed_has_twin(
+    fn graph_text_has_twin(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         name: &str,
         kind: PageKind,
     ) -> io::Result<bool> {
@@ -6987,23 +6984,23 @@ impl Graph {
         };
         let mut variants = 0;
         for path in configured_text_variant_paths(&dir, &stem) {
-            if self.managed_exists(permit, &path)? {
+            if self.graph_text_exists(permit, &path)? {
                 variants += 1;
             }
         }
         Ok(variants > 1)
     }
 
-    fn managed_path_for(
+    fn graph_text_path_for(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         name: &str,
         kind: PageKind,
     ) -> io::Result<PathBuf> {
         let preferred = self.preferred_format();
         match kind {
             PageKind::Journal => Ok(self
-                .managed_find_entry(permit, name, kind)?
+                .graph_text_find_entry(permit, name, kind)?
                 .map(|entry| entry.path)
                 .unwrap_or_else(|| {
                     let stem = self
@@ -7019,14 +7016,14 @@ impl Graph {
                 let primary = self
                     .pages_path()
                     .join(format!("{encoded}.{}", preferred.ext()));
-                if self.managed_exists(permit, &primary)? {
+                if self.graph_text_exists(permit, &primary)? {
                     return Ok(primary);
                 }
                 for alternate in configured_text_variant_paths(&self.pages_path(), &encoded) {
                     if alternate == primary {
                         continue;
                     }
-                    if self.managed_exists(permit, &alternate)? {
+                    if self.graph_text_exists(permit, &alternate)? {
                         return Ok(alternate);
                     }
                 }
@@ -7037,7 +7034,7 @@ impl Graph {
 
     fn managed_is_shadow_journal(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         date: crate::date::JournalDate,
     ) -> io::Result<bool> {
@@ -7051,16 +7048,16 @@ impl Graph {
         let canonical = self.journal_format.file_stem(date);
         let directory = self.journals_path();
         for path in configured_text_variant_paths(&directory, &canonical) {
-            if self.managed_exists(permit, &path)? {
+            if self.graph_text_exists(permit, &path)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    fn managed_path_is_cacheable(
+    fn graph_text_path_is_cacheable(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<bool> {
         if let Some(entry) = self.entry_for_path(path) {
@@ -7073,12 +7070,12 @@ impl Graph {
         Ok(true)
     }
 
-    fn managed_read_optional(
+    fn graph_text_read_optional(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<Vec<u8>>> {
-        let target = match self.managed_target(permit, path, false) {
+        let target = match self.graph_text_target(permit, path, false) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -7087,29 +7084,29 @@ impl Graph {
         read_projection_optional(target.parent(), &target.filename)
     }
 
-    fn managed_read_optional_text(
+    fn graph_text_read_optional_text(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<String>> {
-        self.managed_read_optional(permit, path)?
+        self.graph_text_read_optional(permit, path)?
             .map(|bytes| {
                 String::from_utf8(bytes).map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "managed text file is not valid UTF-8",
+                        "graph text file is not valid UTF-8",
                     )
                 })
             })
             .transpose()
     }
 
-    fn managed_read_optional_text_with_identity(
+    fn graph_text_read_optional_text_with_identity(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<(String, ContentDigest)>> {
-        let target = match self.managed_target(permit, path, false) {
+        let target = match self.graph_text_target(permit, path, false) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -7127,7 +7124,7 @@ impl Graph {
         let text = String::from_utf8(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "managed text file is not valid UTF-8",
+                "graph text file is not valid UTF-8",
             )
         })?;
         Ok(Some((text, identity)))
@@ -7136,12 +7133,12 @@ impl Graph {
     /// One-open coherent snapshot for a conflict authority decision. Unlike an
     /// ordinary read, this also performs the hard-refusal admission checks that
     /// must never mint override authority (portable alias and multiple links).
-    fn managed_read_optional_editor_conflict_snapshot(
+    fn graph_text_read_optional_editor_conflict_snapshot(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<(String, ContentDigest)>> {
-        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -7150,7 +7147,7 @@ impl Graph {
                 ),
             )
         })?;
-        let target = match self.managed_target(permit, path, false) {
+        let target = match self.graph_text_target(permit, path, false) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -7162,25 +7159,25 @@ impl Graph {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-        validate_graph_text_single_link(&file, managed_path.as_str())?;
+        validate_graph_text_single_link(&file, graph_text_path.as_str())?;
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
         let text = String::from_utf8(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "managed text file is not valid UTF-8",
+                "graph text file is not valid UTF-8",
             )
         })?;
         Ok(Some((text, identity)))
     }
 
-    fn managed_optional_file_identity(
+    fn graph_text_optional_file_identity(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<ContentDigest>> {
-        let target = match self.managed_target(permit, path, false) {
+        let target = match self.graph_text_target(permit, path, false) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -7198,21 +7195,21 @@ impl Graph {
     /// must not depend on unrelated page-name uniqueness.
     fn load_validated_graph_text_target(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         target: &Path,
     ) -> io::Result<Option<ExactGraphLoadedPage>> {
         let Some(entry) = self.graph_inventory_entry(target)? else {
             return Ok(None);
         };
         let Some((content, file_identity)) =
-            self.managed_read_optional_text_with_identity(permit, target)?
+            self.graph_text_read_optional_text_with_identity(permit, target)?
         else {
             return Ok(None);
         };
         #[cfg(test)]
         GRAPH_TEXT_VALIDATION_TARGET_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
-        if usize_to_u64(content.len())? > managed_text_inventory_limits().retained_content_bytes {
-            return Err(managed_text_inventory_limit_error("aggregate text bytes"));
+        if usize_to_u64(content.len())? > graph_text_inventory_limits().retained_content_bytes {
+            return Err(graph_text_inventory_limit_error("aggregate text bytes"));
         }
         let (entry, document, revision) = parse_exact_page(self, &entry, &content)?;
         Ok(Some(ExactGraphLoadedPage {
@@ -7229,12 +7226,12 @@ impl Graph {
     /// validation must not enumerate a large retained parent twice per save.
     fn validate_existing_graph_text_target_local(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         expected_identity: ContentDigest,
     ) -> io::Result<()> {
-        let target = self.managed_target(permit, path, false)?;
-        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+        let target = self.graph_text_target(permit, path, false)?;
+        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -7245,7 +7242,7 @@ impl Graph {
         })?;
         self.validate_existing_graph_text_target_exact(
             &target,
-            &managed_path,
+            &graph_text_path,
             Some(expected_identity),
         )?;
         Ok(())
@@ -7253,8 +7250,8 @@ impl Graph {
 
     fn validate_existing_graph_text_target_exact(
         &self,
-        target: &ManagedTextTarget,
-        managed_path: &ManagedPath,
+        target: &GraphTextTarget,
+        graph_text_path: &GraphTextPath,
         expected_identity: Option<ContentDigest>,
     ) -> io::Result<ContentDigest> {
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
@@ -7263,10 +7260,10 @@ impl Graph {
         if expected_identity.is_some_and(|expected| expected != identity) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "managed text target changed at the local identity validation boundary",
+                "graph text target changed at the local identity validation boundary",
             ));
         }
-        validate_graph_text_single_link(&file, managed_path.as_str())?;
+        validate_graph_text_single_link(&file, graph_text_path.as_str())?;
         Ok(identity)
     }
 
@@ -7276,8 +7273,8 @@ impl Graph {
     /// unrelated subtree or reading graph-text bytes.
     fn validate_graph_text_portable_aliases_path_local(
         &self,
-        permit: &ManagedTextWritePermit,
-        managed_path: &ManagedPath,
+        permit: &GraphTextWritePermit,
+        graph_text_path: &GraphTextPath,
         strict_creation: bool,
     ) -> io::Result<()> {
         #[cfg(test)]
@@ -7288,15 +7285,13 @@ impl Graph {
             relative: String,
         }
 
-        let limits = managed_text_inventory_limits();
-        let components = managed_path.as_str().split('/').collect::<Vec<_>>();
+        let limits = graph_text_inventory_limits();
+        let components = graph_text_path.as_str().split('/').collect::<Vec<_>>();
         if components.len().saturating_sub(1) > limits.directory_depth {
-            return Err(managed_text_inventory_limit_error(
-                "managed directory depth",
-            ));
+            return Err(graph_text_inventory_limit_error("graph directory depth"));
         }
         let mut prefixes = vec![PortablePrefix {
-            directory: self.managed_permit_root(permit)?.try_clone()?,
+            directory: self.graph_text_permit_root(permit)?.try_clone()?,
             relative: String::new(),
         }];
         let mut all_entries = 0_usize;
@@ -7314,16 +7309,16 @@ impl Graph {
 
             for prefix in prefixes {
                 for entry in prefix.directory.entries()? {
-                    all_entries = all_entries.checked_add(1).ok_or_else(|| {
-                        managed_text_inventory_limit_error("all directory entries")
-                    })?;
+                    all_entries = all_entries
+                        .checked_add(1)
+                        .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
                     if all_entries > limits.all_entries {
-                        return Err(managed_text_inventory_limit_error("all directory entries"));
+                        return Err(graph_text_inventory_limit_error("all directory entries"));
                     }
                     let entry = entry?;
                     let name = entry.file_name();
                     let Some(name) = name.to_str() else {
-                        // ManagedPath is UTF-8 by contract, so this entry cannot
+                        // GraphTextPath is UTF-8 by contract, so this entry cannot
                         // share the requested portable component identity.
                         continue;
                     };
@@ -7332,16 +7327,12 @@ impl Graph {
                         .len()
                         .checked_add(usize::from(!prefix.relative.is_empty()))
                         .and_then(|length| length.checked_add(name.len()))
-                        .ok_or_else(|| {
-                            managed_text_inventory_limit_error("aggregate path bytes")
-                        })?;
+                        .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
                     path_bytes = path_bytes
                         .checked_add(usize_to_u64(relative_len)?)
-                        .ok_or_else(|| {
-                            managed_text_inventory_limit_error("aggregate path bytes")
-                        })?;
+                        .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
                     if path_bytes > limits.path_bytes {
-                        return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                        return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                     }
                     if !PortablePathKey::graph_text_component_matches(
                         name,
@@ -7370,7 +7361,7 @@ impl Graph {
                     }
 
                     if is_filename {
-                        if relative == managed_path.as_str()
+                        if relative == graph_text_path.as_str()
                             || !file_type.is_file()
                             || !self.graph_text_scope.is_eligible(&relative)
                         {
@@ -7385,7 +7376,7 @@ impl Graph {
                                         io::ErrorKind::AlreadyExists,
                                         format!(
                                             "graph text paths share one portable case/NFC identity: {relative} and {}",
-                                            managed_path.as_str()
+                                            graph_text_path.as_str()
                                         ),
                                     ),
                                 ));
@@ -7400,9 +7391,9 @@ impl Graph {
                     }
                     directory_count = directory_count
                         .checked_add(1)
-                        .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                        .ok_or_else(|| graph_text_inventory_limit_error("directory count"))?;
                     if directory_count > limits.directories {
-                        return Err(managed_text_inventory_limit_error("directory count"));
+                        return Err(graph_text_inventory_limit_error("directory count"));
                     }
                     if strict_creation && relative != requested_relative {
                         projection_real_directory(&prefix.directory, name)?;
@@ -7418,7 +7409,7 @@ impl Graph {
                         ));
                     }
                     if next.len() == limits.pending_directories {
-                        return Err(managed_text_inventory_limit_error("pending directories"));
+                        return Err(graph_text_inventory_limit_error("pending directories"));
                     }
                     projection_real_directory(&prefix.directory, name)?;
                     next.push(PortablePrefix {
@@ -7440,12 +7431,12 @@ impl Graph {
     /// cannot choose one without authenticated exact logical authority.
     fn validate_current_graph_text_collision_strict(
         &self,
-        _permit: &ManagedTextWritePermit,
+        _permit: &GraphTextWritePermit,
         target: &Path,
         target_identity: Option<ContentDigest>,
     ) -> io::Result<Arc<CompleteGraphTextAdmissionIndex>> {
         let target_relative = self.rel_path(target);
-        let target_path = ManagedPath::parse(target_relative.clone()).map_err(|error| {
+        let target_path = GraphTextPath::parse(target_relative.clone()).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -7564,7 +7555,7 @@ impl Graph {
     /// target-local and no-replace; ordinary creation never hashes the graph.
     fn direct_creation_proof(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         target: &Path,
         kind: PageKind,
         name: &str,
@@ -7593,7 +7584,7 @@ impl Graph {
             return Err(PageBuildOutcome::Failed.creation_error());
         };
 
-        let target = ManagedPath::parse(self.rel_path(target)).map_err(|error| {
+        let target = GraphTextPath::parse(self.rel_path(target)).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("guarded graph-text target is not portable: {error}"),
@@ -7871,7 +7862,7 @@ impl Graph {
     /// readable but every member is non-writable.
     fn validate_graph_text_target(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         target: &Path,
         requested_identity: Option<(PageKind, &str)>,
     ) -> io::Result<ExactGraphValidation> {
@@ -7923,28 +7914,28 @@ impl Graph {
         })
     }
 
-    fn managed_read_to_string(
+    fn graph_text_read_to_string(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<String> {
-        self.managed_read_optional_text(permit, path)?
+        self.graph_text_read_optional_text(permit, path)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 
-    fn managed_content_rev_matches(
+    fn graph_text_content_rev_matches(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         expected: &str,
     ) -> io::Result<bool> {
         if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid managed content revision",
+                "invalid graph content revision",
             ));
         }
-        let target = self.managed_target(permit, path, false)?;
+        let target = self.graph_text_target(permit, path, false)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let mut file = open_projection_file_nofollow(target.parent(), &target.filename)?;
         let mut hash = Sha256::new();
@@ -7961,7 +7952,7 @@ impl Graph {
             if total > MAX_PROJECTION_EVIDENCE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "managed revision evidence exceeds the reload bound",
+                    "graph revision evidence exceeds the reload bound",
                 ));
             }
             hash.update(&buffer[..read]);
@@ -7969,13 +7960,13 @@ impl Graph {
         Ok(format!("{:x}", hash.finalize()) == expected)
     }
 
-    fn managed_file_equals_bytes(
+    fn graph_text_file_equals_bytes(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         expected: &[u8],
     ) -> io::Result<bool> {
-        let target = self.managed_target(permit, path, false)?;
+        let target = self.graph_text_target(permit, path, false)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let mut file = open_projection_file_nofollow(target.parent(), &target.filename)?;
         if file.metadata()?.len() != expected.len() as u64 {
@@ -7998,14 +7989,14 @@ impl Graph {
         }
     }
 
-    fn managed_read_to_string_with_budget(
+    fn graph_text_read_to_string_with_budget(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         budget: &RetainedContentBudget,
         resource: &'static str,
     ) -> io::Result<BudgetedString> {
-        let target = self.managed_target(permit, path, false)?;
+        let target = self.graph_text_target(permit, path, false)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let (_file, bytes, mut reservation) = open_and_read_projection_regular_with_budget(
             target.parent(),
@@ -8017,15 +8008,15 @@ impl Graph {
         let value = String::from_utf8(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "managed text file is not valid UTF-8",
+                "graph text file is not valid UTF-8",
             )
         })?;
         reservation.resize(usize_to_u64(value.capacity())?, resource)?;
         Ok(BudgetedString { value, reservation })
     }
 
-    fn managed_exists(&self, permit: &ManagedTextWritePermit, path: &Path) -> io::Result<bool> {
-        let target = match self.managed_target(permit, path, false) {
+    fn graph_text_exists(&self, permit: &GraphTextWritePermit, path: &Path) -> io::Result<bool> {
+        let target = match self.graph_text_target(permit, path, false) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -8042,17 +8033,17 @@ impl Graph {
 
     fn validate_direct_creation_proof_before_mutation(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         proof: &DirectCreationProof,
     ) -> io::Result<()> {
-        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        if managed_path != proof.target {
+        if graph_text_path != proof.target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "creation proof does not bind one absent exact target",
@@ -8064,8 +8055,8 @@ impl Graph {
                 "effective page identity evidence changed before creation publication",
             ));
         }
-        self.validate_graph_text_portable_aliases_path_local(permit, &managed_path, true)?;
-        match self.managed_target(permit, path, false) {
+        self.validate_graph_text_portable_aliases_path_local(permit, &graph_text_path, true)?;
+        match self.graph_text_target(permit, path, false) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
             Ok(target) => match target.parent().symlink_metadata(&target.filename) {
@@ -8089,9 +8080,9 @@ impl Graph {
         Ok(())
     }
 
-    fn managed_atomic_create_with_proof(
+    fn graph_text_atomic_create_with_proof(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         bytes: &[u8],
         proof: DirectCreationProof,
@@ -8099,13 +8090,13 @@ impl Graph {
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
-        let target = self.managed_target(permit, path, true)?;
+        let target = self.graph_text_target(permit, path, true)?;
         // Parent creation is itself a mutation, so the first validation above
         // precedes it. Re-run only the path-local portable/no-follow boundary
         // after the chain exists; the graph-wide census remains singular.
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
-        managed_write_before_mutation_hook()?;
+        graph_text_write_before_mutation_hook()?;
         if self.graph_text_external_observation_pending() {
             let _ = target.parent().remove_file(&temp);
             return Err(io::Error::new(
@@ -8143,15 +8134,15 @@ impl Graph {
         self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path))
     }
 
-    fn managed_atomic_write_with_conflict(
+    fn graph_text_atomic_write_with_conflict(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         bytes: &[u8],
         create_new: bool,
         editor_episode: Option<&ConflictEditorEpisode>,
     ) -> io::Result<()> {
-        self.managed_atomic_write_validated(
+        self.graph_text_atomic_write_validated(
             permit,
             path,
             bytes,
@@ -8161,14 +8152,14 @@ impl Graph {
         )
     }
 
-    fn managed_atomic_write_from_transaction_inventory(
+    fn graph_text_atomic_write_from_transaction_inventory(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         bytes: &[u8],
         create_new: bool,
     ) -> io::Result<()> {
-        self.managed_atomic_write_validated(
+        self.graph_text_atomic_write_validated(
             permit,
             path,
             bytes,
@@ -8178,9 +8169,9 @@ impl Graph {
         )
     }
 
-    fn managed_atomic_write_validated(
+    fn graph_text_atomic_write_validated(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         bytes: &[u8],
         create_new: bool,
@@ -8192,9 +8183,9 @@ impl Graph {
                 let _ = self.guarded_graph_text_identity_index()?;
             }
             let expected_identity = self
-                .managed_optional_file_identity(permit, path)?
+                .graph_text_optional_file_identity(permit, path)?
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-            return self.managed_atomic_replace_bound(
+            return self.graph_text_atomic_replace_bound(
                 permit,
                 path,
                 bytes,
@@ -8213,7 +8204,7 @@ impl Graph {
         if validation == GraphTextPublicationValidation::CompleteIndex {
             let _ = self.guarded_graph_text_identity_index()?;
         }
-        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("guarded graph-text target is not portable: {error}"),
@@ -8222,27 +8213,27 @@ impl Graph {
         if validation == GraphTextPublicationValidation::TransactionInventory {
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
-                &managed_path,
+                &graph_text_path,
                 create_new,
             )?;
         }
-        let target = self.managed_target(permit, path, true)?;
+        let target = self.graph_text_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
-        managed_write_before_mutation_hook()?;
+        graph_text_write_before_mutation_hook()?;
         let validation_result = match validation {
             GraphTextPublicationValidation::CompleteIndex => self
                 .validate_current_graph_text_collision_strict(
                     permit,
                     path,
-                    self.managed_optional_file_identity(permit, path)?,
+                    self.graph_text_optional_file_identity(permit, path)?,
                 )
                 .map(|_| ()),
             GraphTextPublicationValidation::PathLocal
             | GraphTextPublicationValidation::TransactionInventory => (|| {
                 self.validate_graph_text_portable_aliases_path_local(
                     permit,
-                    &managed_path,
+                    &graph_text_path,
                     create_new,
                 )?;
                 match target.parent().symlink_metadata(&target.filename) {
@@ -8285,9 +8276,9 @@ impl Graph {
     /// same-directory hidden recovery name and the user's staged bytes remain in
     /// their own hidden staged-recovery name instead of any version being
     /// overwritten.
-    fn managed_atomic_replace_bound(
+    fn graph_text_atomic_replace_bound(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         path: &Path,
         bytes: &[u8],
         expected_identity: ContentDigest,
@@ -8300,8 +8291,8 @@ impl Graph {
         use std::sync::atomic::{AtomicU64, Ordering};
         static RECOVERY_SEQ: AtomicU64 = AtomicU64::new(0);
 
-        let target = self.managed_target(permit, path, false)?;
-        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+        let target = self.graph_text_target(permit, path, false)?;
+        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("guarded graph-text target is not portable: {error}"),
@@ -8309,7 +8300,7 @@ impl Graph {
         })?;
         if let Err(error) = self.validate_existing_graph_text_target_exact(
             &target,
-            &managed_path,
+            &graph_text_path,
             Some(expected_identity),
         ) {
             if editor_episode.is_some()
@@ -8333,7 +8324,7 @@ impl Graph {
         let staged_identity = match (|| {
             let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
             let identity = canonical_projection_file_resource_id(&staged_file)?;
-            validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
+            validate_graph_text_single_link(&staged_file, graph_text_path.as_str())?;
             Ok::<_, io::Error>(identity)
         })() {
             Ok(identity) => identity,
@@ -8362,11 +8353,11 @@ impl Graph {
             // Deterministic tests replace the target here: after normal-save's
             // final byte reread and after force-save's final retained-identity
             // validation, but before the first live-name mutation.
-            managed_write_before_mutation_hook()?;
-            self.validate_graph_text_portable_aliases_path_local(permit, &managed_path, false)?;
+            graph_text_write_before_mutation_hook()?;
+            self.validate_graph_text_portable_aliases_path_local(permit, &graph_text_path, false)?;
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
-                &managed_path,
+                &graph_text_path,
                 Some(expected_identity),
             ) {
                 if editor_episode.is_some()
@@ -8395,10 +8386,10 @@ impl Graph {
             if canonical_projection_file_resource_id(&live_file)? != expected_identity {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    "managed text target changed before durable retirement",
+                    "graph text target changed before durable retirement",
                 ));
             }
-            validate_graph_text_single_link(&live_file, managed_path.as_str())?;
+            validate_graph_text_single_link(&live_file, graph_text_path.as_str())?;
             drop(live_file);
             rename_noreplace(&target.filename, &recovery, &live_bytes)?;
             retired = true;
@@ -8406,7 +8397,7 @@ impl Graph {
             let (retired_file, retired_bytes) =
                 open_and_read_projection_regular(target.parent(), &recovery)?;
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
-            validate_graph_text_single_link(&retired_file, managed_path.as_str())?;
+            validate_graph_text_single_link(&retired_file, graph_text_path.as_str())?;
             drop(retired_file);
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
@@ -8415,10 +8406,10 @@ impl Graph {
                 retired_conflict_snapshot = Some((retired_bytes, retired_identity));
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    "managed text target changed at the identity-bound publication boundary",
+                    "graph text target changed at the identity-bound publication boundary",
                 ));
             }
-            managed_write_after_retire_hook()?;
+            graph_text_write_after_retire_hook()?;
 
             let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
             if canonical_projection_file_resource_id(&staged_file)? != staged_identity {
@@ -8427,7 +8418,7 @@ impl Graph {
                     "staged editor identity changed before publication",
                 ));
             }
-            validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
+            validate_graph_text_single_link(&staged_file, graph_text_path.as_str())?;
             drop(staged_file);
 
             if let Err(error) = rename_noreplace(&temp, &target.filename, bytes) {
@@ -8440,7 +8431,7 @@ impl Graph {
             journal_projection_after_publish_hook()?;
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
-                &managed_path,
+                &graph_text_path,
                 Some(staged_identity),
             ) {
                 if editor_episode.is_some()
@@ -8479,7 +8470,7 @@ impl Graph {
             }
             Err(primary) => {
                 if retired && !published {
-                    let restore = managed_write_before_restore_hook().and_then(|()| {
+                    let restore = graph_text_write_before_restore_hook().and_then(|()| {
                         let recovery_file =
                             open_projection_file_nofollow(target.parent(), &recovery)?;
                         if canonical_projection_file_resource_id(&recovery_file)?
@@ -8490,7 +8481,7 @@ impl Graph {
                                 "displaced target identity changed before restore",
                             ));
                         }
-                        validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
+                        validate_graph_text_single_link(&recovery_file, graph_text_path.as_str())?;
                         let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
                         match publication_authority {
                             EditorPublicationAuthority::DirectFile => {
@@ -8565,7 +8556,7 @@ impl Graph {
                                 ),
                                 Err(_) => io::Error::new(
                                     io::ErrorKind::InvalidData,
-                                    "managed text file is not valid UTF-8",
+                                    "graph text file is not valid UTF-8",
                                 ),
                             },
                             None => error,
@@ -8582,13 +8573,13 @@ impl Graph {
         }
     }
 
-    fn managed_move_noreplace(
+    fn graph_text_move_noreplace(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         source: &Path,
         destination: &Path,
     ) -> io::Result<()> {
-        self.managed_move_noreplace_validated(
+        self.graph_text_move_noreplace_validated(
             permit,
             source,
             destination,
@@ -8596,13 +8587,13 @@ impl Graph {
         )
     }
 
-    fn managed_move_noreplace_from_transaction_inventory(
+    fn graph_text_move_noreplace_from_transaction_inventory(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         source: &Path,
         destination: &Path,
     ) -> io::Result<()> {
-        self.managed_move_noreplace_validated(
+        self.graph_text_move_noreplace_validated(
             permit,
             source,
             destination,
@@ -8612,43 +8603,47 @@ impl Graph {
 
     /// Move one exact hidden file produced by the editor publication protocol.
     /// The retained source is validated directly rather than through
-    /// `ManagedPath`: hidden publication artifacts are not ordinary documents,
-    /// and recovery must not treat them as such. Note that `ManagedPath` itself
-    /// does NOT reject a leading-dot name — `is_managed_path` only requires a
+    /// `GraphTextPath`: hidden publication artifacts are not ordinary documents,
+    /// and recovery must not treat them as such. Note that `GraphTextPath` itself
+    /// does NOT reject a leading-dot name — `is_graph_text_path` only requires a
     /// non-empty stem and a graph-text extension — so this validation is the
     /// boundary, not a redundant second check.
-    /// `managed_path_accepts_leading_dot_name` in `oplog::receipt` keeps that
+    /// `graph_text_path_accepts_leading_dot_name` in `oplog::receipt` keeps that
     /// statement honest.
-    fn managed_move_editor_recovery_noreplace(
+    fn graph_text_move_editor_recovery_noreplace(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         source_path: &Path,
         destination_path: &Path,
     ) -> io::Result<ContentDigest> {
         let _identity = self.lock_graph_text_identity_mutation()?;
-        let destination_managed =
-            ManagedPath::parse(self.rel_path(destination_path)).map_err(|error| {
+        let destination_graph_text = GraphTextPath::parse(self.rel_path(destination_path))
+            .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("editor recovery destination is not portable: {error}"),
                 )
             })?;
-        self.validate_graph_text_portable_aliases_path_local(permit, &destination_managed, true)?;
+        self.validate_graph_text_portable_aliases_path_local(
+            permit,
+            &destination_graph_text,
+            true,
+        )?;
 
-        let source = self.managed_target(permit, source_path, false)?;
+        let source = self.graph_text_target(permit, source_path, false)?;
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
         let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
         let source_identity = canonical_projection_file_resource_id(&source_file)?;
         validate_graph_text_single_link(&source_file, &self.rel_path(source_path))?;
         drop(source_file);
 
-        let destination = self.managed_target(permit, destination_path, true)?;
+        let destination = self.graph_text_target(permit, destination_path, true)?;
         match destination.parent().symlink_metadata(&destination.filename) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
             Err(error) => return Err(error),
         }
-        managed_write_before_mutation_hook()?;
+        graph_text_write_before_mutation_hook()?;
         let rebound = open_projection_file_nofollow(source.parent(), &source.filename)?;
         if canonical_projection_file_resource_id(&rebound)? != source_identity {
             return Err(io::Error::new(
@@ -8657,13 +8652,17 @@ impl Graph {
             ));
         }
         validate_graph_text_single_link(&rebound, &self.rel_path(source_path))?;
-        self.validate_graph_text_portable_aliases_path_local(permit, &destination_managed, true)?;
+        self.validate_graph_text_portable_aliases_path_local(
+            permit,
+            &destination_graph_text,
+            true,
+        )?;
         match destination.parent().symlink_metadata(&destination.filename) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
             Err(error) => return Err(error),
         }
-        rename_managed_noreplace(
+        rename_graph_text_noreplace(
             source.parent(),
             &source.filename,
             destination.parent(),
@@ -8679,9 +8678,9 @@ impl Graph {
         Ok(source_identity)
     }
 
-    fn managed_move_noreplace_validated(
+    fn graph_text_move_noreplace_validated(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         source: &Path,
         destination: &Path,
         validation: GraphTextPublicationValidation,
@@ -8692,42 +8691,51 @@ impl Graph {
         }
         let source_path = source.to_path_buf();
         let destination_path = destination.to_path_buf();
-        let source_managed = ManagedPath::parse(self.rel_path(&source_path)).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("guarded graph-text source is not portable: {error}"),
-            )
-        })?;
-        let destination_managed =
-            ManagedPath::parse(self.rel_path(&destination_path)).map_err(|error| {
+        let source_graph_text =
+            GraphTextPath::parse(self.rel_path(&source_path)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("guarded graph-text source is not portable: {error}"),
+                )
+            })?;
+        let destination_graph_text = GraphTextPath::parse(self.rel_path(&destination_path))
+            .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("guarded graph-text destination is not portable: {error}"),
                 )
             })?;
         if validation != GraphTextPublicationValidation::CompleteIndex {
-            self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
-                &destination_managed,
+                &source_graph_text,
+                false,
+            )?;
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &destination_graph_text,
                 true,
             )?;
         }
-        let source = self.managed_target(permit, &source_path, false)?;
+        let source = self.graph_text_target(permit, &source_path, false)?;
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
-        let destination = self.managed_target(permit, &destination_path, true)?;
+        let destination = self.graph_text_target(permit, &destination_path, true)?;
         match destination.parent().symlink_metadata(&destination.filename) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
             Err(error) => return Err(error),
         }
-        managed_write_before_mutation_hook()?;
+        graph_text_write_before_mutation_hook()?;
         if validation != GraphTextPublicationValidation::CompleteIndex {
-            self.validate_graph_text_portable_aliases_path_local(permit, &source_managed, false)?;
-            self.validate_existing_graph_text_target_exact(&source, &source_managed, None)?;
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
-                &destination_managed,
+                &source_graph_text,
+                false,
+            )?;
+            self.validate_existing_graph_text_target_exact(&source, &source_graph_text, None)?;
+            self.validate_graph_text_portable_aliases_path_local(
+                permit,
+                &destination_graph_text,
                 true,
             )?;
             match destination.parent().symlink_metadata(&destination.filename) {
@@ -8736,7 +8744,7 @@ impl Graph {
                 Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
             }
         }
-        rename_managed_noreplace(
+        rename_graph_text_noreplace(
             source.parent(),
             &source.filename,
             destination.parent(),
@@ -8750,14 +8758,14 @@ impl Graph {
         ])
     }
 
-    fn managed_move_to_trash(
+    fn graph_text_move_to_trash(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         source: &Path,
         destination: &Path,
         trash: &Path,
     ) -> io::Result<()> {
-        self.managed_create_dir_all(permit, trash)
+        self.graph_text_create_dir_all(permit, trash)
             .map_err(|error| {
                 let display = trash.strip_prefix(&self.root).unwrap_or(trash).display();
                 io::Error::new(
@@ -8765,12 +8773,15 @@ impl Graph {
                     format!("could not prepare trash path {display}: {error}"),
                 )
             })?;
-        self.managed_move_noreplace(permit, source, destination)
+        self.graph_text_move_noreplace(permit, source, destination)
     }
 
     /// Capture exact current page bytes through the same retained graph
     /// capability used by the guarded writer.
-    pub(crate) fn read_projection_input(&self, path: &ManagedPath) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) fn read_projection_input(
+        &self,
+        path: &GraphTextPath,
+    ) -> io::Result<Option<Vec<u8>>> {
         require_projection_platform()?;
         let target = self.projection_page_target(path.as_str())?;
         let lock = self.page_lock(&target.absolute_path);
@@ -8786,13 +8797,13 @@ impl Graph {
     /// Classify one exact managed path against this graph's configured text
     /// roots. The longest component-boundary match wins; equal roots are
     /// ambiguous and therefore rejected instead of guessed.
-    pub(crate) fn classify_managed_text_path(
+    pub(crate) fn classify_graph_text_path(
         &self,
-        path: &ManagedPath,
-    ) -> Result<ManagedTextKind, UnsafeGraphTextPath> {
+        path: &GraphTextPath,
+    ) -> Result<GraphTextKind, UnsafeGraphTextPath> {
         let path_components = path.as_str().split('/').collect::<Vec<_>>();
-        let page_root = managed_root_components(&self.config.pages_dir);
-        let journal_root = managed_root_components(&self.config.journals_dir);
+        let page_root = configured_root_components(&self.config.pages_dir);
+        let journal_root = configured_root_components(&self.config.journals_dir);
         let Some(page_root) = page_root else {
             return Err(UnsafeGraphTextPath(path.as_str().to_owned()));
         };
@@ -8808,10 +8819,10 @@ impl Graph {
         let journal_matches = path_components.len() > journal_root.len()
             && path_components.starts_with(&journal_root);
         match (page_matches, journal_matches) {
-            (true, false) => Ok(ManagedTextKind::Page),
-            (false, true) => Ok(ManagedTextKind::Journal),
-            (true, true) if page_root.len() > journal_root.len() => Ok(ManagedTextKind::Page),
-            (true, true) if journal_root.len() > page_root.len() => Ok(ManagedTextKind::Journal),
+            (true, false) => Ok(GraphTextKind::Page),
+            (false, true) => Ok(GraphTextKind::Journal),
+            (true, true) if page_root.len() > journal_root.len() => Ok(GraphTextKind::Page),
+            (true, true) if journal_root.len() > page_root.len() => Ok(GraphTextKind::Journal),
             _ => Err(UnsafeGraphTextPath(path.as_str().to_owned())),
         }
     }
@@ -8851,7 +8862,7 @@ impl Graph {
                 DirectSaveFailureCode::PrecheckInterrupted,
                 io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "managed inventory changed during retained identity capture",
+                    "graph inventory changed during retained identity capture",
                 ),
             )
         }))
@@ -8862,7 +8873,7 @@ impl Graph {
         limits: InitialShadowLimits,
     ) -> io::Result<(InitialShadowCapture, u64)> {
         require_projection_platform()?;
-        let permit = self.admit_managed_text_writer()?;
+        let permit = self.admit_graph_text_writer()?;
         let first = collect_initial_shadow_managed_inventory_with_limits_inner(
             self, &permit, true, limits, 0, false, true,
         )?;
@@ -8881,7 +8892,7 @@ impl Graph {
                 DirectSaveFailureCode::PrecheckInterrupted,
                 io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "managed inventory changed during retained identity capture",
+                    "graph inventory changed during retained identity capture",
                 ),
             ));
         }
@@ -9071,7 +9082,7 @@ impl Graph {
         let eligible_path = self
             .graph_text_scope
             .is_eligible(relative)
-            .then(|| ManagedPath::parse(relative.to_owned()))
+            .then(|| GraphTextPath::parse(relative.to_owned()))
             .transpose()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let mut path_growth =
@@ -9176,7 +9187,7 @@ impl Graph {
         self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
         let eligible_path =
             if self.graph_text_scope.is_eligible(&relative) {
-                Some(ManagedPath::parse(relative.clone()).map_err(|error| {
+                Some(GraphTextPath::parse(relative.clone()).map_err(|error| {
                     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
                 })?)
             } else {
@@ -9226,7 +9237,7 @@ impl Graph {
                 (semantic, format)
             } else {
                 (
-                    self.managed_entry_for_managed_path(&path)
+                    self.graph_text_entry_for_graph_text_path(&path)
                         .map_err(|error| {
                             io::Error::new(io::ErrorKind::InvalidData, error.to_string())
                         })?,
@@ -9334,7 +9345,7 @@ impl Graph {
             .get(prepared.relative.as_str())
             .copied()
             == Some(true);
-        let prior_tombstone = ManagedPath::parse(prepared.relative.clone())
+        let prior_tombstone = GraphTextPath::parse(prepared.relative.clone())
             .ok()
             .is_some_and(|path| index.tombstones_by_exact_path.contains_key(&path));
         count_graph_text_admission_event_work(
@@ -9344,7 +9355,7 @@ impl Graph {
         );
         let _ = remove_graph_text_admission_path(index, &prepared.relative);
         let is_graph_text = prepared.eligible.is_some();
-        if let Ok(path) = ManagedPath::parse(prepared.relative.clone()) {
+        if let Ok(path) = GraphTextPath::parse(prepared.relative.clone()) {
             index.tombstones_by_exact_path.remove(&path);
         }
         index.permanent_bytes = checked_add_bytes(index.permanent_bytes, prepared.retained_growth)?;
@@ -9448,7 +9459,7 @@ impl Graph {
             Err(error) => return Err(error),
         }
         self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
-        let retained_growth = match target.managed_path.as_ref() {
+        let retained_growth = match target.graph_text_path.as_ref() {
             Some(path)
                 if index
                     .file_resource_by_exact_relative
@@ -9485,7 +9496,7 @@ impl Graph {
             graph_text_delta_reverse_members(index, &relative),
         );
         if let Some(tombstone) = remove_graph_text_admission_path(index, &relative) {
-            if let Ok(path) = ManagedPath::parse(relative.to_owned()) {
+            if let Ok(path) = GraphTextPath::parse(relative.to_owned()) {
                 index.tombstones_by_exact_path.insert(path, tombstone);
             }
             index.permanent_bytes =
@@ -9513,7 +9524,7 @@ impl Graph {
                 )
             })?
         } else {
-            &self.managed_write_binding()?.root
+            &self.graph_text_write_binding()?.root
         };
         let mut chain = vec![root.try_clone()?];
         for component in &target.parent_components {
@@ -9538,7 +9549,7 @@ impl Graph {
                 self.graph_text_scope_binding()?,
             )
         } else {
-            let binding = self.managed_write_binding()?;
+            let binding = self.graph_text_write_binding()?;
             (
                 binding.resource_id,
                 self.graph_text_scope
@@ -9568,7 +9579,7 @@ impl Graph {
         if projection_dir_identity(retained)? != projection_dir_identity(&rebound)? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "graph root changed during managed inventory capture",
+                "graph root changed during graph inventory capture",
             ));
         }
         Ok(())
@@ -9711,27 +9722,28 @@ impl Graph {
     /// authority.
     pub fn resolve_rel(&self, rel: &str) -> Option<PathBuf> {
         let abs = self.resolve_rel_lexical(rel)?;
-        if !path_stays_within_root(&self.root, &abs) || path_uses_managed_alias(&self.root, &abs) {
+        if !path_stays_within_root(&self.root, &abs) || path_uses_graph_text_alias(&self.root, &abs)
+        {
             return None;
         }
         Some(abs)
     }
 
-    fn resolve_managed_rel(
+    fn resolve_graph_text_rel(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         rel: &str,
     ) -> io::Result<Option<PathBuf>> {
-        self.managed_permit_root(permit)?;
+        self.graph_text_permit_root(permit)?;
         Ok(self.resolve_configured_rel_lexical(rel))
     }
 
     fn resolve_graph_rel_with_permit(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         rel: &str,
     ) -> io::Result<Option<PathBuf>> {
-        self.managed_permit_root(permit)?;
+        self.graph_text_permit_root(permit)?;
         Ok(self.resolve_rel_lexical(rel))
     }
 
@@ -9862,9 +9874,9 @@ impl Graph {
         {
             return Err(bad_path());
         }
-        let managed_path = ManagedPath::parse(relative.to_owned()).ok();
+        let graph_text_path = GraphTextPath::parse(relative.to_owned()).ok();
         if require_eligible
-            && (!self.graph_text_scope.is_eligible(relative) || managed_path.is_none())
+            && (!self.graph_text_scope.is_eligible(relative) || graph_text_path.is_none())
         {
             return Err(bad_path());
         }
@@ -9882,7 +9894,7 @@ impl Graph {
             parent_components.push((*component).to_owned());
         }
         Ok(GraphTextExactPath {
-            managed_path,
+            graph_text_path,
             parent_components,
             filename: filename.to_owned(),
         })
@@ -10076,48 +10088,43 @@ impl Graph {
             *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
             return entries;
         }
-        let entries = match self
-            .admit_retained_managed_text_writer()
-            .and_then(|permit| {
-                let entries = self.graph_text_entries(&permit)?;
-                let limits = managed_text_inventory_limits();
-                let mut raw_bytes = 0_u64;
-                let mut effective = Vec::with_capacity(entries.len());
-                let mut failures = Vec::new();
-                for entry in entries {
-                    let loaded =
-                        self.managed_read_optional_text_with_identity(&permit, &entry.path);
-                    let parsed = match loaded {
-                        Ok(Some((content, _))) => {
-                            raw_bytes = raw_bytes
-                                .checked_add(usize_to_u64(content.len())?)
-                                .ok_or_else(|| {
-                                    managed_text_inventory_limit_error("aggregate text bytes")
-                                })?;
-                            if raw_bytes > limits.retained_content_bytes {
-                                return Err(managed_text_inventory_limit_error(
-                                    "aggregate text bytes",
-                                ));
-                            }
-                            parse_exact_page(self, &entry, &content)
+        let entries = match self.admit_retained_graph_text_writer().and_then(|permit| {
+            let entries = self.graph_text_entries(&permit)?;
+            let limits = graph_text_inventory_limits();
+            let mut raw_bytes = 0_u64;
+            let mut effective = Vec::with_capacity(entries.len());
+            let mut failures = Vec::new();
+            for entry in entries {
+                let loaded = self.graph_text_read_optional_text_with_identity(&permit, &entry.path);
+                let parsed = match loaded {
+                    Ok(Some((content, _))) => {
+                        raw_bytes = raw_bytes
+                            .checked_add(usize_to_u64(content.len())?)
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate text bytes")
+                            })?;
+                        if raw_bytes > limits.retained_content_bytes {
+                            return Err(graph_text_inventory_limit_error("aggregate text bytes"));
                         }
-                        Ok(None) => {
-                            failures.push(format!(
-                                "{}: disappeared during graph text listing",
-                                entry.rel_path
-                            ));
-                            continue;
-                        }
-                        Err(error) => Err(error),
-                    };
-                    match parsed {
-                        Ok((entry, _, _)) => effective.push(entry),
-                        Err(_) => failures.push(entry.rel_path),
+                        parse_exact_page(self, &entry, &content)
                     }
+                    Ok(None) => {
+                        failures.push(format!(
+                            "{}: disappeared during graph text listing",
+                            entry.rel_path
+                        ));
+                        continue;
+                    }
+                    Err(error) => Err(error),
+                };
+                match parsed {
+                    Ok((entry, _, _)) => effective.push(entry),
+                    Err(_) => failures.push(entry.rel_path),
                 }
-                *self.page_index_failures.write().unwrap() = failures;
-                Ok(effective)
-            }) {
+            }
+            *self.page_index_failures.write().unwrap() = failures;
+            Ok(effective)
+        }) {
             Ok(entries) => entries,
             Err(error) => {
                 *self.page_index_failures.write().unwrap() =
@@ -10237,7 +10244,7 @@ impl Graph {
                     add(&mut seen, name);
                 }
             }
-            let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
+            let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_BLOCK_DEPTH] =
                 std::array::from_fn(|_| None);
             let mut len = usize::from(!doc.roots.is_empty());
             if len != 0 {
@@ -10262,7 +10269,7 @@ impl Graph {
                     add(&mut seen, name);
                 }
                 if !block.children.is_empty() {
-                    if len == MAX_MANAGED_BLOCK_DEPTH {
+                    if len == MAX_BLOCK_DEPTH {
                         // Cache documents normally pass the checked parser/admission
                         // boundary. Contain any forged or stale over-depth value:
                         // publish no partial result.
@@ -10291,7 +10298,7 @@ impl Graph {
                 .map(|(e, _)| e.clone())
                 .collect(),
             None => self
-                .admit_retained_managed_text_writer()
+                .admit_retained_graph_text_writer()
                 .and_then(|permit| self.graph_text_entries(&permit))
                 .unwrap_or_default()
                 .into_iter()
@@ -10396,8 +10403,8 @@ impl Graph {
     }
 
     pub fn migrate_journal_filenames_checked(&self) -> io::Result<usize> {
-        let write = self.admit_managed_text_writer()?;
-        let entries = self.managed_text_entries(&write, false)?;
+        let write = self.admit_graph_text_writer()?;
+        let entries = self.configured_text_entries(&write, false)?;
         let mut n = 0;
         for entry in entries
             .into_iter()
@@ -10405,10 +10412,10 @@ impl Graph {
         {
             let p = entry.path;
             if let Some(target) = self.journal_filename_migration_target(&p) {
-                if self.managed_exists(&write, &target)? {
+                if self.graph_text_exists(&write, &target)? {
                     continue;
                 }
-                if self.managed_move_noreplace(&write, &p, &target).is_ok() {
+                if self.graph_text_move_noreplace(&write, &p, &target).is_ok() {
                     n += 1;
                 }
             }
@@ -10792,7 +10799,7 @@ impl Graph {
         &self,
         rel: &str,
     ) -> io::Result<Option<crate::concord_queue::MarkerConflictDiff>> {
-        let path = ManagedPath::parse(rel.to_owned()).map_err(|_| bad_path())?;
+        let path = GraphTextPath::parse(rel.to_owned()).map_err(|_| bad_path())?;
         let Some(bytes) = self.read_projection_input(&path)? else {
             return Ok(None);
         };
@@ -10857,18 +10864,18 @@ impl Graph {
         base_rev: &str,
         pre_choice: &str,
     ) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         // Gate order (storage-sync-contract §3 invariant 9): the graph-global
         // identity gate is taken before any page lock. Inverting it deadlocks
         // every graph-text write in the process, not just this page.
         let _identity = self.lock_graph_text_identity_mutation()?;
         let path = self
-            .resolve_managed_rel(&write, rel)?
+            .resolve_graph_text_rel(&write, rel)?
             .ok_or_else(bad_path)?;
         let entry = self.entry_for_path(&path).ok_or_else(bad_path)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
-        let content = self.managed_read_to_string(&write, &path)?;
+        let content = self.graph_text_read_to_string(&write, &path)?;
         if content_rev(&content) != base_rev {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -10928,7 +10935,7 @@ impl Graph {
         };
         assign_doc_runtime_ids(&mut merged.roots, &entry.rel_path);
         let dto = page_dto_checked(&entry, &merged)?;
-        let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        let cacheable = self.graph_text_path_is_cacheable(&write, &path)?;
         // Keep the pre-resolution marker bytes recoverable (ADR 0007), the way
         // the sync-copy resolve already trashes its conflict copy. The marker
         // file is rewritten IN PLACE, so a byte-exact copy staged here is the
@@ -10970,7 +10977,7 @@ impl Graph {
         base_rev: Option<&str>,
         presented: ConflictOverride,
     ) -> io::Result<(PathBuf, Option<String>, Option<String>)> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let (path, _) = self.save_target(&write, page)?;
         let activation = page.activation.map(EditorActivation::from_u64);
         let episode = ConflictEditorEpisode {
@@ -11061,10 +11068,10 @@ impl Graph {
         page: &PageDto,
         base_text: Option<&str>,
     ) -> io::Result<crate::sync_diff::SyncConflictDiff> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let (path, _) = self.save_target(&write, page)?;
         let theirs_text = self
-            .managed_read_optional_editor_conflict_snapshot(&write, &path)?
+            .graph_text_read_optional_editor_conflict_snapshot(&write, &path)?
             .map(|(text, _)| text);
         let mine = page_dto_document(page)?;
         let theirs = parse_doc(&path, theirs_text.as_deref().unwrap_or_default());
@@ -11093,7 +11100,7 @@ impl Graph {
         decisions: &std::collections::HashMap<String, String>,
         pre_choice: &str,
     ) -> io::Result<PageDto> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         // Gate order (storage-sync-contract §3 invariant 9): the graph-global
         // identity gate is taken before any page lock. Inverting it deadlocks
         // every graph-text write in the process, not just this page.
@@ -11102,7 +11109,7 @@ impl Graph {
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
         let (theirs_text, expected_identity) = self
-            .managed_read_optional_editor_conflict_snapshot(&write, &path)?
+            .graph_text_read_optional_editor_conflict_snapshot(&write, &path)?
             .unzip();
         let current_disk_rev = theirs_text
             .as_deref()
@@ -11145,7 +11152,7 @@ impl Graph {
                     .map_err(merge_refused)?,
             },
         )?;
-        let cacheable = self.managed_path_is_cacheable(&write, &path)?;
+        let cacheable = self.graph_text_path_is_cacheable(&write, &path)?;
         let rev = self.write_page(
             &write,
             &resolved,
@@ -11213,7 +11220,7 @@ impl Graph {
         winner_rel: &str,
         conflict_rel: &str,
     ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
-        let winner = ManagedPath::parse(winner_rel.to_owned()).map_err(|_| bad_path())?;
+        let winner = GraphTextPath::parse(winner_rel.to_owned()).map_err(|_| bad_path())?;
         let Some(win_bytes) = self.read_projection_input(&winner)? else {
             return Ok(None);
         };
@@ -11274,8 +11281,8 @@ impl Graph {
         canonical_rel: &str,
         stray_rel: &str,
     ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
-        let canonical = ManagedPath::parse(canonical_rel.to_owned()).map_err(|_| bad_path())?;
-        let stray = ManagedPath::parse(stray_rel.to_owned()).map_err(|_| bad_path())?;
+        let canonical = GraphTextPath::parse(canonical_rel.to_owned()).map_err(|_| bad_path())?;
+        let stray = GraphTextPath::parse(stray_rel.to_owned()).map_err(|_| bad_path())?;
         let Some(canonical_bytes) = self.read_projection_input(&canonical)? else {
             return Ok(None);
         };
@@ -11377,7 +11384,7 @@ impl Graph {
         if !path_is_sync_conflict(&conflict) {
             return Ok(None);
         }
-        let path = ManagedPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
+        let path = GraphTextPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
         self.read_projection_input(&path)?
             .map(String::from_utf8)
             .transpose()
@@ -11398,7 +11405,7 @@ impl Graph {
             return Err(bad_path());
         }
         self.ensure_within_graph_root(&source)?;
-        let path = ManagedPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
+        let path = GraphTextPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
         if self.read_projection_input(&path)?.as_deref() != Some(expected) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -11464,16 +11471,16 @@ impl Graph {
         merge_base_rev: Option<&str>,
         pre_choice: &str,
     ) -> io::Result<PageDto> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         // Gate order (storage-sync-contract §3 invariant 9): the graph-global
         // identity gate is taken before any page lock. Inverting it deadlocks
         // every graph-text write in the process, not just this page.
         let _identity = self.lock_graph_text_identity_mutation()?;
         let win = self
-            .resolve_managed_rel(&write, winner_rel)?
+            .resolve_graph_text_rel(&write, winner_rel)?
             .ok_or_else(bad_path)?;
         let conf = self
-            .resolve_managed_rel(&write, conflict_rel)?
+            .resolve_graph_text_rel(&write, conflict_rel)?
             .ok_or_else(bad_path)?;
         if win == conf {
             return Err(io::Error::new(
@@ -11485,8 +11492,8 @@ impl Graph {
         // Lock the winner so a concurrent editor/watcher write can't race the merge.
         let lock = self.page_lock(&win);
         let _guard = lock.lock().unwrap();
-        let win_content = self.managed_read_to_string(&write, &win)?;
-        let conf_content = self.managed_read_to_string(&write, &conf)?;
+        let win_content = self.graph_text_read_to_string(&write, &win)?;
+        let conf_content = self.graph_text_read_to_string(&write, &conf)?;
         // base_rev guard — the winner must still be what the UI diffed against.
         if content_rev(&win_content) != base_rev {
             return Err(io::Error::new(
@@ -11563,16 +11570,16 @@ impl Graph {
         assign_doc_runtime_ids(&mut merged.roots, &win_entry.rel_path);
         let mut dto = page_dto_checked(&win_entry, &merged)?;
         dto.path = win_entry.rel_path.clone();
-        let win_cacheable = self.managed_path_is_cacheable(&write, &win)?;
+        let win_cacheable = self.graph_text_path_is_cacheable(&write, &win)?;
         // Stage-before-commit (L5): move the conflict copy out first, then write the
         // merged winner; roll the move back if the write fails.
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.managed_create_dir_all(&write, &trash)?;
+        self.graph_text_create_dir_all(&write, &trash)?;
         let conf_name = conf.file_name().and_then(|s| s.to_str()).unwrap_or("file");
         let staged = trash.join(format!("{}__{conf_name}", trash_stamp()));
-        self.managed_move_noreplace(&write, &conf, &staged)?;
-        if self.managed_read_to_string(&write, &staged)? != conf_content {
-            let _ = self.managed_move_noreplace(&write, &staged, &conf);
+        self.graph_text_move_noreplace(&write, &conf, &staged)?;
+        if self.graph_text_read_to_string(&write, &staged)? != conf_content {
+            let _ = self.graph_text_move_noreplace(&write, &staged, &conf);
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "conflict copy changed during merge",
@@ -11591,8 +11598,8 @@ impl Graph {
         ) {
             Ok(rev) => rev,
             Err(error) => {
-                let _ = managed_write_during_rollback_hook();
-                let _ = self.managed_move_noreplace(&write, &staged, &conf);
+                let _ = graph_text_write_during_rollback_hook();
+                let _ = self.graph_text_move_noreplace(&write, &staged, &conf);
                 return Err(error);
             }
         };
@@ -11639,7 +11646,7 @@ impl Graph {
     /// the affordance for reconciling a duplicate day. Refuses a path separator so
     /// it can't reach outside `journals/`.
     pub fn trash_journal_file(&self, name: &str) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         if name.is_empty() || name.contains('/') || name.contains('\\') {
             return Err(io::Error::new(
@@ -11648,7 +11655,7 @@ impl Graph {
             ));
         }
         let src = self.journals_path().join(name);
-        if !self.managed_exists(&write, &src)? {
+        if !self.graph_text_exists(&write, &src)? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no such journal file",
@@ -11656,7 +11663,7 @@ impl Graph {
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Journal);
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
-        self.managed_move_to_trash(&write, &src, &dest, &trash)?;
+        self.graph_text_move_to_trash(&write, &src, &dest, &trash)?;
         Ok(())
     }
 
@@ -11670,13 +11677,13 @@ impl Graph {
     /// in the pre-block is dropped. The src is trashed ONLY after `dst` is durably
     /// written.
     pub fn merge_pages(&self, src_rel: &str, dst_rel: &str) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let src = self
-            .resolve_managed_rel(&write, src_rel)?
+            .resolve_graph_text_rel(&write, src_rel)?
             .ok_or_else(bad_path)?;
         let dst = self
-            .resolve_managed_rel(&write, dst_rel)?
+            .resolve_graph_text_rel(&write, dst_rel)?
             .ok_or_else(bad_path)?;
         if src == dst {
             return Err(io::Error::new(
@@ -11696,8 +11703,8 @@ impl Graph {
         // current for write_page's recheck).
         let lock = self.page_lock(&dst);
         let _guard = lock.lock().unwrap();
-        let src_content = self.managed_read_to_string(&write, &src)?;
-        let dst_content = self.managed_read_to_string(&write, &dst)?;
+        let src_content = self.graph_text_read_to_string(&write, &src)?;
+        let dst_content = self.graph_text_read_to_string(&write, &dst)?;
         if Format::from_path(&dst) == Format::Org
             && (!crate::org::org_editable(&dst_content) || !crate::org::org_editable(&src_content))
         {
@@ -11744,7 +11751,7 @@ impl Graph {
         merged.roots.extend(src_doc.roots);
         assign_doc_runtime_ids(&mut merged.roots, &dst_entry.rel_path);
         let dto = page_dto_checked(&dst_entry, &merged)?;
-        let dst_cacheable = self.managed_path_is_cacheable(&write, &dst)?;
+        let dst_cacheable = self.graph_text_path_is_cacheable(&write, &dst)?;
         // L5: stage `src` into the trash BEFORE committing the merged `dst`. The old
         // order (write dst, then trash src) duplicated blocks on a retry when
         // trashing failed: dst already held src's blocks while src survived on disk,
@@ -11759,12 +11766,12 @@ impl Graph {
                 _ => TrashEntryKind::Page,
             },
         );
-        self.managed_create_dir_all(&write, &trash)?;
+        self.graph_text_create_dir_all(&write, &trash)?;
         let src_name = src.file_name().and_then(|s| s.to_str()).unwrap_or("file");
         let staged = trash.join(format!("{}__{src_name}", trash_stamp()));
-        self.managed_move_noreplace(&write, &src, &staged)?;
-        if self.managed_read_to_string(&write, &staged)? != src_content {
-            let _ = self.managed_move_noreplace(&write, &staged, &src);
+        self.graph_text_move_noreplace(&write, &src, &staged)?;
+        if self.graph_text_read_to_string(&write, &staged)? != src_content {
+            let _ = self.graph_text_move_noreplace(&write, &staged, &src);
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "source changed during merge",
@@ -11784,8 +11791,8 @@ impl Graph {
             None,
             dst_cacheable,
         ) {
-            let _ = managed_write_during_rollback_hook();
-            let _ = self.managed_move_noreplace(&write, &staged, &src);
+            let _ = graph_text_write_during_rollback_hook();
+            let _ = self.graph_text_move_noreplace(&write, &staged, &src);
             return Err(e);
         }
         Ok(())
@@ -11817,11 +11824,11 @@ impl Graph {
     /// references are NOT rewritten (a stray rarely has any); the file's own
     /// content is unchanged.
     pub fn rename_file_to_page(&self, src_rel: &str, new_name: &str) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let page_inventory_snapshot = self.current_page_inventory_snapshot();
         let src = self
-            .resolve_managed_rel(&write, src_rel)?
+            .resolve_graph_text_rel(&write, src_rel)?
             .ok_or_else(bad_path)?;
         let name = new_name.trim();
         if name.is_empty() {
@@ -11845,7 +11852,7 @@ impl Graph {
                 if entry.path == src {
                     continue;
                 }
-                if ManagedPath::parse(entry.rel_path.as_str()).is_err() {
+                if GraphTextPath::parse(entry.rel_path.as_str()).is_err() {
                     continue;
                 }
                 let Some(incumbent) = self.load_validated_graph_text_target(&write, &entry.path)?
@@ -11871,7 +11878,7 @@ impl Graph {
         }
         let enc = encode_page_name(name, self.config.file_name_format);
         for target in configured_text_variant_paths(&dir, &enc) {
-            if self.managed_exists(&write, &target)? {
+            if self.graph_text_exists(&write, &target)? {
                 return Err(DirectSaveError::into_io(
                     DirectSaveFailureCode::IdentityNameTaken,
                     io::Error::new(
@@ -11881,15 +11888,15 @@ impl Graph {
                 ));
             }
         }
-        self.managed_create_dir_all(&write, &dir)?;
+        self.graph_text_create_dir_all(&write, &dir)?;
         let dst = dir.join(format!("{enc}.{ext}"));
-        self.managed_move_noreplace(&write, &src, &dst)?;
+        self.graph_text_move_noreplace(&write, &src, &dst)?;
         // Reopen only the committed destination, not the graph: this binds the
         // inventory entry to the exact bytes that now own the new name even if an
         // external editor changed the retained source inode during the move.
         let updated_page_inventory =
             page_inventory_snapshot.and_then(|(mut inventory, mut failures)| {
-                let content = self.managed_read_to_string(&write, &dst).ok()?;
+                let content = self.graph_text_read_to_string(&write, &dst).ok()?;
                 let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
                 let effective = parse_exact_page(self, &provisional, &content)
                     .ok()
@@ -11968,10 +11975,10 @@ impl Graph {
     /// Returns `true` when a file was created and `false` when an existing page
     /// won. Existing content is never overwritten.
     pub fn create_markdown_page_if_absent(&self, name: &str, content: &str) -> io::Result<bool> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         if self
-            .managed_find_entry(&write, name, PageKind::Page)?
+            .graph_text_find_entry(&write, name, PageKind::Page)?
             .is_some()
         {
             return Ok(false);
@@ -12002,13 +12009,13 @@ impl Graph {
             )
         })?;
         if self
-            .managed_find_entry(&write, name, PageKind::Page)?
+            .graph_text_find_entry(&write, name, PageKind::Page)?
             .is_some()
-            || self.managed_exists(&write, &path)?
+            || self.graph_text_exists(&write, &path)?
         {
             return Ok(false);
         }
-        match self.managed_atomic_create_with_proof(
+        match self.graph_text_atomic_create_with_proof(
             &write,
             &path,
             content.as_bytes(),
@@ -12024,7 +12031,7 @@ impl Graph {
             "{}.org",
             encode_page_name(name, self.config.file_name_format)
         ));
-        if self.managed_exists(&write, &alt)? {
+        if self.graph_text_exists(&write, &alt)? {
             // An Org twin appeared during publication. Withdraw only the exact
             // guide inode we just created. Stage the currently named inode first
             // and verify it in recovery, so an external replacement that wins at
@@ -12050,7 +12057,7 @@ impl Graph {
         // the second page can be created (GH #391, and the same family as the
         // negative Windows follow-up in GH #374).
         let Some((reread, identity)) =
-            self.managed_read_optional_text_with_identity(&write, &path)?
+            self.graph_text_read_optional_text_with_identity(&write, &path)?
         else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -12470,7 +12477,7 @@ impl Graph {
         // disk-move boundaries revoke explicitly elsewhere
         // (`observe_graph_text_external_paths`, `sync_file_checked`,
         // `forget_file`), so nothing is lost here. (GH #254 increment 3.)
-        let permit = self.admit_retained_managed_text_writer()?;
+        let permit = self.admit_retained_graph_text_writer()?;
         let Some(ExactGraphLoadedPage {
             entry: effective,
             document,
@@ -12517,7 +12524,7 @@ impl Graph {
         if self.entry_for_path(&abs).is_none() {
             return Ok(None);
         }
-        let permit = self.admit_retained_managed_text_writer()?;
+        let permit = self.admit_retained_graph_text_writer()?;
         let Some(ExactGraphLoadedPage {
             entry: effective,
             document,
@@ -12541,7 +12548,7 @@ impl Graph {
 
     /// Read and parse a page file into a [`Document`].
     pub fn read_document(&self, entry: &PageEntry) -> io::Result<Document> {
-        let permit = self.admit_retained_managed_text_writer()?;
+        let permit = self.admit_retained_graph_text_writer()?;
         self.load_validated_graph_text_target(&permit, &entry.path)?
             .map(|loaded| loaded.document)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
@@ -12549,10 +12556,10 @@ impl Graph {
 
     fn parse_page_entry_with_permit(
         &self,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         entry: PageEntry,
     ) -> PageParseResult {
-        let content = match self.managed_read_optional_text_with_identity(&permit, &entry.path) {
+        let content = match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
             Ok(Some((content, _))) => content,
             _ => return Err(entry.rel_path),
         };
@@ -12565,10 +12572,7 @@ impl Graph {
         })
     }
 
-    fn page_build_entries(
-        &self,
-        permit: &ManagedTextWritePermit,
-    ) -> Result<Vec<PageEntry>, String> {
+    fn page_build_entries(&self, permit: &GraphTextWritePermit) -> Result<Vec<PageEntry>, String> {
         #[cfg(test)]
         self.page_build_test
             .enumerations
@@ -12584,7 +12588,7 @@ impl Graph {
     /// The per-file work (read → content_rev → parse → assign uuids) is independent,
     /// so on a large graph we fan it across cores. Result order is irrelevant: the
     /// cache is searched by `(kind, name)`, never by position.
-    fn load_all_pages_with_permit(&self, permit: &ManagedTextWritePermit) -> PageCacheBuild {
+    fn load_all_pages_with_permit(&self, permit: &GraphTextWritePermit) -> PageCacheBuild {
         let entries = match self.page_build_entries(permit) {
             Ok(entries) => entries,
             Err(failure) => {
@@ -12696,7 +12700,7 @@ impl Graph {
         }
     }
 
-    fn repair_page_cache_once(&self, permit: &ManagedTextWritePermit) -> PageBuildOutcome {
+    fn repair_page_cache_once(&self, permit: &GraphTextWritePermit) -> PageBuildOutcome {
         let expected_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let (flight, owner) = self.claim_page_build(expected_generation);
         if !owner {
@@ -12792,7 +12796,7 @@ impl Graph {
             // Admission precedes flight ownership. Query callers retain their
             // historical retry semantics, while Direct creation uses the bounded
             // `repair_page_cache_once` entry point instead.
-            let permit = match self.admit_retained_managed_text_writer() {
+            let permit = match self.admit_retained_graph_text_writer() {
                 Ok(permit) => permit,
                 Err(_) => return f(&[]),
             };
@@ -12866,7 +12870,7 @@ impl Graph {
         else {
             return false;
         };
-        let Ok(permit) = self.admit_retained_managed_text_writer() else {
+        let Ok(permit) = self.admit_retained_graph_text_writer() else {
             return false;
         };
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
@@ -12879,7 +12883,7 @@ impl Graph {
             if cancelled() {
                 return false;
             }
-            match self.managed_read_optional_text_with_identity(&permit, &entry.path) {
+            match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
                 Ok(Some((content, _))) => {
                     let revision = content_rev(&content);
                     sources.push((entry, revision));
@@ -12927,7 +12931,7 @@ impl Graph {
     fn stream_warm_replacements(
         &self,
         projection: &crate::direct_projection::DirectProjection,
-        permit: &ManagedTextWritePermit,
+        permit: &GraphTextWritePermit,
         generation: u64,
         pages: Vec<PageEntry>,
         parse_config: Arc<crate::config::ParseConfig>,
@@ -12943,7 +12947,7 @@ impl Graph {
                 return projection.abandon_warm_stream(generation);
             }
             let fallback = entry.clone();
-            let item = match self.managed_read_optional_text_with_identity(permit, &entry.path) {
+            let item = match self.graph_text_read_optional_text_with_identity(permit, &entry.path) {
                 Ok(Some((content, _))) => {
                     #[cfg(test)]
                     self.page_build_test
@@ -13019,7 +13023,7 @@ impl Graph {
         if self.cache.read().unwrap().is_some() {
             return true; // already built (e.g. by a query) — nothing to warm
         }
-        let permit = match self.admit_retained_managed_text_writer() {
+        let permit = match self.admit_retained_graph_text_writer() {
             Ok(permit) => permit,
             Err(_) => return false,
         };
@@ -13058,7 +13062,7 @@ impl Graph {
                 self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
                 return false;
             }
-            match self.managed_read_optional_text_with_identity(&permit, &e.path) {
+            match self.graph_text_read_optional_text_with_identity(&permit, &e.path) {
                 Ok(Some((content, identity))) => {
                     let path = e.path.clone();
                     let revision = content_rev(&content);
@@ -13090,7 +13094,7 @@ impl Graph {
             return false;
         }
         for (path, identity, revision) in &baselines {
-            match self.managed_read_optional_text_with_identity(&permit, path) {
+            match self.graph_text_read_optional_text_with_identity(&permit, path) {
                 Ok(Some((content, current_identity)))
                     if current_identity == *identity && content_rev(&content) == *revision => {}
                 _ => {
@@ -14303,7 +14307,7 @@ impl Graph {
         new: &str,
         expected_path: Option<&str>,
     ) -> io::Result<RenameOutcome> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
         let new = new.trim();
@@ -14315,15 +14319,15 @@ impl Graph {
             return Ok(RenameOutcome::default()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
-        let mut content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        let entries = self.managed_text_entries_with_budget(&write, false, &content_budget)?;
+        let mut content_budget = RetainedContentBudget::new(graph_text_inventory_limits());
+        let entries = self.configured_text_entries_with_budget(&write, false, &content_budget)?;
         let page_inventory_snapshot = self.current_page_inventory_snapshot();
         self.validate_page_mutation_target(&write, &entries, old, PageKind::Page, expected_path)?;
         // M1: refuse to rename an ambiguous page (same-stem .md/.markdown/.org on
         // disk) — which twin moves, and which content is authoritative, is
         // undecidable here.
-        if self.managed_has_twin(&write, old, PageKind::Page)?
-            || self.managed_has_twin(&write, new, PageKind::Page)?
+        if self.graph_text_has_twin(&write, old, PageKind::Page)?
+            || self.graph_text_has_twin(&write, new, PageKind::Page)?
         {
             return Err(twin_error(old));
         }
@@ -14338,18 +14342,18 @@ impl Graph {
         // `work` -> `work1` turns `work/log` into `work1/log`, not `work1/work1log`.
         let mut rename_pairs: Vec<(String, String)> = Vec::new();
         let mut rename_pairs_charge =
-            RetainedHeapCharge::new(Some(&content_budget), "managed rename pair vector")?;
+            RetainedHeapCharge::new(Some(&content_budget), "graph rename pair vector")?;
         let mut moves: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut moves_charge =
-            RetainedHeapCharge::new(Some(&content_budget), "managed rename move vector")?;
+            RetainedHeapCharge::new(Some(&content_budget), "graph rename move vector")?;
         let mut move_destinations: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
         let mut move_destinations_charge =
-            RetainedHeapCharge::new(Some(&content_budget), "managed rename destination set")?;
+            RetainedHeapCharge::new(Some(&content_budget), "graph rename destination set")?;
         let mut move_identities: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut move_identities_charge =
-            RetainedHeapCharge::new(Some(&content_budget), "managed rename identity set")?;
+            RetainedHeapCharge::new(Some(&content_budget), "graph rename identity set")?;
         let mut primary_is_file = false;
         for entry in entries.iter() {
             if entry.kind != PageKind::Page {
@@ -14373,28 +14377,28 @@ impl Graph {
                     conservative_vec_entry_bytes::<(String, String)>()?,
                     checked_add_bytes(owned_string_upper_bound(&entry.name)?, new_name_bound)?,
                 )?,
-                "managed rename pair vector",
+                "graph rename pair vector",
             )?;
             moves_charge.grow(
                 checked_add_bytes(
                     conservative_vec_entry_bytes::<(PathBuf, PathBuf)>()?,
                     checked_add_bytes(owned_path_upper_bound(&entry.path)?, new_path_bound)?,
                 )?,
-                "managed rename move vector",
+                "graph rename move vector",
             )?;
             move_destinations_charge.grow(
                 checked_add_bytes(
                     conservative_hash_entry_bytes::<PathBuf, ()>()?,
                     new_path_bound,
                 )?,
-                "managed rename destination set",
+                "graph rename destination set",
             )?;
             move_identities_charge.grow(
                 checked_add_bytes(
                     conservative_hash_entry_bytes::<String, ()>()?,
                     new_name_bound,
                 )?,
-                "managed rename identity set",
+                "graph rename identity set",
             )?;
             let new_name = if is_primary {
                 new.to_string()
@@ -14423,7 +14427,7 @@ impl Graph {
                     ),
                 ));
             }
-            if new_path != entry.path && self.managed_exists(&write, &new_path)? {
+            if new_path != entry.path && self.graph_text_exists(&write, &new_path)? {
                 return Err(DirectSaveError::into_io(
                     DirectSaveFailureCode::IdentityNameTaken,
                     io::Error::new(io::ErrorKind::AlreadyExists, "target page exists"),
@@ -14434,7 +14438,7 @@ impl Graph {
             {
                 if other_format_target != entry.path
                     && other_format_target != new_path
-                    && self.managed_exists(&write, &other_format_target)?
+                    && self.graph_text_exists(&write, &other_format_target)?
                 {
                     return Err(DirectSaveError::into_io(
                         DirectSaveFailureCode::IdentityNameTaken,
@@ -14480,7 +14484,7 @@ impl Graph {
                         owned_string_upper_bound(new)?,
                     )?,
                 )?,
-                "managed rename pair vector",
+                "graph rename pair vector",
             )?;
             rename_pairs.push((old.to_string(), new.to_string()));
         }
@@ -14503,7 +14507,7 @@ impl Graph {
                 usize_to_u64(moves.len())?,
                 conservative_hash_entry_bytes::<PathBuf, PathBuf>()?,
             )?,
-            "managed rename move map table capacity",
+            "graph rename move map table capacity",
         )?;
         let move_dst: std::collections::HashMap<PathBuf, PathBuf> = moves.into_iter().collect();
         // The whole rename SET as a normalized(old) -> new map, so each graph file
@@ -14511,7 +14515,7 @@ impl Graph {
         // (one per `(old,new)` pair), which made a namespace rename O(graph_text * K)
         // and recomputed code ranges twice per pair per file (perf Codex#2).
         let mut rename_map_charge =
-            RetainedHeapCharge::new(Some(&content_budget), "managed rename rewrite map")?;
+            RetainedHeapCharge::new(Some(&content_budget), "graph rename rewrite map")?;
         for (old_name, new_name) in &rename_pairs {
             rename_map_charge.grow(
                 checked_add_bytes(
@@ -14521,7 +14525,7 @@ impl Graph {
                         owned_string_upper_bound(new_name)?,
                     )?,
                 )?,
-                "managed rename rewrite map",
+                "graph rename rewrite map",
             )?;
         }
         let rename_map: std::collections::HashMap<String, String> = rename_pairs
@@ -14531,20 +14535,20 @@ impl Graph {
         let mut edits: Vec<Edit> = Vec::new();
         let mut skipped_conflicted_referrers: Vec<String> = Vec::new();
         let mut edits_charge =
-            RetainedHeapCharge::new(Some(&content_budget), "managed rename edit vector")?;
+            RetainedHeapCharge::new(Some(&content_budget), "graph rename edit vector")?;
         for entry in entries.iter() {
-            let content = self.managed_read_to_string_with_budget(
+            let content = self.graph_text_read_to_string_with_budget(
                 &write,
                 &entry.path,
                 &mut content_budget,
-                "managed rename baseline bytes",
+                "graph rename baseline bytes",
             )?;
             let is_org = Format::from_path(&entry.path) == Format::Org;
             // One inline-ref pass + one `tags::` pass per file (each computes code
             // ranges once), regardless of how many descendants are being renamed.
             let mut inline_reservation = content_budget.reserve(
                 rename_rewrite_upper_bound(&content, &rename_map, is_org)?,
-                "managed rename inline rewrite construction bound",
+                "graph rename inline rewrite construction bound",
             )?;
             let inline = crate::refs::rename_refs_multi_with_format(
                 &content,
@@ -14554,16 +14558,16 @@ impl Graph {
             );
             inline_reservation.resize(
                 usize_to_u64(inline.capacity())?,
-                "managed rename inline rewrite bytes",
+                "graph rename inline rewrite bytes",
             )?;
             let mut updated_reservation = content_budget.reserve(
                 rename_rewrite_upper_bound(&inline, &rename_map, false)?,
-                "managed rename tags rewrite construction bound",
+                "graph rename tags rewrite construction bound",
             )?;
             let updated = crate::refs::rename_tags_property_multi(&inline, &rename_map, is_org);
             updated_reservation.resize(
                 usize_to_u64(updated.capacity())?,
-                "managed rename replacement bytes",
+                "graph rename replacement bytes",
             )?;
             drop(inline);
             drop(inline_reservation);
@@ -14601,7 +14605,7 @@ impl Graph {
                 reservation: original_reservation,
             } = content;
             let _base_rev_scratch =
-                content_budget.reserve(128, "managed rename revision string construction")?;
+                content_budget.reserve(128, "graph rename revision string construction")?;
             let base_rev = content_rev(&original);
             match move_dst.get(&entry.path) {
                 Some(dst) => {
@@ -14616,7 +14620,7 @@ impl Graph {
                                 )?,
                             )?,
                         )?,
-                        "managed rename edit vector",
+                        "graph rename edit vector",
                     )?;
                     edits.push(Edit {
                         src: entry.path.clone(),
@@ -14638,7 +14642,7 @@ impl Graph {
                                 owned_string_upper_bound(&base_rev)?,
                             )?,
                         )?,
-                        "managed rename edit vector",
+                        "graph rename edit vector",
                     )?;
                     edits.push(Edit {
                         src: entry.path.clone(),
@@ -14693,9 +14697,9 @@ impl Graph {
             }
         }
         let _lock_state_charge =
-            content_budget.reserve(lock_state_bound, "managed rename lock state")?;
+            content_budget.reserve(lock_state_bound, "graph rename lock state")?;
         let _rollback_state_charge =
-            content_budget.reserve(rollback_state_bound, "managed rename rollback state")?;
+            content_budget.reserve(rollback_state_bound, "graph rename rollback state")?;
         let mut lock_paths: Vec<PathBuf> = Vec::new();
         for e in &edits {
             lock_paths.push(e.src.clone());
@@ -14710,7 +14714,7 @@ impl Graph {
         // Phase 2 — re-verify nothing changed under us since Phase 0; abort (no
         // change) on any mismatch (an external editor / Syncthing pull landed).
         for e in &edits {
-            if e.is_move && e.dst != e.src && self.managed_exists(&write, &e.dst)? {
+            if e.is_move && e.dst != e.src && self.graph_text_exists(&write, &e.dst)? {
                 return Err(DirectSaveError::into_io(
                     DirectSaveFailureCode::IdentityNameTaken,
                     io::Error::new(io::ErrorKind::AlreadyExists, "target page exists"),
@@ -14720,7 +14724,7 @@ impl Graph {
             // it as empty could let an actually-empty baseline pass verification,
             // after which the transaction would overwrite a file we could no
             // longer inspect.
-            if !self.managed_content_rev_matches(&write, &e.src, &e.base_rev)? {
+            if !self.graph_text_content_rev_matches(&write, &e.src, &e.base_rev)? {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
             }
         }
@@ -14734,16 +14738,16 @@ impl Graph {
                 // Phase 2 can be far in the past for a large graph. Recheck this
                 // exact file immediately before its write so an external editor or
                 // sync pull that landed while earlier edits committed is preserved.
-                if !self.managed_content_rev_matches(&write, &e.src, &e.base_rev)? {
+                if !self.graph_text_content_rev_matches(&write, &e.src, &e.base_rev)? {
                     return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
                 }
                 self.note_self_write(&e.dst, content_rev(&e.new_content));
                 if e.is_move && e.dst != e.src {
                     if let Some(parent) = e.dst.parent() {
-                        self.managed_create_dir_all(&write, parent)?;
+                        self.graph_text_create_dir_all(&write, parent)?;
                     }
                 }
-                self.managed_atomic_write_from_transaction_inventory(
+                self.graph_text_atomic_write_from_transaction_inventory(
                     &write,
                     &e.dst,
                     e.new_content.as_bytes(),
@@ -14753,17 +14757,17 @@ impl Graph {
                 if e.is_move && e.dst != e.src {
                     rename_source_remove_failpoint()?;
                     let trash = typed_trash_dir(&self.root, TrashEntryKind::Page);
-                    self.managed_create_dir_all(&write, &trash)?;
+                    self.graph_text_create_dir_all(&write, &trash)?;
                     let src_name = e.src.file_name().and_then(|s| s.to_str()).unwrap_or("page");
                     let staged = trash.join(format!("{}__rename__{src_name}", trash_stamp()));
-                    self.managed_move_noreplace_from_transaction_inventory(
+                    self.graph_text_move_noreplace_from_transaction_inventory(
                         &write, &e.src, &staged,
                     )?;
                     written.last_mut().unwrap().1 = Some(staged.clone());
                     // If a sync replacement won just before the atomic move, the
                     // staged bytes no longer match our baseline. Abort and restore
                     // that exact inode instead of completing from stale content.
-                    if !self.managed_content_rev_matches(&write, &staged, &e.base_rev)? {
+                    if !self.graph_text_content_rev_matches(&write, &staged, &e.base_rev)? {
                         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
                     }
                 }
@@ -14774,18 +14778,18 @@ impl Graph {
             // Roll back in reverse, and drop the self-write markers for bytes that
             // won't survive the rollback so they can't later suppress a real
             // external change (M1).
-            let _ = managed_write_during_rollback_hook();
+            let _ = graph_text_write_during_rollback_hook();
             for (e, staged_source) in written.iter().rev() {
                 if e.is_move && e.dst != e.src {
                     let source_restored = match staged_source {
                         Some(staged) => {
-                            self.managed_move_noreplace_from_transaction_inventory(
+                            self.graph_text_move_noreplace_from_transaction_inventory(
                                 &write, staged, &e.src,
                             )
                             .is_ok()
-                                || self.managed_exists(&write, &e.src).unwrap_or(false)
+                                || self.graph_text_exists(&write, &e.src).unwrap_or(false)
                         }
-                        None => self.managed_exists(&write, &e.src).unwrap_or(false),
+                        None => self.graph_text_exists(&write, &e.src).unwrap_or(false),
                     };
                     if source_restored {
                         // Never compare and unlink the live destination. Detach
@@ -14802,11 +14806,11 @@ impl Graph {
                 } else {
                     let ours = content_rev(&e.new_content);
                     if self
-                        .managed_content_rev_matches(&write, &e.dst, &ours)
+                        .graph_text_content_rev_matches(&write, &e.dst, &ours)
                         .unwrap_or(false)
                     {
                         self.note_self_write(&e.dst, content_rev(&e.orig));
-                        let _ = self.managed_atomic_write_from_transaction_inventory(
+                        let _ = self.graph_text_atomic_write_from_transaction_inventory(
                             &write,
                             &e.dst,
                             e.orig.as_bytes(),
@@ -14886,13 +14890,13 @@ impl Graph {
         kind: PageKind,
         expected_path: Option<&str>,
     ) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         self.block_external_scope_mutation(&write, name, kind, expected_path, "delete")?;
-        let entries = self.managed_text_entries(&write, false)?;
+        let entries = self.configured_text_entries(&write, false)?;
         // M1: with same-stem .md/.markdown/.org twins, "which file?" is
         // ambiguous — refuse rather than trash an arbitrary one.
-        if self.managed_has_twin(&write, name, kind)? {
+        if self.graph_text_has_twin(&write, name, kind)? {
             return Err(twin_error(name));
         }
         let matching: Vec<_> = entries
@@ -14925,7 +14929,7 @@ impl Graph {
                 .and_then(|s| s.to_str())
                 .unwrap_or("page.md");
             let dest = trash.join(format!("{}__{fname}", trash_stamp()));
-            self.managed_move_to_trash(&write, &entry.path, &dest, &trash)?;
+            self.graph_text_move_to_trash(&write, &entry.path, &dest, &trash)?;
         }
         self.cache_remove(name, kind, removed);
         Ok(())
@@ -14933,7 +14937,7 @@ impl Graph {
 
     fn block_external_scope_mutation(
         &self,
-        _write: &ManagedTextWritePermit,
+        _write: &GraphTextWritePermit,
         name: &str,
         kind: PageKind,
         expected_path: Option<&str>,
@@ -14972,7 +14976,7 @@ impl Graph {
     /// semantics of rewriting `[[page]]` references remain ambiguous.
     fn validate_page_mutation_target(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         entries: &[PageEntry],
         name: &str,
         kind: PageKind,
@@ -14991,9 +14995,11 @@ impl Graph {
         let Some(expected) = expected_path.filter(|path| !path.trim().is_empty()) else {
             return Ok(());
         };
-        let expected_abs = self.resolve_managed_rel(write, expected)?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid expected page path")
-        })?;
+        let expected_abs = self
+            .resolve_graph_text_rel(write, expected)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid expected page path")
+            })?;
         let Some(entry) = matching.first() else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "stale page target"));
         };
@@ -15768,28 +15774,28 @@ impl Graph {
 
     fn existing_hls_page_path(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         key: &str,
     ) -> io::Result<Option<PathBuf>> {
         let name = crate::pdf::hls_page_name(key);
         let md = self.pages_path().join(format!("{name}.md"));
         let org = self.pages_path().join(format!("{name}.org"));
         match (
-            self.managed_exists(write, &md)?,
-            self.managed_exists(write, &org)?,
+            self.graph_text_exists(write, &md)?,
+            self.graph_text_exists(write, &org)?,
         ) {
             (true, true) => Err(twin_error(&name)),
             (true, false) => Ok(Some(md)),
             (false, true) => Ok(Some(org)),
             (false, false) => Ok(self
-                .managed_find_entry(write, &name, PageKind::Page)?
+                .graph_text_find_entry(write, &name, PageKind::Page)?
                 .map(|entry| entry.path)),
         }
     }
 
     fn hls_page_path(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         pdf_filename: &str,
         key: &str,
     ) -> io::Result<PathBuf> {
@@ -15840,7 +15846,7 @@ impl Graph {
     /// created. Old Tine-key artifacts remain in place until the established
     /// edit-time migration path can carry their notes forward safely.
     pub fn open_pdf(&self, pdf_filename: &str, label: &str) -> io::Result<crate::pdf::PdfState> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         // Gate order (storage-sync-contract §3 invariant 9): the graph-global
         // identity gate is taken before any page lock. Inverting it deadlocks
         // every graph-text write in the process, not just this page.
@@ -15857,7 +15863,7 @@ impl Graph {
         let legacy_page_exists = legacy_key != key
             && !self.retained_asset_key_in_use_by_pdf(&write, &legacy_key)?
             && self.existing_hls_page_path(&write, &legacy_key)?.is_some();
-        let page_baseline = self.managed_read_optional_text(&write, &page_path)?;
+        let page_baseline = self.graph_text_read_optional_text(&write, &page_path)?;
         if page_baseline.is_none() && !legacy_page_exists {
             let format = Format::from_path(&page_path);
             let page_doc = crate::pdf::hls_page_document_for_format(
@@ -15938,7 +15944,7 @@ impl Graph {
         page: i64,
         scale: f64,
     ) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let key = crate::pdf::asset_key(pdf_filename);
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let lock = self.page_lock(&page_path);
@@ -16012,14 +16018,14 @@ impl Graph {
     /// under its separate authority and is not rebound through the graph permit.
     fn retained_asset_key_in_use_by_pdf(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         candidate_key: &str,
     ) -> io::Result<bool> {
         if self.assets_root != self.root.join("assets") {
             return Ok(self.asset_key_in_use_by_pdf(candidate_key));
         }
         let sentinel = self.root.join("assets/.tine-capability-inventory");
-        let target = match self.managed_target(write, &sentinel, false) {
+        let target = match self.graph_text_target(write, &sentinel, false) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
@@ -16215,7 +16221,7 @@ impl Graph {
         highlights: &[crate::pdf::Highlight],
         base_ids: &[String],
     ) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         // Gate order (storage-sync-contract §3 invariant 9): the graph-global
         // identity gate is taken before any page lock. Inverting it deadlocks
         // every graph-text write in the process, not just this page.
@@ -16242,10 +16248,10 @@ impl Graph {
         // Read every artifact that will participate before committing either one.
         // If the notes page (or its legacy source) is unreadable, abort while the
         // sidecar is still untouched rather than leaving a half-updated pair.
-        let page_baseline = self.managed_read_optional_text(&write, &page_path)?;
+        let page_baseline = self.graph_text_read_optional_text(&write, &page_path)?;
         let legacy_page_baseline = if page_baseline.is_none() {
             match &legacy_page {
-                Some(path) => self.managed_read_optional_text(&write, path)?,
+                Some(path) => self.graph_text_read_optional_text(&write, path)?,
                 None => None,
             }
         } else {
@@ -16358,7 +16364,7 @@ impl Graph {
         // The hls page is a real page; reflect it in the search cache.
         let name = crate::pdf::hls_page_name(&key);
         let entry = self
-            .managed_find_entry(&write, &name, PageKind::Page)?
+            .graph_text_find_entry(&write, &name, PageKind::Page)?
             .unwrap_or(PageEntry {
                 name,
                 kind: PageKind::Page,
@@ -16378,21 +16384,22 @@ impl Graph {
         // legacy update stays at its original path. Unchanged files are moved to
         // recoverable trash rather than hard-deleted.
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
-            if self.managed_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
+            if self.graph_text_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
                 // Create the trash directory only when something is actually
                 // going into it. Unconditionally mkdir-ing it made every
                 // highlight save materialize `logseq/.tine-trash/conflict/` in a
                 // tree that may never need it (invariant 4).
                 let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-                self.managed_create_dir_all(&write, &trash)?;
+                self.graph_text_create_dir_all(&write, &trash)?;
                 let name = path
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("legacy.md");
                 let dest = trash.join(format!("{}__legacy__{name}", trash_stamp()));
-                if self.managed_move_noreplace(&write, path, &dest).is_ok() {
-                    if self.managed_read_optional_text(&write, &dest)?.as_ref() != Some(baseline) {
-                        let _ = self.managed_move_noreplace(&write, &dest, path);
+                if self.graph_text_move_noreplace(&write, path, &dest).is_ok() {
+                    if self.graph_text_read_optional_text(&write, &dest)?.as_ref() != Some(baseline)
+                    {
+                        let _ = self.graph_text_move_noreplace(&write, &dest, path);
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
                             "legacy highlight page changed during migration cleanup",
@@ -16412,7 +16419,7 @@ impl Graph {
     /// Map an on-disk `.md` path to its page entry (journal or page), or None if
     /// it isn't in the graph's journals/pages dirs.
     pub fn entry_for_path(&self, path: &Path) -> Option<PageEntry> {
-        self.managed_entry_for_path(path).ok().flatten()
+        self.graph_text_entry_for_path(path).ok().flatten()
     }
 
     /// True when an external filesystem event at `path` can change this graph's
@@ -16553,7 +16560,7 @@ impl Graph {
             return false;
         }
         exact_graph_text_event_after_candidate_hook();
-        let Ok(write) = self.admit_managed_text_writer() else {
+        let Ok(write) = self.admit_graph_text_writer() else {
             return false;
         };
         let Ok(_identity) = self.lock_graph_text_identity_mutation() else {
@@ -16563,11 +16570,11 @@ impl Graph {
         let Ok(_guard) = lock.lock() else {
             return false;
         };
-        let first = match self.managed_read_optional_text_with_identity(&write, path) {
+        let first = match self.graph_text_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
             _ => return false,
         };
-        let second = match self.managed_read_optional_text_with_identity(&write, path) {
+        let second = match self.graph_text_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
             _ => return false,
         };
@@ -16643,31 +16650,31 @@ impl Graph {
     /// recovery if another writer has already recreated the name.
     fn withdraw_file_to_conflict_if_exact(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         path: &Path,
         expected: &[u8],
         reason: &str,
     ) -> io::Result<bool> {
         withdrawal_race_hook(path)?;
-        if !self.managed_exists(write, path)? {
+        if !self.graph_text_exists(write, path)? {
             return Ok(false);
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.managed_create_dir_all(write, &trash)?;
+        self.graph_text_create_dir_all(write, &trash)?;
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("file");
         let staged = trash.join(format!("{}__{reason}__{name}", trash_stamp()));
-        match self.managed_move_noreplace(write, path, &staged) {
+        match self.graph_text_move_noreplace(write, path, &staged) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         }
-        let staged_matches = match self.managed_file_equals_bytes(write, &staged, expected) {
+        let staged_matches = match self.graph_text_file_equals_bytes(write, &staged, expected) {
             Ok(matches) => matches,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let _ = self.managed_move_noreplace(write, &staged, path);
+                let _ = self.graph_text_move_noreplace(write, &staged, path);
                 return Err(io::Error::from(io::ErrorKind::NotFound));
             }
             Err(error) => return Err(error),
@@ -16675,11 +16682,11 @@ impl Graph {
         if staged_matches {
             return Ok(true);
         }
-        match self.managed_move_noreplace(write, &staged, path) {
+        match self.graph_text_move_noreplace(write, &staged, path) {
             Ok(()) => Ok(false),
             // A new live winner appeared after staging. Keeping the displaced
             // inode in conflict trash preserves both versions.
-            Err(_) if self.managed_exists(write, path).unwrap_or(false) => Ok(false),
+            Err(_) if self.graph_text_exists(write, path).unwrap_or(false) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -16697,7 +16704,7 @@ impl Graph {
     /// the caller's cache_upsert, so it stays the caller's responsibility).
     fn commit_write<T>(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         path: &Path,
         content: &str,
         baseline: Option<&str>,
@@ -16711,7 +16718,7 @@ impl Graph {
         let result = (|| {
             if create_parent {
                 if let Some(parent) = path.parent() {
-                    self.managed_create_dir_all(write, parent)?;
+                    self.graph_text_create_dir_all(write, parent)?;
                 }
             }
             if recheck {
@@ -16719,7 +16726,8 @@ impl Graph {
                 // Only NotFound means "no baseline file". Permission errors, invalid
                 // UTF-8, and transient I/O failures must abort; collapsing them to
                 // None would authorize an overwrite of unreadable on-disk data.
-                let now = match self.managed_read_optional_editor_conflict_snapshot(write, path) {
+                let now = match self.graph_text_read_optional_editor_conflict_snapshot(write, path)
+                {
                     Ok(now) => now,
                     Err(error) if editor_episode.is_some() => {
                         return Err(Self::observation_failure_or_hard_refusal(
@@ -16783,7 +16791,7 @@ impl Graph {
 
     fn commit_editor_write(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         path: &Path,
         content: &str,
         baseline: Option<&str>,
@@ -16815,7 +16823,7 @@ impl Graph {
             create_parent,
             editor_episode,
             || match (expected_identity, creation_proof) {
-                (Some(identity), _) => self.managed_atomic_replace_bound(
+                (Some(identity), _) => self.graph_text_atomic_replace_bound(
                     write,
                     path,
                     content.as_bytes(),
@@ -16826,14 +16834,14 @@ impl Graph {
                     turn_short_id,
                 ),
                 (None, Some(creation_proof)) if baseline.is_none() => self
-                    .managed_atomic_create_with_proof(
+                    .graph_text_atomic_create_with_proof(
                         write,
                         path,
                         content.as_bytes(),
                         creation_proof,
                         editor_episode,
                     ),
-                (None, _) => self.managed_atomic_write_with_conflict(
+                (None, _) => self.graph_text_atomic_write_with_conflict(
                     write,
                     path,
                     content.as_bytes(),
@@ -16843,7 +16851,7 @@ impl Graph {
             },
         )?;
         editor_commit_before_final_reread_hook()?;
-        let reread = match self.managed_read_optional_editor_conflict_snapshot(write, path) {
+        let reread = match self.graph_text_read_optional_editor_conflict_snapshot(write, path) {
             Ok(reread) => reread,
             Err(error) if editor_episode.is_some() => {
                 return Err(Self::observation_failure_or_hard_refusal(
@@ -16879,7 +16887,7 @@ impl Graph {
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "managed text final reread does not match published bytes",
+                "graph text final reread does not match published bytes",
             ));
         }
         self.loaded_file_identities
@@ -16911,7 +16919,7 @@ impl Graph {
 
     /// Checked watcher entrypoint for an externally changed page file.
     pub fn sync_file_checked(&self, path: &Path) -> io::Result<Option<PageEntry>> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let lock = self.page_lock(path);
         let _guard = lock.lock().unwrap();
@@ -16944,19 +16952,19 @@ impl Graph {
         // unreadable or ambiguous path poisons the retained generation and the
         // next guarded write rebuilds instead of trusting stale ownership.
         let _ = self.update_guarded_graph_text_identity_paths(std::iter::once(path), true);
-        let (content, identity) = match self.managed_read_optional_text_with_identity(&write, path)
-        {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                self.record_watcher_identity_failure(path);
-                return Ok(None);
-            }
-            Err(error) => {
-                self.record_watcher_identity_failure(path);
-                return Err(error);
-            }
-        };
-        let current = match self.managed_read_optional_text_with_identity(&write, path) {
+        let (content, identity) =
+            match self.graph_text_read_optional_text_with_identity(&write, path) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    self.record_watcher_identity_failure(path);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.record_watcher_identity_failure(path);
+                    return Err(error);
+                }
+            };
+        let current = match self.graph_text_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
                 self.record_watcher_identity_failure(path);
@@ -16971,7 +16979,7 @@ impl Graph {
             self.record_watcher_identity_failure(path);
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "managed text watcher snapshot changed before reconciliation",
+                "graph text watcher snapshot changed before reconciliation",
             ));
         }
         self.remember_exact_graph_text_state(path, content_rev(&content), identity);
@@ -17009,7 +17017,7 @@ impl Graph {
     /// false "changed on disk".
     fn sync_file_content(
         &self,
-        write: Option<&ManagedTextWritePermit>,
+        write: Option<&GraphTextWritePermit>,
         path: &Path,
         content: &str,
         consume_self_write: bool,
@@ -17163,14 +17171,14 @@ impl Graph {
 
     /// Checked watcher path for an externally removed page file.
     pub fn sync_deleted_file(&self, path: &Path) -> io::Result<Option<PageEntry>> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         if self.entry_for_path(path).is_none() {
             return Ok(None);
         }
         let lock = self.page_lock(path);
         let guard = lock.lock().unwrap();
-        if self.managed_exists(&write, path)? {
+        if self.graph_text_exists(&write, path)? {
             return Ok(None);
         }
         let forgotten = self.forget_file(path);
@@ -17187,7 +17195,7 @@ impl Graph {
     /// the graph) or a `.md`+`.org` twin (ambiguous identity, M1).
     fn save_target(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         page: &PageDto,
     ) -> io::Result<(PathBuf, bool)> {
         if !page.path.is_empty() {
@@ -17207,7 +17215,7 @@ impl Graph {
             // this editor was promised. Landing on the stale pin would create
             // exactly the ambiguous twin that creation admission exists to refuse.
             if let Some(held) = self.prospective_activation_target(page) {
-                let resolved = self.managed_path_for(write, &page.name, page.kind)?;
+                let resolved = self.graph_text_path_for(write, &page.name, page.kind)?;
                 if resolved != held {
                     // Drift. Whether the new target is free or occupied, the
                     // editor's IDENTITY moves with it: the same person is still
@@ -17228,18 +17236,18 @@ impl Graph {
                     );
                     self.retarget_editor_activation(&held, &resolved, activation);
                 }
-                let cache = self.managed_path_is_cacheable(write, &resolved)?;
+                let cache = self.graph_text_path_is_cacheable(write, &resolved)?;
                 return Ok((resolved, cache));
             }
-            let cache = self.managed_path_is_cacheable(write, &path)?;
+            let cache = self.graph_text_path_is_cacheable(write, &path)?;
             return Ok((path, cache));
         }
         // M1: refuse to write an ambiguous page (both .md and .org on disk) — we
         // can't tell which file the editor's content belongs to.
-        if self.managed_has_twin(write, &page.name, page.kind)? {
+        if self.graph_text_has_twin(write, &page.name, page.kind)? {
             return Err(twin_error(&page.name));
         }
-        let path = self.managed_path_for(write, &page.name, page.kind)?;
+        let path = self.graph_text_path_for(write, &page.name, page.kind)?;
         Ok((path, true))
     }
 
@@ -17331,8 +17339,8 @@ impl Graph {
         // guard still decides whether bytes may land and mints any conflict under
         // this activation. Absent editors use `activate_absent_editor` instead.
         let matched_baseline = if let Some(expected_revision) = expected_revision {
-            let permit = self.admit_retained_managed_text_writer()?;
-            match self.managed_read_optional_text(&permit, &abs)? {
+            let permit = self.admit_retained_graph_text_writer()?;
+            match self.graph_text_read_optional_text(&permit, &abs)? {
                 Some(content) if content_rev(&content) == expected_revision => Some(content),
                 Some(_) => {
                     return Err(io::Error::new(
@@ -17395,8 +17403,8 @@ impl Graph {
         name: &str,
         kind: PageKind,
     ) -> io::Result<EditorActivationHandle> {
-        let permit = self.admit_managed_text_writer()?;
-        let abs = self.managed_path_for(&permit, name, kind)?;
+        let permit = self.admit_graph_text_writer()?;
+        let abs = self.graph_text_path_for(&permit, name, kind)?;
         let rel = self.rel_path(&abs);
         let mut state = self.editor_activations.lock().unwrap();
         state.next += 1;
@@ -17786,10 +17794,10 @@ impl Graph {
 
     fn validate_editor_conflict_portable_path(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<()> {
-        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -17798,12 +17806,12 @@ impl Graph {
                 ),
             )
         })?;
-        self.validate_graph_text_portable_aliases_path_local(write, &managed_path, false)
+        self.validate_graph_text_portable_aliases_path_local(write, &graph_text_path, false)
     }
 
     fn observe_editor_conflict(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         path: &Path,
         editor_episode: Option<&ConflictEditorEpisode>,
         site: EditorConflictSite,
@@ -17820,7 +17828,7 @@ impl Graph {
         if let Err(error) = conflict_observation_hook() {
             return Self::observation_failure_or_hard_refusal(site, error);
         }
-        match self.managed_read_optional_editor_conflict_snapshot(write, path) {
+        match self.graph_text_read_optional_editor_conflict_snapshot(write, path) {
             Ok(Some((bytes, resource_identity))) => {
                 let revision = content_rev(&bytes);
                 self.conflict_error_from_snapshot(
@@ -17895,7 +17903,7 @@ impl Graph {
             RECORD_SCHEMA,
         };
 
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let mut images: std::collections::BTreeMap<String, Vec<u8>> =
             std::collections::BTreeMap::new();
         let mut participants: Vec<MoveParticipant> = Vec::new();
@@ -17983,7 +17991,7 @@ impl Graph {
             eprintln!("attempted to persist an ephemeral bundled Guide page");
             return Ok("guide-ephemeral".into());
         }
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let (path, cache) = self.save_target(&write, page)?;
         // Serialize against any other writer of THIS page (a PDF highlight write
@@ -18123,7 +18131,7 @@ impl Graph {
         &self,
         page: &PageDto,
     ) -> io::Result<Option<ConflictOverride>> {
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let (path, _cache) = self.save_target(&write, page)?;
         let state = self.conflict_authority.lock().unwrap();
         Ok(state.tokens.get(&path).map(|token| ConflictOverride {
@@ -18167,7 +18175,7 @@ impl Graph {
             eprintln!("attempted to force-persist an ephemeral bundled Guide page");
             return Ok("guide-ephemeral".into());
         }
-        let write = self.admit_managed_text_writer()?;
+        let write = self.admit_graph_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
         let (path, cache) = self.save_target(&write, page)?;
         let lock = self.page_lock(&path);
@@ -18349,7 +18357,7 @@ impl Graph {
     /// what was written — no extra read).
     fn write_page(
         &self,
-        write: &ManagedTextWritePermit,
+        write: &GraphTextWritePermit,
         page: &PageDto,
         path: &Path,
         existing: Option<&str>,
@@ -18703,7 +18711,7 @@ fn newly_reclassified_page_property_line(existing: &str, proposed: &Document) ->
     }
 
     fn outline_property_lines<'a>(blocks: &'a [DocBlock], out: &mut Vec<&'a str>) {
-        let mut frames: [Option<std::slice::Iter<'a, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
+        let mut frames: [Option<std::slice::Iter<'a, DocBlock>>; MAX_BLOCK_DEPTH] =
             std::array::from_fn(|_| None);
         let mut len = usize::from(!blocks.is_empty());
         if len != 0 {
@@ -18725,8 +18733,8 @@ fn newly_reclassified_page_property_line(existing: &str, proposed: &Document) ->
                     .filter(|line| page_header_property(line)),
             );
             if !block.children.is_empty() {
-                if len == MAX_MANAGED_BLOCK_DEPTH {
-                    debug_assert!(false, "document nesting exceeded managed depth");
+                if len == MAX_BLOCK_DEPTH {
+                    debug_assert!(false, "document nesting exceeded graph depth");
                     continue;
                 }
                 frames[len] = Some(block.children.iter());
@@ -19426,7 +19434,7 @@ pub(crate) fn doc_runtime_id_for_order(owner_rel_path: &str, order_key: &str) ->
     let mut depth = 0;
     for component in order_key.split('/') {
         depth += 1;
-        if depth > MAX_MANAGED_BLOCK_DEPTH
+        if depth > MAX_BLOCK_DEPTH
             || component.len() != 8
             || !component
                 .bytes()
@@ -19454,7 +19462,7 @@ fn assign_runtime_ids_checked(blocks: &mut [DocBlock], parent: Uuid) -> io::Resu
         parent: Uuid,
         sibling: usize,
     }
-    let mut frames: [Option<Frame<'_>>; MAX_MANAGED_BLOCK_DEPTH] = std::array::from_fn(|_| None);
+    let mut frames: [Option<Frame<'_>>; MAX_BLOCK_DEPTH] = std::array::from_fn(|_| None);
     let mut len = usize::from(!blocks.is_empty());
     if len != 0 {
         frames[0] = Some(Frame {
@@ -19480,10 +19488,10 @@ fn assign_runtime_ids_checked(blocks: &mut [DocBlock], parent: Uuid) -> io::Resu
             block.uuid = structural.to_string();
         }
         if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
+            if len == MAX_BLOCK_DEPTH {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "managed page block nesting exceeds 128 levels",
+                    "graph page block nesting exceeds 128 levels",
                 ));
             }
             frames[len] = Some(Frame {
@@ -19648,7 +19656,7 @@ pub(crate) fn dto_blocks_to_doc_checked(
         next: usize,
         output: Vec<DocBlock>,
     }
-    let mut frames: [Option<Frame<'_>>; MAX_MANAGED_BLOCK_DEPTH] = std::array::from_fn(|_| None);
+    let mut frames: [Option<Frame<'_>>; MAX_BLOCK_DEPTH] = std::array::from_fn(|_| None);
     frames[0] = Some(Frame {
         source: blocks,
         next: 0,
@@ -19681,10 +19689,10 @@ pub(crate) fn dto_blocks_to_doc_checked(
         frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
         frame.output.push(dto_block_to_doc_block(block, is_org));
         if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
+            if len == MAX_BLOCK_DEPTH {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "managed page block nesting exceeds 128 levels",
+                    "graph page block nesting exceeds 128 levels",
                 ));
             }
             frames[len] = Some(Frame {
@@ -19711,7 +19719,7 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
         next: usize,
         output: Vec<BlockDto>,
     }
-    let mut frames: [Option<Frame<'_>>; MAX_MANAGED_BLOCK_DEPTH] = std::array::from_fn(|_| None);
+    let mut frames: [Option<Frame<'_>>; MAX_BLOCK_DEPTH] = std::array::from_fn(|_| None);
     frames[0] = Some(Frame {
         source: blocks,
         next: 0,
@@ -19752,10 +19760,10 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
             .output
             .push(doc_block_facets_dto(block, block.uuid.clone()));
         if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
+            if len == MAX_BLOCK_DEPTH {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "managed document nesting exceeds 128 levels",
+                    "graph document nesting exceeds 128 levels",
                 ));
             }
             frames[len] = Some(Frame {
@@ -19821,7 +19829,7 @@ pub(crate) fn existing_document_page_dto(
 ) -> io::Result<PageDto> {
     assign_virtual_doc_runtime_ids(
         &mut document.roots,
-        "managed-document-update-v1",
+        "graph-document-update-v1",
         if base.path.is_empty() {
             &base.name
         } else {
@@ -20089,7 +20097,7 @@ impl TrashEntryKind {
 
 /// Translate the storage crate's physical boundary into the Graph API's I/O
 /// boundary without losing the collision distinction needed by delete retries.
-fn managed_trash_filesystem_error(error: FilesystemError) -> io::Error {
+fn graph_text_trash_filesystem_error(error: FilesystemError) -> io::Error {
     match error {
         FilesystemError::Io(error) => error,
         FilesystemError::DurableNameOperationUnavailable(message) => {
@@ -20103,18 +20111,18 @@ fn managed_trash_filesystem_error(error: FilesystemError) -> io::Error {
         } => io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "managed recovery stored length mismatch for {path}: expected {expected}, got {actual}"
+                "graph recovery stored length mismatch for {path}: expected {expected}, got {actual}"
             ),
         ),
         FilesystemError::StoredFileTooLarge { path, length, limit } => io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "managed recovery stored file is too large for {path}: {length} bytes exceeds {limit}"
+                "graph recovery stored file is too large for {path}: {length} bytes exceeds {limit}"
             ),
         ),
         FilesystemError::ByteCollision => io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "managed recovery destination contains different bytes",
+            "graph recovery destination contains different bytes",
         ),
     }
 }
@@ -20700,7 +20708,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_publish(path, bytes, PublishMode::Replace)
 }
 
-fn managed_root_components(root: &str) -> Option<Vec<&str>> {
+fn configured_root_components(root: &str) -> Option<Vec<&str>> {
     if root.is_empty() || root.starts_with('/') || root.contains('\\') || root.contains('\0') {
         return None;
     }
@@ -20712,7 +20720,7 @@ fn managed_root_components(root: &str) -> Option<Vec<&str>> {
 }
 
 fn projection_component_is_portable(component: &str) -> bool {
-    managed_component_is_portable(component)
+    graph_text_component_is_portable(component)
 }
 
 #[cfg(any(
@@ -21124,19 +21132,19 @@ fn read_projection_optional_bound_capture_impl(
     let (opened, bytes) = match opened {
         Ok(result) => result,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            managed_inventory_read_hook()?;
+            graph_text_inventory_read_hook()?;
             return match dir.symlink_metadata(name) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "managed target appeared during absence capture",
+                    "graph target appeared during absence capture",
                 )),
                 Err(error) => Err(error),
             };
         }
         Err(error) => return Err(error),
     };
-    managed_inventory_read_hook()?;
+    graph_text_inventory_read_hook()?;
 
     let mut rebound = open_projection_file_nofollow(dir, name)?;
     if !projection_files_have_same_identity(&opened, &rebound)? {
@@ -21144,7 +21152,7 @@ fn read_projection_optional_bound_capture_impl(
             DirectSaveFailureCode::PrecheckInterrupted,
             io::Error::new(
                 io::ErrorKind::Interrupted,
-                "managed target was replaced or changed during capture",
+                "graph target was replaced or changed during capture",
             ),
         ));
     }
@@ -21163,7 +21171,7 @@ fn read_projection_optional_bound_capture_impl(
         if rebound_bytes > rebound_limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "managed target grew beyond the capture bound",
+                "graph target grew beyond the capture bound",
             ));
         }
         hasher.update(&buffer[..read]);
@@ -21172,7 +21180,7 @@ fn read_projection_optional_bound_capture_impl(
     if rebound_description != expected {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "managed target changed while its retained binding was validated",
+            "graph target changed while its retained binding was validated",
         ));
     }
     let file_resource_id = canonical_projection_file_resource_id(&opened)?;
@@ -21248,11 +21256,11 @@ const MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES: u64 = 64 * 1024 * 1024;
 /// Peak content retained while mutable managed-text preparation has both parsed
 /// and raw/projection representations alive. This matches the 512 MiB initial
 /// shadow raw-byte ceiling, while accounting for those simultaneous copies.
-const MAX_MANAGED_TEXT_RETAINED_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GRAPH_TEXT_RETAINED_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct InitialShadowLimits {
-    managed_files: usize,
+    graph_text_files: usize,
     raw_bytes: u64,
     directory_depth: usize,
     all_entries: usize,
@@ -21264,7 +21272,7 @@ struct InitialShadowLimits {
 }
 
 const INITIAL_SHADOW_LIMITS: InitialShadowLimits = InitialShadowLimits {
-    managed_files: MAX_INITIAL_SHADOW_MANAGED_FILES,
+    graph_text_files: MAX_INITIAL_SHADOW_MANAGED_FILES,
     raw_bytes: MAX_INITIAL_SHADOW_RAW_BYTES,
     directory_depth: MAX_INITIAL_SHADOW_DIRECTORY_DEPTH,
     all_entries: MAX_INITIAL_SHADOW_ALL_ENTRIES,
@@ -21279,8 +21287,8 @@ const INITIAL_SHADOW_LIMITS: InitialShadowLimits = InitialShadowLimits {
 /// initial-shadow limits so the later migration cannot be driven beyond the
 /// memory and traversal envelope already accepted for shadow capture.
 #[derive(Clone, Copy)]
-struct ManagedTextInventoryLimits {
-    managed_files: usize,
+struct GraphTextInventoryLimits {
+    graph_text_files: usize,
     directory_depth: usize,
     all_entries: usize,
     directories: usize,
@@ -21289,14 +21297,14 @@ struct ManagedTextInventoryLimits {
     retained_content_bytes: u64,
 }
 
-const MANAGED_TEXT_INVENTORY_LIMITS: ManagedTextInventoryLimits = ManagedTextInventoryLimits {
-    managed_files: MAX_INITIAL_SHADOW_MANAGED_FILES,
+const GRAPH_TEXT_INVENTORY_LIMITS: GraphTextInventoryLimits = GraphTextInventoryLimits {
+    graph_text_files: MAX_INITIAL_SHADOW_MANAGED_FILES,
     directory_depth: MAX_INITIAL_SHADOW_DIRECTORY_DEPTH,
     all_entries: MAX_INITIAL_SHADOW_ALL_ENTRIES,
     directories: MAX_INITIAL_SHADOW_DIRECTORIES,
     pending_directories: MAX_INITIAL_SHADOW_PENDING_DIRECTORIES,
     path_bytes: MAX_INITIAL_SHADOW_PATH_BYTES,
-    retained_content_bytes: MAX_MANAGED_TEXT_RETAINED_CONTENT_BYTES,
+    retained_content_bytes: MAX_GRAPH_TEXT_RETAINED_CONTENT_BYTES,
 };
 
 /// A single preparation budget spans mutable inventory consumers. Every
@@ -21327,9 +21335,9 @@ struct RetainedContentReservation {
 }
 
 impl RetainedContentBudget {
-    fn new(limits: ManagedTextInventoryLimits) -> Self {
+    fn new(limits: GraphTextInventoryLimits) -> Self {
         #[cfg(test)]
-        MANAGED_TEXT_BUDGET_LAST_PEAK.with(|peak| peak.set(0));
+        GRAPH_TEXT_BUDGET_LAST_PEAK.with(|peak| peak.set(0));
         Self {
             state: Rc::new(RetainedContentBudgetState {
                 limit: limits.retained_content_bytes,
@@ -21350,11 +21358,9 @@ impl RetainedContentBudget {
             .retained
             .get()
             .checked_add(bytes)
-            .ok_or_else(|| {
-                managed_text_inventory_limit_error("aggregate retained content bytes")
-            })?;
+            .ok_or_else(|| graph_text_inventory_limit_error("aggregate retained content bytes"))?;
         if candidate > self.state.limit {
-            return Err(managed_text_inventory_limit_error(
+            return Err(graph_text_inventory_limit_error(
                 "aggregate retained content bytes",
             ));
         }
@@ -21376,7 +21382,7 @@ impl RetainedContentBudget {
 #[cfg(test)]
 impl Drop for RetainedContentBudget {
     fn drop(&mut self) {
-        MANAGED_TEXT_BUDGET_LAST_PEAK.with(|peak| peak.set(self.state.peak.get()));
+        GRAPH_TEXT_BUDGET_LAST_PEAK.with(|peak| peak.set(self.state.peak.get()));
     }
 }
 
@@ -21390,10 +21396,10 @@ impl RetainedContentReservation {
                 .get()
                 .checked_add(increase)
                 .ok_or_else(|| {
-                    managed_text_inventory_limit_error("aggregate retained content bytes")
+                    graph_text_inventory_limit_error("aggregate retained content bytes")
                 })?;
             if candidate > self.state.limit {
-                return Err(managed_text_inventory_limit_error(
+                return Err(graph_text_inventory_limit_error(
                     "aggregate retained content bytes",
                 ));
             }
@@ -21405,7 +21411,7 @@ impl RetainedContentReservation {
             let retained = self.state.retained.get();
             assert!(
                 retained >= decrease,
-                "released unreserved managed content for {resource}"
+                "released unreserved graph content for {resource}"
             );
             self.state.retained.set(retained - decrease);
         }
@@ -21419,7 +21425,7 @@ impl Drop for RetainedContentReservation {
         let retained = self.state.retained.get();
         assert!(
             retained >= self.bytes,
-            "double release of managed content reservation"
+            "double release of graph content reservation"
         );
         self.state.retained.set(
             retained
@@ -21499,7 +21505,7 @@ impl AsRef<str> for BudgetedString {
 }
 
 fn allocation_overflow() -> io::Error {
-    managed_text_inventory_limit_error("aggregate retained content bytes")
+    graph_text_inventory_limit_error("aggregate retained content bytes")
 }
 
 fn checked_add_bytes(left: u64, right: u64) -> io::Result<u64> {
@@ -21591,7 +21597,7 @@ fn usize_to_u64(value: usize) -> io::Result<u64> {
 /// Managed page input is accepted only through depth 128. All operation-time
 /// nested walks use this fixed root-to-leaf frame ceiling, so traversal does
 /// not consume attacker-controlled call stack or an uncharged all-node stack.
-pub(crate) const MAX_MANAGED_BLOCK_DEPTH: usize = 128;
+pub(crate) const MAX_BLOCK_DEPTH: usize = 128;
 
 #[derive(Clone, Copy)]
 #[cfg(test)]
@@ -21603,7 +21609,7 @@ struct BlockDtoWalkFrame<'a> {
 
 #[cfg(test)]
 struct BlockDtoWalk<'a> {
-    frames: [BlockDtoWalkFrame<'a>; MAX_MANAGED_BLOCK_DEPTH],
+    frames: [BlockDtoWalkFrame<'a>; MAX_BLOCK_DEPTH],
     len: usize,
 }
 
@@ -21615,7 +21621,7 @@ impl<'a> BlockDtoWalk<'a> {
             next: 0,
             depth: 0,
         };
-        let mut frames = [empty; MAX_MANAGED_BLOCK_DEPTH];
+        let mut frames = [empty; MAX_BLOCK_DEPTH];
         let len = usize::from(!blocks.is_empty());
         if len != 0 {
             frames[0] = BlockDtoWalkFrame {
@@ -21641,10 +21647,10 @@ impl<'a> BlockDtoWalk<'a> {
             frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
             let depth = frame.depth;
             if !block.children.is_empty() {
-                if self.len == MAX_MANAGED_BLOCK_DEPTH {
+                if self.len == MAX_BLOCK_DEPTH {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "managed page block nesting exceeds 128 levels",
+                        "graph page block nesting exceeds 128 levels",
                     ));
                 }
                 self.frames[self.len] = BlockDtoWalkFrame {
@@ -21770,21 +21776,21 @@ struct ExactGraphValidation {
 }
 
 #[cfg(not(test))]
-fn managed_text_inventory_limits() -> ManagedTextInventoryLimits {
-    MANAGED_TEXT_INVENTORY_LIMITS
+fn graph_text_inventory_limits() -> GraphTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS
 }
 
 #[cfg(test)]
-fn managed_text_inventory_limits() -> ManagedTextInventoryLimits {
-    MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+fn graph_text_inventory_limits() -> GraphTextInventoryLimits {
+    GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
         override_limits
             .borrow()
-            .unwrap_or(MANAGED_TEXT_INVENTORY_LIMITS)
+            .unwrap_or(GRAPH_TEXT_INVENTORY_LIMITS)
     })
 }
 
 struct InitialShadowEntry {
-    path: ManagedPath,
+    path: GraphTextPath,
     bytes: Option<Vec<u8>>,
     description: BlobDescription,
     file_resource_id: ContentDigest,
@@ -21804,7 +21810,7 @@ struct InitialShadowCapture {
 
 fn collect_initial_shadow_managed_inventory_with_limits_inner(
     graph: &Graph,
-    _permit: &ManagedTextWritePermit,
+    _permit: &GraphTextWritePermit,
     retain_bytes: bool,
     limits: InitialShadowLimits,
     simultaneous_capture_bytes: u64,
@@ -21852,7 +21858,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             })?
             .try_clone()?
     } else {
-        graph.managed_write_binding()?.root.try_clone()?
+        graph.graph_text_write_binding()?.root.try_clone()?
     };
     let root_resource = canonical_projection_directory_resource_id(&directory)?;
     directories_by_exact_relative.insert(String::new(), root_resource);
@@ -21885,7 +21891,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             let name = name.to_str().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "managed text entry name is not UTF-8",
+                    "graph text entry name is not UTF-8",
                 )
             })?;
             let relative_len = relative
@@ -21942,9 +21948,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                     DirectSaveFailureCode::PrecheckSymlink,
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!(
-                            "managed text entry is a symlink or reparse point: {child_relative}"
-                        ),
+                        format!("graph text entry is a symlink or reparse point: {child_relative}"),
                     ),
                 ));
             }
@@ -21954,9 +21958,9 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                 }
                 let child_depth = depth
                     .checked_add(1)
-                    .ok_or_else(|| initial_shadow_limit_error("managed directory depth"))?;
+                    .ok_or_else(|| initial_shadow_limit_error("graph directory depth"))?;
                 if child_depth > limits.directory_depth {
-                    return Err(initial_shadow_limit_error("managed directory depth"));
+                    return Err(initial_shadow_limit_error("graph directory depth"));
                 }
                 directory_count = directory_count
                     .checked_add(1)
@@ -21971,7 +21975,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "managed directories alias one resource: {first} and {child_relative}"
+                            "graph directories alias one resource: {first} and {child_relative}"
                         ),
                     ));
                 }
@@ -21982,7 +21986,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                         DirectSaveFailureCode::PrecheckInterrupted,
                         io::Error::new(
                             io::ErrorKind::Interrupted,
-                            format!("managed directory changed during capture: {child_relative}"),
+                            format!("graph directory changed during capture: {child_relative}"),
                         ),
                     ));
                 }
@@ -21999,7 +22003,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             if !file_type.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("managed text entry is not a regular file: {child_relative}"),
+                    format!("graph text entry is not a regular file: {child_relative}"),
                 ));
             }
             let file = open_projection_file_nofollow(&directory, name)?;
@@ -22013,10 +22017,10 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             if !graph.graph_text_scope.is_eligible(&child_relative) {
                 continue;
             }
-            if entries.len() == limits.managed_files {
-                return Err(initial_shadow_limit_error("managed file count"));
+            if entries.len() == limits.graph_text_files {
+                return Err(initial_shadow_limit_error("graph file count"));
             }
-            let path = ManagedPath::parse(child_relative)
+            let path = GraphTextPath::parse(child_relative)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
             let remaining_raw = limits
                 .raw_bytes
@@ -22038,7 +22042,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::Interrupted,
-                        format!("managed entry disappeared during capture: {path}"),
+                        format!("graph entry disappeared during capture: {path}"),
                     )
                 })?;
             if retain_bytes {
@@ -22052,7 +22056,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             if captured_resource != file_resource {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    format!("managed entry changed after enumeration: {path}"),
+                    format!("graph entry changed after enumeration: {path}"),
                 ));
             }
             raw_bytes = raw_bytes
@@ -22078,7 +22082,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "initial shadow capture contains duplicate managed paths",
+            "initial shadow capture contains duplicate graph paths",
         ));
     }
     Ok(InitialShadowCapture {
@@ -22212,7 +22216,7 @@ fn build_graph_text_admission_index(
             graph.canonical_resource_id()?,
         )
     } else {
-        let binding = graph.managed_write_binding()?;
+        let binding = graph.graph_text_write_binding()?;
         (
             graph
                 .graph_text_scope
@@ -22343,7 +22347,7 @@ fn build_graph_text_admission_index(
                     .get(entry.path.as_str())
                     .cloned()
                     .map(Ok)
-                    .unwrap_or_else(|| graph.managed_entry_for_managed_path(&entry.path))
+                    .unwrap_or_else(|| graph.graph_text_entry_for_graph_text_path(&entry.path))
                     .map_err(|error| {
                         io::Error::new(io::ErrorKind::InvalidData, error.to_string())
                     })?,
@@ -22492,12 +22496,12 @@ fn graph_text_index_validation_scratch_upper_bound(
     let all_files = capture.file_link_count_by_exact_relative.len();
     let graph_text_files = capture.entries.len();
     for structural in [
-        persistent_map_build_path_peak_upper_bound::<ManagedPath, GraphTextAdmissionRecord>(
+        persistent_map_build_path_peak_upper_bound::<GraphTextPath, GraphTextAdmissionRecord>(
             graph_text_files,
         )?,
         persistent_map_build_path_peak_upper_bound::<
             PortablePathKey,
-            std::collections::BTreeSet<ManagedPath>,
+            std::collections::BTreeSet<GraphTextPath>,
         >(graph_text_files)?,
         persistent_map_build_path_peak_upper_bound::<
             ContentDigest,
@@ -22508,7 +22512,7 @@ fn graph_text_index_validation_scratch_upper_bound(
         persistent_map_build_path_peak_upper_bound::<String, bool>(all_files)?,
         persistent_map_build_path_peak_upper_bound::<
             (u8, String),
-            std::collections::BTreeSet<ManagedPath>,
+            std::collections::BTreeSet<GraphTextPath>,
         >(graph_text_files)?,
     ] {
         bytes = checked_add_bytes(bytes, structural)?;
@@ -22571,7 +22575,7 @@ fn graph_text_journal_title_format_budget(
 
 fn graph_text_observed_semantic_name_upper_bound(
     graph: &Graph,
-    path: &ManagedPath,
+    path: &GraphTextPath,
     content: &str,
 ) -> io::Result<GraphTextSemanticNameBudget> {
     let title_format = graph_text_journal_title_format_budget(graph)?;
@@ -22613,7 +22617,7 @@ fn graph_text_observed_semantic_name_upper_bound(
 
 fn guarded_graph_text_semantic_name_upper_bound(
     graph: &Graph,
-    path: &ManagedPath,
+    path: &GraphTextPath,
     _content_len: usize,
 ) -> io::Result<u64> {
     let title_format = graph_text_journal_title_format_budget(graph)?;
@@ -22639,7 +22643,7 @@ fn graph_text_file_record_worst_case_upper_bound(
     )?;
     let portable_key_len = checked_mul_bytes(path_len, 8)?;
     let semantic_key_len = checked_mul_bytes(semantic_name_len, 8)?;
-    let mut bytes = conservative_btree_entry_bytes::<ManagedPath, GraphTextAdmissionRecord>()?;
+    let mut bytes = conservative_btree_entry_bytes::<GraphTextPath, GraphTextAdmissionRecord>()?;
     bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(path_len)?)?;
     bytes = checked_add_bytes(bytes, usize_to_u64(std::mem::size_of::<PageEntry>())?)?;
     bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(semantic_name_len)?)?;
@@ -22647,28 +22651,29 @@ fn graph_text_file_record_worst_case_upper_bound(
     bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(absolute_len)?)?;
     bytes = checked_add_bytes(
         bytes,
-        conservative_btree_entry_bytes::<PortablePathKey, std::collections::BTreeSet<ManagedPath>>(
+        conservative_btree_entry_bytes::<PortablePathKey, std::collections::BTreeSet<GraphTextPath>>(
         )?,
     )?;
     bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(portable_key_len)?)?;
     bytes = checked_add_bytes(
         bytes,
-        graph_text_owned_btree_row_upper_bound::<ManagedPath, ()>(path_len)?,
+        graph_text_owned_btree_row_upper_bound::<GraphTextPath, ()>(path_len)?,
     )?;
     bytes = checked_add_bytes(
         bytes,
-        conservative_btree_entry_bytes::<(u8, String), std::collections::BTreeSet<ManagedPath>>()?,
+        conservative_btree_entry_bytes::<(u8, String), std::collections::BTreeSet<GraphTextPath>>(
+        )?,
     )?;
     bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(semantic_key_len)?)?;
     checked_add_bytes(
         bytes,
-        graph_text_owned_btree_row_upper_bound::<ManagedPath, ()>(path_len)?,
+        graph_text_owned_btree_row_upper_bound::<GraphTextPath, ()>(path_len)?,
     )
 }
 
 fn graph_text_parse_budget_permit(
     graph: &Graph,
-    path: &ManagedPath,
+    path: &GraphTextPath,
     content: &str,
 ) -> io::Result<GraphTextParseBudgetPermit> {
     let semantic_budget = graph_text_observed_semantic_name_upper_bound(graph, path, content)?;
@@ -22688,7 +22693,7 @@ fn graph_text_parse_budget_permit(
 
 fn graph_text_admission_upsert_retained_upper_bound(
     relative: &str,
-    path: Option<&ManagedPath>,
+    path: Option<&GraphTextPath>,
     semantic: Option<&PageEntry>,
 ) -> io::Result<u64> {
     let relative_len = usize_to_u64(relative.len())?;
@@ -22714,13 +22719,13 @@ fn graph_text_admission_upsert_retained_upper_bound(
     };
     bytes = checked_add_bytes(
         bytes,
-        conservative_btree_entry_bytes::<ManagedPath, GraphTextAdmissionRecord>()?,
+        conservative_btree_entry_bytes::<GraphTextPath, GraphTextAdmissionRecord>()?,
     )?;
     bytes = checked_add_bytes(bytes, owned_string_upper_bound(path.as_str())?)?;
     bytes = checked_add_bytes(bytes, graph_text_page_entry_retained_upper_bound(semantic)?)?;
     bytes = checked_add_bytes(
         bytes,
-        conservative_btree_entry_bytes::<PortablePathKey, std::collections::BTreeSet<ManagedPath>>(
+        conservative_btree_entry_bytes::<PortablePathKey, std::collections::BTreeSet<GraphTextPath>>(
         )?,
     )?;
     bytes = checked_add_bytes(
@@ -22729,17 +22734,18 @@ fn graph_text_admission_upsert_retained_upper_bound(
     )?;
     bytes = checked_add_bytes(
         bytes,
-        graph_text_owned_btree_row_upper_bound::<ManagedPath, ()>(relative_len)?,
+        graph_text_owned_btree_row_upper_bound::<GraphTextPath, ()>(relative_len)?,
     )?;
     let semantic_key = graph_text_semantic_key(semantic);
     bytes = checked_add_bytes(
         bytes,
-        conservative_btree_entry_bytes::<(u8, String), std::collections::BTreeSet<ManagedPath>>()?,
+        conservative_btree_entry_bytes::<(u8, String), std::collections::BTreeSet<GraphTextPath>>(
+        )?,
     )?;
     bytes = checked_add_bytes(bytes, owned_string_upper_bound(&semantic_key.1)?)?;
     bytes = checked_add_bytes(
         bytes,
-        graph_text_owned_btree_row_upper_bound::<ManagedPath, ()>(relative_len)?,
+        graph_text_owned_btree_row_upper_bound::<GraphTextPath, ()>(relative_len)?,
     )?;
     Ok(bytes)
 }
@@ -22749,7 +22755,7 @@ fn graph_text_admission_tombstone_upper_bound(
     record: Option<&GraphTextAdmissionRecord>,
 ) -> io::Result<u64> {
     let relative_len = usize_to_u64(relative.len())?;
-    let mut bytes = conservative_btree_entry_bytes::<ManagedPath, GraphTextAdmissionTombstone>()?;
+    let mut bytes = conservative_btree_entry_bytes::<GraphTextPath, GraphTextAdmissionTombstone>()?;
     bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(relative_len)?)?;
     if let Some(record) = record {
         bytes = checked_add_bytes(bytes, page_entry_clone_upper_bound(&record.semantic)?)?;
@@ -22789,18 +22795,18 @@ fn graph_text_admission_delta_payload_peak(
     relative: &str,
     prepared: Option<&PreparedGraphTextAdmissionUpsert>,
 ) -> io::Result<u64> {
-    fn managed_members(
-        members: Option<&std::collections::BTreeSet<ManagedPath>>,
+    fn graph_text_members(
+        members: Option<&std::collections::BTreeSet<GraphTextPath>>,
     ) -> io::Result<u64> {
         let Some(members) = members else {
             return Ok(0);
         };
         count_graph_text_admission_persistent_payload_members(members.len());
-        let mut bytes = conservative_btree_entry_bytes::<ManagedPath, ()>()?;
+        let mut bytes = conservative_btree_entry_bytes::<GraphTextPath, ()>()?;
         for member in members {
             bytes = checked_add_bytes(
                 bytes,
-                graph_text_owned_btree_row_upper_bound::<ManagedPath, ()>(usize_to_u64(
+                graph_text_owned_btree_row_upper_bound::<GraphTextPath, ()>(usize_to_u64(
                     member.as_str().len(),
                 )?)?,
             )?;
@@ -22824,15 +22830,15 @@ fn graph_text_admission_delta_payload_peak(
     }
 
     let mut bytes = 0;
-    if let Ok(path) = ManagedPath::parse(relative.to_owned()) {
+    if let Ok(path) = GraphTextPath::parse(relative.to_owned()) {
         if let Some(record) = index.files_by_exact_path.get(&path) {
             bytes = checked_add_bytes(
                 bytes,
-                managed_members(index.paths_by_portable_key.get(&path.portable_key()))?,
+                graph_text_members(index.paths_by_portable_key.get(&path.portable_key()))?,
             )?;
             bytes = checked_add_bytes(
                 bytes,
-                managed_members(
+                graph_text_members(
                     index
                         .paths_by_semantic_key
                         .get(&graph_text_semantic_key(&record.semantic)),
@@ -22854,11 +22860,11 @@ fn graph_text_admission_delta_payload_peak(
         if let Some((path, record)) = &prepared.eligible {
             bytes = checked_add_bytes(
                 bytes,
-                managed_members(index.paths_by_portable_key.get(&path.portable_key()))?,
+                graph_text_members(index.paths_by_portable_key.get(&path.portable_key()))?,
             )?;
             bytes = checked_add_bytes(
                 bytes,
-                managed_members(
+                graph_text_members(
                     index
                         .paths_by_semantic_key
                         .get(&graph_text_semantic_key(&record.semantic)),
@@ -22872,7 +22878,7 @@ fn graph_text_admission_delta_payload_peak(
 fn graph_text_admission_upsert_worst_case_upper_bound(
     graph: &Graph,
     relative: &str,
-    eligible_path: Option<&ManagedPath>,
+    eligible_path: Option<&GraphTextPath>,
     content: &str,
 ) -> io::Result<u64> {
     let relative_len = usize_to_u64(relative.len())?;
@@ -23052,7 +23058,7 @@ fn validate_graph_text_admission_index(index: &CompleteGraphTextAdmissionIndex) 
         }
     }
     for (relative, is_graph_text) in &index.file_is_graph_text_by_exact_relative {
-        let exact = ManagedPath::parse(relative.clone())
+        let exact = GraphTextPath::parse(relative.clone())
             .ok()
             .and_then(|path| index.files_by_exact_path.get(&path));
         if !index.file_resource_by_exact_relative.contains_key(relative)
@@ -23097,7 +23103,7 @@ fn validate_graph_text_admission_delta(
     index: &CompleteGraphTextAdmissionIndex,
     relative: &str,
 ) -> io::Result<()> {
-    let path = match ManagedPath::parse(relative.to_owned()) {
+    let path = match GraphTextPath::parse(relative.to_owned()) {
         Ok(path) => path,
         Err(_) => {
             let resource = index.file_resource_by_exact_relative.get(relative);
@@ -23225,7 +23231,7 @@ fn graph_text_delta_reverse_members(
     index: &CompleteGraphTextAdmissionIndex,
     relative: &str,
 ) -> usize {
-    let Ok(path) = ManagedPath::parse(relative.to_owned()) else {
+    let Ok(path) = GraphTextPath::parse(relative.to_owned()) else {
         return 0;
     };
     let Some(record) = index.files_by_exact_path.get(&path) else {
@@ -23254,7 +23260,7 @@ fn remove_graph_text_admission_path(
     relative: &str,
 ) -> Option<GraphTextAdmissionTombstone> {
     let mut prior_record = None;
-    if let Ok(path) = ManagedPath::parse(relative.to_owned()) {
+    if let Ok(path) = GraphTextPath::parse(relative.to_owned()) {
         if let Some(record) = index.files_by_exact_path.remove(&path) {
             let portable = path.portable_key();
             persistent_set_remove(&mut index.paths_by_portable_key, &portable, &path);
@@ -23294,7 +23300,7 @@ fn graph_text_event_scratch_upper_bound(relative: &str) -> io::Result<u64> {
         bytes,
         conservative_vec_capacity_upper_bound::<Dir>(component_slots)?,
     )?;
-    // Component strings, filename, parent-relative construction, ManagedPath,
+    // Component strings, filename, parent-relative construction, GraphTextPath,
     // normalized keys, and error-path scratch are never simultaneously larger
     // than these conservative full-relative clones.
     bytes = checked_add_bytes(
@@ -23498,24 +23504,24 @@ fn initial_shadow_limit_error(resource: &'static str) -> io::Error {
     )
 }
 
-fn managed_text_inventory_limit_error(resource: &'static str) -> io::Error {
+fn graph_text_inventory_limit_error(resource: &'static str) -> io::Error {
     DirectSaveError::into_io(
         DirectSaveFailureCode::PrecheckLimit,
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("managed text inventory {resource} bound exceeded"),
+            format!("graph text inventory {resource} bound exceeded"),
         ),
     )
 }
 
-fn managed_text_inventory_alias_error(
+fn graph_text_inventory_alias_error(
     resource: &'static str,
     first: &str,
     second: &str,
 ) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("managed {resource} alias one resource: {first} and {second}"),
+        format!("graph {resource} alias one resource: {first} and {second}"),
     )
 }
 
@@ -23933,7 +23939,7 @@ fn graph_text_transition_byte_collision(position: &str) -> io::Error {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_managed_noreplace(
+fn rename_graph_text_noreplace(
     source_dir: &Dir,
     source: &str,
     destination_dir: &Dir,
@@ -23962,7 +23968,7 @@ fn rename_managed_noreplace(
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn rename_managed_noreplace(
+fn rename_graph_text_noreplace(
     source_dir: &Dir,
     source: &str,
     destination_dir: &Dir,
@@ -23990,7 +23996,7 @@ fn rename_managed_noreplace(
 }
 
 #[cfg(windows)]
-fn rename_managed_noreplace(
+fn rename_graph_text_noreplace(
     source_dir: &Dir,
     source: &str,
     destination_dir: &Dir,
@@ -24019,7 +24025,7 @@ fn rename_managed_noreplace(
     target_os = "android",
     windows
 )))]
-fn rename_managed_noreplace(
+fn rename_graph_text_noreplace(
     _source_dir: &Dir,
     _source: &str,
     _destination_dir: &Dir,
@@ -24449,7 +24455,7 @@ pub fn durable_private_authority_update(
         }
         let (directory, filename) = durable_private_authority_directory(path)?;
         let publication = DurableDirectoryPublication::open(&directory)
-            .map_err(managed_trash_filesystem_error)?;
+            .map_err(graph_text_trash_filesystem_error)?;
         let published = match baseline.as_deref() {
             None => publication.publish_new_exact_single_writer(&filename, next.as_bytes()),
             Some(expected) => {
@@ -24459,7 +24465,7 @@ pub fn durable_private_authority_update(
         match published {
             Ok(()) => return Ok(()),
             Err(FilesystemError::ByteCollision) => continue,
-            Err(error) => return Err(managed_trash_filesystem_error(error)),
+            Err(error) => return Err(graph_text_trash_filesystem_error(error)),
         }
     }
     Err(io::Error::new(
@@ -24486,11 +24492,11 @@ pub fn durable_private_authority_retire(
     };
     let (directory, filename) = durable_private_authority_directory(path)?;
     let publication =
-        DurableDirectoryPublication::open(&directory).map_err(managed_trash_filesystem_error)?;
+        DurableDirectoryPublication::open(&directory).map_err(graph_text_trash_filesystem_error)?;
     let retired = format!(".{filename}.retired-{}", Uuid::new_v4().simple());
     publication
         .retire_exact(&filename, &retired, &expected)
-        .map_err(managed_trash_filesystem_error)?;
+        .map_err(graph_text_trash_filesystem_error)?;
     let _ = directory.remove_file(&retired);
     Ok(())
 }

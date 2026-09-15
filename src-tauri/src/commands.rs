@@ -3719,7 +3719,7 @@ mod direct_save_error_tests {
                 "precheck.resource_alias",
             ),
             (
-                "managed text entry is a symlink or reparse point: pages/Alias.md",
+                "graph text entry is a symlink or reparse point: pages/Alias.md",
                 "precheck.symlink",
             ),
             (
