@@ -39,7 +39,7 @@ use crate::query::sql::sql_gates_tests::{
     scratch, serialize, write_fast_corpus, Corpus, CONTENT_PLAN_SHAPES, IDENTITY_SHAPES,
     PLAN_SHAPES,
 };
-use crate::query::sql::{descriptor_statement, ContentPlan};
+use crate::query::sql::{descriptor_view_statement, ContentPlan};
 use crate::query::{
     collect_page_rows_over, collect_pred_bounded_over, page_recency_secs_for, ConstructionProfile,
     GraphQueryPages, PreViewGroups, QueryDialect, QueryInput, QueryPageSource,
@@ -415,7 +415,7 @@ fn operation_snapshot_driver_reuses_readers_without_retaining_answers() {
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
     let registry = corpus.graph.property_registry();
-    let identity = ResultIdentity::Stored;
+    let identity = ResultIdentity::session_owned();
     let recency = recency_for(&corpus.root);
     let page_recency = page_recency_for(&corpus.root);
     let mut snapshot = corpus.snapshot();
@@ -503,7 +503,7 @@ fn the_database_result_equals_the_walk_on_every_shape_and_bound() {
     let root = scratch("r3-parity");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let (differences, rows) = parity_over(&corpus, &ResultIdentity::Stored);
+    let (differences, rows) = parity_over(&corpus, &ResultIdentity::session_owned());
     assert!(
         rows > 0,
         "the corpus admitted nothing; the gate proves nothing"
@@ -527,7 +527,7 @@ fn a_fresh_direct_session_resolves_the_same_ids_structurally() {
     let root = scratch("r3-structural");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let identity = ResultIdentity::DirectStructural {
+    let identity = ResultIdentity {
         session_pages: Arc::new(HashSet::new()),
         all_session: false,
     };
@@ -554,10 +554,10 @@ fn the_database_result_equals_the_walk_over_a_real_corpus() {
         return;
     };
     let corpus = Corpus::open(PathBuf::from(&root), false);
-    let (stored, rows) = parity_over(&corpus, &ResultIdentity::Stored);
+    let (stored, rows) = parity_over(&corpus, &ResultIdentity::session_owned());
     let (structural, _) = parity_over(
         &corpus,
-        &ResultIdentity::DirectStructural {
+        &ResultIdentity {
             session_pages: Arc::new(HashSet::new()),
             all_session: false,
         },
@@ -728,7 +728,7 @@ fn q4_unsorted_sample_uses_complete_base_order() {
         &ResultReadInputs {
             statement: &statement,
             order: BackendOrder::Direct,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             max_rows: 2,
             max_bytes: usize::MAX,
             profile: ConstructionProfile::default(),
@@ -1056,11 +1056,12 @@ fn q4_snapshot_query(
     let registry = corpus.graph.property_registry();
     let recency = recency_for(&corpus.root);
     let page_recency = page_recency_for(&corpus.root);
+    let identity = ResultIdentity::session_owned();
     let reader = SnapshotQueryReader::new(
         snapshot,
         SnapshotQueryInputs {
             registry: &registry,
-            identity: &ResultIdentity::Stored,
+            identity: &identity,
             order,
             recency: &recency,
             page_recency: &page_recency,
@@ -1808,7 +1809,7 @@ fn a_huge_page_with_one_match_costs_one_descriptor_row_and_one_payload_row() {
         usize::MAX,
         usize::MAX,
         ConstructionProfile::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the database result read answers");
     let census = result_read_census();
@@ -1865,7 +1866,7 @@ fn the_payload_is_read_in_batches_of_128_and_never_per_block() {
         usize::MAX,
         usize::MAX,
         ConstructionProfile::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the database result read answers");
     let census = result_read_census();
@@ -1941,7 +1942,7 @@ fn read_damaged(
         &ResultReadInputs {
             statement: &statement,
             order: BackendOrder::Direct,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
             profile: ConstructionProfile::default(),
@@ -2066,7 +2067,7 @@ fn every_missing_required_row_fails_the_read_rather_than_shortening_it() {
         usize::MAX,
         usize::MAX,
         ConstructionProfile::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the undamaged projection answers");
     let admitted: Vec<&BlockDto> = healthy
@@ -2257,7 +2258,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
     // taken per page and not per read.
     let mut session = HashSet::new();
     session.insert(page_id);
-    let preserved = read(&ResultIdentity::DirectStructural {
+    let preserved = read(&ResultIdentity {
         session_pages: Arc::new(session),
         all_session: false,
     })
@@ -2296,7 +2297,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
 
     // `all_session` takes the same decision for every page at once: the stored
     // id everywhere, which is the rewritten one where it was rewritten.
-    let all = read(&ResultIdentity::DirectStructural {
+    let all = read(&ResultIdentity {
         session_pages: Arc::new(HashSet::new()),
         all_session: true,
     })
@@ -2312,7 +2313,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
     // The page is NOT in the session set: its rows resolve STRUCTURALLY back
     // to the walk's ids, and the identity-term adjustment (38 bytes out, 36
     // in) has to be exact or `emit_batch`'s estimate check fails the read.
-    let structural = read(&ResultIdentity::DirectStructural {
+    let structural = read(&ResultIdentity {
         session_pages: Arc::new(HashSet::new()),
         all_session: false,
     })
@@ -2328,7 +2329,7 @@ fn session_pages_keep_their_stored_identity_and_the_estimate_adjustment_is_exact
     );
 
     // And `Stored` always answers the stored id.
-    let stored = read(&ResultIdentity::Stored).expect("the stored read answers");
+    let stored = read(&ResultIdentity::session_owned()).expect("the stored read answers");
     assert_eq!(
         stored
             .groups
@@ -2367,7 +2368,7 @@ fn an_impossible_stored_estimate_fails_the_read() {
         &ResultReadInputs {
             statement: &statement,
             order: BackendOrder::Direct,
-            identity: &ResultIdentity::DirectStructural {
+            identity: &ResultIdentity {
                 session_pages: Arc::new(HashSet::new()),
                 all_session: false,
             },
@@ -2429,7 +2430,7 @@ fn cancelling_between_batches_stops_the_read_and_releases_the_snapshot() {
         &ResultReadInputs {
             statement: &statement,
             order: BackendOrder::Direct,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
             profile: ConstructionProfile::default(),
@@ -2477,7 +2478,7 @@ fn a_cancelled_job_reads_nothing() {
         &ResultReadInputs {
             statement: &statement,
             order: BackendOrder::Direct,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             max_rows: usize::MAX,
             max_bytes: usize::MAX,
             profile: ConstructionProfile::default(),
@@ -2500,7 +2501,8 @@ fn the_descriptor_statement_wraps_every_lowered_shape() {
     let mut snapshot = corpus.snapshot();
     for (source, dialect) in every_shape() {
         let (_query, statement) = corpus.lower_block_anchored(source, dialect);
-        let descriptor = descriptor_statement(&statement, BackendOrder::Direct)
+        let descriptor = descriptor_view_statement(&statement, BackendOrder::Direct, None)
+            .map(|ranked| ranked.query)
             .unwrap_or_else(|error| panic!("{source}: {error}"));
         assert_eq!(
             descriptor.params, statement.params,
@@ -2541,7 +2543,7 @@ fn a_page_anchored_statement_has_no_block_descriptor() {
         corpus.lower("@page and name like 'proj/%'", QueryDialect::Tql, false);
     assert_eq!(anchor, crate::query::ir::Anchor::Page);
     assert!(
-        descriptor_statement(&statement, BackendOrder::Direct).is_err(),
+        descriptor_view_statement(&statement, BackendOrder::Direct, None).is_err(),
         "a page-anchored statement has no block descriptor read"
     );
 }
@@ -2601,7 +2603,7 @@ fn journals_and_pages_keep_their_kind() {
         usize::MAX,
         usize::MAX,
         ConstructionProfile::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the read answers");
     assert!(

@@ -22,7 +22,6 @@ pub(crate) mod og;
 pub mod path_refs;
 pub mod print;
 pub mod registry;
-#[allow(dead_code)] // Producer integration follows the independently tested cache component.
 pub(crate) mod registry_cache;
 pub(crate) mod registry_sql;
 pub(crate) mod sort;
@@ -31,31 +30,16 @@ pub(crate) mod sort;
 // guard shares recognises a `*_tests.rs` file included by a SIBLING under
 // `#[cfg(test)]`, and only then does it stop counting the gates' `eprintln!`
 // receipts as production print sites (I-5).
-//
-// §5.9's dispatch — what a release build would call the compiler from — is not
-// wired in this packet, so outside `cfg(test)` the module is dead code and says
-// so once, here, rather than through forty individual suppressions.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) mod sql;
-// R3's shared database-result constructor. Like `sql`, it is what §5.9's
-// dispatch will call rather than something a release build reaches yet: R3b
-// wires Direct Files' production switch to it and R4 wires Managed Storage, so
-// outside `cfg(test)` the module says "not called yet" once, here.
 pub(crate) mod rank;
 pub(crate) mod read_execute;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod results;
+pub(crate) mod sql;
 pub(crate) mod statistics;
-// RET3's database-owned export subtree construction: located selection over the
-// shared result collector, and bounded subtree hydration over the SAME caller
-// owned snapshots. Like `sql` and `results` it is what the public Direct and
-// Managed export adapters will call rather than something a release build
-// reaches yet — that migration is the manager's next packet, and until it lands
-// the module says "not called yet" once, here.
+// Database-owned export subtree construction: located selection over the
+// shared result collector, and bounded subtree hydration over the SAME
+// caller-owned snapshots.
 pub(crate) mod export_execute;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod export_results;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod friendly;
 pub(crate) mod tql;
 pub mod view;
@@ -143,11 +127,9 @@ pub struct BoundedGroups {
 /// The ONE result-construction accounting rule.
 ///
 /// It exists as a type rather than as an open-coded pair of counters because
-/// two producers had drifted apart on exactly this: Direct charged
-/// `payload + page name + 256` per admitted row and latched `exceeded`, while
-/// the managed block-referrer loop probed a group overhead per row but
-/// accumulated it once per emitted group -- so the same `max_bytes` admitted a
-/// different number of rows on the two paths for identical content.
+/// two producers once drifted apart on exactly this: one charged a group
+/// overhead per row and the other once per emitted group, so the same
+/// `max_bytes` admitted a different number of rows for identical content.
 pub(crate) struct ConstructionBudget {
     max_rows: usize,
     max_bytes: usize,
@@ -226,15 +208,12 @@ struct BoundedReferenceGroup {
 
 /// The ONE bounded reference-result accumulator (I-12, I-13).
 ///
-/// Direct Files' `collect_reference_occurrences_bounded`, managed backlinks and
-/// unlinked references (`bound_application_reference_sources`) and the managed
-/// block-referrer path each used to own a private copy of the same four rules —
+/// Reference producers each used to own a private copy of the same four rules —
 /// [`ConstructionBudget`] admission, grouping duplicate logical page names under
 /// the canonical [`crate::refs::page_key`], carrying `total`/`exceeded`, and the
-/// OG display order — and the three copies had already drifted: the managed
-/// block-referrer path grouped by storage path, so two files whose titles fold
-/// to one logical page produced two reference groups where Direct produced one.
-/// They are call sites now; this type is the algorithm.
+/// OG display order — and the copies had drifted: one grouped by storage path,
+/// so two files whose titles fold to one logical page produced two reference
+/// groups. They are call sites now; this type is the algorithm.
 ///
 /// Rows are admitted in the caller's declaration order, which every caller makes
 /// source-path order, because the budget truncates and Direct Files charges
@@ -416,9 +395,10 @@ fn reference_group_display_order(
 /// This is NOT the producer of "what day is this journal page". That question
 /// has one config-aware owner, [`crate::date::JournalFormat::parse`], which is
 /// what fills `PageEntry::date_key`. Deriving the day from the title with the
-/// default format instead is what made journal-range queries answer empty on
-/// every graph configuring a custom `:journal/page-title-format`
-/// (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001).
+/// default format instead is what made the removed Managed Storage query path
+/// answer journal-range queries empty on every graph configuring a custom
+/// `:journal/page-title-format` (REG-W4-C7B-MANAGED-JOURNAL-ORDINAL-001,
+/// retired with that path).
 ///
 /// ONE caller survives: [`resolve_date_token`], which reads a `(between …)`
 /// BOUND LITERAL the user typed rather than a page's day.
@@ -3198,162 +3178,6 @@ pub(crate) fn apply_result_view_directives<B: ResultViewBlock>(
     }
     groups
 }
-
-// Candidate planning exists only for the independent test oracle. Production
-// parses once and checks that IR's validity before acquiring its SQL snapshot.
-// The public executor census enforces that these declarations are test-only.
-/// One reconstructible, page-complete candidate source for a managed simple
-/// query. These facts only choose pages; the exact current parser DTO remains
-/// authoritative for block membership and result shape.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[cfg(test)]
-pub(crate) enum SimpleQueryCandidateSource {
-    Task(String),
-    PageRef(String),
-    BlockProperty(String),
-    PageProperty(String),
-    Page(String),
-    Namespace(String),
-    Journal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) enum SimpleQueryCandidatePlan {
-    Empty,
-    Indexed(Vec<SimpleQueryCandidateSource>),
-    All,
-}
-
-/// Conservative page-level candidate plan for indexed managed simple-query
-/// families. A returned union is complete: every matching block must live on a
-/// page selected by at least one source. AND may choose one complete child; OR
-/// may union only when every branch is complete. Valid shapes that cannot be
-/// narrowed use the explicit all-page plan; invalid shapes need no page reads.
-#[cfg(test)]
-pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandidatePlan {
-    type Sources = std::collections::BTreeSet<SimpleQueryCandidateSource>;
-    fn one(source: SimpleQueryCandidateSource) -> Option<Sources> {
-        Some(std::iter::once(source).collect())
-    }
-    /// The page-row leaves, reached through a `page` hop on a block row or
-    /// directly at the `@page` anchor.
-    fn page_sources(filter: &Filter) -> Option<Sources> {
-        match filter {
-            Filter::Leaf {
-                leaf: Leaf::Attr { attr, op, value },
-            } => match (attr, op, value) {
-                (Attr::Name, CmpOp::Eq, Value::Text { text }) => {
-                    one(SimpleQueryCandidateSource::Page(refs::page_key(text)))
-                }
-                (Attr::Name, CmpOp::StartsWith, Value::Text { text }) => {
-                    one(SimpleQueryCandidateSource::Namespace(refs::page_key(
-                        text.trim_end_matches('/'),
-                    )))
-                }
-                (Attr::Journal, CmpOp::Eq, Value::Bool { value: true }) => {
-                    one(SimpleQueryCandidateSource::Journal)
-                }
-                (Attr::Day, _, _) => one(SimpleQueryCandidateSource::Journal),
-                _ => None,
-            },
-            Filter::Leaf {
-                leaf:
-                    Leaf::Rel {
-                        rel: Rel::Props,
-                        quant: Quant::Any,
-                        pred,
-                    },
-            } => pred.props_key().and_then(|key| {
-                one(SimpleQueryCandidateSource::PageProperty(property_key_norm(
-                    &key,
-                )))
-            }),
-            Filter::And { items } => items.iter().find_map(page_sources),
-            Filter::Or { items } => {
-                let mut union = Sources::new();
-                for item in items {
-                    union.extend(page_sources(item)?);
-                }
-                Some(union)
-            }
-            _ => None,
-        }
-    }
-    fn sources(filter: &Filter) -> Option<Sources> {
-        match filter {
-            Filter::Leaf {
-                leaf:
-                    Leaf::Attr {
-                        attr: Attr::Task,
-                        op: CmpOp::In,
-                        value: Value::List { items },
-                    },
-            } => items
-                .iter()
-                .map(|item| match item {
-                    Value::Text { text } => {
-                        Some(SimpleQueryCandidateSource::Task(text.to_ascii_uppercase()))
-                    }
-                    _ => None,
-                })
-                .collect::<Option<Sources>>(),
-            Filter::Leaf {
-                leaf:
-                    Leaf::Rel {
-                        rel: Rel::Refs,
-                        quant: Quant::Any,
-                        pred,
-                    },
-            } => pred
-                .ref_name()
-                .and_then(|name| one(SimpleQueryCandidateSource::PageRef(refs::page_key(&name)))),
-            Filter::Leaf {
-                leaf:
-                    Leaf::Rel {
-                        rel: Rel::Props,
-                        quant: Quant::Any,
-                        pred,
-                    },
-            } => pred.props_key().and_then(|key| {
-                one(SimpleQueryCandidateSource::BlockProperty(
-                    property_key_norm(&key),
-                ))
-            }),
-            Filter::Leaf {
-                leaf:
-                    Leaf::Rel {
-                        rel: Rel::Page,
-                        quant: Quant::Any,
-                        pred,
-                    },
-            } => page_sources(pred),
-            Filter::And { items } => items.iter().find_map(sources),
-            Filter::Or { items } => {
-                let mut union = Sources::new();
-                for item in items {
-                    union.extend(sources(item)?);
-                }
-                Some(union)
-            }
-            _ => None,
-        }
-    }
-
-    let (query, _view) = parse_query_source(query_src, JournalDate::today());
-    if query.is_invalid() {
-        return SimpleQueryCandidatePlan::Empty;
-    }
-    let filter = match query.anchor {
-        Anchor::Block => query.evaluable_filter(),
-        Anchor::Page => og::rebase_to_block(&query.evaluable_filter()),
-    };
-    match sources(&filter) {
-        Some(sources) => SimpleQueryCandidatePlan::Indexed(sources.into_iter().collect()),
-        None => SimpleQueryCandidatePlan::All,
-    }
-}
-
 
 /// `query_run` over a Direct Files graph when the IR is already parsed (the
 /// §7.1 command hands the IR, not text).
@@ -6438,57 +6262,6 @@ mod tests {
             )]
         );
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn managed_simple_query_candidate_plan_is_conservative_across_boolean_shapes() {
-        use SimpleQueryCandidatePlan as Plan;
-        use SimpleQueryCandidateSource as Source;
-
-        assert_eq!(
-            simple_query_candidate_plan("(and (task todo) (priority A) (not (page Templates)))"),
-            Plan::Indexed(vec![Source::Task("TODO".into())])
-        );
-        assert_eq!(
-            simple_query_candidate_plan("(or (and (task TODO) (property x y)) (task doing now))"),
-            Plan::Indexed(vec![
-                Source::Task("DOING".into()),
-                Source::Task("NOW".into()),
-                Source::Task("TODO".into())
-            ])
-        );
-        assert_eq!(
-            simple_query_candidate_plan("(and (not (task TODO)) (property type book))"),
-            Plan::Indexed(vec![Source::BlockProperty("type".into())])
-        );
-        assert_eq!(
-            simple_query_candidate_plan(
-                "(or (page-ref Alpha) (page-property status public) (page Home))"
-            ),
-            Plan::Indexed(vec![
-                Source::PageRef("alpha".into()),
-                Source::PageProperty("status".into()),
-                Source::Page("home".into())
-            ])
-        );
-        assert_eq!(
-            simple_query_candidate_plan("(and (not (task TODO)) \"x\")"),
-            Plan::All
-        );
-        assert_eq!(
-            simple_query_candidate_plan("(or (task TODO) \"x\")"),
-            Plan::All
-        );
-        assert_eq!(simple_query_candidate_plan("\"x\""), Plan::All);
-        assert_eq!(
-            simple_query_candidate_plan("(page-tags public private)"),
-            Plan::Indexed(vec![Source::PageProperty("tags".into())])
-        );
-        assert_eq!(
-            simple_query_candidate_plan("(between journal -7d today)"),
-            Plan::Indexed(vec![Source::Journal])
-        );
-        assert_eq!(simple_query_candidate_plan(")"), Plan::Empty);
     }
 
     #[test]

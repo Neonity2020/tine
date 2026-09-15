@@ -325,12 +325,6 @@ enum ProjectionParentCapture {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EditorPublicationAuthority {
-    /// The Markdown/Org file is the sole durable authority (Direct Files).
-    DirectFile,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphTextPublicationValidation {
     /// Standalone callers have not established graph-wide collision evidence.
     CompleteIndex,
@@ -342,24 +336,6 @@ enum GraphTextPublicationValidation {
     /// already completed a bounded no-follow inventory. Publication still
     /// repeats exact target, single-link, portable-path, and no-clobber checks.
     TransactionInventory,
-}
-
-fn preflight_editor_publication_chain(
-    authority: EditorPublicationAuthority,
-    chain: &[Dir],
-) -> io::Result<()> {
-    match authority {
-        EditorPublicationAuthority::DirectFile => preflight_projection_chain(chain),
-    }
-}
-
-fn sync_editor_publication_chain(
-    authority: EditorPublicationAuthority,
-    chain: &[Dir],
-) -> io::Result<()> {
-    match authority {
-        EditorPublicationAuthority::DirectFile => sync_projection_chain_required(chain),
-    }
 }
 
 /// Parse a page file's bytes into a [`Document`] using the parser for its
@@ -796,10 +772,9 @@ pub struct PageDto {
 }
 
 /// Exact asset-side result of one PDF-highlight merge. The annotation page is
-/// a separate authority boundary: Direct Files commits it through the guarded
-/// file writer, while managed storage commits it through the semantic actor.
-/// Keeping the sidecar receipt typed lets either caller compensate a rejected
-/// page transaction without re-reading or guessing which bytes it published.
+/// a separate authority boundary, committed through the guarded file writer.
+/// Keeping the sidecar receipt typed lets the caller compensate a rejected page
+/// transaction without re-reading or guessing which bytes it published.
 pub(crate) struct PdfHighlightSidecarCommit {
     legacy_key: String,
     edn_path: PathBuf,
@@ -1468,8 +1443,8 @@ impl EditorConflictSite {
 
 pub struct Graph {
     pub root: PathBuf,
-    /// Retained no-follow identity of the graph root. Sparse projection writes
-    /// fail closed when this capability could not be established at graph open.
+    /// Retained no-follow identity of the graph root. Projection writes fail
+    /// closed when this capability could not be established at graph open.
     projection_root: Option<Dir>,
     /// Graph-relative live names whose editor-publication claimants could not
     /// be reconciled during the checked-open walk. Journal replay must never
@@ -1685,13 +1660,13 @@ impl RecoverySummary {
                 "editor recovery claimant target is not UTF-8",
             )
         })?;
-        let managed = GraphTextPath::parse(relative).map_err(|error| {
+        let portable = GraphTextPath::parse(relative).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("editor recovery claimant target is not portable: {error}"),
             )
         })?;
-        self.claimants.insert(managed);
+        self.claimants.insert(portable);
         Ok(())
     }
 }
@@ -1741,8 +1716,8 @@ struct GuardedGraphTextIdentityState {
     /// the dominant cost of a save on a large graph, and "how many times did it
     /// rebuild?" is the first question any slow-save report raises. A counter
     /// that exists only in the test binary cannot answer that question on the
-    /// machine that has the problem -- which is exactly how the managed-recovery
-    /// lane burned a full diagnostic cycle on 2026-08-05/06.
+    /// machine that has the problem -- which is exactly how a recovery
+    /// investigation burned a full diagnostic cycle on 2026-08-05/06.
     complete_builds: usize,
     exact_updates: usize,
     /// Cost of the most recent complete rebuild, split into its two phases.
@@ -2134,13 +2109,6 @@ impl<'a, K: Ord, V> IntoIterator for &'a PersistentMap<K, V> {
     }
 }
 
-/// Terminal reason supplied by a platform exact-feed adapter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub(crate) enum GraphTextExactFeedFailure {
-    DirectoryMutation,
-}
-
 /// Core classification for one exact graph-relative platform event path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -2228,7 +2196,7 @@ impl GraphTextExactFeedBatchActualCharges {
     fn remaining_raw(&self) -> io::Result<u64> {
         MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES
             .checked_sub(self.raw_bytes)
-            .ok_or_else(|| initial_shadow_limit_error("exact feed batch aggregate raw bytes"))
+            .ok_or_else(|| graph_text_capture_limit_error("exact feed batch aggregate raw bytes"))
     }
 
     fn live_preparation_bytes(
@@ -2248,7 +2216,7 @@ impl GraphTextExactFeedBatchActualCharges {
         index
             .peak_limit
             .checked_sub(self.live_preparation_bytes(index, batch_scratch)?)
-            .ok_or_else(|| initial_shadow_limit_error("peak build memory"))
+            .ok_or_else(|| graph_text_capture_limit_error("peak build memory"))
     }
 
     fn ensure_work_peak(
@@ -2271,7 +2239,7 @@ impl GraphTextExactFeedBatchActualCharges {
         raw_bytes: u64,
     ) -> io::Result<()> {
         if raw_bytes > self.remaining_raw()? {
-            return Err(initial_shadow_limit_error(
+            return Err(graph_text_capture_limit_error(
                 "exact feed batch aggregate raw bytes",
             ));
         }
@@ -2290,7 +2258,7 @@ impl GraphTextExactFeedBatchActualCharges {
         let permanent = checked_add_bytes(index.permanent_bytes, self.prepared_growth)
             .and_then(|bytes| checked_add_bytes(bytes, growth))?;
         if permanent > index.permanent_limit {
-            return Err(initial_shadow_limit_error("permanent index memory"));
+            return Err(graph_text_capture_limit_error("permanent index memory"));
         }
         Ok(())
     }
@@ -2961,7 +2929,7 @@ thread_local! {
     static FAIL_NEXT_PROJECTION_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROJECTION_EXACT_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_TEXT_INVENTORY_READ_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static INITIAL_SHADOW_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static GRAPH_TEXT_CAPTURE_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_INVENTORY_LIMITS_OVERRIDE: std::cell::RefCell<Option<GraphTextInventoryLimits>> = const { std::cell::RefCell::new(None) };
     static GRAPH_TEXT_BUDGET_LAST_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BOUNDED_READ_AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
@@ -3203,15 +3171,15 @@ fn graph_text_inventory_read_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn initial_shadow_revalidation_hook(_root: &Path) -> io::Result<()> {
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| match hook.borrow_mut().take() {
+fn graph_text_capture_revalidation_hook(_root: &Path) -> io::Result<()> {
+    GRAPH_TEXT_CAPTURE_REVALIDATION_RACE.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn initial_shadow_revalidation_hook(_root: &Path) -> io::Result<()> {
+fn graph_text_capture_revalidation_hook(_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -4367,11 +4335,10 @@ impl Graph {
     ///
     /// Every route out of a simple or advanced query goes through here — ready,
     /// not ready, busy, failed, cancelled — so that a future arm cannot answer
-    /// a public query with anything but the projection. Today's code is why
-    /// that matters and not a stylistic preference: `run_query`'s sparse-task
-    /// arm and `run_query_bounded`'s fell back with a bare
+    /// a public query with anything but the projection. That is not a stylistic
+    /// preference: two earlier arms fell back with a bare
     /// `map_or_else`/`unwrap_or_else` and never called `note_fallback_read`, so
-    /// a FAILED sparse read scheduled no recovery and the projection could sit
+    /// a FAILED read scheduled no recovery and the projection could sit
     /// unusable until the next save.
     ///
     /// **RET2 retired the walk from this route.** Martin, 2026-09-07: the
@@ -4651,7 +4618,7 @@ impl Graph {
         // The identity policy, captured with the snapshot: a page THIS process
         // lowered answers with its stored live id; a row reused from an earlier
         // session answers with the structural id the fresh parse assigns it.
-        let identity = crate::query::results::ResultIdentity::DirectStructural {
+        let identity = crate::query::results::ResultIdentity {
             session_pages: Arc::clone(&job.session_pages),
             all_session: false,
         };
@@ -4730,7 +4697,7 @@ impl Graph {
         self.dispatch_direct_query(|request| {
             self.direct_projection_read_job(request, sensitivity, |job| {
                 let registry = self.direct_lowering_registry(prepared.requires_registry(), job)?;
-                let identity = crate::query::results::ResultIdentity::DirectStructural {
+                let identity = crate::query::results::ResultIdentity {
                     session_pages: Arc::clone(&job.session_pages),
                     all_session: false,
                 };
@@ -4785,7 +4752,7 @@ impl Graph {
                         )));
                     }
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity::DirectStructural {
+                    let identity = ResultIdentity {
                         session_pages: Arc::new(HashSet::new()),
                         all_session: false,
                     };
@@ -5139,7 +5106,7 @@ impl Graph {
                     )
                 })
                 .collect::<Vec<_>>();
-            let identity = crate::query::results::ResultIdentity::DirectStructural {
+            let identity = crate::query::results::ResultIdentity {
                 session_pages: Arc::clone(&job.session_pages),
                 all_session: false,
             };
@@ -5512,8 +5479,8 @@ impl Graph {
     }
 
     /// Stable identity of the exact no-follow directory capability retained at
-    /// graph open. This is the only graph-root identity accepted by sparse
-    /// projection enrollment; the ambient path in `Graph::root` is not authority.
+    /// graph open. This is the only graph-root identity accepted by projection
+    /// enrollment; the ambient path in `Graph::root` is not authority.
     pub fn canonical_resource_id(&self) -> io::Result<CanonicalGraphResourceId> {
         let root = self.projection_root.as_ref().ok_or_else(|| {
             io::Error::new(
@@ -5723,15 +5690,15 @@ impl Graph {
                 crate::backend_error::tagged_backend_error("operation-cancelled", None),
             ));
         }
-        let managed = GraphTextPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
-        let absolute = self.root.join(managed.as_str());
+        let text_path = GraphTextPath::parse(relative.to_owned()).map_err(|_| bad_path())?;
+        let absolute = self.root.join(text_path.as_str());
         let Some(entry) = self.graph_inventory_entry(&absolute)? else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "path is not an admitted graph-text source",
             ));
         };
-        if entry.rel_path != managed.as_str() {
+        if entry.rel_path != text_path.as_str() {
             return Err(bad_path());
         }
 
@@ -5777,7 +5744,7 @@ impl Graph {
             ));
         }
         Ok(GraphTextSourceDigest {
-            path: managed.to_string(),
+            path: text_path.to_string(),
             length,
             digest: format!("{:x}", hasher.finalize()),
         })
@@ -5984,7 +5951,7 @@ impl Graph {
         };
         let capture_started = std::time::Instant::now();
         let (capture, combined_capture_bytes) = self
-            .capture_retained_graph_text_identity_with_limits(INITIAL_SHADOW_LIMITS)
+            .capture_retained_graph_text_identity_with_limits(GRAPH_TEXT_CAPTURE_LIMITS)
             .map_err(|error| {
                 io::Error::new(
                     error.kind(),
@@ -6000,7 +5967,7 @@ impl Graph {
         let mut replacement = build_graph_text_admission_index(
             self,
             &capture,
-            INITIAL_SHADOW_LIMITS,
+            GRAPH_TEXT_CAPTURE_LIMITS,
             replacement_peak,
             decode_semantics,
             prior.as_deref(),
@@ -6097,7 +6064,7 @@ impl Graph {
             .and_then(|bytes| checked_add_bytes(bytes, payload_peak))
             .and_then(|bytes| checked_add_bytes(bytes, event_scratch))?;
         if peak > current.peak_limit {
-            return Err(initial_shadow_limit_error("peak build memory"));
+            return Err(graph_text_capture_limit_error("peak build memory"));
         }
 
         match final_state {
@@ -6852,7 +6819,7 @@ impl Graph {
         if usize_to_u64(semantic.name.len())? > permit.semantic_name_bytes
             || actual_name_allocation > permit.semantic_name_allocation_bytes
         {
-            return Err(initial_shadow_limit_error(
+            return Err(graph_text_capture_limit_error(
                 "rendered semantic title allocation",
             ));
         }
@@ -6882,7 +6849,7 @@ impl Graph {
         if usize_to_u64(semantic.name.len())? > permit.semantic_name_bytes
             || actual_name_allocation > permit.semantic_name_allocation_bytes
         {
-            return Err(initial_shadow_limit_error(
+            return Err(graph_text_capture_limit_error(
                 "rendered semantic title allocation",
             ));
         }
@@ -6910,7 +6877,7 @@ impl Graph {
     ) -> Result<PageEntry, UnsafeGraphTextPath> {
         match self.classify_graph_text_path(path) {
             Ok(GraphTextKind::Page | GraphTextKind::Journal) => {}
-            Err(outside) => return self.unmanaged_graph_text_entry(path, outside),
+            Err(outside) => return self.unconfigured_graph_text_entry(path, outside),
         }
         self.graph_entry_for_relative_path(path.as_str())
             .map_err(|_| UnsafeGraphTextPath(path.as_str().to_owned()))
@@ -6918,9 +6885,9 @@ impl Graph {
 
     /// OG-compatible decode for supported graph text that no configured root
     /// owns. Containers OG itself skips, hidden paths, provider conflict copies
-    /// and spellings the guarded sparse writer cannot address keep the original
+    /// and spellings the guarded writer cannot address keep the original
     /// configured-root rejection instead of gaining new authority here.
-    fn unmanaged_graph_text_entry(
+    fn unconfigured_graph_text_entry(
         &self,
         path: &GraphTextPath,
         outside: UnsafeGraphTextPath,
@@ -7026,7 +6993,7 @@ impl Graph {
         }
     }
 
-    fn managed_is_shadow_journal(
+    fn is_shadow_journal_under_permit(
         &self,
         permit: &GraphTextWritePermit,
         path: &Path,
@@ -7057,7 +7024,7 @@ impl Graph {
         if let Some(entry) = self.entry_for_path(path) {
             if entry.kind == PageKind::Journal {
                 if let Some(date) = entry.date_key.map(crate::date::JournalDate::from_ordinal) {
-                    return Ok(!self.managed_is_shadow_journal(permit, path, date)?);
+                    return Ok(!self.is_shadow_journal_under_permit(permit, path, date)?);
                 }
             }
         }
@@ -8186,7 +8153,6 @@ impl Graph {
                 expected_identity,
                 None,
                 editor_episode,
-                EditorPublicationAuthority::DirectFile,
                 None,
             );
         }
@@ -8278,7 +8244,6 @@ impl Graph {
         expected_identity: ContentDigest,
         expected_bytes: Option<&[u8]>,
         editor_episode: Option<&ConflictEditorEpisode>,
-        publication_authority: EditorPublicationAuthority,
         turn_short_id: Option<[u8; 4]>,
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
@@ -8312,7 +8277,7 @@ impl Graph {
             }
             return Err(error);
         }
-        preflight_editor_publication_chain(publication_authority, &target.chain)?;
+        preflight_projection_chain(&target.chain)?;
         let temp =
             create_editor_staged_recovery(target.parent(), &target.filename, bytes, turn_short_id)?;
         let staged_identity = match (|| {
@@ -8369,12 +8334,9 @@ impl Graph {
                 }
                 return Err(error);
             }
-            let rename_noreplace =
-                |from: &str, to: &str, expected: &[u8]| match publication_authority {
-                    EditorPublicationAuthority::DirectFile => {
-                        move_graph_text_exact_no_replace(target.parent(), from, to, expected)
-                    }
-                };
+            let rename_noreplace = |from: &str, to: &str, expected: &[u8]| {
+                move_graph_text_exact_no_replace(target.parent(), from, to, expected)
+            };
             let (live_file, live_bytes) =
                 open_and_read_projection_regular(target.parent(), &target.filename)?;
             if canonical_projection_file_resource_id(&live_file)? != expected_identity {
@@ -8438,23 +8400,15 @@ impl Graph {
                 }
                 return Err(error);
             }
-            if publication_authority == EditorPublicationAuthority::DirectFile {
-                move_graph_text_exact_no_replace(
-                    target.parent(),
-                    &recovery,
-                    &retired_cleanup,
-                    &retired_bytes,
-                )?;
-                let _ = target.parent().remove_file(&retired_cleanup);
-            } else {
-                target.parent().remove_file(&recovery)?;
-            }
+            move_graph_text_exact_no_replace(
+                target.parent(),
+                &recovery,
+                &retired_cleanup,
+                &retired_bytes,
+            )?;
+            let _ = target.parent().remove_file(&retired_cleanup);
             retired = false;
-            if publication_authority == EditorPublicationAuthority::DirectFile {
-                Ok(())
-            } else {
-                sync_editor_publication_chain(publication_authority, &target.chain)
-            }
+            Ok(())
         })();
 
         let outcome = match result {
@@ -8477,41 +8431,20 @@ impl Graph {
                         }
                         validate_graph_text_single_link(&recovery_file, graph_text_path.as_str())?;
                         let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
-                        match publication_authority {
-                            EditorPublicationAuthority::DirectFile => {
-                                move_graph_text_exact_no_replace(
-                                    target.parent(),
-                                    &recovery,
-                                    &target.filename,
-                                    &recovery_bytes,
-                                )
-                            }
-                        }
+                        move_graph_text_exact_no_replace(
+                            target.parent(),
+                            &recovery,
+                            &target.filename,
+                            &recovery_bytes,
+                        )
                     });
                     match restore {
                         Ok(()) => {
                             retired = false;
-                            let sync_error = if publication_authority
-                                != EditorPublicationAuthority::DirectFile
-                            {
-                                sync_editor_publication_chain(publication_authority, &target.chain)
-                                    .err()
-                            } else {
-                                None
-                            };
-                            if let Some(sync_error) = sync_error {
-                                Err(io::Error::new(
-                                    primary.kind(),
-                                    format!(
-                                        "{primary}; target identity was restored but directory sync failed: {sync_error}"
-                                    ),
-                                ))
-                            } else {
-                                restore_succeeded = true;
-                                debug_assert!(!retired || published);
-                                let _ = target.parent().remove_file(&temp);
-                                Err(primary)
-                            }
+                            restore_succeeded = true;
+                            debug_assert!(!retired || published);
+                            let _ = target.parent().remove_file(&temp);
+                            Err(primary)
                         }
                         Err(restore_error) => Err(io::Error::new(
                             primary.kind(),
@@ -8828,8 +8761,8 @@ impl Graph {
     /// accidentally inspect the replacement resource.
     fn capture_retained_graph_text_identity_with_limits(
         &self,
-        limits: InitialShadowLimits,
-    ) -> io::Result<(InitialShadowCapture, u64)> {
+        limits: GraphTextCaptureLimits,
+    ) -> io::Result<(GraphTextCapture, u64)> {
         // GH #267 / F3. The two passes must agree, and ANY concurrent filesystem
         // activity anywhere in the graph makes them disagree -- which on a
         // Syncthing, Dropbox or OneDrive folder is not an anomaly, it is the
@@ -8864,15 +8797,13 @@ impl Graph {
 
     fn attempt_retained_graph_text_identity_capture(
         &self,
-        limits: InitialShadowLimits,
-    ) -> io::Result<(InitialShadowCapture, u64)> {
+        limits: GraphTextCaptureLimits,
+    ) -> io::Result<(GraphTextCapture, u64)> {
         require_projection_platform()?;
         let permit = self.admit_graph_text_writer()?;
-        let first = collect_initial_shadow_managed_inventory_with_limits_inner(
-            self, &permit, true, limits, 0, false, true,
-        )?;
-        initial_shadow_revalidation_hook(&self.root)?;
-        let second = collect_initial_shadow_managed_inventory_with_limits_inner(
+        let first = collect_graph_text_capture_inner(self, &permit, true, limits, 0, false, true)?;
+        graph_text_capture_revalidation_hook(&self.root)?;
+        let second = collect_graph_text_capture_inner(
             self,
             &permit,
             false,
@@ -8881,7 +8812,7 @@ impl Graph {
             false,
             true,
         )?;
-        if !initial_shadow_captures_match(&first, &second) {
+        if !graph_text_captures_match(&first, &second) {
             return Err(DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckInterrupted,
                 io::Error::new(
@@ -8893,7 +8824,7 @@ impl Graph {
         let combined_capture_bytes =
             checked_add_bytes(first.peak_build_charge, second.peak_build_charge)?;
         if combined_capture_bytes > limits.peak_build_bytes {
-            return Err(initial_shadow_limit_error("peak build memory"));
+            return Err(graph_text_capture_limit_error("peak build memory"));
         }
         Ok((first, combined_capture_bytes))
     }
@@ -8946,10 +8877,9 @@ impl Graph {
                 .map(PreparedGraphTextAdmissionFinalState::Present),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                graph_text_exact_feed_failure_cause(
-                    GraphTextExactFeedFailure::DirectoryMutation,
-                    &format!("touched path became non-regular: {relative}"),
-                ),
+                graph_text_exact_feed_failure_cause(&format!(
+                    "touched path became non-regular: {relative}"
+                )),
             )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => self
                 .prepare_graph_text_file_remove(index, relative, require_ambient_binding)
@@ -8972,7 +8902,7 @@ impl Graph {
         let remaining_peak = index
             .peak_limit
             .checked_sub(live)
-            .ok_or_else(|| initial_shadow_limit_error("peak build memory"))?;
+            .ok_or_else(|| graph_text_capture_limit_error("peak build memory"))?;
         let mut raw_bytes = 0_u64;
         for final_state in prepared {
             let (relative, expected) = match final_state {
@@ -8989,11 +8919,11 @@ impl Graph {
                     let remaining_raw = MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES
                         .checked_sub(raw_bytes)
                         .ok_or_else(|| {
-                            initial_shadow_limit_error("exact feed batch aggregate raw bytes")
+                            graph_text_capture_limit_error("exact feed batch aggregate raw bytes")
                         })?;
                     let expected_len = upsert.description.byte_length();
                     if expected_len > remaining_raw {
-                        return Err(initial_shadow_limit_error(
+                        return Err(graph_text_capture_limit_error(
                             "exact feed batch aggregate raw bytes",
                         ));
                     }
@@ -9147,7 +9077,7 @@ impl Graph {
             None => index
                 .peak_limit
                 .checked_sub(live_bytes)
-                .ok_or_else(|| initial_shadow_limit_error("peak build memory"))?,
+                .ok_or_else(|| graph_text_capture_limit_error("peak build memory"))?,
         };
         let content_limit = match actual_charges.as_deref() {
             Some(_) => enumerated_len,
@@ -9209,9 +9139,9 @@ impl Graph {
             let worst_permanent = index
                 .permanent_bytes
                 .checked_add(worst_growth)
-                .ok_or_else(|| initial_shadow_limit_error("permanent index memory"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("permanent index memory"))?;
             if worst_permanent > index.permanent_limit {
-                return Err(initial_shadow_limit_error("permanent index memory"));
+                return Err(graph_text_capture_limit_error("permanent index memory"));
             }
         }
         let eligible = if let Some(path) = eligible_path {
@@ -9226,7 +9156,7 @@ impl Graph {
                 let (semantic, format, node_count) =
                     self.decode_present_graph_text_with_node_count(&path, &bytes, permit)?;
                 if node_count > MAX_GRAPH_TEXT_PARSER_NODES {
-                    return Err(initial_shadow_limit_error("parser node count"));
+                    return Err(graph_text_capture_limit_error("parser node count"));
                 }
                 (semantic, format)
             } else {
@@ -9263,9 +9193,9 @@ impl Graph {
             let final_permanent = index
                 .permanent_bytes
                 .checked_add(retained_growth)
-                .ok_or_else(|| initial_shadow_limit_error("permanent index memory"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("permanent index memory"))?;
             if final_permanent > index.permanent_limit {
-                return Err(initial_shadow_limit_error("permanent index memory"));
+                return Err(graph_text_capture_limit_error("permanent index memory"));
             }
         }
         let revalidation_live = checked_add_bytes(
@@ -9275,7 +9205,7 @@ impl Graph {
         let revalidation_peak = index
             .peak_limit
             .checked_sub(revalidation_live)
-            .ok_or_else(|| initial_shadow_limit_error("peak build memory"))?;
+            .ok_or_else(|| graph_text_capture_limit_error("peak build memory"))?;
         graph_text_event_revalidation_race_hook()?;
         let rebound_parent =
             self.graph_text_event_parent_policy(&target, require_ambient_binding)?;
@@ -11416,7 +11346,7 @@ impl Graph {
         identity.update([0]);
         identity.update(expected);
         let staged = trash.join(format!(
-            "{}__managed-{:x}.{extension}",
+            "{}__conflict-{:x}.{extension}",
             trash_stamp(),
             identity.finalize()
         ));
@@ -14224,7 +14154,7 @@ impl Graph {
                 crate::direct_projection::RegistrySensitivity::Required,
                 |job| {
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity::DirectStructural {
+                    let identity = ResultIdentity {
                         session_pages: Arc::clone(&job.session_pages),
                         all_session: false,
                     };
@@ -15182,7 +15112,7 @@ impl Graph {
                 request,
                 crate::direct_projection::RegistrySensitivity::Insensitive,
                 |job| {
-                    let identity = crate::query::results::ResultIdentity::DirectStructural {
+                    let identity = crate::query::results::ResultIdentity {
                         session_pages: Arc::clone(&job.session_pages),
                         all_session: false,
                     };
@@ -15867,16 +15797,7 @@ impl Graph {
             );
             let content = serialize_pdf_hls_page(&page_path, &page_doc, None)?;
             let page_rev = self.commit_editor_write(
-                &write,
-                &page_path,
-                &content,
-                None,
-                true,
-                None,
-                None,
-                None,
-                EditorPublicationAuthority::DirectFile,
-                None,
+                &write, &page_path, &content, None, true, None, None, None, None,
             )?;
             let name = crate::pdf::hls_page_name(&key);
             let entry = PageEntry {
@@ -15892,8 +15813,8 @@ impl Graph {
         Ok(state)
     }
 
-    /// Initialize/read only OG's asset-side PDF sidecar. Managed storage calls
-    /// this inside its actor and creates the HLS graph page through the oplog.
+    /// Initialize/read only OG's asset-side PDF sidecar. The caller owns the HLS
+    /// graph page.
     pub(crate) fn open_pdf_asset_only(
         &self,
         pdf_filename: &str,
@@ -16004,7 +15925,7 @@ impl Graph {
         })
     }
 
-    /// Read the PDF-name collision input that can select a managed HLS page from
+    /// Read the PDF-name collision input that can select an HLS page from
     /// retained A as well. Internal `assets/` is enumerated through the writer's
     /// retained graph capability, so a replacement B cannot suppress or trigger
     /// legacy HLS migration. An explicitly approved external assets root remains
@@ -16043,9 +15964,8 @@ impl Graph {
     }
 
     /// Merge and publish only the asset-side PDF highlight sidecar. The caller
-    /// must either commit the paired HLS page and call `finish_...`, or reject
-    /// the page transaction and call `rollback_...`. Actor serialization is the
-    /// managed-mode lock; Direct Files still holds its existing HLS page lock.
+    /// holds its HLS page lock and must either commit the paired HLS page and
+    /// call `finish_...`, or reject the page transaction and call `rollback_...`.
     fn commit_highlight_sidecar_asset_only(
         &self,
         pdf_filename: &str,
@@ -16337,7 +16257,6 @@ impl Graph {
                 None,
                 None,
                 None,
-                EditorPublicationAuthority::DirectFile,
                 None,
             ) {
                 Ok(rev) => rev,
@@ -16792,7 +16711,6 @@ impl Graph {
         expected_identity: Option<ContentDigest>,
         editor_episode: Option<&ConflictEditorEpisode>,
         creation_proof: Option<DirectCreationProof>,
-        publication_authority: EditorPublicationAuthority,
         turn_short_id: Option<[u8; 4]>,
     ) -> io::Result<String> {
         // The Direct existing-file replacement already performs the late
@@ -16802,9 +16720,7 @@ impl Graph {
         // `commit_write` immediately beforehand duplicated a full-file read
         // without closing an additional race. Keep that earlier recheck for
         // creates and unpinned auxiliary writes.
-        let commit_recheck = recheck
-            && !(publication_authority == EditorPublicationAuthority::DirectFile
-                && expected_identity.is_some());
+        let commit_recheck = recheck && expected_identity.is_none();
         let create_parent = creation_proof.is_none();
         let (rev, ()) = self.commit_write(
             write,
@@ -16822,7 +16738,6 @@ impl Graph {
                     identity,
                     recheck.then_some(baseline).flatten().map(str::as_bytes),
                     editor_episode,
-                    publication_authority,
                     turn_short_id,
                 ),
                 (None, Some(creation_proof)) if baseline.is_none() => self
@@ -16886,9 +16801,7 @@ impl Graph {
             .write()
             .unwrap()
             .insert(path.to_path_buf(), (rev.clone(), identity));
-        if publication_authority == EditorPublicationAuthority::DirectFile {
-            self.remember_exact_graph_text_state(path, rev.clone(), identity);
-        }
+        self.remember_exact_graph_text_state(path, rev.clone(), identity);
         Ok(rev)
     }
 
@@ -17035,7 +16948,7 @@ impl Graph {
             if let Some(date) = entry.date_key.map(crate::date::JournalDate::from_ordinal) {
                 let shadow = match write {
                     Some(write) => self
-                        .managed_is_shadow_journal(write, path, date)
+                        .is_shadow_journal_under_permit(write, path, date)
                         .unwrap_or(true),
                     None => self.is_shadow_journal(path, date),
                 };
@@ -18378,7 +18291,6 @@ impl Graph {
                 expected_identity,
                 editor_episode,
                 creation_proof,
-                EditorPublicationAuthority::DirectFile,
                 None,
             )?
         } else {
@@ -19878,7 +19790,7 @@ pub fn content_rev(s: &str) -> String {
 
 /// Encode one logical page title as a portable on-disk filename stem.
 ///
-/// This is the shared create/rename/sparse identity boundary. It retains OG's
+/// This is the shared create/rename identity boundary. It retains OG's
 /// configured namespace spellings (`%2F` for legacy, `___` for triple-lowbar)
 /// and percent syntax while making the mapping injective: a literal percent is
 /// escaped before generated escapes are introduced, and every character the
@@ -21094,16 +21006,16 @@ fn read_projection_optional_bound_capture_with_limits(
 // has to be observable in production, not asserted in a comment. A thread-local
 // increment is free next to the open + read + SHA-256 it counts.
 thread_local! {
-    static MANAGED_TEXT_CAPTURE_READS: Cell<usize> = const { Cell::new(0) };
+    static GRAPH_TEXT_CAPTURE_READS: Cell<usize> = const { Cell::new(0) };
 }
 
-fn count_managed_text_capture_read() {
-    MANAGED_TEXT_CAPTURE_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+fn count_graph_text_capture_read() {
+    GRAPH_TEXT_CAPTURE_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
 }
 
 #[cfg(test)]
-pub(crate) fn managed_text_capture_reads() -> usize {
-    MANAGED_TEXT_CAPTURE_READS.with(Cell::get)
+pub(crate) fn graph_text_capture_reads() -> usize {
+    GRAPH_TEXT_CAPTURE_READS.with(Cell::get)
 }
 
 fn read_projection_optional_bound_capture_impl(
@@ -21111,7 +21023,7 @@ fn read_projection_optional_bound_capture_impl(
     name: &str,
     limits: Option<(u64, u64)>,
 ) -> io::Result<Option<(Vec<u8>, BlobDescription, ContentDigest, u64, u64)>> {
-    count_managed_text_capture_read();
+    count_graph_text_capture_read();
     let rebound_limit = limits
         .map(|(content_limit, _)| content_limit)
         .unwrap_or(MAX_PROJECTION_EVIDENCE_BYTES);
@@ -21197,11 +21109,11 @@ fn open_and_read_projection_regular_exact_bound(
     let mut file = open_projection_file_nofollow(dir, name)?;
     let len = file.metadata()?.len();
     if len > content_limit {
-        return Err(initial_shadow_limit_error("aggregate raw bytes"));
+        return Err(graph_text_capture_limit_error("aggregate raw bytes"));
     }
     let allocation_peak = checked_add_bytes(len, 16 * 1024)?;
     if allocation_peak > peak_limit {
-        return Err(initial_shadow_limit_error("peak build memory"));
+        return Err(graph_text_capture_limit_error("peak build memory"));
     }
     bounded_read_after_metadata_hook()?;
     let capacity = usize::try_from(len).map_err(|_| {
@@ -21235,13 +21147,13 @@ fn open_and_read_projection_regular_exact_bound(
     Ok((file, bytes))
 }
 
-const MAX_INITIAL_SHADOW_MANAGED_FILES: usize = 1_000_000;
-const MAX_INITIAL_SHADOW_RAW_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_INITIAL_SHADOW_DIRECTORY_DEPTH: usize = 256;
-const MAX_INITIAL_SHADOW_ALL_ENTRIES: usize = 2_000_000;
-const MAX_INITIAL_SHADOW_DIRECTORIES: usize = 1_000_000;
-const MAX_INITIAL_SHADOW_PENDING_DIRECTORIES: usize = 1_000_000;
-const MAX_INITIAL_SHADOW_PATH_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GRAPH_TEXT_CAPTURE_FILES: usize = 1_000_000;
+const MAX_GRAPH_TEXT_CAPTURE_RAW_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GRAPH_TEXT_CAPTURE_DIRECTORY_DEPTH: usize = 256;
+const MAX_GRAPH_TEXT_CAPTURE_ALL_ENTRIES: usize = 2_000_000;
+const MAX_GRAPH_TEXT_CAPTURE_DIRECTORIES: usize = 1_000_000;
+const MAX_GRAPH_TEXT_CAPTURE_PENDING_DIRECTORIES: usize = 1_000_000;
+const MAX_GRAPH_TEXT_CAPTURE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GRAPH_TEXT_ADMISSION_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GRAPH_TEXT_ADMISSION_BUILD_PEAK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES: u64 = 64 * 1024 * 1024;
@@ -21251,7 +21163,7 @@ const MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_GRAPH_TEXT_RETAINED_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
-struct InitialShadowLimits {
+struct GraphTextCaptureLimits {
     graph_text_files: usize,
     raw_bytes: u64,
     directory_depth: usize,
@@ -21263,21 +21175,21 @@ struct InitialShadowLimits {
     peak_build_bytes: u64,
 }
 
-const INITIAL_SHADOW_LIMITS: InitialShadowLimits = InitialShadowLimits {
-    graph_text_files: MAX_INITIAL_SHADOW_MANAGED_FILES,
-    raw_bytes: MAX_INITIAL_SHADOW_RAW_BYTES,
-    directory_depth: MAX_INITIAL_SHADOW_DIRECTORY_DEPTH,
-    all_entries: MAX_INITIAL_SHADOW_ALL_ENTRIES,
-    directories: MAX_INITIAL_SHADOW_DIRECTORIES,
-    pending_directories: MAX_INITIAL_SHADOW_PENDING_DIRECTORIES,
-    path_bytes: MAX_INITIAL_SHADOW_PATH_BYTES,
+const GRAPH_TEXT_CAPTURE_LIMITS: GraphTextCaptureLimits = GraphTextCaptureLimits {
+    graph_text_files: MAX_GRAPH_TEXT_CAPTURE_FILES,
+    raw_bytes: MAX_GRAPH_TEXT_CAPTURE_RAW_BYTES,
+    directory_depth: MAX_GRAPH_TEXT_CAPTURE_DIRECTORY_DEPTH,
+    all_entries: MAX_GRAPH_TEXT_CAPTURE_ALL_ENTRIES,
+    directories: MAX_GRAPH_TEXT_CAPTURE_DIRECTORIES,
+    pending_directories: MAX_GRAPH_TEXT_CAPTURE_PENDING_DIRECTORIES,
+    path_bytes: MAX_GRAPH_TEXT_CAPTURE_PATH_BYTES,
     permanent_index_bytes: MAX_GRAPH_TEXT_ADMISSION_INDEX_BYTES,
     peak_build_bytes: MAX_GRAPH_TEXT_ADMISSION_BUILD_PEAK_BYTES,
 };
 
-/// Bounds for mutable managed-text inventories. These deliberately reuse the
-/// initial-shadow limits so the later migration cannot be driven beyond the
-/// memory and traversal envelope already accepted for shadow capture.
+/// Bounds for mutable graph-text inventories. These deliberately reuse the
+/// capture limits so a mutable inventory cannot be driven beyond the memory
+/// and traversal envelope already accepted for the initial capture.
 #[derive(Clone, Copy)]
 struct GraphTextInventoryLimits {
     graph_text_files: usize,
@@ -21290,12 +21202,12 @@ struct GraphTextInventoryLimits {
 }
 
 const GRAPH_TEXT_INVENTORY_LIMITS: GraphTextInventoryLimits = GraphTextInventoryLimits {
-    graph_text_files: MAX_INITIAL_SHADOW_MANAGED_FILES,
-    directory_depth: MAX_INITIAL_SHADOW_DIRECTORY_DEPTH,
-    all_entries: MAX_INITIAL_SHADOW_ALL_ENTRIES,
-    directories: MAX_INITIAL_SHADOW_DIRECTORIES,
-    pending_directories: MAX_INITIAL_SHADOW_PENDING_DIRECTORIES,
-    path_bytes: MAX_INITIAL_SHADOW_PATH_BYTES,
+    graph_text_files: MAX_GRAPH_TEXT_CAPTURE_FILES,
+    directory_depth: MAX_GRAPH_TEXT_CAPTURE_DIRECTORY_DEPTH,
+    all_entries: MAX_GRAPH_TEXT_CAPTURE_ALL_ENTRIES,
+    directories: MAX_GRAPH_TEXT_CAPTURE_DIRECTORIES,
+    pending_directories: MAX_GRAPH_TEXT_CAPTURE_PENDING_DIRECTORIES,
+    path_bytes: MAX_GRAPH_TEXT_CAPTURE_PATH_BYTES,
     retained_content_bytes: MAX_GRAPH_TEXT_RETAINED_CONTENT_BYTES,
 };
 
@@ -21726,8 +21638,8 @@ enum PinnedSaveAuthority<'a> {
     /// `base_rev` argument; `PageDto.rev` is NOT part of the working-store DTO
     /// that `pageToDto` builds, so it must never be read as one.
     ///
-    /// Refusing a changed inode up front (as the retired managed journal
-    /// projection did) would pre-empt the base-revision check and turn every
+    /// Refusing a changed inode up front (as an earlier journal projection
+    /// did) would pre-empt the base-revision check and turn every
     /// rename-based external write (Syncthing, Dropbox, Logseq OG, VS Code, any
     /// temp+rename tool) into a permanent
     /// `path-pinned page does not match its captured exact owner`. The frontend
@@ -21781,7 +21693,7 @@ fn graph_text_inventory_limits() -> GraphTextInventoryLimits {
     })
 }
 
-struct InitialShadowEntry {
+struct GraphTextCaptureEntry {
     path: GraphTextPath,
     bytes: Option<Vec<u8>>,
     description: BlobDescription,
@@ -21789,8 +21701,8 @@ struct InitialShadowEntry {
     link_count: u64,
 }
 
-struct InitialShadowCapture {
-    entries: Vec<InitialShadowEntry>,
+struct GraphTextCapture {
+    entries: Vec<GraphTextCaptureEntry>,
     directories_by_exact_relative: std::collections::BTreeMap<String, ContentDigest>,
     paths_by_file_resource:
         std::collections::BTreeMap<ContentDigest, std::collections::BTreeSet<String>>,
@@ -21800,15 +21712,15 @@ struct InitialShadowCapture {
     peak_build_charge: u64,
 }
 
-fn collect_initial_shadow_managed_inventory_with_limits_inner(
+fn collect_graph_text_capture_inner(
     graph: &Graph,
     _permit: &GraphTextWritePermit,
     retain_bytes: bool,
-    limits: InitialShadowLimits,
+    limits: GraphTextCaptureLimits,
     simultaneous_capture_bytes: u64,
     require_ambient_binding: bool,
     skip_symlinks: bool,
-) -> io::Result<InitialShadowCapture> {
+) -> io::Result<GraphTextCapture> {
     struct PendingDirectory {
         directory: Dir,
         relative: String,
@@ -21820,7 +21732,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
     let mut all_entries = 0_usize;
     let mut directory_count = 1_usize;
     let mut path_bytes = 0_u64;
-    let mut peak_build_charge = initial_shadow_root_capture_upper_bound()?;
+    let mut peak_build_charge = graph_text_root_capture_upper_bound()?;
     let mut directories_by_exact_relative = std::collections::BTreeMap::new();
     let mut directory_resources = std::collections::BTreeMap::new();
     let mut paths_by_file_resource =
@@ -21833,7 +21745,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
         limits.peak_build_bytes,
     )?;
     if directory_count > limits.directories {
-        return Err(initial_shadow_limit_error("directory count"));
+        return Err(graph_text_capture_limit_error("directory count"));
     }
     if require_ambient_binding {
         graph.ensure_projection_root_binding()?;
@@ -21856,7 +21768,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
     directories_by_exact_relative.insert(String::new(), root_resource);
     directory_resources.insert(root_resource, String::new());
     if pending.len() == limits.pending_directories {
-        return Err(initial_shadow_limit_error("pending directories"));
+        return Err(graph_text_capture_limit_error("pending directories"));
     }
     pending.push(PendingDirectory {
         directory,
@@ -21874,9 +21786,9 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
         for entry in directory.entries()? {
             all_entries = all_entries
                 .checked_add(1)
-                .ok_or_else(|| initial_shadow_limit_error("all directory entries"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("all directory entries"))?;
             if all_entries > limits.all_entries {
-                return Err(initial_shadow_limit_error("all directory entries"));
+                return Err(graph_text_capture_limit_error("all directory entries"));
             }
             let entry = entry?;
             let name = entry.file_name();
@@ -21894,15 +21806,15 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             path_bytes = path_bytes
                 .checked_add(
                     usize_to_u64(relative_len)
-                        .map_err(|_| initial_shadow_limit_error("aggregate path bytes"))?,
+                        .map_err(|_| graph_text_capture_limit_error("aggregate path bytes"))?,
                 )
-                .ok_or_else(|| initial_shadow_limit_error("aggregate path bytes"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("aggregate path bytes"))?;
             if path_bytes > limits.path_bytes {
-                return Err(initial_shadow_limit_error("aggregate path bytes"));
+                return Err(graph_text_capture_limit_error("aggregate path bytes"));
             }
-            grow_initial_shadow_capture_charge(
+            grow_graph_text_capture_charge(
                 &mut peak_build_charge,
-                initial_shadow_discovered_path_upper_bound(usize_to_u64(relative_len)?)?,
+                graph_text_discovered_path_upper_bound(usize_to_u64(relative_len)?)?,
                 simultaneous_capture_bytes,
                 limits.peak_build_bytes,
             )?;
@@ -21950,15 +21862,15 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                 }
                 let child_depth = depth
                     .checked_add(1)
-                    .ok_or_else(|| initial_shadow_limit_error("graph directory depth"))?;
+                    .ok_or_else(|| graph_text_capture_limit_error("graph directory depth"))?;
                 if child_depth > limits.directory_depth {
-                    return Err(initial_shadow_limit_error("graph directory depth"));
+                    return Err(graph_text_capture_limit_error("graph directory depth"));
                 }
                 directory_count = directory_count
                     .checked_add(1)
-                    .ok_or_else(|| initial_shadow_limit_error("directory count"))?;
+                    .ok_or_else(|| graph_text_capture_limit_error("directory count"))?;
                 if directory_count > limits.directories {
-                    return Err(initial_shadow_limit_error("directory count"));
+                    return Err(graph_text_capture_limit_error("directory count"));
                 }
                 projection_real_directory(&directory, name)?;
                 let child = open_projection_dir_nofollow(&directory, name)?;
@@ -21983,7 +21895,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                     ));
                 }
                 if pending.len() == limits.pending_directories {
-                    return Err(initial_shadow_limit_error("pending directories"));
+                    return Err(graph_text_capture_limit_error("pending directories"));
                 }
                 pending.push(PendingDirectory {
                     directory: child,
@@ -22010,20 +21922,20 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                 continue;
             }
             if entries.len() == limits.graph_text_files {
-                return Err(initial_shadow_limit_error("graph file count"));
+                return Err(graph_text_capture_limit_error("graph file count"));
             }
             let path = GraphTextPath::parse(child_relative)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
             let remaining_raw = limits
                 .raw_bytes
                 .checked_sub(raw_bytes)
-                .ok_or_else(|| initial_shadow_limit_error("aggregate raw bytes"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("aggregate raw bytes"))?;
             let live_capture_bytes =
                 checked_add_bytes(simultaneous_capture_bytes, peak_build_charge)?;
             let remaining_peak = limits
                 .peak_build_bytes
                 .checked_sub(live_capture_bytes)
-                .ok_or_else(|| initial_shadow_limit_error("peak build memory"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("peak build memory"))?;
             let (bytes, description, captured_resource, _, _) =
                 read_projection_optional_bound_capture_with_limits(
                     &directory,
@@ -22038,7 +21950,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
                     )
                 })?;
             if retain_bytes {
-                grow_initial_shadow_capture_charge(
+                grow_graph_text_capture_charge(
                     &mut peak_build_charge,
                     usize_to_u64(bytes.capacity())?,
                     simultaneous_capture_bytes,
@@ -22053,11 +21965,11 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             }
             raw_bytes = raw_bytes
                 .checked_add(usize_to_u64(bytes.len())?)
-                .ok_or_else(|| initial_shadow_limit_error("aggregate raw bytes"))?;
+                .ok_or_else(|| graph_text_capture_limit_error("aggregate raw bytes"))?;
             if raw_bytes > limits.raw_bytes {
-                return Err(initial_shadow_limit_error("aggregate raw bytes"));
+                return Err(graph_text_capture_limit_error("aggregate raw bytes"));
             }
-            entries.push(InitialShadowEntry {
+            entries.push(GraphTextCaptureEntry {
                 path,
                 description,
                 bytes: retain_bytes.then_some(bytes),
@@ -22074,10 +21986,10 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "initial shadow capture contains duplicate graph paths",
+            "graph-text capture contains duplicate graph paths",
         ));
     }
-    Ok(InitialShadowCapture {
+    Ok(GraphTextCapture {
         entries,
         directories_by_exact_relative,
         paths_by_file_resource,
@@ -22105,12 +22017,12 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
 
 fn ensure_graph_text_peak_limit(base: u64, additional: u64, limit: u64) -> io::Result<()> {
     if checked_add_bytes(base, additional)? > limit {
-        return Err(initial_shadow_limit_error("peak build memory"));
+        return Err(graph_text_capture_limit_error("peak build memory"));
     }
     Ok(())
 }
 
-fn grow_initial_shadow_capture_charge(
+fn grow_graph_text_capture_charge(
     charge: &mut u64,
     growth: u64,
     simultaneous_capture_bytes: u64,
@@ -22122,10 +22034,10 @@ fn grow_initial_shadow_capture_charge(
     Ok(())
 }
 
-fn initial_shadow_discovered_path_upper_bound(relative_len: u64) -> io::Result<u64> {
+fn graph_text_discovered_path_upper_bound(relative_len: u64) -> io::Result<u64> {
     let owned_path = owned_string_len_upper_bound(relative_len)?;
     let mut bytes = checked_add_bytes(
-        conservative_vec_entry_bytes::<InitialShadowEntry>()?,
+        conservative_vec_entry_bytes::<GraphTextCaptureEntry>()?,
         checked_add_bytes(
             conservative_vec_entry_bytes::<(Dir, String, usize)>()?,
             owned_path,
@@ -22149,7 +22061,7 @@ fn initial_shadow_discovered_path_upper_bound(relative_len: u64) -> io::Result<u
     checked_add_bytes(bytes, 512)
 }
 
-fn initial_shadow_root_capture_upper_bound() -> io::Result<u64> {
+fn graph_text_root_capture_upper_bound() -> io::Result<u64> {
     let empty = owned_string_len_upper_bound(0)?;
     let mut bytes = conservative_vec_entry_bytes::<(Dir, String, usize)>()?;
     bytes = checked_add_bytes(
@@ -22172,10 +22084,7 @@ fn graph_text_semantic_key(entry: &PageEntry) -> (u8, String) {
     (kind, crate::refs::page_key(&entry.name))
 }
 
-fn initial_shadow_captures_match(
-    first: &InitialShadowCapture,
-    second: &InitialShadowCapture,
-) -> bool {
+fn graph_text_captures_match(first: &GraphTextCapture, second: &GraphTextCapture) -> bool {
     first.directories_by_exact_relative == second.directories_by_exact_relative
         && first.paths_by_file_resource == second.paths_by_file_resource
         && first.file_link_count_by_exact_relative == second.file_link_count_by_exact_relative
@@ -22196,8 +22105,8 @@ fn initial_shadow_captures_match(
 
 fn build_graph_text_admission_index(
     graph: &Graph,
-    capture: &InitialShadowCapture,
-    limits: InitialShadowLimits,
+    capture: &GraphTextCapture,
+    limits: GraphTextCaptureLimits,
     combined_capture_bytes: u64,
     decode_semantics: bool,
     prior: Option<&CompleteGraphTextAdmissionIndex>,
@@ -22225,7 +22134,7 @@ fn build_graph_text_admission_index(
     let permanent_bytes =
         graph_text_initial_permanent_upper_bound(graph, capture, decode_semantics)?;
     if permanent_bytes > limits.permanent_index_bytes {
-        return Err(initial_shadow_limit_error("permanent index memory"));
+        return Err(graph_text_capture_limit_error("permanent index memory"));
     }
     let validation_scratch =
         graph_text_index_validation_scratch_upper_bound(graph, capture, decode_semantics)?;
@@ -22301,7 +22210,7 @@ fn build_graph_text_admission_index(
         let bytes = entry
             .bytes
             .as_deref()
-            .expect("the first initial-shadow pass retains bytes");
+            .expect("the first capture pass retains bytes");
         // THE cut (GH #267). A rebuild used to parse EVERY document in the graph
         // whenever the exact-observation chain had broken -- on every save, and
         // on Windows or a network share that was essentially always. But an
@@ -22330,7 +22239,7 @@ fn build_graph_text_admission_index(
             let (semantic, format, node_count) =
                 graph.decode_present_graph_text_with_node_count(&entry.path, bytes, permit)?;
             if node_count > MAX_GRAPH_TEXT_PARSER_NODES {
-                return Err(initial_shadow_limit_error("parser node count"));
+                return Err(graph_text_capture_limit_error("parser node count"));
             }
             (semantic, format)
         } else {
@@ -22377,7 +22286,7 @@ fn build_graph_text_admission_index(
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "initial shadow contains duplicate exact graph-text paths",
+                "graph-text capture contains duplicate exact graph-text paths",
             ));
         }
     }
@@ -22389,7 +22298,7 @@ fn build_graph_text_admission_index(
 
 fn graph_text_initial_permanent_upper_bound(
     graph: &Graph,
-    capture: &InitialShadowCapture,
+    capture: &GraphTextCapture,
     decode_semantics: bool,
 ) -> io::Result<u64> {
     let title_format = graph_text_journal_title_format_budget(graph)?;
@@ -22459,7 +22368,7 @@ fn graph_text_initial_permanent_upper_bound(
 
 fn graph_text_index_validation_scratch_upper_bound(
     graph: &Graph,
-    capture: &InitialShadowCapture,
+    capture: &GraphTextCapture,
     decode_semantics: bool,
 ) -> io::Result<u64> {
     let mut largest_path = 0_u64;
@@ -22557,7 +22466,9 @@ fn graph_text_journal_title_format_budget(
     if input_bytes > MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES
         || rendered_bytes > MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES
     {
-        return Err(initial_shadow_limit_error("journal title format expansion"));
+        return Err(graph_text_capture_limit_error(
+            "journal title format expansion",
+        ));
     }
     Ok(GraphTextJournalTitleFormatBudget {
         input_bytes,
@@ -22600,7 +22511,7 @@ fn graph_text_observed_semantic_name_upper_bound(
     }
     observed = observed.max(title_format.rendered_bytes);
     if observed > MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES {
-        return Err(initial_shadow_limit_error("semantic title bytes"));
+        return Err(graph_text_capture_limit_error("semantic title bytes"));
     }
     Ok(GraphTextSemanticNameBudget {
         semantic_name_bytes: observed,
@@ -22616,7 +22527,7 @@ fn guarded_graph_text_semantic_name_upper_bound(
     let observed =
         checked_add_bytes(usize_to_u64(path.as_str().len())?, 64)?.max(title_format.rendered_bytes);
     if observed > MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES {
-        return Err(initial_shadow_limit_error("semantic title bytes"));
+        return Err(graph_text_capture_limit_error("semantic title bytes"));
     }
     Ok(observed)
 }
@@ -23389,7 +23300,7 @@ const MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES: usize = 4096;
 /// Carried over unchanged from the deleted exact-feed batch that used to
 /// namespace them; `classify_graph_text_exact_feed_path` is the live consumer.
 const MAX_GRAPH_TEXT_EXACT_RELATIVE_BYTES: usize = 4096;
-const MAX_GRAPH_TEXT_EXACT_PATH_COMPONENTS: usize = MAX_INITIAL_SHADOW_DIRECTORY_DEPTH + 1;
+const MAX_GRAPH_TEXT_EXACT_PATH_COMPONENTS: usize = MAX_GRAPH_TEXT_CAPTURE_DIRECTORY_DEPTH + 1;
 
 fn validate_graph_text_exact_feed_relative(relative: &str) -> io::Result<()> {
     if relative != relative.trim()
@@ -23411,10 +23322,8 @@ fn validate_graph_text_exact_feed_relative(relative: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn graph_text_exact_feed_failure_cause(reason: GraphTextExactFeedFailure, cause: &str) -> String {
-    let label = match reason {
-        GraphTextExactFeedFailure::DirectoryMutation => "directory mutation",
-    };
+fn graph_text_exact_feed_failure_cause(cause: &str) -> String {
+    let label = "directory mutation";
     let available = MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES.saturating_sub(label.len() + 2);
     let mut boundary = cause.len().min(available);
     while !cause.is_char_boundary(boundary) {
@@ -23486,12 +23395,12 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
         .unwrap_or(DirectSaveFailureCode::Unknown.as_str())
 }
 
-fn initial_shadow_limit_error(resource: &'static str) -> io::Error {
+fn graph_text_capture_limit_error(resource: &'static str) -> io::Error {
     DirectSaveError::into_io(
         DirectSaveFailureCode::PrecheckLimit,
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("initial shadow {resource} bound exceeded"),
+            format!("graph-text capture {resource} bound exceeded"),
         ),
     )
 }

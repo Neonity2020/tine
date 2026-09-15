@@ -65,27 +65,6 @@ where
     rows
 }
 
-/// The two `blocks` query-text columns from one block's visible text (§5.8,
-/// §5.10).
-///
-/// `folded` is `BlockProjection::visible_lower` where the caller already holds
-/// it: `BlockProjection::projection` fills that field with exactly
-/// `search_query::canonical_fold(visible)`, so passing it
-/// saves a second fold on the Direct Files build path without introducing a
-/// second folding rule. Managed Storage carries only the visible text across
-/// its input capture and passes `None`.
-///
-/// Deliberately not `searchable_text`: both producers collapse whitespace in
-/// that column for the existing search consumers, and a content predicate has
-/// to be able to tell `a  b` from `a b`.
-pub fn query_visible_columns(visible: &str, folded: Option<&str>) -> (String, String) {
-    let folded = folded.map_or_else(
-        || crate::search_query::canonical_fold(visible),
-        str::to_owned,
-    );
-    (visible.to_owned(), folded)
-}
-
 /// One owner's `tags` rows: the spelling the source used, plus the page-name
 /// key `tag('x')` compares on (§3.2 K18).
 ///

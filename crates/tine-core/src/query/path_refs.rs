@@ -133,10 +133,10 @@ pub fn dfs_path_refs<'a, N: 'a, C, R, V>(
 /// parent, and the block's OWN normalized references — `BlockProjection`'s
 /// `refs_norm`, the walk's exact source, on both backends (§5.8 G1).
 ///
-/// Reference postings are deliberately not an input: they encode different
-/// things per backend (Direct Files labels `tags::`/`alias::` values kind 3,
-/// Managed labels alias declarations kind 4 and property keys kind 5), so no
-/// kind filter over them can be parity-safe.
+/// Reference postings are deliberately not an input: the walk's exact source
+/// is `refs_norm`, and the postings encode more than that (they label
+/// `tags::`/`alias::` values kind 3), so a kind filter over them would first
+/// have to be proven equivalent.
 #[derive(Debug, Clone, Copy)]
 pub struct PathRefBlock<'a, Id> {
     pub id: Id,

@@ -15,7 +15,7 @@ fn print_snapshot(
     source: &str,
 ) -> Result<String, crate::publish::PrintPreparationError> {
     let registry = corpus.graph.property_registry();
-    let identity = ResultIdentity::Stored;
+    let identity = ResultIdentity::session_owned();
     let recency = |_page: RecencyPage<'_>| 0;
     let page_recency = crate::query::rank::PageRecencyPrograms::new(
         crate::query::rank::JournalRankInput::StoredDay,
@@ -386,7 +386,7 @@ fn read_export(
     }
     let registry = corpus.graph.property_registry();
     let recency = |_page: RecencyPage<'_>| 0;
-    let identity = ResultIdentity::Stored;
+    let identity = ResultIdentity::session_owned();
     let mut snapshot = corpus.snapshot();
     let answer = prepared.execute(
         &mut snapshot,
@@ -632,7 +632,7 @@ fn missing_required_descendant_payload_fails_the_whole_batch() {
     let specs = vec![spec("damaged", "(and (task TODO) (page Alpha))")];
     let prepared = PreparedExportBatch::prepare(&specs, 64, corpus.today());
     let registry = corpus.graph.property_registry();
-    let identity = ResultIdentity::Stored;
+    let identity = ResultIdentity::session_owned();
     let recency = |_page: RecencyPage<'_>| 0;
     let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
         .expect("damaged projection still opens");
@@ -662,7 +662,7 @@ fn cancellation_after_complete_construction_returns_no_partial_batch() {
     let specs = vec![spec("cancel", "(task TODO)")];
     let prepared = PreparedExportBatch::prepare(&specs, 64, corpus.today());
     let registry = corpus.graph.property_registry();
-    let identity = ResultIdentity::Stored;
+    let identity = ResultIdentity::session_owned();
     let recency = |_page: RecencyPage<'_>| 0;
     let mut snapshot = corpus.snapshot();
     let cancellation = snapshot.cancellation();

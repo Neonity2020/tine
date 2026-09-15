@@ -321,8 +321,7 @@ graph open, save or external file observation.
 The switched read families are literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
 inventory used by autocomplete and navigation. They also include the shared
-property-facet rows used by the query builder and editor autocomplete, and the
-PageRef simple-query candidate plan in the independent test oracle. The production
+property-facet rows used by the query builder and editor autocomplete. The production
 query route selects results through SQL. The switched families further include page aliases and
 real-page ownership, explicit backlink and safely tokenizable unlinked-reference
 candidate selection, persisted/runtime block-identity lookup, block-referrer
@@ -332,16 +331,6 @@ candidate/name set before applying the existing parser-owned matching and
 presentation semantics. They no longer use manual whole-graph candidate scans
 or second in-memory alias, reference-candidate, block-identity, referenced-name,
 or block-ref-count semantic caches as their ordinary route.
-
-There is no separate sparse task-query read family. It was a marker-narrowed
-candidate stream that SQLite enumerated and the parser evaluator then
-re-evaluated block by block, admitted by its own `sparse_task_query_eligibility`
-gate; the RET2 correction deleted the
-gate, its two source guards and the parser sparse runner once Direct Files
-answered a task query through the ONE lowered statement below instead of
-pre-filtering a walk. A task query is now simply one shape that statement
-answers, and it is admitted by the lowering, not by a second opinion about
-which shapes are enumerable.
 
 TQL publication indexes its immutable captured documents with the existing
 Direct projection producer only when an authorized page contains a TQL macro.

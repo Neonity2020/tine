@@ -270,7 +270,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     const contract = source("docs/contracts/typed-errors.md");
     const directClassifier = model.slice(
       model.indexOf("pub fn direct_save_conflict_epoch"),
-      model.indexOf("fn initial_shadow_limit_error"),
+      model.indexOf("fn graph_text_capture_limit_error"),
     );
     expect(directClassifier).toContain("downcast_ref::<DirectSaveError>()");
     expect(directClassifier).not.toMatch(/(?:to_string|contains|starts_with)\s*\(/);

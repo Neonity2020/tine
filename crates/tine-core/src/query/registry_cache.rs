@@ -12,8 +12,6 @@ use crate::doc::property_key_norm;
 use crate::query::registry::{is_internal_key, Registry};
 use crate::query::{QueryExecutionError, QueryUnavailableReason};
 
-pub(crate) type SharedRegistryCache = Arc<std::sync::Mutex<CommittedRegistryCache>>;
-
 struct Published {
     revision: u64,
     registry: Arc<Registry>,
@@ -219,9 +217,8 @@ impl RegistryCapture {
         self.build_at_validated_revision(snapshot, config, revision)
     }
 
-    /// Managed callers pass the acceptance sequence already validated by
-    /// `open_managed` inside this exact snapshot. It is distinct from the
-    /// disposable physical query revision Direct reads above.
+    /// Build at a query revision the caller has already validated inside this
+    /// exact snapshot.
     pub(crate) fn build_at_validated_revision(
         &self,
         snapshot: &mut PhysicalProjectionQuerySnapshot,

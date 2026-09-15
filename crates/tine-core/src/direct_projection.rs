@@ -2902,10 +2902,9 @@ fn lower_blocks(
             .join(" ");
         // The query columns are the EXACT visible text and its fold, never the
         // whitespace-collapsed `searchable_text` beside them (§5.10).
-        let (query_visible, query_visible_folded) = crate::query::derived::query_visible_columns(
-            &projection.visible,
-            Some(&projection.visible_lower),
-        );
+        // `visible_lower` is exactly `search_query::canonical_fold(visible)`.
+        let (query_visible, query_visible_folded) =
+            (projection.visible.clone(), projection.visible_lower.clone());
         let properties = projection
             .properties
             .iter()
@@ -6075,27 +6074,7 @@ mod tests {
             contract,
             "direct-files-projections/<canonical-graph-path-digest>.sqlite"
         ));
-        // RET2 correction: the sparse task-query family is DELETED, so the
-        // contract must say so rather than describe it as a live read family.
-        // Pinned as a retirement, because "the document still mentions it" is
-        // how dead code survives a sweep.
-        assert!(contains_words(
-            contract,
-            "There is no separate sparse task-query read family."
-        ));
-        assert!(contains_words(
-            contract,
-            "the RET2 correction deleted the\ngate"
-        ));
         assert!(contains_words(contract, "shared\nproperty-facet rows"));
-        assert!(contains_words(
-            contract,
-            "PageRef simple-query candidate plan"
-        ));
-        assert!(contains_words(
-            contract,
-            "PageRef simple-query candidate plan in the independent test oracle."
-        ));
         assert!(contains_words(
             contract,
             "The production\nquery route selects results through SQL."

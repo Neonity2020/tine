@@ -1310,17 +1310,18 @@ pub fn markdown_round_trips(content: &str) -> bool {
 /// Whether parsing and format-preserving serialization retain the complete
 /// document model, even when insignificant source trivia is canonicalized.
 ///
-/// Sparse-v2 admission uses this structural criterion: activation preserves the
-/// original source bytes and its backup, so harmless whitespace normalization
-/// must not prevent import. A later edit may canonicalize that trivia, but it
-/// may not change block content or ancestry.
-pub fn markdown_structurally_round_trips(content: &str) -> bool {
+/// Harmless whitespace normalization passes; a change to block content or
+/// ancestry does not. The outline differential and serializer tests use it as
+/// their refusal oracle.
+#[cfg(test)]
+pub(crate) fn markdown_structurally_round_trips(content: &str) -> bool {
     let Ok(parsed) = try_parse_with_source_spans(content) else {
         return false;
     };
     markdown_structurally_round_trips_parsed(content, &parsed)
 }
 
+#[cfg(test)]
 pub(crate) fn markdown_structurally_round_trips_parsed(
     content: &str,
     parsed: &ParsedDocument,

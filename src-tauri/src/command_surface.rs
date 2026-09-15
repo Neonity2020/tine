@@ -257,7 +257,6 @@ mod tests {
     fn the_list_is_sorted_so_lookup_can_binary_search() {
         assert!(KNOWN_COMMANDS.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(is_known_command("load_graph"));
-        assert!(!is_known_command("sparse_v2_status"));
         assert!(!is_known_command(""));
     }
 }

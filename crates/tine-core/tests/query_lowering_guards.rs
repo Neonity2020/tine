@@ -97,26 +97,12 @@ struct CensusRecord {
 
 fn containing_symbol(source: &str, offset: usize) -> String {
     let before = &source[..offset];
-    let function = Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)")
+    Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)")
         .unwrap()
         .captures_iter(before)
         .last()
         .map(|capture| capture[1].to_string())
-        .expect("read-family call must be inside a named function");
-    if before
-        .rfind("impl SimpleQuerySqlRead for ")
-        .is_some_and(|implementation| before[implementation..].rfind("fn ").is_some())
-    {
-        let implementation = before.rfind("impl SimpleQuerySqlRead for ").unwrap();
-        let rest = &before[implementation + "impl SimpleQuerySqlRead for ".len()..];
-        let owner = rest
-            .split(|character: char| character.is_whitespace() || character == '{')
-            .next()
-            .unwrap();
-        format!("{owner}::{function}")
-    } else {
-        function
-    }
+        .expect("read-family call must be inside a named function")
 }
 
 fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static str) {

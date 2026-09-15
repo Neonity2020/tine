@@ -510,11 +510,11 @@ fn export_core_answers_exactly_what_the_walk_export_answers() {
     let mut differences: Vec<String> = Vec::new();
     let mut nodes = 0usize;
     for identity in [
-        ResultIdentity::Stored,
+        ResultIdentity::session_owned(),
         // A FRESH Direct session: no page's identity is this session's, so
         // every row — root and descendant alike — resolves its public id
         // structurally from the stored path and order key.
-        ResultIdentity::DirectStructural {
+        ResultIdentity {
             session_pages: std::sync::Arc::new(std::collections::HashSet::new()),
             all_session: false,
         },
@@ -584,8 +584,14 @@ fn tql_export_preserves_the_declared_dialect_and_exact_subtree_membership() {
     );
 
     let mut snapshot = corpus.snapshot();
-    let tql_read = export_over(&corpus, &mut snapshot, &tql, caps, &ResultIdentity::Stored)
-        .expect("the declared TQL export answers");
+    let tql_read = export_over(
+        &corpus,
+        &mut snapshot,
+        &tql,
+        caps,
+        &ResultIdentity::session_owned(),
+    )
+    .expect("the declared TQL export answers");
     snapshot.finish();
     assert_eq!(
         preorder_ids(&tql_read.results[0].groups[0].blocks),
@@ -630,7 +636,7 @@ fn export_core_matches_the_walk_through_sort_coalescing_and_sampling() {
             &mut snapshot,
             &specs,
             caps,
-            &ResultIdentity::Stored,
+            &ResultIdentity::session_owned(),
         )
         .expect("the export answers");
         snapshot.finish();
@@ -672,7 +678,7 @@ fn a_child_that_cannot_fit_stops_its_parent_but_not_its_grandparents_next_child(
         &mut snapshot,
         &specs,
         caps,
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers");
     snapshot.finish();
@@ -721,7 +727,7 @@ fn the_node_budget_is_recursive_too() {
             &mut snapshot,
             &specs,
             caps,
-            &ResultIdentity::Stored,
+            &ResultIdentity::session_owned(),
         )
         .expect("the export answers");
         snapshot.finish();
@@ -754,7 +760,7 @@ fn a_huge_page_with_a_tiny_requested_subtree_reads_the_subtree_only() {
         &mut snapshot,
         &specs,
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers");
     snapshot.finish();
@@ -806,7 +812,7 @@ fn output_payload_is_read_only_for_admitted_descendants() {
         &mut snapshot,
         &specs,
         caps,
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers");
     snapshot.finish();
@@ -851,7 +857,7 @@ fn the_export_reads_no_source_document() {
         &mut snapshot,
         &specs,
         caps,
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers without any source document");
     snapshot.finish();
@@ -942,7 +948,7 @@ fn a_root_is_the_physical_block_that_was_selected_not_the_first_block_that_share
         &mut snapshot,
         &specs,
         caps,
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers");
     snapshot.finish();
@@ -1002,7 +1008,7 @@ fn equal_display_names_do_not_merge_two_physical_subtrees() {
         &mut snapshot,
         &specs,
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers");
     snapshot.finish();
@@ -1119,7 +1125,7 @@ fn a_nested_root_verifies_the_parent_that_ends_its_subtree() {
         &mut snapshot,
         &specs,
         caps,
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("the export answers");
     snapshot.finish();
@@ -1183,7 +1189,7 @@ fn export_damaged(
         &mut snapshot,
         &[spec("later", "(task LATER)")],
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     snapshot.finish();
     let _ = std::fs::remove_file(&path);
@@ -1232,7 +1238,7 @@ fn a_damaged_projection_fails_the_export_instead_of_shortening_it() {
             &mut snapshot,
             &[spec("later", "(task LATER)")],
             Caps::default(),
-            &ResultIdentity::Stored,
+            &ResultIdentity::session_owned(),
         )
         .expect("the healthy export answers");
         snapshot.finish();
@@ -1303,7 +1309,7 @@ fn a_missing_final_descendant_result_row_fails_instead_of_shortening_export() {
         &mut snapshot,
         &[spec("later", "(task LATER)")],
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .unwrap();
     snapshot.finish();
@@ -1424,7 +1430,7 @@ fn a_selected_zero_child_leaf_is_complete() {
         &mut snapshot,
         &[spec("leaf", "(task LATER)")],
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("a selected leaf with no children is complete");
     snapshot.finish();
@@ -1482,7 +1488,7 @@ fn completeness_batches_exactly_128_parents_per_statement() {
             &mut snapshot,
             &[spec("batch", "(task LATER)")],
             Caps::default(),
-            &ResultIdentity::Stored,
+            &ResultIdentity::session_owned(),
         )
         .expect("the complete wide subtree exports");
         snapshot.finish();
@@ -1521,7 +1527,7 @@ fn repeated_selected_roots_reuse_the_verified_topology() {
         &mut snapshot,
         &specs,
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("both occurrences export");
     snapshot.finish();
@@ -1568,7 +1574,7 @@ fn cancelling_between_completeness_batches_reads_no_descendant_payload() {
         &mut snapshot,
         &[spec("batch", "(task LATER)")],
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     set_before_completeness_batch_hook(None);
     assert!(
@@ -1598,7 +1604,7 @@ fn a_cancelled_export_reads_nothing() {
         &mut snapshot,
         &[spec("todo", "(task TODO)")],
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     snapshot.finish();
     assert!(matches!(answer, Err(ResultReadError::Cancelled)));
@@ -1643,7 +1649,7 @@ fn cancelling_between_output_payload_batches_stops_the_export() {
         &mut snapshot,
         &[spec("wide", "(task TODO)")],
         Caps::default(),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     set_before_export_payload_batch_hook(None);
     owner.join().expect("the owner thread finishes");

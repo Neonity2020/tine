@@ -1,19 +1,11 @@
-//! Character-level three-way machinery over one block body, shared by the two
-//! storage regimes. One bounded Myers diff, one hunk model, one composition —
-//! two collision rules, because the two regimes carry different authority:
-//!
-//! - [`classify_concurrent_edits`] (managed storage, GH #351) decides whether
-//!   the CRDT's merge may ship SILENTLY. It is deliberately conservative: any
-//!   doubt — overlapping OR merely adjacent hunks, oversized inputs, a bounded
-//!   diff search giving up, or a clean composition that disagrees with the CRDT
-//!   merge (diff mis-anchoring on repetitive text) — resolves to `Conflict`.
-//! - [`merge_disjoint`] (Direct Files / Concord) produces a merged body that is
-//!   only ever PRE-SELECTED for the user to confirm, never auto-applied, so it
-//!   uses the weaker rule of [`hunks_collide_relaxed`].
+//! Character-level three-way merge over one block body, for the Direct Files
+//! conflict resolver. [`merge_disjoint`] produces a merged body that is only
+//! ever PRE-SELECTED for the user to confirm, never auto-applied, which is why
+//! it may use the relaxed collision rule of [`hunks_collide_relaxed`].
 
-/// Inputs larger than this (per text, in bytes) are classified `Conflict`
+/// Inputs larger than this (per text, in bytes) get no merge proposal
 /// without diffing; the bounded search below stays cheap.
-const MAX_CLASSIFIED_BYTES: usize = 256 * 1024;
+const MAX_MERGE_BYTES: usize = 256 * 1024;
 
 /// Upper bound on the Myers edit distance explored per side before giving up
 /// conservatively. The backtrack trace retains one band per distance step —
@@ -21,19 +13,8 @@ const MAX_CLASSIFIED_BYTES: usize = 256 * 1024;
 /// the worst-case trace near 8 MB, where 8192 with full-width rows reached
 /// ~1 GiB for a pair of 4 KiB full replacements (audit 4). Any real pair of
 /// disjoint-region edits of one outline block sits far below this distance;
-/// larger rewrites classify `Conflict`, which keeps both authored versions.
+/// larger rewrites get no merge proposal.
 const MAX_EDIT_DISTANCE: usize = 1024;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TextMergeClassification {
-    /// The two edits touch disjoint regions of the ancestor and their
-    /// composition equals the CRDT merge: the merged text is a faithful
-    /// union of both edits.
-    CleanUnion,
-    /// The edits overlap (or the classifier could not prove they do not):
-    /// both authored after-states must be kept.
-    Conflict,
-}
 
 /// One replaced region of the ancestor: bytes `base_start..base_end` become
 /// `replacement`. Pure insertions have `base_start == base_end`.
@@ -42,63 +23,6 @@ struct Hunk {
     base_start: usize,
     base_end: usize,
     replacement: String,
-}
-
-/// Classify a concurrent same-block edit pair against the ancestor and the
-/// CRDT-merged result. `mine`/`theirs` are the two authored after-states in
-/// any order; the classification is symmetric.
-pub fn classify_concurrent_edits(
-    base: &str,
-    mine: &str,
-    theirs: &str,
-    crdt_merged: &str,
-) -> TextMergeClassification {
-    if mine == theirs {
-        // Identical edits cannot conflict; the merge is faithful iff the
-        // CRDT agrees (duplicated concurrent insertions would not).
-        return if crdt_merged == mine {
-            TextMergeClassification::CleanUnion
-        } else {
-            TextMergeClassification::Conflict
-        };
-    }
-    if base == mine {
-        // Only one side actually changed the text.
-        return if crdt_merged == theirs {
-            TextMergeClassification::CleanUnion
-        } else {
-            TextMergeClassification::Conflict
-        };
-    }
-    if base == theirs {
-        return if crdt_merged == mine {
-            TextMergeClassification::CleanUnion
-        } else {
-            TextMergeClassification::Conflict
-        };
-    }
-    if base.len() > MAX_CLASSIFIED_BYTES
-        || mine.len() > MAX_CLASSIFIED_BYTES
-        || theirs.len() > MAX_CLASSIFIED_BYTES
-    {
-        return TextMergeClassification::Conflict;
-    }
-    let base_chars: Vec<char> = base.chars().collect();
-    let Some(my_hunks) = diff_hunks(&base_chars, &mine.chars().collect::<Vec<_>>()) else {
-        return TextMergeClassification::Conflict;
-    };
-    let Some(their_hunks) = diff_hunks(&base_chars, &theirs.chars().collect::<Vec<_>>()) else {
-        return TextMergeClassification::Conflict;
-    };
-    if hunks_collide(&my_hunks, &their_hunks) {
-        return TextMergeClassification::Conflict;
-    }
-    let composed = compose(&base_chars, &my_hunks, &their_hunks);
-    if composed == crdt_merged {
-        TextMergeClassification::CleanUnion
-    } else {
-        TextMergeClassification::Conflict
-    }
 }
 
 /// Three-way merge of two edits of `base` whose hunks are disjoint under the
@@ -114,9 +38,9 @@ pub fn merge_disjoint(base: &str, mine: &str, theirs: &str) -> Option<String> {
     if base == mine || base == theirs {
         return None;
     }
-    if base.len() > MAX_CLASSIFIED_BYTES
-        || mine.len() > MAX_CLASSIFIED_BYTES
-        || theirs.len() > MAX_CLASSIFIED_BYTES
+    if base.len() > MAX_MERGE_BYTES
+        || mine.len() > MAX_MERGE_BYTES
+        || theirs.len() > MAX_MERGE_BYTES
     {
         return None;
     }
@@ -248,29 +172,13 @@ fn lcs_matches(base: &[char], target: &[char]) -> Option<Vec<(usize, usize)>> {
     Some(matches)
 }
 
-/// True when any hunk of one side overlaps or touches a hunk of the other.
-/// Touching (adjacent or same-position) hunks are treated as collisions:
-/// their relative order in a composition would be ambiguous.
-fn hunks_collide(mine: &[Hunk], theirs: &[Hunk]) -> bool {
-    for a in mine {
-        for b in theirs {
-            let disjoint = a.base_end < b.base_start || b.base_end < a.base_start;
-            if !disjoint {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// True when any hunk of one side overlaps a hunk of the other in a NONEMPTY
 /// base interval, or both are pure insertions at the same position (their
 /// relative order is unknowable).
 ///
-/// Deliberately weaker than [`hunks_collide`]: touching delete/insert pairs
-/// compose deterministically (see [`compose`]'s `(start, end)` order) and so
-/// merge here. The asymmetry is the authority difference — the strict rule
-/// gates a SILENT apply, this one gates a suggestion the user confirms.
+/// Touching delete/insert pairs compose deterministically (see [`compose`]'s
+/// `(start, end)` order) and so merge here: the result is a suggestion the
+/// user confirms, never a silent apply.
 fn hunks_collide_relaxed(mine: &[Hunk], theirs: &[Hunk]) -> bool {
     // A pure insertion strictly inside the other side's replaced range: the
     // insertion's anchor no longer exists in the merged text, and `compose`
@@ -316,118 +224,6 @@ fn compose(base: &[char], mine: &[Hunk], theirs: &[Hunk]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn disjoint_region_edits_classify_clean() {
-        assert_eq!(
-            classify_concurrent_edits(
-                "alpha beta gamma",
-                "ALPHA beta gamma",
-                "alpha beta GAMMA",
-                "ALPHA beta GAMMA",
-            ),
-            TextMergeClassification::CleanUnion
-        );
-    }
-
-    #[test]
-    fn full_replacements_classify_conflict() {
-        assert_eq!(
-            classify_concurrent_edits(
-                "shared base text",
-                "first offline text",
-                "second offline text",
-                "firconofflint offline text",
-            ),
-            TextMergeClassification::Conflict
-        );
-    }
-
-    #[test]
-    fn prefix_edit_and_link_rewrite_classify_clean() {
-        assert_eq!(
-            classify_concurrent_edits(
-                "referrer [[Rename Referrer Target]]",
-                "referrer [[Rename Referrer Target Renamed]]",
-                "ordinary referrer edit [[Rename Referrer Target]]",
-                "ordinary referrer edit [[Rename Referrer Target Renamed]]",
-            ),
-            TextMergeClassification::CleanUnion
-        );
-    }
-
-    #[test]
-    fn clean_composition_disagreeing_with_crdt_is_a_conflict() {
-        assert_eq!(
-            classify_concurrent_edits(
-                "alpha beta gamma",
-                "ALPHA beta gamma",
-                "alpha beta GAMMA",
-                "ALPHA beta gaGAMMAmma",
-            ),
-            TextMergeClassification::Conflict
-        );
-    }
-
-    #[test]
-    fn identical_edits_are_clean_only_without_duplication() {
-        assert_eq!(
-            classify_concurrent_edits("base", "same edit", "same edit", "same edit"),
-            TextMergeClassification::CleanUnion
-        );
-        assert_eq!(
-            classify_concurrent_edits("base", "same edit", "same edit", "same editsame edit"),
-            TextMergeClassification::Conflict
-        );
-    }
-
-    #[test]
-    fn one_sided_change_is_clean_when_crdt_matches_the_editor() {
-        assert_eq!(
-            classify_concurrent_edits("base", "base", "edited", "edited"),
-            TextMergeClassification::CleanUnion
-        );
-    }
-
-    #[test]
-    fn adjacent_edits_classify_conflict() {
-        assert_eq!(
-            classify_concurrent_edits("ab", "Xb", "aY", "XY"),
-            TextMergeClassification::Conflict
-        );
-    }
-
-    #[test]
-    fn overlapping_insertions_at_one_position_classify_conflict() {
-        assert_eq!(
-            classify_concurrent_edits(
-                "one two",
-                "one extra two",
-                "one other two",
-                "one extraother  two",
-            ),
-            TextMergeClassification::Conflict
-        );
-    }
-
-    #[test]
-    fn multibyte_disjoint_edits_classify_clean() {
-        assert_eq!(
-            classify_concurrent_edits("káva a čaj", "KÁVA a čaj", "káva a ČAJ", "KÁVA a ČAJ",),
-            TextMergeClassification::CleanUnion
-        );
-    }
-
-    #[test]
-    fn oversized_inputs_classify_conflict() {
-        let big = "x".repeat(MAX_CLASSIFIED_BYTES + 1);
-        assert_eq!(
-            classify_concurrent_edits(&big, "a", "b", "ab"),
-            TextMergeClassification::Conflict
-        );
-    }
-
-    // --- merge_disjoint (Direct Files suggestion path) --------------------
 
     /// The flagship case the relaxed rule exists for: a trailing deletion and
     /// an append that merely TOUCH. Both argument orders compose identically,
@@ -491,7 +287,7 @@ mod tests {
 
     #[test]
     fn oversized_inputs_are_no_merge() {
-        let big = "x".repeat(MAX_CLASSIFIED_BYTES + 1);
+        let big = "x".repeat(MAX_MERGE_BYTES + 1);
         assert_eq!(merge_disjoint(&big, "a", "b"), None);
     }
 

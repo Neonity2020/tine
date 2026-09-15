@@ -11,17 +11,9 @@ use std::fmt;
 use std::ops::Range;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-#[cfg(test)]
 thread_local! {
     static OUTLINE_PARSE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-
-#[cfg(test)]
-static MANAGED_PARSE_CENSUS_ENABLED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static MANAGED_PARSE_CENSUS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(crate) fn reset_parse_attempts() {
@@ -331,9 +323,6 @@ fn parse_document_uncached(
     #[cfg(test)]
     {
         OUTLINE_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
-        if MANAGED_PARSE_CENSUS_ENABLED.load(Ordering::Relaxed) {
-            MANAGED_PARSE_CENSUS_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
     }
     let outline = lsdoc::parse_outline(source, format.lsdoc_name())
         .map_err(|_| OutlineAdapterError::ParserOwnership)?;

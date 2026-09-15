@@ -78,14 +78,14 @@ fn friendly_main_reader_matches_the_independent_walk_for_rank_and_identity_shape
         QueryPlan::friendly("alpha OR Café", 8, 8),
         QueryPlan::friendly("-draft", 8, 8),
     ];
-    let structural = ResultIdentity::DirectStructural {
+    let structural = ResultIdentity {
         session_pages: Arc::new(HashSet::new()),
         all_session: false,
     };
     for plan in &plans {
         let expected = plan.execute_with_explain(&corpus.graph, || false, true);
-        let stored =
-            read(&corpus, plan, &ResultIdentity::Stored).expect("the Stored Friendly read answers");
+        let stored = read(&corpus, plan, &ResultIdentity::session_owned())
+            .expect("the Stored Friendly read answers");
         assert_same_execution(&expected, &stored);
         let structural =
             read(&corpus, plan, &structural).expect("the structural Friendly read answers");
@@ -103,7 +103,7 @@ fn sections_limit_independently_pages_precede_blocks_and_children_are_not_suppre
     let one = read(
         &corpus,
         &QueryPlan::friendly("alpha", 1, 1),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("limited read");
     assert!(matches!(one.hits.first(), Some(QueryHit::Page { .. })));
@@ -113,7 +113,7 @@ fn sections_limit_independently_pages_precede_blocks_and_children_are_not_suppre
     let blocks = read(
         &corpus,
         &QueryPlan::friendly("alpha", 0, 16),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("block-only limited read");
     assert!(!blocks.has_more.pages);
@@ -156,7 +156,7 @@ fn sections_limit_independently_pages_precede_blocks_and_children_are_not_suppre
     let zero = read(
         &corpus,
         &QueryPlan::friendly("alpha", 0, 0),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("zero-limit read");
     assert!(zero.hits.is_empty());
@@ -179,7 +179,7 @@ fn supplied_scope_path_is_authoritative_over_the_scope_name() {
         },
     );
     let expected = plan.execute_with_explain(&corpus.graph, || false, true);
-    let actual = read(&corpus, &plan, &ResultIdentity::Stored).expect("scoped read");
+    let actual = read(&corpus, &plan, &ResultIdentity::session_owned()).expect("scoped read");
     assert_same_execution(&expected, &actual);
     assert!(actual.hits.iter().all(|hit| matches!(
         hit,
@@ -206,7 +206,7 @@ fn admitted_payload_uses_the_shared_128_row_batches_and_never_hydrates_the_senti
     let answer = read(
         &corpus,
         &QueryPlan::friendly("needle", 0, PAYLOAD_BATCH + 1),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     )
     .expect("batched read");
     let census = result_read_census();
@@ -245,7 +245,7 @@ fn cancellation_between_payload_batches_returns_no_partial_execution() {
         &FriendlyReadInputs {
             plan: &plan,
             graph_root: &corpus.root,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             explain: true,
             lane: None,
         },
@@ -271,7 +271,7 @@ fn cancellation_inside_rank_and_before_ancestor_work_returns_no_partial_executio
         &FriendlyReadInputs {
             plan: &rank_plan,
             graph_root: &corpus.root,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             explain: true,
             lane: None,
         },
@@ -289,7 +289,7 @@ fn cancellation_inside_rank_and_before_ancestor_work_returns_no_partial_executio
         &FriendlyReadInputs {
             plan: &ancestor_plan,
             graph_root: &corpus.root,
-            identity: &ResultIdentity::Stored,
+            identity: &ResultIdentity::session_owned(),
             explain: true,
             lane: None,
         },
@@ -356,7 +356,7 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
             &FriendlyReadInputs {
                 plan: &plan,
                 graph_root: &corpus.root,
-                identity: &ResultIdentity::Stored,
+                identity: &ResultIdentity::session_owned(),
                 explain: true,
                 lane: None,
             },
@@ -491,7 +491,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let root = scratch("q3-friendly-scope");
     write_membership_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let structural = ResultIdentity::DirectStructural {
+    let structural = ResultIdentity {
         session_pages: Arc::new(HashSet::new()),
         all_session: false,
     };
@@ -500,7 +500,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let names = read_with(
         &corpus,
         &scoped("zeta", 8, 8, FriendlyPageMatchScope::Names),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     let named = page_identities(&names);
     assert!(
@@ -519,7 +519,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let historic = read_with(
         &corpus,
         &QueryPlan::friendly("zeta", 8, 8),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     assert_same_execution(&historic, &names);
     // …and the historic answer is still the independent walk's.
@@ -560,7 +560,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let content = read_with(
         &corpus,
         &scoped("zeta", 8, 8, FriendlyPageMatchScope::Content),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     let bodies = page_identities(&content);
     assert!(bodies.contains(&("pages/Body Only.md".to_string(), PageKind::Page)));
@@ -617,7 +617,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let split = read_with(
         &corpus,
         &scoped("zeta omega", 8, 8, FriendlyPageMatchScope::Content),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     assert!(
         !page_identities(&split).contains(&("pages/Split.md".to_string(), PageKind::Page)),
@@ -628,7 +628,7 @@ fn q3_friendly_scope_membership_and_evidence() {
     let both = read_with(
         &corpus,
         &scoped("zeta", 8, 8, FriendlyPageMatchScope::Both),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     let union = page_identities(&both);
     for role in [
@@ -678,7 +678,7 @@ fn q3_friendly_scope_membership_and_evidence() {
         FriendlyPageMatchScope::Both,
     ] {
         let plan = scoped("zeta", 8, 8, scope);
-        let stored = read_with(&corpus, &plan, &ResultIdentity::Stored);
+        let stored = read_with(&corpus, &plan, &ResultIdentity::session_owned());
         let direct = read_with(&corpus, &plan, &structural);
         assert_eq!(
             page_identities(&stored),
@@ -697,7 +697,7 @@ fn q3_friendly_scope_membership_and_evidence() {
             block_identities(&read_with(
                 &corpus,
                 &QueryPlan::friendly("zeta", 8, 8),
-                &ResultIdentity::Stored
+                &ResultIdentity::session_owned()
             )),
             "{scope:?}: the Blocks section is untouched by page membership scope"
         );
@@ -730,7 +730,11 @@ fn q3_mixed_limits_are_independent() {
         )
     };
 
-    let unbounded = read_with(&corpus, &sampled(None, None), &ResultIdentity::Stored);
+    let unbounded = read_with(
+        &corpus,
+        &sampled(None, None),
+        &ResultIdentity::session_owned(),
+    );
     let all_pages = page_identities(&unbounded);
     let all_blocks = block_identities(&unbounded);
     assert!(
@@ -740,7 +744,11 @@ fn q3_mixed_limits_are_independent() {
 
     // Page sample 1 / block sample 3: each family keeps its OWN bound, and the
     // rows it keeps are the first rows of the complete order.
-    let mixed = read_with(&corpus, &sampled(Some(1), Some(3)), &ResultIdentity::Stored);
+    let mixed = read_with(
+        &corpus,
+        &sampled(Some(1), Some(3)),
+        &ResultIdentity::session_owned(),
+    );
     assert_eq!(page_identities(&mixed).len(), 1);
     assert_eq!(block_identities(&mixed).len(), 3);
     assert_eq!(page_identities(&mixed), all_pages[..1].to_vec());
@@ -748,15 +756,27 @@ fn q3_mixed_limits_are_independent() {
     assert!(mixed.has_more.pages && mixed.has_more.blocks);
 
     // Zero empties ONLY its own family; no capacity transfers to the other.
-    let no_pages = read_with(&corpus, &sampled(Some(0), Some(3)), &ResultIdentity::Stored);
+    let no_pages = read_with(
+        &corpus,
+        &sampled(Some(0), Some(3)),
+        &ResultIdentity::session_owned(),
+    );
     assert!(page_identities(&no_pages).is_empty());
     assert_eq!(block_identities(&no_pages), all_blocks[..3].to_vec());
-    let no_blocks = read_with(&corpus, &sampled(Some(1), Some(0)), &ResultIdentity::Stored);
+    let no_blocks = read_with(
+        &corpus,
+        &sampled(Some(1), Some(0)),
+        &ResultIdentity::session_owned(),
+    );
     assert_eq!(page_identities(&no_blocks).len(), 1);
     assert!(block_identities(&no_blocks).is_empty());
 
     // An absent sample preserves the consumer's own bound.
-    let half = read_with(&corpus, &sampled(None, Some(1)), &ResultIdentity::Stored);
+    let half = read_with(
+        &corpus,
+        &sampled(None, Some(1)),
+        &ResultIdentity::session_owned(),
+    );
     assert_eq!(page_identities(&half), all_pages);
     assert_eq!(block_identities(&half).len(), 1);
 
@@ -764,7 +784,7 @@ fn q3_mixed_limits_are_independent() {
     let over = read_with(
         &corpus,
         &sampled(Some(10_000), Some(10_000)),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     assert_eq!(page_identities(&over), all_pages);
     assert_eq!(block_identities(&over), all_blocks);
@@ -788,7 +808,7 @@ fn q3_friendly_page_display_hydrates_stored_rows_only() {
     let plain = read_with(
         &corpus,
         &QueryPlan::friendly("zeta", 8, 8),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     );
     assert!(plain.hits.iter().all(|hit| matches!(
         hit,
@@ -804,7 +824,7 @@ fn q3_friendly_page_display_hydrates_stored_rows_only() {
             ..FriendlyDisplayOptions::default()
         },
     );
-    let hydrated = read_with(&corpus, &displayed, &ResultIdentity::Stored);
+    let hydrated = read_with(&corpus, &displayed, &ResultIdentity::session_owned());
     let mut stored_rows = 0;
     let mut virtual_rows = 0;
     for hit in &hydrated.hits {
@@ -864,12 +884,12 @@ fn q3_friendly_sections_sort_the_complete_set_before_their_bound() {
     let ascending = page_identities(&read_with(
         &corpus,
         &by_name(SortDir::Asc, None),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     ));
     let descending = page_identities(&read_with(
         &corpus,
         &by_name(SortDir::Desc, None),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     ));
     assert!(ascending.len() > 2, "the fixture has enough pages to order");
     assert_ne!(ascending, descending, "the authored direction is honoured");
@@ -883,7 +903,7 @@ fn q3_friendly_sections_sort_the_complete_set_before_their_bound() {
     let capped = page_identities(&read_with(
         &corpus,
         &by_name(SortDir::Desc, Some(2)),
-        &ResultIdentity::Stored,
+        &ResultIdentity::session_owned(),
     ));
     assert_eq!(capped, descending[..2].to_vec());
 }

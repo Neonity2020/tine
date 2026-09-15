@@ -13,9 +13,8 @@
 //! assertion notices, because the walk answers correctly. It is only visible as
 //! a COUNTER (no statement read) or as a SOURCE CENSUS. This is the census.
 //!
-//! **What is pinned.** A walk needs a source, and there are exactly two source
-//! constructors — `GraphQueryPages` (Direct Files' whole parsed graph) and
-//! `ApplicationQueryPages` (Managed storage's candidate set). Pinning their
+//! **What is pinned.** A walk needs a source, and there is exactly one source
+//! constructor, `GraphQueryPages` (the whole parsed graph). Pinning its
 //! construction sites therefore pins every walk, without pinning the dozens of
 //! interior `&dyn QueryPageSource` parameters that only pass one along.
 //!
@@ -39,10 +38,10 @@ use regex::Regex;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// The two walk-source constructors. `GraphQueryPagesInMode` is deliberately
+/// The walk-source constructor. `GraphQueryPagesInMode` is deliberately
 /// not listed: it wraps a `GraphQueryPages(..)` it must construct, so its site
 /// is already counted.
-const SOURCE_CONSTRUCTORS: &[&str] = &["GraphQueryPages(", "ApplicationQueryPages {"];
+const SOURCE_CONSTRUCTORS: &[&str] = &["GraphQueryPages("];
 
 #[test]
 fn public_quick_switch_routes_bypass_query_quick_switch() {
@@ -87,9 +86,7 @@ fn public_quick_switch_routes_bypass_query_quick_switch() {
 ///   recovery. RET1 kept these as an internal repair checkpoint; RET2 removed
 ///   them and wired one bounded repair plus a typed
 ///   `query::QueryExecutionError` instead, which is what makes the public
-///   commands database-only. **Both halves have landed and the list is empty:**
-///   RET2-Managed took the two `sync_runtime.rs` rows, RET2-Direct took the
-///   three `model.rs` rows.
+///   commands database-only. **It has landed and the list is empty.**
 /// * **RET3** — the friendly (`{{query}}` / backlinks / derived) ranking route
 ///   and the export subtree reader, migrated after the public commands.
 /// * **oracle** — a walk that exists to be COMPARED against, or a §8.1
@@ -105,13 +102,6 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
     // never repairs; a missing projection is `ProjectionUnavailable`; a stopped
     // worker is bounded rather than an endless retry. `model.rs` builds no
     // walk source at all any more, which is why it names no function below.)
-    //
-    // (`sync_runtime.rs::ir_walk_ready` and
-    // `sync_runtime.rs::application_simple_query_pages_ready` were here too.
-    // RET2-Managed deleted `application_ir_query_walk_ready` and replaced
-    // `application_ir_query_turn`'s no-stamp / non-local branches with typed
-    // `query::QueryExecutionError`s; both functions are now compiled only under
-    // test, as the parity oracles.)
     //
     // Direct Files' `{{query}}` friendly ranking route still walks, but it does
     // so through `query.rs::run_query_bounded` below, which is RET3's.
@@ -139,25 +129,11 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
          consumer after RET2-Direct: `publish.rs`'s static export \
          (`Graph::run_advanced_query_bounded_cached` dispatches instead).",
     ),
-    // (`query.rs::run_application_advanced_query_pages_bounded` was here, on
-    // RET3's list. RET2-Managed-Advanced reached it early: the Managed
-    // advanced datalog query is a PUBLIC query command on the same captured
-    // route as the two IR commands and SimpleQuery, so its walk was retired
-    // with theirs. `sync_runtime.rs::application_advanced_query_ready` — the
-    // actor turn that loaded EVERY page of the graph to answer it — is gone,
-    // the wire request is intercepted by
-    // `SyncRuntimeHandle::application_captured_query`, and the wrapper is now
-    // compiled only under test, as the parity oracle
-    // `RuntimeActor::application_complete_page_advanced_query` reaches. Direct
-    // Files' `run_advanced_query_bounded` is untouched and is still RET3's.)
     // RET3 IS RETIRED (S3 campaign Q2, "Print queries from the current main
     // image on both backends"; recorded here during the Q5 closure, 2026-09-09).
-    // Both export readers are gone from production:
+    // The export reader is gone from production:
     //
-    //   * `export_application_query_subtrees` — the Managed arm — no longer
-    //     exists at all. It survives only as a string in this census and in
-    //     `sync_runtime_tests.rs`.
-    //   * `export_query_subtrees` — the Direct arm — still exists in
+    //   * `export_query_subtrees` still exists in
     //     `query.rs`, but it and `export_query_subtrees_over` are now
     //     `#[cfg(test)]`: an independent WALK ORACLE, not a production read.
     //     The shipped path is `model.rs::export_query_subtrees` over
@@ -272,7 +248,7 @@ fn production_walk_sources_are_pinned() {
     assert!(
         differences.is_empty(),
         "the production walk-source census changed:\n{}\n\n\
-         A walk source is `GraphQueryPages` or `ApplicationQueryPages`, and \
+         A walk source is a `GraphQueryPages`, and \
          building one is how production evaluates the parsed graph instead of \
          the projection. Martin, 2026-09-07: traversal \"needs to be only \
          present as an oracle and needs to be retired as soon as we are \
@@ -306,9 +282,8 @@ fn the_public_query_commands_never_build_a_walk_source() {
         offenders.is_empty(),
         "the Tauri command layer builds a walk source at:\n{}\n\n\
          SPEC §7.1's `query_run` and `query_explain_empty` reach the engine \
-         through `run_query_result_ir` / `explain_empty_query` (Direct Files) \
-         and `SyncApplicationNavigationRequest::QueryRun` / `QueryExplainEmpty` \
-         (Managed storage). Both are database routes. A command that builds its \
+         through `run_query_result_ir` / `explain_empty_query`, a database \
+         route. A command that builds its \
          own page source has reconnected the oracle at the wire, where no \
          result assertion can see it.",
         offenders.join("\n")
@@ -334,23 +309,8 @@ fn a_walk_inside_a_cfg_test_region_is_not_counted() {
 }
 
 #[test]
-fn candidate_planning_is_only_an_oracle_and_the_cursor_owner_remains_shared() {
+fn the_cursor_owner_remains_shared() {
     let root = repo_root();
-    let declarations = Regex::new(
-        r"(?:enum|trait|fn)\s+(?:SimpleQueryCandidateSource|SimpleQueryCandidatePlan|SimpleQuerySqlRead|simple_query_candidate_plan|lower_simple_query_candidate_plan)\b",
-    ).unwrap();
-    let offenders = production_source_files()
-        .into_iter()
-        .filter_map(|path| {
-            declarations
-                .is_match(&compiled_source(&path))
-                .then(|| relative_path(&root, &path))
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        offenders.is_empty(),
-        "production still includes the candidate planner: {offenders:?}"
-    );
     let direct = compiled_source(&root.join("crates/tine-core/src/direct_projection.rs"));
     assert!(direct.contains("query_cursor::drain_after"));
 }

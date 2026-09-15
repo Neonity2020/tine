@@ -10,7 +10,7 @@
 //!
 //! * SELECTION is the compiler's statement ([`crate::query::sql::lower_query`]),
 //!   passed in verbatim. This module wraps it once
-//!   ([`crate::query::sql::descriptor_statement`]) to add ordering and the
+//!   ([`crate::query::sql::descriptor_view_statement`]) to add ordering and the
 //!   result metadata; it never re-lowers, never re-applies §5.3's result-set
 //!   rule (the statement already did), and never edits the predicate.
 //! * Main-result ORDERING and semantic sampling precede admission in SQL.
@@ -82,23 +82,31 @@ pub(crate) enum BackendOrder {
 /// Physical selection ids and public result ids are separate. This policy is
 /// captured ONCE per job, beside the snapshot, and is never re-read from live
 /// state while an answer is being built.
-pub(crate) enum ResultIdentity {
-    /// Direct rows produced in THIS session: the stored
-    /// `query_block_results.result_id` IS the public id.
-    Stored,
-    /// Direct Files in a FRESH session: a page nobody edited in this session
-    /// will be re-parsed on demand into reproducible STRUCTURAL runtime ids, so
-    /// its rows resolve through `doc_runtime_id_for_order(path, order_key)` —
-    /// no document, no traversal. A page this session DID edit kept its live
-    /// ids at an exact revision, so its rows use the stored id.
-    ///
-    /// The set is captured by the caller together with the snapshot; nothing
-    /// here reads live state. `all_session` is the whole-graph shortcut for a
-    /// session that owns every page's identity.
-    DirectStructural {
-        session_pages: Arc<HashSet<[u8; 16]>>,
-        all_session: bool,
-    },
+///
+/// A page nobody edited in this session will be re-parsed on demand into
+/// reproducible STRUCTURAL runtime ids, so its rows resolve through
+/// `doc_runtime_id_for_order(path, order_key)` — no document, no traversal. A
+/// page this session DID edit kept its live ids at an exact revision, so its
+/// rows use the stored `query_block_results.result_id`.
+///
+/// The set is captured by the caller together with the snapshot; nothing here
+/// reads live state. `all_session` is the whole-graph shortcut for a session
+/// that owns every page's identity.
+pub(crate) struct ResultIdentity {
+    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    pub(crate) all_session: bool,
+}
+
+impl ResultIdentity {
+    /// Every page's identity belongs to this session, so every row keeps its
+    /// stored id.
+    #[cfg(test)]
+    pub(crate) fn session_owned() -> Self {
+        Self {
+            session_pages: Arc::default(),
+            all_session: true,
+        }
+    }
 }
 
 /// WHERE one admitted result physically lives, inside THIS batch.
@@ -872,7 +880,7 @@ impl<C: ResultCarrier> PageGroups<C> {
 }
 
 /// Column offsets of the descriptor row, in the order
-/// [`descriptor_statement`] selects them.
+/// [`crate::query::sql::descriptor_view_statement`] selects them.
 mod descriptor_column {
     pub(super) const BLOCK_ID: usize = 0;
     pub(super) const PAGE_ID: usize = 1;
@@ -1181,13 +1189,7 @@ pub(crate) fn resolve_identity(
     stored_id: &str,
     stored_estimate: usize,
 ) -> Result<(String, usize), String> {
-    let structural = match identity {
-        ResultIdentity::Stored => false,
-        ResultIdentity::DirectStructural {
-            session_pages,
-            all_session,
-        } => !*all_session && !session_pages.contains(&page_id),
-    };
+    let structural = !identity.all_session && !identity.session_pages.contains(&page_id);
     if !structural {
         return Ok((stored_id.to_owned(), stored_estimate));
     }

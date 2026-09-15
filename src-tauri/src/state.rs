@@ -47,51 +47,9 @@ pub(crate) struct CaptureGraphBinding {
     pub(crate) binding_generation: u64,
 }
 
-/// The single **write** authority retained for one graph/window binding.
-pub(crate) enum GraphAuthority {
-    Legacy(Arc<Graph>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GraphAuthorityKind {
-    Legacy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AssetStreamAuthority {
-    Direct,
-}
-
 #[derive(Debug)]
 pub(crate) enum AssetStreamError {
-    InvalidAsset { authority: AssetStreamAuthority },
-}
-
-#[derive(Debug)]
-pub(crate) struct AssetStreamResolution {
-    pub(crate) authority: AssetStreamAuthority,
-    pub(crate) path: PathBuf,
-}
-
-fn require_legacy_authority(kind: GraphAuthorityKind) -> Result<(), CommandError> {
-    match kind {
-        GraphAuthorityKind::Legacy => Ok(()),
-    }
-}
-
-impl GraphAuthority {
-    fn kind(&self) -> GraphAuthorityKind {
-        match self {
-            Self::Legacy(_) => GraphAuthorityKind::Legacy,
-        }
-    }
-
-    fn legacy_graph_cloned(&self) -> Result<Arc<Graph>, CommandError> {
-        require_legacy_authority(self.kind())?;
-        match self {
-            Self::Legacy(graph) => Ok(Arc::clone(graph)),
-        }
-    }
+    InvalidAsset,
 }
 
 /// A use of the graph authority admitted by `GraphSlot::legacy_graph`.
@@ -108,7 +66,7 @@ impl Deref for LegacyGraphLease {
 }
 
 pub(crate) struct GraphSlot {
-    authority: GraphAuthority,
+    graph: Arc<Graph>,
     /// The configuration snapshot `load_graph` hands the frontend. Replaceable
     /// so a settings change can update it in place: a config refresh publishes
     /// a whole replacement slot after a reopen, and without this a window would
@@ -131,7 +89,7 @@ impl GraphSlot {
     pub(crate) fn new(graph: Graph, root_key: PathBuf) -> Self {
         let graph_meta = graph.meta();
         Self {
-            authority: GraphAuthority::Legacy(Arc::new(graph)),
+            graph: Arc::new(graph),
             graph_meta: RwLock::new(graph_meta),
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -141,10 +99,10 @@ impl GraphSlot {
         }
     }
 
-    /// The legacy-only authority gate used by all existing Tauri graph paths.
+    /// Lease this binding's graph for one command.
     pub(crate) fn legacy_graph(&self) -> Result<LegacyGraphLease, CommandError> {
         Ok(LegacyGraphLease {
-            graph: self.authority.legacy_graph_cloned()?,
+            graph: Arc::clone(&self.graph),
         })
     }
 
@@ -155,32 +113,19 @@ impl GraphSlot {
 
     /// Report the selected save route for this exact graph binding.
     pub(crate) fn application_page_admission(&self) -> ApplicationPageAdmission {
-        match &self.authority {
-            GraphAuthority::Legacy(_) => ApplicationPageAdmission::direct(self.binding_generation),
-        }
+        ApplicationPageAdmission::direct(self.binding_generation)
     }
 
     /// Resolve one range-streamed asset without borrowing graph-text write
     /// authority. Containment is the one canonical `Graph::stream_asset_path`
     /// implementation.
-    pub(crate) fn asset_stream_path(
-        &self,
-        name: &str,
-    ) -> Result<AssetStreamResolution, AssetStreamError> {
-        let GraphAuthority::Legacy(graph) = &self.authority;
-        graph
+    pub(crate) fn asset_stream_path(&self, name: &str) -> Result<PathBuf, AssetStreamError> {
+        self.graph
             .stream_asset_path(name)
-            .map(|path| AssetStreamResolution {
-                authority: AssetStreamAuthority::Direct,
-                path,
-            })
-            .map_err(|_| AssetStreamError::InvalidAsset {
-                authority: AssetStreamAuthority::Direct,
-            })
+            .map_err(|_| AssetStreamError::InvalidAsset)
     }
 
-    /// Persist a change to `logseq/config.edn` under whichever authority this
-    /// slot holds.
+    /// Persist a change to `logseq/config.edn`.
     ///
     /// Settings use the short-lived filesystem capability, enforced in
     /// `tine-core` by `Graph::ensure_config_write_target`, without graph-text
@@ -192,8 +137,7 @@ impl GraphSlot {
         self.with_filesystem_graph(f)
     }
 
-    /// Move something into (or clear) the recoverable trash under whichever
-    /// authority this slot holds.
+    /// Move something into (or clear) the recoverable trash.
     ///
     /// Trashing a page, journal or conflict copy is a graph-text deletion and
     /// is admitted inside `tine-core`, at `Graph::admit_graph_text_writer`.
@@ -209,12 +153,7 @@ impl GraphSlot {
         &self,
         f: impl FnOnce(&Graph) -> Result<T, CommandError>,
     ) -> Result<T, CommandError> {
-        match &self.authority {
-            GraphAuthority::Legacy(_) => {
-                let lease = self.legacy_graph()?;
-                f(&lease)
-            }
-        }
+        f(self.graph.as_ref())
     }
 
     pub(crate) fn graph_meta(&self) -> tine_core::model::GraphMeta {
@@ -227,13 +166,9 @@ impl GraphSlot {
     /// generation here made every later command from that window stale after a
     /// config refresh, including autosaves.
     fn refreshed(graph: Graph, old: &GraphSlot) -> Result<Self, CommandError> {
-        // Refresh is a whole-graph reopen; the old slot must still hold a
-        // graph to reopen.
-        let old_graph = old.legacy_graph()?;
-        drop(old_graph);
         let graph_meta = graph.meta();
         Ok(Self {
-            authority: GraphAuthority::Legacy(Arc::new(graph)),
+            graph: Arc::new(graph),
             graph_meta: RwLock::new(graph_meta),
             root_key: old.root_key.clone(),
             binding_generation: old.binding_generation,
@@ -809,16 +744,14 @@ mod tests {
     }
 
     #[test]
-    fn normal_slots_are_legacy_only_and_authority_types_are_send_sync() {
+    fn graph_slots_are_send_sync() {
         let base =
             std::env::temp_dir().join(format!("tine-slot-authority-{}", uuid::Uuid::new_v4()));
         let slot = graph(&base);
 
-        assert!(matches!(&slot.authority, GraphAuthority::Legacy(_)));
         assert!(slot.legacy_graph().is_ok());
 
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<GraphAuthority>();
         assert_send_sync::<GraphSlot>();
 
         let _ = std::fs::remove_dir_all(base);

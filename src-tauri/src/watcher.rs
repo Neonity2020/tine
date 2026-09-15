@@ -2694,7 +2694,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_unmanaged_file_events_do_not_schedule_graph_scans() {
+    fn explicit_non_graph_text_file_events_do_not_schedule_graph_scans() {
         use notify::event::{CreateKind, EventKind, RemoveKind};
 
         for (kind, path, asset_paths) in [

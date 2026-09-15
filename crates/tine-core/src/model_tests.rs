@@ -3465,7 +3465,7 @@ fn rename_transaction_does_not_build_the_guarded_graph_index() {
 
     let before = graph.guarded_graph_text_identity_report();
     GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
-        .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        .with(|charge| charge.set(Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes)));
     graph
         .rename_page("Alpha", "Beta")
         .expect("bounded rename must not enter retained-shadow construction");
@@ -3474,8 +3474,8 @@ fn rename_transaction_does_not_build_the_guarded_graph_index() {
     assert_eq!(after.complete_builds, before.complete_builds);
     assert_eq!(
         GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
-        Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-        "rename consumed the retained-shadow capture hook"
+        Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes),
+        "rename consumed the retained capture hook"
     );
     assert!(!dir.join("pages/Alpha.md").exists());
     assert_eq!(
@@ -6097,12 +6097,12 @@ fn direct_trash_move_does_not_capture_unrelated_graph_text_bytes() {
     graph
         .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
         .unwrap();
-    let before_reads = managed_text_capture_reads();
+    let before_reads = graph_text_capture_reads();
     let before_builds = graph.guarded_graph_text_identity_report().complete_builds;
 
     graph.trash_journal_file("2026_08_25.md").unwrap();
 
-    assert_eq!(managed_text_capture_reads(), before_reads);
+    assert_eq!(graph_text_capture_reads(), before_reads);
     assert_eq!(
         graph.guarded_graph_text_identity_report().complete_builds,
         before_builds
@@ -8656,7 +8656,7 @@ fn direct_save_failure_codes_are_stable() {
         DirectSaveError::into_io(code, source)
     };
     for (code, error) in [
-        // model.rs `capture_managed_text_entries` symlink arm.
+        // model.rs `capture_graph_text_entries` symlink arm.
         (
             "precheck.symlink",
             Error::new(
@@ -8704,7 +8704,7 @@ fn direct_save_failure_codes_are_stable() {
         ),
         (
             "precheck.limit",
-            initial_shadow_limit_error("peak build memory"),
+            graph_text_capture_limit_error("peak build memory"),
         ),
         (
             "identity.owned_elsewhere",
@@ -8869,14 +8869,14 @@ fn direct_save_conflict_sites_produce_their_own_codes() {
 }
 
 /// The same binding for the precheck helpers, which are free functions and so
-/// can be driven directly. `initial_shadow_limit_error` and
+/// can be driven directly. `graph_text_capture_limit_error` and
 /// `graph_text_inventory_limit_error` are the two the save path calls when a
 /// bound is exceeded; both are `precheck.limit`, and neither may become a
 /// conflict.
 #[test]
 fn direct_save_precheck_helpers_produce_their_own_codes() {
     for error in [
-        initial_shadow_limit_error("entries"),
+        graph_text_capture_limit_error("entries"),
         graph_text_inventory_limit_error("bytes"),
     ] {
         assert_eq!(direct_save_failure_code(&error), "precheck.limit");
@@ -9075,7 +9075,7 @@ fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
     reset_graph_text_admission_test_counters();
     GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
     GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
-        .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        .with(|charge| charge.set(Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes)));
     graph
         .save_page(
             &direct_save_bench_new_page("Fresh After Existing Save"),
@@ -9092,8 +9092,8 @@ fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
     assert_eq!(after.complete_builds, before.complete_builds);
     assert_eq!(
         GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
-        Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-        "creation must not consume the retained shadow capture hook"
+        Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes),
+        "creation must not consume the retained capture hook"
     );
     assert_eq!(
         fs::read(dir.join("pages/Existing.md")).unwrap(),
@@ -9255,26 +9255,26 @@ fn steady_state_direct_saves_never_build_the_graph_index() {
 /// parent behavior, ordinary missing-target creation entered the retained
 /// shadow-import builder and surfaced the exact v0.6.92 reporter suffix.
 #[test]
-fn missing_target_creation_ignores_the_retained_shadow_peak_limit() {
+fn missing_target_creation_ignores_the_retained_capture_peak_limit() {
     let dir = scratch("missing-target-retained-shadow-limit");
     fs::write(dir.join("pages/Existing.md"), b"- existing\n").unwrap();
     let graph = Graph::open(&dir);
     graph.warm_cache();
 
     GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
-        .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        .with(|charge| charge.set(Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes)));
     let target = dir.join("pages/Noncolliding Missing Target.md");
     graph
         .save_page(
             &direct_save_bench_new_page("Noncolliding Missing Target"),
             None,
         )
-        .expect("ordinary creation must not consult the retained shadow peak bound");
+        .expect("ordinary creation must not consult the retained capture peak bound");
     assert!(target.is_file(), "the admitted creation must publish bytes");
     assert_eq!(
         GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
-        Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
-        "ordinary creation consumed the retained shadow capture hook"
+        Some(GRAPH_TEXT_CAPTURE_LIMITS.peak_build_bytes),
+        "ordinary creation consumed the retained capture hook"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -9282,7 +9282,7 @@ fn missing_target_creation_ignores_the_retained_shadow_peak_limit() {
 /// The whole validation/publication path is target-local: no graph census,
 /// retained capture, complete-index build, or parse work.
 #[test]
-fn missing_target_creation_has_zero_graph_census_shadow_or_parse_work() {
+fn missing_target_creation_has_zero_graph_census_capture_or_parse_work() {
     let dir = scratch("missing-target-one-streaming-census");
     for index in 0..24 {
         fs::write(
@@ -9680,7 +9680,7 @@ fn an_existing_save_never_enters_the_graph_capture_race() {
     graph.warm_cache();
 
     // This hook runs only between the old capture's two graph-wide passes.
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+    GRAPH_TEXT_CAPTURE_REVALIDATION_RACE.with(|hook| {
         let other = dir.join("pages/Other.md");
         *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- other, pulled in\n")));
     });
@@ -9691,7 +9691,7 @@ fn an_existing_save_never_enters_the_graph_capture_race() {
     graph
         .save_page(&page, Some(&base))
         .expect("a sync client touching an unrelated file must not fail this save");
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+    GRAPH_TEXT_CAPTURE_REVALIDATION_RACE.with(|hook| {
         assert!(
             hook.borrow_mut().take().is_some(),
             "existing save must not enter whole-graph capture"
@@ -10899,9 +10899,9 @@ fn admission_semantic_accounting_admits_large_ordinary_text_and_rejects_overlong
         graph_text_file_record_worst_case_upper_bound(&graph, path.as_str().len() as u64, observed)
             .unwrap();
     let realistic_raw_corpus = 480_u64 * 1024 * 1024;
-    assert!(realistic_raw_corpus < INITIAL_SHADOW_LIMITS.raw_bytes);
+    assert!(realistic_raw_corpus < GRAPH_TEXT_CAPTURE_LIMITS.raw_bytes);
     assert!(
-        checked_mul_bytes(one_record, 4).unwrap() < INITIAL_SHADOW_LIMITS.permanent_index_bytes,
+        checked_mul_bytes(one_record, 4).unwrap() < GRAPH_TEXT_CAPTURE_LIMITS.permanent_index_bytes,
         "ordinary titles must not be charged as four 120 MiB document bodies"
     );
 
@@ -11058,10 +11058,6 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     );
     assert!(!replace.contains("DurableDirectoryPublication"), "{RULE}");
     assert!(!replace.contains(".move_exact_no_replace("), "{RULE}");
-    assert!(
-        !replace.contains("EditorPublicationAuthority::DirectFile => rename_projection_noreplace"),
-        "the Direct arm must carry the exact-byte protocol, not the bare rename"
-    );
 }
 
 /// GH #466. The exact-byte protocol the Direct Files name transition carries:

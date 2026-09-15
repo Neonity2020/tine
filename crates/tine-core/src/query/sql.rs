@@ -201,10 +201,6 @@ struct QueryRegexBinding {
 }
 
 impl QueryRegexProgram {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.bindings.is_empty()
-    }
-
     /// The predicate `tine_query_regex(<id>, <exact visible text>)` calls.
     ///
     /// An ID this program does not name is an ERROR and not `false`: it means
@@ -299,6 +295,11 @@ pub(crate) enum ResultSetRule {
     /// WHERE block_id = <anchor>.parent_block_id AND <filter>)`. One seek per
     /// candidate row, but the whole filter is re-evaluated per row — for a
     /// `children` predicate that nests a subquery per row.
+    ///
+    /// Production never selects it: only the `sql_gates_tests` identity and
+    /// plan gates build it, as the baseline [`RESULT_SET_RULE`] was measured
+    /// against.
+    #[cfg_attr(not(test), allow(dead_code))]
     CorrelatedProbe,
     /// SPEC §3.5's own spelling: name the match set as a CTE and anti-join it
     /// against its own `parent_block_id`. The anti-join subquery is
@@ -306,6 +307,10 @@ pub(crate) enum ResultSetRule {
     /// instead of once per candidate row — but SQLite also INLINES an ordinary
     /// CTE, so the filter itself is still evaluated twice (once as the row
     /// source, once to build the anti-join list).
+    ///
+    /// Production never selects it; [`RESULT_SET_RULE`] part 3 says why the
+    /// gates keep it.
+    #[cfg_attr(not(test), allow(dead_code))]
     MatchSetCte,
     /// The same anti-join with SQLite's `MATERIALIZED` hint, which is the only
     /// spelling that actually evaluates the filter ONCE: the match set is
@@ -403,7 +408,7 @@ pub(crate) struct LoweringInputs<'a> {
 /// §5.3's block answer row and the relation it reads, as ONE named pair.
 ///
 /// They are constants rather than inline literals because
-/// [`descriptor_statement`] wraps exactly this relation, and a wrapper that
+/// [`descriptor_view_statement`] wraps exactly this relation, and a wrapper that
 /// re-spelled it would be a second compiler the moment either side moved
 /// (D-14, I-12). The `_IDS` twins are the SAME relation with the routing join
 /// to `pages` removed: the descriptor read re-joins `pages` itself, LEFT, so a
@@ -419,10 +424,9 @@ const MATCH_SET_IDS: &str = "SELECT m.block_id, m.page_id FROM m";
 /// §5.3's PAGE answer row and its relation, the same named pair for `@page`.
 ///
 /// [`page_statement`] wraps exactly this relation for the same reason
-/// [`descriptor_statement`] wraps the block one. The `_IDS` twin adds `p.path`:
-/// the page read re-joins `query_page_order` itself (LEFT), and Managed
-/// Storage's page order IS the path, so both order keys have to survive into
-/// the wrapper's CTE. `p` is the anchor alias and can never collide with a
+/// [`descriptor_view_statement`] wraps the block one. The `_IDS` twin adds `p.path`:
+/// the page read re-joins `query_page_order` on it (LEFT), so the order key
+/// has to survive into the wrapper's CTE. `p` is the anchor alias and can never collide with a
 /// nested relation's, because [`Compiler::alias`] always appends a number.
 const PAGE_ANCHOR_SELECT: &str = "SELECT p.page_id, p.name, p.text_kind, p.journal_day";
 const PAGE_ANCHOR_FROM: &str = "FROM pages p";
@@ -453,9 +457,8 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
     };
     let (row, select, from) = match query.anchor {
         // §5.3's block row is `(block_id, page_id, path)` and nothing else.
-        // `block_id` is the answer, `page_id` is the routing identity Managed
-        // Storage's overlay route will address a page by, and `path` is the
-        // Direct order key the descriptor read (`query/results.rs`) joins
+        // `block_id` is the answer, `page_id` is the page's routing identity,
+        // and `path` is the order key the descriptor read (`query/results.rs`) joins
         // `query_page_order` on. `pages.name` and `pages.text_kind` were
         // decoration: no consumer of these rows ever decoded either, and the
         // descriptor read takes both from the page row of the ANSWER only.
@@ -547,8 +550,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         (Row::Page(_), _) => (select, from),
     };
     // The selection relation answers membership only. Descriptor/page wrappers
-    // apply backend order using persisted Direct page positions and preorder,
-    // or Managed paths. Keeping presentation order out of this relation also
+    // apply page order using persisted page positions and preorder. Keeping presentation order out of this relation also
     // leaves the predicate's index choices independent of a pages.path sort.
     let mut sql = match &cte {
         Some(cte) => format!("{cte} {select} {from} WHERE {where_}"),
@@ -608,21 +610,12 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
 /// FAIL the read. An inner join would answer the same question with fewer rows,
 /// which is the one thing a damaged disposable cache may never do.
 ///
-/// **Ordering** is the order the walk CHARGES its budget in: Direct Files by
+/// **Ordering** is the order the walk CHARGES its budget in:
 /// `query_page_order.position` (the projection's copy of the inventory order
-/// `GraphQueryPages::for_each_page` enumerates), Managed Storage by `pages.path`
-/// under SQLite's default BINARY collation, which is `String::cmp` on the UTF-8
-/// bytes. Within a page it is always `query_block_results.preorder`.
+/// `GraphQueryPages::for_each_page` enumerates). Within a page it is always `query_block_results.preorder`.
 ///
 /// `Anchor::Page` statements have no block descriptor and are rejected here:
 /// their rows are consumed exactly as they are today.
-pub(crate) fn descriptor_statement(
-    statement: &SqlQuery,
-    order: crate::query::results::BackendOrder,
-) -> Result<SqlQuery, MaterializationError> {
-    Ok(descriptor_view_statement(statement, order, None)?.query)
-}
-
 pub(crate) fn descriptor_view_statement(
     statement: &SqlQuery,
     order: crate::query::results::BackendOrder,
@@ -953,18 +946,15 @@ fn statistics_columns(
 /// plus the ordering, complete count and raw-cost metadata the shared reader
 /// needs before it hydrates admitted page properties.
 ///
-/// **A wrapper, not a second compiler**, exactly as [`descriptor_statement`] is:
+/// **A wrapper, not a second compiler**, exactly as [`descriptor_view_statement`] is:
 /// `statement` is [`lower_query`]'s output verbatim, its selected-page relation
 /// becomes one more CTE (`r`) beside whatever `WITH` list the statement already
 /// carries. Sort programs and property keys are bound values. A block-anchored
 /// statement is rejected because its rows belong to the block descriptor read.
 ///
-/// **The join is LEFT on purpose (D-3).** Direct Files' page order IS
+/// **The join is LEFT on purpose (D-3).** The page order IS
 /// `query_page_order.position`; a missing row must FAIL the read rather than
-/// sort a page silently to one end of a truncated answer. Managed Storage
-/// supplies no `query_page_order` and orders by `pages.path` under SQLite's
-/// BINARY collation, which is `String::cmp` on the UTF-8 bytes and is exactly
-/// the `rel_path` sort `application_navigation_pages_ready` ends with.
+/// sort a page silently to one end of a truncated answer.
 pub(crate) struct RankedPageStatement {
     pub(crate) query: SqlQuery,
     pub(crate) ranks: QueryRankPrograms,
@@ -3832,7 +3822,10 @@ mod tests {
         );
         assert!(invalid.matches_nothing);
         assert_eq!(invalid.content_plans, vec![ContentPlan::Regex]);
-        assert!(invalid.regexes.is_empty(), "a false leaf binds no program");
+        assert!(
+            invalid.regexes.bindings.is_empty(),
+            "a false leaf binds no program"
+        );
     }
 
     /// The compiled-regex table is de-duplicated by EFFECTIVE PATTERN, so the same

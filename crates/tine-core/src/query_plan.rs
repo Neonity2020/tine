@@ -1846,9 +1846,7 @@ fn execute_page_candidates(
 }
 
 /// Execute the established literal page autocomplete/quick-switch semantics
-/// over an explicitly supplied exact-frontier candidate set. Managed storage
-/// uses this to share ranking with Direct Files without constructing a parsed
-/// `Graph` cache.
+/// over an explicitly supplied candidate set.
 pub(crate) fn legacy_page_search_entries(
     file_pages: Vec<PageEntry>,
     aliases: Vec<(String, String, String)>,
@@ -1885,19 +1883,14 @@ fn walk_blocks<'a>(
     true
 }
 
-/// The one block-branch evaluator, shared by Direct Files and managed storage.
+/// The block-branch evaluator.
 ///
-/// `pages` yields borrowed `(inventory entry, converted roots)` pairs, which is
-/// the only thing the two storage modes genuinely disagree about: Direct
-/// borrows from `Graph::with_pages`'s cached `Arc<Document>`, managed from the
-/// converted tree its projection cache retains. Everything the two paths used
-/// to disagree about by accident -- when evidence is evaluated, when the result
-/// DTO is built, what is cloned per candidate -- lives here now and therefore
-/// cannot drift again.
+/// `pages` yields borrowed `(inventory entry, converted roots)` pairs from
+/// `Graph::with_pages`'s cached `Arc<Document>`.
 ///
 /// Evidence and the result DTO are produced once per WINNER, after the heap is
-/// drained. Doing it per retained candidate inside the walk (which the managed
-/// twin used to do) is O(retained) parses and DTOs where this is O(limit).
+/// drained. Doing it per retained candidate inside the walk is O(retained)
+/// parses and DTOs where this is O(limit).
 ///
 /// Generic, not `dyn`: monomorphization keeps each caller's walk exactly the
 /// code it would have written by hand -- no per-block allocation, no indirect
