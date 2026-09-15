@@ -41,12 +41,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
-<<<<<<< HEAD
 - Typing a workspace name with Chinese or another input method (IME) now works. The name field used to be rebuilt on every keystroke, which cancelled the character being composed. (GH #498)
 - Returning to the browser tab of a published export no longer shows a "couldn't finish checking for external changes" error. The read-only export has nothing to re-check, so it no longer tries. An export also no longer shows a stray “⊞ Table” button on every page, or an error after zooming or scrolling a PDF. (GH #549)
-=======
 - Carrying unfinished tasks to today while today's journal had a sync conflict no longer lets a later edit to one of the earlier days delete those tasks from that day's file. Tine now keeps the earlier days unchanged on disk until today is saved, as it already did for other block moves. Moving blocks into the same page twice before it saved also no longer leaves the first move's source page unable to save.
->>>>>>> origin/master
 - Queries answer every comparison they accept. `like` on `task`, `priority`
   and `page.namespace` (for example `task like 'DO%'`), `page.journal != …`,
   `page.name not in (…)` and `content in (…)` / `not in (…)` used to return
