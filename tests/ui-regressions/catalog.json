@@ -11379,7 +11379,7 @@
         "all"
       ],
       "layer": "render",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/components/Block.codeFenceScaffold.test.tsx",
@@ -11389,7 +11389,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "User outcome: after typing ``` to open a code block, the user can still say which language it is, so highlighting works. Classification: blocking core operation — with no language there is no syntax highlighting and no other control anywhere in the UI offers one. Root cause: a regression from the GH #413 scaffold (d365bf5d, shipped in v0.6.981). The third backtick scaffolded the complete fence and dropped the caret into the body-only code view, which hides the opening fence line; the language autocomplete only triggers on a visible ```<char> line, so the only remaining path was the /Code block command. Fix: both paths now go through one door (Block.tsx `openFenceLanguagePicker`), which opens the same empty language picker on the still-visible opener; Escape or a non-language keystroke falls into the body exactly as before, keeping #413's closing fence and interior caret. Fail-before: tine-agents/evidence/code-fence-language/507-fail-before.log (4 of 5 scaffold tests fail; the unrelated mid-text test passes). Evidence layer: render (jsdom) plus the native editor-interactions journey."
+      "notes": "User outcome: after typing ``` to open a code block, the user can still say which language it is, so highlighting works. Classification: blocking core operation — with no language there is no syntax highlighting and no other control anywhere in the UI offers one. Root cause: a regression from the GH #413 scaffold (d365bf5d, shipped in v0.6.981). The third backtick scaffolded the complete fence and dropped the caret into the body-only code view, which hides the opening fence line; the language autocomplete only triggers on a visible ```<char> line, so the only remaining path was the /Code block command. Fix: both paths now go through one door (Block.tsx `openFenceLanguagePicker`), which opens the same empty language picker on the still-visible opener; Escape or a non-language keystroke falls into the body exactly as before, keeping #413's closing fence and interior caret. Fail-before: tine-agents/evidence/code-fence-language/507-fail-before.log (4 of 5 scaffold tests fail; the unrelated mid-text test passes). Evidence layer: render (jsdom) plus the native editor-interactions journey. Covered at master c9e2b435: the native editor-interactions journey ran against that exact staged build and the coordinator recorded its real-app gate."
     }
   ]
 }
