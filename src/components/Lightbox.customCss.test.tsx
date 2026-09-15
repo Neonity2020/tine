@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { readAppStylesheet } from "../testSource";
 import { render } from "solid-js/web";
 import { setLightbox } from "../ui";
 import { Lightbox } from "./Toasts";
@@ -13,7 +13,7 @@ afterEach(() => {
 describe("lightbox geometry under graph custom.css (GH #319)", () => {
   it("keeps the full-screen image auto-sized when a later generic img rule fixes thumbnail width", () => {
     const app = document.createElement("style");
-    app.textContent = readFileSync("src/styles/app.css", "utf8");
+    app.textContent = readAppStylesheet();
     document.head.appendChild(app);
     const custom = document.createElement("style");
     custom.textContent = "img { width: 320px; height: 120px; }";

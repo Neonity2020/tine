@@ -1,8 +1,7 @@
-import fs from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { readAppStylesheet } from "./testSource";
 
-const css = fs.readFileSync(path.join(process.cwd(), "src/styles/app.css"), "utf8");
+const css = readAppStylesheet();
 
 describe("page actions responsive discoverability", () => {
   it("keeps the ellipsis visible for keyboard focus and while its menu is open", () => {

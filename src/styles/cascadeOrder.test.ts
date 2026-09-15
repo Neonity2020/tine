@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readAppStylesheet } from "../testSource";
 
 const stylesDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -111,7 +112,10 @@ function shadowedOverrides(source: string): string[] {
 describe("stylesheet cascade order", () => {
   for (const file of ["app.css", "theme.css"]) {
     it(`${file}: no responsive override is shadowed by a later identical-selector default`, () => {
-      expect(shadowedOverrides(fs.readFileSync(path.join(stylesDir, file), "utf8"))).toEqual([]);
+      const source = file === "app.css"
+        ? readAppStylesheet()
+        : fs.readFileSync(path.join(stylesDir, file), "utf8");
+      expect(shadowedOverrides(source)).toEqual([]);
     });
   }
 

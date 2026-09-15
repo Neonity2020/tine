@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { readAppStylesheet } from "../testSource";
 import { Show, createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
@@ -1676,7 +1676,7 @@ describe("PdfViewer released-OG themes and outline", () => {
   });
 
   it("matches released OG 1.0.0 page-theme filtering without inverting highlight overlays", () => {
-    const css = readFileSync("src/styles/app.css", "utf8");
+    const css = readAppStylesheet();
     expect(css).toContain('.pdf-viewer[data-theme="light"] {\n  --pdf-container-bg: #fff;\n  --pdf-toolbar-bg: #fff;\n  --pdf-page-bg: #fff;');
     expect(css).toContain('.pdf-viewer[data-theme="warm"] {\n  --pdf-container-bg: #f6efdf;\n  --pdf-toolbar-bg: #f6efdf;\n  --pdf-page-bg: #f8eeda;');
     expect(css).not.toMatch(/\.pdf-viewer\[data-theme="warm"\][^{]*\{[^}]*filter:[^}]*\b(?:sepia|saturate)\b/s);
@@ -1689,7 +1689,7 @@ describe("PdfViewer released-OG themes and outline", () => {
   });
 
   it("keeps page geometry stable when offscreen PDF canvases are evicted", () => {
-    const css = readFileSync("src/styles/app.css", "utf8");
+    const css = readAppStylesheet();
     expect(css).toMatch(/\.pdf-page \{[^}]*flex:\s*0 0 auto;/s);
   });
 });

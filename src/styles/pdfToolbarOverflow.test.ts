@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readAppStylesheet } from "../testSource";
 
-const css = readFileSync("src/styles/app.css", "utf8");
+const css = readAppStylesheet();
 
 describe("PDF toolbar responsive overflow", () => {
   it("lets the viewer-width container control both toolbar actions and their sibling menu copies", () => {

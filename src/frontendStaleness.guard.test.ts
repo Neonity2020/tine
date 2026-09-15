@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { readBlockModuleSource } from "./testSource";
 
 const swept = [
   "src/components/QuickSwitcher.tsx",
@@ -13,9 +14,12 @@ const swept = [
 
 describe("I-20 graph identity guard", () => {
   it("never compares staleness with the render epoch at a swept landing site", () => {
-    const offenders = swept.filter((file) =>
-      readFileSync(join(process.cwd(), file), "utf8").includes("graphEpoch()"),
-    );
+    const offenders = swept.filter((file) => {
+      const source = file === "src/components/Block.tsx"
+        ? readBlockModuleSource()
+        : readFileSync(join(process.cwd(), file), "utf8");
+      return source.includes("graphEpoch()");
+    });
     expect(
       offenders,
       "I-20: graph identity is graphBindingRev, never graphEpoch(); see persistence.ts:362 and the Harvest D dossier",

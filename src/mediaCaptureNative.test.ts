@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readBlockModuleSource } from "./testSource";
 
 describe("Android voice-recording bounds", () => {
   it("caps duration and bytes, then hands the native temp to Rust without base64", () => {
@@ -29,7 +30,7 @@ describe("Android voice-recording bounds", () => {
       bridge.indexOf("#[cfg(target_os = \"android\")]", bridge.indexOf("struct MediaCaptureResult"))
     );
     expect(result).toMatch(/path:\s*Option<String>/);
-    const block = readFileSync("src/components/Block.tsx", "utf8");
+    const block = readBlockModuleSource();
     expect(block).toMatch(/backend\(\)\.importNativeCapture\(res\.path, candidate\)/);
   });
 
@@ -50,7 +51,7 @@ describe("Android voice-recording bounds", () => {
     const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
     expect(commands).toMatch(/tine_photo_/);
     expect(commands).toMatch(/MAX_PHOTO_BYTES/);
-    const block = readFileSync("src/components/Block.tsx", "utf8");
+    const block = readBlockModuleSource();
     expect(block).toMatch(/capturePhoto[\s\S]*importNativeCapture\(res\.path, candidate\)/);
   });
 });

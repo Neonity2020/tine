@@ -29,7 +29,6 @@ import { pluginManager } from "../plugins/manager";
 import { bindPluginBlockSnapshot, isPluginGraphOwnerCurrent } from "../plugins/ownership";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
 import { typoTypeReplace } from "../render/typography";
-import { blockDropPosition, type BlockDropPosition } from "../editor/blockDrag";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { failureShape } from "../failureShape";
 import { spellcheckEnabled } from "../spellcheckSettings";
@@ -39,7 +38,6 @@ import {
   pageByName,
   pageWritable,
   setRaw,
-  setBlockProperty,
   makeOwnNumberedList,
   removeOwnNumberedList,
   stopOwnNumberedListOnEmptyEnter,
@@ -55,14 +53,12 @@ import {
   nextVisibleOrExtend,
   beginPageHeaderEdit,
   finishPageHeaderEdit,
-  insertEmptyChildBlock,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
   replaceTemplateTriggerWithOutline,
   insertOutlineChildren,
   pasteClipboardPayload,
   deleteBlock,
-  moveBlocksRelative,
   moveBlockFeed,
   moveItem,
   selectBlock,
@@ -70,7 +66,6 @@ import {
   extendSelectionTo,
   clearSelection,
   moveSelection,
-  selectedIds,
   isSelected,
   ensureBlockId,
   persistentBlockRef,
@@ -146,7 +141,6 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
-import { dropSelection, setDragSelectionSuppressed } from "../dragSelectionGuard";
 import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
@@ -176,7 +170,6 @@ import {
   textareaCaretPoints,
 } from "../editor/caretRows";
 import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim, type PropFormat } from "../editor/properties";
-import { queryMacroExtents } from "../editor/queryMacro";
 import { QUERY_MACRO_SCAFFOLD } from "../editor/queryMacroName";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
@@ -205,118 +198,14 @@ import { blockBackgroundColor } from "../blockColors";
 import { blockDtoExternalId } from "../blockIdentity";
 import { SheetContainer } from "./SheetContainer";
 import { shouldOpenBlockContextMenu } from "../contextMenuPolicy";
+import { applySheetViewSlashAction } from "./block/sheetSlashAction";
+import { bodyContainsQueryMacro, detectMacro } from "./block/macroDetection";
+import { beginDrag, dragId, dragMoved, dropInd } from "./block/pointerDrag";
 
-type SheetSlashView = "grid" | "table" | "board";
-
-export function applySheetViewSlashAction(id: string, view: SheetSlashView): string | null {
-  const node = doc.byId[id];
-  if (!node) return null;
-  let seededCellId: string | null = null;
-  withUndoUnit(`sheet:view:${view}`, [node.page], () => {
-    const shouldSeedGrid = view === "grid" && (doc.byId[id]?.children.length ?? 0) === 0;
-    setBlockProperty(id, "tine.view", view);
-    if (view === "board") setBlockProperty(id, "tine.group-by", "state");
-    if (shouldSeedGrid) {
-      const rowId = insertEmptyChildBlock(id, 0);
-      if (rowId) seededCellId = insertEmptyChildBlock(rowId, 0);
-    }
-  });
-  endEdit("select-block");
-  if (seededCellId) startEditing(seededCellId, 0);
-  return seededCellId;
-}
-
-// Detect a block whose entire body is a single query / {{embed}} macro.
-//
-// §7.9: the query half reads QUERY_MACRO_NAMES, so `{{tine-query …}}` is the
-// same kind of block as `{{query …}}` — a block whose body is a TQL macro must
-// get the standalone-query treatment (builder bar, sheet views, `tine.*` view
-// properties), not fall through to inline text.
-function detectMacro(raw: string): { kind: "query" | "embed"; inner: string } | null {
-  // The macro is the block's visible body — strip property lines (the shared line
-  // recognizer) so a `{{query}}\nid:: …` block still matches. Cheap: no parse.
-  const text = raw.split("\n").filter((l) => !isPropertyLine(l)).join("\n").trim();
-  // A query macro is recognized by the SHARED extent reader, not by a regex
-  // assembled here (§7.9, I-12). The regex this replaced ended the name with
-  // `\b`, which made `{{query-foo bar}}` a query macro — `-` is a word boundary
-  // in JavaScript — and it ended the macro at the last `}}` in the text, which a
-  // `}}` inside a string literal could move. The reader gets both right, and it
-  // is the same one `bodyContainsQueryMacro` and the renderer use.
-  const [extent, ...rest] = queryMacroExtents(text);
-  if (extent && rest.length === 0 && extent.start === 0 && extent.end === text.length) {
-    // The body the renderer re-reads keeps the AUTHORED spelling, so a
-    // `{{tine-query …}}` block is not silently relabelled `query` on the way in.
-    return { kind: "query", inner: `${extent.name} ${extent.argument}` };
-  }
-  const embed = /^\{\{(embed)\b([\s\S]*)\}\}$/i.exec(text);
-  return embed ? { kind: "embed", inner: `${embed[1]}${embed[2]}` } : null;
-}
-
-// Any complete query macro anywhere in the body. The shared scanner is
-// brace/string/page-ref aware and catches inline macros ("Tasks {{query …}}"),
-// not only macros occupying their own line, and it knows both macro names.
-function bodyContainsQueryMacro(raw: string): boolean {
-  return queryMacroExtents(raw).length > 0;
-}
+export { applySheetViewSlashAction };
 
 // (Rendered-property hidden set lives in render/block.ts as RENDER_HIDDEN_PROPS /
 // isRenderHiddenProp, shared with body.tsx's renderProps.)
-
-// Pointer-based drag reorder (HTML5 DnD is unreliable in WebKitGTK).
-const [dragId, setDragId] = createSignal<string | null>(null);
-const [dropInd, setDropInd] = createSignal<{ id: string; position: BlockDropPosition } | null>(null);
-let dragMoved = false;
-
-function beginDrag(id: string, e: MouseEvent) {
-  const startX = e.clientX;
-  const startY = e.clientY;
-  let capturedIds: string[] | null = null;
-  dragMoved = false;
-  const onMove = (ev: MouseEvent) => {
-    if (!dragMoved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
-    if (!dragMoved) {
-      dragMoved = true;
-      const selected = selectedIds();
-      capturedIds = selected.length ? [...selected] : [id];
-      setDragId(id);
-      endEdit("drag-start");
-      // Moving a block is not a text gesture. WebKit otherwise runs its own
-      // selection drag from the bullet and paints every block the pointer
-      // crosses blue (GH #424, macOS; Chromium does not do this, which is why
-      // the same build looked clean on Windows).
-      setDragSelectionSuppressed(true);
-    }
-    // WebKit can re-anchor a selection mid-drag; the class alone is not enough.
-    dropSelection();
-    const el = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest(
-      ".ls-block"
-    ) as HTMLElement | null;
-    const tid = el?.dataset.blockId;
-    if (tid) {
-      const main = el!.querySelector(".block-main")!.getBoundingClientRect();
-      setDropInd({
-        id: tid,
-        position: blockDropPosition(ev.clientX, ev.clientY, el!.getBoundingClientRect(), main),
-      });
-    } else {
-      setDropInd(null);
-    }
-  };
-  const onUp = () => {
-    document.removeEventListener("mousemove", onMove);
-    document.removeEventListener("mouseup", onUp);
-    setDragSelectionSuppressed(false);
-    const ind = dropInd();
-    if (dragMoved && ind && doc.byId[ind.id]) {
-      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.position);
-    }
-    setDragId(null);
-    setDropInd(null);
-    setTimeout(() => (dragMoved = false), 0);
-  };
-  document.addEventListener("mousemove", onMove);
-  document.addEventListener("mouseup", onUp);
-}
 
 // Set ONLY by the quick-capture window (capture.tsx). Flows through the Block
 // tree to every Editor so the capture's submit/cancel gestures and Enter mode

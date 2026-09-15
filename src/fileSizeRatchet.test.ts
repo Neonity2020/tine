@@ -30,11 +30,9 @@ const SKIPPED_DIRS = new Set(["node_modules", "target", "dist", "vendor", "gen"]
 
 /** Files above their cap when the ratchet landed, pinned at that length. */
 const PINNED: Record<string, number> = {
-  "src/styles/app.css": 12_369,
   "src/store.ts": 6_370,
   "src-tauri/src/watcher.rs": 4_625,
   "src-tauri/src/commands.rs": 4_419,
-  "src/components/Block.tsx": 4_093,
 };
 
 export function isTestFile(relative: string): boolean {
