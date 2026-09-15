@@ -870,7 +870,11 @@ changes exactly one behavior — sync-conflict diffs degrade from 3-way with
 pre-selected suggestions back to the plain 2-way diff until the ledger
 repopulates from ordinary saves and admissions. Ledger updates are best-effort
 background work off the save critical path; they may not block or fail an
-open, save, or reload.
+open, save, or reload. Quitting Tine waits at most
+`concord_ledger::EXIT_DRAIN_BUDGET` (200 ms) in total for every open graph's
+queued updates, because quitting right after a save is the ordinary
+multi-device case the ledger serves; an update still queued after that is
+lost, and that page's next conflict merges against an older base.
 Each graph's ledger is its own directory, keyed by the graph's root id.
 
 A prune runs at graph open and reclaims everything that can no longer answer:

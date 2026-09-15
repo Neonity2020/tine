@@ -49,6 +49,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   `page.journal`) is now reported as an error instead of silently matching
   nothing.
 
+- Quitting Tine right after saving no longer throws away the copy of that
+  page Tine keeps for merging sync conflicts. Tine now waits up to 0.2 s at
+  quit for those updates, so a later conflict on the page still gets
+  three-way merge suggestions instead of more lines to review by hand.
+
 - While the query index is still building, property autocomplete now offers
   an Org page's own properties (its `:PROPERTIES:` drawer) and no longer
   offers a `key::` line that sits inside a code block, the same suggestions
