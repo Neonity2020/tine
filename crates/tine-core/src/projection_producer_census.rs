@@ -963,21 +963,81 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "open.create",
             1,
         ),
-        ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 3),
-        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 4),
-        ("crates/tine-core/src/model.rs", "fs.remove_file", 11),
-        ("crates/tine-core/src/model.rs", "fs.rename", 3),
-        ("crates/tine-core/src/model.rs", "libc.renameat2", 3),
-        ("crates/tine-core/src/model.rs", "open.create_new", 7),
-        ("crates/tine-core/src/model.rs", "windows.MoveFileW", 1),
+        // K3 (2026-09-15) moved these out of model.rs verbatim; the module's
+        // totals did not change.
         (
-            "crates/tine-core/src/model.rs",
+            "crates/tine-core/src/model/atomic_copy.rs",
+            "cap.remove_file",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/atomic_copy.rs",
+            "fs.create_dir_all",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/atomic_copy.rs",
+            "fs.remove_file",
+            3,
+        ),
+        ("crates/tine-core/src/model/atomic_copy.rs", "fs.rename", 1),
+        (
+            "crates/tine-core/src/model/atomic_copy.rs",
+            "open.create_new",
+            3,
+        ),
+        (
+            "crates/tine-core/src/model/atomic_fs.rs",
+            "fs.create_dir_all",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/atomic_fs.rs",
+            "fs.remove_file",
+            8,
+        ),
+        ("crates/tine-core/src/model/atomic_fs.rs", "fs.rename", 2),
+        (
+            "crates/tine-core/src/model/atomic_fs.rs",
+            "libc.renameat2",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/atomic_fs.rs",
+            "open.create_new",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/atomic_fs.rs",
+            "windows.MoveFileW",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "cap.create_dir",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "cap.remove_file",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "libc.renameat2",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "open.create_new",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
             "windows.NtSetInformationFile",
             1,
         ),
-        // K3 (2026-09-15) moved these out of model.rs verbatim; the module's
-        // totals did not change.
+        ("crates/tine-core/src/model/trash.rs", "fs.create_dir_all", 1),
         (
             "crates/tine-core/src/model/assets.rs",
             "fs.create_dir_all",
@@ -1314,7 +1374,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         // hard link that shared storage refuses — for the graph tree's own
         // no-clobber rename (`move_graph_text_exact_no_replace`). The two
         // remaining opens are the app-private durable authorities.
-        ("crates/tine-core/src/model.rs", "durable_directory.open", 2),
+        ("crates/tine-core/src/model/atomic_copy.rs", "durable_directory.open", 2),
         ("src-tauri/src/plugins.rs", "package.publish", 1),
         ("src-tauri/src/plugins.rs", "package.recover", 1),
         ("src-tauri/src/plugins.rs", "package.retire", 1),

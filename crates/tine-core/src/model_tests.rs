@@ -117,7 +117,7 @@ fn production_docblock_struct_literals_are_reviewed() {
             "DocBlock::new is the raw-only canonical constructor",
         ),
         (
-            "crates/tine-core/src/model.rs",
+            "crates/tine-core/src/model/block_dto.rs",
             "dto_block_to_doc_block",
             "the one BlockDto field mapping",
         ),
@@ -11002,7 +11002,7 @@ fn production_projection_has_no_alternate_graph_writer_entrypoint() {
 /// whose Android arm is hard-link-then-unlink and fails with `EACCES` on the
 /// shared storage a Direct Files graph lives in. v0.6.981 shipped exactly that
 /// and every Android save failed. Imitate `move_graph_text_exact_no_replace`
-/// in `model.rs`; the storage boundary stays for app-private authorities only.
+/// in `model/projection_rename.rs`; the storage boundary stays for app-private authorities only.
 #[test]
 fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     const RULE: &str = "GH #466 / I-16: Direct Files graph-text name transitions use \
