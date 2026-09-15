@@ -818,31 +818,20 @@ impl PdfHighlightSidecarCommit {
     }
 }
 
-/// Per-retained-resource admission state for every page or journal mutation.
+/// Per-retained-resource serialization for every page or journal mutation.
 ///
-/// Writers take a permit before their existing page/sync locks. The mutex also
-/// serializes graph-text identity transitions across every writer of one
-/// retained resource.
+/// Every writer of one retained resource shares this gate, so graph-text
+/// identity transitions are totally ordered across all of them.
 struct ManagedTextWriteGate {
-    state: std::sync::Mutex<ManagedTextWriteState>,
     /// Resource-wide serialization for graph-text identity validation, the
     /// corresponding filesystem transition, and retained-index publication.
     ///
     /// This is deliberately reentrant by thread: higher-level transactions
     /// (rename/merge/projection recovery) call the same low-level publication
-    /// primitives while retaining one authority window. The handoff gate above
-    /// still decides who may write; this lock decides the total order in which
-    /// admitted writers change graph-text identity.
+    /// primitives while retaining one authority window. This lock decides the
+    /// total order in which admitted writers change graph-text identity.
     identity_mutation: std::sync::Mutex<GraphTextIdentityMutationState>,
     identity_mutation_changed: std::sync::Condvar,
-    #[cfg(test)]
-    admission_race_barrier: std::sync::Mutex<Option<Arc<std::sync::Barrier>>>,
-}
-
-#[derive(Default)]
-struct ManagedTextWriteState {
-    active_writers: usize,
-    handoff_held: bool,
 }
 
 #[derive(Default)]
@@ -861,24 +850,11 @@ struct GraphTextIdentityMutationGuard<'a> {
     gate: &'a ManagedTextWriteGate,
 }
 
-/// Holds the graph-text mutation authority across a storage-mode publication.
-///
-/// Callers cannot manufacture this guard.  `Graph` returns it only after the
-/// complete Direct Files identity generation still matches the candidate's
-/// captured source generation.  Keeping it alive closes the final race between
-/// that comparison and publishing a successor storage authority.
-pub struct GraphTextIdentityPublicationGuard<'a> {
-    _identity: GraphTextIdentityMutationGuard<'a>,
-}
-
 impl ManagedTextWriteGate {
     fn new() -> Self {
         Self {
-            state: std::sync::Mutex::new(ManagedTextWriteState::default()),
             identity_mutation: std::sync::Mutex::new(GraphTextIdentityMutationState::default()),
             identity_mutation_changed: std::sync::Condvar::new(),
-            #[cfg(test)]
-            admission_race_barrier: std::sync::Mutex::new(None),
         }
     }
 
@@ -944,35 +920,6 @@ impl ManagedTextWriteGate {
             .expect("graph-text identity mutation epoch exhausted");
         state.epoch
     }
-
-    fn admit_writer(self: &Arc<Self>) -> io::Result<ManagedTextWritePermit> {
-        #[cfg(test)]
-        self.synchronize_admission_race();
-        let mut state = self.state.lock().unwrap();
-        if state.handoff_held {
-            return Err(handoff_write_blocked_error());
-        }
-        state.active_writers += 1;
-        Ok(ManagedTextWritePermit {
-            gate: Some(Arc::clone(self)),
-            root: None,
-            resource_id: None,
-        })
-    }
-
-    fn release_writer(&self) {
-        let mut state = self.state.lock().unwrap();
-        debug_assert!(state.active_writers != 0);
-        state.active_writers = state.active_writers.saturating_sub(1);
-    }
-
-    #[cfg(test)]
-    fn synchronize_admission_race(&self) {
-        let barrier = self.admission_race_barrier.lock().unwrap().clone();
-        if let Some(barrier) = barrier {
-            barrier.wait();
-        }
-    }
 }
 
 impl Drop for GraphTextIdentityMutationGuard<'_> {
@@ -989,8 +936,8 @@ impl Drop for GraphTextIdentityMutationGuard<'_> {
     }
 }
 
-/// Process-local weak registry of independent writer gates. A live graph or
-/// handoff keeps its gate alive; dead resources are pruned on the next open.
+/// Process-local weak registry of independent writer gates. A live graph keeps
+/// its gate alive; dead resources are pruned on the next open.
 static MANAGED_TEXT_WRITE_GATE_REGISTRY: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<CanonicalGraphResourceId, std::sync::Weak<ManagedTextWriteGate>>,
@@ -1038,13 +985,6 @@ fn managed_text_write_binding_for_resource(
     })
 }
 
-fn handoff_write_blocked_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "managed text writes are reserved for external reconciliation",
-    )
-}
-
 fn managed_write_identity_mismatch_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -1052,12 +992,12 @@ fn managed_write_identity_mismatch_error() -> io::Error {
     )
 }
 
-/// An active managed-text writer admission. Its only job is to keep the graph
-/// handoff mint from observing a false quiescent point.
+/// An admitted graph-text writer: the retained root capability every write
+/// resolves its paths under, bound to the resource identity it was admitted
+/// against.
 struct ManagedTextWritePermit {
-    gate: Option<Arc<ManagedTextWriteGate>>,
-    root: Option<Dir>,
-    resource_id: Option<CanonicalGraphResourceId>,
+    root: Dir,
+    resource_id: CanonicalGraphResourceId,
 }
 
 struct ManagedTextTarget {
@@ -1070,14 +1010,6 @@ impl ManagedTextTarget {
         self.chain
             .last()
             .expect("managed text target retains its parent chain")
-    }
-}
-
-impl Drop for ManagedTextWritePermit {
-    fn drop(&mut self) {
-        if let Some(gate) = self.gate.take() {
-            gate.release_writer();
-        }
     }
 }
 
@@ -1443,6 +1375,7 @@ impl EditorConflictSite {
     /// Every conflict-minting site. Exhaustive by construction: the length is
     /// pinned, so adding a variant without adding it here fails to compile and
     /// the site-to-code guards cannot silently stop covering it.
+    #[cfg(test)]
     const ALL: [Self; 10] = [
         Self::SaveBaselinePresent,
         Self::SaveBaselineAbsent,
@@ -2139,11 +2072,6 @@ impl<K: Ord, V> PersistentMap<K, V> {
         self.iter().map(|(key, _)| key)
     }
 
-    #[cfg(test)]
-    fn values(&self) -> impl Iterator<Item = &V> {
-        self.iter().map(|(_, value)| value)
-    }
-
     fn path_copy_peak_upper_bound(&self) -> io::Result<u64> {
         // Deletion can copy both the search path and the in-order-successor
         // path. Each level can allocate five nodes for a double rotation.
@@ -2210,16 +2138,7 @@ impl<'a, K: Ord, V> IntoIterator for &'a PersistentMap<K, V> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub(crate) enum GraphTextExactFeedFailure {
-    BackendError,
-    OverflowOrQueueLoss,
-    SequenceDiscontinuity,
-    UnsupportedOrAmbiguousEvent,
     DirectoryMutation,
-    RootMutation,
-    ScopeOrConfigMutation,
-    ModeSwitch,
-    ExplicitDisconnect,
-    LeaseDropped,
 }
 
 /// Core classification for one exact graph-relative platform event path.
@@ -3025,36 +2944,6 @@ struct GraphTextAdmissionTestCounters {
 }
 
 #[cfg(test)]
-impl GraphTextAdmissionTestCounters {
-    fn difference_since(self, earlier: Self) -> Self {
-        macro_rules! difference {
-            ($field:ident) => {
-                self.$field.checked_sub(earlier.$field).unwrap_or_else(|| {
-                    panic!(
-                        "admission {} counter reset during measurement",
-                        stringify!($field)
-                    )
-                })
-            };
-        }
-        Self {
-            builder_enumerations: difference!(builder_enumerations),
-            direct_creation_censuses: difference!(direct_creation_censuses),
-            direct_creation_files_hashed: difference!(direct_creation_files_hashed),
-            point_query_attempts: difference!(point_query_attempts),
-            parser_invocations: difference!(parser_invocations),
-            index_map_insertions: difference!(index_map_insertions),
-            event_map_key_reads: difference!(event_map_key_reads),
-            event_map_key_writes: difference!(event_map_key_writes),
-            event_reverse_members: difference!(event_reverse_members),
-            persistent_node_allocations: difference!(persistent_node_allocations),
-            persistent_rotations: difference!(persistent_rotations),
-            persistent_payload_members: difference!(persistent_payload_members),
-        }
-    }
-}
-
-#[cfg(test)]
 thread_local! {
     static FAIL_NEXT_RENAME_SOURCE_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WITHDRAW_RACE_REPLACEMENT: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
@@ -3068,17 +2957,13 @@ thread_local! {
     static PROJECTION_AFTER_RETIRE_COLLISION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_POST_PUBLISH_COLLISION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static PROJECTION_CASE_ALIAS: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_PROJECTION_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static FAIL_AFTER_PROJECTION_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROJECTION_EXACT_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MANAGED_INVENTORY_READ_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static INITIAL_SHADOW_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE: std::cell::RefCell<Option<ManagedTextInventoryLimits>> = const { std::cell::RefCell::new(None) };
     static MANAGED_TEXT_BUDGET_LAST_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BOUNDED_READ_AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static HANDOFF_MINT_AFTER_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static HANDOFF_TRANSFER_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_IDENTITY_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_AFTER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_AFTER_IDENTITY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
@@ -3105,47 +2990,6 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) struct ProjectionCaseAliasGuard;
-
-#[cfg(test)]
-impl Drop for ProjectionCaseAliasGuard {
-    fn drop(&mut self) {
-        PROJECTION_CASE_ALIAS.with(|alias| {
-            alias.borrow_mut().take();
-        });
-    }
-}
-
-/// Model a case-insensitive exact-path lookup without changing production path
-/// resolution. While `existing` is present, resolving `requested` addresses
-/// that exact physical spelling; after retirement, a create uses `requested`.
-#[cfg(test)]
-pub(crate) fn projection_case_alias_for_test(
-    requested: &str,
-    existing: &str,
-) -> ProjectionCaseAliasGuard {
-    PROJECTION_CASE_ALIAS.with(|alias| {
-        let mut alias = alias.borrow_mut();
-        assert!(
-            alias.is_none(),
-            "projection case-alias hook is already armed"
-        );
-        *alias = Some((requested.to_owned(), existing.to_owned()));
-    });
-    ProjectionCaseAliasGuard
-}
-
-#[cfg(test)]
-fn projection_case_alias_physical_path(root: &Path, requested: &str) -> Option<String> {
-    PROJECTION_CASE_ALIAS.with(|alias| {
-        let alias = alias.borrow();
-        let (hook_requested, existing) = alias.as_ref()?;
-        (hook_requested == requested && fs::symlink_metadata(root.join(existing)).is_ok())
-            .then(|| existing.clone())
-    })
-}
-
-#[cfg(test)]
 fn reset_graph_text_admission_test_counters() {
     GRAPH_TEXT_ADMISSION_TEST_COUNTERS
         .with(|counters| counters.set(GraphTextAdmissionTestCounters::default()));
@@ -3154,28 +2998,6 @@ fn reset_graph_text_admission_test_counters() {
 #[cfg(test)]
 fn graph_text_admission_test_counters() -> GraphTextAdmissionTestCounters {
     GRAPH_TEXT_ADMISSION_TEST_COUNTERS.with(Cell::get)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_graph_text_parser_counter_for_scan_test() {
-    reset_graph_text_admission_test_counters();
-}
-
-/// Test-only work proof for runtime-open paths.  A graph-wide exact-feed build
-/// visits retained directories through this counter; arming a feed must not.
-#[cfg(test)]
-pub(crate) fn reset_graph_text_admission_builder_counter_for_runtime_test() {
-    reset_graph_text_admission_test_counters();
-}
-
-#[cfg(test)]
-pub(crate) fn graph_text_admission_builder_enumerations_for_runtime_test() -> usize {
-    graph_text_admission_test_counters().builder_enumerations
-}
-
-#[cfg(test)]
-pub(crate) fn graph_text_parser_invocations_for_scan_test() -> usize {
-    graph_text_admission_test_counters().parser_invocations
 }
 
 #[cfg(test)]
@@ -3189,15 +3011,6 @@ fn count_graph_text_admission_builder_enumeration() {
 
 #[cfg(not(test))]
 fn count_graph_text_admission_builder_enumeration() {}
-
-#[cfg(test)]
-fn count_graph_text_admission_point_query() {
-    GRAPH_TEXT_ADMISSION_TEST_COUNTERS.with(|counters| {
-        let mut value = counters.get();
-        value.point_query_attempts += 1;
-        counters.set(value);
-    });
-}
 
 #[cfg(test)]
 fn count_graph_text_admission_parser_invocation() {
@@ -3305,34 +3118,6 @@ fn graph_text_parse_failure_hook() -> io::Result<()> {
     Ok(())
 }
 
-/// Clear thread-local projection test controls without affecting measurements.
-/// The crash corpus owns this state for the duration of one corpus run because
-/// libtest can reuse a worker thread after ordinary panic unwinding.
-#[cfg(test)]
-pub(crate) fn reset_projection_graph_test_hooks() {
-    WITHDRAW_RACE_REPLACEMENT.with(|replacement| drop(replacement.borrow_mut().take()));
-    GUIDE_TWIN_RACE_CONTENT.with(|content| drop(content.borrow_mut().take()));
-    PROJECTION_LAST_MOMENT_REPLACEMENT.with(|replacement| drop(replacement.borrow_mut().take()));
-    PROJECTION_PUBLICATION_RACE_REPLACEMENT
-        .with(|replacement| drop(replacement.borrow_mut().take()));
-    PROJECTION_AFTER_RETIRE_REPLACEMENT.with(|replacement| drop(replacement.borrow_mut().take()));
-    PROJECTION_STALE_RECOVERY_WRITE.with(|write| drop(write.borrow_mut().take()));
-    PROJECTION_POST_PUBLISH_REPLACEMENT.with(|replacement| drop(replacement.borrow_mut().take()));
-    PROJECTION_LATE_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_AFTER_RETIRE_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_POST_PUBLISH_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_BEFORE_RESTORE.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_CASE_ALIAS.with(|alias| drop(alias.borrow_mut().take()));
-    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(false));
-    FAIL_AFTER_PROJECTION_PARENT_SYNC.with(|fail| fail.set(false));
-    PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
-    MANAGED_INVENTORY_READ_RACE.with(|hook| drop(hook.borrow_mut().take()));
-    INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| drop(hook.borrow_mut().take()));
-    BOUNDED_READ_AFTER_METADATA.with(|hook| drop(hook.borrow_mut().take()));
-    // The corpus does not exercise rename_page, so its rename-only source
-    // removal failpoint has no corpus-state lifetime.
-}
-
 #[cfg(test)]
 fn rename_source_remove_failpoint() -> io::Result<()> {
     FAIL_NEXT_RENAME_SOURCE_REMOVE.with(|flag| {
@@ -3397,25 +3182,6 @@ fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
 
 #[cfg(not(test))]
 fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-fn projection_parent_after_sync_hook() -> io::Result<()> {
-    FAIL_AFTER_PROJECTION_PARENT_SYNC.with(|fail| {
-        if fail.replace(false) {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "injected crash after projection parent creation and sync",
-            ))
-        } else {
-            Ok(())
-        }
-    })
-}
-
-#[cfg(not(test))]
-fn projection_parent_after_sync_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -5782,13 +5548,11 @@ impl Graph {
 
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
         let binding = self.managed_write_binding()?;
-        let mut permit = binding.gate.admit_writer()?;
-        if let Err(error) = managed_write_after_admission_hook() {
-            drop(permit);
-            return Err(error);
-        }
-        permit.root = Some(binding.root.try_clone()?);
-        permit.resource_id = Some(binding.resource_id);
+        managed_write_after_admission_hook()?;
+        let permit = ManagedTextWritePermit {
+            root: binding.root.try_clone()?,
+            resource_id: binding.resource_id,
+        };
         managed_write_after_identity_check_hook();
         Ok(permit)
     }
@@ -5798,10 +5562,10 @@ impl Graph {
         if self.canonical_resource_id()? != binding.resource_id {
             return Err(managed_write_identity_mismatch_error());
         }
-        let mut permit = binding.gate.admit_writer()?;
-        permit.root = Some(binding.root.try_clone()?);
-        permit.resource_id = Some(binding.resource_id);
-        Ok(permit)
+        Ok(ManagedTextWritePermit {
+            root: binding.root.try_clone()?,
+            resource_id: binding.resource_id,
+        })
     }
 
     fn managed_write_binding(&self) -> io::Result<&ManagedTextWriteBinding> {
@@ -5819,15 +5583,10 @@ impl Graph {
 
     fn managed_permit_root<'a>(&self, permit: &'a ManagedTextWritePermit) -> io::Result<&'a Dir> {
         let binding = self.managed_write_binding()?;
-        if permit.resource_id != Some(binding.resource_id) {
+        if permit.resource_id != binding.resource_id {
             return Err(managed_write_identity_mismatch_error());
         }
-        permit.root.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "managed text writer permit has no retained root capability",
-            )
-        })
+        Ok(&permit.root)
     }
 
     fn managed_target(
@@ -5857,11 +5616,7 @@ impl Graph {
             match projection_real_directory(current, component) {
                 Ok(()) => {}
                 Err(error) if create_parent && error.kind() == io::ErrorKind::NotFound => {
-                    create_projection_chain_component(
-                        current,
-                        component,
-                        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
-                    )?;
+                    create_projection_chain_component(current, component)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -6588,25 +6343,9 @@ impl Graph {
         }
     }
 
-    /// Acquire graph-text mutation authority iff `expected_generation` is
-    /// still current.  The returned guard must remain alive until the storage
-    /// selector and in-process graph slot have both been published.
-    pub fn lock_graph_text_identity_publication(
-        &self,
-        expected_generation: u64,
-    ) -> io::Result<Option<GraphTextIdentityPublicationGuard<'_>>> {
-        let identity = self.lock_graph_text_identity_mutation()?;
-        if self.guarded_graph_text_identity_report().generation != expected_generation {
-            return Ok(None);
-        }
-        Ok(Some(GraphTextIdentityPublicationGuard {
-            _identity: identity,
-        }))
-    }
-
     /// Run one bounded, multi-document Tine operation without allowing a raw
-    /// native watcher callback or storage-mode handoff to split it between two
-    /// graph-text publications. Individual writes still take their ordinary
+    /// native watcher callback to split it between two graph-text
+    /// publications. Individual writes still take their ordinary
     /// path locks and perform all exact validation; this only keeps their shared
     /// resource authority contiguous (the Guide copy is the first caller).
     pub(crate) fn with_graph_text_write_transaction<T>(
@@ -7008,7 +6747,7 @@ impl Graph {
 
     /// Construct a list entry only after assigning the exact path's canonical
     /// longest-root owner. This is also the only ownership rule used by cache
-    /// and handoff paths through `entry_for_path`.
+    /// paths through `entry_for_path`.
     fn managed_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         if !is_page_file(path) {
             return Ok(None);
@@ -10100,26 +9839,6 @@ impl Graph {
             parent_components,
             filename: (*filename).to_owned(),
         };
-        #[cfg(test)]
-        {
-            let mut target = target;
-            if let Some(physical_path) =
-                projection_case_alias_physical_path(&self.root, relative_path)
-            {
-                let physical_components = physical_path.split('/').collect::<Vec<_>>();
-                target.absolute_path = self.root.join(&physical_path);
-                target.parent_components = physical_components[..physical_components.len() - 1]
-                    .iter()
-                    .map(|component| (*component).to_owned())
-                    .collect();
-                target.filename = physical_components
-                    .last()
-                    .expect("test alias path has a filename")
-                    .to_string();
-            }
-            return Ok(target);
-        }
-        #[cfg(not(test))]
         Ok(target)
     }
 
@@ -10169,11 +9888,7 @@ impl Graph {
         })
     }
 
-    fn projection_parent(
-        &self,
-        target: &ProjectionTarget,
-        create_missing: bool,
-    ) -> io::Result<ProjectionParent> {
+    fn projection_parent(&self, target: &ProjectionTarget) -> io::Result<ProjectionParent> {
         let root = self.projection_root.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -10183,18 +9898,7 @@ impl Graph {
         let mut chain = vec![root.try_clone()?];
         for component in &target.parent_components {
             let current = chain.last().expect("projection chain contains root");
-            match projection_real_directory(current, component) {
-                Ok(()) => {}
-                Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
-                    create_projection_chain_component(
-                        current,
-                        component,
-                        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection,
-                    )?;
-                    projection_parent_after_sync_hook()?;
-                }
-                Err(error) => return Err(error),
-            }
+            projection_real_directory(current, component)?;
             chain.push(open_projection_dir_nofollow(current, component)?);
         }
         Ok(ProjectionParent { chain })
@@ -10274,7 +9978,7 @@ impl Graph {
         parent: &ProjectionParent,
         target: &ProjectionTarget,
     ) -> io::Result<()> {
-        let rebound = self.projection_parent(target, false)?;
+        let rebound = self.projection_parent(target)?;
         if projection_dir_identity(rebound.final_dir())?
             != projection_dir_identity(parent.final_dir())?
         {
@@ -20764,9 +20468,9 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 pub(crate) enum AtomicReplaceOutcome {
     /// `next` is now the file's content.
     Published,
-    /// Someone else wrote the file first; nothing was published. Carries the
-    /// bytes actually found, so the caller can retry, refuse, or preserve them.
-    ExternalChanged(Vec<u8>),
+    /// Someone else wrote the file first; nothing was published and their
+    /// bytes stay in place.
+    ExternalChanged,
 }
 
 /// Publish `next` to `path` ONLY if `path` still holds `expected`.
@@ -20830,7 +20534,7 @@ fn atomic_replace_expected_with_hooks(
         if error.kind() == io::ErrorKind::NotFound {
             // The file we meant to update is gone: an external delete. Not ours
             // to recreate silently.
-            return Ok(AtomicReplaceOutcome::ExternalChanged(Vec::new()));
+            return Ok(AtomicReplaceOutcome::ExternalChanged);
         }
         return Err(error);
     }
@@ -20853,15 +20557,12 @@ fn atomic_replace_expected_with_hooks(
     };
     if found != expected {
         // Someone wrote between the caller's read and now. Put their bytes back
-        // and publish nothing.
-        let restored = move_file_noreplace(&retired, path);
+        // and publish nothing. If an even newer external CREATE took the name,
+        // `retired` stays for the recovery sweep rather than deleting anyone's
+        // data.
+        let _ = move_file_noreplace(&retired, path);
         let _ = fs::remove_file(&tmp);
-        if restored.is_err() {
-            // An even newer external CREATE took the name. Leave `retired` for
-            // the recovery sweep rather than deleting anyone's data.
-            return Ok(AtomicReplaceOutcome::ExternalChanged(found));
-        }
-        return Ok(AtomicReplaceOutcome::ExternalChanged(found));
+        return Ok(AtomicReplaceOutcome::ExternalChanged);
     }
 
     // PUBLISH into the slot we vacated. No-replace: an AlreadyExists here means
@@ -20869,9 +20570,8 @@ fn atomic_replace_expected_with_hooks(
     if let Err(error) = move_file_noreplace(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         if error.kind() == io::ErrorKind::AlreadyExists {
-            let current = fs::read(path).unwrap_or_default();
             // Our retired bytes stay on disk for the sweep to triage.
-            return Ok(AtomicReplaceOutcome::ExternalChanged(current));
+            return Ok(AtomicReplaceOutcome::ExternalChanged);
         }
         let _ = move_file_noreplace(&retired, path);
         return Err(error);
@@ -21959,90 +21659,6 @@ impl<'a> BlockDtoWalk<'a> {
     }
 }
 
-#[cfg(test)]
-fn managed_block_walk_stack_upper_bound<T>() -> io::Result<u64> {
-    checked_mul_bytes(
-        usize_to_u64(MAX_MANAGED_BLOCK_DEPTH)?,
-        usize_to_u64(std::mem::size_of::<T>())?,
-    )
-}
-
-/// Source-derived upper bound for the parser, runtime-id assignment, lsdoc
-/// projections, DTO construction, and all simultaneously live parser/DTO
-/// buffers. Every term is tied to an owned lsdoc/Tine allocation class. A
-/// source byte is also a conservative upper bound on the number of AST nodes,
-/// reference/property strings, and source ranges that the grammar can emit.
-#[cfg(test)]
-fn managed_page_build_upper_bound(content: &str) -> io::Result<u64> {
-    let source = u64::try_from(content.len()).map_err(|_| allocation_overflow())?;
-    let lines = if content.is_empty() {
-        0
-    } else {
-        checked_add_bytes(
-            u64::try_from(content.bytes().filter(|byte| *byte == b'\n').count())
-                .map_err(|_| allocation_overflow())?,
-            1,
-        )?
-    };
-    managed_page_build_metrics_upper_bound(source, lines)
-}
-
-#[cfg(test)]
-fn managed_page_build_metrics_upper_bound(source: u64, lines: u64) -> io::Result<u64> {
-    let source_units = source.max(lines);
-    let mut bytes = 0_u64;
-    // Parser input plus Document/DTO raw and page preamble storage.
-    for _class in ["parser input", "document raw", "dto raw", "page preamble"] {
-        bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(source)?)?;
-    }
-    // lsdoc AST and the Tine document/DTO nodes that can coexist during parse.
-    for slots in [
-        conservative_vec_capacity_upper_bound::<lsdoc::ast::Block>(source_units)?,
-        conservative_vec_capacity_upper_bound::<lsdoc::ast::Inline>(source_units)?,
-        conservative_vec_capacity_upper_bound::<DocBlock>(lines)?,
-        conservative_vec_capacity_upper_bound::<BlockDto>(lines)?,
-        conservative_vec_capacity_upper_bound::<(String, String)>(source_units)?,
-        conservative_vec_capacity_upper_bound::<String>(source_units)?,
-        conservative_vec_capacity_upper_bound::<std::ops::Range<usize>>(source_units)?,
-    ] {
-        bytes = checked_add_bytes(bytes, slots)?;
-    }
-    // Projection-owned text classes. Each class can retain at most the complete
-    // source payload, including Unicode expansion via owned_string_upper_bound.
-    for _class in [
-        "visible",
-        "visible lowercase",
-        "page references",
-        "normalized references",
-        "block references",
-        "marker and priority",
-        "properties",
-        "planning dates",
-        "tags",
-        "reference evidence names",
-    ] {
-        bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(source)?)?;
-    }
-    // Parser line slices and open frames are bounded by physical lines.
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<(usize, usize)>(lines)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<usize>(lines)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        managed_block_walk_stack_upper_bound::<(std::slice::IterMut<'_, DocBlock>, Uuid, usize)>()?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        managed_block_walk_stack_upper_bound::<(&[DocBlock], usize, Vec<BlockDto>)>()?,
-    )?;
-    Ok(bytes)
-}
-
 fn rename_rewrite_upper_bound(
     content: &str,
     renames: &std::collections::HashMap<String, String>,
@@ -22932,7 +22548,6 @@ struct GraphTextJournalTitleFormatBudget {
 #[derive(Clone, Copy)]
 struct GraphTextSemanticNameBudget {
     semantic_name_bytes: u64,
-    title_format: GraphTextJournalTitleFormatBudget,
 }
 
 fn graph_text_journal_title_format_budget(
@@ -22993,7 +22608,6 @@ fn graph_text_observed_semantic_name_upper_bound(
     }
     Ok(GraphTextSemanticNameBudget {
         semantic_name_bytes: observed,
-        title_format,
     })
 }
 
@@ -23320,32 +22934,6 @@ fn initial_graph_text_collision_group_insert<K, T>(
 {
     count_graph_text_admission_persistent_payload_members(1);
     map.entry(key).or_default().insert(member);
-}
-
-#[cfg(test)]
-fn initial_shadow_global_collision(index: &CompleteGraphTextAdmissionIndex) -> Option<io::Error> {
-    if index
-        .file_link_count_by_exact_relative
-        .iter()
-        .find(|(_, links)| **links != 1)
-        .is_some()
-    {
-        return Some(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "managed file has an unsafe retained link count",
-        ));
-    }
-    if index
-        .paths_by_file_resource
-        .values()
-        .any(|members| members.len() > 1)
-    {
-        return Some(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "managed files alias one retained resource",
-        ));
-    }
-    None
 }
 
 fn validate_graph_text_admission_index(index: &CompleteGraphTextAdmissionIndex) -> io::Result<()> {
@@ -23827,16 +23415,7 @@ fn validate_graph_text_exact_feed_relative(relative: &str) -> io::Result<()> {
 
 fn graph_text_exact_feed_failure_cause(reason: GraphTextExactFeedFailure, cause: &str) -> String {
     let label = match reason {
-        GraphTextExactFeedFailure::BackendError => "backend error",
-        GraphTextExactFeedFailure::OverflowOrQueueLoss => "overflow or queue loss",
-        GraphTextExactFeedFailure::SequenceDiscontinuity => "sequence discontinuity",
-        GraphTextExactFeedFailure::UnsupportedOrAmbiguousEvent => "unsupported or ambiguous event",
         GraphTextExactFeedFailure::DirectoryMutation => "directory mutation",
-        GraphTextExactFeedFailure::RootMutation => "root mutation",
-        GraphTextExactFeedFailure::ScopeOrConfigMutation => "scope or config mutation",
-        GraphTextExactFeedFailure::ModeSwitch => "mode switch",
-        GraphTextExactFeedFailure::ExplicitDisconnect => "explicit disconnect",
-        GraphTextExactFeedFailure::LeaseDropped => "lease drop",
     };
     let available = MAX_GRAPH_TEXT_ADMISSION_DIAGNOSTIC_CAUSE_BYTES.saturating_sub(label.len() + 2);
     let mut boundary = cause.len().min(available);
@@ -24082,17 +23661,10 @@ fn create_projection_staging_file(
 /// directory-entry flush primitive as a platform limitation.
 ///
 /// The probe covers exactly the directory the operation will later flush — the
-/// chain leaf — because that is the only barrier the operation takes.
-///
-/// This is the strict, sole-authority variant. The Markdown/Org projection of
-/// an accepted manifest uses [`preflight_reconstructible_projection_chain`];
-/// see [`crate::filesystem_durability::DurabilityArtifactClass`] for why the
-/// two classes get different platform policies.
+/// chain leaf — because that is the only barrier the operation takes. It is
+/// strict on every platform: the graph tree is the sole authority for its bytes.
 fn preflight_projection_chain(chain: &[Dir]) -> io::Result<()> {
-    sync_projection_chain_with_class(
-        chain,
-        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
-    )
+    sync_projection_chain(chain)
 }
 
 /// The exact platform primitive named by the projection receipt. It is a
@@ -24120,10 +23692,9 @@ const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
 const PROJECTION_NOREPLACE_RENAME_OPERATION: &str =
     "atomic no-clobber rename publishing the projection";
 
-/// The raw platform no-replace rename. It deliberately returns the untouched
-/// platform error: [`rename_projection_noreplace_with_class`] needs the exact
-/// `errno` to tell a filesystem that cannot provide the flag from a filesystem
-/// that refused the operation, and `io::Error::new` would discard it.
+/// The raw platform no-replace rename. It returns the untouched platform error,
+/// so [`rename_projection_noreplace`] names the refused call around the exact
+/// `errno` rather than an `io::Error::new` that would discard it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     use std::ffi::CString;
@@ -24297,18 +23868,20 @@ fn rename_projection_noreplace_platform(_dir: &Dir, _from: &str, _to: &str) -> i
     ))
 }
 
-/// The strict, sole-authority no-clobber publication. Every caller here writes a
-/// graph-tree artifact the graph itself is the only authority for, so the atomic
+/// The single no-clobber publication of a graph-tree name. Every caller writes
+/// an artifact the graph itself is the only authority for, so the atomic
 /// primitive is the contract: there is no second copy to rebuild from, and a
 /// two-step publication would leave a reserved-but-empty live name behind a
-/// crash. A filesystem that cannot provide the primitive fails the write.
+/// crash. A filesystem that cannot provide the primitive fails the write, on
+/// every platform (`docs/storage-sync-contract.md` §2.10b).
 fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
-    rename_projection_noreplace_with_class(
-        dir,
-        from,
-        to,
-        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
-    )
+    rename_projection_noreplace_platform(dir, from, to).map_err(|error| {
+        projection_platform_error(
+            PROJECTION_NOREPLACE_RENAME_OPERATION,
+            &format!("{from:?} -> {to:?}"),
+            error,
+        )
+    })
 }
 
 /// The Direct Files graph-text name transition: the exact-byte move protocol of
@@ -24345,12 +23918,7 @@ fn move_graph_text_exact_no_replace(
         return Err(graph_text_transition_byte_collision("source"));
     }
     rename_projection_noreplace(dir, from, to)?;
-    sync_projection_directory_with_class(
-        dir,
-        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
-        0,
-        1,
-    )?;
+    sync_projection_directory(dir, 0, 1)?;
     if read_projection_regular(dir, to)? != expected {
         return Err(graph_text_transition_byte_collision("published"));
     }
@@ -24363,300 +23931,6 @@ fn graph_text_transition_byte_collision(position: &str) -> io::Error {
         format!("graph text name transition found different bytes at its {position} name"),
     )
 }
-
-/// Is this platform error the filesystem saying "I do not implement that flag"?
-///
-/// `renameat2` reports an unsupported flag as `EINVAL` on most filesystems, as
-/// `ENOSYS` when the syscall itself is absent, and as `EOPNOTSUPP`/`ENOTSUP` on
-/// some stacked filesystems. Android shared storage additionally reports
-/// `EACCES` for this flagged syscall while permitting an ordinary same-directory
-/// rename. That platform-only answer is classified by
-/// [`noreplace_or_reserve_for_platform`], where the fallback must still perform
-/// the ordinary rename; a real permission denial therefore remains a failure.
-/// Everywhere else `EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`, and `ENOENT`
-/// describe the operation rather than the flag and stay fatal.
-#[cfg(unix)]
-fn is_flagged_rename_capability_refusal(error: &io::Error) -> bool {
-    // Written as comparisons rather than a `match`: on Linux `ENOTSUP` and
-    // `EOPNOTSUPP` are the same value, and repeating them as patterns is an
-    // unreachable-pattern lint.
-    error.raw_os_error().is_some_and(|errno| {
-        errno == libc::EINVAL
-            || errno == libc::ENOSYS
-            || errno == libc::EOPNOTSUPP
-            || errno == libc::ENOTSUP
-    })
-}
-
-/// Windows has one no-replace primitive and it is `FileRenameInformation` with
-/// `ReplaceIfExists = FALSE`, which NTFS/ReFS/FAT all implement. There is no
-/// capability answer to recognise, so nothing degrades there.
-#[cfg(not(unix))]
-fn is_flagged_rename_capability_refusal(_error: &io::Error) -> bool {
-    false
-}
-
-/// Filesystems (by `st_dev`) already known to refuse the flagged rename.
-///
-/// The answer is a property of the mounted filesystem, not of one file, so it is
-/// remembered once instead of costing a failed syscall on every publication. It
-/// is only ever consulted for the reconstructible projection class, so the
-/// strict class cannot read or write it.
-#[cfg(unix)]
-static FLAGGED_RENAME_UNSUPPORTED_DEVICES: RwLock<std::collections::BTreeSet<u64>> =
-    RwLock::new(std::collections::BTreeSet::new());
-
-#[cfg(unix)]
-fn projection_device_id(dir: &Dir) -> io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-
-    Ok(dir.try_clone()?.into_std_file().metadata()?.dev())
-}
-
-/// A miss is never load-bearing: an unknown device simply attempts the flagged
-/// rename and learns the answer from it. Correctness does not depend on the
-/// cache, only the syscall count does.
-#[cfg(unix)]
-fn flagged_rename_known_unsupported(dir: &Dir) -> bool {
-    let Ok(device) = projection_device_id(dir) else {
-        return false;
-    };
-    FLAGGED_RENAME_UNSUPPORTED_DEVICES
-        .read()
-        .is_ok_and(|devices| devices.contains(&device))
-}
-
-#[cfg(unix)]
-fn remember_flagged_rename_unsupported(dir: &Dir) {
-    if let Ok(device) = projection_device_id(dir) {
-        if let Ok(mut devices) = FLAGGED_RENAME_UNSUPPORTED_DEVICES.write() {
-            devices.insert(device);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn flagged_rename_known_unsupported(_dir: &Dir) -> bool {
-    false
-}
-
-#[cfg(not(unix))]
-fn remember_flagged_rename_unsupported(_dir: &Dir) {}
-
-/// Publish without the flag, on a filesystem that does not implement it.
-///
-/// **What it keeps.** The destination name is reserved with an exclusive create
-/// (`O_CREAT|O_EXCL`), which fails with `EEXIST` if anything already occupies
-/// that name. So the one guarantee `RENAME_NOREPLACE` was there to provide —
-/// never silently destroy a file that is already at the destination — still
-/// holds, and a failure to reserve is returned as `AlreadyExists`, the exact
-/// error the flagged rename raises, so every guarded-conflict caller above is
-/// unchanged. If the rename itself then fails, the reservation is rolled back
-/// (only when the destination is still byte-for-byte the placeholder this call
-/// created, checked by physical identity), so a failed publication does not
-/// leave an empty file at a live page name.
-///
-/// **What it gives up.** Atomicity of the name transition. Between the
-/// reservation and the rename the destination exists as a zero-length file, so
-/// (a) a crash inside that window leaves a zero-length name that the projection
-/// drain rebuilds from the accepted manifest on the next open — exactly as it
-/// rebuilds an interrupted projection today — and (b) an external writer that
-/// replaces the placeholder inside that window is overwritten rather than
-/// winning the race. Both are why this is confined to
-/// `SharedReconstructibleProjection`, where the manifest in private storage is
-/// still the authority for these bytes, and is never used for artifacts the
-/// graph tree is the sole authority for.
-fn reserve_and_rename(
-    source_dir: &Dir,
-    from: &str,
-    destination_dir: &Dir,
-    to: &str,
-) -> io::Result<()> {
-    let mut options = CapOpenOptions::new();
-    options.write(true).create_new(true);
-    // An occupied destination fails here, before anything has moved.
-    let reserved = destination_dir.open_with(to, &options)?.into_std();
-    let reserved_identity = match canonical_projection_file_resource_id(&reserved) {
-        Ok(identity) => identity,
-        Err(error) => {
-            let _ = destination_dir.remove_file(to);
-            return Err(error);
-        }
-    };
-    drop(reserved);
-    match source_dir.rename(from, destination_dir, to) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // Roll the reservation back, but only if the destination is still
-            // the exact placeholder this call created. If someone replaced it,
-            // their file stays.
-            if let Ok(current) = open_projection_file_nofollow(destination_dir, to) {
-                let still_ours = canonical_projection_file_resource_id(&current)
-                    .is_ok_and(|identity| identity == reserved_identity);
-                drop(current);
-                if still_ours {
-                    let _ = destination_dir.remove_file(to);
-                }
-            }
-            Err(error)
-        }
-    }
-}
-
-/// The single place the projection leg publishes a name without clobbering.
-///
-/// `PrivateDurableAuthority` gets the platform primitive and nothing else.
-/// `SharedReconstructibleProjection` additionally accepts a capability refusal
-/// from that primitive and falls back to [`reserve_and_rename`];
-/// every other errno stays fatal for both classes, on every platform.
-///
-/// The fallback is not gated on Android, unlike the durability-barrier policy in
-/// [`crate::filesystem_durability`]. That policy gives a guarantee up, so it is
-/// confined to the platform that forces the choice; this one keeps its guarantee
-/// and only loses atomicity, and the same `EINVAL` is reachable on any host
-/// whose graph lives on a filesystem without `rename2` flags (FAT/exFAT media,
-/// some FUSE and network mounts). Failing those writes closed would be an
-/// availability bug with no in-scope threat behind it.
-fn rename_projection_noreplace_with_class(
-    dir: &Dir,
-    from: &str,
-    to: &str,
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-) -> io::Result<()> {
-    let reconstructible = matches!(
-        class,
-        crate::filesystem_durability::DurabilityArtifactClass::SharedReconstructibleProjection
-    );
-    let (step, result) = noreplace_or_reserve(dir, from, dir, to, reconstructible, &|| {
-        #[cfg(test)]
-        if let Some(injected) = armed_projection_noreplace_rename(class, dir)? {
-            return Err(io::Error::from_raw_os_error(injected.errno));
-        }
-        rename_projection_noreplace_platform(dir, from, to)
-    });
-    result.map_err(|error| {
-        projection_platform_error(
-            match step {
-                FlaggedRenameStep::Platform => PROJECTION_NOREPLACE_RENAME_OPERATION,
-                FlaggedRenameStep::Reservation => PROJECTION_RESERVED_RENAME_OPERATION,
-            },
-            &format!("{from:?} -> {to:?}"),
-            error,
-        )
-    })
-}
-
-/// Which of the two primitives produced the answer, so the receipt can name the
-/// call the filesystem actually ran.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FlaggedRenameStep {
-    Platform,
-    Reservation,
-}
-
-/// The single no-clobber-rename policy for the Markdown/Org publication leg.
-///
-/// `platform` is the caller's own no-clobber primitive — the projection leg and
-/// the provider transport each validate different things around theirs, and
-/// neither should inherit the other's checks — so this owns only the policy: a
-/// `PrivateDurableAuthority` artifact gets that primitive and nothing else,
-/// while a `SharedReconstructibleProjection` artifact additionally reads a
-/// capability refusal from it and degrades to [`reserve_and_rename`]. Every
-/// other errno stays fatal for both classes, on every platform.
-///
-/// The device memo is keyed on the destination directory: source and
-/// destination are always on one mount here (a cross-device rename is `EXDEV`
-/// before any flag matters) and the reservation is created at the destination.
-fn noreplace_or_reserve(
-    source_dir: &Dir,
-    from: &str,
-    destination_dir: &Dir,
-    to: &str,
-    reconstructible: bool,
-    platform: &dyn Fn() -> io::Result<()>,
-) -> (FlaggedRenameStep, io::Result<()>) {
-    noreplace_or_reserve_for_platform(
-        source_dir,
-        from,
-        destination_dir,
-        to,
-        reconstructible,
-        cfg!(target_os = "android"),
-        platform,
-    )
-}
-
-fn noreplace_or_reserve_for_platform(
-    source_dir: &Dir,
-    from: &str,
-    destination_dir: &Dir,
-    to: &str,
-    reconstructible: bool,
-    android: bool,
-    platform: &dyn Fn() -> io::Result<()>,
-) -> (FlaggedRenameStep, io::Result<()>) {
-    if reconstructible && flagged_rename_known_unsupported(destination_dir) {
-        return (
-            FlaggedRenameStep::Reservation,
-            reserve_and_rename(source_dir, from, destination_dir, to),
-        );
-    }
-    match platform() {
-        Ok(()) => (FlaggedRenameStep::Platform, Ok(())),
-        Err(error)
-            if reconstructible
-                && reconstructible_flagged_rename_capability_refusal(&error, android) =>
-        {
-            remember_flagged_rename_unsupported(destination_dir);
-            (
-                FlaggedRenameStep::Reservation,
-                reserve_and_rename(source_dir, from, destination_dir, to),
-            )
-        }
-        Err(error) => (FlaggedRenameStep::Platform, Err(error)),
-    }
-}
-
-fn reconstructible_flagged_rename_capability_refusal(error: &io::Error, android: bool) -> bool {
-    is_flagged_rename_capability_refusal(error)
-        || (android && error.kind() == io::ErrorKind::PermissionDenied)
-}
-
-const PROJECTION_RESERVED_RENAME_OPERATION: &str =
-    "exclusive reservation and rename publishing the projection";
-
-/// A substitute for the platform no-replace rename, armed for exactly one graph
-/// tree, so a host test can reproduce a device whose filesystem refuses the
-/// flagged call. Process-global for the same reason as
-/// [`ArmedProjectionDirectoryBarrier`]: the runtime saves on its actor thread.
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) struct ArmedProjectionNoreplaceRename {
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-    errno: i32,
-    root: ProjectionDirIdentity,
-}
-
-#[cfg(test)]
-static ARMED_PROJECTION_NOREPLACE_RENAME: std::sync::Mutex<Option<ArmedProjectionNoreplaceRename>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn armed_projection_noreplace_rename(
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-    dir: &Dir,
-) -> io::Result<Option<ArmedProjectionNoreplaceRename>> {
-    let armed = *ARMED_PROJECTION_NOREPLACE_RENAME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(armed) = armed.filter(|armed| armed.class == class) else {
-        return Ok(None);
-    };
-    Ok((projection_dir_identity(dir)? == armed.root).then_some(armed))
-}
-
-#[cfg(all(test, not(unix)))]
-pub(crate) fn forget_flagged_rename_capabilities() {}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn rename_managed_noreplace(
@@ -24763,13 +24037,10 @@ fn rename_managed_noreplace(
 /// on every platform, Android included.
 ///
 /// One barrier, on the directory whose entries the operation changed; see
-/// [`sync_projection_chain_with_class`] for why the ancestors take none.
+/// [`sync_projection_chain`] for why the ancestors take none.
 fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
     projection_directory_sync_hook(Path::new("."))?;
-    sync_projection_chain_with_class(
-        chain,
-        crate::filesystem_durability::DurabilityArtifactClass::PrivateDurableAuthority,
-    )
+    sync_projection_chain(chain)
 }
 
 /// Make the directory-entry changes of one projection operation durable.
@@ -24791,112 +24062,43 @@ fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
 /// 2026-08-26 chain-flush cut this walked the whole chain leaf-to-root, so a
 /// two-deep page path paid three barriers per call and about twelve per
 /// foreground save.
-fn sync_projection_chain_with_class(
-    chain: &[Dir],
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-) -> io::Result<()> {
+fn sync_projection_chain(chain: &[Dir]) -> io::Result<()> {
     let depth = chain.len();
     let Some(leaf) = chain.last() else {
         return Ok(());
     };
-    sync_projection_directory_with_class(leaf, class, depth.saturating_sub(1), depth)
+    sync_projection_directory(leaf, depth.saturating_sub(1), depth)
 }
 
 /// Create one missing component of a projection parent chain and make the new
 /// directory's NAME durable in the parent that now holds it.
 ///
 /// This is the *only* place a freshly created projection ancestor gets its
-/// barrier, and it is what lets [`sync_projection_chain_with_class`] flush the
+/// barrier, and it is what lets [`sync_projection_chain`] flush the
 /// leaf alone: after this returns, the created entry is on stable storage, so a
 /// crash between here and the operation's own barrier cannot lose the path the
 /// operation is about to publish into.
 /// `projection_producer_census::g_b_choke_helper_caller_counts_are_pinned`
 /// pins this function's callers; do not create a chain component anywhere else.
-fn create_projection_chain_component(
-    parent: &Dir,
-    component: &str,
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-) -> io::Result<()> {
+fn create_projection_chain_component(parent: &Dir, component: &str) -> io::Result<()> {
     parent.create_dir(component)?;
-    sync_projection_directory_with_class(parent, class, 0, 1)
+    sync_projection_directory(parent, 0, 1)
 }
 
 /// The single place the projection leg calls the platform directory-flush
 /// primitive. It names the operation and the chain position on failure — a bare
-/// platform errno on a device receipt is not actionable — and then applies the
-/// per-artifact-class platform policy.
-fn sync_projection_directory_with_class(
-    dir: &Dir,
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-    index: usize,
-    depth: usize,
-) -> io::Result<()> {
-    let name = |error: io::Error| {
+/// platform errno on a device receipt is not actionable — and is strict on every
+/// platform (`docs/storage-sync-contract.md` §2.10a).
+fn sync_projection_directory(dir: &Dir, index: usize, depth: usize) -> io::Result<()> {
+    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
+    tine_storage::sync_dir_required(dir).map_err(|error| {
         projection_platform_error(
             "fsync of the projection parent directory",
-            &format!("chain depth {}/{depth} ({class:?})", index + 1),
+            &format!("chain depth {}/{depth}", index + 1),
             error,
         )
-    };
-    #[cfg(test)]
-    if let Some(injected) = armed_projection_directory_barrier(class, dir)? {
-        let result = Err(name(io::Error::from_raw_os_error(injected.errno)));
-        return if injected.android {
-            crate::filesystem_durability::android_durability_barrier(class, result)
-        } else {
-            crate::filesystem_durability::finish_durability_barrier(class, result)
-        };
-    }
-    crate::durability_counters::note(crate::durability_counters::Barrier::Directory);
-    let result = tine_storage::sync_dir_required(dir).map_err(name);
-    crate::filesystem_durability::finish_durability_barrier(class, result)
+    })
 }
-
-/// A substitute for the platform directory-flush primitive, armed for exactly
-/// one graph tree so a host test can reproduce a device that refuses the barrier
-/// on every attempt.
-///
-/// It is deliberately process-global rather than thread-local: the runtime
-/// executes a save on its actor thread, so a thread-local armed by a test would
-/// never be observed by the code under test. Scoping it to the fixture's own
-/// root directory identity keeps it from touching any other test's graph.
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) struct ArmedProjectionDirectoryBarrier {
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-    errno: i32,
-    android: bool,
-    root: ProjectionDirIdentity,
-}
-
-#[cfg(test)]
-static ARMED_PROJECTION_DIRECTORY_BARRIER: std::sync::Mutex<
-    Option<ArmedProjectionDirectoryBarrier>,
-> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn armed_projection_directory_barrier(
-    class: crate::filesystem_durability::DurabilityArtifactClass,
-    dir: &Dir,
-) -> io::Result<Option<ArmedProjectionDirectoryBarrier>> {
-    let armed = *ARMED_PROJECTION_DIRECTORY_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(armed) = armed.filter(|armed| armed.class == class) else {
-        return Ok(None);
-    };
-    Ok((projection_dir_identity(dir)? == armed.root).then_some(armed))
-}
-
-/// The platform's directory identity pair as [`projection_dir_identity`]
-/// reports it: `(device, inode)` on unix, `(volume, file id)` on Windows.
-/// Test harnesses that pin an armed injection to one graph store this, so the
-/// type must follow the platform rather than assume the unix shape.
-#[cfg(test)]
-#[cfg(unix)]
-pub(crate) type ProjectionDirIdentity = (u64, u64);
-#[cfg(windows)]
-pub(crate) type ProjectionDirIdentity = (u64, [u8; 16]);
 
 #[cfg(unix)]
 fn projection_dir_identity(dir: &Dir) -> io::Result<(u64, u64)> {
@@ -25380,7 +24582,7 @@ fn atomic_update_with_hooks(
             Some(current) => {
                 match atomic_replace_expected(path, current.as_bytes(), next.as_bytes())? {
                     AtomicReplaceOutcome::Published => return Ok(()),
-                    AtomicReplaceOutcome::ExternalChanged(_) => continue,
+                    AtomicReplaceOutcome::ExternalChanged => continue,
                 }
             }
         }

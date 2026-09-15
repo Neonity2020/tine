@@ -126,13 +126,6 @@ const PINNED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "crates/tine-core/src/query.rs",
-        "run_pred_bounded",
-        1,
-        "RET3: the pre-view block constructor's Direct Files entry, reached \
-         through `run_query_result`",
-    ),
-    (
-        "crates/tine-core/src/query.rs",
         "run_query_result",
         1,
         "RET3: the TEXT result entry (`run_query_result`), still used by \

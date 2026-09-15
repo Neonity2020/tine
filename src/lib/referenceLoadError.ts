@@ -3,11 +3,10 @@
  *
  * This used to be two copies of a two-line function that mapped every error
  * except `result-too-large:` to "backend" and threw the message away. When the
- * backend started refusing reference queries under Tine-managed storage, it
- * said so in plain words -- "This action is unavailable while Tine-managed
- * storage is active." -- and the UI replaced that with "the backend request
- * failed", which reads as transient. Diagnosing it took a source-level
- * investigation that the discarded string would have answered outright.
+ * backend refused reference queries it said why in plain words, and the UI
+ * replaced that with "the backend request failed", which reads as transient.
+ * Diagnosing it took a source-level investigation that the discarded string
+ * would have answered outright.
  *
  * So: classify for the message we render, and keep the detail for the user who
  * asks for it and for the console.

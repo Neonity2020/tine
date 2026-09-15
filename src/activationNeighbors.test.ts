@@ -190,14 +190,14 @@ describe("GH #254 increment 3 activation neighbours", () => {
     expect(save).not.toHaveBeenCalled();
   });
 
-  it("keeps managed revision-only save responses compatible", async () => {
+  it("keeps revision-only save responses compatible", async () => {
     vi.spyOn(backend(), "activateAbsentEditor").mockResolvedValue(null);
-    await loadRoutedPage(emptyPage("Managed", "page"));
-    markDirty("Managed");
-    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "managed-revision" });
+    await loadRoutedPage(emptyPage("Revision only", "page"));
+    markDirty("Revision only");
+    vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "revision-only" });
 
-    expect(await flushPage("Managed")).toBe(true);
-    expect(editorActivationFor("Managed")).toBeUndefined();
+    expect(await flushPage("Revision only")).toBe(true);
+    expect(editorActivationFor("Revision only")).toBeUndefined();
   });
 
   it("does not let a stale save success update its replacement instance", async () => {

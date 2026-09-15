@@ -1082,26 +1082,6 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-#[cfg(unix)]
-#[test]
-fn android_shared_storage_permission_refusal_is_only_a_flagged_rename_capability_answer() {
-    let permission = io::Error::from_raw_os_error(libc::EACCES);
-    assert!(reconstructible_flagged_rename_capability_refusal(
-        &permission,
-        true
-    ));
-    assert!(
-        !reconstructible_flagged_rename_capability_refusal(&permission, false),
-        "desktop EACCES remains a real permission failure"
-    );
-
-    let io_failure = io::Error::from_raw_os_error(libc::EIO);
-    assert!(
-        !reconstructible_flagged_rename_capability_refusal(&io_failure, true),
-        "Android may degrade only the shared-filesystem capability refusal"
-    );
-}
-
 fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) -> ConflictOverride {
     let bytes = fs::read_to_string(path).unwrap();
     let resource_identity =
@@ -10848,7 +10828,7 @@ fn projection_twin_check_covers_all_supported_extensions_and_preserves_files() {
         fs::write(&twin_path, &twin_bytes).unwrap();
 
         let target = graph.projection_page_target(&target_relative).unwrap();
-        let parent = graph.projection_parent(&target, false).unwrap();
+        let parent = graph.projection_parent(&target).unwrap();
         graph
             .ensure_projection_target_shape(&parent, &target)
             .unwrap();
@@ -11334,7 +11314,7 @@ fn conditional_publish_refuses_when_the_file_changed_underneath() {
     fs::write(&path, b"external").unwrap();
     let outcome = atomic_replace_expected(&path, b"expected", b"ours").unwrap();
     match outcome {
-        AtomicReplaceOutcome::ExternalChanged(found) => assert_eq!(found, b"external"),
+        AtomicReplaceOutcome::ExternalChanged => {}
         AtomicReplaceOutcome::Published => panic!("published over an external write"),
     }
     assert_eq!(fs::read(&path).unwrap(), b"external", "their bytes stand");
@@ -12640,8 +12620,8 @@ fn journal_conflicts_expose_a_routable_path_per_file() {
 #[cfg(unix)]
 #[test]
 fn root_replacement_after_admission_writes_retained_resource() {
-    let dir = scratch("handoff-admission-root-race");
-    let moved = dir.with_file_name("tine-handoff-admission-root-race-moved");
+    let dir = scratch("admission-root-race");
+    let moved = dir.with_file_name("tine-admission-root-race-moved");
     let _ = fs::remove_dir_all(&moved);
     let graph = Graph::open(&dir);
     MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
@@ -12669,8 +12649,8 @@ fn root_replacement_after_admission_writes_retained_resource() {
 #[cfg(unix)]
 #[test]
 fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() {
-    let dir = scratch("handoff-root-replacement-page-lock");
-    let moved = dir.with_file_name("tine-handoff-root-replacement-page-lock-moved");
+    let dir = scratch("root-replacement-page-lock");
+    let moved = dir.with_file_name("tine-root-replacement-page-lock-moved");
     let _ = fs::remove_dir_all(&moved);
     let graph = Arc::new(Graph::open(&dir));
     let target = dir.join("pages").join("page lock retained.md");

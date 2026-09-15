@@ -22,7 +22,6 @@ pub mod edn;
 mod filesystem_durability;
 
 pub mod durability_counters;
-pub mod graph_name_folding;
 pub mod graph_text_path;
 pub mod graph_text_scope;
 pub mod html_sanitize;

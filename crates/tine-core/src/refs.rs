@@ -569,6 +569,29 @@ fn rewrite_bare_tags(valpart: &str, renames: &std::collections::HashMap<String, 
 mod tests {
     use super::*;
 
+    /// Tine's page-name key folds case and NFC/NFD, so a case- or
+    /// normalization-folding filesystem can never merge two pages Tine holds
+    /// apart: its equivalence classes are a subset of Tine's. The storage
+    /// contract's §2.10d rests on this fact.
+    #[test]
+    fn filesystem_folding_never_separates_names_tine_already_treats_as_one() {
+        for (left, right) in [
+            (
+                "K\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}",
+                "k\u{16f}\u{148} b\u{11b}\u{17e}\u{ed}",
+            ),
+            ("\u{17d} pilot notes", "Z\u{30c} pilot notes"),
+            ("Foo", "foo"),
+        ] {
+            assert_eq!(
+                page_key(left),
+                page_key(right),
+                "a filesystem fold must never split a pair Tine treats as one page: \
+                 {left} / {right}"
+            );
+        }
+    }
+
     #[test]
     fn read_bracket_link_balances_parens() {
         // url with parens (block ref) captured whole, not stopped at first `)`

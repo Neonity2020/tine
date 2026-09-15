@@ -18,7 +18,6 @@ pub(crate) enum CommandError {
         detail: String,
     },
     Io {
-        kind: std::io::ErrorKind,
         message: String,
     },
     Worker {
@@ -187,10 +186,6 @@ impl CommandError {
         }
     }
 
-    pub(crate) fn contains(&self, needle: &str) -> bool {
-        self.wire().contains(needle)
-    }
-
     fn wire(&self) -> String {
         match self {
             Self::Tagged {
@@ -297,7 +292,6 @@ impl From<std::io::Error> for CommandError {
             return Self::json(error);
         }
         Self::Io {
-            kind: error.kind(),
             message: error.to_string(),
         }
     }

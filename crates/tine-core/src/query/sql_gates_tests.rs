@@ -2893,7 +2893,6 @@ fn dump_the_lowered_statements_as_a_measurement_baseline() {
 
 /// One arm's samples for one shape.
 struct Arm {
-    label: &'static str,
     sql: String,
     samples: Vec<u128>,
     identities: BTreeSet<String>,
@@ -2963,21 +2962,18 @@ fn the_baseline_and_current_statements_are_measured_against_each_other() {
         let params = statement.params.clone();
         let mut arms = [
             Arm {
-                label: "before",
                 sql: before_sql.clone(),
                 samples: Vec::new(),
                 identities: BTreeSet::new(),
                 columns: 0,
             },
             Arm {
-                label: "after",
                 sql: statement.sql.clone(),
                 samples: Vec::new(),
                 identities: BTreeSet::new(),
                 columns: 0,
             },
             Arm {
-                label: "control",
                 sql: before_sql.clone(),
                 samples: Vec::new(),
                 identities: BTreeSet::new(),

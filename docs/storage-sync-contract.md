@@ -567,33 +567,33 @@ it does when a filesystem cannot provide a primitive. The ordinary page save
 keeps its audited shape: temp + fsync + exact durable name publication +
 base-revision guard + lock (§1.3 describes the name transition).
 
-### 2.10a Durability barriers by artifact class
+### 2.10a Durability barriers are strict on every platform
 
-Platform durability policy is stated **per artifact class**, never globally.
-`crate::filesystem_durability::DurabilityArtifactClass` names two classes:
+Every durability barrier on the graph tree is strict on **every** platform,
+Android included. Page text, conflict copies, trash, withdrawn bytes and assets
+have no second copy to rebuild them from, so a barrier the filesystem refuses
+is a real durability failure and fails the write
+(`model::sync_projection_directory`).
 
-| Class | Policy |
-| --- | --- |
-| `PrivateDurableAuthority` | Strict on **every** platform, Android included. A barrier the filesystem refuses is a real durability failure. Graph-tree bytes the graph is the **sole** authority for take this class: page text, conflict copies, trash, withdrawn bytes, assets. |
-| `SharedReconstructibleProjection` | Strict everywhere except Android. On Android only, and only for `PermissionDenied`/`Unsupported`/`InvalidInput` (`EPERM`/`ENOTSUP`/`EINVAL`), the barrier **degrades**. Every other errno stays fatal. |
-
-The degrading class exists for bytes a second copy can rebuild. Retrying a
-capability refusal can never succeed, so for such bytes retrying forever is not
-crash-safety but an availability bug that strands the user's edit; Android CI
-run 32088229039 recorded exactly that (`detail:Invalid argument (os error 22)`,
-64 turns). Direct Files graph text has no second copy, so its name transitions
-and their directory barriers take the strict class
-(`move_graph_text_exact_no_replace`).
+The one tolerance left is the Direct move-recovery journal's directory barrier,
+`filesystem_durability::sync_move_recovery_directory`. On Android only, and
+only for `PermissionDenied`/`Unsupported`/`InvalidInput`
+(`EPERM`/`ENOTSUP`/`EINVAL`), that barrier accepts the refusal; every other
+errno stays fatal, and every other platform stays strict. Android CI run
+32088229039 recorded shared storage refusing the directory flush with
+`detail:Invalid argument (os error 22)`. Managed Storage additionally had a
+degradable artifact class for its reconstructible Markdown projection; it was
+removed with that mode (ADR 0066).
 
 Because the device is the only oracle for these semantics, every platform
 primitive on the graph-tree publication leg — the directory flush, `renameat2`
 with `RENAME_NOREPLACE`, file `fsync`, and the no-follow `openat` of a parent or
 file — names its operation and its location in the error it returns.
 `ErrorKind` is preserved, because guarded-conflict classification and the
-durability policy both match on it.
+journal's Android tolerance both match on it.
 
-The class split is enforced at the primitive by
-`filesystem_durability::tests::only_the_reconstructible_projection_class_degrades_and_only_on_android`.
+The journal tolerance is enforced by
+`filesystem_durability::tests::android_tolerates_only_the_three_capability_refusals`.
 
 ### 2.10a-i Durability barriers and the batch commit point
 
@@ -619,7 +619,7 @@ removed-checks table), and
 fails if one returns.
 
 **A publication flushes the leaf directory of its parent chain, and nothing
-above it.** `sync_projection_chain_with_class` flushes `chain.last()` only. The
+above it.** `sync_projection_chain` flushes `chain.last()` only. The
 leaf-only argument has two halves and they are exhaustive:
 
 * An ancestor **Tine created during this operation** is made durable when it is
@@ -668,27 +668,16 @@ about the running device; the receipt wins.** The same `EINVAL` is reachable off
 Android on any filesystem without `rename2` flags (FAT/exFAT removable media,
 some FUSE and network mounts).
 
-`model::rename_projection_noreplace_with_class` keys its answer on the same
-`DurabilityArtifactClass`:
-
-| Class | Policy for the flagged rename |
-| --- | --- |
-| `PrivateDurableAuthority` | The platform primitive and nothing else, on every platform. There is no second copy to rebuild these bytes from, so a non-atomic publication could leave a reserved-but-empty file at a live graph name after a crash. A filesystem that cannot provide the primitive fails the write. |
-| `SharedReconstructibleProjection` | `EINVAL`, `ENOSYS` and `EOPNOTSUPP`/`ENOTSUP` from the flagged rename — and **only** those three, matched on the raw `errno`, not on `ErrorKind` — are read as "this filesystem does not implement that flag" and retried through `reserve_and_rename`: reserve the destination with an exclusive create (`O_CREAT|O_EXCL`), then rename onto the reservation. Every other errno (`EIO`, `ENOSPC`, `EACCES`, `EXDEV`, `EEXIST`, `ENOENT`) describes the operation rather than the flag and stays fatal. |
-
-Direct Files graph text is sole-authority data, so its name transitions take the
-strict row through `model::rename_projection_noreplace`: on a filesystem
-without the flag, a Direct Files create or save fails rather than publishing
-non-atomically. The reservation fallback keeps the one guarantee
-`RENAME_NOREPLACE` exists for — an occupied destination fails the reservation
-as `AlreadyExists` before anything moves — but gives up atomicity, which is why
-it is confined to bytes that have a second copy.
-
-The flag answer is a property of the mounted filesystem, so it is remembered per
-`st_dev` (`model::FLAGGED_RENAME_UNSUPPORTED_DEVICES`) after the first
-capability refusal instead of costing a failed syscall on every publication. The
-memo is never load-bearing: an unknown device simply attempts the flagged rename
-and learns from it.
+Every graph-tree name transition therefore takes the platform primitive and
+nothing else, on every platform, through `model::rename_projection_noreplace`.
+Graph text is sole-authority data: a two-step publication (reserve the
+destination with an exclusive create, then rename onto the reservation) could
+leave a reserved-but-empty file at a live graph name after a crash, with no
+second copy to rebuild it from. On a filesystem without the flag, a Direct
+Files create or save fails rather than publishing non-atomically, and the error
+names the refused call. Managed Storage's reconstructible projection used that
+reservation fallback, with a per-device memo of the answer; both were removed
+with it (ADR 0066).
 
 ### 2.10d When the graph filesystem folds two page names into one file
 
@@ -708,10 +697,9 @@ confined to Android: FAT/exFAT removable media, NTFS, APFS in its default
 configuration and any `ext4` directory carrying the casefold attribute fold
 case, and HFS+ additionally folds Unicode normalization.
 
-**Which folding, measured rather than assumed.** Three axes are probed
-independently — ASCII case, non-ASCII (Unicode) case, and NFC against NFD —
-because they are separable platform facts and a graph that is legal under one is
-illegal under another. On the API-35 emulator the answer was **case folds,
+**Which folding.** Three axes are separable platform facts — ASCII case,
+non-ASCII (Unicode) case, and NFC against NFD — and a graph that is legal under
+one is illegal under another. On the API-35 emulator the answer was **case folds,
 normalization does not**: the fixture verifies its shapes in list order, and the
 run above reported the case pair while the normalization pair
 (`pages/\u{17d} pilot notes #pilot.md` against
@@ -722,8 +710,8 @@ AOSP disagrees with that. Android shared storage folds case through
 is defined over the NFDICF form, and NFC and NFD share that form — so on the
 source, normalization should fold too. §2.10b already settled how that
 disagreement is resolved: **upstream source is evidence about upstream intent,
-not proof about the running device; the receipt wins.** The probe therefore
-reports what the filesystem in front of it does.
+not proof about the running device; the receipt wins.** The contract below
+therefore holds whichever of the three axes a device folds.
 
 **Why this is not, by itself, a merge of two pages.** Tine's logical page name
 is already case- and normalization-insensitive: `LogicalPageName::key_digest`
@@ -733,7 +721,7 @@ filesystem cannot tell apart is therefore a pair Tine **already treats as one
 page**. Such a filesystem cannot merge two distinct Tine pages, because two
 names it folds were never two pages here. This is the load-bearing fact behind
 everything below, and it is bound to the code by
-`graph_name_folding::tests::filesystem_folding_never_separates_names_tine_already_treats_as_one`.
+`refs::tests::filesystem_folding_never_separates_names_tine_already_treats_as_one`.
 
 What folding does change is that a duplicate file — a second spelling of a name
 the graph already holds — cannot exist there at all. Whoever wrote the second
@@ -749,16 +737,11 @@ instead of landing beside it.
 | Writes | Tine writes a graph path only when it either learned that exact path from the filesystem's own directory entry or creates it through the no-clobber publication (§2.10b), so Tine can never be the writer that destroys a folded twin: an occupied fold resolves to `AlreadyExists` before anything has moved. |
 | Reporting | A fold performed by ANOTHER writer before Tine ever saw the graph is not detectable and is not reported: Tine has no evidence two files ever existed. |
 
-**The probe** (`graph_name_folding::graph_name_folding`). A write/read-back pair
-per axis inside one hidden, uniquely named directory under the graph root, which
-is removed before returning. Deliberately a write probe rather than an
-inspection of the mount table, for the reason §2.10b gives. The answer is a
-property of the mounted filesystem, so it is remembered per `st_dev` — the same
-key and the same reasoning as `model::FLAGGED_RENAME_UNSUPPORTED_DEVICES` — and
-it is **never load-bearing**: a probe that cannot run answers
-`GraphNameFolding::UNKNOWN`, which is byte-identical to "folds nothing", so no
-behavior depends on it having succeeded. It writes and removes files under the
-graph root, and the memo means a device pays for it once.
+**No probe.** Tine does not detect which axes a graph filesystem folds, because
+no behavior depends on the answer: the contract above holds on every
+filesystem. (A write/read-back probe existed for the Android shared-storage
+journey and was removed with Managed Storage, ADR 0066, having no production
+caller.)
 
 **What is deliberately NOT promised.** Tine does not reconstruct a side of a
 folded pair that another writer already destroyed, and does not claim a merge it
@@ -766,10 +749,8 @@ has no evidence of. On such a device the user's graph can hold only one of the
 two spellings; keeping both requires a name that differs by more than
 capitalisation or accent spelling.
 
-Enforced by `graph_name_folding::tests` (nine cases: the three axes are
-independent, every path component folds, the probe leaves no residue, an
-unprobeable root degrades to non-folding, a forced answer is scoped to one graph
-root, and the equivalence-class fact above).
+Enforced by the equivalence-class test above and by the no-clobber publication
+tests of §2.10b.
 
 ### 2.10f The interrupted-publication recovery walk
 
@@ -878,7 +859,7 @@ hardening; it is unpaid latency, and later a source of availability bugs.
 | `fsync` before reading a projection evidence file | `model::sync_and_read_projection_regular` | — | A read through the same process's page cache returns the bytes the writer wrote whether or not they are on the platter. Flushing cannot change the result and cannot detect corruption. | Plain bounded read (`read_projection_regular`) |
 | `fsync` before opening-and-reading a projection file | `model::sync_open_and_read_projection_regular` | — | As above. On Windows it additionally forced a write-capable open for a read. | `open_and_read_projection_regular` |
 | `fsync` before re-reading a retained quarantine handle | `model::sync_and_reread_retained_projection_file` | — | As above; the handle is the one this process just wrote through. | `reread_retained_projection_file` |
-| `fsync` of every **ancestor** of a projection target's parent chain | `model::sync_projection_chain_with_class` (leaf-to-root loop), reached from ~30 write/rename/preflight call sites | — | The operation changes entry lists in the chain leaf only. An ancestor Tine created in this operation is already flushed by `create_projection_chain_component` at creation; an ancestor it did not create already has a durable entry in its own parent, and no in-scope scenario (crash/power loss, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, honest multi-device divergence, malformed import) can un-durable an entry already on stable storage. See §2.10a-i for the one out-of-ownership case it did cover. | One barrier on the chain leaf, plus the existing per-creation barrier |
+| `fsync` of every **ancestor** of a projection target's parent chain | `model::sync_projection_chain` (then a leaf-to-root loop), reached from ~30 write/rename/preflight call sites | — | The operation changes entry lists in the chain leaf only. An ancestor Tine created in this operation is already flushed by `create_projection_chain_component` at creation; an ancestor it did not create already has a durable entry in its own parent, and no in-scope scenario (crash/power loss, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, honest multi-device divergence, malformed import) can un-durable an entry already on stable storage. See §2.10a-i for the one out-of-ownership case it did cover. | One barrier on the chain leaf, plus the existing per-creation barrier |
 
 The removed barriers are replaced by nothing because nothing needed them;
 integrity of graph bytes is still checked by the means that actually detect

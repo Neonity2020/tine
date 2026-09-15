@@ -10,8 +10,8 @@ import { describe, expect, it } from "vitest";
 // that epoch on the conflict error and is therefore the only place that may
 // raise a banner.
 //
-// Three other places used to raise one directly — both watcher arms and the
-// sparse-v2 reconciliation — and every banner they raised was unresolvable:
+// Three other places used to raise one directly — both watcher arms and a
+// since-removed reconciliation arm — and every banner they raised was unresolvable:
 // "Keep mine" presented null, `save_page` refused it, the retry is forbidden
 // while the page is conflicted, and the only live action left discarded the
 // user's work. They now route through `reconcileExternalChange`. This test is

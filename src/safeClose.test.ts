@@ -242,7 +242,7 @@ describe("GH #161 shared safe-close transaction", () => {
     const nativePrepareFailed = vi.fn((failure: AndroidNativePrepareFailure) => {
       toasts.push(
         failure.status === "refused" || failure.status === "partial"
-          ? "Tine-managed storage could not verify a clean stop. The app remains open so you can retry or inspect recovery status."
+          ? "Couldn't verify a clean stop. The app remains open so you can retry."
           : "Couldn't close the app. Your graph remains open.",
       );
     });
@@ -250,7 +250,7 @@ describe("GH #161 shared safe-close transaction", () => {
 
     await expect(rootClose.request()).resolves.toBe("native_prepare_refused");
     expect(nativePrepareFailed).toHaveBeenCalledExactlyOnceWith(refusal);
-    expect(toasts).toEqual(["Tine-managed storage could not verify a clean stop. The app remains open so you can retry or inspect recovery status."]);
+    expect(toasts).toEqual(["Couldn't verify a clean stop. The app remains open so you can retry."]);
     expect(safeClose.inFlight()).toBe(false);
     expect(rootClose.phase()).toBe(AndroidRootClosePhase.Idle);
     expect(exit).not.toHaveBeenCalled();
@@ -261,7 +261,7 @@ describe("GH #161 shared safe-close transaction", () => {
     expect(transitions).toEqual([true, false, true]);
   });
 
-  it("keeps a partial managed shutdown shielded and retries only native preparation", async () => {
+  it("keeps a partial native shutdown shielded and retries only native preparation", async () => {
     const { deps, safeClose, transitions } = harness();
     const partial = { status: "partial" as const, safe_slots: ["A"], detail: "B refused" };
     const prepareNativeClose = vi.fn()

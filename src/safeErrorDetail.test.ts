@@ -36,19 +36,19 @@ describe("safe error detail", () => {
 
   it("redacts nested relative source paths inside a structured activation reason", () => {
     expect(safeErrorDetail(
-      "shadow import failed: notes/private area/plan.org: parser rejected source",
-    )).toBe("shadow import failed: [path]: parser rejected source");
+      "page import failed: notes/private area/plan.org: parser rejected source",
+    )).toBe("page import failed: [path]: parser rejected source");
   });
 
-  // Martin's phone, Aug 18: a join failure whose detail named a graph-relative
-  // provider path was discarded whole and shown as "The command failed without
-  // a safe diagnostic detail" — the redactor recognized absolute paths only,
-  // so the surviving "/" tripped the structural reject at the end.
-  it("redacts a graph-relative provider path instead of discarding the message", () => {
+  // Martin's phone, Aug 18: a failure whose detail named a graph-relative path
+  // was discarded whole and shown as "The command failed without a safe
+  // diagnostic detail" — the redactor recognized absolute paths only, so the
+  // surviving "/" tripped the structural reject at the end.
+  it("redacts a graph-relative path instead of discarding the message", () => {
     expect(safeErrorDetail(
-      "managed sync join failed at provider discovery: .tine-sync/v2/shared/outbox: Invalid argument (os error 22)",
+      "graph open failed at directory scan: .recycle/pages/outbox: Invalid argument (os error 22)",
     )).toBe(
-      "managed sync join failed at provider discovery: [path]: Invalid argument (os error 22)",
+      "graph open failed at directory scan: [path]: Invalid argument (os error 22)",
     );
   });
 
@@ -57,9 +57,9 @@ describe("safe error detail", () => {
   // bare snake_case identifier cannot carry graph text.
   it("keeps an attributed refusal site, which is authored, not user data", () => {
     expect(safeErrorDetail(
-      'managed sync join failed at provider scan: ActorRefusedAt("require_pending_publication_absent")',
+      'graph open failed at projection scan: RefusedAt("require_projection_parent_present")',
     )).toBe(
-      'managed sync join failed at provider scan: ActorRefusedAt("require_pending_publication_absent")',
+      'graph open failed at projection scan: RefusedAt("require_projection_parent_present")',
     );
   });
 
@@ -71,27 +71,27 @@ describe("safe error detail", () => {
     );
   });
 
-  // Martin's phone, Aug 19: a join refusal was ONCE MORE reduced to "The
-  // command failed without a safe diagnostic detail". The structural check was
+  // Martin's phone, Aug 19: a refusal was ONCE MORE reduced to "The command
+  // failed without a safe diagnostic detail". The structural check was
   // all-or-nothing, so any residue it could not vouch for cost the whole
   // sentence — and the stage name in front of that residue is the entire
   // diagnostic value. Redact the token, keep the sentence.
   it("keeps the failing stage when a debug-formatted value trails it", () => {
     expect(safeErrorDetail(
-      'managed sync join failed at provider discovery: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }',
-    )).toBe("managed sync join failed at provider discovery: Os [details]");
+      'graph open failed at directory scan: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }',
+    )).toBe("graph open failed at directory scan: Os [details]");
   });
 
   it("keeps the failing stage when an unvouched token trails it", () => {
     expect(safeErrorDetail(
-      "managed sync join failed at runtime reopen: expected <SharedDescriptor>, found nothing",
-    )).toBe("managed sync join failed at runtime reopen: expected [details], found nothing");
+      "graph open failed at projection reopen: expected <ProjectionDescriptor>, found nothing",
+    )).toBe("graph open failed at projection reopen: expected [details], found nothing");
   });
 
   it("redacts one opaque token rather than the sentence carrying it", () => {
     expect(safeErrorDetail(
-      `managed sync join failed at provider scan: unreadable marker ${"a".repeat(120)}`,
-    )).toBe("managed sync join failed at provider scan: unreadable marker [redacted]");
+      `graph open failed at projection scan: unreadable marker ${"a".repeat(120)}`,
+    )).toBe("graph open failed at projection scan: unreadable marker [redacted]");
   });
 
   // A page path is the one path whose last segment routinely contains spaces,

@@ -182,7 +182,7 @@ describe("watcher page inventory invalidation", () => {
 // These cover both directions: a false conflict must not appear, and a REAL external
 // change must still surface one.
 describe("conflict requires per-page divergence, not just a notification", () => {
-  const name = "Managed Racing Edit";
+  const name = "Racing Edit";
 
   function liveDirtyPage(rev: string | null) {
     resetPaneLayoutToSingle({

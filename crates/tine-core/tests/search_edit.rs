@@ -1054,7 +1054,7 @@ fn a_block_created_in_the_editor_keeps_queries_answering() {
     g.save_page(&page, page.rev.as_deref()).unwrap();
 
     let started = Instant::now();
-    let mut last = String::from("no attempt yet");
+    let mut last;
     loop {
         match g.run_query("(task TODO)") {
             Ok(groups) => {

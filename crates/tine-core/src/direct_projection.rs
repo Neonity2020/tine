@@ -17,8 +17,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
     PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
-    PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalProperty,
-    PhysicalQueryValue, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
+    PhysicalProjectionQuerySnapshot, PhysicalProperty, PhysicalQueryValue,
+    PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -148,7 +148,6 @@ struct PendingFull {
 /// `direct_source_revisions`; an unchanged graph publishes readiness from this
 /// alone, a changed one names the pages the warm thread must parse.
 struct PendingWarm {
-    generation: u64,
     sources: Vec<(PageEntry, String)>,
     parse_config: Arc<ParseConfig>,
 }
@@ -182,6 +181,7 @@ pub(crate) enum WarmStreamItem {
 
 enum QueryCaptureRequirement {
     CurrentSnapshot,
+    #[cfg(test)]
     StrictGeneration(u64),
 }
 
@@ -316,20 +316,6 @@ struct ProjectionShared {
     commit_notification: AtomicU64,
     commit_waker: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
-    /// The D-15 statement seam, opened lazily beside the typed reader above.
-    ///
-    /// Named `statement_seam` rather than `…_reader` on purpose: the field above
-    /// holds the WRITE-CAPABLE `PhysicalGraphProjectionDatabase` under the name
-    /// `reader`, and the tine-storage boundary census attributes a method call
-    /// to the receiver NAME by substring. A `query_reader` here would file every
-    /// read-only statement under the writable handle in that inventory, which is
-    /// exactly the distinction D-15 rests on.
-    ///
-    /// It is a SECOND read-only connection because that is what the seam is: a
-    /// separate, read-only handle over the disposable projection, with no way to
-    /// reach a writable one (D-15's enforcement is the handle, not a validator).
-    /// It answers §5.9's dispatched query and nothing else.
-    statement_seam: Mutex<Option<PhysicalProjectionQueryReader>>,
     /// R3: the ONE admission/cancellation owner for database-owned query jobs
     /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
     /// drains every job before it replaces or resets the file, and `Drop`
@@ -347,14 +333,6 @@ struct ProjectionShared {
     /// live lookup during output.
     session_pages: Mutex<Arc<HashSet<[u8; 16]>>>,
     committed_registry: SharedCommittedRegistry,
-    /// The generation at which §5.10's FTS-building signal was last observed
-    /// READY. Readiness is monotonic within one projection file — the index
-    /// owner finishes the build and never un-finishes it, and a rebuild
-    /// publishes a new generation — so a `true` may be remembered and a `false`
-    /// never is. That keeps the signal one probe per generation instead of one
-    /// per query (I-15) without ever stranding a query on a stale `false`.
-    fts_ready_at: AtomicU64,
-    fts_ever_ready: AtomicBool,
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
@@ -473,6 +451,7 @@ fn query_capture_available(
                 && shared.validated.load(Ordering::Acquire)
                 && !shared.worker_failed.load(Ordering::Acquire)
         }
+        #[cfg(test)]
         QueryCaptureRequirement::StrictGeneration(generation) => shared.ready_at(*generation),
     }
 }
@@ -550,6 +529,7 @@ fn capture_query_job(
         snapshot,
         session_pages,
         config,
+        #[cfg(test)]
         query_revision,
         registry,
         registry_owner: Arc::clone(&shared.committed_registry),
@@ -571,6 +551,7 @@ pub(crate) struct DirectQueryJob {
     pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
     pub(crate) config: Arc<ParseConfig>,
     /// Actual acquired SQL image, distinct from the admission target.
+    #[cfg(test)]
     pub(crate) query_revision: u64,
     registry: Option<RegistryCapture>,
     registry_owner: SharedCommittedRegistry,
@@ -750,14 +731,6 @@ pub(crate) struct ReferenceCandidateIndex {
     pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
 }
 
-/// What one attempt to answer through the D-15 statement seam produced
-/// (SPEC §5.9). See [`DirectProjection::run_statement`].
-pub(crate) enum StatementRead {
-    Rows(Vec<Vec<PhysicalQueryValue>>),
-    NotReady,
-    Failed,
-}
-
 /// Direct Files' disposable parser-fact projection.
 ///
 /// The foreground only publishes already-parsed `Arc<Document>` snapshots into
@@ -787,12 +760,9 @@ impl DirectProjection {
             commit_notification: AtomicU64::new(0),
             commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
-            statement_seam: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             committed_registry: Arc::new(Mutex::new(None)),
-            fts_ready_at: AtomicU64::new(0),
-            fts_ever_ready: AtomicBool::new(false),
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
@@ -895,7 +865,6 @@ impl DirectProjection {
         pending.warm_outcome = None;
         pending.warm_superseded = false;
         pending.warm = Some(PendingWarm {
-            generation,
             sources,
             parse_config,
         });
@@ -1345,6 +1314,7 @@ impl DirectProjection {
     /// The statement's compiled-regex program is installed by
     /// `query::results::read_results` on the job's own connection — the ONE
     /// install site — so a job carries no regex state of its own.
+    #[cfg(test)]
     pub(crate) fn open_query_job_for(
         &self,
         cache_generation: u64,
@@ -1423,6 +1393,7 @@ impl DirectProjection {
                         && self.shared.validated.load(Ordering::Acquire)
                         && !self.shared.worker_failed.load(Ordering::Acquire)
                 }
+                #[cfg(test)]
                 QueryCaptureRequirement::StrictGeneration(generation) => self.ready_at(*generation),
             };
             if !available {
@@ -1453,86 +1424,6 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn active_query_jobs_test(&self) -> usize {
         self.shared.query_jobs.active()
-    }
-
-    /// One read through the D-15 seam. [`DirectProjection::run_statement`] is
-    /// this plus §5.9's dispatched-statement census and §4.3.2's regex
-    /// registration; [`DirectProjection::fts_ready`] is this without either,
-    /// because a readiness probe is not an answer and binds no pattern.
-    ///
-    /// R3: dispatched statements no longer run here — they run on a job's own
-    /// owned snapshot (`open_query_job`), which is also where the statement's
-    /// compiled-regex program is installed. The pooled seam serves the
-    /// readiness probe and the reference readers only.
-    fn seam_read(
-        &self,
-        cache_generation: u64,
-        sql: &str,
-        parameters: &[PhysicalQueryValue],
-    ) -> StatementRead {
-        if !self.ready_at(cache_generation) {
-            return StatementRead::NotReady;
-        }
-        // Named `seam`, not `reader`, for the reason the field is (see
-        // `ProjectionShared::statement_seam`).
-        let mut seam = self.shared.statement_seam.lock().unwrap();
-        if seam.is_none() {
-            *seam = PhysicalProjectionQueryReader::open(&self.shared.path).ok();
-        }
-        let Some(seam) = seam.as_ref() else {
-            return StatementRead::Failed;
-        };
-        let Ok(rows) = seam.run_projection_query(sql, parameters) else {
-            return StatementRead::Failed;
-        };
-        // A snapshot that straddles a rebuild is not a snapshot — the same
-        // re-check every other reader here makes. The generation moving is not a
-        // projection defect, so it is `NotReady` and not `Failed`.
-        if !self.ready_at(cache_generation) {
-            return StatementRead::NotReady;
-        }
-        #[cfg(test)]
-        self.shared.indexed_reads.fetch_add(1, Ordering::Relaxed);
-        StatementRead::Rows(rows)
-    }
-
-    /// The EXISTING FTS-building signal (§5.10), read on the SAME materialized
-    /// read and generation as the query it accelerates and SEPARATELY from
-    /// projection readiness. `false` means the transient building phase, where
-    /// the compiler omits candidate bounds and evaluates the same exact
-    /// predicates on the ready block columns.
-    ///
-    /// A read that cannot answer reports `false`, which costs a bound and never
-    /// an answer.
-    pub(crate) fn fts_ready(&self, cache_generation: u64) -> bool {
-        if self.shared.fts_ever_ready.load(Ordering::Acquire)
-            && self.shared.fts_ready_at.load(Ordering::Acquire) == cache_generation
-        {
-            return true;
-        }
-        let ready = self.probe_fts_ready(cache_generation);
-        if ready {
-            self.shared
-                .fts_ready_at
-                .store(cache_generation, Ordering::Release);
-            self.shared.fts_ever_ready.store(true, Ordering::Release);
-        }
-        ready
-    }
-
-    fn probe_fts_ready(&self, cache_generation: u64) -> bool {
-        matches!(
-            self.seam_read(
-                cache_generation,
-                crate::query::results::FTS_READY_PROBE_SQL,
-                &[],
-            ),
-            StatementRead::Rows(rows)
-                if matches!(
-                    rows.first().and_then(|row| row.first()),
-                    Some(PhysicalQueryValue::Integer(1))
-                )
-        )
     }
 
     pub(crate) fn note_fallback_read(&self) {
@@ -2004,6 +1895,7 @@ impl DirectProjection {
 
     /// Retain a resource until the writer has released its connection and lease.
     /// The publication root also has a foreground owner until its graph drops.
+    #[cfg(test)]
     pub(crate) fn retain_worker_resource(&self, resource: Arc<dyn Send + Sync>) {
         if let Some(resources) = self.shared.worker_resources.lock().unwrap().as_mut() {
             resources.push(resource);
@@ -2325,10 +2217,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     // Drop every connection before the disposable file can be
                     // replaced; a reader must not retain an old file handle.
                     let mut reader = shared.reader.lock().unwrap();
-                    let mut seam = shared.statement_seam.lock().unwrap();
                     reader.take();
-                    seam.take();
-                    shared.fts_ever_ready.store(false, Ordering::Release);
                     writer_slot.take();
                     let mut database = open_projection_database(&shared.path)
                         .map_err(|error| error.to_string())?;
@@ -7730,12 +7619,9 @@ mod tests {
             commit_notification: AtomicU64::new(0),
             commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
-            statement_seam: Mutex::new(None),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
             session_pages: Mutex::new(Arc::new(HashSet::new())),
             committed_registry: Arc::new(Mutex::new(None)),
-            fts_ready_at: AtomicU64::new(0),
-            fts_ever_ready: AtomicBool::new(false),
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),

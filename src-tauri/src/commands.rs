@@ -3866,7 +3866,7 @@ mod query_command_surface_tests {
 
     use super::*;
     use tine_core::query::ir::{
-        AggFn, DisplayDraft, Field, FriendlyPageMatchScope, Query, SortDir, ViewKind, ViewSettings,
+        AggFn, DisplayDraft, Field, FriendlyPageMatchScope, SortDir, ViewKind,
     };
 
     fn graph_free_registry() -> tine_core::query::registry::Registry {

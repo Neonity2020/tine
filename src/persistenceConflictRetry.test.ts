@@ -17,10 +17,9 @@ const calls: {
   name: string;
   force: boolean;
   conflictEpoch: number | null;
-  managedConflictObservation: { path: string; revision: string } | null;
 }[] = [];
 let nextResult: (() => Promise<{ revision: string }>) | null = null;
-let observedManagedPage: { rev: string; path: string } | null = null;
+let observedPage: { rev: string; path: string } | null = null;
 let draftPath = "pages/Notes.md";
 
 vi.mock("./store", () => ({
@@ -46,11 +45,6 @@ vi.mock("./store", () => ({
 }));
 
 vi.mock("./backend", () => ({
-  ManagedActorRefusalError: class ManagedActorRefusalError extends Error {
-    constructor(readonly reasonCode: string) {
-      super("managed actor refusal");
-    }
-  },
   isSaveConflictError: (error: unknown) =>
     typeof error === "object" && error !== null && "kind" in error && error.kind === "save-conflict",
   backend: () => ({
@@ -59,15 +53,14 @@ vi.mock("./backend", () => ({
       _baseRev: string | null,
       force: boolean,
       conflictEpoch: number | null,
-      managedConflictObservation: { path: string; revision: string } | null,
     ) => {
-      calls.push({ name: page.name, force, conflictEpoch, managedConflictObservation });
+      calls.push({ name: page.name, force, conflictEpoch });
       const result = nextResult;
       nextResult = null;
       return result ? result() : Promise.resolve({ revision: "rev-after" });
     },
-    getPageByPath: () => Promise.resolve(observedManagedPage),
-    getPage: () => Promise.resolve(observedManagedPage),
+    getPageByPath: () => Promise.resolve(observedPage),
+    getPage: () => Promise.resolve(observedPage),
   }),
 }));
 
@@ -109,7 +102,7 @@ describe("a failure is classified by its code, not by the page's name", () => {
     toasts.length = 0;
     conflicted.clear();
     nextResult = null;
-    observedManagedPage = null;
+    observedPage = null;
     draftPath = "pages/Notes.md";
     resetSaveState();
   });
@@ -132,7 +125,7 @@ describe("a failure is classified by its code, not by the page's name", () => {
         kind: "direct-save-failure",
         reasonCode: "precheck.symlink",
         ioErrorKind: "InvalidInput",
-        message: `managed text entry is a symlink or reparse point: pages/${name}.md`,
+        message: `graph text entry is a symlink or reparse point: pages/${name}.md`,
       });
 
       expect(await forceSave(name)).toBe(false);
@@ -172,7 +165,7 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     toasts.length = 0;
     conflicted.clear();
     nextResult = null;
-    observedManagedPage = null;
+    observedPage = null;
     draftPath = "pages/Notes.md";
     resetSaveState();
   });

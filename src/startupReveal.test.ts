@@ -61,7 +61,7 @@ describe("stable desktop startup reveal (GH #132)", () => {
     expect(native).toContain("window.show()");
   });
 
-  it("lets the themed window paint before a configured graph can enter managed recovery", () => {
+  it("lets the themed window paint before a configured graph opens", () => {
     const setupStart = native.indexOf(".setup(|app|");
     const setupEnd = native.indexOf(".invoke_handler", setupStart);
     const setup = native.slice(setupStart, setupEnd);

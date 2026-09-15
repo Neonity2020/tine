@@ -23,10 +23,10 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_EVIDENCE_SPANS: usize = 32;
 
-/// How many times the shared block evaluator has produced match evidence and a
-/// result DTO. The architectural claim is that this is once per WINNER, not
-/// once per retained candidate -- O(limit), not O(retained) -- and a counter is
-/// the only way to state that as a test rather than as a comment.
+// How many times the shared block evaluator has produced match evidence and a
+// result DTO. The architectural claim is that this is once per WINNER, not
+// once per retained candidate -- O(limit), not O(retained) -- and a counter is
+// the only way to state that as a test rather than as a comment.
 #[cfg(test)]
 thread_local! {
     static BLOCK_EVIDENCE_EVALUATIONS: std::cell::Cell<usize> =
@@ -142,43 +142,7 @@ pub struct QueryBranch {
     pub limit: usize,
 }
 
-impl QueryBranch {
-    /// The already-folded needle of a branch that is EXACTLY one literal fuzzy
-    /// `VisibleContent` predicate -- the `((` block-picker shape produced by
-    /// [`QueryPlan::block_search_literal`].
-    ///
-    /// Such a branch, and only such a branch, can be narrowed by a stored
-    /// ordered-subsequence candidate index: the index answers "which pages
-    /// could contain this subsequence", the parser-owned matcher still ranks
-    /// blocks and produces evidence, and a narrowed scan therefore returns the
-    /// same results as a full scan. A branch with boolean structure, negation
-    /// or a regex is NOT narrowable this way, because a page that fails the
-    /// literal test can still satisfy the branch.
-    ///
-    /// One accessor, used by both storage modes, so a future narrowable shape
-    /// cannot be taught to one evaluator and not the other.
-    pub(crate) fn fuzzy_visible_content_needle(&self) -> Option<&str> {
-        match &self.predicate {
-            QueryExpr::Text(TextPredicate {
-                field: TextField::VisibleContent,
-                mode: TextMatchMode::Fuzzy,
-                value,
-                ..
-            }) => Some(value.as_str()),
-            _ => None,
-        }
-    }
-}
-
 impl QueryPlan {
-    /// The narrowable fuzzy needle of this plan's block branch, if it has one.
-    pub(crate) fn fuzzy_block_needle(&self) -> Option<&str> {
-        self.branches
-            .iter()
-            .find(|branch| branch.target == QueryTarget::Blocks)
-            .and_then(QueryBranch::fuzzy_visible_content_needle)
-    }
-
     /// Captured current-page scope for projection-backed Friendly execution.
     /// A physical path, when present, remains authoritative over display name.
     pub(crate) fn page_scope(&self) -> Option<&QueryPageScope> {
@@ -304,20 +268,6 @@ pub struct QueryExecution {
     pub has_more: QueryHasMore,
     /// A cancelled latest-wins lane returns no partial results.
     pub cancelled: bool,
-}
-
-/// One exact current managed page paired with the same inventory entry used by
-/// Direct Files for scope, path tie-breaking and page-hit projection.
-///
-/// `roots` is the page's already-converted block tree, supplied by the caller
-/// from its `ApplicationProjectionCache`. It is the managed analogue of the
-/// cached `Arc<Document>` Direct Files walks: retaining it here is what lets
-/// the shared evaluator hold `&DocBlock` winners and defer evidence/DTO
-/// construction until the heap is drained, exactly as the Direct path does.
-#[cfg(test)]
-pub(crate) struct ApplicationQueryPlanPage {
-    pub(crate) entry: PageEntry,
-    pub(crate) roots: std::sync::Arc<Vec<DocBlock>>,
 }
 
 /// **The Display facts a Friendly search runs under** (SPEC §7.6, Q3).
@@ -688,69 +638,9 @@ impl QueryPlan {
             cancelled: false,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn execute_application_with_explain(
-        &self,
-        file_pages: Vec<PageEntry>,
-        pages: &[ApplicationQueryPlanPage],
-        aliases: Vec<(String, String, String)>,
-        referenced: Vec<String>,
-        cancelled: impl Fn() -> bool,
-        explain: bool,
-    ) -> QueryExecution {
-        let explanation = if explain {
-            self.explanation()
-        } else {
-            QueryExplanation {
-                branches: Vec::new(),
-            }
-        };
-        if !self.diagnostics.is_empty() {
-            return QueryExecution {
-                hits: Vec::new(),
-                diagnostics: self.diagnostics.clone(),
-                explanation,
-                has_more: QueryHasMore::default(),
-                cancelled: false,
-            };
-        }
-        let mut hits = Vec::new();
-        let mut has_more = QueryHasMore::default();
-        for branch in &self.branches {
-            if cancelled() {
-                return cancelled_execution(self, explanation);
-            }
-            let branch_hits = match branch.target {
-                QueryTarget::Pages => execute_page_candidates(
-                    self,
-                    file_pages.clone(),
-                    aliases.clone(),
-                    referenced.clone(),
-                    branch,
-                    &cancelled,
-                ),
-                QueryTarget::Blocks => execute_application_blocks(self, pages, branch, &cancelled),
-            };
-            let Some((mut branch_hits, branch_has_more)) = branch_hits else {
-                return cancelled_execution(self, explanation);
-            };
-            match branch.target {
-                QueryTarget::Pages => has_more.pages |= branch_has_more,
-                QueryTarget::Blocks => has_more.blocks |= branch_has_more,
-            }
-            hits.append(&mut branch_hits);
-        }
-        QueryExecution {
-            hits,
-            diagnostics: self.diagnostics.clone(),
-            explanation,
-            has_more,
-            cancelled: false,
-        }
-    }
 }
 
+#[cfg(test)]
 fn cancelled_execution(plan: &QueryPlan, explanation: QueryExplanation) -> QueryExecution {
     QueryExecution {
         hits: Vec::new(),
@@ -2145,30 +2035,6 @@ fn execute_blocks(
     graph.with_pages(execute)
 }
 
-#[cfg(test)]
-fn execute_application_blocks(
-    plan: &QueryPlan,
-    pages: &[ApplicationQueryPlanPage],
-    branch: &QueryBranch,
-    cancelled: &impl Fn() -> bool,
-) -> Option<(Vec<QueryHit>, bool)> {
-    if branch.limit == 0 {
-        return Some((Vec::new(), false));
-    }
-    // Managed candidate narrowing for a fuzzy predicate happens at the CALLER,
-    // which owns the materialized index and decides whether the accepted
-    // frontier is the whole story; by the time pages reach here they are
-    // already the narrowed set. See `SyncRuntimeActor::application_query_plan_ready`.
-    execute_block_candidates(
-        plan,
-        pages
-            .iter()
-            .map(|source| (&source.entry, source.roots.as_slice())),
-        branch,
-        cancelled,
-    )
-}
-
 /// Convert typed block hits back to the exact grouped shape used by existing
 /// search/query consumers. Hits arrive in global relevance order; only contiguous
 /// hits from the same page are coalesced, so flattening the groups preserves that
@@ -2255,18 +2121,11 @@ mod tests {
         (dir, graph)
     }
 
-    /// The shared block evaluator, driven on both storage modes over literally
-    /// the same content: identical results, and evidence plus result DTOs
-    /// produced once per WINNER rather than once per retained candidate.
-    ///
-    /// The evaluation count is the point. The managed twin used to call
-    /// `eval_ranked_block_expr` and build a `BlockDto` inside the walk for
-    /// every candidate the heap retained, so a `limit`-bounded search over a
-    /// large page set did O(retained) work where Direct did O(limit). Asserting
-    /// the count is what turns "they share an evaluator now" from a comment
-    /// into a test.
+    /// The block evaluator produces evidence and result DTOs once per WINNER
+    /// rather than once per retained candidate, so a `limit`-bounded search
+    /// over a large page set does O(limit) evidence work, not O(retained).
     #[test]
-    fn application_block_evaluator_matches_direct_and_evaluates_evidence_per_winner() {
+    fn block_evaluator_evaluates_evidence_once_per_winner() {
         const PAGES: usize = 5;
         const BLOCKS: usize = 20;
         let nonce = SystemTime::now()
@@ -2296,45 +2155,19 @@ mod tests {
         }
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let entries = graph.list_pages();
-        let pages = graph.with_pages(|pages| {
-            pages
-                .iter()
-                .map(|(entry, doc)| ApplicationQueryPlanPage {
-                    entry: entry.clone(),
-                    // Cloning a `DocBlock` resets its memoized projection, so
-                    // the managed side genuinely starts cold here rather than
-                    // borrowing Direct's warm cache.
-                    roots: std::sync::Arc::new(doc.roots.clone()),
-                })
-                .collect::<Vec<_>>()
-        });
         let matching = PAGES * BLOCKS * 2;
         for limit in [1_usize, 3, 7, 50, 1_000] {
             let plan = QueryPlan::block_search("needle", limit);
             let _ = take_block_evidence_evaluations();
-            let direct = plan.execute(&graph, || false);
-            let direct_evaluations = take_block_evidence_evaluations();
-            let managed = plan.execute_application_with_explain(
-                entries.clone(),
-                &pages,
-                Vec::new(),
-                Vec::new(),
-                || false,
-                true,
-            );
-            let managed_evaluations = take_block_evidence_evaluations();
+            let execution = plan.execute(&graph, || false);
+            let evaluations = take_block_evidence_evaluations();
             assert_eq!(
-                serde_json::to_value(&managed).unwrap(),
-                serde_json::to_value(&direct).unwrap(),
-                "managed block evaluation diverged from Direct Files at limit={limit}"
+                execution.hits.len(),
+                limit.min(matching),
+                "block search returns limit.min(matching) hits at limit={limit}"
             );
             assert_eq!(
-                direct_evaluations, managed_evaluations,
-                "the two modes must do the same amount of evidence work at limit={limit}"
-            );
-            assert_eq!(
-                managed_evaluations,
+                evaluations,
                 limit.min(matching),
                 "evidence and DTOs must be produced once per winner, not once per retained candidate, at limit={limit}"
             );

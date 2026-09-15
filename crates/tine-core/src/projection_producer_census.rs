@@ -963,22 +963,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "open.create",
             1,
         ),
-        (
-            "crates/tine-core/src/graph_name_folding.rs",
-            "fs.create_dir_all",
-            1,
-        ),
-        (
-            "crates/tine-core/src/graph_name_folding.rs",
-            "fs.remove_dir_all",
-            1,
-        ),
-        (
-            "crates/tine-core/src/graph_name_folding.rs",
-            "fs.remove_file",
-            2,
-        ),
-        ("crates/tine-core/src/graph_name_folding.rs", "fs.write", 2),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
         ("crates/tine-core/src/model.rs", "cap.remove_file", 18),
         ("crates/tine-core/src/model.rs", "cap.rename", 1),
@@ -1119,7 +1103,6 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         "write_page_projection_with_attempts",
         "preserve_and_restore_projection_recovery",
         "retire_stable_projection_quarantine",
-        "reserve_and_rename",
         "create_projection_chain_component",
         "empty_asset_trash",
         "reserve_publish_stage",
@@ -1156,8 +1139,6 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         "publish_temp_noreplace",
         "atomic_copy_new_into_live",
         "move_live_to_recovery",
-        "graph_name_folding",
-        "probe_graph_name_folding",
     ];
     let actual = roots
         .into_iter()
@@ -1192,8 +1173,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("write_page_projection_with_attempts", 0),
         ("preserve_and_restore_projection_recovery", 0),
         ("retire_stable_projection_quarantine", 0),
-        ("reserve_and_rename", 2),
-        ("create_projection_chain_component", 2),
+        ("create_projection_chain_component", 1),
         ("empty_asset_trash", 1),
         ("reserve_publish_stage", 1),
         ("reserve_publish_recovery", 3),
@@ -1239,8 +1219,6 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("publish_temp_noreplace", 1),
         ("atomic_copy_new_into_live", 4),
         ("move_live_to_recovery", 7),
-        ("graph_name_folding", 0),
-        ("probe_graph_name_folding", 2),
     ];
     assert_eq!(
         actual, expected,
@@ -1272,11 +1250,6 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
         ),
         ("PC-12", "src-tauri/src/graph.rs", "fncreate_graph("),
         ("PC-13", "src-tauri/src/backup.rs", "fnrestore_backup("),
-        (
-            "PC-14",
-            "crates/tine-core/src/graph_name_folding.rs",
-            "fnprobe_graph_name_folding(",
-        ),
         (
             "PC-18",
             "src-tauri/src/commands.rs",
@@ -1313,19 +1286,6 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
     assert!(
         restore[0].contains("slot.legacy_graph_cloned("),
         "PC-13 restore must remain gated to a Direct-Files graph"
-    );
-    let folding_callers = files
-        .iter()
-        .filter_map(|file| {
-            let count = identifier_occurrences(&file.code, "graph_name_folding(")
-                - file.code.matches("fn graph_name_folding(").count();
-            (count != 0).then_some((file.relative.clone(), count))
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        folding_callers.is_empty(),
-        "PC-14: the graph-name folding probe has had no production caller since the \
-         Android managed journey was removed; review any new caller: {folding_callers:?}"
     );
 }
 

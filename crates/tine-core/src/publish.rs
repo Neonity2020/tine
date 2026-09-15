@@ -4919,7 +4919,8 @@ impl Drop for PublicationSnapshotRoot {
 /// selection belongs to the caller-supplied current-main reader.
 struct PublicationGraphSnapshot {
     graph: Graph,
-    root: PublicationSnapshotRoot,
+    /// Held for its `Drop`, which removes the snapshot directory.
+    _root: PublicationSnapshotRoot,
 }
 
 pub mod app_export;
@@ -4970,7 +4971,7 @@ impl PublicationGraphSnapshot {
                 Ok(()) => {
                     return Ok(Self {
                         graph: Graph::from_page_snapshot(&root, pages),
-                        root: PublicationSnapshotRoot(root),
+                        _root: PublicationSnapshotRoot(root),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -7648,7 +7649,7 @@ mod tests {
 
         let graph = Graph::open(&dir);
         let snapshot = PublicationGraphSnapshot::new(capture_snapshot_pages(&graph)).unwrap();
-        let root = snapshot.root.0.clone();
+        let root = snapshot._root.0.clone();
 
         #[cfg(unix)]
         {

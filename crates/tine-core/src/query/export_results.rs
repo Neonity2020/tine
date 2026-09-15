@@ -792,20 +792,6 @@ struct Admission {
 /// pre-check would reject is a node the estimate rejects too. The estimate is
 /// the STORED one, identity-adjusted by the same owner the result read uses,
 /// and pass 3 re-checks it against the payload that is actually decoded.
-#[cfg(test)]
-fn admit_subtree(
-    subtree: &Subtree,
-    root_estimate: usize,
-    remaining_nodes: &mut usize,
-    remaining_bytes: &mut usize,
-) -> Admission {
-    let mut remaining = Some((*remaining_nodes, *remaining_bytes));
-    let admitted = admit_subtree_policy(subtree, root_estimate, &mut remaining)
-        .expect("bounded test admission allocates");
-    (*remaining_nodes, *remaining_bytes) = remaining.expect("bounded admission");
-    admitted
-}
-
 fn admit_subtree_policy(
     subtree: &Subtree,
     root_estimate: usize,

@@ -300,12 +300,12 @@ describe("Journals feed generation lifecycle", () => {
       kind: "page",
       title: "Résumé 日本語",
       pre_block: null,
-      rev: "sparse-load-rev",
+      rev: "route-load-rev",
       blocks: [{ id: "nested-utf", raw: "nested UTF original", collapsed: false, children: [] }],
     };
     vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => new Promise(() => {}));
     vi.spyOn(backend(), "getPage").mockResolvedValue(existing);
-    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "sparse-saved-rev" });
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue({ revision: "route-saved-rev" });
     const mounted = mount(() => <PageView />);
     try {
       await flushMicrotasks();
@@ -323,7 +323,7 @@ describe("Journals feed generation lifecycle", () => {
       await tick();
       const editor = mounted.root.querySelector<HTMLTextAreaElement>("textarea.block-editor");
       expect(editor).not.toBeNull();
-      const edited = "nested UTF original sparse v2 saved existing UTF page";
+      const edited = "nested UTF original saved existing UTF page";
       editor!.value = edited;
       editor!.dispatchEvent(new InputEvent("input", {
         bubbles: true,
@@ -338,7 +338,7 @@ describe("Journals feed generation lifecycle", () => {
           name: existing.name,
           blocks: [expect.objectContaining({ raw: edited })],
         }),
-        "sparse-load-rev",
+        "route-load-rev",
         false,
         // Not a forced save, so it presents no conflict observation (GH #254).
         null,

@@ -913,8 +913,8 @@ function overtypeCell(sel: CellSel, text: string): boolean {
   const adapter = adapterFor(sel.gridId, sel.surfaceId);
   if (adapter?.overtype) return adapter.overtype(sel, text);
   const beginEditing = () => {
-    // A managed preflight may settle after this mounted Sheet instance has
-    // gone away. Do not transfer its post-commit edit into another surface.
+    // Materialization may settle after this mounted Sheet instance has gone
+    // away. Do not transfer its post-commit edit into another surface.
     if (adapter && adapterFor(sel.gridId, sel.surfaceId) !== adapter) return;
     if (!startCellEditing(sel, 0)) return;
     replaceThroughMountedEditor(sel, text);
@@ -1124,16 +1124,13 @@ export function handleCellSelectionKey(e: KeyboardEvent): boolean {
         : undefined;
       setCellSel(withCellMeta(next, sel.surfaceId, rowId));
     };
-    const next = moveSheetSelection(
+    // moveSheetSelection invokes applySelection in this call stack.
+    moveSheetSelection(
       sel,
       arrowDir as SheetMoveDirection,
       applySelection,
       captureSheetMutationAuthority(sel),
     );
-    if (next) {
-      // Direct mode invokes applySelection in this call stack; managed mode
-      // invokes it only after accepted preflight + atomic publication.
-    }
     return true;
   }
   if (mod && !e.altKey && !e.shiftKey && key === "d" && !isSeamSel(sel)) {

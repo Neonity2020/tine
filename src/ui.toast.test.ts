@@ -5,7 +5,7 @@ describe("toast deduplication", () => {
   afterEach(() => setToasts([]));
 
   it("keeps one visible report for repeated identical runtime diagnostics", () => {
-    const message = "Tine-managed storage needs attention: repeated failure";
+    const message = "Graph storage needs attention: repeated failure";
     const first = pushToast(message, "error", { sticky: true, dedupe: true });
     const repeated = pushToast(message, "error", { sticky: true, dedupe: true });
 

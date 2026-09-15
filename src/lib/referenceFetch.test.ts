@@ -67,13 +67,13 @@ describe("createReferenceFetcher", () => {
   it("still reports a real backend refusal", async () => {
     const { fetcher, dispose, errors } = harness(() => "Target");
     const rows = await fetcher("Target", async () => {
-      throw new Error("This action is unavailable while Tine-managed storage is active.");
+      throw new Error("Reference queries are unavailable for this graph.");
     });
     dispose();
     expect(rows).toEqual([]);
     expect(errors.at(-1)).toMatchObject({
       kind: "backend",
-      detail: "This action is unavailable while Tine-managed storage is active.",
+      detail: "Reference queries are unavailable for this graph.",
     });
   });
 });

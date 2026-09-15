@@ -1110,10 +1110,10 @@ fn candidate_blocks_admit(
     admitted
 }
 
-/// How many blocks the reference walk actually classified — i.e. how many had
-/// their lsdoc projection forced to answer "does this refer to the target".
-/// The saving block narrowing exists for is the drop in this number, so the
-/// gate measures it rather than asserting it in prose.
+// How many blocks the reference walk actually classified — i.e. how many had
+// their lsdoc projection forced to answer "does this refer to the target".
+// The saving block narrowing exists for is the drop in this number, so the
+// gate measures it rather than asserting it in prose.
 #[cfg(test)]
 thread_local! {
     static REFERENCE_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2385,24 +2385,6 @@ impl QueryPageSource for GraphQueryPages<'_> {
     }
 }
 
-fn run_pred_bounded(
-    graph: &Graph,
-    query: &Query,
-    view: &ViewSettings,
-    today: JournalDate,
-    max_rows: usize,
-    max_bytes: usize,
-) -> BoundedGroups {
-    run_pred_bounded_over(
-        &GraphQueryPages(graph),
-        query,
-        view,
-        today,
-        max_rows,
-        max_bytes,
-    )
-}
-
 // RETIREMENT-CANDIDATE: the in-memory query walk.
 //
 // WHAT MAY BE DELETED: `run_pred_bounded_over` together with the whole
@@ -2669,6 +2651,7 @@ pub fn run_query_result(
 /// caller, after the result-cache retrieval), because it is a property of how
 /// this source was bound and not of the rows — which is exactly why the rows may
 /// be shared and the report may not.
+#[cfg(test)]
 pub(crate) fn run_resolved_query_result_over(
     source: &dyn QueryPageSource,
     resolved: &ResolvedQuery,
@@ -3130,23 +3113,6 @@ pub(crate) fn base_order_result_view_groups<B>(groups: &mut [ResultViewGroup<B>]
     groups.sort_by(|a, b| compare_result_pages(&a.page, a.kind, &b.page, b.kind));
 }
 
-/// The VIEW half: `sort-by` then `sample`, over already base-ordered rows.
-/// Nothing here reads the graph, so it may run on a cached pre-view result.
-pub(crate) fn apply_view_directives(
-    groups: Vec<RefGroup>,
-    recency_by_page: &std::collections::HashMap<String, i64>,
-    opts: &QueryOpts,
-) -> Vec<RefGroup> {
-    apply_result_view_directives(
-        groups.into_iter().map(ResultViewGroup::from).collect(),
-        recency_by_page,
-        opts,
-    )
-    .into_iter()
-    .map(RefGroup::from)
-    .collect()
-}
-
 /// The sole view implementation for ordinary and physically located entries.
 pub(crate) fn apply_result_view_directives<B: ResultViewBlock>(
     groups: Vec<ResultViewGroup<B>>,
@@ -3457,47 +3423,6 @@ pub fn explain_empty_query(
 pub fn query_source_has_props_leaf(src: &str) -> bool {
     let (query, _view) = parse_query_source(src, JournalDate::today());
     query.filter.has_props_leaf()
-}
-
-/// "Could an edit to this page change the derived result of `filter`?" — the
-/// SAME parse and the SAME evaluator the real matcher uses, so a keep/evict
-/// decision can never drift from what a full recompute would give.
-fn page_contributes_to_filter(
-    filter: &Filter,
-    entry: &PageEntry,
-    doc: &Document,
-    today: JournalDate,
-    config: &crate::config::ParseConfig,
-    registry: &registry::Registry,
-) -> bool {
-    let (page_props, _page_tags) = page_facets(doc.pre_block.as_deref());
-    let compiled = eval::CompiledLeaves::for_query(filter);
-    let ctx = EvalCtx {
-        journal: entry.date_key,
-        is_journal: entry.kind == PageKind::Journal,
-        page_name: &entry.name,
-        page_props: &page_props,
-        page_roots: &doc.roots,
-        today,
-        compiled: &compiled,
-        mode: atom::CompareMode::Both,
-        format: Format::from_path(std::path::Path::new(&entry.rel_path)).into(),
-        config,
-        registry,
-    };
-    let mut hit = false;
-    let mut path_refs = PathRefCounts::new();
-    walk_path_refs(
-        &doc.roots,
-        &mut path_refs,
-        eval::uses_path_refs(filter),
-        &mut |block, ancestor_refs| {
-            if !hit && eval::eval_block(filter, block, ancestor_refs, &ctx) {
-                hit = true;
-            }
-        },
-    );
-    hit
 }
 
 /// Whether page `doc` references `target` or any of its aliases — i.e. could be

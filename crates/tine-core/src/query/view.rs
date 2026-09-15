@@ -615,6 +615,7 @@ pub struct EmptyExplanation {
 /// the binding failed there is nothing honest to count: the rows are empty and
 /// the caller gets the diagnostics and the support report instead of a table of
 /// zeroes that reads like a result.
+#[cfg(test)]
 pub(crate) fn explain_empty(
     source: &dyn crate::query::QueryPageSource,
     resolved: &crate::query::ResolvedQuery,

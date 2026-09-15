@@ -68,8 +68,8 @@ export function safeErrorDetail(error: unknown): string {
     // A RELATIVE path is just as private and was matched by nothing above, so
     // it survived to the structural check below and discarded the whole
     // message — a real device was told "The command failed without a safe
-    // diagnostic detail" for `.tine-sync/v2/shared/...`. Redact it like any
-    // other path instead of throwing the sentence away.
+    // diagnostic detail" for a graph-relative path. Redact it like any other
+    // path instead of throwing the sentence away.
     .replace(/(^|[\s("'=])\.?[\w.@-]+(?:\/[\w.@-]+)+\/?/gu, "$1[path]")
     .replace(/\b(?:https?|ssh):\/\/[^\s"'<>]+/giu, "[link]")
     .replace(/\b(authorization|bearer|token|secret|password)\b(?:\s*[:=]\s*|\s+)[^\s,;]+/giu, "$1 [redacted]")

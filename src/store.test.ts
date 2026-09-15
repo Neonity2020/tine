@@ -2973,13 +2973,13 @@ describe("save engine (persistence)", () => {
     deleteSpy.mockRestore();
   });
 
-  it("retains the captured draft when the managed delete is deferred", async () => {
-    load([blk("still present after deferred delete")]);
-    const deleteSpy = vi.spyOn(backend(), "deletePage").mockRejectedValue(new Error("managed delete deferred"));
+  it("retains the captured draft when the backend delete fails", async () => {
+    load([blk("still present after failed delete")]);
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockRejectedValue(new Error("delete failed"));
 
     await expect(deletePage("Test", "page")).resolves.toBe(false);
     expect(pageByName("Test")).toBeDefined();
-    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("still present after deferred delete");
+    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("still present after failed delete");
     expect(deleteSpy).toHaveBeenCalledTimes(1);
     deleteSpy.mockRestore();
   });

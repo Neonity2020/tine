@@ -767,7 +767,6 @@ struct Descriptor {
 /// recency axis needs, kept out of the group because they are inputs and not
 /// part of the answer.
 struct PageGroup<C: ResultCarrier> {
-    page_id: [u8; 16],
     group: ResultViewGroup<C::Block>,
     journal_day: Option<i64>,
     path: String,
@@ -827,7 +826,6 @@ impl<C: ResultCarrier> PageGroups<C> {
         }
         let at = self.order.len();
         self.order.push(PageGroup {
-            page_id,
             group: ResultViewGroup {
                 page: name.to_owned(),
                 kind,
@@ -1755,10 +1753,10 @@ pub(crate) fn result_read_census() -> ResultReadCensus {
     CENSUS.with(std::cell::Cell::get)
 }
 
-/// A barrier point at the top of each payload batch (test-only), so a gate can
-/// cancel BETWEEN batches deterministically instead of racing a sleep against
-/// the read. The same shape as `direct_projection`'s `BEFORE_APPLY_PENDING`
-/// hook, which exists for the same reason.
+// A barrier point at the top of each payload batch (test-only), so a gate can
+// cancel BETWEEN batches deterministically instead of racing a sleep against
+// the read. The same shape as `direct_projection`'s `BEFORE_APPLY_PENDING`
+// hook, which exists for the same reason.
 #[cfg(test)]
 thread_local! {
     static BEFORE_PAYLOAD_BATCH: std::cell::RefCell<Option<Box<dyn Fn(usize)>>> =

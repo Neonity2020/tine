@@ -4090,7 +4090,7 @@ fn concord_ledger_save_overhead_measurement() {
         .len();
     eprintln!("target page: {} ({size} bytes)", target.rel_path);
 
-    let mut measure = |label: &str, rounds: usize| {
+    let measure = |label: &str, rounds: usize| {
         let mut page = graph.load_by_path(&target.rel_path).unwrap().unwrap();
         let mut times_us: Vec<u128> = Vec::with_capacity(rounds);
         for i in 0..rounds {

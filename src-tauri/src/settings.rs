@@ -242,17 +242,6 @@ pub(crate) fn reveal_known_graph(
     }
 }
 
-pub(crate) fn last_graph_path(app: &tauri::AppHandle) -> Option<String> {
-    settings_path(app)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|json| {
-            json.get("last_graph_path")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-}
-
 /// Quick-capture Enter behaviour (app-level, in tine-settings.json): true → a
 /// plain Enter files the capture; false (default) → Enter makes a new block and
 /// Cmd/Ctrl+Enter files.

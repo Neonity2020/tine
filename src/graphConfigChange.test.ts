@@ -54,8 +54,8 @@ describe("applying a live config.edn change", () => {
     expect(favorites().map((f) => f.name)).toEqual(["Beta"]);
   });
 
-  // A managed graph re-reads configuration after Tine's OWN settings write, so
-  // the file moving is not evidence that the user's view is wrong. Re-seeding
+  // The graph re-reads configuration after Tine's OWN settings write, so the
+  // file moving is not evidence that the user's view is wrong. Re-seeding
   // here would drop the arrangement and re-fetch its page on every star.
   it("does not re-seed favorites the user is already being shown", () => {
     const getPage = vi.spyOn(backend(), "getPage");
