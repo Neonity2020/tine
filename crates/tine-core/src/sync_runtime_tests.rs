@@ -21530,6 +21530,129 @@ fn exact_object_progress_rechecks_every_incomplete_manifest_once_per_wave() {
 }
 
 #[test]
+fn pending_ingress_accepted_residue_retires_on_reopen() {
+    let (receiver, sender, receiver_handle, sender_handle) =
+        joined_shared_pair("provider-pending-residue", 0xba00);
+    let (batch, ..) = submit_shared_page(
+        &sender_handle,
+        0xba10,
+        "Accepted Residue",
+        "notes/accepted-residue.md",
+        "accepted",
+    );
+    publish_shared_batch(&sender_handle, &sender, batch);
+    settle_shared_provider(&sender_handle);
+    let delivered = copy_provider_batch(&sender, &receiver, batch, ProviderBatchDelivery::Complete);
+    receiver_handle
+        .observe_provider_paths(delivered, false)
+        .unwrap();
+    settle_shared_provider(&receiver_handle);
+    assert!(matches!(
+        receiver_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(receiver_handle);
+    let bytes = fs::read(
+        sender
+            .request
+            .provider_root
+            .join("outbox/manifests")
+            .join(format!("{batch}.manifest")),
+    )
+    .unwrap();
+    // Simulate crash after durable acceptance and before custody retirement.
+    let mut provider = SharedProviderTransport::open(
+        &receiver.request.provider_root,
+        &receiver.request.provider_journal_root,
+    )
+    .unwrap();
+    assert!(provider.pending_ingress().is_empty());
+    provider.retain_pending_ingress(&bytes).unwrap();
+    drop(provider);
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+    settle_shared_provider(&reopened);
+    assert_eq!(reopened.status().unwrap().provider_pending, 0);
+    assert_eq!(
+        fs::read_dir(
+            receiver
+                .request
+                .provider_journal_root
+                .parent()
+                .unwrap()
+                .join("pending-ingress-v1")
+        )
+        .unwrap()
+        .count(),
+        0
+    );
+}
+
+#[test]
+fn pending_ingress_child_survives_reopen_while_parent_manifest_is_absent() {
+    let (receiver, sender, receiver_handle, sender_handle) =
+        joined_shared_pair("provider-pending-parent", 0xb900);
+    let (parent, ..) = submit_shared_page(
+        &sender_handle,
+        0xb910,
+        "Missing Parent",
+        "notes/missing-parent.md",
+        "parent",
+    );
+    publish_shared_batch(&sender_handle, &sender, parent);
+    let (child, ..) = submit_shared_page(
+        &sender_handle,
+        0xb920,
+        "Waiting Child",
+        "notes/waiting-child.md",
+        "child",
+    );
+    publish_shared_batch(&sender_handle, &sender, child);
+    settle_shared_provider(&sender_handle);
+    settle_shared_provider(&receiver_handle);
+    let delivered = copy_provider_batch(&sender, &receiver, child, ProviderBatchDelivery::Complete);
+    receiver_handle
+        .observe_provider_paths(delivered, false)
+        .unwrap();
+    for _ in 0..64 {
+        let _ = receiver_handle.tick().unwrap();
+    }
+    assert!(receiver_handle.status().unwrap().provider_pending > 0);
+    assert!(!receiver_handle.status().unwrap().provider_runnable);
+    drop(receiver_handle);
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+    for _ in 0..64 {
+        let tick = reopened.tick().unwrap();
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_)
+            ),
+            "{tick:?}"
+        );
+    }
+    assert!(reopened.status().unwrap().provider_pending > 0);
+    let delivered =
+        copy_provider_batch(&sender, &receiver, parent, ProviderBatchDelivery::Complete);
+    reopened.observe_provider_paths(delivered, false).unwrap();
+    settle_shared_provider(&reopened);
+    assert!(receiver.graph_root.join("notes/waiting-child.md").is_file());
+    assert_eq!(reopened.status().unwrap().provider_pending, 0);
+    assert_eq!(
+        fs::read_dir(
+            receiver
+                .request
+                .provider_journal_root
+                .parent()
+                .unwrap()
+                .join("pending-ingress-v1")
+        )
+        .unwrap()
+        .count(),
+        0
+    );
+}
+
+#[test]
 fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement() {
     let (control, peer, control_handle, peer_handle) =
         joined_shared_pair("provider-incomplete-frontier-control", 0xb300);
@@ -21658,6 +21781,24 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
         "Safe must remain blocked while authenticated foreign delivery is incomplete"
     );
 
+    let pending_root = author
+        .request
+        .provider_journal_root
+        .parent()
+        .unwrap()
+        .join("pending-ingress-v1");
+    assert_eq!(fs::read_dir(&pending_root).unwrap().count(), 1);
+    // Retry custody owns the original even when the provider temporarily
+    // removes its manifest. Only the delayed objects arrive after reopen.
+    fs::remove_file(
+        author
+            .request
+            .provider_root
+            .join("outbox/manifests")
+            .join(format!("{delayed_batch}.manifest")),
+    )
+    .unwrap();
+
     drop(author_handle);
     let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
     assert!(
@@ -21706,6 +21847,11 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
             .join("notes/delayed-peer-independent.md")
             .is_file(),
         "late foreign objects did not converge after restart"
+    );
+    assert_eq!(
+        fs::read_dir(&pending_root).unwrap().count(),
+        0,
+        "accepted ingress must retire its private recovery copy"
     );
     assert!(matches!(
         restarted.clean_shutdown(),

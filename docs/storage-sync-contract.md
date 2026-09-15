@@ -205,6 +205,21 @@ The device-private provider journal also has `pending-publication-v1/` and
 `provider-transaction.authority`; these never sync and cannot grant shared
 graph authority.
 
+`pending-ingress-v1/<batch>-<manifest-digest>.manifest`, beside the private
+provider journal, retains the exact validated manifest only when its objects
+or causal dependencies are still absent. These are retry originals, not
+accepted archive commits. Cold open visits only this pending namespace (at
+most 4,096 entries and 8 MiB of manifest bytes), validates the content-addressed
+name and current workspace/lineage, and retries through ordinary ingress.
+It does not enumerate provider manifest/object history. Complete ingress and
+local authoring add no pending-ingress artifact. Immutable publication and its
+durability barrier precede dequeue into the sleeping pending set; durable
+acceptance or independently durable retained continuation precedes retirement.
+Missing delivery sleeps until a provider observation, blocks `Safe`, and does
+not block unrelated own-frontier publication. Corrupt or conflicting originals
+remain in place and refuse replay/retirement. Interrupted publication temporaries
+are never replay authority. This internal recovery change has no Guide delta.
+
 An INCOMPLETE provider tree is not an unsafe one. A file-sync tool creates the
 directories above in whatever order it likes, may hold one back for minutes,
 and may remove one again while it propagates another device's deletion. An

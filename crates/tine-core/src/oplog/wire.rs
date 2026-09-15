@@ -67,6 +67,7 @@ pub const MAX_PROVIDER_RESCAN_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PROVIDER_RESCAN_DEPTH: usize = 16;
 pub(crate) const SHARED_PROVIDER_CLEAN_BASELINES_NAMESPACE: &str = "clean-baselines-v1";
 pub const MAX_PROVIDER_RESIDUE_ENTRIES: usize = 512;
+pub(crate) const PROVIDER_PENDING_INGRESS_NAMESPACE: &str = "pending-ingress-v1";
 
 /// The `{inbox,outbox}/removed/` entry count at which a provider operation
 /// compacts the residue directory against live journal state before adding one
@@ -1154,6 +1155,13 @@ pub(crate) struct SharedProviderTransport {
     runtime: ProviderRuntime,
     journal: ProviderRetryJournal,
     pending_publication: Dir,
+    pending_ingress: Dir,
+    pending_ingress_manifests: BTreeMap<BatchId, Vec<u8>>,
+    pending_ingress_bytes: usize,
+}
+
+fn pending_ingress_name(batch: BatchId, bytes: &[u8]) -> String {
+    format!("{batch}-{}.manifest", super::ContentDigest::of(bytes))
 }
 
 impl SharedProviderTransport {
@@ -1175,11 +1183,124 @@ impl SharedProviderTransport {
         ensure_provider_directory(&journal_device, PROVIDER_PENDING_PUBLICATION_NAMESPACE)?;
         let pending_publication =
             open_provider_directory(&journal_device, PROVIDER_PENDING_PUBLICATION_NAMESPACE)?;
+        ensure_provider_directory(&journal_device, PROVIDER_PENDING_INGRESS_NAMESPACE)?;
+        let pending_ingress =
+            open_provider_directory(&journal_device, PROVIDER_PENDING_INGRESS_NAMESPACE)?;
+        let mut pending_ingress_manifests = BTreeMap::new();
+        let mut total_bytes = 0_usize;
+        for (index, entry) in pending_ingress.entries()?.enumerate() {
+            if index >= MAX_PROVIDER_RESCAN_ENTRIES {
+                return Err(ScenarioError::UnsafeProviderJournal(
+                    "pending ingress entry bound exceeded".into(),
+                ));
+            }
+            let entry = entry?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                ScenarioError::UnsafeProviderJournal("non-UTF-8 pending ingress".into())
+            })?;
+            if super::object_store::is_temp_name(&name) {
+                if !entry.file_type()?.is_file() {
+                    return Err(ScenarioError::UnsafeProviderJournal(name));
+                }
+                continue;
+            }
+            let opened = open_provider_regular_optional(
+                &pending_ingress,
+                &name,
+                super::MAX_MANIFEST_BYTES,
+                &name,
+            )?
+            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
+            let manifest = super::OperationBatch::decode(&opened.bytes)
+                .map_err(|error| ScenarioError::UnsafeProviderJournal(error.to_string()))?;
+            if name != pending_ingress_name(manifest.batch_id(), &opened.bytes) {
+                return Err(ScenarioError::UnsafeProviderJournal(name));
+            }
+            total_bytes = total_bytes.saturating_add(opened.bytes.len());
+            if pending_ingress_manifests.len() >= MAX_PROVIDER_RESCAN_ENTRIES
+                || total_bytes > MAX_PROVIDER_RESCAN_BYTES
+                || pending_ingress_manifests
+                    .insert(manifest.batch_id(), opened.bytes)
+                    .is_some()
+            {
+                return Err(ScenarioError::UnsafeProviderJournal(
+                    "pending ingress exceeds bounds or duplicates a batch".into(),
+                ));
+            }
+        }
         Ok(Self {
             runtime: ProviderRuntime::open(provider_root.to_path_buf())?,
             journal,
             pending_publication,
+            pending_ingress,
+            pending_ingress_manifests,
+            pending_ingress_bytes: total_bytes,
         })
+    }
+
+    pub(crate) fn pending_ingress(&self) -> &BTreeMap<BatchId, Vec<u8>> {
+        &self.pending_ingress_manifests
+    }
+
+    /// Retain exact observed bytes only when delivery is incomplete. This is
+    /// retry custody, never accepted archive membership or shared authority.
+    pub(crate) fn retain_pending_ingress(&mut self, bytes: &[u8]) -> Result<(), ScenarioError> {
+        let manifest = super::OperationBatch::decode(bytes)
+            .map_err(|error| ScenarioError::UnsafeProviderJournal(error.to_string()))?;
+        let batch = manifest.batch_id();
+        if let Some(existing) = self.pending_ingress_manifests.get(&batch) {
+            if existing != bytes {
+                return Err(ScenarioError::ProviderConflictingBytes(format!(
+                    "pending ingress {batch}"
+                )));
+            }
+        } else if self.pending_ingress_manifests.len() >= MAX_PROVIDER_RESCAN_ENTRIES
+            || self.pending_ingress_bytes.saturating_add(bytes.len()) > MAX_PROVIDER_RESCAN_BYTES
+        {
+            return Err(ScenarioError::UnsafeProviderJournal(
+                "pending ingress exceeds bounds".into(),
+            ));
+        }
+        super::object_store::publish_immutable_exact(
+            &self.pending_ingress,
+            &pending_ingress_name(batch, bytes),
+            bytes,
+            "pending ingress",
+        )
+        .map_err(ScenarioError::from)?;
+        if self
+            .pending_ingress_manifests
+            .insert(batch, bytes.to_vec())
+            .is_none()
+        {
+            self.pending_ingress_bytes += bytes.len();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_pending_ingress(&mut self, batch: BatchId) -> Result<(), ScenarioError> {
+        if let Some(bytes) = self.pending_ingress_manifests.get(&batch) {
+            let name = pending_ingress_name(batch, bytes);
+            let current = open_provider_regular_optional(
+                &self.pending_ingress,
+                &name,
+                super::MAX_MANIFEST_BYTES,
+                &name,
+            )?;
+            if current
+                .as_ref()
+                .is_some_and(|current| current.bytes != *bytes)
+            {
+                return Err(ScenarioError::ProviderConflictingBytes(name));
+            }
+            if current.is_some() {
+                self.pending_ingress.remove_file(&name)?;
+            }
+            sync_provider_directory(&self.pending_ingress)?;
+            self.pending_ingress_bytes -= bytes.len();
+            self.pending_ingress_manifests.remove(&batch);
+        }
+        Ok(())
     }
 
     pub(crate) fn publish_descriptor(&mut self, bytes: &[u8]) -> Result<(), ScenarioError> {
@@ -7427,6 +7548,101 @@ mod tests {
             vec![object.descriptor().unwrap()],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn pending_ingress_contract_pins_layout_and_bounds() {
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert_eq!(PROVIDER_PENDING_INGRESS_NAMESPACE, "pending-ingress-v1");
+        assert_eq!(MAX_PROVIDER_RESCAN_ENTRIES, 4_096);
+        assert_eq!(MAX_PROVIDER_RESCAN_BYTES, 8 * 1024 * 1024);
+        assert!(contract.contains("pending-ingress-v1/<batch>-<manifest-digest>.manifest"));
+        assert!(contract.contains("at\nmost 4,096 entries and 8 MiB of manifest bytes"));
+    }
+
+    #[test]
+    fn pending_ingress_preserves_exact_bytes_across_reopen_and_retires() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let batch = BatchId::from_uuid(Uuid::from_u128(0x5f80));
+        let bytes = fixture_manifest(BatchOrigin::LocalMutation, batch)
+            .encode()
+            .unwrap();
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        assert!(provider.pending_ingress().is_empty());
+        provider.retain_pending_ingress(&bytes).unwrap();
+        provider.retain_pending_ingress(&bytes).unwrap();
+        assert_eq!(provider.pending_ingress_bytes, bytes.len());
+        drop(provider);
+        let mut reopened = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        assert_eq!(reopened.pending_ingress().get(&batch), Some(&bytes));
+        reopened.retire_pending_ingress(batch).unwrap();
+        reopened.retire_pending_ingress(batch).unwrap();
+        assert_eq!(reopened.pending_ingress_bytes, 0);
+        drop(reopened);
+        assert!(SharedProviderTransport::open(&provider_root, &journal_root)
+            .unwrap()
+            .pending_ingress()
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_ingress_corruption_is_preserved_and_refused() {
+        for valid_replacement in [false, true] {
+            let root = ScenarioRoot::new().unwrap();
+            let provider_root = root.0.join("provider");
+            let journal_root = root.0.join("private/device/journal");
+            let batch = BatchId::from_uuid(Uuid::from_u128(0x5f81));
+            let bytes = fixture_manifest(BatchOrigin::LocalMutation, batch)
+                .encode()
+                .unwrap();
+            let mut provider =
+                SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+            provider.retain_pending_ingress(&bytes).unwrap();
+            let path = journal_root
+                .parent()
+                .unwrap()
+                .join("pending-ingress-v1")
+                .join(pending_ingress_name(batch, &bytes));
+            let corrupted = if valid_replacement {
+                fixture_manifest(
+                    BatchOrigin::LocalMutation,
+                    BatchId::from_uuid(Uuid::from_u128(0x5f82)),
+                )
+                .encode()
+                .unwrap()
+            } else {
+                b"torn manifest".to_vec()
+            };
+            fs::write(&path, &corrupted).unwrap();
+            assert!(provider.retire_pending_ingress(batch).is_err());
+            drop(provider);
+            assert!(SharedProviderTransport::open(&provider_root, &journal_root).is_err());
+            assert_eq!(fs::read(&path).unwrap(), corrupted);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_ingress_symlink_is_refused_without_reading_target() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        drop(provider);
+        let target = root.0.join("unrelated");
+        fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            journal_root
+                .parent()
+                .unwrap()
+                .join("pending-ingress-v1/hostile.manifest"),
+        )
+        .unwrap();
+        assert!(SharedProviderTransport::open(&provider_root, &journal_root).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"untouched");
     }
 
     #[test]
