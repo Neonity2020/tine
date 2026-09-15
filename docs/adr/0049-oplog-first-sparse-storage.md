@@ -1,6 +1,6 @@
 # 0049. Oplog-first sparse storage uses catalog and stable home-page shards
 
-- **Status:** Accepted — architecture/format selection; implementation and LocalActive remain gated
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-07-22
 - **Partially superseded by:** [ADR 0060](0060-qualified-generations-and-indefinite-cold-history.md) for retirement of redundant hot representations; indefinite logical history is preserved.
 - **Supersedes:** [ADR 0048](0048-compatible-managed-sync.md)

@@ -434,7 +434,7 @@ segments the panel reports as retained`), `src/sheet/fields.test.ts`
 ## 6. One summary for every grouped or aggregated face
 
 The backend owns exact ordinary-field statistics in optional `QueryResult.statistics`.
-Rows and statistics come from one current main-SQLite snapshot on both backends.
+Rows and statistics come from one current main-SQLite snapshot.
 Statistics describe the complete semantically ordered sample, before payload
 admission. The frontend formats these returned facts; visible, revealed or live
 editor rows never supply an exact query-wide fold. Children-backed sheets retain
@@ -996,7 +996,6 @@ filters retired bindings and increments ordinary dataRev without reloading
 editors. This covers an early coherent read followed by a later commit, including
 a database replacement whose physical SQLite revision happens to repeat.
 The counter is never a query target, result key or saved-edit acknowledgment.
-Managed uses its existing completed local/provider drain notifications.
 
 
 Static whole-site queries use the same current-main SQL reader for OG, advanced,
@@ -1009,17 +1008,15 @@ ordinary live-query reads still accept a coherent older main image. Print-query
 routing and the remaining Friendly public adapters are not covered by this
 publication migration.
 
-Tests: `publish::tests`,
-`managed_static_publication_pairs_ordinary_drain_with_current_main_queries`, and
+Tests: `publish::tests` and
 `publication_sources_are_compared_inside_the_owned_main_snapshot`.
 
 Print executes ordinary OG/TQL macros and query tables/boards through the shared
-current-main SQLite selection and subtree executor on both backends. One document
+current-main SQLite selection and subtree executor. One document
 owns one snapshot, registry, execution day, identity policy and cancellation
-lifetime, including nested and repeated occurrences. Direct reads the requested
-page body from its file; Managed loads the exact actor-owned page body and reads
-queries off actor through the existing Managed read admission. Those body and
-query authorities do not imply one source revision or a just-saved-edit guarantee.
+lifetime, including nested and repeated occurrences. Print reads the requested
+page body from its file. That body read and the query snapshot do not imply one
+source revision or a just-saved-edit guarantee.
 
 Each occurrence independently permits 20,000 shallow rows and 32 MiB of shallow
 construction, with a 64 KiB source limit and the existing 64-level OG/EDN nesting

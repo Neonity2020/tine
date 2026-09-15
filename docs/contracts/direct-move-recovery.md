@@ -194,12 +194,3 @@ disagree with that the save path has not already been gated on.
 this over Markdown and Org, LF and CRLF, property blocks, heading shapes and a
 non-participant bystander file; `duplicate_looking_identities_bind_the_physical_file`
 covers the twin-identity shape.
-
-## 7. Managed storage
-
-None of this applies to Managed Storage, whose cross-page move is one native
-request with its own recovery. Carry has no managed arm at all — the native move
-accepts one source page — and since B2 it **refuses** under a managed binding
-instead of running the Direct choreography underneath it
-(`dispatchCarry` in `src/storageDispatch.ts`). Lifting the managed multi-source
-limit is an open product question, not an implementation gap.

@@ -10,13 +10,11 @@ copy.
 
 ## 1. Configuration is not graph text
 
-`logseq/config.edn` is a **plain filesystem file under both storage engines**:
-never in `GraphTextScope`, never in the oplog, never projected. That is stated as
-a capability contract at `Graph::ensure_config_write_target` and is why settings
-are writable even in a read-only managed view.
+`logseq/config.edn` is a **plain filesystem file**: never in `GraphTextScope`
+and never saved through the page path. That is stated as a capability contract
+at `Graph::ensure_config_write_target`.
 
-There is therefore **no Direct-versus-managed fork** in this mechanism. One
-file, one parser, one write authority.
+The mechanism therefore has one file, one parser, and one write authority.
 
 ## 2. Why the watcher used to drop it
 
@@ -53,14 +51,6 @@ has, and `set_favorites` in particular never refreshed — so the open-time dige
 alone would read every star toggled in the sidebar as an outside change.
 `Graph::write_config` is therefore the single funnel every setter publishes
 through, and it records what it wrote.
-
-A managed slot retains no `Graph` to ask, and its refresh is a meta-only reopen
-with no cache to lose. The watcher therefore keeps its own last-seen digest per
-managed root (`config_seen`) and lets the comparison in §4 decide whether
-anything is worth announcing. That memory is not an optional cache: poll mode
-cannot name paths and so rechecks every graph every cycle, which without it
-would reopen a derived view every three seconds forever. A Direct graph needs no
-such memory — its own instance is the witness.
 
 Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
 `config::tests::a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change`

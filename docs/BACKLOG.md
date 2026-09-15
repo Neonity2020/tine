@@ -23,17 +23,13 @@ with per-pane tabs/history and the TreeSheets grid nav model (spec
 in **v0.5.0**. **Multi-graph + multi-window workflow** (GH #55/#70/#56; ADR 0038)
 merged to master as `ad9bf67`.)_
 
-- **Experimental managed sync stabilization** (ADR 0049) — The operation-backed
-  compatible mode is now on `master` and exposed only as a **Testing only** opt-in
-  under Settings → Backups & recovery → Storage & sync. It keeps Markdown/Org as
-  an editable projection, records managed history in `.tine-sync/`, supports
-  conservative external-file import and two-device shared-provider setup, and
-  leaves Direct files as the default for every graph. The current managed scope is
-  page and journal text; assets, PDF sidecars, and configuration remain ordinary
-  provider files. Remaining before it can leave experimental status: full
-  desktop/mobile CI and deployment, real two-device Syncthing/Dropbox soak tests,
-  adversarial long-history performance measurements, canonical private-mode
-  projection policy, and provider-blind encryption.
+- **Sync is re-specified from scratch** (Martin, 2026-09-15; ADR 0066) — The
+  experimental Managed Storage mode was removed; Direct Files is the only storage
+  mode, and the old implementation lives only in git history. Any future sync or
+  end-to-end-encrypted subgraph sharing starts from a fresh spec that sets
+  budgets for code size, performance, and disk space, states the code invariants
+  it must keep, and reuses existing code where possible. Until then, sync between
+  devices stays delegated to the user's own tool over the Markdown/Org files.
 
 - **Inline-code property lookalikes parse as properties** (Martin, Jul 8 2026:
   fix in Now, "should be treated as code"). A bullet whose text STARTS with an
@@ -72,7 +68,6 @@ _(**Shipped & released**, removed from the queue: **#23 paste-URL-over-selection
 | Item | Notes |
 |---|---|
 | **Logseq HTML-paste double-escape follow-up** | `src/editor/htmlPaste.ts:72`. Not scheduled: the 2026-09-02 identity-escaper restoration already keeps literal punctuation literal, so the observed `a [b] c` → `a \\[b\\] c` cost is not present on current master; retain this line as the closed provenance record rather than reopening the reverted escape policy. |
-| **Maintenance: retire the source-shape tests in `tine-core`** (Martin, Aug 11 2026) | A number of `sync_runtime` tests assert on their own source *text*: they `include_str!` the module, slice it between two function-signature markers, and check the slice contains a substring. They pin **layout, not behaviour**, so an ordinary refactor breaks them whether or not a guarantee was lost — and the failure cannot distinguish "the code moved" from "the code is gone", so every one costs a manual read of the production path to classify. Three broke in the 0.6.92 release gate purely from the actor-dispatch and response-evidence refactors: `trusted_local_commit_refusal` moved from preparation to execution (correctly — that is where the commit happens), and `Some(target_page)` became `Some((target_page, response_evidence, prepared_editor_projection))`. Each was repaired in place to keep the release moving; the pattern itself was not. This also fails our own reasonable-alternative gate: a reasonable equivalent implementation does not pass. Work: inventory every `include_str!("sync_runtime.rs")`-style guard, decide per case whether the invariant is real (then express it behaviourally — assert the refusal code a path actually returns) or was only ever a proxy (then delete it). Do it as a deliberate pass, not opportunistically mid-batch. |
 | **Pane-select: tree-aligned intermediate widening rungs** (Martin, Jul 8 2026) | The outward-widening ladder currently jumps pane side → covering seam → whole-window edge. Contiguous multi-pane edge spans ("split above two of three columns") are splittable iff a SUBTREE spans exactly those panes (the layout is a binary tree; splitting = wrapping a node) — those tree-aligned spans could become intermediate rungs (subtree-edge target kind + a wrap-node-at-path split primitive + cross-pane highlight rendering). Non-aligned spans have no well-defined split and stay unsupported (ADR 0033). Deferred until daily driving shows the need. |
 | **Nav-model unification candidates** (ADR 0034) | The sheets/panes shared key protocol + contract test shipped Jul 8 2026 (`src/navProtocol.ts`, `src/navModel.contract.test.ts`). Two divergences documented as intentional but open to later unification if Martin wants: (a) shift+arrow — sheets extend a range, panes just step (would become span-widening once tree-aligned rungs exist, see the entry above); (b) remove — sheets delete a row/col *at a seam* (Backspace=before/Delete=after), panes close *a region*; sided seam-deletion for panes would close whole subtrees at once (several panes) — recoverable (views, not data) but aggressive. |
 | **Guide copy: overwrite-to-update a stale `tine-guide/` copy** | Deferred. The current guide-copy action is intentionally non-destructive: it copies missing pages and assets but never overwrites an existing copied page because the user may have edited it. A future refresh flow should make stale-copy replacement explicit and reviewable. |

@@ -99,8 +99,8 @@ outrank older prose. Record a discrepancy rather than silently choosing a story.
 - `Tine Guide` is the v1 navigation owner. In-app Guide full-text search and a
   hierarchical public side navigation would be product changes; this program
   records but does not implement them.
-- Managed-storage/sync status copy is frozen unless Martin separately provides
-  current wording. The documentation worker must not infer status from code.
+- Storage copy describes Direct Files, Tine's only storage mode since
+  2026-09-15. The documentation worker must not infer status from code.
 - Kimi may edit Markdown templates and generated `website/guide/` output. It may
   append a manager-approved entry to `GUIDE_TEMPLATES`, but may not otherwise
   edit Rust production logic.
@@ -155,7 +155,7 @@ inventory finds a material gap. Likely families are:
 - plugins and themes;
 - Android/mobile and desktop/platform differences;
 - files, backups, external edits, graph compatibility and recovery;
-- managed storage/sync, clearly labelled according to its current status.
+- file-sync services and conflict review (Direct Files).
 
 `Feature showcase` remains the rendering/conformance kitchen sink. It is not a
 substitute for task-oriented explanation.

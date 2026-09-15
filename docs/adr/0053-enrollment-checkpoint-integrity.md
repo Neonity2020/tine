@@ -1,6 +1,6 @@
 # 0053. Enrollment checkpoint integrity and legacy verification
 
-- **Status:** Accepted
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-08-10
 - **Supersedes:** [0050](0050-private-enrollment-checkpoint-authority.md)
 

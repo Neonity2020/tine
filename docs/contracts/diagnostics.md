@@ -23,10 +23,10 @@ a fixed-shape event or a fixed content-free terminal line.
 
 `TINE_DEBUG` and `--debug` are parsed in exactly one function,
 `src-tauri/src/debug.rs::debug_opt_in_requested`. `debug_init` hands its answer
-to `tine_core::sync_runtime::set_runtime_debug_diagnostics(bool)` once, at the
+to `tine_core::backend_error::set_runtime_debug_diagnostics(bool)` once, at the
 top of `run()` and before any subsystem starts, and every later reader — core
 and src-tauri alike — asks
-`tine_core::sync_runtime::runtime_debug_diagnostics_enabled()`. `debug_enabled()`
+`tine_core::backend_error::runtime_debug_diagnostics_enabled()`. `debug_enabled()`
 in src-tauri is a thin delegate to that same reader, so the two crates cannot
 disagree about whether debugging is on (I-12). The setter is plain and
 idempotent, not init-once: a test may flip it, and the last call wins.
@@ -53,15 +53,9 @@ require an exact reviewed entry, and a caught failure reaches one only through
 and message hash and drops the message itself. Graph identity on the save path
 is represented by a count, never a page name.
 
-Every failed page save has one fixed-shape native receipt. Direct Files records
-its closed save-failure code and guarded-index counters as `direct.save`;
-Tine-managed storage records the actor's closed refusal code as `managed.save`.
-Managed conflict and deferred outcomes preserve their closed, content-free
-subtype (for example `managed.conflict.stale_base` or
-`managed.deferred.blocked_recovery`), rather than disappearing behind a generic
-IPC failure.
-Unknown actor stages collapse to `actor_refused_at_stage`: stage text, page
-identity, paths, error prose, and draft content never enter either event.
+Every failed page save has one fixed-shape native receipt: Direct Files records
+its closed save-failure code and guarded-index counters as `direct.save`. Page
+identity, paths, error prose, and draft content never enter the event.
 
 ## Print-site classes
 
@@ -76,13 +70,12 @@ thing on both sides of the boundary:
 | d | Always-on, payload provably content-free | anywhere |
 
 The retained class (b) channels are named, and each is off unless its own flag
-is set: `TINE_PHASE_TRACE`, `TINE_CRDT_TRACE`, `TINE_ACTIVATION_TRACE`,
-`TINE_BATCH_TRACE`, `TINE_PUBLISH_TRACE`, `TINE_SEMANTIC_TRACE`,
-`TINE_TICK_TRACE`, `TINE_CLEAN_WATCHER_TRACE`, and the
-`TINE_DEBUG`/`--debug` opt-in behind `runtime_debug_diagnostics_enabled()` /
-`debug_enabled()`. `crates/tine-core/src/oplog/projection.rs` holds the one class
-(b) line that renders graph bytes; it is legal only because that trace is off by
-default and explicitly requested.
+is set. Only one remains: the `TINE_DEBUG`/`--debug` opt-in behind
+`runtime_debug_diagnostics_enabled()` / `debug_enabled()`. No directed trace
+flag remains in `crates/tine-core/src`. The one core class (b) line,
+`direct_projection.rs::report_projection_failure`, repeats a projection failure
+with its raw error; it is legal only because that opt-in is off by default and
+explicitly requested.
 
 This paragraph is pinned in both directions by
 `directed_trace_flags_are_the_same_set_in_the_contract_and_in_the_census` in
@@ -104,41 +97,6 @@ identifiable there without a relaunch under `TINE_DEBUG`; `ErrorKind` is a
 bounded enum, so it says `PermissionDenied` without the OS prose or the
 directory.
 
-## Managed runtime tick vocabulary
-
-The native bridge emits only these bounded tick states: `idle`,
-`checkpoint_capture_skipped`, `local_mutation`, `provider_mutation`,
-`recovery_blocked`, `recovering`, `retry_full`, `blocked`, `failed`,
-`admitted_noop`, `admitted_complete`, and `terminal`.
-`checkpoint_capture_skipped` is deliberately distinct from `recovering`:
-the disposable checkpoint was not captured, while accepted authority and the
-foreground runtime continue unchanged. This vocabulary is pinned by
-`checkpoint_capture_skip_has_its_own_tick_value`.
-
-The fixed `managed.checkpoint_capture_skipped` receipt carries exactly one of
-`runtime_not_attached`, `indexed_runtime`, `blocked_runtime`,
-`unsettled_runtime`, `durable_frontier_ahead`, or `capture_failed`.
-These are bounded causes, never error prose, and are pinned by
-`fixed_event_shape_contains_no_free_form_message_fields`.
-
-The fixed `managed.history_recovery` receipt carries the recovery attempt,
-closed reason and phase, BatchId and DocumentId, requested and actual CRDT
-floors, closed retry class, numeric fences for all three journal domains,
-accepted/pending/replayed counts, phase durations, checkpoint bytes when a
-checkpoint completed, publication edge, and preservation result. It never
-copies the free-form retry cause; the frontend applies its existing bounded
-sanitizer when that cause is shown or explicitly copied.
-
-The fixed `managed.checkpoint_publication` receipt carries T, E, the age cutoff,
-clock-frozen state and last reset time, the policy revision and byte policy,
-each changed document's identity/floors and I/L/R/B
-measurements, post-cut remainder, hysteresis shortfall, budget overage and
-closed limiting cause, changed/exported/reused and worker export counts,
-hot/cold read and byte totals, phase durations, checkpoint bytes, and the
-commit-last publication edge. Peak RSS is emitted only when measured. These
-records contain identifiers and counts, never page names, paths, or document
-bytes.
-
 Parser failures cross the lsdoc-diff worker boundary only as a status plus
 `ParserDiagnostic`: a nullable numeric offset, UTF-8 input length, and opaque
 input hash. An exception object or free-form parser detail cannot inhabit that
@@ -148,11 +106,11 @@ type.
 
 `crates/tine-core/tests/content_out_of_logs.rs` walks production Rust library
 sources, excluding standalone CLI output and cfg(test) regions. Its exact
-allowlist currently contains 76 Rust production print sites, each with a class,
+allowlist currently contains 18 Rust production print sites, each with a class,
 reason, and gate. A deletion changes the census just as an addition does.
 
 `src/contentOutOfLogs.ratchet.test.ts` walks production TypeScript and TSX and
-classifies 21 variable-bearing frontend console sites. It also pins the parser
+classifies 19 variable-bearing frontend console sites. It also pins the parser
 failure shape and the two allowlist counts in this document. Changes to either
 census require an explicit contract review.
 

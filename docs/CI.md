@@ -89,16 +89,12 @@ change and requires explicit negative contract fixtures plus a fresh build.
 Linux is Tine's complete behavior matrix: its nextest inventory contract proves
 every selected non-ignored `tine-core` test runs exactly once across four
 isolated shards. Selection is allow-by-default: every current and newly added
-test enters the release gate automatically. The only subtraction is the exact
-known-red legacy-oracle corpus, proven BY NAME and classified by behavior family
-rather than hidden behind a module prefix:
-`KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` in
-`scripts/tine-core-nextest-contract.mjs` lists every excluded test, and the
-contract fails both when another test is omitted and when a listed name no
-longer exists. The 2026-08-25 honest unfiltered run completed 2,116 tests with
-2,071 passing, 45 normally failing, 41 ignored, and no hangs or timeouts; it
-removed 47 stale or passing exclusions. A residual legacy-oracle failure is not
-itself a current production fail-before. The same selection and profile run on
+test enters the release gate automatically. The only possible subtraction is
+`KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES` in
+`scripts/tine-core-nextest-contract.mjs`, and it is empty: the known-red
+legacy-oracle corpus it used to list was deleted with Managed Storage
+(ADR 0066). The contract fails when any test is omitted, and a name added to
+the list must exist. The same selection and profile run on
 every pull request, so the PR gate and the release shards cannot drift apart.
 Those tests
 exercise Tine's semantic and lifecycle integration with the

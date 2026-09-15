@@ -1,6 +1,6 @@
 # 0061. Un-wire the per-block Managed Storage layout forward
 
-- **Status:** Accepted; release gated on the same-window write benchmark
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-09-10
 
 ## Context

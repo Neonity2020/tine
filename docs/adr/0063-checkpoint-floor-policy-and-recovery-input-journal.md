@@ -1,6 +1,6 @@
 # 0063. Checkpoint floor policy and recovery-input journal
 
-- **Status:** Accepted
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-09-11
 
 ## Context

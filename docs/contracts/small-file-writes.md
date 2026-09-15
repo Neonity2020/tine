@@ -1,6 +1,6 @@
 # Small-file writes — living contract
 
-Scope: the small files Tine rewrites in place outside the oplog storage path —
+Scope: the small files Tine rewrites in place outside the page-save path —
 `logseq/config.edn` and the PDF/highlight `.edn` sidecars. Page saves are NOT
 covered here; they have their own audited path and their own contract.
 

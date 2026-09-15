@@ -2,7 +2,7 @@
 
 Scope: restoring Markdown/Org, asset sidecars, and `logseq/config.edn` from a
 Tine backup. This is a deliberately separate publication stack from ordinary
-graph saves and managed storage.
+graph saves.
 
 The stack stays capability-bound. Recovery directories and live parents are
 opened beneath approved graph or assets roots with `cap-std`; symlink or

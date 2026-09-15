@@ -1,6 +1,6 @@
 # 0055. One native supervisor owns storage-mode transitions
 
-- **Status:** Implemented
+- **Status:** Implemented; narrowed to Direct Files only by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-08-16
 - **Amends:** [0049](0049-oplog-first-sparse-storage.md)
 

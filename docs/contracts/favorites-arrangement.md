@@ -14,9 +14,8 @@ config.edn        --reconcile-> arrangement            (external changes)
 - **`config.edn :favorites`** stays the shared, Logseq-readable answer to *which*
   pages are favorited, in display order. Logseq keeps working unchanged.
 - **The arrangement page** owns *nesting, order and collapse*. It is an ordinary
-  graph page, so it merges deterministically through the oplog on Managed
-  Storage and reaches the Concord conflict UI on Direct Files — for free, and
-  with **no new write path**: it saves through the audited `save_page`.
+  graph page, so a divergent copy reaches the Concord conflict UI — for free,
+  and with **no new write path**: it saves through the audited `save_page`.
 
 A blob (JSON or an EDN key) was rejected for exactly this reason: it has no
 merge semantics, so two devices editing favorites is last-writer-wins, which is
@@ -89,9 +88,8 @@ resolved.
 
 The arrangement page is **never a reference source** — its links are a sidebar
 arrangement, not a mention. This is enforced by `refs::ReferenceSourceExclusions`,
-the single predicate shared by both reference engines; Direct Files and managed
-storage previously open-coded the same comparison at eight sites, which is how
-they drift. **A new exclusion belongs in that type, not at a call site.**
+the single predicate the reference path uses; eight sites once open-coded the
+same comparison, which is how they drift. **A new exclusion belongs in that type, not at a call site.**
 
 An *unmarked* page named "Favorites" remains an ordinary reference source.
 Tested by `query::tests::favorites_layout_page_is_never_a_reference_source`.

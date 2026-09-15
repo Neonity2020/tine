@@ -1,6 +1,6 @@
 # 0060. Qualified generations bound ordinary work while retaining history
 
-- **Status:** Accepted — implementation and cutover remain gated
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-09-07
 - **Partially supersedes:** [ADR 0049](0049-oplog-first-sparse-storage.md): the first-rollout prohibition on retiring redundant hot representations, not the preservation of logical history.
 

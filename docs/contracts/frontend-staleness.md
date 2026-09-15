@@ -23,9 +23,8 @@ Existing specialized exemplars remain `pdfOwnership.ts`, RightSidebar's
 Each entry names the item, the production producer that owns the work, the
 trigger or key that may re-run it, the numeric bound, and the proof test. All
 four are pinned by `src/frontendStaleness.contract.test.ts`; a bound with no
-proof test is not a contract. The packet's fifth item is a Rust-side
-measurement of the Managed clean-reopen path and is recorded in
-`docs/storage-sync-contract.md` instead.
+proof test is not a contract. The packet's fifth item measured a storage mode
+Tine no longer has, so it has no entry here.
 
 **Item 1 — sort-key derivation.** Producer: the `sortedRows` memo in
 `src/components/SheetTable.tsx`. Trigger: a change of sort column/direction or

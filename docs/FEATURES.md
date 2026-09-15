@@ -89,10 +89,9 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   and writes to it, and fails closed if the link is later retargeted; pages,
   journals, and configuration never inherit that exception.
 - **Live external-asset refresh** — images replaced by an editor or a
-  whole-graph synchronizer refresh in place in both Direct Files and managed
-  storage. Asset observation is metadata-only and separate from the managed
-  oplog; PDFs, audio, and video already open in Tine are left undisturbed and
-  use the new bytes on their next open.
+  whole-graph synchronizer refresh in place. Asset observation is metadata-only;
+  PDFs, audio, and video already open in Tine are left undisturbed and use the
+  new bytes on their next open.
 - **Drag the corner grip to resize an image *or a video*** — stored as a width % in
   Logseq's `{:width …}` brace, so it round-trips.
 - ⊕ **Audio ⤢ Expand** opens a wide overlay player — a **waveform scrubber** with

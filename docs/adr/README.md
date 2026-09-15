@@ -75,19 +75,20 @@ see the project `CLAUDE.md`.
 | [0046](0046-declarative-plugin-settings-and-themes.md) | Plugin settings and themes are separate declarative host contracts | Accepted |
 | [0047](0047-android-plugin-platform-at-launch.md) | Android joins the initial plugin-platform launch through explicit opt-in | Accepted |
 | [0048](0048-compatible-managed-sync.md) | Managed sync uses operation truth with an optional shared Markdown projection | Superseded by 0049 |
-| [0049](0049-oplog-first-sparse-storage.md) | Oplog-first sparse storage uses catalog and stable home-page shards | Accepted — implementation/LocalActive gated |
+| [0049](0049-oplog-first-sparse-storage.md) | Oplog-first sparse storage uses catalog and stable home-page shards | Superseded by 0066 |
 | [0050](0050-private-enrollment-checkpoint-authority.md) | Private enrollment authority authenticates bounded immutable checkpoints | Superseded by 0053 |
-| [0051](0051-single-user-multipart-bootstrap-authority.md) | Single-user multipart bootstrap authority is one commit-last V1 publication | Accepted — inactive format contract |
+| [0051](0051-single-user-multipart-bootstrap-authority.md) | Single-user multipart bootstrap authority is one commit-last V1 publication | Superseded by 0054 |
 | [0052](0052-ios-plugin-platform-apple-4-7-2.md) | The plugin API may never re-export native surface (Apple 4.7.2); read before widening `PLUGIN_CAPABILITIES` | Accepted |
-| [0053](0053-enrollment-checkpoint-integrity.md) | Current enrollment checkpoints provide versioned integrity; legacy HMAC is verification-only | Accepted |
-| [0054](0054-lazy-genesis-managed-activation.md) | Managed activation imports one lazy genesis and derives disposable projections once | Accepted — implementation gated |
-| [0055](0055-native-storage-mode-supervisor.md) | One native supervisor owns storage-mode transitions and an always-available emergency Direct Files escape | Accepted — implementation in progress |
+| [0053](0053-enrollment-checkpoint-integrity.md) | Current enrollment checkpoints provide versioned integrity; legacy HMAC is verification-only | Superseded by 0066 |
+| [0054](0054-lazy-genesis-managed-activation.md) | Managed activation imports one lazy genesis and derives disposable projections once | Superseded by 0066 |
+| [0055](0055-native-storage-mode-supervisor.md) | One native supervisor owns storage-mode transitions and an always-available emergency Direct Files escape | Implemented; narrowed to Direct Files by 0066 |
 | [0056](0056-concord-base-ledger-and-three-way.md) | Concord base ledger enables block-level 3-way conflict suggestions | Accepted |
 | [0057](0057-concord-conflict-objects-and-in-page-resolution.md) | A conflict is a derived, multi-sided object resolved in the page; markers are parsed, never invented | Accepted |
 | [0058](0058-privacy-safe-diagnostic-flight-recorder.md) | Production diagnostics use a bounded privacy-safe flight recorder, separate from detailed debug logs | Accepted |
 | [0059](0059-bounded-theme-presentation-presets.md) | Theme API 0.2 adds bounded host-owned typography, journal-header, and Today-summary presets | Accepted |
-| [0060](0060-qualified-generations-and-indefinite-cold-history.md) | Qualified generations bound ordinary work while retaining history | Accepted; cutover gated |
-| [0061](0061-unwire-per-block-managed-layout-forward.md) | Managed Storage returns forward to a catalog plus per-page shards; per-block stores are preserved and rebuilt | Accepted; benchmark gated |
-| [0062](0062-real-deletion-and-restore-by-reconstruction.md) | Deleted blocks leave the live page document; Restore re-materializes from accepted history under the same Logseq UUID | Accepted |
-| [0063](0063-checkpoint-floor-policy-and-recovery-input-journal.md) | Checkpoint floor cuts on measured bytes with acceptance age only as an eligibility bound; a third journal domain holds unaccepted peer originals | Accepted |
-| [0064](0064-generation-root-extension-and-hot-retirement.md) | Generation roots carry sealed accepted indexes instead of a lifetime-sized covered roster, and covered hot history is retired only after the new marker names the same bytes cold | Accepted |
+| [0060](0060-qualified-generations-and-indefinite-cold-history.md) | Qualified generations bound ordinary work while retaining history | Superseded by 0066 |
+| [0061](0061-unwire-per-block-managed-layout-forward.md) | Managed Storage returns forward to a catalog plus per-page shards; per-block stores are preserved and rebuilt | Superseded by 0066 |
+| [0062](0062-real-deletion-and-restore-by-reconstruction.md) | Deleted blocks leave the live page document; Restore re-materializes from accepted history under the same Logseq UUID | Superseded by 0066 |
+| [0063](0063-checkpoint-floor-policy-and-recovery-input-journal.md) | Checkpoint floor cuts on measured bytes with acceptance age only as an eligibility bound; a third journal domain holds unaccepted peer originals | Superseded by 0066 |
+| [0064](0064-generation-root-extension-and-hot-retirement.md) | Generation roots carry sealed accepted indexes instead of a lifetime-sized covered roster, and covered hot history is retired only after the new marker names the same bytes cold | Superseded by 0066 |
+| [0066](0066-remove-managed-storage.md) | Managed Storage is removed; Direct Files is the only storage mode, and any future sync is specified afresh under code, performance, and space budgets | Accepted |

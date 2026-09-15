@@ -1,6 +1,6 @@
 # 0054. Managed activation imports one lazy genesis
 
-- **Status:** Accepted — implementation gated
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-08-14
 - **Supersedes:** [0051](0051-single-user-multipart-bootstrap-authority.md)
 - **Amends:** [0049](0049-oplog-first-sparse-storage.md)

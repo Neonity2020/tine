@@ -60,5 +60,5 @@ Keep worktree-local `target/` directories: a single shared Cargo target would
 serialize otherwise-disjoint parallel batches on Cargo locks and mix branch
 fingerprints. Re-measure real overnight batches after the workflow change.
 Consider splitting `tine-core` only if profiles still show a persistent large
-edit-build cost in one code area; never split Direct Files or managed-storage
-authority merely to reduce compile time.
+edit-build cost in one code area; never split Direct Files authority merely to
+reduce compile time.

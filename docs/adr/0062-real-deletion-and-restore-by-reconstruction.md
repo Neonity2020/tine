@@ -1,6 +1,6 @@
 # 0062. Real deletion and Restore by reconstruction
 
-- **Status:** Accepted
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-09-10
 
 ## Context

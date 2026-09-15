@@ -1,6 +1,6 @@
 # 0064. Generation root extension and hot-history retirement
 
-- **Status:** Accepted
+- **Status:** Superseded by [0066](0066-remove-managed-storage.md)
 - **Date:** 2026-09-11
 
 ## Context

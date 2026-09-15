@@ -11,11 +11,6 @@ icon:: 🛟
 	- 1. Open `logseq/.tine-trash/pages/` or `logseq/.tine-trash/journals/` inside your graph. Deleted files have a timestamp followed by `__` before their original name.
 	- 2. Remove the timestamp and `__`, then move the file into the configured pages or journals folder. For a page that originally lived elsewhere, you may return it to that location instead.
 	- 3. What you should see: Tine notices the restored file like any external change, and the page reappears.
-- ## Review several deletions in Tine-managed storage
-	- 1. Open the **Deleted pages** dock after the warning appears. Tier 2 starts at four deletions; Tier 3 covers at least 10% of the graph (rounded up), or 50 pages when that is lower, and pauses propagation for about five minutes. Smaller Tier 1 sweeps stay quiet.
-	- 2. Review every member page, then choose exactly one explicit action: **Restore**, **Re-apply**, or **Keep deletion**. Closing the warning or panel records no choice and does not dispose the sweep.
-	- 3. If Restore fails, read the recorded cause and choose **Run Restore again**. Tine resumes through its durable whole-sweep Restore; do not recreate pages one at a time while it is running.
-	- 4. What you should see: progress and completion update live, and the finished sweep remains visible with **Restored**, **Deletion re-applied**, or **Deletion kept**. This surface applies only to experimental managed storage; the single-file steps above remain the Direct files recovery path. See [[Features/Managed sync]].
 - ## Restore an earlier state of the graph
 	- 1. Open Settings (**t s**) → **Backups & recovery** and find the snapshot from before the damage. (Tine snapshots your Markdown/Org files on every launch; **Snapshots to keep** controls how many survive.)
 	- 2. Choose **Restore** beside it and confirm.
@@ -37,9 +32,8 @@ icon:: 🛟
 	- Meaning: Tine started, but the open itself is stuck or has failed. Once it takes longer than a moment you get a card naming the current phase and the elapsed time; if the open cannot complete, the same card becomes **Tine needs help opening this workspace** with actions.
 	- 1. **Retry lookup** — attempt the same open again. This is safe to repeat.
 	- 2. **Open another graph…** — pick a different folder and leave this one untouched.
-	- 3. **Return … to Direct Files…** — offered only for a graph you enrolled in experimental Tine-managed storage; it puts that graph back on plain files.
-	- 4. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
-	- 5. What you should see: no managed-storage data has been discarded by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
+	- 3. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
+	- 4. What you should see: nothing about the graph has been changed by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
 - ## Create a privacy-safe diagnostic report
 	- 1. Open Settings → **Diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
 	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.

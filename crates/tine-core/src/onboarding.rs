@@ -69,10 +69,6 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         markdown: include_str!("templates/plugins.md"),
     },
     GuideTemplate {
-        title: "Features/Managed sync",
-        markdown: include_str!("templates/managed-sync.md"),
-    },
-    GuideTemplate {
         title: "Features/Tips & shortcuts",
         markdown: include_str!("templates/tips.md"),
     },
@@ -167,7 +163,6 @@ pub struct GuideCopyResult {
 pub(crate) struct GuideCopyPage {
     pub(crate) name: String,
     pub(crate) markdown: String,
-    pub(crate) page: PageDto,
 }
 
 pub(crate) struct GuideCopyAsset {
@@ -308,12 +303,7 @@ pub(crate) fn guide_copy_plan(title: &str) -> io::Result<GuideCopyPlan> {
                 rewrite_bundled_guide_links(template.markdown, &renames),
                 &name,
             );
-            let page = markdown_page_dto(&name, &name, &markdown)?;
-            Ok(GuideCopyPage {
-                name,
-                markdown,
-                page,
-            })
+            Ok(GuideCopyPage { name, markdown })
         })
         .collect::<io::Result<Vec<_>>>()?;
     let assets = referenced_guide_assets()?
@@ -698,7 +688,6 @@ mod tests {
         let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
             .expect("files reference was copied");
         assert!(copied_markdown.contains("logseq/.tine-trash"));
-        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Sheets]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -748,7 +737,6 @@ mod tests {
         assert!(
             copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
         );
-        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -806,90 +794,6 @@ mod tests {
             copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn absence_sweep_recovery_is_taught_in_both_guide_surfaces() {
-        let managed = GUIDE_TEMPLATES
-            .iter()
-            .find(|template| template.title == "Features/Managed sync")
-            .expect("managed-sync page is registered");
-        assert!(managed
-            .markdown
-            .contains("Review a detected group deletion"));
-        assert!(managed.markdown.contains("Four deleted pages"));
-        assert!(managed.markdown.contains("**Restore**"));
-        assert!(managed.markdown.contains("**Re-apply**"));
-        assert!(managed.markdown.contains("**Keep deletion**"));
-        assert!(managed.markdown.contains("Run Restore again"));
-        assert!(managed
-            .markdown
-            .contains("Closing either the warning or the panel makes no decision"));
-        assert!(managed
-            .markdown
-            .contains("[[Reference/Troubleshooting and recovery]]"));
-
-        let recovery = GUIDE_TEMPLATES
-            .iter()
-            .find(|template| template.title == "Reference/Troubleshooting and recovery")
-            .expect("recovery page is registered");
-        assert!(recovery
-            .markdown
-            .contains("Review several deletions in Tine-managed storage"));
-        assert!(recovery
-            .markdown
-            .contains("Closing the warning or panel records no choice"));
-        assert!(recovery.markdown.contains("finished sweep remains visible"));
-
-        let dir = scratch("tine-guide-absence-sweep-copy");
-        let graph = Graph::open(&dir);
-        let copied = copy_guide_into_graph(&graph, "Features/Managed sync").unwrap();
-        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
-            .expect("managed-sync page was copied");
-        assert!(copied_markdown.contains("Run Restore again"));
-        assert!(copied_markdown.contains("[[tine-guide/Reference/Troubleshooting and recovery]]"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn automatic_full_history_recovery_is_taught_in_every_managed_sync_guide_surface() {
-        const RECOVERY_SENTENCE: &str =
-            "Rebuilding local history to merge older changes. Editing will resume automatically.";
-        let managed = GUIDE_TEMPLATES
-            .iter()
-            .find(|template| template.title == "Features/Managed sync")
-            .expect("managed-sync page is registered");
-        assert!(managed.markdown.contains(RECOVERY_SENTENCE));
-        assert!(managed
-            .markdown
-            .contains("waits for the missing change to arrive"));
-        assert!(managed.markdown.contains("retries automatically"));
-        assert!(managed.markdown.contains("keeps your unsent edits"));
-
-        let virtual_page = bundled_guide_pages()
-            .unwrap()
-            .into_iter()
-            .find(|page| page.title == "Features/Managed sync")
-            .expect("managed-sync page is available in the read-only Guide");
-        fn collect_outline_text(blocks: &[crate::model::BlockDto], text: &mut String) {
-            for block in blocks {
-                text.push_str(&block.raw);
-                text.push('\n');
-                collect_outline_text(&block.children, text);
-            }
-        }
-        let mut virtual_text = String::new();
-        collect_outline_text(&virtual_page.page.blocks, &mut virtual_text);
-        assert!(virtual_text.contains(RECOVERY_SENTENCE));
-
-        let dir = scratch("tine-guide-automatic-full-history-recovery");
-        let graph = Graph::open(&dir);
-        let copied = copy_guide_into_graph(&graph, "Features/Managed sync").unwrap();
-        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
-            .expect("managed-sync page was copied");
-        assert!(copied_markdown.contains(RECOVERY_SENTENCE));
-        assert!(copied_markdown.contains("retries automatically"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
