@@ -964,7 +964,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 14),
+        ("crates/tine-core/src/model.rs", "cap.remove_file", 3),
         ("crates/tine-core/src/model.rs", "fs.create_dir_all", 4),
         ("crates/tine-core/src/model.rs", "fs.remove_file", 11),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
@@ -998,6 +998,11 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "crates/tine-core/src/model/conflicts.rs",
             "fs.remove_file",
             1,
+        ),
+        (
+            "crates/tine-core/src/model/graph_text_writes.rs",
+            "cap.remove_file",
+            11,
         ),
         (
             "crates/tine-core/src/model/open_graph.rs",

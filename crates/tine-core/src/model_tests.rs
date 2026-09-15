@@ -10797,10 +10797,10 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
 fn projection_twin_check_uses_only_bounded_direct_metadata_lookups() {
     let source = crate::test_support::model_module_source();
     let shape = source
-        .split_once("    fn ensure_projection_target_shape(")
+        .split_once("fn ensure_projection_target_shape(")
         .expect("projection target-shape function")
         .1
-        .split_once("\n    fn ensure_projection_parent_binding(")
+        .split_once("fn ensure_projection_parent_binding(")
         .expect("next projection function")
         .0;
 
@@ -11011,10 +11011,10 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
         hard link that shared storage refuses; imitate move_graph_text_exact_no_replace";
     let source = crate::test_support::model_module_source();
     let create = source
-        .split_once("    fn graph_text_atomic_create_with_proof(")
+        .split_once("fn graph_text_atomic_create_with_proof(")
         .expect("Direct Files create path")
         .1
-        .split_once("\n    fn graph_text_atomic_write_with_conflict(")
+        .split_once("fn graph_text_atomic_write_with_conflict(")
         .expect("next Direct Files write function")
         .0;
     assert!(
@@ -11027,7 +11027,7 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     assert!(!create.contains(".move_exact_no_replace("), "{RULE}");
 
     let write = source
-        .split_once("    fn graph_text_atomic_write_validated(")
+        .split_once("fn graph_text_atomic_write_validated(")
         .expect("Direct Files validated write path")
         .1
         .split_once("\n    /// Replace an existing editor target")
@@ -11045,10 +11045,10 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
     assert!(!write.contains("target.parent().rename("), "{RULE}");
 
     let replace = source
-        .split_once("    fn graph_text_atomic_replace_bound(")
+        .split_once("fn graph_text_atomic_replace_bound(")
         .expect("Direct Files bounded replacement")
         .1
-        .split_once("\n    fn graph_text_move_noreplace(")
+        .split_once("fn graph_text_move_noreplace(")
         .expect("next projection method")
         .0;
     // The retire/publish closure, the recovery set-aside, and the restore.
