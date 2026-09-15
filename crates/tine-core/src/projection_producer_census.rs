@@ -681,12 +681,31 @@ fn tine_storage_surface_inventory(files: &[ProductionFile]) -> Vec<(String, Stri
 
 fn tine_storage_imported_call_inventory(files: &[ProductionFile]) -> Vec<(String, String, usize)> {
     let identifier = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("static regex");
-    let mut inventory = Vec::new();
-    for file in files {
-        let imports = tine_storage_surface_inventory(std::slice::from_ref(file))
+    let imports_of = |file: &ProductionFile| {
+        tine_storage_surface_inventory(std::slice::from_ref(file))
             .into_iter()
             .filter_map(|(_, token, _)| token.starts_with("usetine_storage").then_some(token))
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    };
+    let mut inventory = Vec::new();
+    for file in files {
+        let mut imports = imports_of(file);
+        // A module that opens with `use super::*;` calls its parent's imports
+        // too. K3 split model.rs into such seam modules; without this, a
+        // `DurableDirectoryPublication::open(` moved into model/atomic_copy.rs
+        // silently left the surface instead of moving on it.
+        if file.compact.contains("usesuper::*;") {
+            let parent = file
+                .relative
+                .rsplit_once('/')
+                .map(|(directory, _)| format!("{directory}.rs"));
+            if let Some(parent) = files
+                .iter()
+                .find(|candidate| Some(&candidate.relative) == parent.as_ref())
+            {
+                imports.extend(imports_of(parent));
+            }
+        }
         if imports.is_empty() {
             continue;
         }
@@ -966,6 +985,17 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         // K3 (2026-09-15) moved these out of model.rs verbatim; the module's
         // totals did not change.
         (
+            "crates/tine-core/src/model/assets.rs",
+            "fs.create_dir_all",
+            3,
+        ),
+        (
+            "crates/tine-core/src/model/assets.rs",
+            "fs.remove_dir_all",
+            1,
+        ),
+        ("crates/tine-core/src/model/assets.rs", "fs.remove_file", 2),
+        (
             "crates/tine-core/src/model/atomic_copy.rs",
             "cap.remove_file",
             1,
@@ -1013,43 +1043,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         (
-            "crates/tine-core/src/model/projection_rename.rs",
-            "cap.create_dir",
-            1,
-        ),
-        (
-            "crates/tine-core/src/model/projection_rename.rs",
-            "cap.remove_file",
-            2,
-        ),
-        (
-            "crates/tine-core/src/model/projection_rename.rs",
-            "libc.renameat2",
-            2,
-        ),
-        (
-            "crates/tine-core/src/model/projection_rename.rs",
-            "open.create_new",
-            2,
-        ),
-        (
-            "crates/tine-core/src/model/projection_rename.rs",
-            "windows.NtSetInformationFile",
-            1,
-        ),
-        ("crates/tine-core/src/model/trash.rs", "fs.create_dir_all", 1),
-        (
-            "crates/tine-core/src/model/assets.rs",
-            "fs.create_dir_all",
-            3,
-        ),
-        (
-            "crates/tine-core/src/model/assets.rs",
-            "fs.remove_dir_all",
-            1,
-        ),
-        ("crates/tine-core/src/model/assets.rs", "fs.remove_file", 2),
-        (
             "crates/tine-core/src/model/conflicts.rs",
             "fs.create_dir_all",
             1,
@@ -1075,6 +1068,36 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/model/pdf.rs", "fs.create_dir_all", 6),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "cap.create_dir",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "cap.remove_file",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "libc.renameat2",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "open.create_new",
+            2,
+        ),
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "windows.NtSetInformationFile",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/trash.rs",
+            "fs.create_dir_all",
+            1,
+        ),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
         ("crates/tine-core/src/publish.rs", "cap.create_dir", 2),
         // Stage-side parents: the recovery slot, a query export's parent
@@ -1374,7 +1397,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         // hard link that shared storage refuses — for the graph tree's own
         // no-clobber rename (`move_graph_text_exact_no_replace`). The two
         // remaining opens are the app-private durable authorities.
-        ("crates/tine-core/src/model/atomic_copy.rs", "durable_directory.open", 2),
+        (
+            "crates/tine-core/src/model/atomic_copy.rs",
+            "durable_directory.open",
+            2,
+        ),
         ("src-tauri/src/plugins.rs", "package.publish", 1),
         ("src-tauri/src/plugins.rs", "package.recover", 1),
         ("src-tauri/src/plugins.rs", "package.retire", 1),
@@ -1403,9 +1430,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-15: K2 made the query walk and Direct `property_owner_rows`
     // test-only; their storage calls left the production surface, by deletion
     // only.
+    // 2026-09-15: K3 moved model.rs's storage calls verbatim into the model/
+    // seam modules (atomic_copy, projection_rename, trash), which reach
+    // model.rs's imports through `use super::*`; the inventory now follows
+    // that inheritance. With model/*.rs read as model.rs, the surface hashes
+    // to the previous digest: paths moved, nothing else.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "4b8e68edda6809e5fc3eacd25cc4e49974afe7258f547381f2068f07161f1693",
+        "a3cc16ac263c9e35f283c3880b454f81890714862b559fd73a48077c44662e3b",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
