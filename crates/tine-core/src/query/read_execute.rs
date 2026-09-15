@@ -114,7 +114,7 @@ impl<'a> SnapshotQueryReader<'a> {
         if !result.report.supported || query.is_invalid() {
             return Ok(result);
         }
-        let compiled = super::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let compiled = super::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
         let statement = lower_query(
             &query,
             &LoweringInputs {

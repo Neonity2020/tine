@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use tine_storage::sqlite::{PhysicalPlanning, PhysicalPropertyAtom, PhysicalTag};
 
 use crate::config::ParseConfig;
+use crate::date::planning_day;
 use crate::query::atom::{AtomFormat, AtomOrigin};
-use crate::query::eval::planning_day;
 use crate::query::path_refs::{path_refs_closure, PathRefBlock};
 use crate::query::registry::owner_property_atoms;
 

@@ -14767,51 +14767,6 @@ fn registry_graph(tag: &str) -> PathBuf {
     dir
 }
 
-#[test]
-fn a_key_page_save_advances_the_registry_generation_and_an_unrelated_save_does_not() {
-    let dir = registry_graph("registry-key-page-save");
-    let graph = Graph::open(&dir);
-    graph.warm_cache();
-    let before = graph.property_registry_generation();
-
-    // A page that is not a property key: its rows are covered by the page-cache
-    // generation, and nothing about the key's declarations moved.
-    let unrelated = graph
-        .load_named("Unrelated", PageKind::Page)
-        .unwrap()
-        .unwrap();
-    graph
-        .save_page(&unrelated, unrelated.rev.as_deref())
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        graph.property_registry_generation(),
-        before,
-        "an unrelated save changes no row and no declaration"
-    );
-
-    // The key page. Its `tine.type::` is what the walk coerces by, so the
-    // snapshot has to be rebuilt even though no property ROW changed.
-    let mut key_page = graph.load_named("score", PageKind::Page).unwrap().unwrap();
-    key_page.blocks[0].raw = "the key page, reworded".into();
-    key_page.pre_block = Some("tine.type:: text".to_string());
-    graph.save_page(&key_page, key_page.rev.as_deref()).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        graph.property_registry_generation() > before,
-        "a declaration change advances the generation"
-    );
-    assert_eq!(
-        graph
-            .property_registry()
-            .effective_type("score")
-            .expect("the key is in the registry"),
-        crate::query::ir::ObservedType::Text,
-        "the declared type overrides the observed one (§6.3)"
-    );
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// A declaration page changes the meaning of a property query on another page.
 /// `01` is the number 1 under a number key and the text `01` under a text key.
 #[test]
@@ -14895,67 +14850,6 @@ fn a_journal_title_format_change_answers_a_journal_day_query_anew() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Two readers racing the rebuild never see a half-built table: every snapshot
-/// handed out is internally complete, and one generation always means one set
-/// of rows.
-#[test]
-fn concurrent_readers_never_observe_a_half_built_registry() {
-    let dir = registry_graph("registry-concurrent-readers");
-    let graph = Arc::new(Graph::open(&dir));
-    graph.warm_cache();
-
-    let observations = Arc::new(std::sync::Mutex::new(Vec::<(u64, Vec<String>)>::new()));
-    let mut handles = Vec::new();
-    for _ in 0..8 {
-        let graph = Arc::clone(&graph);
-        let observations = Arc::clone(&observations);
-        handles.push(std::thread::spawn(move || {
-            for _ in 0..40 {
-                let snapshot = graph.property_registry();
-                let shape = snapshot
-                    .rows()
-                    .iter()
-                    .map(|row| {
-                        format!(
-                            "{}:{:?}:{}",
-                            row.normalized_name, row.observed_type, row.count_blocks
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                // A snapshot is never empty-but-generation-advanced: the key is
-                // in every published table this graph can produce.
-                assert!(
-                    shape.iter().any(|row| row.starts_with("score:")),
-                    "a published snapshot always carries the graph's keys: {shape:?}"
-                );
-                observations
-                    .lock()
-                    .unwrap()
-                    .push((snapshot.generation(), shape));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    let observations = observations.lock().unwrap();
-    let mut by_generation: std::collections::BTreeMap<u64, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (generation, shape) in observations.iter() {
-        match by_generation.get(generation) {
-            Some(seen) => assert_eq!(
-                seen, shape,
-                "generation {generation} was published with two different tables"
-            ),
-            None => {
-                by_generation.insert(*generation, shape.clone());
-            }
-        }
-    }
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// O11: the registry built from the Direct Files READY PROJECTION STREAM and the
 /// one built from the Direct Files cold document iterator are one table. The
 /// producers disagree only about
@@ -15017,15 +14911,12 @@ fn every_implemented_row_source_builds_the_same_registry() {
     // cannot show WHICH source answered (that is the point of the guard above),
     // so the projection's own read counter is the witness: a rebuild that fell
     // back to the document iterator touches the projection zero times.
-    assert_eq!(graph.property_registry().rows(), from_documents.rows());
     let reads_before = graph.direct_projection_indexed_reads_test();
-    let source_generation = graph.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-    let rebuilt = graph.rebuild_property_registry(&config, source_generation);
+    assert_eq!(graph.property_registry().rows(), from_documents.rows());
     assert!(
         graph.direct_projection_indexed_reads_test() > reads_before,
-        "a registry rebuild on a ready Direct Files graph reads the projection"
+        "the oracle's registry on a ready Direct Files graph reads the projection"
     );
-    assert_eq!(rebuilt.rows(), from_documents.rows());
     let _ = fs::remove_dir_all(dir);
 }
 

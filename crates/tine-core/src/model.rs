@@ -1532,17 +1532,6 @@ pub struct Graph {
     /// today). Lets a re-render, a second component showing the same query, or
     /// navigating back to a page recompute nothing; never serves a stale result.
     derived_cache: RwLock<Option<DerivedCache>>,
-    /// The graph's observed property registry (SPEC §6.1–§6.4): a **disposable,
-    /// in-memory, graph-scoped** cache, one per open graph. Nothing is persisted
-    /// and nothing is authoritative — the
-    /// property lines in the Markdown/Org tree are (D-3).
-    ///
-    /// It is built under ONE snapshot and swapped atomically, refreshed
-    /// (debounced ~250 ms) when the page-cache generation changes, when a page
-    /// whose name IS a property key is saved, and **unconditionally** when
-    /// `ParseConfig::digest()` differs from the digest the snapshot was built
-    /// under (G7). It is never rebuilt per query.
-    property_registry: RwLock<Option<PropertyRegistryState>>,
     /// Disposable SQLite facts for Direct Files. Markdown/Org and the parsed
     /// page cache remain authoritative; indexed reads are admitted only when
     /// this worker has published the exact current `cache_gen`.
@@ -2605,22 +2594,6 @@ impl DerivedEntry {
         DerivedEntry { result }
     }
 }
-
-/// One published registry snapshot plus what it was built from, so the refresh
-/// rule can decide cheaply whether it is still current.
-struct PropertyRegistryState {
-    registry: Arc<crate::query::registry::Registry>,
-    /// The `cache_gen` the rows were read at.
-    source_generation: u64,
-    /// When the snapshot was published, for the ~250 ms debounce (§6.4).
-    built_at: std::time::Instant,
-    /// Set when a page whose name is a property key was saved, so the next read
-    /// rebuilds even at an unchanged generation.
-    declarations_dirty: bool,
-}
-
-/// The registry refresh debounce (§6.4): a burst of saves rebuilds once.
-const PROPERTY_REGISTRY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Which of SPEC §5.9's states one dispatched query attempt reached.
 ///
@@ -3961,7 +3934,6 @@ impl Graph {
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
-            property_registry: RwLock::new(None),
             external_observation_epoch: std::sync::atomic::AtomicU64::new(0),
             external_reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
             external_observation_instance: NEXT_EXTERNAL_OBSERVATION_INSTANCE
@@ -4311,6 +4283,7 @@ impl Graph {
     /// The generation is re-checked after the read for the same reason every
     /// other projection reader re-checks it: a snapshot that straddles a
     /// rebuild is not a snapshot.
+    #[cfg(test)]
     fn direct_projection_property_owner_rows(
         &self,
     ) -> Option<(
@@ -4573,7 +4546,7 @@ impl Graph {
             // No property predicate can observe registry types in this plan.
             Arc::new(crate::query::registry::Registry::empty(&config))
         };
-        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
         let fts_ready = match crate::query::results::probe_fts_ready(&mut job.snapshot) {
             Ok(ready) => ready,
             Err(error) => return direct_attempt_from_read(Err(error.into())),
@@ -4968,9 +4941,7 @@ impl Graph {
     /// the oracle reads (I-12). Returned as the owned piece the borrow in
     /// `LoweringInputs` needs.
     ///
-    /// SQL-only, from the caller's already-owned job: the legacy
-    /// `Graph::property_registry()` walk and its ~250 ms UI debounce are not
-    /// eligible sources for an execution's metadata, and a failed read is
+    /// SQL-only, from the caller's already-owned job: a failed read is
     /// propagated rather than degraded to the cached or empty table.
     fn direct_lowering_registry(
         &self,
@@ -5003,7 +4974,8 @@ impl Graph {
         };
         self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
             let registry = self.direct_lowering_registry(query.filter.has_props_leaf(), job)?;
-            let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+            let compiled =
+                crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
             let statement = lower_query(
                 query,
                 &LoweringInputs {
@@ -5083,8 +5055,9 @@ impl Graph {
                     } else {
                         crate::query::block_anchored_query(probe)
                     };
-                    let compiled =
-                        crate::query::eval::CompiledLeaves::for_query(&probe.evaluable_filter());
+                    let compiled = crate::query::compiled::CompiledLeaves::for_query(
+                        &probe.evaluable_filter(),
+                    );
                     lower_query(
                         &probe,
                         &LoweringInputs {
@@ -5422,15 +5395,6 @@ impl Graph {
     pub(crate) fn reset_direct_projection_candidate_probe_test(&self) {
         DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow_mut().clear());
         crate::query::reset_full_graph_query_evaluations();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_editor_registry_generation_test(&self, generation: u64) {
-        let mut editor = self.property_registry.write().unwrap();
-        let state = editor
-            .as_mut()
-            .expect("the fixture must publish the editor registry first");
-        state.registry = Arc::new((*state.registry).clone().with_generation(generation));
     }
 
     /// Every page document the projection-side readers loaded from the parsed
@@ -13318,10 +13282,6 @@ impl Graph {
             (Vec::new(), crate::query::RealPageNames::new())
         };
         let today = crate::date::JournalDate::today().ordinal_key();
-        // A save of a page whose name IS a property key can change the registry's
-        // declarations without changing any property row, so it marks the
-        // snapshot for rebuild before the retention rule reads it (§6.2, C6).
-        self.note_property_key_page_saved(&entry.name);
         // Hold the derived write lock across the WHOLE prune+re-tag. This is
         // deliberately atomic: the keep/evict test (page_affects_*) is re-evaluated
         // against whatever entry is CURRENTLY in the map, so a result a concurrent
@@ -13565,41 +13525,24 @@ impl Graph {
         self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
-    /// ONE coherent property-registry snapshot (§6.2). Every reader — the walk's
-    /// coercion, the TQL diagnostics, `query_registry` — takes this `Arc`, so a
-    /// query sees one generation end to end.
-    ///
-    /// Refresh rule: rebuild when the page-cache generation changed, when a
-    /// property-key page was saved, or **unconditionally** when the
-    /// `ParseConfig` digest differs from the one the snapshot was built under
-    /// (G7 — a `journal_page_title_format` edit can re-type an ambiguous value
-    /// while leaving every row and declaration unchanged). The first two are
-    /// debounced; the digest check is not, because a stale digest means the
-    /// snapshot answers a question the user has already changed.
-    pub fn property_registry(&self) -> Arc<crate::query::registry::Registry> {
+    /// The walk oracle's property registry, built from the current rows on
+    /// every call: the ready projection's raw stream when it answers, the
+    /// parsed documents otherwise. Test-only since K2 (2026-09-15): the product
+    /// reads the projection's committed registry
+    /// ([`Graph::query_property_registry_current`]) and has no other.
+    #[cfg(test)]
+    pub(crate) fn property_registry(&self) -> Arc<crate::query::registry::Registry> {
         let config = self.config.parse_config();
-        let digest = config.digest();
-        let source_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        {
-            let guard = self.property_registry.read().unwrap();
-            if let Some(state) = guard.as_ref() {
-                let digest_current = state.registry.config_digest() == digest;
-                let rows_current =
-                    state.source_generation == source_generation && !state.declarations_dirty;
-                if digest_current
-                    && (rows_current || state.built_at.elapsed() < PROPERTY_REGISTRY_DEBOUNCE)
-                {
-                    return Arc::clone(&state.registry);
-                }
-            }
-        }
-        self.rebuild_property_registry(&config, source_generation)
-    }
-
-    /// The current registry generation — the term the `props` half of the query
-    /// cache key carries (C6).
-    pub fn property_registry_generation(&self) -> u64 {
-        self.property_registry().generation()
+        let (rows, pages) = self
+            .direct_projection_property_owner_rows()
+            .unwrap_or_else(|| crate::query::property_owner_rows(self));
+        let registry = crate::query::registry::build_registry(
+            rows.into_iter(),
+            &|page_id: &str| pages.get(page_id).cloned(),
+            &config,
+        )
+        .expect("every row names a page of its own snapshot");
+        Arc::new(registry)
     }
 
     /// A strict registry for an already-acquired query snapshot. The old UI
@@ -13615,106 +13558,6 @@ impl Graph {
         job.read_registry(&config)
     }
 
-    /// A page was saved. When its name IS a property key, the registry's
-    /// declarations may have changed even though no row did, so mark the
-    /// snapshot for rebuild; a non-key save changes nothing here (the page-cache
-    /// generation bump already covers its rows).
-    pub(crate) fn note_property_key_page_saved(&self, page_name: &str) {
-        let key = crate::refs::page_key(page_name);
-        let is_key_page = {
-            let guard = self.property_registry.read().unwrap();
-            guard.as_ref().is_some_and(|state| {
-                state
-                    .registry
-                    .rows()
-                    .iter()
-                    .any(|row| crate::refs::page_key(&row.normalized_name) == key)
-            })
-        };
-        if !is_key_page {
-            return;
-        }
-        if let Some(state) = self.property_registry.write().unwrap().as_mut() {
-            state.declarations_dirty = true;
-        }
-    }
-
-    /// Build a registry under one snapshot and publish it atomically. The
-    /// generation advances when the rows or declarations differ, and
-    /// **unconditionally** when the config digest differs (G7).
-    fn rebuild_property_registry(
-        &self,
-        config: &crate::config::ParseConfig,
-        source_generation: u64,
-    ) -> Arc<crate::query::registry::Registry> {
-        // §6.2's three row sources, two of which are Direct Files' (CLOSURE §4).
-        // Projection ready → the shared ready raw stream, so a registry read
-        // does not walk every hydrated document. Not ready (open
-        // reconciliation, full rebuild, the milliseconds after a save while the
-        // delta applies) → the cold document iterator over the same page cache
-        // the walk reads. They are ADAPTERS onto one aggregator: `build_registry`
-        // below is the same call either way, and the guard in
-        // `query::registry` asserts both report identical rows.
-        let (rows, pages) = match self.direct_projection_property_owner_rows() {
-            Some(ready) => ready,
-            None => crate::query::property_owner_rows(self),
-        };
-        let built = crate::query::registry::build_registry(
-            rows.into_iter(),
-            &|page_id: &str| pages.get(page_id).cloned(),
-            config,
-        );
-        let built = match built {
-            Ok(built) => built,
-            // A snapshot-consistency defect (a row naming an absent page) is not
-            // a reason to answer with a half-built table: keep the last good
-            // snapshot and try again at the next generation.
-            Err(_) => {
-                if let Some(state) = self.property_registry.read().unwrap().as_ref() {
-                    return Arc::clone(&state.registry);
-                }
-                crate::query::registry::Registry::empty(config)
-            }
-        };
-        self.publish_property_registry(built, source_generation)
-    }
-
-    fn publish_property_registry(
-        &self,
-        built: crate::query::registry::Registry,
-        source_generation: u64,
-    ) -> Arc<crate::query::registry::Registry> {
-        let mut guard = self.property_registry.write().unwrap();
-        let previous = guard.as_ref();
-        let previous_generation = previous.map_or(0, |state| state.registry.generation());
-        let digest_changed = previous
-            .map(|state| state.registry.config_digest() != built.config_digest())
-            .unwrap_or(true);
-        let rows_changed = previous
-            .map(|state| !state.registry.rows_equal(&built))
-            .unwrap_or(true);
-        let generation = if digest_changed || rows_changed {
-            previous_generation.saturating_add(1)
-        } else {
-            previous_generation
-        };
-        let registry = Arc::new(built.with_generation(generation));
-        // A later edit does not invalidate the old coherent answer, but that
-        // answer must not replace the registry used by a newer query capture.
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != source_generation
-            || registry.config_digest() != self.config.parse_config().digest()
-        {
-            return registry;
-        }
-        *guard = Some(PropertyRegistryState {
-            registry: Arc::clone(&registry),
-            source_generation,
-            built_at: std::time::Instant::now(),
-            declarations_dirty: false,
-        });
-        registry
-    }
-
     /// §6.2's registry for the CURRENT source generation, SQL-only and
     /// fallible (RET2).
     ///
@@ -13722,10 +13565,8 @@ impl Graph {
     /// Its cache can reuse unchanged metadata without borrowing the editor
     /// registry or its debounce state.
     ///
-    /// It never falls back to `Graph::property_registry`: that refresh walks
-    /// parsed documents when the projection is not ready and serves a ~250 ms
-    /// debounced snapshot when it is, so it can answer with metadata no
-    /// execution used.
+    /// It is the product's only registry: the document-built one
+    /// (`Graph::property_registry`) exists only for the test-only walk oracle.
     pub(crate) fn query_property_registry_current(
         &self,
         _source_generation: u64,

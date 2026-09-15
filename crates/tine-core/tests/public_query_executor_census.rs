@@ -79,74 +79,21 @@ fn public_quick_switch_routes_bypass_query_quick_switch() {
     assert!(!body.contains(".execute("));
 }
 
-/// Every production walk, by `(file, enclosing function)`, and the packet that
-/// deletes it.
+/// Every production walk, by `(file, enclosing function)`. The list is empty
+/// and should stay empty.
 ///
-/// * **RET2** — the public query routes' readiness / read-error / cancellation
-///   recovery. RET1 kept these as an internal repair checkpoint; RET2 removed
-///   them and wired one bounded repair plus a typed
-///   `query::QueryExecutionError` instead, which is what makes the public
-///   commands database-only. **It has landed and the list is empty.**
-/// * **RET3** — the friendly (`{{query}}` / backlinks / derived) ranking route
-///   and the export subtree reader, migrated after the public commands.
-/// * **oracle** — a walk that exists to be COMPARED against, or a §8.1
-///   counterfactual mode. These stay: the amendment retires production
-///   traversal, not the oracle the parity gates need.
-const PINNED: &[(&str, &str, usize, &str)] = &[
-    // ---- RET2: no rows. The public IR route has no walk behind it. ----
-    // (`model.rs::direct_ir_explain_empty`, `model.rs::direct_page_rows` and
-    // `model.rs::direct_simple_query_pre_view` were here. RET2-Direct replaced
-    // `Graph::dispatched_or_walk` with `Graph::dispatch_direct_query`: one
-    // bounded repair through the existing streamed recovery, then a retry of
-    // the SAME statement, then a typed `query::QueryExecutionError`. Cancelled
-    // never repairs; a missing projection is `ProjectionUnavailable`; a stopped
-    // worker is bounded rather than an endless retry. `model.rs` builds no
-    // walk source at all any more, which is why it names no function below.)
-    //
-    // Direct Files' `{{query}}` friendly ranking route still walks, but it does
-    // so through `query.rs::run_query_bounded` below, which is RET3's.
-    // ---- RET3: the friendly / advanced / export routes ----
-    (
-        "crates/tine-core/src/query.rs",
-        "run_query_bounded",
-        1,
-        "RET3: `{{query}}` ranking over Direct Files. Remaining production \
-         consumer after RET2-Direct: `publish.rs`'s static OG-macro export \
-         (`Graph::run_query_bounded` no longer reaches it — it dispatches).",
-    ),
-    (
-        "crates/tine-core/src/query.rs",
-        "run_query_result",
-        1,
-        "RET3: the TEXT result entry (`run_query_result`), still used by \
-         `{{query}}` rendering and by the gates' oracle",
-    ),
-    (
-        "crates/tine-core/src/query.rs",
-        "run_advanced_query_bounded",
-        1,
-        "RET3: advanced datalog over Direct Files. Remaining production \
-         consumer after RET2-Direct: `publish.rs`'s static export \
-         (`Graph::run_advanced_query_bounded_cached` dispatches instead).",
-    ),
-    // RET3 IS RETIRED (S3 campaign Q2, "Print queries from the current main
-    // image on both backends"; recorded here during the Q5 closure, 2026-09-09).
-    // The export reader is gone from production:
-    //
-    //   * `export_query_subtrees` still exists in
-    //     `query.rs`, but it and `export_query_subtrees_over` are now
-    //     `#[cfg(test)]`: an independent WALK ORACLE, not a production read.
-    //     The shipped path is `model.rs::export_query_subtrees` over
-    //     `export_execute::PreparedExportBatch`, on one SQLite snapshot.
-    //
-    // This deletion is the retirement, exactly as the panic message below asks
-    // for. It was found late because `production_walk_sources_are_pinned` was
-    // ALREADY red for other rows when Q2 landed, so nothing flagged the change
-    // at the time — a pre-existing red hid a real retirement for three packets.
-    // If a future reader wants the walk back, it is the oracle, under cfg(test).
-    // Counterfactual corpus modes now compile only in ignored unit tests.
-    // scripts/query-oracle-dump.py preserves their reproducible TSV command.
-];
+/// * **RET2** removed the public query routes' walk recovery.
+/// * **RET3** (S3 campaign Q2) removed the export subtree reader.
+/// * **K2** (consolidation, 2026-09-15) removed the last three rows,
+///   `query.rs::run_query_bounded`, `run_query_result` and
+///   `run_advanced_query_bounded`, by moving the walk into `query/walk.rs`,
+///   which `query.rs` declares under `#[cfg(test)]`. None had a production
+///   caller left: `publish.rs` and the `{{query}}` render path dispatch to SQL.
+///   What remains is the oracle the parity gates need.
+///
+/// A new row means production evaluates the parsed graph again. Say in the
+/// packet notes which read and why the database could not answer it.
+const PINNED: &[(&str, &str, usize, &str)] = &[];
 
 /// A file a SIBLING (or its parent module file) declares under `#[cfg(test)]`.
 ///

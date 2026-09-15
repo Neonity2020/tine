@@ -67,7 +67,7 @@
 //! never a second normalizer that agrees by inspection.
 //!
 //! **`content match` (§5.10).** The compiler consumes the SAME parsed
-//! [`search_query::Matcher`] the walk consumes — [`crate::query::eval::CompiledLeaves`],
+//! [`search_query::Matcher`] the walk consumes — [`crate::query::compiled::CompiledLeaves`],
 //! keyed by [`Filter::match_sources`] — and never re-parses the payload
 //! (I-12, D-14). Each retained OR arm becomes an `AND` of `instr` predicates on
 //! `blocks.query_visible_folded`, and, when the FTS index is READY, gains a
@@ -116,8 +116,8 @@ pub(crate) mod sql_gates_tests;
 
 use crate::date::JournalDate;
 use crate::doc::property_key_norm;
-use crate::query::atom::atom_key;
-use crate::query::eval::{format_number, CompiledLeaves};
+use crate::query::atom::{atom_key, format_number};
+use crate::query::compiled::CompiledLeaves;
 use crate::query::ir::{Anchor, Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Query, Rel, Value};
 use crate::query::rank::{PageRecencyPrograms, QueryRankPrograms};
 use crate::query::registry::Registry;

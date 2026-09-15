@@ -171,7 +171,7 @@ fn select_subtree_roots(
     bounds: Bounds,
     inputs: &SubtreeSelectionInputs<'_>,
 ) -> Result<ExportSelectionAnswer<(BlockDto, ResultLocator)>, ResultReadError> {
-    let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+    let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
     let statement = lower_query(
         query,
         &LoweringInputs {

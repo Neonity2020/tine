@@ -39,6 +39,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   your own tool, such as Syncthing or Dropbox. Any future built-in sync will be
   designed afresh.
 
+### Fixed
+
+- While the query index is still building, property autocomplete now offers
+  an Org page's own properties (its `:PROPERTIES:` drawer) and no longer
+  offers a `key::` line that sits inside a code block, the same suggestions
+  it shows once the index is ready.
+
 ## [0.6.983] - 2026-09-14
 
 ### Added

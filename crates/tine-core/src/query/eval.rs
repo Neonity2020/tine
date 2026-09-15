@@ -13,18 +13,21 @@
 //! compared by the key's **effective type** from the registry (§6.3). Wave A's
 //! `value_matches` — comma-split, ref-stripped, ASCII-lowercased, untyped — is
 //! deleted; the corpus-parity export (O8) is what accounts for the difference.
-
-use std::collections::HashMap;
+//!
+//! **Test-only since K2 (2026-09-15).** The walk this evaluates for is the SQL
+//! lowering's oracle (`query::walk`). What the product shares with it lives in
+//! `compiled` (`CompiledLeaves`), `atom::format_number` and `date::planning_day`.
 
 use crate::config::ParseConfig;
-use crate::date::JournalDate;
+use crate::date::{planning_day, JournalDate};
 use crate::doc::{property_key_norm, DocBlock};
 use crate::model::PageKind;
-use crate::query::atom::{atom_key, Atom, AtomFormat};
+use crate::query::atom::{atom_key, format_number, Atom, AtomFormat};
+use crate::query::compiled::CompiledLeaves;
 use crate::query::ir::{Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Rel, Value};
 use crate::query::registry::Registry;
 use crate::refs;
-use crate::search_query::{canonical_fold, Matcher};
+use crate::search_query::canonical_fold;
 
 /// Per-page evaluation context: the page row a block row belongs to, plus the
 /// evaluation's `today` (relative date literals stay unresolved in the IR).
@@ -59,88 +62,6 @@ pub(crate) struct EvalCtx<'a> {
     /// other four exist so gate 1 can attribute a walk/OG difference to the
     /// decision that caused it.
     pub(crate) mode: crate::query::atom::CompareMode,
-}
-
-/// Patterns that cost real work to build (`(search …)`'s friendly matcher, a
-/// `(content-regex …)` regex) compiled ONCE per query rather than per block.
-/// The old `Pred` carried the compiled value inside the variant; the IR carries
-/// only the user's text, so the compile cache lives here.
-#[derive(Default)]
-pub(crate) struct CompiledLeaves {
-    matchers: HashMap<String, Matcher>,
-    regexes: HashMap<String, Option<regex::Regex>>,
-    folded: HashMap<String, String>,
-}
-
-impl CompiledLeaves {
-    /// Parse every compiled leaf of one query, ONCE (SPEC §5.10, R3).
-    ///
-    /// **This is the parsed Match payload, and it is the only one.** The walk
-    /// reads `match_program` below; P1's SQL compiler reads the same map, over
-    /// the same `Filter::match_sources` keys, and lowers the SAME
-    /// `search_query::Matcher::Boolean` groups it finds there into `instr`
-    /// predicates. A second `Matcher::parse` anywhere in the query engine — in
-    /// the compiler, in a plan, in a cache — is the fork this campaign exists
-    /// to prevent (I-12): `content match` and legacy `(search …)` would stop
-    /// meaning the same thing the moment the two parses disagreed.
-    pub(crate) fn for_query(filter: &Filter) -> CompiledLeaves {
-        let mut compiled = CompiledLeaves::default();
-        collect_compiled(filter, &mut compiled);
-        compiled
-    }
-
-    /// The parsed Match payload for one `content match <text>` leaf — the
-    /// value both engines consume, never a re-parsed string.
-    pub(crate) fn match_program(&self, source: &str) -> Option<&Matcher> {
-        self.matchers.get(source)
-    }
-    /// The compiled legacy `content regexp` pattern for one leaf, or `None`
-    /// when the pattern did not compile — which §4.3.2 keeps as a retained leaf
-    /// that matches false. The SQL compiler reads the SAME map, so an invalid
-    /// pattern is a constant-false leaf on both engines rather than a second
-    /// `regex::Regex::new` that could disagree about validity (I-12).
-    pub(crate) fn regex(&self, source: &str) -> Option<&regex::Regex> {
-        self.regexes.get(source).and_then(Option::as_ref)
-    }
-    fn fold(&self, text: &str) -> String {
-        self.folded
-            .get(text)
-            .cloned()
-            .unwrap_or_else(|| canonical_fold(text))
-    }
-}
-
-fn collect_compiled(filter: &Filter, out: &mut CompiledLeaves) {
-    // The Match half goes through the IR's own recognizer, so "which leaves
-    // carry a search query" has one answer for the walk and for the lowering.
-    for source in filter.match_sources() {
-        out.matchers
-            .entry(source.to_string())
-            .or_insert_with(|| Matcher::parse(source));
-    }
-    filter.any_leaf(&mut |leaf| {
-        if let Leaf::Attr {
-            attr: Attr::Content,
-            op,
-            value: Value::Text { text },
-        } = leaf
-        {
-            match op {
-                CmpOp::Regex => {
-                    out.regexes
-                        .entry(text.clone())
-                        .or_insert_with(|| regex::Regex::new(text).ok());
-                }
-                CmpOp::Like => {
-                    out.folded
-                        .entry(text.clone())
-                        .or_insert_with(|| canonical_fold(text));
-                }
-                _ => {}
-            }
-        }
-        false
-    });
 }
 
 use crate::query::path_refs::PathRefCounts;
@@ -772,16 +693,6 @@ fn compare_atom_text(op: CmpOp, value: &Value, key: &str) -> bool {
     }
 }
 
-/// A number written back as a comparison operand: integers without a `.0` tail,
-/// so `prop('k') = 12` compares against the atom text `12`.
-pub(crate) fn format_number(number: f64) -> String {
-    if number.fract() == 0.0 && number.abs() < 1e15 {
-        format!("{}", number as i64)
-    } else {
-        format!("{number}")
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Attribute comparisons
 // ---------------------------------------------------------------------------
@@ -792,12 +703,10 @@ fn eval_content(op: CmpOp, value: &Value, block: &DocBlock, ctx: &EvalCtx) -> bo
     };
     let projection = block.projection();
     match op {
-        CmpOp::Like => like_matches(&projection.visible_lower, &ctx.compiled.fold(text)),
-        CmpOp::StartsWith => projection
-            .visible_lower
-            .starts_with(&ctx.compiled.fold(text)),
-        CmpOp::Eq => projection.visible_lower == ctx.compiled.fold(text),
-        CmpOp::NotEq => projection.visible_lower != ctx.compiled.fold(text),
+        CmpOp::Like => like_matches(&projection.visible_lower, &canonical_fold(text)),
+        CmpOp::StartsWith => projection.visible_lower.starts_with(&canonical_fold(text)),
+        CmpOp::Eq => projection.visible_lower == canonical_fold(text),
+        CmpOp::NotEq => projection.visible_lower != canonical_fold(text),
         // §5.10: an empty or invalid-regex Match is a FALSE leaf, exactly as
         // today. `Matcher::matches` answers false for `Empty` and
         // `InvalidRegex`, and `is_some_and` answers false for a leaf whose
@@ -937,38 +846,6 @@ fn compare_day(op: CmpOp, value: &Value, day: i64, today: JournalDate) -> bool {
     }
 }
 
-/// The ONE timestamp-text → `yyyymmdd` primitive (D-14, J10), grown from the
-/// walk's old `parse_angle_date`: it consumes the BRACKETLESS facet text exactly
-/// as `doc::planning_dates` stores it on `BlockProjection::scheduled` and
-/// `BlockProjection::deadline`, and an angle-bracketed caller strips the `<`
-/// first.
-///
-/// **Calendar-validated (C5).** The old parser accepted `2026-13-45` because it
-/// only read three integers. The month/day are now checked against the existing
-/// `date.rs` `is_leap`/`days_in_month` (reused, never re-derived), so a
-/// malformed timestamp has presence and no day.
-pub(crate) fn planning_day(text: &str) -> Option<i64> {
-    let text = text.trim();
-    let text = text.strip_prefix('<').unwrap_or(text);
-    let end = text.find([' ', '>']).unwrap_or(text.len());
-    let mut parts = text[..end].split('-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if !(1..=12).contains(&month) {
-        return None;
-    }
-    let year_i32 = i32::try_from(year).ok()?;
-    let month_u32 = u32::try_from(month).ok()?;
-    if day < 1 || day > i64::from(crate::date::days_in_month(year_i32, month_u32)) {
-        return None;
-    }
-    Some(year * 10000 + month * 100 + day)
-}
-
 /// SQL `LIKE` over an already-folded haystack: `%` matches any run, `_` any one
 /// character, and `\` escapes either (the lowering emits `LIKE ? ESCAPE '\'`).
 pub(crate) fn like_matches(haystack: &str, pattern: &str) -> bool {
@@ -1055,23 +932,6 @@ pub(crate) fn page_row_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn planning_day_accepts_the_bracketless_projection_text_and_the_angle_form() {
-        assert_eq!(planning_day("2026-07-29 Wed"), Some(20260729));
-        assert_eq!(planning_day("<2026-07-29 Wed>"), Some(20260729));
-        assert_eq!(planning_day("2026-07-29"), Some(20260729));
-    }
-
-    #[test]
-    fn planning_day_validates_the_calendar_so_a_malformed_date_has_no_day() {
-        // C5: the old `parse_angle_date` answered 20261345 for the first of these.
-        assert_eq!(planning_day("2026-13-45"), None);
-        assert_eq!(planning_day("2026-02-30"), None);
-        assert_eq!(planning_day("2023-02-29"), None);
-        assert_eq!(planning_day("2026-04-31"), None);
-        assert_eq!(planning_day("2024-02-29"), Some(20240229));
-    }
 
     #[test]
     fn like_matches_wildcards_escapes_and_anchors() {

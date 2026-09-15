@@ -313,7 +313,7 @@ impl Corpus {
         let today = self.today();
         let (query, _view) = crate::query::parse_query_text(source, dialect, today);
         let registry = self.graph.property_registry();
-        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
         let inputs = LoweringInputs {
             today,
             registry: &registry,
@@ -364,7 +364,7 @@ impl Corpus {
             "the focused query must stay page-anchored"
         );
         let registry = self.graph.property_registry();
-        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
         let inputs = LoweringInputs {
             today: self.today(),
             registry: &registry,
@@ -441,7 +441,7 @@ impl Corpus {
         let (parsed, _view) = crate::query::parse_query_text(source, dialect, today);
         let query = crate::query::block_anchored_query(&parsed);
         let registry = self.graph.property_registry();
-        let compiled = crate::query::eval::CompiledLeaves::for_query(&query.evaluable_filter());
+        let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
         let inputs = LoweringInputs {
             today,
             registry: &registry,

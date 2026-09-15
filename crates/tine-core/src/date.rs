@@ -123,6 +123,38 @@ pub(crate) fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
+/// The ONE timestamp-text → `yyyymmdd` primitive (D-14, J10), grown from the
+/// walk's old `parse_angle_date`: it consumes the BRACKETLESS facet text exactly
+/// as `doc::planning_dates` stores it on `BlockProjection::scheduled` and
+/// `BlockProjection::deadline`, and an angle-bracketed caller strips the `<`
+/// first.
+///
+/// **Calendar-validated (C5).** The old parser accepted `2026-13-45` because it
+/// only read three integers. The month/day are now checked against the existing
+/// `date.rs` `is_leap`/`days_in_month` (reused, never re-derived), so a
+/// malformed timestamp has presence and no day.
+pub(crate) fn planning_day(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let text = text.strip_prefix('<').unwrap_or(text);
+    let end = text.find([' ', '>']).unwrap_or(text.len());
+    let mut parts = text[..end].split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let year_i32 = i32::try_from(year).ok()?;
+    let month_u32 = u32::try_from(month).ok()?;
+    if day < 1 || day > i64::from(crate::date::days_in_month(year_i32, month_u32)) {
+        return None;
+    }
+    Some(year * 10000 + month * 100 + day)
+}
+
 // Howard Hinnant's civil <-> days-since-epoch algorithms (1970-01-01 = day 0).
 fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y } as i64;
@@ -635,5 +667,27 @@ mod fmt_tests {
             let got = Format::compile(&vector.fmt).parse(&vector.input);
             assert_eq!(got, want, "parse {:?}", vector);
         }
+    }
+}
+
+#[cfg(test)]
+mod planning_day_tests {
+    use super::*;
+
+    #[test]
+    fn planning_day_accepts_the_bracketless_projection_text_and_the_angle_form() {
+        assert_eq!(planning_day("2026-07-29 Wed"), Some(20260729));
+        assert_eq!(planning_day("<2026-07-29 Wed>"), Some(20260729));
+        assert_eq!(planning_day("2026-07-29"), Some(20260729));
+    }
+
+    #[test]
+    fn planning_day_validates_the_calendar_so_a_malformed_date_has_no_day() {
+        // C5: the old `parse_angle_date` answered 20261345 for the first of these.
+        assert_eq!(planning_day("2026-13-45"), None);
+        assert_eq!(planning_day("2026-02-30"), None);
+        assert_eq!(planning_day("2023-02-29"), None);
+        assert_eq!(planning_day("2026-04-31"), None);
+        assert_eq!(planning_day("2024-02-29"), Some(20240229));
     }
 }

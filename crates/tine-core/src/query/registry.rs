@@ -10,10 +10,10 @@
 //! turns property rows into registry rows; every backend state supplies the
 //! same [`OwnerRow`] stream and the same same-snapshot page lookup:
 //!
-//! | backend state | rows | page lookup |
+//! | source | rows | page lookup |
 //! |---|---|---|
-//! | Direct Files, projection ready | `SqliteGraphProjectionRead::property_facet_rows_after(false, …)` | `pages(page_id, path, name)` in the same snapshot |
-//! | Direct Files, not ready | [`crate::query::property_owner_rows`] over the document cache | the page entry's `rel_path` / name |
+//! | the product: the projection's committed registry | `SqliteGraphProjectionRead::property_facet_rows_after(false, …)` | `pages(page_id, path, name)` in the same snapshot |
+//! | the test-only walk oracle, projection not ready | `crate::query::property_owner_rows` over the document cache | the page entry's `rel_path` / name |
 //!
 //! The three `Vec<(key, Vec<value>)>` facet wrappers that exist today are NOT
 //! sources: they aggregate owner identity away, and owner identity is what

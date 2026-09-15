@@ -474,7 +474,7 @@ impl Filter {
     ///
     /// **The Match leaf's payload is the SEARCH QUERY, and it is parsed exactly
     /// once per execution.** This is the one place the tree is asked which of
-    /// its leaves carry one; the walk (`eval::CompiledLeaves::for_query`) and
+    /// its leaves carry one; the walk (`compiled::CompiledLeaves::for_query`) and
     /// P1's SQL compiler both read it and both consume the SAME parsed
     /// `search_query::Matcher` that the parse produces, so neither can end up
     /// with its own idea of what `foo -draft OR "a b"` means (I-12). Raw FTS

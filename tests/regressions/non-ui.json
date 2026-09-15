@@ -4094,6 +4094,29 @@
   "failBefore": "proven"
  },
  "notes": "Exact safety/interoperability. The snapshot is built from a closed sub-graph (PublicationGraphSnapshot over the selected pages only), so backlinks, block_ref_counts, aliases and icons cannot name an outside page. Query rows are recorded by the same executor that renders the static site, with the export's scope rules (<% current page %> substitution, on-page context, BEGIN_QUERY table view, nested rows not recorded, host block removed from the home run). The home page is synthesized (name = export name, or '<name> (export)' on collision) and never written to the graph. A build without the embedded frontend warns and ships no app/. Byte search for a private sentinel is the privacy oracle."
+},
+{
+ "id": "REG-AUTOCOMPLETE-PAGE-PROPERTIES-FALLBACK-001",
+ "title": "While the query index is still building, property autocomplete offers an Org page's :PROPERTIES: drawer and does not offer a key:: line inside a code block, the same keys it offers once the index is ready",
+ "family": "query-autocomplete",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "Consolidation K2 (2026-09-15): the not-ready fallback read page properties through a second extractor (page_facets) that ignored Org drawers and fenced code; K2 routes it through the projection's DocBlock::preamble grammar"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection.rs::tests::autocomplete_fallback_reads_page_properties_like_the_projection"
+  ],
+  "scenario": "query.autocomplete-not-ready-page-properties",
+  "failBefore": "proven"
+ },
+ "notes": "Blocking stateful UX: one answer to 'which property keys does this graph have' in both index states. Fail-before on base 37226c0b: the fallback offered [fenced, status] where the projection offers [owner, status]. Evidence: tine-agents/evidence/consolidation/k2/autocomplete-fail-before.log."
 }
 ]
 }

@@ -30,11 +30,11 @@ const SKIPPED_DIRS = new Set(["node_modules", "target", "dist", "vendor", "gen"]
 
 /** Files above their cap when the ratchet landed, pinned at that length. */
 const PINNED: Record<string, number> = {
-  "crates/tine-core/src/model.rs": 24_493,
+  "crates/tine-core/src/model.rs": 24_334,
   "src/styles/app.css": 12_369,
   "crates/tine-core/src/publish.rs": 9_231,
-  "crates/tine-core/src/direct_projection.rs": 8_182,
-  "crates/tine-core/src/query.rs": 8_021,
+  "crates/tine-core/src/direct_projection.rs": 8_180,
+  "crates/tine-core/src/query.rs": 7_051,
   "src/store.ts": 6_370,
   "src-tauri/src/watcher.rs": 4_625,
   "src-tauri/src/commands.rs": 4_419,

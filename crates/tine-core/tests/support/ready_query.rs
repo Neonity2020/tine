@@ -48,15 +48,23 @@ pub fn attach_projection(graph: &Graph, root: &Path) {
 /// so where its file lives is the caller's choice; nothing about the graph
 /// changes.
 pub fn attach_scratch_projection(graph: &Graph, tag: &str) {
-    let database = std::env::temp_dir()
-        .join(format!("tine-ready-query-{}-{tag}", std::process::id()))
-        .join("projection.sqlite");
-    let _ = std::fs::remove_dir_all(database.parent().expect("the database has a directory"));
+    remove_scratch_projection(tag);
     graph.warm_cache();
     graph
-        .attach_direct_projection(database)
+        .attach_direct_projection(scratch_projection_dir(tag).join("projection.sqlite"))
         .expect("the disposable projection attaches");
     graph.warm_cache();
+}
+
+/// Delete what `attach_scratch_projection(_, tag)` created, once its graph is
+/// dropped. The directory is per process, so a fixture that skips this leaves
+/// one behind in the temp directory on every run.
+pub fn remove_scratch_projection(tag: &str) {
+    let _ = std::fs::remove_dir_all(scratch_projection_dir(tag));
+}
+
+fn scratch_projection_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("tine-ready-query-{}-{tag}", std::process::id()))
 }
 
 /// Run `attempt` until it answers, retrying ONLY typed readiness.

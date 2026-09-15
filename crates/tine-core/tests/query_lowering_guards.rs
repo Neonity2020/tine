@@ -78,10 +78,13 @@ fn hand_written_cursor_drains_are_pinned() {
     // candidate route — along with parsed-page ranking. Its
     // `fuzzy_subsequence_candidate_pages_after` drain went with it, and so did
     // its row above. No surviving consumer changed.
+    // 11 → 9: K2 made `property_owner_rows` test-only. It fed the editor
+    // registry, whose only reader was the query walk; the walk is the test-only
+    // oracle now and the product reads the projection's committed registry.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        11,
-        "I-12: the eleven owned Direct cursor consumers must each delegate to drain_after"
+        9,
+        "I-12: the nine owned Direct cursor consumers must each delegate to drain_after"
     );
 }
 
@@ -115,16 +118,6 @@ fn classify(file: &str, symbol: &str, family: &str) -> (&'static str, &'static s
         }
         (DIRECT, "reference_candidates", "page_referrer_candidates_after") => {
             ("other-question", "Direct explicit reference candidates")
-        }
-        // The §6.2 registry row source (P0-rust Wave D, `18f4265c`): the page map
-        // and the property rows, read under ONE projection snapshot so a row
-        // naming a page the map lacks is a consistency defect rather than a
-        // silent Markdown fallback.
-        (DIRECT, "property_owner_rows", "navigation_pages_after_with_header_validation") => {
-            ("other-question", "Direct registry snapshot page map")
-        }
-        (DIRECT, "property_owner_rows", "property_facet_rows_after") => {
-            ("other-question", "Direct registry snapshot property rows")
         }
         // R6: `list_pages` in a warm session (no parsed cache) is served from
         // the ready projection's page inventory instead of a whole-graph parse.
@@ -196,23 +189,6 @@ fn expected_census() -> BTreeSet<CensusRecord> {
             DIRECT,
             "real_page_names",
             "Direct real page ownership",
-        ),
-        // The §6.2 registry row source (P0-rust Wave D, `18f4265c`). It reads the
-        // page map and the property rows under ONE projection snapshot, so it is
-        // two classified reads in one symbol, not a new read family. CLOSURE §4
-        // rejected answering this from the document walk: the walk aggregates
-        // owner identity away, so it cannot report cardinality or distinct owners.
-        (
-            "navigation_pages_after_with_header_validation",
-            DIRECT,
-            "property_owner_rows",
-            "Direct registry snapshot page map",
-        ),
-        (
-            "property_facet_rows_after",
-            DIRECT,
-            "property_owner_rows",
-            "Direct registry snapshot property rows",
         ),
         (
             "navigation_pages_after_with_header_validation",

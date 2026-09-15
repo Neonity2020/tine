@@ -1194,6 +1194,7 @@ impl DirectProjection {
     ///
     /// `None` means "not ready, or the read refused" — the caller falls back to
     /// the document iterator, exactly as §5.9's dispatch does for queries.
+    #[cfg(test)]
     pub(crate) fn property_owner_rows(
         &self,
         cache_generation: u64,
@@ -3011,8 +3012,7 @@ fn append_reference_postings(
 }
 
 fn facets(raw: &str, is_org: bool) -> (String, Vec<PhysicalProperty>, Vec<String>) {
-    let mut block = DocBlock::new(raw);
-    block.is_org = is_org;
+    let block = DocBlock::preamble(raw, is_org);
     let searchable = block
         .visible_text()
         .split_whitespace()
@@ -6630,7 +6630,6 @@ mod tests {
             *graph.block_ref_counts().unwrap(),
             *oracle.block_ref_counts().unwrap()
         );
-        let _ = graph.property_registry();
         assert_eq!(
             entry_signature(&graph.list_pages()),
             entry_signature(&oracle.list_pages())
@@ -6726,9 +6725,6 @@ mod tests {
         };
         let (job, initial) = read();
         drop(job);
-        let editor_registry = graph.property_registry();
-        assert!(initial.rows_equal(&editor_registry));
-        assert!(!Arc::ptr_eq(&initial, &editor_registry));
         assert!(
             Arc::ptr_eq(
                 &initial,
@@ -6736,7 +6732,7 @@ mod tests {
                     .query_property_registry_current(graph.cache_generation())
                     .unwrap()
             ),
-            "public registry must use the committed owner even when an editor cache is current"
+            "the public registry is the committed owner's"
         );
         let entry = graph
             .list_pages()
@@ -6810,6 +6806,42 @@ mod tests {
             ))
         ));
         assert!(!graph.has_parsed_cache_test());
+    }
+
+    /// The not-ready autocomplete fallback reads a page's own properties with
+    /// the projection's grammar: an Org page's drawer is offered before
+    /// readiness exactly as after it, and a `key::` line inside a Markdown
+    /// preamble's code fence is content in both answers.
+    #[test]
+    fn autocomplete_fallback_reads_page_properties_like_the_projection() {
+        let _serial = serialize_projection_tests();
+        let root = scratch("autocomplete-page-properties");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        for (name, text) in [
+            ("Plan.org", ":PROPERTIES:\n:owner: alice\n:END:\n* task\n"),
+            ("Notes.md", "status:: draft\n\n- block\n"),
+            ("Fence.md", "```\nfenced:: content\n```\n\n- block\n"),
+        ] {
+            std::fs::write(root.join("pages").join(name), text).unwrap();
+        }
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+
+        let ready = graph.autocomplete_property_facets_bounded(100, 1_000_000);
+        assert!(
+            ready.0.iter().any(|(key, _)| key == "owner"),
+            "the projection reads the Org page drawer: {ready:?}"
+        );
+        assert_eq!(
+            crate::query::autocomplete_property_facets_bounded(&graph, 100, 1_000_000),
+            ready,
+            "the not-ready fallback must offer what the ready projection offers"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6912,40 +6944,6 @@ mod tests {
             crate::query::ir::ObservedType::Number
         );
         assert!(!current.rows.iter().any(|row| row.normalized_name == "seed"));
-        assert!(!graph.has_parsed_cache_test());
-    }
-
-    #[test]
-    fn non_property_query_does_not_borrow_editor_registry_generation() {
-        let _serial = serialize_projection_tests();
-        let root = scratch("task-no-editor-registry-generation");
-        std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(root.join("pages/Source.md"), "- TODO task\n  score:: 1\n").unwrap();
-        let graph = Graph::open(&root);
-        graph
-            .attach_direct_projection(root.join("private/projection.sqlite"))
-            .unwrap();
-        graph.warm_cache();
-        wait_ready(&graph);
-
-        let property = graph
-            .run_query_bounded("(property score 1)", 100, 1_000_000)
-            .expect("the property query reads committed metadata");
-        assert_eq!(property.total, 1);
-        let projection = graph.direct_projection_test().unwrap();
-        projection.take_registry_capture_attempts();
-
-        graph.property_registry();
-        graph.set_editor_registry_generation_test(777);
-        let task = graph
-            .run_query_bounded("(task TODO)", 100, 1_000_000)
-            .expect("the property-free query remains available");
-        assert_eq!(task.total, 1);
-        assert_eq!(
-            projection.take_registry_capture_attempts(),
-            0,
-            "a property-free query must not acquire editor or SQL registry metadata"
-        );
         assert!(!graph.has_parsed_cache_test());
     }
 

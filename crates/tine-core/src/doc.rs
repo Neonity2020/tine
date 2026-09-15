@@ -248,6 +248,15 @@ impl DocBlock {
         }
     }
 
+    /// A page's preamble (`Document::pre_block`) as a block of the page's own
+    /// format, so its properties, tags and visible text come from the same
+    /// lsdoc projection as any block's.
+    pub(crate) fn preamble(raw: &str, is_org: bool) -> Self {
+        let mut block = DocBlock::new(raw);
+        block.is_org = is_org;
+        block
+    }
+
     /// Lazily-computed, memoized projection of `raw` (visible lowercased text +
     /// normalized refs). Safe to memoize because it's a pure function of `raw`
     /// and a cached DocBlock is REPLACED wholesale (a fresh, empty cell) whenever

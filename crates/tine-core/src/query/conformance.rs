@@ -2324,7 +2324,7 @@ fn one_parse_of_the_match_payload_serves_every_engine() {
     let sources = filter.match_sources();
     assert_eq!(sources, vec!["foo -draft OR \"a b\"", "other"]);
 
-    let compiled = crate::query::eval::CompiledLeaves::for_query(&filter);
+    let compiled = crate::query::compiled::CompiledLeaves::for_query(&filter);
     let program = compiled
         .match_program(sources[0])
         .expect("the walk's parsed payload");
@@ -2349,7 +2349,7 @@ fn one_parse_of_the_match_payload_serves_every_engine() {
         JournalDate::today(),
     );
     let empty_filter = empty.evaluable_filter();
-    let compiled = crate::query::eval::CompiledLeaves::for_query(&empty_filter);
+    let compiled = crate::query::compiled::CompiledLeaves::for_query(&empty_filter);
     assert!(matches!(
         compiled.match_program(empty_filter.match_sources()[0]),
         Some(crate::search_query::Matcher::Empty)

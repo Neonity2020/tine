@@ -1294,9 +1294,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     //
     // 2026-09-15: the Managed Storage removal (ADR 0066) and the K0 cleanup
     // moved the digest by deletion only.
+    // 2026-09-15: K2 made the query walk and Direct `property_owner_rows`
+    // test-only; their storage calls left the production surface, by deletion
+    // only.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "debebdf6b995c5cd9d76950131c10edd069ebd60c5e3e0eb0a4ab4811aaeb1b3",
+        "4b8e68edda6809e5fc3eacd25cc4e49974afe7258f547381f2068f07161f1693",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

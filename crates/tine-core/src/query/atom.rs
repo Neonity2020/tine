@@ -638,6 +638,16 @@ impl Atom {
     }
 }
 
+/// A number written back as a comparison operand: integers without a `.0` tail,
+/// so `prop('k') = 12` compares against the atom text `12`.
+pub(crate) fn format_number(number: f64) -> String {
+    if number.fract() == 0.0 && number.abs() < 1e15 {
+        format!("{}", number as i64)
+    } else {
+        format!("{number}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
