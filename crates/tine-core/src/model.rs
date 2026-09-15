@@ -24863,8 +24863,8 @@ fn sync_projection_chain_with_class(
 /// leaf alone: after this returns, the created entry is on stable storage, so a
 /// crash between here and the operation's own barrier cannot lose the path the
 /// operation is about to publish into.
-/// `model::tests::projection_retry_resumes_after_synced_partial_parent_chain`
-/// holds this invariant; do not create a chain component anywhere else.
+/// `projection_producer_census::g_b_choke_helper_caller_counts_are_pinned`
+/// pins this function's callers; do not create a chain component anywhere else.
 fn create_projection_chain_component(
     parent: &Dir,
     component: &str,

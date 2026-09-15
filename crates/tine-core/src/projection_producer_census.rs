@@ -964,11 +964,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         (
-            "crates/tine-core/src/fast_commit.rs",
-            "fs.create_dir_all",
-            1,
-        ),
-        (
             "crates/tine-core/src/graph_name_folding.rs",
             "fs.create_dir_all",
             1,
@@ -984,31 +979,15 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             2,
         ),
         ("crates/tine-core/src/graph_name_folding.rs", "fs.write", 2),
-        (
-            "crates/tine-core/src/managed_storage_journey.rs",
-            "file.create",
-            2,
-        ),
-        (
-            "crates/tine-core/src/managed_storage_journey.rs",
-            "fs.create_dir_all",
-            5,
-        ),
-        (
-            "crates/tine-core/src/managed_storage_journey.rs",
-            "fs.remove_dir_all",
-            2,
-        ),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 26),
+        ("crates/tine-core/src/model.rs", "cap.remove_file", 18),
         ("crates/tine-core/src/model.rs", "cap.rename", 1),
-        ("crates/tine-core/src/model.rs", "fs.create_dir", 8),
         ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
-        ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 2),
-        ("crates/tine-core/src/model.rs", "fs.remove_file", 16),
+        ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 1),
+        ("crates/tine-core/src/model.rs", "fs.remove_file", 14),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
         ("crates/tine-core/src/model.rs", "libc.renameat2", 3),
-        ("crates/tine-core/src/model.rs", "open.create_new", 16),
+        ("crates/tine-core/src/model.rs", "open.create_new", 8),
         ("crates/tine-core/src/model.rs", "windows.MoveFileW", 1),
         (
             "crates/tine-core/src/model.rs",
@@ -1016,188 +995,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
-        // Current-action roots reclaim only covered cursor marks and obsolete
-        // derived roots; original receipt and sweep records remain retained.
-        (
-            "crates/tine-core/src/oplog/absence_sweep.rs",
-            "cap.remove_file",
-            2,
-        ),
-        // Packet 3 v2 checkpoint cleanup removes only digest-named image/map
-        // objects absent from both retained generations and all active-reader
-        // pins. The graph-derived scan budget bounds each cleanup pass.
-        (
-            "crates/tine-core/src/oplog/checkpoint_generation.rs",
-            "cap.remove_file",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/current_action_roots.rs",
-            "cap.remove_file",
-            3,
-        ),
-        ("crates/tine-core/src/oplog/import.rs", "fs.create_dir", 1),
-        (
-            "crates/tine-core/src/oplog/import.rs",
-            "fs.create_dir_all",
-            1,
-        ),
-        ("crates/tine-core/src/oplog/import.rs", "fs.remove_file", 4),
-        ("crates/tine-core/src/oplog/import.rs", "open.create_new", 1),
-        (
-            "crates/tine-core/src/oplog/lazy_genesis.rs",
-            "fs.create_dir",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/lazy_genesis.rs",
-            "fs.create_dir_all",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/lazy_genesis.rs",
-            "fs.remove_dir_all",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/lazy_genesis.rs",
-            "fs.remove_file",
-            2,
-        ),
-        // Join marker replacement now crosses the shared durable boundary.
-        ("crates/tine-core/src/oplog/lazy_genesis.rs", "fs.rename", 3),
-        (
-            "crates/tine-core/src/oplog/lazy_genesis.rs",
-            "open.create_new",
-            5,
-        ),
-        (
-            "crates/tine-core/src/oplog/local_completion_index.rs",
-            "cap.remove_file",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "cap.create_dir",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "cap.hard_link",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "cap.remove_file",
-            4,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "cap.rename",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "open.create_new",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "cap.remove_file",
-            4,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "cap.rename",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "file.set_len",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "fs.create_dir",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "libc.mkdirat",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "libc.openat.create",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "libc.renameat",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "libc.renameat2",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "libc.unlinkat",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "open.create",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_store.rs",
-            "open.create_new",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/receiver_absence_summary.rs",
-            "cap.remove_file",
-            3,
-        ),
-        // Packet 3 v2 §4 selects a fresh empty recovery-input segment only
-        // after checkpoint reinstall, then best-effort unlinks the superseded
-        // segment and frontier. The anchor replacement remains the authority.
-        (
-            "crates/tine-core/src/oplog/recovery_input_journal.rs",
-            "cap.remove_file",
-            2,
-        ),
-        ("crates/tine-core/src/oplog/sqlite.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/oplog/sqlite.rs", "fs.create_dir", 1),
-        (
-            "crates/tine-core/src/oplog/sqlite.rs",
-            "fs.create_dir_all",
-            2,
-        ),
-        ("crates/tine-core/src/oplog/sqlite.rs", "fs.remove_file", 1),
-        (
-            "crates/tine-core/src/oplog/sqlite.rs",
-            "libc.openat.create",
-            1,
-        ),
-        ("crates/tine-core/src/oplog/sqlite.rs", "open.create", 1),
-        ("crates/tine-core/src/oplog/sqlite.rs", "open.create_new", 1),
-        ("crates/tine-core/src/oplog/wire.rs", "cap.create_dir", 1),
-        // 10 since ca9bd718 (W5-smalls): `retire_provider_residue_entry` is
-        // the single validated front door for retiring one `removed/` entry.
-        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 10),
-        ("crates/tine-core/src/oplog/wire.rs", "cap.rename", 8),
-        ("crates/tine-core/src/oplog/wire.rs", "file.set_len", 1),
-        ("crates/tine-core/src/oplog/wire.rs", "fs.create_dir_all", 2),
-        ("crates/tine-core/src/oplog/wire.rs", "libc.renameat2", 2),
-        ("crates/tine-core/src/oplog/wire.rs", "open.create_new", 3),
-        (
-            "crates/tine-core/src/oplog/wire.rs",
-            "windows.SetFileInformationByHandle",
-            1,
-        ),
         ("crates/tine-core/src/publish.rs", "cap.create_dir", 2),
         ("crates/tine-core/src/publish.rs", "cap.create_dir_all", 1),
         ("crates/tine-core/src/publish.rs", "cap.rename", 2),
@@ -1216,24 +1013,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "windows.CreateDirectoryW",
             1,
         ),
-        ("crates/tine-core/src/sync_runtime.rs", "cap.remove_file", 7),
-        (
-            // +1 (5 -> 6): the clean open/activation path ensures the
-            // device-private application runtime root exists before qualifying
-            // this endpoint's persistent CRDT writer lanes (P1).
-            "crates/tine-core/src/sync_runtime.rs",
-            "fs.create_dir_all",
-            6,
-        ),
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "fs.remove_dir_all",
-            5,
-        ),
-        // Packet R1 replaces the rollback rename lattice with two staged
-        // generation publications; the marker replacement is the sole commit.
-        ("crates/tine-core/src/sync_runtime.rs", "fs.rename", 3),
-        ("crates/tine-core/src/sync_runtime.rs", "open.create_new", 1),
         ("src-tauri/src/backup.rs", "cap.create_dir", 2),
         // Packet R1 gives Windows the same no-clobber hard-link publication
         // shape as Unix and removes the replacement-style rename fallback.
@@ -1302,11 +1081,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         // onto the shared atomic writer. Only the audited legacy-session move
         // still needs a raw rename in this file.
         ("src-tauri/src/settings.rs", "fs.rename", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.create_dir", 1),
-        ("src-tauri/src/sync_runtime.rs", "fs.create_dir_all", 3),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_dir_all", 3),
-        ("src-tauri/src/sync_runtime.rs", "fs.remove_file", 2),
-        ("src-tauri/src/sync_runtime.rs", "fs.rename", 4),
     ]
     .into_iter()
     .map(|(path, primitive, count)| (path.to_owned(), primitive.to_owned(), count))
@@ -1387,7 +1161,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("managed_atomic_write_validated", 2),
         ("managed_atomic_replace_bound", 2),
         ("rename_projection_noreplace_platform", 1),
-        ("rename_managed_noreplace", 3),
+        ("rename_managed_noreplace", 2),
         ("atomic_publish", 2),
         // +4 from `direct_move_recovery.rs` (packet B2): the record, each
         // content-addressed image blob, a quarantined record, and every page a
@@ -1401,15 +1175,15 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         // +1 from `settings.rs` (packet P2): the device-local notice
         // dismissals are published through that same named audited protocol.
         ("atomic_write", 14),
-        ("atomic_write_new", 11),
+        ("atomic_write_new", 10),
         ("atomic_replace_expected_with_hooks", 1),
         ("atomic_copy", 0),
         ("atomic_copy_new", 1),
         ("atomic_copy_file_new", 1),
-        ("move_file_noreplace", 22),
+        ("move_file_noreplace", 18),
         ("move_to_trash", 3),
-        ("write_page_projection_with_attempts", 2),
-        ("preserve_and_restore_projection_recovery", 2),
+        ("write_page_projection_with_attempts", 0),
+        ("preserve_and_restore_projection_recovery", 0),
         ("retire_stable_projection_quarantine", 0),
         ("reserve_and_rename", 2),
         ("create_projection_chain_component", 2),
@@ -1418,19 +1192,19 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("reserve_publish_recovery", 2),
         ("commit_publish_stage", 1),
         ("write_publish_stage_file", 8),
-        ("pending_projection_cleanup_bounded", 2),
-        ("validate_pending_cleanup_round_root", 2),
-        ("remove_mutation_authority_if_exact", 3),
-        ("replace_mutation_authority_if_exact_inner", 1),
-        ("move_pending_cleanup_marker_noreplace", 1),
-        ("acquire_mutation_lease", 4),
-        ("publish_immutable_exact_with_durability", 4),
-        ("publish_android_private_immutable", 1),
-        ("publish_pending_cleanup_marker", 2),
-        ("flip_pending_cleanup_round", 1),
-        ("stage_object_bytes", 1),
-        ("stage_manifest_bytes", 1),
-        ("stage", 6),
+        ("pending_projection_cleanup_bounded", 0),
+        ("validate_pending_cleanup_round_root", 0),
+        ("remove_mutation_authority_if_exact", 0),
+        ("replace_mutation_authority_if_exact_inner", 0),
+        ("move_pending_cleanup_marker_noreplace", 0),
+        ("acquire_mutation_lease", 0),
+        ("publish_immutable_exact_with_durability", 0),
+        ("publish_android_private_immutable", 0),
+        ("publish_pending_cleanup_marker", 0),
+        ("flip_pending_cleanup_round", 0),
+        ("stage_object_bytes", 0),
+        ("stage_manifest_bytes", 0),
+        ("stage", 2),
         // 7 since W5-census: the run-local page-name overlay commits its own
         // in-memory point transition (`local_overlay.page_names.commit`)
         // alongside `ephemeral_page_names.commit`. Name-shared with the
@@ -1439,15 +1213,15 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         // each page shard's in-memory Loro transaction (`document.commit`), as
         // the control's page-shard builder did. Also name-shared; no durable
         // write path.
-        ("commit", 8),
-        ("publish_immutable", 6),
-        ("install_staged_artifact", 1),
+        ("commit", 0),
+        ("publish_immutable", 0),
+        ("install_staged_artifact", 0),
         ("replace_head", 0),
-        ("ensure_shared_provider_directory", 4),
-        ("put_complete", 1),
-        ("provider_retire_original_into_placeholder", 1),
+        ("ensure_shared_provider_directory", 0),
+        ("put_complete", 0),
+        ("provider_retire_original_into_placeholder", 0),
         ("write_config", 9),
-        ("atomic_update", 4),
+        ("atomic_update", 3),
         ("create_graph", 0),
         ("create_demo_graph", 1),
         ("reserve_restore_recovery", 2),
@@ -1456,7 +1230,7 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("publish_temp_noreplace", 1),
         ("atomic_copy_new_into_live", 4),
         ("move_live_to_recovery", 7),
-        ("graph_name_folding", 2),
+        ("graph_name_folding", 0),
         ("probe_graph_name_folding", 2),
     ];
     assert_eq!(
@@ -1472,31 +1246,6 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
     let representatives = [
         ("PC-1", "crates/tine-core/src/model.rs", "fnsave_page("),
         (
-            "PC-2",
-            "crates/tine-core/src/sync_runtime.rs",
-            "fnexecute_provider(",
-        ),
-        (
-            "PC-3",
-            "crates/tine-core/src/oplog/operational_coordinator.rs",
-            "fnexecute_clean_local(",
-        ),
-        (
-            "PC-4",
-            "crates/tine-core/src/oplog/operational_coordinator.rs",
-            "fnexecute_clean_external(",
-        ),
-        (
-            "PC-5",
-            "src-tauri/src/sync_runtime.rs",
-            "fnopen_record_with_progress(",
-        ),
-        (
-            "PC-6",
-            "src-tauri/src/sync_runtime.rs",
-            "fnshutdown_for_direct_files_escape(",
-        ),
-        (
             "PC-7",
             "src-tauri/src/watcher.rs",
             "fnobserve_legacy_graph_text_event(",
@@ -1506,11 +1255,6 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
             "PC-9",
             "src-tauri/src/commands.rs",
             "fnapply_journal_filename_migrations(",
-        ),
-        (
-            "PC-10",
-            "crates/tine-core/src/sync_runtime.rs",
-            "fnprepare_shared_clean(",
         ),
         (
             "PC-11",
@@ -1523,16 +1267,6 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
             "PC-14",
             "crates/tine-core/src/graph_name_folding.rs",
             "fnprobe_graph_name_folding(",
-        ),
-        (
-            "PC-15",
-            "src-tauri/src/sync_runtime.rs",
-            "fnarchive_graph_provider_namespace(",
-        ),
-        (
-            "PC-16",
-            "src-tauri/src/android_managed_storage_smoke.rs",
-            "fnJava_page_tine_app_ManagedStorageSmoke_runManagedActivationSmoke(",
         ),
         (
             "PC-18",
@@ -1571,14 +1305,6 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
         restore[0].contains("slot.legacy_graph_cloned("),
         "PC-13 restore must remain gated to a Direct-Files graph"
     );
-    let tauri_lib = fs::read_to_string(repo.join("src-tauri/src/lib.rs")).unwrap();
-    let tauri_lib_compact = tauri_lib
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    assert!(tauri_lib_compact.contains(
-        "#[cfg(all(target_os=\"android\",debug_assertions))]modandroid_managed_storage_smoke;"
-    ));
     let folding_callers = files
         .iter()
         .filter_map(|file| {
@@ -1587,13 +1313,10 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
             (count != 0).then_some((file.relative.clone(), count))
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        folding_callers,
-        [(
-            "crates/tine-core/src/managed_storage_journey.rs".to_owned(),
-            2
-        )],
-        "PC-14 must remain confined to the Android managed journey"
+    assert!(
+        folding_callers.is_empty(),
+        "PC-14: the graph-name folding probe has had no production caller since the \
+         Android managed journey was removed; review any new caller: {folding_callers:?}"
     );
 }
 
@@ -1624,128 +1347,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ],
     );
     let expected = [
-        (
-            "crates/tine-core/src/fast_commit.rs",
-            "journal.fast_append",
-            1,
-        ),
-        ("crates/tine-core/src/fast_commit.rs", "journal.v1.open", 1),
         // GH #466: the three Direct Files graph-text sites (create, validated
         // write, bounded replace) left this boundary — its Android arm is a
         // hard link that shared storage refuses — for the graph tree's own
         // no-clobber rename (`move_graph_text_exact_no_replace`). The two
         // remaining opens are the app-private durable authorities.
         ("crates/tine-core/src/model.rs", "durable_directory.open", 2),
-        // Packet A5: the disposable clean-open checkpoint publishes its two
-        // slots and commit pointer through one durable directory.
-        (
-            "crates/tine-core/src/oplog/checkpoint_generation.rs",
-            "durable_directory.open",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/checkpoint_generation.rs",
-            "immutable.batch",
-            1,
-        ),
-        // The cold resolver publishes immutable packs and its guarded roots
-        // through existing durable-directory handles; no raw writer is added.
-        (
-            "crates/tine-core/src/oplog/cold_object_store.rs",
-            "durable_directory.open",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/hot_engine.rs",
-            "journal.managed_append",
-            1,
-        ),
-        // The join marker uses the shared exact atomic replacement primitive.
-        (
-            "crates/tine-core/src/oplog/lazy_genesis.rs",
-            "durable_directory.open",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
-            "journal.fast_append",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/local_journal_v2_anchor.rs",
-            "journal.managed_append",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "durable_directory.open",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/object_store.rs",
-            "immutable.single_writer",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_turn_journal.rs",
-            "durable_directory.open",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_turn_journal.rs",
-            "journal.turn_append",
-            1,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_turn_journal.rs",
-            "journal.v2.open",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/projection_turn_journal.rs",
-            "journal.v2.prepare",
-            1,
-        ),
-        // Packet 3's below-floor custody is a separate sequence domain, but it
-        // deliberately crosses the same audited v2 WAL and durable-directory
-        // publication boundaries as the existing journals. §4 adds one
-        // prepared empty successor, its confirmation open, and the exact
-        // anchor replacement that commits successful reinstall.
-        (
-            "crates/tine-core/src/oplog/recovery_input_journal.rs",
-            "durable_directory.open",
-            2,
-        ),
-        (
-            "crates/tine-core/src/oplog/recovery_input_journal.rs",
-            "journal.v2.open",
-            5,
-        ),
-        (
-            "crates/tine-core/src/oplog/recovery_input_journal.rs",
-            "journal.v2.prepare",
-            2,
-        ),
-        (
-            // New row: the device-private CRDT writer-lane record reaches the
-            // audited durable publication family through the same shared
-            // primitive as every other authority (D-7), and never through a
-            // bespoke temp+rename (P1).
-            "crates/tine-core/src/oplog/writer_lane.rs",
-            "durable_directory.open",
-            1,
-        ),
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "durable_directory.open",
-            4,
-        ),
-        ("crates/tine-core/src/sync_runtime.rs", "journal.v2.open", 2),
-        (
-            "crates/tine-core/src/sync_runtime.rs",
-            "journal.v2.prepare",
-            1,
-        ),
         ("src-tauri/src/plugins.rs", "package.publish", 1),
         ("src-tauri/src/plugins.rs", "package.recover", 1),
         ("src-tauri/src/plugins.rs", "package.retire", 1),
@@ -2267,9 +1874,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // -- disposable checkpoint state inside a write boundary that already
     // existed, not accepted history, raw files, or the physical projection
     // database. New call-site family, no new write boundary.
+    //
+    // Managed Storage removal (ADR 0066, 2026-09-15): every row that lived in
+    // the deleted `oplog/`, `sync_runtime*`, managed bootstrap/projection and
+    // Android smoke files leaves the surface, together with the 22 write-
+    // boundary tuples above. No row was added and no surviving Direct Files
+    // row changed its count; the digest moves only by deletion.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "c67041dfc50dc5bf2c3822ac5a7169c681ee68e6bb0d81e46409f8fbe4b0aaa1",
+        "4236e82510754527f68874dcefcd254c74d76c0e34be874a3fa2d517403842b4",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
@@ -2331,93 +1944,6 @@ fn g_h_repository_root_tracks_no_lane_evidence() {
         tracked.trim().is_empty(),
         "lane evidence is tracked at the repository root; move it under \
          tine-agents/evidence/ and `git rm` it:\n{tracked}"
-    );
-}
-
-/// I-21 / I-20: an off-actor query job holds an owned snapshot of the Managed
-/// projection file, so every site that closes or replaces that file drains the
-/// runtime's query-job owner first. The file closes in exactly three places —
-/// `RuntimeActor` dropping (its `SqliteFrontier` truncates the WAL on drop),
-/// `HandleInner` dropping (which must refuse new jobs BEFORE it stops the
-/// actor), and the shared-join install replacing the clean runtime — and this
-/// guard pins each one to its drain. The accepted-batch apply is deliberately
-/// not a site: it writes the checkpoint sidecar, never a WAL checkpoint.
-/// Exemplar to imitate when adding a fourth: the shared-join install in
-/// `sync_runtime.rs` (`cancel_all_and_drain()` on the line before
-/// `self.clean.take()`).
-#[test]
-fn g_i_managed_query_jobs_drain_before_projection_file_close() {
-    let files = production_rust();
-    let source = |relative: &str| {
-        &files
-            .iter()
-            .find(|file| file.relative == relative)
-            .unwrap_or_else(|| panic!("{relative} is a production file"))
-            .code
-    };
-    let runtime = source("crates/tine-core/src/sync_runtime.rs");
-    let block = |header: &str| {
-        let start = runtime
-            .find(header)
-            .unwrap_or_else(|| panic!("{header} exists in sync_runtime.rs"));
-        let tail = &runtime[start..];
-        &tail[..tail.find("\n}\n").expect("impl block closes")]
-    };
-    let actor_drop = block("impl Drop for RuntimeActor {");
-    let actor_drain = actor_drop
-        .find("managed_query.jobs.cancel_all_and_drain()")
-        .expect(
-            "I-21: RuntimeActor::drop must drain every off-actor query job before its \
-             SqliteFrontier closes the projection file (see the guard's doc comment)",
-        );
-    assert!(
-        actor_drain < actor_drop.len(),
-        "I-21: RuntimeActor::drop drains before its fields close the main projection"
-    );
-    let handle_drop = block("impl Drop for HandleInner {");
-    let close = handle_drop
-        .find("managed_query.jobs.close()")
-        .expect("I-21: HandleInner::drop must close the query-job owner");
-    let stop = handle_drop
-        .find("sender.get_mut().unwrap().take()")
-        .expect("HandleInner::drop stops the actor by dropping its sender");
-    assert!(
-        close < stop,
-        "I-21: the handle must refuse and drain query jobs BEFORE it stops the actor, \
-         because the actor's exit closes the projection file"
-    );
-    let takes = runtime
-        .match_indices("self.clean.take()")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        takes.len(),
-        1,
-        "a new site replaces the clean runtime; drain `managed_query.jobs` on the line \
-         before it and extend this guard (I-21)"
-    );
-    for (at, _) in takes {
-        let preceding = &runtime[at.saturating_sub(400)..at];
-        let drain = preceding
-            .find("managed_query.jobs.cancel_all_and_drain()")
-            .expect(
-                "I-21: `self.clean.take()` closes the projection file; drain the query-job \
-                 owner immediately before it (exemplar: the shared-join install)",
-            );
-        assert!(
-            drain < preceding.len(),
-            "I-21: drain the query jobs before replacing the main projection"
-        );
-    }
-    assert_eq!(
-        runtime.matches("self.clean = Some(").count(),
-        1,
-        "the clean runtime is reinstalled in exactly one place (the shared-join install), \
-         after the drained take above; a second installer needs its own drain (I-21)"
-    );
-    let sqlite = source("crates/tine-core/src/oplog/sqlite.rs");
-    assert!(
-        sqlite.contains("impl Drop for SqliteFrontier"),
-        "the reason the drains exist: SqliteFrontier checkpoints the WAL on drop"
     );
 }
 
@@ -2739,14 +2265,14 @@ fn census_guard_itself_names_every_required_guard() {
         .filter_map(|line| line.trim().strip_prefix("fn g_"))
         .filter_map(|line| line.split_once('(').map(|(name, _)| name))
         .collect::<BTreeSet<_>>();
-    assert_eq!(tests.len(), 9);
+    assert_eq!(tests.len(), 8);
     let prefixes = tests
         .iter()
         .map(|name| name.split('_').next().unwrap())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         prefixes,
-        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h", "i"])
+        BTreeSet::from(["a", "b", "c", "d", "e", "f", "g", "h"])
     );
 }
 

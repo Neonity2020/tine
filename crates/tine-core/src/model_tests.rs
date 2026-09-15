@@ -14880,7 +14880,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
         ));
     }
     assert!(
-        checked >= 25,
+        checked >= 16,
         "only {checked} page-lock holders were examined; the guard lost its subjects"
     );
     assert!(

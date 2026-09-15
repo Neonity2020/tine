@@ -118,7 +118,7 @@ struct AllowedSite {
 // The census still moves when a print is ADDED to, REMOVED from, or MOVED
 // BETWEEN functions — each of which is a real change to what a shipped binary
 // can emit, and each of which deserves a human classification.
-const RUST_PRINT_SITE_COUNT: usize = 76;
+const RUST_PRINT_SITE_COUNT: usize = 18;
 const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/concord_ledger.rs", function: "run", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "best-effort ledger update failure carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
     AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "projection directory creation carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },

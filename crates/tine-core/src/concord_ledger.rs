@@ -431,7 +431,7 @@ mod tests {
         assert!(contract.contains(&format!("currently {LEDGER_SCHEMA}")));
         assert!(contract.contains("It is never an authority"));
         assert!(contract.contains("safe to delete wholesale at any time"));
-        assert!(contract.contains("a managed\nbinding never attaches one"));
+        assert!(contract.contains("keyed by the graph's root id"));
         assert!(contract.contains("index and pin entries naming a blob that is absent"));
         assert!(contract.contains("never warns,\nrefuses, or reports a missing blob to the user"));
     }

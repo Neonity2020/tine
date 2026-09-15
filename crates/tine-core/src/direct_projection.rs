@@ -6211,7 +6211,7 @@ mod tests {
         ));
         assert!(contains_words(
             contract,
-            "Both production\nquery backends now select results through SQL."
+            "The production\nquery route selects results through SQL."
         ));
         assert!(contains_words(contract, "literal fuzzy-search candidate"));
         assert!(contains_words(contract, "referenced-page\ninventory"));
@@ -6226,7 +6226,7 @@ mod tests {
         assert!(contains_words(contract, "Direct fact-extractor version"));
         assert!(contains_words(
             contract,
-            "app-private graph-fact projection contains no managed state"
+            "app-private graph-fact projection contains no authority state"
         ));
         assert!(contains_words(contract, "clean\nreopen lowers none"));
         assert!(contains_words(
@@ -6315,13 +6315,13 @@ mod tests {
             "Clearing readiness\nalone would strand the projection until another edit.",
             "Cancellation is excluded\nfrom repair",
             // Answer ownership belongs to the read operation, not a producer cache.
-            "Direct and Managed simple and advanced queries\nconstruct an operation-scoped answer from their acquired SQLite snapshots.",
+            "Direct simple and advanced queries\nconstruct an operation-scoped answer from their acquired SQLite snapshots.",
             "The producer retains\nno query answers and manages no answer-cache invalidation.",
             // Navigation and Friendly remain separately scoped migration work.
             "Friendly graph\nsearch likewise still ranks and produces evidence from parser-projected blocks",
             "they do not authorize a fallback from the\nsimple, advanced, page, registry, or Explain public-query dispatch",
             // The candidate planner and its selectivity cutoff are oracle-only.
-            "Managed production queries no longer construct a candidate-page plan or apply\nits selectivity cutoff.",
+            "Production queries construct no candidate-page plan and apply no\nselectivity cutoff.",
             "semantic empty refusal before any snapshot or registry acquisition",
             "Candidate types and lowering remain test-only\nfor the independent oracle.",
         ] {
