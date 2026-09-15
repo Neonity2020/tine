@@ -1297,9 +1297,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-15: K2 made the query walk and Direct `property_owner_rows`
     // test-only; their storage calls left the production surface, by deletion
     // only.
+    // 2026-09-15: K4 made the SQL lowering decide on the operator first, so
+    // `=` and `<>` (and the day comparisons) share one bind each: query/sql.rs
+    // has one fewer `PhysicalQueryValue::Integer(` (12 → 11) and one fewer
+    // `PhysicalQueryValue::Text(` (25 → 24) call site, and nothing else moved.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "4b8e68edda6809e5fc3eacd25cc4e49974afe7258f547381f2068f07161f1693",
+        "5ee64363739f610e27959ba483dda4b3c491e25e2825043a6583d3134ef0bd30",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
