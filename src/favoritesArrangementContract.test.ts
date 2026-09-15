@@ -4,6 +4,7 @@
 // (AGENTS.md §2, living contracts).
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { modelModuleSource } from "./rustModelSource.test-helpers";
 
 const arrangement = readFileSync("docs/contracts/favorites-arrangement.md", "utf8");
 const reload = readFileSync("docs/contracts/config-live-reload.md", "utf8");
@@ -11,7 +12,7 @@ const layout = readFileSync("src/favoritesLayout.ts", "utf8");
 const store = readFileSync("src/favoritesStore.ts", "utf8");
 const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
 const watcher = readFileSync("src-tauri/src/watcher.rs", "utf8");
-const model = readFileSync("crates/tine-core/src/model.rs", "utf8");
+const model = modelModuleSource();
 const graph = readFileSync("src/graph.ts", "utf8");
 
 describe("favorites arrangement contract matches the source", () => {

@@ -154,16 +154,16 @@ mod tests {
     /// that; this can.
     #[test]
     fn direct_files_journals_desc_uses_this_files_dedup() {
-        let model = include_str!("model.rs");
+        let model = crate::test_support::model_module_source();
         assert!(
             !model.contains("fn dedup_journal_days"),
-            "model.rs has grown a second journal-day dedup implementation; the feed's \
-             representative-file rule must have exactly one owner (this file), or a day \
-             silently drops out of a user's history when the two disagree"
+            "the model module has grown a second journal-day dedup implementation; the \
+             feed's representative-file rule must have exactly one owner (this file), or a \
+             day silently drops out of a user's history when the two disagree"
         );
         let start = model
             .find("pub fn journals_desc(&self)")
-            .expect("model.rs must still define Graph::journals_desc");
+            .expect("the model module must still define Graph::journals_desc");
         let body = &model[start..start + 2000.min(model.len() - start)];
         let end = body
             .find("\n    }")

@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn no_read_path_reintroduces_a_durability_barrier() {
-        let source = include_str!("model.rs");
+        let source = crate::test_support::model_module_source();
         for banned in [
             "fn sync_and_read_projection_regular",
             "fn sync_open_and_read_projection_regular",

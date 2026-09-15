@@ -19,9 +19,6 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 const CONFIG_RS: &str = include_str!("config.rs");
 
-#[cfg(test)]
-const MODEL_RS: &str = include_str!("model.rs");
-
 /// The TypeScript side of the wire. The path leaves the crate deliberately —
 /// the whole point is that the frontend declaration is the third copy, and a
 /// guard that cannot see it is not a guard. `#[cfg(test)]` keeps it out of
@@ -185,7 +182,7 @@ mod tests {
     }
 
     fn graph_meta_rust() -> Vec<String> {
-        rust_struct_pub_fields(MODEL_RS, "GraphMeta")
+        rust_struct_pub_fields(&crate::test_support::model_module_source(), "GraphMeta")
     }
 
     fn graph_meta_ts() -> Vec<String> {

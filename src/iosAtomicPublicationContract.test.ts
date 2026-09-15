@@ -1,9 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { modelModuleFiles, modelModuleSource } from "./rustModelSource.test-helpers";
 
-const sources = [
-  "crates/tine-core/src/model.rs",
-];
+const sources = modelModuleFiles();
 
 describe("iOS atomic publication platform boundary", () => {
   it("routes every Darwin renameatx publication through the iOS implementation", () => {
@@ -14,7 +13,7 @@ describe("iOS atomic publication platform boundary", () => {
   });
 
   it("admits iOS wherever the graph projection platform is selected", () => {
-    const model = readFileSync("crates/tine-core/src/model.rs", "utf8");
+    const model = modelModuleSource();
     const platformGate = model.slice(
       model.indexOf("fn require_projection_platform()"),
       model.indexOf("fn open_projection_root_nofollow")

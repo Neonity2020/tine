@@ -10795,7 +10795,7 @@ fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
 
 #[test]
 fn projection_twin_check_uses_only_bounded_direct_metadata_lookups() {
-    let source = include_str!("model.rs");
+    let source = crate::test_support::model_module_source();
     let shape = source
         .split_once("    fn ensure_projection_target_shape(")
         .expect("projection target-shape function")
@@ -10988,7 +10988,7 @@ fn native_case_alias_requires_retirement_before_new_spelling() {
 
 #[test]
 fn production_projection_has_no_alternate_graph_writer_entrypoint() {
-    let source = include_str!("model.rs");
+    let source = crate::test_support::model_module_source();
     let forbidden = ["pub(crate) fn write_projection", "_exact"].concat();
     assert!(!source.contains(&forbidden));
     assert!(source.contains("self.serialize_page_document("));
@@ -11009,7 +11009,7 @@ fn direct_files_graph_text_publication_uses_the_graph_tree_noreplace_rename() {
         move_graph_text_exact_no_replace (the graph tree's renameat2(RENAME_NOREPLACE) \
         family), never tine-storage's DurableDirectoryPublication, whose Android arm is a \
         hard link that shared storage refuses; imitate move_graph_text_exact_no_replace";
-    let source = include_str!("model.rs");
+    let source = crate::test_support::model_module_source();
     let create = source
         .split_once("    fn graph_text_atomic_create_with_proof(")
         .expect("Direct Files create path")
@@ -14610,22 +14610,44 @@ fn gh254_tokenless_observation_failure_is_retryable_but_not_banner_class() {
 // The invariant is an ordering one and therefore static: any function that
 // holds a page lock while it (transitively) acquires the identity gate is a
 // deadlock against every function that takes them the other way round. This
-// guard walks `model.rs`'s call graph and fails on any such function.
+// guard walks the model module's call graph (model.rs and its K3 seam files
+// under model/) and fails on any such function.
 #[test]
 fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
     use std::collections::{HashMap, HashSet};
 
-    let source = include_str!("model.rs");
-    let lines: Vec<&str> = source.lines().collect();
+    // The model module is model.rs plus its K3 seam files under model/. Each
+    // line keeps its file and line number, so a finding names the file on disk.
+    let files = crate::test_support::model_module_files();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut origin: Vec<(&str, usize)> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::new();
+    for (path, text) in &files {
+        file_starts.push(lines.len());
+        for (number, line) in text.lines().enumerate() {
+            lines.push(line);
+            origin.push((path.as_str(), number + 1));
+        }
+    }
     let is_fn_start = |line: &str| {
         line.starts_with("    fn ")
             || line.starts_with("    pub fn ")
             || line.starts_with("    pub(crate) fn ")
+            || line.starts_with("    pub(super) fn ")
     };
     let mut starts: Vec<usize> = (0..lines.len())
         .filter(|i| is_fn_start(lines[*i]))
         .collect();
     starts.push(lines.len());
+    // A body ends at the next function or at the end of its own file.
+    file_starts.push(lines.len());
+    let end_of = |a: usize, b: usize| {
+        file_starts
+            .iter()
+            .copied()
+            .find(|&edge| edge > a)
+            .map_or(b, |edge| edge.min(b))
+    };
     assert!(
         starts.len() > 400,
         "the function scan found only {} candidates; the source shape changed",
@@ -14636,6 +14658,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
         let rest = line
             .trim_start()
             .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub(super) ")
             .trim_start_matches("pub ")
             .trim_start_matches("fn ");
         let end = rest
@@ -14660,7 +14683,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
 
     let mut bodies: HashMap<&str, Vec<String>> = HashMap::new();
     for pair in starts.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
+        let (a, b) = (pair[0], end_of(pair[0], pair[1]));
         bodies
             .entry(name_of(lines[a]))
             .or_default()
@@ -14707,7 +14730,7 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
     let mut inversions: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for pair in starts.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
+        let (a, b) = (pair[0], end_of(pair[0], pair[1]));
         let body = lines[a..b].join("\n");
         let Some(page_lock_at) = body.find("self.page_lock(") else {
             continue;
@@ -14727,9 +14750,10 @@ fn graph_text_writers_take_the_identity_gate_before_any_page_lock() {
         }
         reaching.sort_unstable();
         inversions.push(format!(
-            "{} (model.rs:{}) holds a page lock and then reaches the identity gate via {reaching:?}",
+            "{} ({}:{}) holds a page lock and then reaches the identity gate via {reaching:?}",
             name_of(lines[a]),
-            a + 1
+            origin[a].0,
+            origin[a].1
         ));
     }
     assert!(

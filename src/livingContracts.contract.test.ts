@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { modelModuleSource } from "./rustModelSource.test-helpers";
 
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
@@ -55,7 +56,7 @@ describe("living publication contracts stay pinned to production", () => {
 
   it("pins the small-file conditional publish, recovery name, and retry bound", () => {
     const contract = source("docs/contracts/small-file-writes.md");
-    const production = source("crates/tine-core/src/model.rs");
+    const production = modelModuleSource();
     for (const claim of [
       "atomic_replace_expected",
       "Graph::recover_interrupted_publishes()",

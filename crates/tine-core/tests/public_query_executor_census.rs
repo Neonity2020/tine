@@ -32,7 +32,8 @@
 mod production_source;
 
 use production_source::{
-    compiled_source, erase_cfg_test_regions, production_source_files, relative_path, repo_root,
+    compiled_source, erase_cfg_test_regions, model_module_files, production_source_files,
+    relative_path, repo_root,
 };
 use regex::Regex;
 use std::collections::BTreeMap;
@@ -46,7 +47,11 @@ const SOURCE_CONSTRUCTORS: &[&str] = &["GraphQueryPages("];
 #[test]
 fn public_quick_switch_routes_bypass_query_quick_switch() {
     let root = repo_root();
-    let model = compiled_source(&root.join("crates/tine-core/src/model.rs"));
+    let model = model_module_files(&root)
+        .iter()
+        .map(|path| compiled_source(path))
+        .collect::<Vec<_>>()
+        .join("\n");
     let body = model
         .split("pub fn quick_switch(")
         .nth(1)

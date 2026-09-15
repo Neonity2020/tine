@@ -3,6 +3,8 @@
 use tine_core::model::atomic_copy;
 use tine_core::{Graph, PageKind};
 
+#[path = "support/production_source.rs"]
+mod production_source;
 #[path = "support/ready_query.rs"]
 mod ready_query;
 
@@ -796,13 +798,18 @@ fn resolve_blocks_uses_hinted_page_lookup_without_per_hint_linear_scans() {
 /// column, which should sit near 1.00.
 #[test]
 fn advanced_queries_keep_no_answer_memo() {
-    let src = include_str!("../src/model.rs");
+    let root = production_source::repo_root();
+    let src = production_source::model_module_files(&root)
+        .iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     for retired in ["fn advanced_memo_bounded(", "fn clear_query_memos_test("] {
         assert!(
             !src.contains(retired),
-            "`{retired}` is back in model.rs. Advanced queries re-execute against the current \
-             image and retain no answer (3ad93741). Reinstating an answer cache is a design \
-             decision that owes an invalidation contract, not a helper."
+            "`{retired}` is back in the model module. Advanced queries re-execute against \
+             the current image and retain no answer (3ad93741). Reinstating an answer cache \
+             is a design decision that owes an invalidation contract, not a helper."
         );
     }
 }

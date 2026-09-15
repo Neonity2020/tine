@@ -5621,7 +5621,7 @@ mod tests {
 
     #[test]
     fn reference_family_has_no_second_in_memory_semantic_index() {
-        let model = include_str!("model.rs");
+        let model = crate::test_support::model_module_source();
         for removed in [
             "alias_cache",
             "reference_candidate_index",

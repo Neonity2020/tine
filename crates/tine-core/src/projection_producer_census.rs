@@ -964,10 +964,9 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 15),
-        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
-        ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 1),
-        ("crates/tine-core/src/model.rs", "fs.remove_file", 14),
+        ("crates/tine-core/src/model.rs", "cap.remove_file", 14),
+        ("crates/tine-core/src/model.rs", "fs.create_dir_all", 4),
+        ("crates/tine-core/src/model.rs", "fs.remove_file", 11),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
         ("crates/tine-core/src/model.rs", "libc.renameat2", 3),
         ("crates/tine-core/src/model.rs", "open.create_new", 7),
@@ -977,6 +976,40 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "windows.NtSetInformationFile",
             1,
         ),
+        // K3 (2026-09-15) moved these out of model.rs verbatim; the module's
+        // totals did not change.
+        (
+            "crates/tine-core/src/model/assets.rs",
+            "fs.create_dir_all",
+            3,
+        ),
+        (
+            "crates/tine-core/src/model/assets.rs",
+            "fs.remove_dir_all",
+            1,
+        ),
+        ("crates/tine-core/src/model/assets.rs", "fs.remove_file", 2),
+        (
+            "crates/tine-core/src/model/conflicts.rs",
+            "fs.create_dir_all",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/conflicts.rs",
+            "fs.remove_file",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/open_graph.rs",
+            "cap.remove_file",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/pages_merge.rs",
+            "fs.create_dir_all",
+            1,
+        ),
+        ("crates/tine-core/src/model/pdf.rs", "fs.create_dir_all", 6),
         ("crates/tine-core/src/onboarding.rs", "fs.create_dir_all", 4),
         ("crates/tine-core/src/publish.rs", "cap.create_dir", 2),
         // Stage-side parents: the recovery slot, a query export's parent
@@ -1184,7 +1217,11 @@ fn g_c_producer_classes_keep_representative_entrypoints_and_negative_gates() {
             "src-tauri/src/watcher.rs",
             "fnobserve_graph_text_event(",
         ),
-        ("PC-8", "crates/tine-core/src/model.rs", "fnpublish_html("),
+        (
+            "PC-8",
+            "crates/tine-core/src/model/queries.rs",
+            "fnpublish_html(",
+        ),
         (
             "PC-9",
             "src-tauri/src/commands.rs",

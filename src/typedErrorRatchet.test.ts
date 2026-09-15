@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { modelModuleSource } from "./rustModelSource.test-helpers";
 import {
   AssetTooLargeError,
   BackendError,
@@ -266,7 +267,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
   });
 
   it("pins the Rust typed boundaries and the living contract", () => {
-    const model = source("crates/tine-core/src/model.rs");
+    const model = modelModuleSource();
     const contract = source("docs/contracts/typed-errors.md");
     const directClassifier = model.slice(
       model.indexOf("pub fn direct_save_conflict_epoch"),

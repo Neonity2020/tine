@@ -334,3 +334,17 @@ pub fn line_of(source: &str, offset: usize) -> usize {
         .count()
         + 1
 }
+
+/// Every file of tine-core's `model` module: `model.rs` first, then each seam
+/// file K3 cut out of it under `model/`, in path order. A guard that reads
+/// `model.rs` alone passes vacuously for code that moved (I-11), so read the
+/// module through here, raw (`fs::read_to_string`) or through
+/// [`compiled_source`]. The in-crate twin is `test_support::model_module_files`.
+pub fn model_module_files(root: &Path) -> Vec<PathBuf> {
+    let src = root.join("crates/tine-core/src");
+    let mut files = Vec::new();
+    collect_rs_files(&src, &src.join("model"), &mut files);
+    files.sort();
+    files.insert(0, src.join("model.rs"));
+    files
+}
