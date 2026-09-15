@@ -4135,7 +4135,8 @@
  "coverage": {
   "tests": [
    "crates/tine-core/src/query/sql_gates_tests.rs::every_operator_the_matrix_accepts_answers_in_both_engines",
-   "crates/tine-core/src/query/tql.rs::tests::like_on_a_date_or_checkbox_attribute_is_a_syntax_diagnostic"
+   "crates/tine-core/src/query/tql.rs::tests::like_on_a_date_or_checkbox_attribute_is_a_syntax_diagnostic",
+   "crates/tine-core/tests/query_lowering_guards.rs::every_operator_decision_in_the_query_engines_names_every_operator"
   ],
   "scenario": "query.matrix-operators",
   "failBefore": "proven"

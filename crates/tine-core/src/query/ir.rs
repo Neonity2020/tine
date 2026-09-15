@@ -269,6 +269,27 @@ impl Value {
             literal: literal.into(),
         }
     }
+    /// The text of a `Text` operand; `None` for any other value shape.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Value::Text { text } => Some(text.as_str()),
+            _ => None,
+        }
+    }
+    /// The items of a `List` operand; `None` for any other value shape.
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List { items } => Some(items.as_slice()),
+            _ => None,
+        }
+    }
+    /// The value of a `Bool` operand; `None` for any other value shape.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool { value } => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 /// A self-contained test on the current row.

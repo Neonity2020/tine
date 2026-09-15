@@ -896,13 +896,17 @@ impl Lower<'_> {
 
     fn condition(&mut self, expr: &Expr, scope: Scope) -> Filter {
         match expr {
-            Expr::BinaryOp { left, op, right } => match op {
+            Expr::BinaryOp {
+                left,
+                op: binary,
+                right,
+            } => match binary {
                 BinaryOperator::Regexp => self.regexp(left, right, scope),
-                _ => match binary_cmp(op) {
+                _ => match binary_cmp(binary) {
                     Some(op) => self.compare(left, op, right, scope),
                     None => self.reject(
                         DiagnosticKind::Syntax,
-                        format!("`{op}` is not a comparison the query language has"),
+                        format!("`{binary}` is not a comparison the query language has"),
                     ),
                 },
             },
@@ -1119,7 +1123,19 @@ impl Lower<'_> {
                             Filter::attr(Attr::AtomCount, CmpOp::Eq, Value::Number { number: 0.0 }),
                         ]),
                     ),
-                    op => Filter::rel(
+                    CmpOp::Eq
+                    | CmpOp::NotEq
+                    | CmpOp::Lt
+                    | CmpOp::Le
+                    | CmpOp::Gt
+                    | CmpOp::Ge
+                    | CmpOp::Between
+                    | CmpOp::In
+                    | CmpOp::NotIn
+                    | CmpOp::Like
+                    | CmpOp::StartsWith
+                    | CmpOp::Match
+                    | CmpOp::Regex => Filter::rel(
                         Rel::Props,
                         Quant::Any,
                         Filter::and(vec![key_test, Filter::attr(Attr::Value, op, value)]),
@@ -1640,8 +1656,10 @@ fn op_label(op: CmpOp) -> &'static str {
     }
 }
 
-fn binary_cmp(op: &BinaryOperator) -> Option<CmpOp> {
-    Some(match op {
+/// The comparison a SQL binary operator names. `sqlparser` has dozens of
+/// operators the query language does not, so this match alone keeps a rest arm.
+fn binary_cmp(binary: &BinaryOperator) -> Option<CmpOp> {
+    Some(match binary {
         BinaryOperator::Eq => CmpOp::Eq,
         BinaryOperator::NotEq => CmpOp::NotEq,
         BinaryOperator::Lt => CmpOp::Lt,

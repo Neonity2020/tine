@@ -1467,42 +1467,53 @@ impl Compiler<'_> {
     /// text.
     fn content(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
         let column = format!("{b}.query_visible_folded");
-        let text = match (op, value) {
-            (CmpOp::In | CmpOp::NotIn, Value::List { items }) => {
+        match op {
+            CmpOp::In | CmpOp::NotIn => {
+                let Some(items) = value.as_list() else {
+                    return "0".to_string();
+                };
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
                 // No text operand: `in` is false and `not in` true, as in the walk.
-                return match self.text_list(items, canonical_fold) {
+                match self.text_list(items, canonical_fold) {
                     Some(list) => format!("{column} {membership} ({list})"),
                     None if op == CmpOp::In => "0".to_string(),
                     None => "1".to_string(),
+                }
+            }
+            CmpOp::Like | CmpOp::StartsWith => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
                 };
-            }
-            (_, Value::Text { text }) => text,
-            _ => return "0".to_string(),
-        };
-        match op {
-            CmpOp::Like => {
-                let pattern = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
-                format!("{column} LIKE {pattern} ESCAPE '\\'")
-            }
-            CmpOp::StartsWith => {
-                let pattern = self.bind(PhysicalQueryValue::Text(format!(
-                    "{}%",
-                    like_escape(&canonical_fold(text))
+                let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(
+                    op,
+                    &canonical_fold(text),
                 )));
                 format!("{column} LIKE {pattern} ESCAPE '\\'")
             }
-            CmpOp::Eq => {
+            CmpOp::Eq | CmpOp::NotEq => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
+                };
                 let literal = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
-                format!("{column} = {literal}")
+                let comparison = if op == CmpOp::Eq { "=" } else { "<>" };
+                format!("{column} {comparison} {literal}")
             }
-            CmpOp::NotEq => {
-                let literal = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
-                format!("{column} <> {literal}")
-            }
-            CmpOp::Match => self.content_match(text, b),
-            CmpOp::Regex => self.content_regex(text, b),
-            _ => "0".to_string(),
+            CmpOp::Match => match value.as_text() {
+                Some(text) => self.content_match(text, b),
+                None => "0".to_string(),
+            },
+            CmpOp::Regex => match value.as_text() {
+                Some(text) => self.content_regex(text, b),
+                None => "0".to_string(),
+            },
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => "0".to_string(),
         }
     }
 
@@ -1696,9 +1707,10 @@ impl Compiler<'_> {
                 let Some(list) = list else {
                     // An empty list of operands: `in` is false, and `not in` is
                     // "present and not equal to anything", i.e. present.
-                    return match op {
-                        CmpOp::In => "0".to_string(),
-                        _ => self.member(&owner, &facet("1".to_string()), false),
+                    return if op == CmpOp::In {
+                        "0".to_string()
+                    } else {
+                        self.member(&owner, &facet("1".to_string()), false)
                     };
                 };
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
@@ -1716,7 +1728,14 @@ impl Compiler<'_> {
                 let sub = facet(format!("{alias}.marker LIKE {pattern} ESCAPE '\\'"));
                 self.member(&owner, &sub, false)
             }
-            _ => "0".to_string(),
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsBlank => "0".to_string(),
         }
     }
 
@@ -1767,9 +1786,10 @@ impl Compiler<'_> {
                 spellings.sort();
                 spellings.dedup();
                 if spellings.is_empty() {
-                    return match op {
-                        CmpOp::In => "0".to_string(),
-                        _ => self.member(&owner, &facet(present), false),
+                    return if op == CmpOp::In {
+                        "0".to_string()
+                    } else {
+                        self.member(&owner, &facet(present), false)
                     };
                 }
                 let list = spellings
@@ -1797,7 +1817,14 @@ impl Compiler<'_> {
                 ));
                 self.member(&owner, &sub, false)
             }
-            _ => "0".to_string(),
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsBlank => "0".to_string(),
         }
     }
 
@@ -1814,10 +1841,11 @@ impl Compiler<'_> {
             from: format!("block_planning {alias}"),
             where_,
         };
-        match op {
-            CmpOp::IsSet => return self.member(&owner, &facet(present), false),
-            CmpOp::IsNotSet => return self.member(&owner, &facet(present), true),
-            _ => {}
+        if op == CmpOp::IsSet {
+            return self.member(&owner, &facet(present), false);
+        }
+        if op == CmpOp::IsNotSet {
+            return self.member(&owner, &facet(present), true);
         }
         let column = format!("{alias}.{field}_day");
         let Some(test) = self.day_comparison(op, value, &column) else {
@@ -2074,17 +2102,33 @@ impl Compiler<'_> {
         match leaf {
             Leaf::Attr { attr, op, value } => match attr {
                 Attr::Name => self.page_name(*op, value, p),
-                Attr::Journal => match (op, value) {
+                Attr::Journal => match op {
                     // `pages.text_kind`, not `journal_day IS NOT NULL`: a journal
                     // page whose stem does not parse has kind Journal and no day,
                     // and the walk reads the kind (`eval_page`'s `Attr::Journal`).
                     // `= true` and `!= false` both select the journal pages.
-                    (CmpOp::Eq, Value::Bool { value }) | (CmpOp::NotEq, Value::Bool { value }) => {
-                        let journal = (*op == CmpOp::Eq) == *value;
-                        let comparison = if journal { "=" } else { "<>" };
-                        format!("{p}.text_kind {comparison} {TEXT_KIND_JOURNAL}")
-                    }
-                    _ => "0".to_string(),
+                    CmpOp::Eq | CmpOp::NotEq => match value.as_bool() {
+                        Some(wanted) => {
+                            let journal = (*op == CmpOp::Eq) == wanted;
+                            let comparison = if journal { "=" } else { "<>" };
+                            format!("{p}.text_kind {comparison} {TEXT_KIND_JOURNAL}")
+                        }
+                        None => "0".to_string(),
+                    },
+                    CmpOp::Lt
+                    | CmpOp::Le
+                    | CmpOp::Gt
+                    | CmpOp::Ge
+                    | CmpOp::Between
+                    | CmpOp::In
+                    | CmpOp::NotIn
+                    | CmpOp::Like
+                    | CmpOp::StartsWith
+                    | CmpOp::Match
+                    | CmpOp::Regex
+                    | CmpOp::IsSet
+                    | CmpOp::IsNotSet
+                    | CmpOp::IsBlank => "0".to_string(),
                 },
                 Attr::Day => self.page_day(*op, value, p),
                 Attr::Namespace => self.page_namespace(*op, value, p),
@@ -2104,38 +2148,53 @@ impl Compiler<'_> {
     /// `eval_page_name` applies to both sides of its comparison.
     fn page_name(&mut self, op: CmpOp, value: &Value, p: &str) -> String {
         let column = format!("{p}.name_key");
-        match (op, value) {
-            (CmpOp::Eq, Value::Text { text }) => {
+        match op {
+            CmpOp::Eq | CmpOp::NotEq => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
+                };
                 let literal = self.bind(PhysicalQueryValue::Text(refs::page_key(text)));
-                format!("{column} = {literal}")
+                let comparison = if op == CmpOp::Eq { "=" } else { "<>" };
+                format!("{column} {comparison} {literal}")
             }
-            (CmpOp::NotEq, Value::Text { text }) => {
-                let literal = self.bind(PhysicalQueryValue::Text(refs::page_key(text)));
-                format!("{column} <> {literal}")
-            }
-            (CmpOp::StartsWith, Value::Text { text }) => {
+            CmpOp::StartsWith => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
+                };
                 // A range on the key column, which is what makes `(namespace X)`
                 // and `page.name starts_with` seek `pages_name_key_idx` (§5.7).
                 let prefix = page_prefix_key(text);
                 self.prefix_range(&column, &prefix)
             }
-            (CmpOp::Like, Value::Text { text }) => {
+            CmpOp::Like => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
+                };
                 let pattern = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
                 format!("{column} LIKE {pattern} ESCAPE '\\'")
             }
-            (CmpOp::In, Value::List { items }) => {
+            CmpOp::In | CmpOp::NotIn => {
+                let Some(items) = value.as_list() else {
+                    return "0".to_string();
+                };
+                let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
+                // No text operand: `in` is false and `not in` true, as in the walk.
                 match self.text_list(items, |text| refs::page_key(text)) {
-                    Some(list) => format!("{column} IN ({list})"),
-                    None => "0".to_string(),
-                }
-            }
-            (CmpOp::NotIn, Value::List { items }) => {
-                match self.text_list(items, |text| refs::page_key(text)) {
-                    Some(list) => format!("{column} NOT IN ({list})"),
+                    Some(list) => format!("{column} {membership} ({list})"),
+                    None if op == CmpOp::In => "0".to_string(),
                     None => "1".to_string(),
                 }
             }
-            _ => "0".to_string(),
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => "0".to_string(),
         }
     }
 
@@ -2144,10 +2203,11 @@ impl Compiler<'_> {
     /// the walk compares.
     fn page_day(&mut self, op: CmpOp, value: &Value, p: &str) -> String {
         let column = format!("{p}.journal_day");
-        match op {
-            CmpOp::IsSet => return format!("{column} IS NOT NULL"),
-            CmpOp::IsNotSet => return format!("{column} IS NULL"),
-            _ => {}
+        if op == CmpOp::IsSet {
+            return format!("{column} IS NOT NULL");
+        }
+        if op == CmpOp::IsNotSet {
+            return format!("{column} IS NULL");
         }
         self.day_comparison(op, value, &column)
             .unwrap_or_else(|| "0".to_string())
@@ -2160,11 +2220,6 @@ impl Compiler<'_> {
     fn page_namespace(&mut self, op: CmpOp, value: &Value, p: &str) -> String {
         let column = format!("{p}.name_key");
         let has_parent = format!("instr({column}, '/') > 0");
-        match op {
-            CmpOp::IsSet => return has_parent,
-            CmpOp::IsNotSet => return format!("instr({column}, '/') = 0"),
-            _ => {}
-        }
         // `name_key` is already fully lowercased, so the walk's ASCII-insensitive
         // comparison is equality against the ASCII-lowercased operand.
         let equals = |compiler: &mut Self, text: &str| -> String {
@@ -2176,56 +2231,51 @@ impl Compiler<'_> {
                 width + 1
             )
         };
-        match (op, value) {
-            (CmpOp::Eq, Value::Text { text }) => {
-                let test = equals(self, text);
-                format!("({test})")
-            }
-            (CmpOp::NotEq, Value::Text { text }) => {
-                let test = equals(self, text);
-                format!("({has_parent} AND NOT ({test}))")
-            }
-            (CmpOp::In, Value::List { items }) => {
-                let tests: Vec<String> = items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Value::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                if tests.is_empty() {
+        match op {
+            CmpOp::IsSet => has_parent,
+            CmpOp::IsNotSet => format!("instr({column}, '/') = 0"),
+            CmpOp::Eq | CmpOp::NotEq => {
+                let Some(text) = value.as_text() else {
                     return "0".to_string();
+                };
+                let test = equals(self, text);
+                if op == CmpOp::Eq {
+                    format!("({test})")
+                } else {
+                    format!("({has_parent} AND NOT ({test}))")
                 }
-                let parts: Vec<String> = tests
+            }
+            CmpOp::In | CmpOp::NotIn => {
+                let Some(items) = value.as_list() else {
+                    return "0".to_string();
+                };
+                let parts: Vec<String> = items
                     .iter()
+                    .filter_map(Value::as_text)
                     .map(|text| {
                         let test = equals(self, text);
                         format!("({test})")
                     })
                     .collect();
-                format!("({})", parts.join(" OR "))
-            }
-            (CmpOp::NotIn, Value::List { items }) => {
-                let tests: Vec<String> = items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Value::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                if tests.is_empty() {
-                    return has_parent;
+                if parts.is_empty() {
+                    // No text operand: `in` is false, and `not in` is "has a parent".
+                    return if op == CmpOp::In {
+                        "0".to_string()
+                    } else {
+                        has_parent
+                    };
                 }
-                let parts: Vec<String> = tests
-                    .iter()
-                    .map(|text| {
-                        let test = equals(self, text);
-                        format!("({test})")
-                    })
-                    .collect();
-                format!("({has_parent} AND NOT ({}))", parts.join(" OR "))
+                let any = parts.join(" OR ");
+                if op == CmpOp::In {
+                    format!("({any})")
+                } else {
+                    format!("({has_parent} AND NOT ({any}))")
+                }
             }
-            (CmpOp::Like | CmpOp::StartsWith, Value::Text { text }) => {
+            CmpOp::Like | CmpOp::StartsWith => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
+                };
                 // The parent is the key up to its last `/`: `rtrim` strips the
                 // trailing characters that are not slashes, then the slash goes.
                 let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(
@@ -2238,7 +2288,14 @@ impl Compiler<'_> {
                      LIKE {pattern} ESCAPE '\\')"
                 )
             }
-            _ => "0".to_string(),
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsBlank => "0".to_string(),
         }
     }
 
@@ -2370,7 +2427,16 @@ impl Compiler<'_> {
             CmpOp::Ge => ">=",
             CmpOp::Lt => "<",
             CmpOp::Le => "<=",
-            _ => return None,
+            CmpOp::Between
+            | CmpOp::In
+            | CmpOp::NotIn
+            | CmpOp::Like
+            | CmpOp::StartsWith
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => return None,
         };
         let alias = self.alias("ac");
         let bound = self.bind(PhysicalQueryValue::Real(*number));
@@ -2450,9 +2516,12 @@ impl Compiler<'_> {
                 _ => None,
             }
         };
-        match (op, value) {
-            (CmpOp::Between, Value::List { items }) if items.len() == 2 => {
-                match (operand(&items[0]), operand(&items[1])) {
+        let comparison = match op {
+            CmpOp::Between => {
+                let Some(items) = value.as_list().filter(|items| items.len() == 2) else {
+                    return "0".to_string();
+                };
+                return match (operand(&items[0]), operand(&items[1])) {
                     (Some(low), Some(high)) => {
                         let (low, high) = if low > high { (high, low) } else { (low, high) };
                         let low = self.bind(PhysicalQueryValue::Real(low));
@@ -2460,15 +2529,19 @@ impl Compiler<'_> {
                         format!("({column} IS NOT NULL AND {column} BETWEEN {low} AND {high})")
                     }
                     _ => "0".to_string(),
-                }
+                };
             }
-            (CmpOp::In | CmpOp::NotIn, Value::List { items }) => {
+            CmpOp::In | CmpOp::NotIn => {
+                let Some(items) = value.as_list() else {
+                    return "0".to_string();
+                };
                 let bounds: Vec<f64> = items.iter().filter_map(operand).collect();
                 if bounds.is_empty() {
-                    return match op {
-                        CmpOp::In => "0".to_string(),
-                        // `not in ()` is vacuously true for a coercible atom.
-                        _ => format!("({column} IS NOT NULL)"),
+                    // `not in ()` is vacuously true for a coercible atom.
+                    return if op == CmpOp::In {
+                        "0".to_string()
+                    } else {
+                        format!("({column} IS NOT NULL)")
                     };
                 }
                 let list = bounds
@@ -2477,25 +2550,27 @@ impl Compiler<'_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
-                format!("({column} IS NOT NULL AND {column} {membership} ({list}))")
+                return format!("({column} IS NOT NULL AND {column} {membership} ({list}))");
             }
-            (op, value) => {
-                let Some(bound) = operand(value) else {
-                    return "0".to_string();
-                };
-                let comparison = match op {
-                    CmpOp::Eq => "=",
-                    CmpOp::NotEq => "<>",
-                    CmpOp::Lt => "<",
-                    CmpOp::Le => "<=",
-                    CmpOp::Gt => ">",
-                    CmpOp::Ge => ">=",
-                    _ => return "0".to_string(),
-                };
-                let bound = self.bind(PhysicalQueryValue::Real(bound));
-                format!("({column} IS NOT NULL AND {column} {comparison} {bound})")
-            }
-        }
+            CmpOp::Eq => "=",
+            CmpOp::NotEq => "<>",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+            CmpOp::Like
+            | CmpOp::StartsWith
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => return "0".to_string(),
+        };
+        let Some(bound) = operand(value) else {
+            return "0".to_string();
+        };
+        let bound = self.bind(PhysicalQueryValue::Real(bound));
+        format!("({column} IS NOT NULL AND {column} {comparison} {bound})")
     }
 
     /// `compare_atom_text`, in SQL. `atom_key` is `NOT NULL`, so no null guard
@@ -2514,13 +2589,17 @@ impl Compiler<'_> {
                 _ => None,
             }
         };
-        match (op, value) {
-            (CmpOp::In | CmpOp::NotIn, Value::List { items }) => {
+        match op {
+            CmpOp::In | CmpOp::NotIn => {
+                let Some(items) = value.as_list() else {
+                    return "0".to_string();
+                };
                 let keys: Vec<String> = items.iter().filter_map(&operand).collect();
                 if keys.is_empty() {
-                    return match op {
-                        CmpOp::In => "0".to_string(),
-                        _ => "1".to_string(),
+                    return if op == CmpOp::In {
+                        "0".to_string()
+                    } else {
+                        "1".to_string()
                     };
                 }
                 let list = keys
@@ -2531,37 +2610,33 @@ impl Compiler<'_> {
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
                 format!("{column} {membership} ({list})")
             }
-            (CmpOp::Like, value) => match operand(value) {
-                Some(pattern) => {
-                    let pattern = self.bind(PhysicalQueryValue::Text(pattern));
+            CmpOp::Like | CmpOp::StartsWith => match operand(value) {
+                Some(key) => {
+                    let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(op, &key)));
                     format!("{column} LIKE {pattern} ESCAPE '\\'")
                 }
                 None => "0".to_string(),
             },
-            (CmpOp::StartsWith, value) => match operand(value) {
-                Some(prefix) => {
-                    let pattern = self.bind(PhysicalQueryValue::Text(format!(
-                        "{}%",
-                        like_escape(&prefix)
-                    )));
-                    format!("{column} LIKE {pattern} ESCAPE '\\'")
-                }
-                None => "0".to_string(),
-            },
-            (op, value) => {
+            CmpOp::Eq | CmpOp::NotEq => {
                 let Some(key) = operand(value) else {
                     return "0".to_string();
                 };
-                let comparison = match op {
-                    CmpOp::Eq => "=",
-                    // K3: a text atom always coerces, so `!=` is plain
-                    // inequality on the comparison key.
-                    CmpOp::NotEq => "<>",
-                    _ => return "0".to_string(),
-                };
+                // K3: a text atom always coerces, so `!=` is plain inequality
+                // on the comparison key.
+                let comparison = if op == CmpOp::Eq { "=" } else { "<>" };
                 let key = self.bind(PhysicalQueryValue::Text(key));
                 format!("{column} {comparison} {key}")
             }
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => "0".to_string(),
         }
     }
 
@@ -2583,8 +2658,11 @@ impl Compiler<'_> {
                 _ => None,
             }
         };
-        match (op, value) {
-            (CmpOp::Between, Value::List { items }) if items.len() == 2 => {
+        // `unbounded` is the `is_none_or` pair: with no resolvable bound, any
+        // day passes `>=` and `<=`, and nothing passes the other four.
+        let (comparison, unbounded) = match op {
+            CmpOp::Between => {
+                let items = value.as_list().filter(|items| items.len() == 2)?;
                 let (low, high) = (resolve(&items[0]), resolve(&items[1]));
                 // OG's `build-between-two-arg` sorts its two resolved bounds.
                 let (low, high) = match (low, high) {
@@ -2600,34 +2678,32 @@ impl Compiler<'_> {
                     let high = self.bind(PhysicalQueryValue::Integer(high));
                     clauses.push(format!("{column} <= {high}"));
                 }
-                Some(format!("({})", clauses.join(" AND ")))
+                return Some(format!("({})", clauses.join(" AND ")));
             }
-            (CmpOp::Ge | CmpOp::Le, value) => {
-                let Some(bound) = resolve(value) else {
-                    // `is_none_or`: no bound, so any day passes.
-                    return Some(format!("{column} IS NOT NULL"));
-                };
-                let comparison = if op == CmpOp::Ge { ">=" } else { "<=" };
-                let bound = self.bind(PhysicalQueryValue::Integer(bound));
-                Some(format!(
-                    "({column} IS NOT NULL AND {column} {comparison} {bound})"
-                ))
-            }
-            (CmpOp::Gt | CmpOp::Lt | CmpOp::Eq | CmpOp::NotEq, value) => {
-                let bound = resolve(value)?;
-                let comparison = match op {
-                    CmpOp::Gt => ">",
-                    CmpOp::Lt => "<",
-                    CmpOp::Eq => "=",
-                    _ => "<>",
-                };
-                let bound = self.bind(PhysicalQueryValue::Integer(bound));
-                Some(format!(
-                    "({column} IS NOT NULL AND {column} {comparison} {bound})"
-                ))
-            }
-            _ => None,
-        }
+            CmpOp::Ge => (">=", true),
+            CmpOp::Le => ("<=", true),
+            CmpOp::Gt => (">", false),
+            CmpOp::Lt => ("<", false),
+            CmpOp::Eq => ("=", false),
+            CmpOp::NotEq => ("<>", false),
+            // Presence is answered by the callers before a day is compared.
+            CmpOp::In
+            | CmpOp::NotIn
+            | CmpOp::Like
+            | CmpOp::StartsWith
+            | CmpOp::Match
+            | CmpOp::Regex
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => return None,
+        };
+        let Some(bound) = resolve(value) else {
+            return unbounded.then(|| format!("{column} IS NOT NULL"));
+        };
+        let bound = self.bind(PhysicalQueryValue::Integer(bound));
+        Some(format!(
+            "({column} IS NOT NULL AND {column} {comparison} {bound})"
+        ))
     }
 
     /// The predicate over a ref or tag element, whose only attribute is `name`.
@@ -2842,7 +2918,21 @@ fn content_plans(filter: &Filter, inputs: &LoweringInputs<'_>) -> Vec<ContentPla
                     ContentPlan::ShortUnindexable
                 }),
             },
-            _ => {}
+            // No other content leaf is a plan class.
+            CmpOp::Eq
+            | CmpOp::NotEq
+            | CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::In
+            | CmpOp::NotIn
+            | CmpOp::Like
+            | CmpOp::StartsWith
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => {}
         }
     });
     out

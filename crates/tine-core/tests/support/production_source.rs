@@ -231,6 +231,13 @@ pub fn compiled_source(path: &Path) -> String {
     if test_only_include(path) {
         return String::new();
     }
+    source_without_test_regions(path)
+}
+
+/// A file's source with its trailing `mod tests` and every other `#[cfg(test)]`
+/// region blanked, whether or not a shipped binary compiles the file at all.
+/// A guard over a test-only oracle (the query walk) reads it through this.
+pub fn source_without_test_regions(path: &Path) -> String {
     let source = fs::read_to_string(path).unwrap();
     let trailing_tests = Regex::new(r"(?m)^#\[cfg\(test\)\]\s*\nmod\s+tests\s*\{").unwrap();
     let source = trailing_tests
