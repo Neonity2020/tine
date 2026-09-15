@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { backend } from "./backend";
+import { backend, PublishedExportReadOnlyError } from "./backend";
 import {
   FOCUS_RESCAN_THROTTLE_MS,
   installFocusFreshnessVerifier,
@@ -9,7 +9,8 @@ import {
 } from "./reloadOnFocus";
 import { onPageBecameReplaceable, resetStore, sweepReplaceable } from "./store";
 import { graphBindingRuntime } from "./graphBindingRuntime";
-import { setToasts } from "./ui";
+import { setToasts, toasts } from "./ui";
+import { PUBLISHED_META_NAME } from "./publishedBackend";
 import { setGraphMeta } from "./ui";
 import { resetSaveState } from "./persistence";
 
@@ -151,6 +152,29 @@ describe("reload on focus", () => {
     installReloadOnFocus();
     window.dispatchEvent(new Event("focus"));
     await vi.waitFor(() => expect(rescan).toHaveBeenCalledTimes(1));
+  });
+
+  // GH #549: a published export is a read-only snapshot with no watcher behind
+  // it, and its backend refuses `rescanGraphNow`. Returning to the tab asked
+  // anyway, so every reader got "couldn't finish checking for external changes
+  // … Editing is available" on each refocus, in an app with no editing at all.
+  it("does nothing on focus in a published export", async () => {
+    const meta = document.createElement("meta");
+    meta.name = PUBLISHED_META_NAME;
+    meta.content = "snapshot.json";
+    document.head.append(meta);
+    try {
+      const rescan = vi.spyOn(backend(), "rescanGraphNow").mockRejectedValue(new PublishedExportReadOnlyError());
+      installReloadOnFocus();
+      window.dispatchEvent(new Event("focus"));
+      await refreshOnReturnToWindow(10_000_000);
+      await flushMicrotasks();
+
+      expect(rescan).not.toHaveBeenCalled();
+      expect(toasts()).toEqual([]);
+    } finally {
+      meta.remove();
+    }
   });
 
   it("does not replace the store's own sweep", () => {

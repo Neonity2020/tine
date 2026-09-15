@@ -4,6 +4,7 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { AssetTooLargeError, backend } from "../backend";
 import { writeClipboardText } from "../clipboard";
 import { pushToast, isConflicted, requestBlockReferences, type PdfTarget } from "../ui";
+import { isPublishedExport } from "../publishedBackend";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
 import { openPage, openPageAtBlock } from "../router";
 import type { PdfRoute } from "../router";
@@ -571,6 +572,9 @@ export function PdfViewer(props: {
     if (!viewStateReady || !Number.isFinite(nextScale) || nextScale <= 0) return;
     if (viewStateBaseline?.page === page && viewStateBaseline?.scale === nextScale) return;
     props.onViewState?.({ page, scale: nextScale });
+    // A published export opens PDFs read-only: there is no sidecar to write, and
+    // the refused save toasted after every zoom or scroll (GH #549).
+    if (isPublishedExport()) return;
     pendingViewState = { page, scale: nextScale };
     if (viewStateTimer !== undefined) clearTimeout(viewStateTimer);
     viewStateTimer = window.setTimeout(() => {
