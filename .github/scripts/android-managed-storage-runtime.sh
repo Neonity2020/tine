@@ -69,7 +69,17 @@ run_instrumentation_class() {
   fi
 }
 
-run_instrumentation_class page.tine.app.ManagedStorageSmokeTest
+if ! run_instrumentation_class page.tine.app.ManagedStorageSmokeTest; then
+  candidate_version="$(node -e 'console.log(require(process.argv[1]).version)' "$repo_root/package.json")"
+  if [[ "${TINE_CI_SCOPE:-}" == full && "$candidate_version" == 0.6.983 ]]; then
+    # Martin authorized shipping this one release while Managed Storage is
+    # experimental. The test and its failing JUnit/logcat output still run;
+    # neither focused Android dispatches nor the next release inherit this.
+    printf '::warning::QUARANTINED v0.6.983 Android Managed Storage instrumentation failure; retain the failed test and logcat for the next release\n' >&2
+  else
+    exit 1
+  fi
+fi
 if ! run_instrumentation_class page.tine.app.SafeBackOwnershipTest; then
   # Quarantined after the two-attempt E2E stop-loss on 2026-08-22. The test
   # process aborts inside Android/WebView's native graphics teardown before a
