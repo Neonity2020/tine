@@ -93,11 +93,17 @@ clipboard copy (`writeText`/`writeRich`) and `confirm`. `queryFacets` and
 `referencedPageNames` answer empty: the export carries answers, not the
 facet or reference inventories a sentence builder would need. Asset reads
 answer only names inside the export's own `assets/` folder, under the rule
-the static copier applies (`AssetSink::asset_relative` in `publish.rs`): a
-remote (`://`, `data:`) reference, a backslash, an absolute path or a `..`
-step is refused without a request; `.` and empty steps collapse, and a colon
-inside a file name is a name. Presentation limits of the baked home page: a
-sampled query shows "sample of N" beside its count (the builder sentence that
+the static copier applies (`AssetSink::asset_relative` in `publish.rs`) to the
+name after its `assets/` prefix: a `?` query or `#` fragment is dropped; a
+remote (`://`) reference, a backslash, an absolute path, a leading `.` step or
+a `..` step is refused without a request; empty and interior `.` steps
+collapse, and a colon inside a file name is a name. (A percent-encoded
+authored name is copied literally and requested literally by images and
+media; a clicked file link decodes it first, in the app and in an export
+alike — a pre-existing app-side difference, not an export rule.)
+Presentation limits of the baked home page: a
+sampled query shows "sample of N" beside its count, read from the anchored
+section's effective view — the one the run used — (the builder sentence that
 says so in the app is not offered), and an advanced (`#+BEGIN_QUERY`) home
 carries no host `tine.*` properties — the home runs under the query's own
 settings, as the app runs an advanced query.

@@ -1311,6 +1311,11 @@ export function QueryMacro(props: {
    *  "why empty?" affordance describe an ANSWER; before the first operation
    *  lands (parse pending, engine rebuilding) there is no answer to explain. */
   const ranEmpty = () => !!displayedOperation() && !groupResource.loading && !groupResource.error && total() === 0;
+  /** The view the execution above actually ran under — the anchored section's
+   *  effective settings (a page-anchored query runs under the Pages settings,
+   *  a block-anchored one under the Blocks settings), NOT the singular
+   *  `displayView()`: a scoped `tine.block-sample::` is invisible there. */
+  const executedView = (): ViewSettings => runnable()?.query.anchor === "page" ? pageResultView() : blockResultView();
   /** The typed refusal of either parse — authored or execution-side — when no
    *  operation has landed: a published export answers only the queries it
    *  was made with, and says so instead of "unavailable". */
@@ -2058,9 +2063,9 @@ export function QueryMacro(props: {
               {/* A published export has no builder sentence to say the rows
                   are a sample; the header says it, so a reader knows the
                   count is not the whole answer. */}
-              <Show when={published && displayView().sample !== undefined}>
+              <Show when={published && executedView().sample !== undefined}>
                 <span class="query-sample-note" title="The export shows a sample of the matching rows">
-                  {" "}sample of {displayView().sample}
+                  {" "}sample of {executedView().sample}
                 </span>
               </Show>
               <Show when={props.blockId && !exportRefusal() && !published}>

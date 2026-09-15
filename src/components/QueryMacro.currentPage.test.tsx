@@ -364,19 +364,38 @@ describe("query `<% current page %>` dispatch to the focused pane (GH #301)", ()
     }
   });
 
-  it("in a published export, a sampled query says so beside its count", async () => {
-    markPublished();
-    loadQueryDoc("{{query (task TODO)}}");
-    const argument = queryMacroExtent("{{query (task TODO)}}")?.argument ?? "";
-    backendReadsQueries({ [argument]: { form: argument, view: { view: "list", sample: 1 } } });
-    vi.spyOn(backend(), "queryRun").mockImplementation(async () => blockRunResult(groupsFor("todo")));
-    openPage("Focus A", "page");
-    const { root, dispose } = mount(() => <Block id="query" />);
-    try {
-      await vi.waitFor(() => expect(root.querySelector(".query-count")?.textContent).toBe("1"));
-      expect(root.querySelector(".query-sample-note")?.textContent).toContain("sample of 1");
-    } finally {
-      dispose();
+  it("in a published export, a sampled query says so beside its count — under the view the run used", async () => {
+    // The note reads the anchored section's EFFECTIVE view, the one the
+    // execution ran under: a scoped `tine.block-sample::` (invisible in the
+    // singular view) is announced, and a present-but-empty block draft that
+    // cleared a singular sample is not.
+    const cases: { reading: Parameters<typeof backendReadsQueries>[0][string]; note: string | null }[] = [
+      { reading: { form: "", view: { view: "list", sample: 1 } }, note: "sample of 1" },
+      { reading: { form: "", view: { view: "list" }, block_display: { sample: 2 } }, note: "sample of 2" },
+      { reading: { form: "", view: { view: "list", sample: 7 }, block_display: { sample: 2 } }, note: "sample of 2" },
+      { reading: { form: "", view: { view: "list", sample: 7 }, block_display: {} }, note: null },
+    ];
+    for (const { reading, note } of cases) {
+      markPublished();
+      loadQueryDoc("{{query (task TODO)}}");
+      const argument = queryMacroExtent("{{query (task TODO)}}")?.argument ?? "";
+      backendReadsQueries({ [argument]: { ...reading, form: argument } });
+      vi.spyOn(backend(), "queryRun").mockImplementation(async () => blockRunResult(groupsFor("todo")));
+      openPage("Focus A", "page");
+      const { root, dispose } = mount(() => <Block id="query" />);
+      try {
+        await vi.waitFor(() => expect(root.querySelector(".query-count")?.textContent).toBe("1"));
+        const rendered = root.querySelector(".query-sample-note")?.textContent ?? null;
+        if (note === null) expect(rendered, JSON.stringify(reading)).toBeNull();
+        else expect(rendered, JSON.stringify(reading)).toContain(note);
+      } finally {
+        dispose();
+        vi.restoreAllMocks();
+        resetSharedQueryResultsForTests();
+        resetStore();
+        document.body.innerHTML = "";
+        document.head.querySelector('meta[name="tine-published"]')?.remove();
+      }
     }
   });
 

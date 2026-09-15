@@ -217,10 +217,17 @@ describe("published backend: the two query seams", () => {
       // answered under the path it copied to: a colon in a name is a name,
       // `.` and empty steps collapse the way `Path::components` collapses them.
       expect(await backend.streamAsset("x:y.png")).toBe("../assets/x%3Ay.png");
+      expect(await backend.streamAsset("data:plot.png")).toBe("../assets/data%3Aplot.png");
       expect(await backend.streamAsset("nested//a.png")).toBe("../assets/nested/a.png");
       expect(await backend.streamAsset("nested/./a.png")).toBe("../assets/nested/a.png");
       expect(await backend.streamAsset(".hidden.png")).toBe("../assets/.hidden.png");
-      for (const name of ["../../private.png", "assets/../../x", "/etc/passwd", "https://example.test/x", "data:image/png;base64,AA", "a\\b.png", ".", "", "./"]) {
+      // The copier drops a query or fragment before copying; the app asks for
+      // the file it copied, not for `a.png?v=1`.
+      expect(await backend.streamAsset("a.png?v=1")).toBe("../assets/a.png");
+      expect(await backend.streamAsset("a.png#crop")).toBe("../assets/a.png");
+      // A leading `.` step is the one `Path::components` keeps, and the copier
+      // refuses it; so does the app.
+      for (const name of ["../../private.png", "assets/../../x", "/etc/passwd", "https://example.test/x", "a\\b.png", ".", "", "./", "./x.png", "?v=1"]) {
         expect(await backend.streamAsset(name), name).toBe("");
         expect(await backend.readAsset(name), name).toEqual(new Uint8Array());
       }
