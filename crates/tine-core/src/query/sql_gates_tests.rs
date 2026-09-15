@@ -1178,6 +1178,65 @@ pub(crate) const IDENTITY_SHAPES: &[(&str, QueryDialect)] = &[
     ),
 ];
 
+/// OG-to-TQL conversion must retain property presence and page scope in both
+/// the editing pane and the persisted macro, including under negation.
+#[test]
+fn all_page_tags_round_trips_with_absent_blank_and_populated_properties() {
+    use crate::query::print::{query_print, PrintDialect};
+
+    let _serial = serialize();
+    let root = scratch("all-page-tags-round-trip");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    for (name, text) in [
+        ("absent", "- TODO absent page tags\n  tags:: block-only\n"),
+        ("blank", "tags::\n\n- TODO blank page tags\n"),
+        ("whitespace", "tags::   \n\n- TODO whitespace page tags\n"),
+        ("tagged", "tags:: alpha, beta\n\n- TODO tagged task\n"),
+    ] {
+        std::fs::write(root.join("pages").join(format!("{name}.md")), text).unwrap();
+    }
+    let corpus = Corpus::open(root, true);
+    for (source, expected) in [
+        ("(all-page-tags)", BTreeSet::from(["tagged".to_string()])),
+        (
+            "(not (all-page-tags))",
+            BTreeSet::from(["absent", "blank", "whitespace"].map(str::to_string)),
+        ),
+        (
+            "(and (task TODO) (all-page-tags))",
+            BTreeSet::from([corpus.block_id_containing("tagged", "tagged task")]),
+        ),
+    ] {
+        let (query, view) =
+            crate::query::parse_query_text(source, QueryDialect::Og, corpus.today());
+        assert!(!query.is_invalid(), "{source}: {:?}", query.diagnostics);
+        assert_eq!(corpus.walk(source, QueryDialect::Og), expected, "{source}");
+        assert_eq!(corpus.sql(source, QueryDialect::Og), expected, "{source}");
+        for dialect in [PrintDialect::Tql, PrintDialect::TqlMacro] {
+            let printed = query_print(&query, &view, dialect, false).unwrap();
+            let (again, _) =
+                crate::query::parse_query_text(&printed, QueryDialect::Tql, corpus.today());
+            assert!(!again.is_invalid(), "{printed}: {:?}", again.diagnostics);
+            assert_eq!(again.anchor, query.anchor, "{printed}");
+            assert_eq!(
+                again.normalized().filter,
+                query.normalized().filter,
+                "{printed}"
+            );
+            assert_eq!(
+                corpus.walk(&printed, QueryDialect::Tql),
+                expected,
+                "{printed}"
+            );
+            assert_eq!(
+                corpus.sql(&printed, QueryDialect::Tql),
+                expected,
+                "{printed}"
+            );
+        }
+    }
+}
+
 /// The `walk == SQL` acceptance gate, over the permanent fast corpus.
 #[test]
 fn the_walk_and_the_lowering_answer_every_shape_identically() {
