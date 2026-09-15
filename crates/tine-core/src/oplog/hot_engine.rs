@@ -8117,6 +8117,27 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Keep a peer's first graph-sized checkpoint capture off the
+    /// user-visible admission path. The provider batch is already complete in
+    /// the accepted archive, so cold open can replay it if the process exits
+    /// before an idle turn publishes the disposable checkpoint. Continuous
+    /// traffic still reaches the hard-tail cut and cannot defer indefinitely.
+    fn schedule_clean_checkpoint_after_provider_ingest(&mut self) {
+        let Some(publisher) = self.clean_checkpoint_publisher.as_ref() else {
+            return;
+        };
+        let durable = publisher.durable_sequence();
+        let scheduled = publisher.scheduled_sequence();
+        let unscheduled_tail = self.next_acceptance_sequence.saturating_sub(scheduled);
+        if unscheduled_tail >= CHECKPOINT_HARD_TAIL_BATCHES {
+            self.schedule_clean_checkpoint_now();
+        } else if (durable == 0 && scheduled == 0)
+            || unscheduled_tail >= CHECKPOINT_SOFT_TAIL_BATCHES
+        {
+            self.checkpoint_soft_pending.set(true);
+        }
+    }
+
     pub(crate) fn schedule_clean_checkpoint_idle(&mut self) -> bool {
         if self.adopt_published_identity_generation().is_err() {
             self.clean_checkpoint_capture_skip
@@ -10293,7 +10314,7 @@ impl ShardedHotEngine {
             self.clean_projection_heads
                 .insert(work.path().clone(), work);
         }
-        self.schedule_clean_checkpoint();
+        self.schedule_clean_checkpoint_after_provider_ingest();
         Ok(outcome)
     }
 

@@ -26,6 +26,13 @@ const exceptionPath = path.join(root, "scripts/release-ci-exception.json");
 const packagePath = path.join(root, "package.json");
 
 export const ONE_RELEASE_CI_EXCEPTION_VERSION = "0.6.982";
+export const RELEASE_E2E_EXCEPTION_VERSION = "0.6.983";
+export const RELEASE_E2E_EXCEPTION = Object.freeze({
+  scenarioKeys: Object.freeze([
+    "linux-managed-real-release:sparse-v2-two-device-real",
+  ]),
+  reason: "2026-09-14: Martin authorized quarantining this copied-real-corpus Managed Storage journey for v0.6.983 after both graph copies durably converged while the receiving live page remained stale. Managed Storage is experimental; retain the unchanged semantic failure as next-release diagnostic evidence.",
+});
 export const PROJECT_VERSION = JSON.parse(fs.readFileSync(packagePath, "utf8")).version;
 export const ONE_RELEASE_CI_EXCEPTION = Object.freeze(JSON.parse(fs.readFileSync(exceptionPath, "utf8")));
 
@@ -85,6 +92,16 @@ export function classifyRetiredManagedV1Problems(problems, version = PROJECT_VER
 }
 
 export function releaseE2eScenarioIsNonblocking(suiteName, scenarioId, version = PROJECT_VERSION) {
-  if (!oneReleaseCiExceptionActive(version)) return false;
-  return ONE_RELEASE_CI_EXCEPTION.releaseE2eNonblockingScenarioKeys.includes(`${suiteName}:${scenarioId}`);
+  return releaseE2eScenarioException(suiteName, scenarioId, version) !== null;
+}
+
+export function releaseE2eScenarioException(suiteName, scenarioId, version = PROJECT_VERSION) {
+  const scenarioKey = `${suiteName}:${scenarioId}`;
+  if (version === RELEASE_E2E_EXCEPTION_VERSION && RELEASE_E2E_EXCEPTION.scenarioKeys.includes(scenarioKey)) {
+    return { version: RELEASE_E2E_EXCEPTION_VERSION, scenarioKey, reason: RELEASE_E2E_EXCEPTION.reason };
+  }
+  if (oneReleaseCiExceptionActive(version) && ONE_RELEASE_CI_EXCEPTION.releaseE2eNonblockingScenarioKeys.includes(scenarioKey)) {
+    return { version: ONE_RELEASE_CI_EXCEPTION_VERSION, scenarioKey };
+  }
+  return null;
 }

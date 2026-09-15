@@ -935,13 +935,18 @@ assert.ok(
 );
 assert.match(
   androidManagedRuntimeScript,
-  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest[\s\S]*run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
-  "independent Android native/activity contracts must use separate instrumentation lifetimes"
+  /if ! run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest; then[\s\S]*TINE_CI_SCOPE:-[\s\S]*== full && "\$candidate_version" == 0\.6\.983[\s\S]*else\n    exit 1\n  fi\nfi\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest/,
+  "Android Managed Storage may be quarantined only for full v0.6.983 CI; focused and later releases stay blocking"
+);
+assert.match(
+  yamlNamedStep(androidManagedRuntime, "Run managed-storage smoke as Tine's Android app UID").join("\n"),
+  /env:\n\s+TINE_CI_SCOPE: \$\{\{ inputs\.scope \}\}[\s\S]*script: bash \.github\/scripts\/android-managed-storage-runtime\.sh/,
+  "Android smoke must pass the actual dispatch scope to its one-release quarantine"
 );
 assert.match(
   androidManagedRuntimeScript,
-  /run_instrumentation_class page\.tine\.app\.ManagedStorageSmokeTest\nif ! run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
-  "managed-storage runtime must remain blocking while exhausted Safe Back emulator infrastructure is explicitly quarantined"
+  /run_instrumentation_class page\.tine\.app\.SafeBackOwnershipTest; then[\s\S]*QUARANTINED Android Safe Back instrumentation/,
+  "independent Android native/activity contracts must use separate instrumentation lifetimes"
 );
 assert.equal(
   yamlScalar(androidUiRuntime, "name", 4),

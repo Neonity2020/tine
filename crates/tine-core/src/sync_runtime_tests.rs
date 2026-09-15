@@ -2083,14 +2083,19 @@ fn managed_save_refusals_cannot_be_constructed_without_a_site_name() {
             "managed refusals must name their site (use ActorRefusedAt/…WithCode/…WithDebugDetail): {unattributed:#?}"
         );
 
-    // The same variants are also reachable through `Self::` inside the two
-    // `Display` impls. Those two arms are the entire legitimate use; a
-    // third would be a construction site hidden behind the shorthand.
-    assert_eq!(
-        production.matches("Self::ActorRefused =>").count(),
-        2,
-        "only the two managed Display arms may name the payload-less refusal"
-    );
+    // `Self::` is legitimate in the two Display arms and the content-free
+    // diagnostic classifier; enumerate exact consumers rather than counting
+    // every shorthand match as a potential construction site.
+    let shorthand = production
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("Self::ActorRefused =>"))
+        .collect::<Vec<_>>();
+    assert_eq!(shorthand, vec![
+        "Self::ActorRefused => formatter.write_str(\"sync actor refused application page intent\"),",
+        "Self::ActorRefused => \"actor_refused\",",
+        "Self::ActorRefused => formatter.write_str(\"sync actor refused editor intent\"),",
+    ]);
 
     // The guard above is satisfied trivially if the named variants stop
     // being used at all, so hold the inventory itself: the managed surface
@@ -16319,14 +16324,27 @@ fn joined_shared_pair_from_graph_copy(
     receiver.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
     receiver.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
 
-    let descriptor = activate_and_prepare_shared(&initiator);
+    // Exact-feed work is page-batched. These copied release corpora are
+    // intentionally larger than the fixed small-fixture budget, so retain a
+    // finite one-turn-per-source-page bound plus the established recovery
+    // slack. The latency interval below starts only after both initial feeds
+    // settle.
+    let initiator_pages = activation_source_counts(&initiator.graph_root).0;
+    let initiator_active = SyncRuntimeHandle::activate_or_resume_local(initiator.request.clone());
+    let initiator_joining = initiator_active.handle.expect("initiator LocalActive");
+    drive_initial_feed_with_turn_budget(&initiator_joining, initiator_pages.saturating_add(128));
+    let descriptor = initiator_joining
+        .prepare_shared()
+        .expect("initiator SharedActive");
+    drop(initiator_joining);
     copy_provider_tree(
         &initiator.request.provider_root,
         &receiver.request.provider_root,
     );
     let receiver_active = SyncRuntimeHandle::activate_or_resume_local(receiver.request.clone());
     let receiver_joining = receiver_active.handle.expect("receiver LocalActive");
-    drive_initial_feed(&receiver_joining);
+    let receiver_pages = activation_source_counts(&receiver.graph_root).0;
+    drive_initial_feed_with_turn_budget(&receiver_joining, receiver_pages.saturating_add(128));
     receiver_joining
         .join_shared(descriptor)
         .unwrap_or_else(|error| panic!("real-corpus receiver could not join: {error}"));
@@ -19867,6 +19885,20 @@ fn own_provider_manifest_revalidation_cursor(fixture: &ActivationFixture) -> Opt
 
 #[test]
 fn outbound_child_blocks_when_ordinary_parent_is_lost() {
+    outbound_child_blocks_until_parent_restored(false, false);
+}
+
+#[test]
+fn outbound_child_blocks_when_ordinary_parent_object_is_lost() {
+    outbound_child_blocks_until_parent_restored(true, false);
+}
+
+#[test]
+fn outbound_child_accepts_retained_cold_parent_after_hot_manifest_loss() {
+    outbound_child_blocks_until_parent_restored(false, true);
+}
+
+fn outbound_child_blocks_until_parent_restored(remove_object: bool, retain_cold: bool) {
     let fixture = make_shared_fixture("provider-outbound-parent-loss", 0xbb2c);
     let _descriptor = activate_and_prepare_shared(&fixture);
     let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
@@ -19881,13 +19913,36 @@ fn outbound_child_blocks_when_ordinary_parent_is_lost() {
     publish_shared_batch(&handle, &fixture, parent_batch);
     settle_shared_provider(&handle);
 
-    let child_batch = submit_durable(
-        &handle,
-        vec![SemanticOperation::SetPagePreamble {
-            page_id,
-            preamble: Some("child must not publish past lost parent".into()),
-        }],
-    );
+    assert!(matches!(
+        handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(handle);
+    let request = reopen_request(&fixture.request);
+    let resources = open_clean_runtime_resources(&request).unwrap().unwrap();
+    let mut actor = RuntimeActor::from_clean_resources(
+        request.clone(),
+        request.clean_identities.clone().unwrap(),
+        resources,
+        SyncRuntimeRecovery::CleanManifestReplay,
+        Arc::new(crate::managed_query::ManagedQueryShared::default()),
+    )
+    .unwrap();
+    for _ in 0..128 {
+        if !actor.provider_has_work() {
+            break;
+        }
+        assert!(!matches!(actor.tick(), SyncRuntimeTick::RecoveryBlocked(_)));
+    }
+    let transaction = OperationTransaction::new(vec![SemanticOperation::SetPagePreamble {
+        page_id,
+        preamble: Some("child must not publish past lost parent".into()),
+    }])
+    .unwrap();
+    let child_batch = match actor.submit_local_mutation(transaction) {
+        SyncLocalMutationOutcome::Durable { batch_id } => batch_id,
+        other => panic!("child fixture must commit before parent loss: {other:?}"),
+    };
     let store = ObjectStore::open(
         &clean_operation_archive_directory(&fixture.request.archive_root),
         fixture.request.identities.workspace_id,
@@ -19912,30 +19967,69 @@ fn outbound_child_blocks_when_ordinary_parent_is_lost() {
             fs::remove_file(provider_manifest).unwrap();
         }
     }
-    fs::remove_file(
+    let parent_manifest_bytes = store.read_manifest_bytes(parent_batch).unwrap();
+    let lost_path = if remove_object {
+        let parent = OperationBatch::decode(&parent_manifest_bytes).unwrap();
+        clean_operation_archive_directory(&fixture.request.archive_root)
+            .join("objects")
+            .join(format!(
+                "{}.object",
+                parent.required_objects()[0].content_digest()
+            ))
+    } else {
         clean_operation_archive_directory(&fixture.request.archive_root)
             .join("batches")
-            .join(format!("{parent_batch}.manifest")),
-    )
-    .unwrap();
-    assert!(matches!(
+            .join(format!("{parent_batch}.manifest"))
+    };
+    let lost_bytes = fs::read(&lost_path).unwrap();
+    fs::remove_file(&lost_path).unwrap();
+    assert!(!matches!(
         store.inspect_batch(parent_batch).unwrap(),
-        crate::oplog::BatchInspection::Absent
+        crate::oplog::BatchInspection::Ready(_)
     ));
 
     let child_provider_manifest = fixture
         .request
         .provider_root
         .join(format!("outbox/manifests/{child_batch}.manifest"));
-    // `2a578d87` retired both the manifest-recovery records this fixture used to
-    // remove and the `RecoveryBlocked("durable outbound dependency {parent} is
-    // absent")` wording; neither has a production writer/emitter today. What
-    // remains is the live user outcome asserted below, and it is currently
-    // BROKEN: with the ordinary parent's manifest absent from the provider AND
-    // from the local archive, the child still publishes and the device reaches a
-    // Safe handoff, so a peer receives a batch whose causal parent exists nowhere.
+    if retain_cold {
+        assert!(matches!(
+            actor
+                .retained_archive_store()
+                .unwrap()
+                .inspect_batch_with_cold_history(parent_batch),
+            Ok(crate::oplog::BatchInspection::Ready(_))
+        ));
+        for _ in 0..128 {
+            if !actor.provider_has_work() {
+                break;
+            }
+            assert!(!matches!(actor.tick(), SyncRuntimeTick::RecoveryBlocked(_)));
+        }
+        assert!(child_provider_manifest.is_file());
+        assert!(matches!(
+            actor.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        return;
+    }
+    let cold = store
+        .root_path()
+        .join(crate::oplog::cold_object_store::COLD_HISTORY_DIRECTORY);
+    let cold_backup = store.root_path().join("test-withheld-cold-history");
+    if cold.exists() {
+        fs::rename(&cold, &cold_backup).unwrap();
+    }
+    assert!(!matches!(
+        actor
+            .retained_archive_store()
+            .unwrap()
+            .inspect_batch_with_cold_history(parent_batch),
+        Ok(crate::oplog::BatchInspection::Ready(_))
+    ));
+    // Accepted effects alone do not prove that a peer can replay this parent.
     for _ in 0..64 {
-        match handle.tick().unwrap() {
+        match actor.tick() {
             SyncRuntimeTick::RecoveryBlocked(_) => break,
             SyncRuntimeTick::Recovering | SyncRuntimeTick::Idle => {}
             other => panic!("ordinary parent loss did not fail closed: {other:?}"),
@@ -19946,9 +20040,35 @@ fn outbound_child_blocks_when_ordinary_parent_is_lost() {
         "child published past its lost ordinary parent"
     );
     assert!(
-        handle.clean_shutdown().is_err(),
+        actor.clean_shutdown().is_err(),
         "ordinary parent loss reached Safe with the child unpublished"
     );
+
+    // Restoring the evidence must unblock the same queued child without reopen.
+    fs::write(&lost_path, lost_bytes).unwrap();
+    if cold_backup.exists() {
+        fs::rename(&cold_backup, &cold).unwrap();
+    }
+    fs::write(
+        fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(parent_relative),
+        parent_manifest_bytes,
+    )
+    .unwrap();
+    for _ in 0..128 {
+        if !actor.provider_has_work() {
+            break;
+        }
+        assert!(!matches!(actor.tick(), SyncRuntimeTick::RecoveryBlocked(_)));
+    }
+    assert!(child_provider_manifest.is_file());
+    assert!(matches!(
+        actor.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
 }
 
 #[test]
@@ -21410,6 +21530,129 @@ fn exact_object_progress_rechecks_every_incomplete_manifest_once_per_wave() {
 }
 
 #[test]
+fn pending_ingress_accepted_residue_retires_on_reopen() {
+    let (receiver, sender, receiver_handle, sender_handle) =
+        joined_shared_pair("provider-pending-residue", 0xba00);
+    let (batch, ..) = submit_shared_page(
+        &sender_handle,
+        0xba10,
+        "Accepted Residue",
+        "notes/accepted-residue.md",
+        "accepted",
+    );
+    publish_shared_batch(&sender_handle, &sender, batch);
+    settle_shared_provider(&sender_handle);
+    let delivered = copy_provider_batch(&sender, &receiver, batch, ProviderBatchDelivery::Complete);
+    receiver_handle
+        .observe_provider_paths(delivered, false)
+        .unwrap();
+    settle_shared_provider(&receiver_handle);
+    assert!(matches!(
+        receiver_handle.clean_shutdown(),
+        Ok(SyncShutdownOutcome::Safe(_))
+    ));
+    drop(receiver_handle);
+    let bytes = fs::read(
+        sender
+            .request
+            .provider_root
+            .join("outbox/manifests")
+            .join(format!("{batch}.manifest")),
+    )
+    .unwrap();
+    // Simulate crash after durable acceptance and before custody retirement.
+    let mut provider = SharedProviderTransport::open(
+        &receiver.request.provider_root,
+        &receiver.request.provider_journal_root,
+    )
+    .unwrap();
+    assert!(provider.pending_ingress().is_empty());
+    provider.retain_pending_ingress(&bytes).unwrap();
+    drop(provider);
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+    settle_shared_provider(&reopened);
+    assert_eq!(reopened.status().unwrap().provider_pending, 0);
+    assert_eq!(
+        fs::read_dir(
+            receiver
+                .request
+                .provider_journal_root
+                .parent()
+                .unwrap()
+                .join("pending-ingress-v1")
+        )
+        .unwrap()
+        .count(),
+        0
+    );
+}
+
+#[test]
+fn pending_ingress_child_survives_reopen_while_parent_manifest_is_absent() {
+    let (receiver, sender, receiver_handle, sender_handle) =
+        joined_shared_pair("provider-pending-parent", 0xb900);
+    let (parent, ..) = submit_shared_page(
+        &sender_handle,
+        0xb910,
+        "Missing Parent",
+        "notes/missing-parent.md",
+        "parent",
+    );
+    publish_shared_batch(&sender_handle, &sender, parent);
+    let (child, ..) = submit_shared_page(
+        &sender_handle,
+        0xb920,
+        "Waiting Child",
+        "notes/waiting-child.md",
+        "child",
+    );
+    publish_shared_batch(&sender_handle, &sender, child);
+    settle_shared_provider(&sender_handle);
+    settle_shared_provider(&receiver_handle);
+    let delivered = copy_provider_batch(&sender, &receiver, child, ProviderBatchDelivery::Complete);
+    receiver_handle
+        .observe_provider_paths(delivered, false)
+        .unwrap();
+    for _ in 0..64 {
+        let _ = receiver_handle.tick().unwrap();
+    }
+    assert!(receiver_handle.status().unwrap().provider_pending > 0);
+    assert!(!receiver_handle.status().unwrap().provider_runnable);
+    drop(receiver_handle);
+    let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+    for _ in 0..64 {
+        let tick = reopened.tick().unwrap();
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_)
+            ),
+            "{tick:?}"
+        );
+    }
+    assert!(reopened.status().unwrap().provider_pending > 0);
+    let delivered =
+        copy_provider_batch(&sender, &receiver, parent, ProviderBatchDelivery::Complete);
+    reopened.observe_provider_paths(delivered, false).unwrap();
+    settle_shared_provider(&reopened);
+    assert!(receiver.graph_root.join("notes/waiting-child.md").is_file());
+    assert_eq!(reopened.status().unwrap().provider_pending, 0);
+    assert_eq!(
+        fs::read_dir(
+            receiver
+                .request
+                .provider_journal_root
+                .parent()
+                .unwrap()
+                .join("pending-ingress-v1")
+        )
+        .unwrap()
+        .count(),
+        0
+    );
+}
+
+#[test]
 fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement() {
     let (control, peer, control_handle, peer_handle) =
         joined_shared_pair("provider-incomplete-frontier-control", 0xb300);
@@ -21538,6 +21781,24 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
         "Safe must remain blocked while authenticated foreign delivery is incomplete"
     );
 
+    let pending_root = author
+        .request
+        .provider_journal_root
+        .parent()
+        .unwrap()
+        .join("pending-ingress-v1");
+    assert_eq!(fs::read_dir(&pending_root).unwrap().count(), 1);
+    // Retry custody owns the original even when the provider temporarily
+    // removes its manifest. Only the delayed objects arrive after reopen.
+    fs::remove_file(
+        author
+            .request
+            .provider_root
+            .join("outbox/manifests")
+            .join(format!("{delayed_batch}.manifest")),
+    )
+    .unwrap();
+
     drop(author_handle);
     let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
     assert!(
@@ -21586,6 +21847,11 @@ fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement(
             .join("notes/delayed-peer-independent.md")
             .is_file(),
         "late foreign objects did not converge after restart"
+    );
+    assert_eq!(
+        fs::read_dir(&pending_root).unwrap().count(),
+        0,
+        "accepted ingress must retire its private recovery copy"
     );
     assert!(matches!(
         restarted.clean_shutdown(),
@@ -21890,10 +22156,12 @@ fn frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes() {
             false,
         )
         .unwrap();
-    settle_shared_provider(&handle);
-    let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
-    assert!(traversal.full_scan_entries > 0, "{traversal:?}");
+    let refusal = wait_for_provider_recovery_block(&handle, "differing head conflict");
+    assert!(refusal.contains("differs from canonical"), "{refusal}");
     assert_eq!(fs::read(&differing_path).unwrap(), differing);
+    assert!(handle.clean_shutdown().is_err());
+    fs::remove_file(&differing_path).unwrap();
+    settle_shared_provider(&handle);
 
     let malformed_name = format!(
         "{}-{}.head",
@@ -21904,10 +22172,11 @@ fn frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes() {
     fs::write(&malformed, b"{").unwrap();
     reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
     handle.observe_provider().unwrap();
-    settle_shared_provider(&handle);
-    let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
-    assert!(traversal.full_scan_entries > 0, "{traversal:?}");
+    let _refusal = wait_for_provider_recovery_block(&handle, "malformed head");
     assert_eq!(fs::read(&malformed).unwrap(), b"{");
+    // A malformed unaccepted head is reported and preserved; unlike the exact
+    // differing-conflict queue entry above, the scan can advance past it.
+    settle_shared_provider(&handle);
     assert!(matches!(
         handle.clean_shutdown(),
         Ok(SyncShutdownOutcome::Safe(_))
@@ -25936,21 +26205,34 @@ fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {
                 &format!("committed sync latency marker {label} {index}"),
             );
             let committed = std::time::Instant::now();
+            let publish_started = std::time::Instant::now();
             publish_shared_batch(&author_handle, &author, batch_id);
+            let publish = publish_started.elapsed();
+            let author_settle_started = std::time::Instant::now();
             settle_shared_provider(&author_handle);
+            let author_settle = author_settle_started.elapsed();
+            let provider_copy_started = std::time::Instant::now();
             let delivered = copy_provider_batch(
                 &author,
                 &receiver,
                 batch_id,
                 ProviderBatchDelivery::Complete,
             );
+            let provider_copy = provider_copy_started.elapsed();
+            let receiver_observe_started = std::time::Instant::now();
             receiver_handle
                 .observe_provider_paths(delivered, false)
                 .unwrap();
+            let receiver_observe = receiver_observe_started.elapsed();
 
             let mut visible = false;
+            let receiver_admission_started = std::time::Instant::now();
+            let mut receiver_turns = 0usize;
             for _ in 0..1_024 {
+                receiver_turns = receiver_turns.saturating_add(1);
+                let tick_started = std::time::Instant::now();
                 let tick = receiver_handle.tick().unwrap();
+                let tick_elapsed = tick_started.elapsed();
                 assert!(
                     !matches!(
                         tick,
@@ -25961,21 +26243,43 @@ fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {
                     ),
                     "peer admission failed for {label} edit {index}: {tick:?}"
                 );
-                visible = matches!(
-                    receiver_handle
-                        .query(SyncRuntimeQueryRequest::LoadPage {
-                            page_id: page_id.to_string(),
-                            block_limit: 4,
-                        })
-                        .unwrap(),
-                    SyncRuntimeQueryReply::PageWithBlocks(Some(_))
-                );
+                let query_started = std::time::Instant::now();
+                let query = receiver_handle
+                    .query(SyncRuntimeQueryRequest::LoadPage {
+                        page_id: page_id.to_string(),
+                        block_limit: 4,
+                    })
+                    .unwrap();
+                let query_elapsed = query_started.elapsed();
+                if tick_elapsed >= Duration::from_millis(100)
+                    || query_elapsed >= Duration::from_millis(100)
+                {
+                    eprintln!(
+                        "managed_sync_latency_slow_turn corpus={label} edit={index} turn={receiver_turns} tick_us={} query_us={} tick={tick:?}",
+                        tick_elapsed.as_micros(),
+                        query_elapsed.as_micros(),
+                    );
+                }
+                visible = matches!(query, SyncRuntimeQueryReply::PageWithBlocks(Some(_)));
                 if visible {
                     break;
                 }
             }
             assert!(visible, "peer did not expose {label} edit {index}");
-            latency_us.push(committed.elapsed().as_micros() as u64);
+            let receiver_admission = receiver_admission_started.elapsed();
+            let total = committed.elapsed();
+            if total >= Duration::from_millis(250) {
+                eprintln!(
+                    "managed_sync_latency_slow corpus={label} edit={index} total_us={} publish_us={} author_settle_us={} provider_copy_us={} receiver_observe_us={} receiver_admission_us={} receiver_turns={receiver_turns}",
+                    total.as_micros(),
+                    publish.as_micros(),
+                    author_settle.as_micros(),
+                    provider_copy.as_micros(),
+                    receiver_observe.as_micros(),
+                    receiver_admission.as_micros(),
+                );
+            }
+            latency_us.push(total.as_micros() as u64);
         }
 
         latency_us.sort_unstable();
@@ -27063,6 +27367,7 @@ fn assert_managed_application_save_detail_accounting(
             detail.finalize_base_objects,
             detail.finalize_projection_intents,
             detail.finalize_seal_pending,
+            preparation.writer_lane_reservation,
         ],
         "finalize",
     );
@@ -27657,6 +27962,10 @@ fn managed_application_save_phase_receipt(
         managed_application_save_quantiles(samples, |sample| sample.preparation_stages.capture);
     let (finalize_p50, finalize_p95) =
         managed_application_save_quantiles(samples, |sample| sample.preparation_stages.finalize);
+    let (writer_lane_reservation_p50, writer_lane_reservation_p95) =
+        managed_application_save_quantiles(samples, |sample| {
+            sample.preparation_stages.writer_lane_reservation
+        });
     let (prepared_p50, prepared_p95) =
         managed_application_save_quantiles(samples, |sample| sample.stages.prepared_record);
     let (graph_p50, graph_p95) =
@@ -27684,7 +27993,7 @@ fn managed_application_save_phase_receipt(
     let detail = managed_application_save_detail_phase_receipt(samples);
     let editor_request = managed_application_save_editor_request_receipt(samples);
     format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} editor_request: {} local_mutation_detail: {}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} writer_lane_reservation_p50_ms={:.3} writer_lane_reservation_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} editor_request: {} local_mutation_detail: {}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(actor_total_p50),
@@ -27715,6 +28024,8 @@ fn managed_application_save_phase_receipt(
             startup_ms(capture_p95),
             startup_ms(finalize_p50),
             startup_ms(finalize_p95),
+            startup_ms(writer_lane_reservation_p50),
+            startup_ms(writer_lane_reservation_p95),
             startup_ms(prepared_p50),
             startup_ms(prepared_p95),
             startup_ms(graph_p50),
@@ -28449,6 +28760,18 @@ fn managed_projection_rebuild_manual_benchmark() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(8);
     let fixture = ActivationFixture::copied_graph("managed-projection-rebuild", 0xa0e9, &source);
+    // Age authoritative history through a page whose shape the benchmark owns.
+    // Picking the first non-empty page in a real corpus made the gate depend on
+    // whether replacing that page's first flattened block happened to preserve
+    // its document structure. The corpus is still the 1,000+ file activation
+    // and rebuild workload; this one added page only supplies valid repeatable
+    // edits before the projection is discarded.
+    let benchmark_path = "pages/tine-managed-projection-rebuild-benchmark.md";
+    fs::write(
+        fixture.graph_root.join(benchmark_path),
+        b"- projection rebuild benchmark\n",
+    )
+    .expect("controlled projection-rebuild benchmark page is writable");
     let workspace_id = fixture.request.identities.workspace_id;
     let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
     assert_eq!(activated.status, SyncLocalActivationStatus::Active);
@@ -28479,22 +28802,13 @@ fn managed_projection_rebuild_manual_benchmark() {
     }
     managed_paths.sort();
     let graph_files = managed_paths.len();
-    let editable = managed_paths
-        .into_iter()
-        .filter(|path| {
-            let (page, _) = load_application_exact(&handle, path);
-            !page.blocks.is_empty()
-        })
-        .take(rounds.max(1))
-        .collect::<Vec<_>>();
     assert!(
-        !editable.is_empty(),
-        "real graph copy has an editable managed page"
+        managed_paths.iter().any(|path| path == benchmark_path),
+        "controlled benchmark page is part of the activated real graph copy"
     );
 
     for round in 0..rounds {
-        let path = &editable[round % editable.len()];
-        let (page, revision) = load_application_exact(&handle, path);
+        let (page, revision) = load_application_exact(&handle, benchmark_path);
         let _ = save_application_block_text(
             &handle,
             page,
@@ -31581,6 +31895,30 @@ fn failure_after_clean_activation_retain_completes_on_the_next_open() {
         handle.clean_shutdown().unwrap(),
         SyncShutdownOutcome::Safe(_)
     ));
+}
+
+#[test]
+fn activation_provider_namespace_accepts_canonical_and_lexical_graph_paths() {
+    let fixture = ActivationFixture::nested_unicode("provider-path-spelling", 0xa1f5_c2e0);
+    let mut request = fixture.request.clone();
+    assert!(validate_activation_paths(&request, &fixture.graph_root).is_ok());
+    request.provider_root = fs::canonicalize(&fixture.graph_root)
+        .unwrap()
+        .join(".tine-sync/v2/shared");
+    assert!(validate_activation_paths(&request, &fixture.graph_root).is_ok());
+    for suffix in [
+        ".tine-sync/v2/other",
+        ".tine-sync/v3/shared",
+        "other/v2/shared",
+    ] {
+        request.provider_root = fixture.graph_root.join(suffix);
+        assert!(validate_activation_paths(&request, &fixture.graph_root).is_err());
+    }
+    request.provider_root = fixture.root.join(".tine-sync/v2/shared");
+    assert!(validate_activation_paths(&request, &fixture.graph_root).is_err());
+    request = fixture.request.clone();
+    request.archive_root = fixture.graph_root.join("must-not-be-private");
+    assert!(validate_activation_paths(&request, &fixture.graph_root).is_err());
 }
 
 #[test]

@@ -420,7 +420,7 @@ fn eval_props(quant: Quant, pred: &Filter, properties: &[(String, String)], ctx:
 
     let atoms = flatten_atoms(source_key, &rows, ctx);
 
-    // `= ''` (IsBlank) and `all-page-tags`'s `atom_count > 0` are properties of
+    // Cardinality tests such as `= ''` (IsBlank) are properties of
     // the whole atom list, not of one atom.
     if let Some(hit) = eval_atom_count_test(&test, present, atoms.len()) {
         return match quant {
@@ -504,8 +504,7 @@ fn eval_atom_count_test(test: &Filter, present: bool, count: usize) -> Option<bo
                 CmpOp::Le => count <= *number,
                 _ => return None,
             };
-            // Both `= ''` and `(all-page-tags)` are scoped by presence: a key
-            // that is absent has no blank value and no tags.
+            // Cardinality is scoped by presence: an absent key has no blank value.
             Some(present && hit)
         }
         _ => None,

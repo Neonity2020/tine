@@ -2657,6 +2657,104 @@
         "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
         "refs": []
       }
+    },
+    {
+      "section": "Fixed",
+      "text": "Privacy-safe diagnostic reports now include the bounded reason code for failed Tine-managed storage page saves, making prolonged unsaved-draft failures diagnosable without debug mode or a special build. A large report's selectable preview is shortened so Settings remains responsive; Copy and Save still export the complete report (GH #540).",
+      "userVisible": true,
+      "regressions": [
+        "UI-DIAGNOSTIC-REPORT-343"
+      ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "The existing Diagnostics guide already directs users to Copy or Save the complete report; the bounded on-screen preview explains itself when active.",
+        "refs": []
+      },
+      "docs": {
+        "status": "update",
+        "reason": "The diagnostics privacy contract now names the managed-save fixed event and bounded outcome vocabulary.",
+        "refs": [
+          "docs/contracts/diagnostics.md"
+        ]
+      },
+      "website": {
+        "status": "update",
+        "reason": "Regenerate and verify the Guide site from canonical templates; no separate marketing claim proposed.",
+        "refs": [
+          "website/guide/"
+        ]
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "Closing with failed saves identifies the affected pages. Choosing not to discard opens a recovery panel with page navigation, save retry, and draft copying, including a complete recovery copy (GH #540).",
+      "userVisible": true,
+      "regressions": [
+        "UI-CLOSE-UNSAVED-RECOVERY"
+      ],
+      "guide": {
+        "status": "update",
+        "reason": "The external-edits and backups guide now explains close-time draft recovery.",
+        "refs": [
+          "crates/tine-core/src/templates/files-external-edits-backups.md"
+        ]
+      },
+      "docs": {
+        "status": "update",
+        "reason": "The Concord contract now records close-time retained-draft recovery behavior.",
+        "refs": [
+          "docs/concord.md"
+        ]
+      },
+      "website": {
+        "status": "update",
+        "reason": "Regenerate and verify the Guide site from canonical templates; no separate marketing claim proposed.",
+        "refs": [
+          "website/guide/"
+        ]
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "A conflict whose original physical page is unavailable exposes its retained draft and guarded resolution instead of hiding recovery behind the page-load error (GH #541).",
+      "userVisible": true,
+      "regressions": [
+        "UI-MISSING-PHYSICAL-CONFLICT-RECOVERY"
+      ],
+      "guide": {
+        "status": "not-applicable",
+        "reason": "This restores access to the existing conflict-resolution flow and introduces no new user procedure.",
+        "refs": []
+      },
+      "docs": {
+        "status": "update",
+        "reason": "The Concord contract now specifies retained recovery when the original physical page cannot be read.",
+        "refs": [
+          "docs/concord.md"
+        ]
+      },
+      "website": {
+        "status": "update",
+        "reason": "Regenerate and verify the Guide site from canonical templates; no separate marketing claim proposed.",
+        "refs": [
+          "website/guide/"
+        ]
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Proposed patch release; no standalone blog feature or minor-release editorial gate proposed.",
+        "refs": []
+      }
     }
   ]
 }

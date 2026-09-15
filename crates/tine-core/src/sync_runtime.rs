@@ -10370,8 +10370,17 @@ fn validate_activation_paths(
 ) -> Result<(), String> {
     let canonical_graph = fs::canonicalize(graph_root)
         .map_err(|error| format!("cannot canonicalize graph root for activation: {error}"))?;
-    let expected_provider = canonical_graph.join(".tine-sync").join("v2").join("shared");
-    if normalize_absolute(&request.provider_root)? != expected_provider {
+    // The namespace may not exist yet. Canonicalize its existing graph ancestor,
+    // rather than comparing a lexical path with Windows' verbatim canonical path.
+    let provider = normalize_absolute(&request.provider_root)?;
+    let provider_graph = provider
+        .ancestors()
+        .nth(3)
+        .filter(|_| provider.ends_with(Path::new(".tine-sync/v2/shared")))
+        .map(fs::canonicalize)
+        .transpose()
+        .map_err(|error| format!("cannot canonicalize provider graph root: {error}"))?;
+    if provider_graph.as_deref() != Some(canonical_graph.as_path()) {
         return Err(
             "provider_root must be exactly the graph's .tine-sync/v2/shared namespace".into(),
         );
@@ -11674,6 +11683,24 @@ fn publish_clean_archive_batch(
         return Err(SyncRuntimeRequestError::ActorRefused(format!(
             "clean outbound batch {batch_id} is outside the sharing namespace"
         )));
+    }
+    // Acceptance is not evidence that the parent's replay bytes still exist.
+    // Check only immediate heads, through the logical hot/cold archive, before
+    // publishing any part of this child or advertising its frontier.
+    for dependency in validated.manifest().causal_dependency_heads() {
+        match store
+            .inspect_batch_with_cold_history(*dependency)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        {
+            crate::oplog::BatchInspection::Ready(parent)
+                if parent.manifest().workspace_id() == workspace_id
+                    && parent.manifest().lineage_digest() == lineage_digest => {}
+            _ => {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "clean outbound dependency {dependency} is not completely retained"
+                )));
+            }
+        }
     }
     for object in validated.manifest().required_objects() {
         let bytes = store
@@ -15296,6 +15323,18 @@ impl RuntimeActor {
         } else {
             None
         };
+        let mut retained_ingress = VecDeque::new();
+        if let (Some(provider), Some(descriptor)) = (&provider, &clean_shared_descriptor) {
+            for (batch, bytes) in provider.pending_ingress() {
+                let manifest = OperationBatch::decode(bytes).map_err(|error| error.to_string())?;
+                if manifest.workspace_id() != descriptor.workspace_id()
+                    || manifest.lineage_digest() != descriptor.lineage_digest()
+                {
+                    return Err("pending ingress names another shared authority".into());
+                }
+                retained_ingress.push_back(*batch);
+            }
+        }
         let clean = CleanRuntimeActorCore::new(
             runtime,
             sweeps,
@@ -15375,10 +15414,10 @@ impl RuntimeActor {
             provider_rescan_required_for_safe: false,
             provider_full_scan_requested: false,
             provider_observation_cursor: None,
-            provider_direct_manifests: VecDeque::new(),
+            provider_direct_manifests: retained_ingress.clone(),
             pending_conflict_resolutions: VecDeque::new(),
             conflict_backlog_seeded: false,
-            provider_direct_queued: BTreeSet::new(),
+            provider_direct_queued: retained_ingress.into_iter().collect(),
             provider_head_dirty: false,
             provider_head_retirement: VecDeque::new(),
             provider_incomplete: BTreeSet::new(),
@@ -15633,6 +15672,12 @@ impl RuntimeActor {
             return Err(SyncRuntimeRequestError::ActorRefused(
                 "provider delivery is unavailable outside SharedActive".into(),
             ));
+        }
+        if imprecise || !paths.is_empty() {
+            let incomplete = std::mem::take(&mut self.provider_incomplete);
+            for batch in incomplete {
+                self.queue_clean_provider_manifest(batch);
+            }
         }
         for path in paths {
             if path.is_empty()
@@ -25600,6 +25645,26 @@ impl RuntimeActor {
         }
     }
 
+    fn defer_clean_provider_manifest(
+        &mut self,
+        batch_id: BatchId,
+        bytes: &[u8],
+    ) -> SyncRuntimeTick {
+        if let Err(error) = self
+            .provider
+            .as_mut()
+            .expect("provider checked")
+            .retain_pending_ingress(bytes)
+        {
+            return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+        }
+        self.provider_direct_manifests
+            .retain(|queued| *queued != batch_id);
+        self.provider_direct_queued.remove(&batch_id);
+        self.provider_incomplete.insert(batch_id);
+        SyncRuntimeTick::Recovering
+    }
+
     fn queue_clean_provider_manifest(&mut self, batch_id: BatchId) {
         if self.provider_direct_queued.insert(batch_id) {
             self.provider_direct_manifests.push_back(batch_id);
@@ -25947,6 +26012,14 @@ impl RuntimeActor {
             });
             match accepted {
                 Ok(true) => {
+                    if let Err(error) = self
+                        .provider
+                        .as_mut()
+                        .expect("provider checked")
+                        .retire_pending_ingress(batch_id)
+                    {
+                        return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                    }
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
                     return SyncRuntimeTick::Recovering;
@@ -25964,18 +26037,26 @@ impl RuntimeActor {
                     .or_default()
                     .exact_manifests += 1;
             }
-            let manifest_bytes = match self
-                .provider
-                .as_ref()
-                .expect("provider checked")
-                .read_exact(&path)
-            {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => {
-                    return SyncRuntimeTick::RecoveryBlocked(format!(
-                        "clean provider head names absent manifest {batch_id}"
-                    ));
+            let provider = self.provider.as_ref().expect("provider checked");
+            let retained = provider.pending_ingress().get(&batch_id);
+            let manifest_bytes = match provider.read_exact(&path) {
+                Ok(Some(bytes)) => {
+                    if retained.is_some_and(|retained| *retained != bytes) {
+                        return SyncRuntimeTick::RecoveryBlocked(format!(
+                            "provider manifest {batch_id} differs from retained ingress"
+                        ));
+                    }
+                    bytes
                 }
+                Ok(None) => match retained {
+                    Some(bytes) => bytes.clone(),
+                    None => {
+                        self.provider_direct_manifests.pop_front();
+                        self.provider_direct_queued.remove(&batch_id);
+                        self.provider_incomplete.insert(batch_id);
+                        return SyncRuntimeTick::Recovering;
+                    }
+                },
                 Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
             };
             let manifest = match OperationBatch::decode(&manifest_bytes) {
@@ -26013,6 +26094,9 @@ impl RuntimeActor {
                 match accepted {
                     Ok(true) if retained => {}
                     Ok(_) => {
+                        if self.provider_incomplete.contains(dependency) {
+                            return self.defer_clean_provider_manifest(batch_id, &manifest_bytes);
+                        }
                         // This batch cannot be admitted before its dependency, and
                         // the lane only ever advances its front. A dependency that
                         // is already queued BEHIND us therefore deadlocks the pair:
@@ -26044,10 +26128,7 @@ impl RuntimeActor {
                 {
                     Ok(Some(bytes)) => bytes,
                     Ok(None) => {
-                        return SyncRuntimeTick::RecoveryBlocked(format!(
-                            "clean provider manifest {batch_id} is missing {}",
-                            descriptor.content_digest()
-                        ));
+                        return self.defer_clean_provider_manifest(batch_id, &manifest_bytes);
                     }
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
                 };
@@ -26094,6 +26175,15 @@ impl RuntimeActor {
             };
             return match outcome {
                 Ok(CleanActorMutationOutcome::Durable(batch_id)) => {
+                    if let Err(error) = self
+                        .provider
+                        .as_mut()
+                        .expect("provider checked")
+                        .retire_pending_ingress(batch_id)
+                    {
+                        return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                    }
+
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
                     if !recovery_delivery {
@@ -26109,6 +26199,15 @@ impl RuntimeActor {
                     SyncRuntimeTick::ProviderMutation { batch_id }
                 }
                 Ok(CleanActorMutationOutcome::DurablePending { .. }) => {
+                    if let Err(error) = self
+                        .provider
+                        .as_mut()
+                        .expect("provider checked")
+                        .retire_pending_ingress(batch_id)
+                    {
+                        return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                    }
+
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
                     SyncRuntimeTick::Recovering
@@ -26169,6 +26268,14 @@ impl RuntimeActor {
                     // This is the acknowledgement/dequeue boundary. No line
                     // above it removes provider work; the durable frame now
                     // owns the exact original independently of transport.
+                    if let Err(error) = self
+                        .provider
+                        .as_mut()
+                        .expect("provider checked")
+                        .retire_pending_ingress(batch_id)
+                    {
+                        return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                    }
                     self.provider_direct_manifests.pop_front();
                     self.provider_direct_queued.remove(&batch_id);
                     SyncRuntimeTick::Recovering
@@ -26635,6 +26742,7 @@ impl RuntimeActor {
                 }) && self.managed_local.as_ref().is_none_or(|managed| {
                     managed.pending_commit.is_none() && managed.frames.is_empty()
                 }) && !self.provider_has_work()
+                    && self.provider_incomplete.is_empty()
                     && !self.move_episode_cleanup_pending
                     && self.move_episode_cleanup_blocked.is_none();
                 if settled {

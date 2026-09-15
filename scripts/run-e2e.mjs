@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  ONE_RELEASE_CI_EXCEPTION_VERSION,
+  releaseE2eScenarioException,
   releaseE2eScenarioIsNonblocking,
 } from "./release-ci-exception.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
@@ -666,7 +666,8 @@ async function runScenario([id, script, extraEnv], contractEntry) {
     }
     const releaseException = status === "failed"
       && e2eMode === "release"
-      && releaseE2eScenarioIsNonblocking(suiteName, id);
+      ? releaseE2eScenarioException(suiteName, id)
+      : null;
     const record = {
       id,
       script,
@@ -683,8 +684,7 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       blocking: failureIsBlocking(status, contractEntry, id),
       ...(releaseException ? {
         releaseException: {
-          version: ONE_RELEASE_CI_EXCEPTION_VERSION,
-          scenarioKey: `${suiteName}:${id}`,
+          ...releaseException,
         },
       } : {}),
     };

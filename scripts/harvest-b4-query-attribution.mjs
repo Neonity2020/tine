@@ -42,7 +42,7 @@ function median(values) {
 
 const queryRows = new Map();
 const hitRows = [];
-const invalidationRows = new Map();
+const acquiredImageRows = new Map();
 const facetRows = new Map();
 const sampleRows = [];
 const readinessRows = [];
@@ -87,7 +87,7 @@ for (let run = 0; run < runs; run += 1) {
   for (const line of `${result.stdout}\n${result.stderr}`.split("\n")) {
     const queryAt = line.indexOf("b4_query ");
     const hitAt = line.indexOf("b4_projection_hit_rate ");
-    const invalidationAt = line.indexOf("b4_invalidation ");
+    const acquiredImageAt = line.indexOf("b4_acquired_image ");
     const facetAt = line.indexOf("b4_facet ");
     const sampleAt = line.indexOf("b4_query_sample ");
     const readinessAt = line.indexOf("b4_readiness ");
@@ -100,10 +100,10 @@ for (let run = 0; run < runs; run += 1) {
       queryRows.get(key).push(row);
     } else if (hitAt >= 0) {
       hitRows.push(fields(line.slice(hitAt)));
-    } else if (invalidationAt >= 0) {
-      const row = fields(line.slice(invalidationAt));
-      if (!invalidationRows.has(row.edit)) invalidationRows.set(row.edit, []);
-      invalidationRows.get(row.edit).push(row);
+    } else if (acquiredImageAt >= 0) {
+      const row = fields(line.slice(acquiredImageAt));
+      if (!acquiredImageRows.has(row.edit)) acquiredImageRows.set(row.edit, []);
+      acquiredImageRows.get(row.edit).push(row);
     } else if (facetAt >= 0) {
       const row = fields(line.slice(facetAt));
       const key = `${row.family}\0${row.pages}`;
@@ -118,38 +118,40 @@ for (let run = 0; run < runs; run += 1) {
 }
 
 if (phase === "after") {
-  // Classes whose candidate set is selective enough to stay on the projection.
-  const candidateOnlyClasses = new Set([
-    "sparse_task", "page_ref", "block_property",
-    "page_property", "page_tags", "page", "namespace",
-    "mixed_and", "complete_or", "boolean_composition",
-  ]);
-  // Classes whose candidate set exceeds the cutoff on this corpus, so the
-  // escape hatch abandons the projection and the parser walk answers. Their
-  // signature is the exact complement: no candidate query completes, exactly
-  // one fallback read is recorded on the existing hatch, and exactly one
-  // full-graph evaluation runs. A driver that accepted either signature would
-  // not notice the hatch silently ceasing to fire.
-  const abandonedClasses = new Set(["task_non_sparse", "journal"]);
+  const expectedSamples = runs * 14 * Math.max(Number.parseInt(rounds, 10), 3);
+  if (sampleRows.length !== expectedSamples) {
+    throw new Error(`expected ${expectedSamples} statement samples, got ${sampleRows.length}`);
+  }
   for (const row of sampleRows) {
-    if (candidateOnlyClasses.has(row.class)) {
-      if (
-        Number.parseInt(row.candidateQueriesCompleted, 10) !== 1 ||
-        Number.parseInt(row.fallbackReads, 10) !== 0 ||
-        Number.parseInt(row.fullGraphEvaluations, 10) !== 0
-      ) {
-        throw new Error(`post-fix candidate-only sample failed: ${JSON.stringify(row)}`);
-      }
-    } else if (abandonedClasses.has(row.class)) {
-      if (
-        Number.parseInt(row.candidateQueriesCompleted, 10) !== 0 ||
-        Number.parseInt(row.fallbackReads, 10) !== 1 ||
-        Number.parseInt(row.fullGraphEvaluations, 10) !== 1 ||
-        Number.parseInt(row.evaluatedPages, 10) !== 0
-      ) {
-        throw new Error(`post-fix abandoned sample failed: ${JSON.stringify(row)}`);
-      }
+    if (
+      Number.parseInt(row.statementQueriesCompleted, 10) !== 1 ||
+      Number.parseInt(row.fallbackReads, 10) !== 0 ||
+      Number.parseInt(row.fullGraphEvaluations, 10) !== 0 ||
+      Number.parseInt(row.evaluatedPages, 10) !== 0
+    ) {
+      throw new Error(`post-retirement statement sample failed: ${JSON.stringify(row)}`);
     }
+  }
+  const expectedReadiness = runs * Math.max(Number.parseInt(rounds, 10), 3);
+  if (readinessRows.length !== expectedReadiness) {
+    throw new Error(`expected ${expectedReadiness} readiness samples, got ${readinessRows.length}`);
+  }
+  for (const row of readinessRows) {
+    if (
+      Number.parseInt(row.statement_reads, 10) !== 1 ||
+      Number.parseInt(row.fallback_reads, 10) !== 0 ||
+      row.oracle_equal !== "true"
+    ) {
+      throw new Error(`post-retirement readiness sample failed: ${JSON.stringify(row)}`);
+    }
+  }
+  for (const [edit, rows] of acquiredImageRows) {
+    if (rows.length !== runs || rows.some((row) => row.outputs_equal !== "true")) {
+      throw new Error(`acquired-image agreement failed for ${edit}: ${JSON.stringify(rows)}`);
+    }
+  }
+  if (acquiredImageRows.size !== 4) {
+    throw new Error(`expected four acquired-image edit classes, got ${acquiredImageRows.size}`);
   }
 }
 
@@ -164,20 +166,20 @@ const report = [];
 report.push(`# runs=${runs} rounds_per_phase=${rounds} pages=${measuredPages} blocks=${measuredBlocks}`);
 report.push("");
 report.push("## Query classes (median of run medians)");
-report.push("| class | memo median/p95/max ms | invalidated-ready median/p95/max ms | invalidated share | growth | indexed reads/run |");
+report.push("| class | repeat median/p95/max ms | invalidated-ready median/p95/max ms | invalidated share | growth | statement reads/run |");
 report.push("| --- | ---: | ---: | ---: | ---: | ---: |");
 for (const className of classes) {
-  const memoRows = queryRows.get(`${className}\0memo`) ?? [];
-  const memo = median(memoRows.map((row) => Number.parseFloat(row.median_ms)));
-  const memoP95 = median(memoRows.map((row) => Number.parseFloat(row.p95_ms)));
-  const memoMax = median(memoRows.map((row) => Number.parseFloat(row.max_ms)));
+  const repeatRows = queryRows.get(`${className}\0repeat`) ?? [];
+  const repeat = median(repeatRows.map((row) => Number.parseFloat(row.median_ms)));
+  const repeatP95 = median(repeatRows.map((row) => Number.parseFloat(row.p95_ms)));
+  const repeatMax = median(repeatRows.map((row) => Number.parseFloat(row.max_ms)));
   const invalidatedRows = queryRows.get(`${className}\0invalidated_ready`) ?? [];
   const invalidated = median(invalidatedRows.map((row) => Number.parseFloat(row.median_ms)));
   const invalidatedP95 = median(invalidatedRows.map((row) => Number.parseFloat(row.p95_ms)));
   const invalidatedMax = median(invalidatedRows.map((row) => Number.parseFloat(row.max_ms)));
-  const indexed = median(invalidatedRows.map((row) => Number.parseInt(row.indexed_reads, 10)));
+  const statementReads = median(invalidatedRows.map((row) => Number.parseInt(row.statement_reads, 10)));
   report.push(
-    `| ${className} | ${memo.toFixed(6)} / ${memoP95.toFixed(6)} / ${memoMax.toFixed(6)} | ${invalidated.toFixed(6)} / ${invalidatedP95.toFixed(6)} / ${invalidatedMax.toFixed(6)} | ${((invalidated / invalidatedTotal) * 100).toFixed(1)}% | ${(invalidated / Math.max(memo, 0.000001)).toFixed(2)}x | ${indexed} |`,
+    `| ${className} | ${repeat.toFixed(6)} / ${repeatP95.toFixed(6)} / ${repeatMax.toFixed(6)} | ${invalidated.toFixed(6)} / ${invalidatedP95.toFixed(6)} / ${invalidatedMax.toFixed(6)} | ${((invalidated / invalidatedTotal) * 100).toFixed(1)}% | ${(invalidated / Math.max(repeat, 0.000001)).toFixed(2)}x | ${statementReads} |`,
   );
 }
 
@@ -192,40 +194,40 @@ for (const className of classes) {
 
 report.push("");
 report.push("## Invalidated-ready sample counters");
-report.push("| class | run | sample | candidateQueriesCompleted | fallbackReads | fullGraphEvaluations | evaluatedPages | medianMs |");
+report.push("| class | run | sample | statementQueriesCompleted | fallbackReads | fullGraphEvaluations | evaluatedPages | medianMs |");
 report.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
 for (const row of sampleRows) {
-  report.push(`| ${row.class} | ${row.run} | ${row.sample} | ${row.candidateQueriesCompleted} | ${row.fallbackReads} | ${row.fullGraphEvaluations} | ${row.evaluatedPages} | ${Number.parseFloat(row.medianMs).toFixed(6)} |`);
+  report.push(`| ${row.class} | ${row.run} | ${row.sample} | ${row.statementQueriesCompleted} | ${row.fallbackReads} | ${row.fullGraphEvaluations} | ${row.evaluatedPages} | ${Number.parseFloat(row.medianMs).toFixed(6)} |`);
 }
 
 const immediate = queryRows.get("sparse_task\0data_rev_immediate") ?? [];
 report.push("");
 report.push("## Projection readiness at immediate post-delta/dataRev proxy");
-report.push("| samples | ready hits | ready misses | hit rate | indexed reads | median query ms |");
+report.push("| samples | ready hits | ready misses | hit rate | statement reads | median query ms |");
 report.push("| ---: | ---: | ---: | ---: | ---: | ---: |");
 const samples = hitRows.reduce((sum, row) => sum + Number.parseInt(row.samples, 10), 0);
 const hits = hitRows.reduce((sum, row) => sum + Number.parseInt(row.ready_hits, 10), 0);
 const misses = hitRows.reduce((sum, row) => sum + Number.parseInt(row.ready_misses, 10), 0);
-const indexed = hitRows.reduce((sum, row) => sum + Number.parseInt(row.indexed_reads, 10), 0);
+const statementReads = hitRows.reduce((sum, row) => sum + Number.parseInt(row.statement_reads, 10), 0);
 report.push(
-  `| ${samples} | ${hits} | ${misses} | ${samples === 0 ? "n/a" : `${((hits / samples) * 100).toFixed(1)}%`} | ${indexed} | ${median(immediate.map((row) => Number.parseFloat(row.median_ms))).toFixed(6)} |`,
+  `| ${samples} | ${hits} | ${misses} | ${samples === 0 ? "n/a" : `${((hits / samples) * 100).toFixed(1)}%`} | ${statementReads} | ${median(immediate.map((row) => Number.parseFloat(row.median_ms))).toFixed(6)} |`,
 );
 
 report.push("");
 report.push("## Readiness distribution");
-report.push("| save | generation | immediate ready | ready latency ms | terminal event | candidate reads | fallback reads | oracle equal |");
+report.push("| save | generation | immediate ready | ready latency ms | terminal event | statement reads | fallback reads | oracle equal |");
 report.push("| --- | ---: | --- | ---: | --- | ---: | ---: | --- |");
 for (const row of readinessRows) {
-  report.push(`| ${row.save} | ${row.generation} | ${row.immediate_ready} | ${Number.parseFloat(row.ready_latency_ms).toFixed(6)} | ${row.terminal_event} | ${row.candidate_reads} | ${row.fallback_reads} | ${row.oracle_equal} |`);
+  report.push(`| ${row.save} | ${row.generation} | ${row.immediate_ready} | ${Number.parseFloat(row.ready_latency_ms).toFixed(6)} | ${row.terminal_event} | ${row.statement_reads} | ${row.fallback_reads} | ${row.oracle_equal} |`);
 }
 
 report.push("");
-report.push("## Scoped invalidation (median counts)");
-report.push("| edit | before | retained | evicted | generation delta |");
-report.push("| --- | ---: | ---: | ---: | ---: |");
-for (const [edit, rows] of invalidationRows) {
+report.push("## Acquired-image agreement");
+report.push("| edit | queries | executions | outputs equal | generation delta |");
+report.push("| --- | ---: | ---: | --- | ---: |");
+for (const [edit, rows] of acquiredImageRows) {
   report.push(
-    `| ${edit} | ${median(rows.map((row) => Number.parseInt(row.before, 10)))} | ${median(rows.map((row) => Number.parseInt(row.retained, 10)))} | ${median(rows.map((row) => Number.parseInt(row.evicted, 10)))} | ${median(rows.map((row) => Number.parseInt(row.cache_gen_after, 10) - Number.parseInt(row.cache_gen_before, 10)))} |`,
+    `| ${edit} | ${median(rows.map((row) => Number.parseInt(row.queries, 10)))} | ${median(rows.map((row) => Number.parseInt(row.executions, 10)))} | ${rows.every((row) => row.outputs_equal === "true")} | ${median(rows.map((row) => Number.parseInt(row.cache_gen_after, 10) - Number.parseInt(row.cache_gen_before, 10)))} |`,
   );
 }
 

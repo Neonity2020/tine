@@ -1185,9 +1185,10 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         ("crates/tine-core/src/oplog/sqlite.rs", "open.create", 1),
         ("crates/tine-core/src/oplog/sqlite.rs", "open.create_new", 1),
         ("crates/tine-core/src/oplog/wire.rs", "cap.create_dir", 1),
-        // 10 since ca9bd718 (W5-smalls): `retire_provider_residue_entry` is
-        // the single validated front door for retiring one `removed/` entry.
-        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 10),
+        // 11: `retire_provider_residue_entry` remains the validated front door
+        // for `removed/` entries; pending-ingress custody adds one private
+        // manifest retirement after durable acceptance or recovery transfer.
+        ("crates/tine-core/src/oplog/wire.rs", "cap.remove_file", 11),
         ("crates/tine-core/src/oplog/wire.rs", "cap.rename", 8),
         ("crates/tine-core/src/oplog/wire.rs", "file.set_len", 1),
         ("crates/tine-core/src/oplog/wire.rs", "fs.create_dir_all", 2),

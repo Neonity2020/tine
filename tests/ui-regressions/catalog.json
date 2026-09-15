@@ -8803,7 +8803,7 @@
         "scenario": "diagnostics.user-controlled-report",
         "failBefore": "proven"
       },
-      "notes": "The settings surface did not exist before GH #343. It now states the exclusion and no-upload boundary beside the action, previews the exact JSON, copies only that generated report, offers native Save on desktop, and clears retained current/previous events on request."
+      "notes": "The settings surface did not exist before GH #343. It now states the exclusion and no-upload boundary beside the action, keeps a large selectable preview bounded while Copy and Save retain the complete JSON, offers native Save on desktop, and clears retained current/previous events on request. GH #540 supplied a 2.8 MB Windows report whose full textarea made Settings extremely sluggish."
     },
     {
       "id": "UI-REFFILTER-CHIPS-FOLLOW-TEXT-173",

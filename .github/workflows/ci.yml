@@ -539,6 +539,8 @@ jobs:
 
       - name: Run managed-storage smoke as Tine's Android app UID
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          TINE_CI_SCOPE: ${{ inputs.scope }}
         with:
           api-level: 35
           arch: x86_64

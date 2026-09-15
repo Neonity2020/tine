@@ -205,6 +205,21 @@ The device-private provider journal also has `pending-publication-v1/` and
 `provider-transaction.authority`; these never sync and cannot grant shared
 graph authority.
 
+`pending-ingress-v1/<batch>-<manifest-digest>.manifest`, beside the private
+provider journal, retains the exact validated manifest only when its objects
+or causal dependencies are still absent. These are retry originals, not
+accepted archive commits. Cold open visits only this pending namespace (at
+most 4,096 entries and 8 MiB of manifest bytes), validates the content-addressed
+name and current workspace/lineage, and retries through ordinary ingress.
+It does not enumerate provider manifest/object history. Complete ingress and
+local authoring add no pending-ingress artifact. Immutable publication and its
+durability barrier precede dequeue into the sleeping pending set; durable
+acceptance or independently durable retained continuation precedes retirement.
+Missing delivery sleeps until a provider observation, blocks `Safe`, and does
+not block unrelated own-frontier publication. Corrupt or conflicting originals
+remain in place and refuse replay/retirement. Interrupted publication temporaries
+are never replay authority. This internal recovery change has no Guide delta.
+
 An INCOMPLETE provider tree is not an unsafe one. A file-sync tool creates the
 directories above in whatever order it likes, may hold one back for minutes,
 and may remove one again while it propagates another device's deletion. An
@@ -1106,6 +1121,16 @@ deque/set invariant if they disagree). Queue order otherwise follows provider
 scan order, which is why this state reproduces only intermittently in journeys —
 `a_dependency_queued_behind_its_dependent_is_promoted_ahead_of_it` pins the rule
 deterministically.
+
+**Outbound causal heads retain replay evidence.** Before publishing a queued
+batch's objects, manifest, or frontier head, the runtime requires every immediate
+causal parent to be complete in the logical hot/cold archive and to name the same
+workspace and lineage. Accepted effects alone do not prove retained replay bytes.
+Missing manifests or objects block publication and Safe handoff; restoration
+unblocks the queued batch without reopening. This check reads the immediate heads,
+not the whole accepted history. The two
+`outbound_child_blocks_when_ordinary_parent_*_lost` tests cover missing manifests
+and objects, refusal, and recovery.
 
 ### 2.3a Adoption: a device that already has a managed graph of its own
 
