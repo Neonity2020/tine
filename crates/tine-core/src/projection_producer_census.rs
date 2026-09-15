@@ -964,14 +964,13 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         ("crates/tine-core/src/model.rs", "cap.create_dir", 1),
-        ("crates/tine-core/src/model.rs", "cap.remove_file", 18),
-        ("crates/tine-core/src/model.rs", "cap.rename", 1),
+        ("crates/tine-core/src/model.rs", "cap.remove_file", 16),
         ("crates/tine-core/src/model.rs", "fs.create_dir_all", 15),
         ("crates/tine-core/src/model.rs", "fs.remove_dir_all", 1),
         ("crates/tine-core/src/model.rs", "fs.remove_file", 14),
         ("crates/tine-core/src/model.rs", "fs.rename", 3),
         ("crates/tine-core/src/model.rs", "libc.renameat2", 3),
-        ("crates/tine-core/src/model.rs", "open.create_new", 8),
+        ("crates/tine-core/src/model.rs", "open.create_new", 7),
         ("crates/tine-core/src/model.rs", "windows.MoveFileW", 1),
         (
             "crates/tine-core/src/model.rs",
@@ -1849,9 +1848,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // Android smoke files leaves the surface, together with the 22 write-
     // boundary tuples above. No row was added and no surviving Direct Files
     // row changed its count; the digest moves only by deletion.
+    //
+    // K0 (2026-09-15): the Direct statement seam and its FTS readiness probes
+    // left `direct_projection.rs`, taking their `PhysicalProjectionQueryReader`
+    // import and `::open(` call with them. The `sync_dir_required(` calls moved
+    // into the collapsed durability helpers without changing any file's count.
+    // Deletion only.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "4236e82510754527f68874dcefcd254c74d76c0e34be874a3fa2d517403842b4",
+        "debebdf6b995c5cd9d76950131c10edd069ebd60c5e3e0eb0a4ab4811aaeb1b3",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
