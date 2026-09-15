@@ -311,8 +311,7 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-core/tests/public_query_executor_census.rs::candidate_planning_is_only_an_oracle_and_the_cursor_owner_remains_shared",
-          "crates/tine-core/src/sync_runtime_tests.rs::ret2_invalid_simple_source_is_refused_before_query_job_acquisition"
+          "crates/tine-core/tests/public_query_executor_census.rs::candidate_planning_is_only_an_oracle_and_the_cursor_owner_remains_shared"
         ],
         "failBefore": "proven"
       },
@@ -585,120 +584,6 @@
         "failBefore": "proven"
       },
       "notes": "REOPENED 2026-09-05 by the reporter's negative follow-up: the behaviour is back in the Windows build of v0.6.98, so this row's released evidence is revoked for Windows under the negative-follow-up rule. What still stands, unchanged and re-run on 2026-09-05: the render-layer ownership assertions pass on the current base, so the shared frontend logic is intact -- an active selection still owns the heading command when the pointer is on another block. What was never evidence for Windows: the 2026-08-11 native confirmation ran on Linux only, and `e2e-selection-actions.mjs` was registered in the Linux suites alone, so no Windows run has ever exercised this journey. It is now registered in `windows-smoke` too. Original fail-before on exact base d1ad0f2c38120de8c88247f7d6062edf8a6ac812: writable pointer changed C and left selected A raw as 'A' instead of '## A'; read-only pointer hid Heading 2 entirely; dragging A's bullet with B+C selected produced B,C,D,E,A instead of A,D,E,B,C. Scope is heading and pointer bullet drag only; adjacent context actions remain pointer-owned."
-    },
-    {
-      "id": "UI-MANAGED-ANDROID-ROOT-SHUTDOWN-001",
-      "title": "Android root Back verifies every managed runtime can stop before activity exit and preserves the safe transition if exit must retry",
-      "family": "window-lifecycle",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "android"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/androidBack.test.ts",
-          "src/safeClose.test.ts",
-          "src-tauri/src/managed_command_surface.rs",
-          "crates/tine-core/src/sync_runtime.rs"
-        ],
-        "scenario": "managed-android.root-back-prepares-before-activity-exit",
-        "failBefore": "proven"
-      },
-      "notes": "Android root Back first runs the shared frontend safe-close transaction, then the registered prepare_tine_quit all-slot native gate, then the existing AppPlugin activity exit. Frontend or native preparation refusal resets the transition and a later Back repeats the full sequence. Once native preparation resolves, the UI remains noneditable even if AppPlugin exit rejects; the next Back retries only the exit. Unit/source guards prove ordering and registration; a real Android hardware-Back run remains unverified locally."
-    },
-    {
-      "id": "UI-MANAGED-SAVE-CONFLICT-RESOLUTION-001",
-      "title": "Managed save conflicts retain the editor draft and offer a revision-bound Keep mine or Use current choice",
-      "family": "edit-render-boundary",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/src/sync_runtime.rs",
-          "src-tauri/src/commands.rs",
-          "src/persistenceConflictRetry.test.ts",
-          "src/components/ConflictBar.test.tsx",
-          "scripts/e2e-sparse-v2-recovery.mjs"
-        ],
-        "scenario": "managed-save.conflict-resolution-is-explicit-and-revision-bound",
-        "failBefore": "proven"
-      },
-      "notes": "Necessity gate proven: the managed native gateway rejected every force before actor invocation and mapped stale saves to a permanent toast, so the retained draft had no in-app authoring path. The covered path observes the exact pinned managed path and revision without loading it into the editor, binds Keep mine to that observation, serializes the replacement through one actor turn, re-conflicts after a second accepted change, recreates remotely deleted retained blocks under fresh durable IDs, and disables replacement for missing, renamed, ambiguous, or otherwise unobservable owners. A baseRev-null draft that loses a concurrent create observes the winner independently by logical name and kind, then resolves against that exact winner path and revision. Use current does not reload or discard the retained draft until the user explicitly selects it."
-    },
-    {
-      "id": "UI-MANAGED-CRASH-STARTUP-RECOVERY-001",
-      "title": "Restarting after interrupted managed-storage activation reveals the app and reports bounded recovery progress without weakening validation",
-      "family": "window-lifecycle",
-      "sources": {
-        "issues": [],
-        "commits": [
-          "946dbb27"
-        ]
-      },
-      "platforms": [
-        "linux",
-        "windows",
-        "macos"
-      ],
-      "layer": "native",
-      "status": "reproduced",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/src/sync_runtime.rs::android_instrumentation_save_journey_shape_succeeds_on_a_host_graph",
-          "src-tauri/src/lib.rs",
-          "src/startupReveal.test.ts"
-        ],
-        "scenario": "startup.managed-crash-recovery-visible-and-bounded",
-        "failBefore": "proven"
-      },
-      "notes": "A 2026-08-05 follow-up found that v0.6.90 could spend roughly 103 seconds in RecoveringPromotedRuntime when two retained runs coexisted with unprovable residue. The candidate fix reconstructs the bootstrap once into process-local ephemeral scratch, reuses it without retaining or publishing that scratch, and falls back to authoritative full replay on refusal. Deterministic success, fallback, no-residue-mutation, and prior stack-overflow sibling proofs pass; keep this row reported until Martin confirms the exact deployed large-graph crash-reopen state."
-    },
-    {
-      "id": "UI-MANAGED-MARKDOWN-SAVE-LAYOUT-001",
-      "title": "Managed application saves preserve authenticated Markdown layout while refusing semantic changes before append",
-      "family": "edit-render-boundary",
-      "sources": {
-        "issues": [],
-        "commits": [
-          "547f8713",
-          "55195b1f",
-          "fbdfe1d7",
-          "6f2bdf66",
-          "7e4d11ee",
-          "71d2dc24",
-          "a6a0167c"
-        ]
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "reproduced",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/src/oplog/hot_engine.rs",
-          "crates/tine-core/src/oplog/import.rs",
-          "crates/tine-core/src/oplog/operational_coordinator.rs",
-          "crates/tine-core/src/oplog/projection.rs",
-          "crates/tine-core/src/oplog/trusted_local_commit.rs",
-          "crates/tine-core/src/sync_runtime.rs"
-        ],
-        "scenario": "managed-save.authenticated-markdown-layout-and-strict-semantics",
-        "failBefore": "proven"
-      },
-      "notes": "The exact private 355-line page and minimized `- ` empty-bullet source reproduced trusted_local.preparation.finalize. The first candidate crossed the write boundary but was revoked on 2026-08-05: after a fully drained save and unsafe reopen, the next save lacked the durable accepted-projection predecessor and entered impossible reconciliation; a delayed self-write watcher callback exposed the same gap, globally deferring page and journal reads, shutdown, and Direct-files return. The replacement re-proves the existing authenticated completed-path row and immutable receipt against exact live bytes, path, page, frontier, claims, endpoint, receipt store, and layout annotations. The private page passed twelve saves through the real compaction threshold, unsafe reopen, delayed watcher callback, a second save, page and journal inventory/load, drain, and Safe shutdown. Keep status reproduced until Martin confirms the deployed dc5-stranded state and Direct-files UI recovery. The private source is not committed."
     },
     {
       "id": "UI-PAGE-RENAME-ASYNC-LARGE-GRAPH-233",
@@ -7476,57 +7361,6 @@
       "notes": "OG parity gap: OG binds :editor/follow-link to mod+o and :editor/open-link-in-sidebar to mod+shift+o (frontend/modules/shortcut/config.cljs:214/:217); Tine had no mod+o at all. The 'which link' rule is transcribed from OG's thingatpt.cljs extract-nearest-link-from-text, including its surprising part: OG collects EVERY candidate in the block and picks the one nearest the caret, so a caret anywhere in a block with one link still follows it. URLs are included for follow and deliberately excluded for the sidebar, matching OG's two call sites. Block refs are best-effort: a bare ((uuid)) in raw text carries no page, so a block outside the loaded working set is not found - the same give-up OG's open-link-in-sidebar! does when db/get-page misses. FAIL-BEFORE is an absence (no mod+o binding existed), verified by grep."
     },
     {
-      "id": "UI-ANDROID-SAFE-BACK-SHUTDOWN-001",
-      "title": "Android Back never exits after an unverified managed shutdown and remains owned before JavaScript is ready",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [
-          161
-        ],
-        "commits": []
-      },
-      "platforms": [
-        "android"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/androidBack.test.ts",
-          "src/safeClose.test.ts",
-          "src-tauri/src/sync_runtime.rs",
-          "src-tauri/src/commands.rs",
-          "src-tauri/gen/android/app/src/main/java/page/tine/app/SafeBackPlugin.kt"
-        ],
-        "scenario": "android.safe-back-typed-managed-shutdown-owner",
-        "failBefore": "proven"
-      },
-      "notes": "An Android AppPlugin listener could fall back to WebView history or activity finish before JavaScript subscribed, while the process-wide managed shutdown helper collapsed terminal and safe outcomes and could exit after a terminal runtime. The repair introduces a native SafeBack owner that consumes all Back events unless its own listener is ready, and a typed process preparation result: only Safe may exit; Refused reopens the editor only when no managed slot was verified; Partial or an unknown transport result remains shielded and retries native preparation alone. JS tests cover listener lifecycle and the zero-progress/partial/unknown retry matrix; Rust tests cover sorted stop-at-first-refusal aggregation, terminal rejection and Safe retry. Physical Android compilation and hardware Back remain hosted-CI/device gates."
-    },
-    {
-      "id": "UI-MANAGED-RUNTIME-EVENT-BRIDGE-001",
-      "title": "Managed-storage runtime status, progress and failure reasons update the app and open Storage & sync panel for the current graph only",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "render",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/managedStorageRuntime.test.ts",
-          "src/components/Settings.test.tsx"
-        ],
-        "scenario": "managed-storage.runtime-event-status-and-error-bridge",
-        "failBefore": "reconstructed"
-      },
-      "notes": "Confirmed UI audit H1 at dc82d0c4: watcher.rs emitted sparse-v2-status, sparse-v2-tick and sparse-v2-error, but the frontend subscribed only to sparse-v2-changed. The Settings panel therefore retained its open-time status snapshot and the runtime's explicit failure reason was invisible. A single app-owned typed bridge now updates both surfaces, preserves the native reason text, and accepts an event only when its binding generation matches the currently bound graph. Direct-file managed-sync-error and graph-watch-error listeners remain unchanged."
-    },
-    {
       "id": "UI-STARTUP-PROGRESS-RECOVERY-001",
       "title": "A graph open that stalls or fails reports its phase and offers retry, another graph, copied details, and an escape back to Direct Files",
       "family": "window-lifecycle",
@@ -7757,76 +7591,6 @@
         "failBefore": "proven"
       },
       "notes": "The v0.6.92 journey clicked as soon as embed macro roots existed, while cross-page descendants populated asynchronously; adding an unrelated await moved the failure between disclosure and arrow/delete. The semantic readiness repair then exposed a deterministic product defect: multiple visible refs/embeds to the same initially unloaded page raced activation; one loaded the exact page, while siblings treated their expected stale-install refusal as permanent failure and stayed shallow. LiveRefGroup now rechecks the exact loaded kind/path after every installation attempt, so a sibling winner hydrates all groups while a different page/path remains refused. A render regression forces two concurrent activation promises and proves both descendants render with one retained activation. The release journey waits for exactly the identities/content/disclosure controls it will operate on, asserts no timing or pixels, and is restored to stable blocking coverage."
-    },
-    {
-      "id": "UI-MANAGED-SHARE-ACTOR-REBIND-001",
-      "title": "Setting up or joining managed sync reopens the actor retired by the enrollment cut before reporting success",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src-tauri/src/sync_runtime.rs",
-          "scripts/e2e-sparse-v2-two-device.mjs"
-        ],
-        "scenario": "managed-storage.share-join-reopen-retired-actor",
-        "failBefore": "proven"
-      },
-      "notes": "The real two-device journey reached healthy local activation, then the first explicit share cut stopped its actor by design and the Tauri command immediately queried that retired handle, returning sync actor is unavailable. Share and already-managed join now reopen the durable post-enrollment runtime, prove its ordinary page inventory/load boundary, and publish a new exact-generation graph slot before returning success. That repair exposed a second product defect: a bounded watcher scan could acknowledge one epoch while newer observations remained pending, but an AdmittedNoop/Complete tick scheduled no continuation and a quiet graph supplied no new inotify edge. The watcher now consults the actor's post-tick pending bit, drains all retained epochs without a timer guess, and still leaves a truly quiet actor asleep. The source regressions pin cut -> reopen -> exact publish ordering and pending-epoch continuation; the real two-device journey remains the release-blocking semantic proof."
-    },
-    {
-      "id": "UI-MANAGED-PROVIDER-ARRIVAL-SCHEDULING-001",
-      "title": "A peer edit delivered into managed storage becomes visible without waiting for an unrelated filesystem event",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/src/sync_runtime.rs",
-          "src-tauri/src/watcher.rs",
-          "scripts/e2e-sparse-v2-two-device.mjs"
-        ],
-        "scenario": "managed-storage.provider-arrival-becomes-scheduled-work",
-        "failBefore": "proven"
-      },
-      "notes": "The two-device journey delivered device B's edit into device A's graph-local provider tree while device A was stopped. On reopen, device A discovered the delivery (provider_pending=3) while its watcher was idle (pending=false, latest_enqueue=2, acknowledged=2), and the peer edit never appeared. The Tauri sparse scheduler decided continuation from the tick result plus the actor's watcher pending bit only, so a tick that settled a watcher epoch read as a quiet graph and cleared the retry schedule; a quiet graph produces no further inotify edge for bytes another device wrote, so the delivered work was stranded forever. The actor now publishes provider_runnable alongside provider_pending - the exact predicate tick consults, not the broad inventory that legitimately never reaches zero while durable publication intents remain - and the scheduler continues while SyncRuntimeStatusSnapshot::has_runnable_work() is true. A tick that reports Idle while still naming runnable provider work is paced by the ordinary backoff schedule instead of the progress cadence, so a blocked causal dependency cannot become a poll loop, and a genuinely quiet actor still arms no timer at all. Source regressions pin arrival across the delivery/reopen cut, arrival to a running receiver, a multi-item drain to zero with interleaved page reads, and the idle direction; the real two-device journey remains the release-blocking semantic proof."
-    },
-    {
-      "id": "UI-MANAGED-PROVIDER-PROJECTION-LOSS-001",
-      "title": "A peer edit that lands in managed SQLite always reaches the Markdown file, even when a local external edit is admitted in the same window",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/src/sync_runtime.rs",
-          "crates/tine-core/src/oplog/projection.rs"
-        ],
-        "scenario": "managed-storage.provider-batch-always-projects-markdown",
-        "failBefore": "proven"
-      },
-      "notes": "On a running receiving device, an inbound provider batch could be applied to SQLite while its Markdown file was never written. The receiver-local projection decided whether a delivered foreign intent was still the live authority by comparing the intent's post-frontier with the page's WHOLE current merged frontier. An ordinary local external admission landing in the same window commits its own batch, which advances the shared page-catalog document, so the delivered intent stopped matching a page it never touched; the intent was then treated as superseded historical evidence and dropped. Nothing else owned that path, so the page existed in ListPages at the right path with no file on disk, clean_shutdown still returned Safe, and a reopen with a full re-drive never repaired it - durable data-visibility loss, since Markdown is the interchange truth for Direct Files parity and for every external tool. A receiver that cannot prove the delivered intent is still current now projects the page's CURRENT accepted state instead of skipping it (idempotent: a genuinely superseded page renders to the bytes already on disk), projects at the path the accepted state names rather than the intent's stale one, and retains the obligation as a published continuation when neither the intent nor the current state can be authorized. Source regressions pin creates, edits and cross-page moves under that interleaving, each with a Safe shutdown and a clean reopen. NOT covered here: provider-delivered DELETES and RENAMES never converge on the clean runtime at all - with or without the interleaving - because the receiver-local tombstone authorization still requires the retired pre-0.7 durable endpoint history store; that is a separate open defect."
     },
     {
       "id": "UI-ANDROID-BACK-OWNERSHIP-001",
@@ -8308,76 +8072,6 @@
       "notes": "GH #361 negative follow-up: the released fix covered a caret immediately after an in-block newline, but a caret immediately before that same newline still left an empty first line in the new block. store.splitBlock now treats either caret position as the same structural boundary and consumes exactly one newline; a doubled newline still preserves one intentional blank line. The shared path serves desktop and mobile. Fail-before on current master produced a new block with raw `\\nline2`; the focused test passes after the fix."
     },
     {
-      "id": "UI-MANAGED-SHARE-SINGLE-TERMINAL-OUTCOME-001",
-      "title": "Sync setup reports one terminal outcome instead of a transient red freshness failure followed by success",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "unit",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/reloadOnFocus.test.tsx::leaves the terminal outcome to an active storage transition",
-          "src/managedStorageRuntime.test.ts::never reports the retired-actor window an enrollment cut opens on purpose",
-          "src/managedStorageRuntime.test.ts::reports a failure that outlives the transition exactly once"
-        ],
-        "scenario": "managed.share-focus-rescan-single-terminal-outcome",
-        "failBefore": "proven"
-      },
-      "notes": "Internal report after v0.6.94: enabling sync first showed the red focus-rescan toast `sync actor is unavailable`, then a green success toast. Share and join deliberately retire their actor and publish a reopened replacement before the owning command returns; managed runtime errors already respected that transition bracket, but reloadOnFocus independently treated its subordinate rescan as a terminal operation. A focus rescan that fails while this window owns a storage transition now releases the freshness/input barrier silently. The Settings command remains the sole owner and reports exactly one authoritative success or failure; ordinary rescan failures outside a transition are unchanged."
-    },
-    {
-      "id": "UI-MANAGED-JOIN-ACTIONABLE-DIAGNOSTIC-001",
-      "title": "A failed managed join preserves its safe stage and reason and offers a Copy details action",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src-tauri/src/sync_runtime.rs::tests::retryable_join_bootstrap_preserves_stage_and_detail_without_debug_wrappers",
-          "src/components/Settings.test.tsx::starts shared discovery only after an explicit Direct Files join action"
-        ],
-        "scenario": "managed.join-retryable-stage-detail-copy",
-        "failBefore": "proven"
-      },
-      "notes": "Internal Android report after v0.6.94: join failed with `join bootstrap did not reach LocalActive: Retryable [details]`. The native command debug-formatted the complete tagged availability object; the privacy sanitizer correctly collapsed its brace-delimited body, losing the operation stage and reason. The command now emits ordinary bounded `stage: detail` text, which the sanitizer can redact token-by-token without deleting its diagnostic class. Every sticky managed-storage failure also carries a Copy details action for the already-sanitized complete message. The exact synthetic and 1,046-page anonymized Linux two-device journeys both pass join, forced-close recovery, partial delivery and bidirectional editing on this candidate, so this row deliberately claims diagnostic coverage rather than inventing an Android root-cause fix without the newly exposed detail."
-    },
-    {
-      "id": "UI-MANAGED-JOURNAL-CROSS-DAY-EDITOR-CONTINUITY-001",
-      "title": "A managed cross-day journal move stays visually continuous and keeps the moved block focused",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "unit",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/components/Page.test.tsx",
-          "src/store.test.ts"
-        ],
-        "scenario": "managed.journal-cross-day-move-editor-continuity",
-        "failBefore": "proven"
-      },
-      "notes": "Internal report against deployed f08e21eb: the native transaction committed safely, but both journal pages became inert and dim, the accepted DTO installation purged and reconstructed their loaded block trees, and the moved editor remounted while its page was still inert. The block therefore briefly disappeared and the caret was lost, preventing repeated move-up/down commands without another click. Fail-before was proven in two passes: the unchanged code produced two visibly-busy page sections while the actor response was pending; retaining the inert hold through accepted publication left document.body focused instead of the moved textarea. Managed moves now retain their persistence/replacement hold without using the destructive visual class, publish the accepted semantic delta while preserving loaded block identity, release inertness before that delta, and re-arm the exact editor/caret context for the adjacent journal mount. No-commit, blocked recovery, page replacement, undo/redo and selection routes retain their existing actor-owned behavior."
-    },
-    {
       "id": "UI-ASSET-LINK-OS-OPENER-367",
       "title": "A labeled link into assets/ opens its file or directory through the OS opener instead of the external-URL route",
       "family": "asset-open",
@@ -8624,34 +8318,6 @@
         "failBefore": "proven"
       },
       "notes": "Martin's approved pointer contract, one decision table per surface: plain click navigates; Shift-click opens the right sidebar; Ctrl(Win/Linux)/Cmd(macOS)+click opens a BACKGROUND tab (this is the change \u2014 PageRef/BlockRefView ctrl-click previously opened the other pane); middle-click opens a background tab everywhere plain-aux semantics existed; context menus keep exposing explicit destinations; and combined modifiers (shift+ctrl) keep plain-click meaning so nothing novel shadows shortcuts. Decision lives once in src/linkGesture.ts (not per surface \u2014 surfaces pick only their destination API), applied to: rendered page refs incl. tags and alias chips, block refs ((uuid)) incl. added middle-click, namespace crumb + sidebar tree labels, Favorites rows, Recent rows, All-pages rows, query result group headers, reference-group headers. The QuickSwitcher already conformed and serves as the control suite; its rows keep their existing middle+ctrl background behavior. failBefore: neutralizing the decision helper makes the 5 ctrl/meta cases red while plain/shift/middle/combined stay green. Text-selection and editor-focus behavior unchanged: shift still suppresses range selection at mousedown, middle mousedown prevents autoscroll, touch long-press (GH #231) is unaffected on all the same anchors."
-    },
-    {
-      "id": "UI-MANAGED-WINDOWS-UPGRADE-REOPEN-370",
-      "title": "A Windows managed workspace upgraded from the preceding patch either reopens with usable pages or reports its real terminal refusal without a running timer",
-      "family": "managed-storage-startup-recovery",
-      "sources": {
-        "issues": [
-          370
-        ],
-        "commits": [
-          "3ccd57c6",
-          "aa116f6a"
-        ]
-      },
-      "platforms": [
-        "windows"
-      ],
-      "layer": "native",
-      "status": "reproduced",
-      "coverage": {
-        "tests": [
-          "scripts/e2e-windows-managed-storage.mjs",
-          "src/startupRecovery.test.ts"
-        ],
-        "scenario": "managed.windows-previous-patch-upgrade-reopen",
-        "failBefore": "proven"
-      },
-      "notes": "GH #370 reports that a managed graph used on v0.6.94 reaches a terminal startup failure after upgrading to v0.6.95. The native result's actual retryable/refused detail is currently hidden by a second generic readiness check, and the recovery card continues incrementing elapsed time after graph.failed. Coverage must preserve the reporter's upgrade/reopen boundary, not merely prove fresh activation followed by immediate return to Direct Files. MS-17 quarantined the shared Windows upgrade/reopen journey on 2026-08-31 after two inconclusive hosted attempts (runs 33349270671 and 33350869828); startupRecovery.test.ts retains the deterministic readiness/refusal coverage, but the literal Windows previous-release boundary returns to covered only after the corrected journey completes an unchanged-binary burn-in."
     },
     {
       "id": "UI-PANE-SCROLL-SLACK-369",
@@ -9081,30 +8747,6 @@
       "notes": "GH #275 follow-up on 32-bit Windows: a PDF flashed, disappeared, and pdf.js reported that the same canvas was used by multiple render operations. renderPage cancelled an existing task before awaiting getPage, but did not claim same-page ownership until after that await. Two synchronous observer/navigation triggers therefore both reached page.render on the same canvas. Per-page and layout generations now establish ownership before getPage and invalidate stale requests across zoom, eviction, and layout rebuild. The current-master duplicate-trigger test called render twice before the fix and once after it."
     },
     {
-      "id": "UI-MANAGED-LARGE-UNLINKED-SOURCE-388",
-      "title": "Managed Unlinked References scans source pages larger than the editor gateway limit while retaining bounded panel results",
-      "family": "managed-reference-query",
-      "sources": {
-        "issues": [
-          388
-        ],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "unit",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "crates/tine-core/src/sync_runtime.rs::managed_unlinked_references_scan_source_pages_larger_than_the_editor_gateway_limit"
-        ],
-        "scenario": null,
-        "failBefore": "proven"
-      },
-      "notes": "GH #388: a candidate source page at the 10,000-block boundary was rejected by the write-oriented whole-page editor gateway before the bounded Unlinked References result could be constructed. Reference panels now retain the projected fast path for ordinary pages and use one linear authenticated hot-page read only for an explicit page-size refusal. Output remains governed by the existing row and byte construction budgets. The synthetic large-page managed graph failed with RequestTooLarge before the fix and returns its single semantic match after it. The intermittent narrow-layout report is separately covered by UI-PANE-WIDTH-382."
-    },
-    {
       "id": "UI-SHORTCUT-RECORD-CTRL-378",
       "title": "On macOS the keyboard-shortcut recorder captures the physical Control key as a distinct ctrl+ binding instead of dropping it, while Cmd keeps mapping to mod and every existing binding keeps its meaning",
       "family": "settings-shortcuts",
@@ -9317,15 +8959,13 @@
         "all"
       ],
       "layer": "native",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
-        "tests": [
-          "scripts/e2e-absence-sweeps.mjs::clean-close-honored"
-        ],
+        "tests": [],
         "scenario": "diagnostics.clean-quit-marker",
         "failBefore": "proven"
       },
-      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after. Retrofitted to GH #426 on 2026-08-31: this internal find and the Linux/Windows half of that public report are the same defect, and the reporter's own diagnostics attachment (v0.6.98, build 94579a0, which predates the fix) confirms it \u2014 its previous session records runtime.started and 26 later events but no runtime.clean_shutdown. The mobile half of #426 is a different orderly-end question and is UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426."
+      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey. mark_clean_shutdown() was placed after tauri's App::run(), which never returns (the event loop exits the process via std::process::exit), so the flight recorder's session-active marker survived every quit and every subsequent launch showed the sticky 'Tine did not close cleanly last time' warning. Present since the flight recorder shipped (GH #343, 271885b2). Fix hooks RunEvent::Exit, the callback tauri delivers before exiting. Wiring is untestable at unit layer (needs the real event loop); the E2E journey's clean-close-honored phase is the observation-boundary proof: unclean toast present on reopen before the fix (diag-1 artifacts), absent after. Retrofitted to GH #426 on 2026-08-31: this internal find and the Linux/Windows half of that public report are the same defect, and the reporter's own diagnostics attachment (v0.6.98, build 94579a0, which predates the fix) confirms it \u2014 its previous session records runtime.started and 26 later events but no runtime.clean_shutdown. The mobile half of #426 is a different orderly-end question and is UI-MOBILE-BACKGROUND-FALSE-UNCLEAN-TOAST-426. Back to reported 2026-09-15: its cited tests were deleted with the Managed Storage removal; the Direct Files outcome still needs its own proof."
     },
     {
       "id": "UI-SETTINGS-SECTION-SWITCH-FLICKER-409",
@@ -9404,29 +9044,6 @@
         "failBefore": "proven"
       },
       "notes": "User outcome: backgrounding Tine on a phone or tablet and coming back later does not greet the user with 'Tine did not close cleanly last time'. Classification: blocking stateful UX (a permanent false alarm that trains users to ignore a real crash notice). Root cause: the flight recorder's session-active marker is removed at the one orderly end the app knew about, the desktop event loop's RunEvent::Exit. iOS and Android have no such moment \u2014 the OS suspends a backgrounded app and reaps it later without notice \u2014 so the marker always survived and EVERY launch warned. The reporter said exactly that: 'It does happen every time in iOS/iPadOS. The OS kills the app when in background so I am having this issue all the time.' Fix: on mobile the recorded session follows webview visibility, ending when the app is hidden and restarting when the user returns, so a crash they witness is still reported and a reap they never see is not. Desktop is deliberately excluded, because a minimised window is still a live session and honouring visibility there would hide exactly the background crashes the recorder exists to catch; that exclusion is asserted on both sides (src/sessionActivity.test.ts 'never ends a desktop session on visibility', and the cfg gate pinned by debug.rs 'visibility_ends_a_session_only_where_the_os_reaps_backgrounded_apps'). Fail-before is causal: making the marker removal a no-op turns debug.rs 'a_session_the_os_reaps_after_backgrounding_is_not_reported_unclean' red while its companion 'a_session_that_dies_after_coming_back_is_still_reported_unclean' stays green. EVIDENCE LIMIT: no iOS or Android runtime was available, so the recorder contract and the platform gating are proven at unit layer on Linux and the on-device toast is not; confidence stays moderate. One further warning is expected on the first launch after upgrading, from the marker the previous build left behind."
-    },
-    {
-      "id": "UI-ABSENCE-RESTORE-PANEL-AUTOCLOSE-INTERNAL",
-      "title": "Completing a sweep Restore does not close the recovery panel or drop the sweep surface",
-      "family": "managed-storage-recovery",
-      "sources": {
-        "issues": [],
-        "commits": []
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/absenceSweeps.test.ts::rebindAbsenceSweepScope::keeps the sweep list and an open panel across a same-generation rebind",
-          "scripts/e2e-absence-sweeps.mjs::restore-action"
-        ],
-        "scenario": "absence-sweeps.restore-keeps-panel",
-        "failBefore": "proven"
-      },
-      "notes": "Internal report, 2026-08-28, found by the absence-sweeps E2E journey (5/5 runs failed on it). The App.tsx sweep-listener effect used bare `() => snapshot().field` accessors inside on(), which re-run on every snapshot replacement even with unchanged values; the effect unconditionally called clearAbsenceSweeps(). Restore's completion emits runtime status events, so finishing a Restore refired the effect and closed the panel the user was looking at while transiently wiping the sweep list (instrumented capture: diag-3 store log, four identical-input refires 150ms after disposition). Fix: memoized effect inputs + rebindAbsenceSweepScope clears only on real generation changes. Fail-before is the instrumented E2E evidence; the helper unit test plus the journey's restore-action/restored-history assertions are the regression coverage."
     },
     {
       "id": "UI-ANDROID-UI-RUNTIME-RESPONSIVE-205",
@@ -9672,30 +9289,6 @@
         "failBefore": "proven"
       },
       "notes": "GH #438 (follow-up to #283): giving Ctrl/Cmd+click to background tabs was the right browser convention but removed the only mouse+modifier route to the other pane. internalLinkDest now yields a fourth destination (Alt+click -> pane), with the GH #288 switcher precedence: pure Shift keeps the sidebar, pure Ctrl/Cmd keeps the background tab, Alt claims every chord it enters (Shift+Alt and Ctrl+Alt included), and combined modifiers without Alt keep plain-click meaning. Every internalLinkDest surface routes the new destination through openRouteInOtherPane \u2014 the gesture/routing call boundary \u2014 so the frontier replacement of the pane-selection helper can change its internals without touching these call sites. Context menus, middle-click, Shift/right-sidebar, guide-page guards, and the annotation-ref plain-click PDF flow are unchanged. Fail-before: all seven Alt+click surface/progression tests red pre-fix (no pane created; Alt fell through to plain-click navigation), the ten existing #283 contract tests green throughout. jsdom render-layer proof; native browser confirmation of the click matrix on a real split remains the manager smoke item."
-    },
-    {
-      "id": "UI-MANAGED-RAPID-JOURNAL-BOUNDARY-MOVE-001",
-      "title": "Rapid uninterrupted Managed Storage commands move one block across several journal-day boundaries without losing commands or flooding errors",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": [],
-        "internal": "Martin physical report 2026-08-30"
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "src/store.test.ts::replays rapid journal-boundary move commands against each accepted actor result",
-          "scripts/e2e-managed-journal-feed.mjs"
-        ],
-        "scenario": "managed.journal-rapid-multi-day-move",
-        "failBefore": "proven"
-      },
-      "notes": "Fail-before: two queued calls captured one source page; the first crossed and the second returned none. The prior deployed binary accepted 120 immediate key events but the marker reached only the preceding journal instead of the fifth loaded day. The queue now contains commands, not precomputed page-pair intents. Each command resolves after its predecessor installs the accepted actor result. The permanent native journey dispatches 120 synthetic Alt+Shift+Down events uninterrupted at 5 ms spacing, requires one exact marker on the fifth loaded journal and no error toast, then separately moves 20 selected roots between named pages by cut/paste and verifies both rendered and durable source/destination state. Exact timing and queue implementation are not user contracts."
     },
     {
       "id": "UI-IPAD-PLATFORM-IDENTITY-446",
@@ -11347,29 +10940,6 @@
         "failBefore": "proven"
       },
       "notes": "Stateful-UX. `query_registry` is SQL-only on both backends and answers a snapshot, typed readiness, or a typed terminal failure; the sheet had a rendering for the first two only. A terminal `query-unavailable` rejected the shared `createReadyQueryResource`, and `Resource.latest` RETHROWS a rejected resource \u2014 so the throw escaped the reactive graph into an error boundary and the add-condition/field picker could not be opened at all, while every control gated on `registry.pending()` (rows still `undefined`) sat on \"Reading this graph's properties\u2026\" with nothing retrying behind it. Fixed in the ONE registry owner (`QueryBuilder.tsx`): a terminal failure is captured as a scoped VALUE, which is what stops the automatic retry, while readiness stays `runQueryWhenReady`'s to retry and a cancellation is rethrown so a superseded read is never published as a result. `RegistryAccess` gained `failure` (the typed error), `unavailable` (`pending || failure`, which every type-dependent edit now waits on instead of `pending` alone) and `retry` \u2014 which IS `request`'s owner, so one shared read serves every open builder and no second retry, backoff or cache exists. The scope/declaration-revision guard covers the failure exactly as it covers rows, so a previous graph's error cannot land either."
-    },
-    {
-      "id": "UI-MANAGED-P4-AUTOMATIC-REBUILD",
-      "title": "Opening a graph whose Managed Storage was written by the per-block (P4) layout preserves the old private store and rebuilds automatically from Markdown/Org",
-      "family": "managed-storage",
-      "sources": {
-        "issues": [],
-        "commits": [],
-        "internal": "Rebaselining v2 packet P1"
-      },
-      "platforms": [
-        "all"
-      ],
-      "layer": "native",
-      "status": "covered",
-      "coverage": {
-        "tests": [
-          "scripts/e2e-managed-p4-rebuild.mjs"
-        ],
-        "scenario": "managed.p4-store-preserved-and-automatically-rebuilt",
-        "failBefore": "unavailable"
-      },
-      "notes": "Journey scripts/e2e-managed-p4-rebuild.mjs (p4_store_is_preserved_and_automatically_rebuilt_from_text) is registered in tests/ui-regressions/e2e-contracts.json with an exact-safety-interoperability contract for private-byte and source preservation and a core-operation contract for automatic recovery plus edit/save/reopen, and is selected by the run-e2e.mjs suite managed-p4-rebuild. It needs a P4-built producer (TINE_P4_APP) beside the exact candidate (TINE_APP); the journey has now run green at candidate 94db49a7 with TINE_P4_APP built from base 1c2707fc, so a genuine per-block producer was used; failBefore stays unavailable because the pre-P1 app IS the P4 writer and therefore never meets foreign P4 bytes, so no build exists in which the journey's premise can fail without deliberately disabling the blank-slate rebuild lifecycle. No new notice, prompt or decision is introduced; the existing graph-open blank-slate lifecycle archives every private byte and reactivates the one current format."
     },
     {
       "id": "UI-QUERY-WHY-EMPTY-BEFORE-ANY-RUN-001",
