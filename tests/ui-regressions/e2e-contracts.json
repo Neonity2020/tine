@@ -1505,31 +1505,29 @@
    "nonRequirements": [
     "No screenshots, geometry, toast wording or search-index contents are asserted."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-09-14: new journey (publish-query stage 1; stage 2 added the app/ assertions); nonblocking until a sequential unchanged-binary burn-in on Direct and Managed is recorded."
+   "stability": "stable"
   },
   "scripts/e2e-published-app.mjs": {
-  "contracts": [
-   {
-    "class": "stateful-ux",
-    "userOutcome": "A query export served over HTTP opens as the read-only Tine app: the root redirects to app/, the export's home page shows the exported query's rows, the Quick Switcher opens an exported page, and Linked References are the export's own.",
-    "blocking": false
-   },
-   {
-    "class": "exact-safety-interoperability",
-    "authority": "Tine published query export read-only contract (docs/contracts/typed-errors.md, Published query exports; ADR 0065)",
-    "userOutcome": "Nothing in the export can be edited: clicking a block opens no editor and keystrokes leave the exported text unchanged; ?static keeps the static site.",
-    "blocking": false
-   }
-  ],
-  "acceptableVariations": [
-   "The app's layout, styling and the exact row rendering may vary while page membership, query rows, navigation and read-only behaviour hold."
-  ],
-  "nonRequirements": [
-   "No screenshots, geometry, toast wording, search ranking or bundle file names are asserted."
-  ],
-  "stability": "quarantined",
-  "quarantineReason": "2026-09-14: new journey (publish-query stage 2, Playwright over a local HTTP server); nonblocking until a sequential unchanged-binary burn-in is recorded."
- }
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A query export served over HTTP opens as the read-only Tine app: the root redirects to app/, the export's home page shows the exported query's rows, the Quick Switcher opens an exported page, and Linked References are the export's own.",
+     "blocking": false
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "Tine published query export read-only contract (docs/contracts/typed-errors.md, Published query exports; ADR 0065)",
+     "userOutcome": "Nothing in the export can be edited: clicking a block opens no editor and keystrokes leave the exported text unchanged; ?static keeps the static site.",
+     "blocking": false
+    }
+   ],
+   "acceptableVariations": [
+    "The app's layout, styling and the exact row rendering may vary while page membership, query rows, navigation and read-only behaviour hold."
+   ],
+   "nonRequirements": [
+    "No screenshots, geometry, toast wording, search ranking or bundle file names are asserted."
+   ],
+   "stability": "stable"
+  }
  }
 }
