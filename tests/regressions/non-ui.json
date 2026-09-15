@@ -186,8 +186,8 @@
  "status": "needs-revalidation",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection.rs::warm_reopen_parses_nothing_and_answers_from_sql",
-   "crates/tine-core/src/direct_projection.rs::public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache"
+   "crates/tine-core/src/direct_projection_tests.rs::warm_reopen_parses_nothing_and_answers_from_sql",
+   "crates/tine-core/src/direct_projection_tests.rs::public_ir_query_on_warm_reopen_uses_sql_without_parsed_cache"
   ],
   "scenario": "reg-direct-warm-reopen-no-parse",
   "failBefore": "Not established by this metadata registration; existing test source inspected only."
@@ -228,7 +228,7 @@
  "coverage": {
   "tests": [
    "crates/tine-core/src/query/export_results_tests.rs::tql_export_preserves_the_declared_dialect_and_exact_subtree_membership",
-   "crates/tine-core/src/query.rs::tests::query_export_spec_defaults_a_missing_simple_dialect_to_og",
+   "crates/tine-core/src/query_tests.rs::query_export_spec_defaults_a_missing_simple_dialect_to_og",
    "src/components/ExportModal.queryBudget.test.tsx"
   ],
   "scenario": "query-engine.export-explicit-dialect",
@@ -290,7 +290,7 @@
  "status": "needs-revalidation",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection.rs::tests::a_timed_out_close_retains_resources_until_the_writer_really_exits"
+   "crates/tine-core/src/direct_projection_tests.rs::a_timed_out_close_retains_resources_until_the_writer_really_exits"
   ],
   "scenario": "query-engine.publication-writer-lifetime"
  },
@@ -312,7 +312,7 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection.rs::tests::a_damaged_query_table_is_rebuilt_without_a_source_edit"
+   "crates/tine-core/src/direct_projection_tests.rs::a_damaged_query_table_is_rebuilt_without_a_source_edit"
   ],
   "scenario": "query-engine.persistent-cache-recovery",
   "failBefore": "P1d-recovery-fail-before.log at c682a7cf: second query remains on fallback after ready"
@@ -350,8 +350,8 @@
      "src-tauri/src/debug.rs::tests::diag_is_silent_when_debug_is_disabled",
      "crates/tine-core/tests/content_out_of_logs.rs",
      "src/contentOutOfLogs.ratchet.test.ts",
-     "crates/tine-core/src/direct_projection.rs::tests::retired_class_c_projection_database_open_emits_no_planted_marker",
-     "crates/tine-core/src/direct_projection.rs::tests::retired_class_c_projection_apply_failure_emits_no_planted_marker",
+     "crates/tine-core/src/direct_projection_tests.rs::retired_class_c_projection_database_open_emits_no_planted_marker",
+     "crates/tine-core/src/direct_projection_tests.rs::retired_class_c_projection_apply_failure_emits_no_planted_marker",
      "src/failureShape.test.ts",
      "src/pdfRenderCoordinator.test.ts"
     ],
@@ -387,7 +387,7 @@
    "layer": "rust-core-publish",
    "status": "covered",
    "coverage": {
-    "tests": ["crates/tine-core/src/publish.rs::tests::publish_macros_never_expand_private_graph_content"],
+    "tests": ["crates/tine-core/src/publish_tests.rs::publish_macros_never_expand_private_graph_content"],
     "scenario": "publish.public-property-lsdoc-boundary",
     "failBefore": "cc-c5a-fail-before-full.txt at ae3d97da170c2aaef41a3cb64b3e574f26a8ca58: a page containing public::true was published even though lsdoc rejects that line as a property; a SUB-indented valid public property was omitted"
    },
@@ -2134,8 +2134,8 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/query.rs::tests::advanced_current_page_input_lowers_the_standard_page_relationship",
-     "crates/tine-core/src/query.rs::tests::advanced_typed_inputs_keep_date_bounds_numeric",
+     "crates/tine-core/src/query_tests.rs::advanced_current_page_input_lowers_the_standard_page_relationship",
+     "crates/tine-core/src/query_tests.rs::advanced_typed_inputs_keep_date_bounds_numeric",
      "crates/tine-core/src/model.rs::tests::advanced_current_page_input_filters_real_graph_blocks",
      "scripts/e2e-compat-home-current-page.mjs"
     ],
@@ -2381,8 +2381,8 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/direct_projection.rs::tests::reference_lookup_waits_for_an_inflight_one_page_projection_delta",
-     "crates/tine-core/src/direct_projection.rs::tests::reference_wait_is_zero_cost_when_no_projection_work_exists"
+     "crates/tine-core/src/direct_projection_tests.rs::reference_lookup_waits_for_an_inflight_one_page_projection_delta",
+     "crates/tine-core/src/direct_projection_tests.rs::reference_wait_is_zero_cost_when_no_projection_work_exists"
     ],
     "failBefore": "proven"
    },
@@ -3413,8 +3413,8 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
-     "crates/tine-core/src/direct_projection.rs::tests::b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence",
+     "crates/tine-core/src/direct_projection_tests.rs::b4_page_ref_and_property_facets_record_indexed_reads",
+     "crates/tine-core/src/direct_projection_tests.rs::b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence",
      "crates/tine-core/tests/query_lowering_guards.rs::simple_query_read_family_census_is_exact"
     ],
     "scenario": "direct-query.shared-facet-and-page-ref-candidate-read",
@@ -3540,9 +3540,9 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/direct_projection.rs::tests::b4_page_ref_and_property_facets_record_indexed_reads",
-     "crates/tine-core/src/direct_projection.rs::tests::an_unselective_shape_answers_through_the_statement_without_a_candidate_superset",
-     "crates/tine-core/src/direct_projection.rs::tests::storage_contract_names_the_generation_bound_cutover",
+     "crates/tine-core/src/direct_projection_tests.rs::b4_page_ref_and_property_facets_record_indexed_reads",
+     "crates/tine-core/src/direct_projection_tests.rs::an_unselective_shape_answers_through_the_statement_without_a_candidate_superset",
+     "crates/tine-core/src/direct_projection_tests.rs::storage_contract_names_the_generation_bound_cutover",
      "crates/tine-core/tests/retirement_candidates.rs::retirement_candidate_markers_are_pinned"
     ],
     "scenario": "direct-query.sqlite-selection-regardless-of-selectivity",
@@ -3773,8 +3773,8 @@
      "src/components/QueryMacroSource.test.tsx",
      "src/editor/queryMacro.test.ts",
      "crates/tine-core/tests/query_macro_extents.rs",
-     "crates/tine-core/src/publish.rs::tests::publish_reads_a_query_macro_from_the_raw_source_not_the_split_args",
-     "crates/tine-core/src/publish.rs::tests::publish_renders_both_query_macro_names_and_never_leaks_the_source"
+     "crates/tine-core/src/publish_tests.rs::publish_reads_a_query_macro_from_the_raw_source_not_the_split_args",
+     "crates/tine-core/src/publish_tests.rs::publish_renders_both_query_macro_names_and_never_leaks_the_source"
     ],
     "scenario": "query-engine.macro-argument-comes-from-the-raw-source",
     "failBefore": "t5-span-fail-before.log (renderer span anchoring), t5-publish-fail-before.log (publishing), t3-splitter-fail-before.log (the deleted options-map splitter disagreeing with Rust on 8 of 20 shared corpus cases)"
@@ -3856,10 +3856,10 @@
    "crates/tine-core/src/query/view.rs::a_present_but_empty_or_invalid_columns_list_clears_and_never_falls_back",
    "crates/tine-core/src/query/view.rs::a_legacy_bare_tine_fields_list_still_names_columns_when_the_new_key_is_absent",
    "crates/tine-core/tests/query_columns_resolution.rs::the_rust_column_resolver_matches_the_shared_fixtures",
-   "crates/tine-core/src/publish.rs::publish_query_table_shows_the_selected_columns_in_the_selected_order",
-   "crates/tine-core/src/publish.rs::publish_query_table_reads_a_legacy_bare_field_list_as_columns",
-   "crates/tine-core/src/publish.rs::publish_query_table_treats_a_present_empty_columns_list_as_no_selection",
-   "crates/tine-core/src/publish.rs::publish_children_sheet_ignores_a_query_column_selection",
+   "crates/tine-core/src/publish_tests.rs::publish_query_table_shows_the_selected_columns_in_the_selected_order",
+   "crates/tine-core/src/publish_tests.rs::publish_query_table_reads_a_legacy_bare_field_list_as_columns",
+   "crates/tine-core/src/publish_tests.rs::publish_query_table_treats_a_present_empty_columns_list_as_no_selection",
+   "crates/tine-core/src/publish_tests.rs::publish_children_sheet_ignores_a_query_column_selection",
    "src/editor/queryViewProperties.test.ts::the shared visible-column resolver::matches the Rust resolver on every shared fixture",
    "src/components/QueryColumns.test.tsx::keeps a declared tine.fields schema across an unrelated filter save",
    "src/components/QueryColumns.test.tsx::rescues a legacy list into tine.columns when a schema is declared over it",
@@ -3965,7 +3965,7 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection.rs::tests::a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_every_page",
+   "crates/tine-core/src/direct_projection_tests.rs::a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_every_page",
    "crates/tine-core/tests/public_query_executor_census.rs::the_reference_panel_commands_use_the_indexed_policy",
    "src/lib/referenceFetch.test.ts"
   ],
@@ -4054,12 +4054,12 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/publish.rs::tests::query_export_publishes_whole_owner_pages_and_nothing_else",
-   "crates/tine-core/src/publish.rs::tests::query_export_refuses_a_stale_review_and_respects_create_vs_replace",
-   "crates/tine-core/src/publish.rs::tests::query_export_refuses_twins_and_empty_results",
-   "crates/tine-core/src/publish.rs::tests::query_export_copies_referenced_assets_into_the_leaf",
-   "crates/tine-core/src/publish.rs::tests::query_export_over_the_asset_budget_is_refused_whole",
-   "crates/tine-core/src/publish.rs::tests::query_export_nested_query_is_silent_about_the_outside_but_flags_sampling",
+   "crates/tine-core/src/publish_tests.rs::query_export_publishes_whole_owner_pages_and_nothing_else",
+   "crates/tine-core/src/publish_tests.rs::query_export_refuses_a_stale_review_and_respects_create_vs_replace",
+   "crates/tine-core/src/publish_tests.rs::query_export_refuses_twins_and_empty_results",
+   "crates/tine-core/src/publish_tests.rs::query_export_copies_referenced_assets_into_the_leaf",
+   "crates/tine-core/src/publish_tests.rs::query_export_over_the_asset_budget_is_refused_whole",
+   "crates/tine-core/src/publish_tests.rs::query_export_nested_query_is_silent_about_the_outside_but_flags_sampling",
    "crates/tine-core/src/graph_text_scope.rs::tests",
    "crates/tine-core/src/model_tests.rs::published_queries_output_never_becomes_pages"
   ],
@@ -4086,8 +4086,8 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/publish.rs::tests::query_export_ships_the_app_over_a_closed_snapshot",
-   "crates/tine-core/src/publish.rs::tests::query_export_without_an_embedded_frontend_warns_and_ships_no_app",
+   "crates/tine-core/src/publish_tests.rs::query_export_ships_the_app_over_a_closed_snapshot",
+   "crates/tine-core/src/publish_tests.rs::query_export_without_an_embedded_frontend_warns_and_ships_no_app",
    "crates/tine-core/src/publish/app_export.rs::tests"
   ],
   "scenario": "publish.query-export-app-closure",
@@ -4111,7 +4111,7 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection.rs::tests::autocomplete_fallback_reads_page_properties_like_the_projection"
+   "crates/tine-core/src/direct_projection_tests.rs::autocomplete_fallback_reads_page_properties_like_the_projection"
   ],
   "scenario": "query.autocomplete-not-ready-page-properties",
   "failBefore": "proven"
