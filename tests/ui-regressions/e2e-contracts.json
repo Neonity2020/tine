@@ -1220,7 +1220,7 @@
    "contracts": [
     {
      "class": "stateful-ux",
-     "userOutcome": "A complete code wrapper exposes only its payload to native select-all, three backticks create a complete scaffold with an interior caret, and ArrowUp at an embed root exits to the preceding host-page block.",
+     "userOutcome": "A complete code wrapper exposes only its payload to native select-all, three backticks create a complete scaffold that offers the language picker on its visible opener line and puts the caret inside when that picker is declined, and ArrowUp at an embed root exits to the preceding host-page block.",
      "blocking": true
     },
     {
@@ -1242,7 +1242,7 @@
     "Exact code-card pixels, syntax colors, caret animation, DOM nesting, or generated runtime block ids."
    ],
    "stability": "stable",
-   "notes": "2026-09-13: Three sequential native runs passed on unchanged fb10683605ce8b5f8a61b27cb0a319b9e66af377 executable SHA256 fa58eb8e4d0f585eb851402b994c4e92149592a8575c460de369e2ca142dea71. The combined cf0c2d5761c0f0dfc805f8558d2e32d50eda918c executable also passed the same journey. Covers native code payload/select-all, scaffold bytes, embed-root ArrowUp, and rendered wrapped drag endpoints."
+   "notes": "2026-09-13: Three sequential native runs passed on unchanged fb10683605ce8b5f8a61b27cb0a319b9e66af377 executable SHA256 fa58eb8e4d0f585eb851402b994c4e92149592a8575c460de369e2ca142dea71. The combined cf0c2d5761c0f0dfc805f8558d2e32d50eda918c executable also passed the same journey. Covers native code payload/select-all, scaffold bytes, embed-root ArrowUp, and rendered wrapped drag endpoints. 2026-09-15 (GH #507): the scaffold step now asserts the language picker on the opener line first, then Escape for the interior caret; re-run natively on the candidate."
   },
   "scripts/e2e-conflict-keep-mine.mjs": {
    "contracts": [

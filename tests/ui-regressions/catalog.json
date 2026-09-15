@@ -9153,7 +9153,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible."
+      "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible. 2026-09-15: the scaffold's caret no longer lands in the body immediately — it offers the language picker on the opener line first (GH #507, row UI-CODE-FENCE-LANGUAGE-507); Escape keeps the interior-caret outcome this row asserts."
     },
     {
       "id": "UI-EMBED-ARROW-UP-EXIT-415",
@@ -11310,6 +11310,34 @@
         "failBefore": "proven"
       },
       "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page + the view compared under viewKey, which folds the engine's dense ViewSettings and the app's sparse resolution together) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export…, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. The Playwright journey passed a five-round sequential unchanged-binary burn-in (Direct and Managed exports, 27/27 each round, binary built from 5ab70870) on 2026-09-15 and runs in linux-release."
+    },
+    {
+      "id": "UI-CODE-FENCE-LANGUAGE-507",
+      "title": "A language can be set on a code block typed with three backticks",
+      "family": "editor-typing",
+      "sources": {
+        "issues": [
+          507,
+          413
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/components/Block.codeFenceScaffold.test.tsx",
+          "src/components/Block.codeFenceAutocomplete.test.tsx",
+          "scripts/e2e-editor-interactions.mjs"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: after typing ``` to open a code block, the user can still say which language it is, so highlighting works. Classification: blocking core operation — with no language there is no syntax highlighting and no other control anywhere in the UI offers one. Root cause: a regression from the GH #413 scaffold (d365bf5d, shipped in v0.6.981). The third backtick scaffolded the complete fence and dropped the caret into the body-only code view, which hides the opening fence line; the language autocomplete only triggers on a visible ```<char> line, so the only remaining path was the /Code block command. Fix: both paths now go through one door (Block.tsx `openFenceLanguagePicker`), which opens the same empty language picker on the still-visible opener; Escape or a non-language keystroke falls into the body exactly as before, keeping #413's closing fence and interior caret. Fail-before: tine-agents/evidence/code-fence-language/507-fail-before.log (4 of 5 scaffold tests fail; the unrelated mid-text test passes). Evidence layer: render (jsdom) plus the native editor-interactions journey."
     }
   ]
 }
