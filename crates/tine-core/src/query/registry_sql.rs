@@ -219,7 +219,7 @@ pub(crate) fn registry_metadata_from_physical_page(
     page: &PhysicalPage,
 ) -> Result<RegistryPageMetadata, String> {
     let page_meta = PageMeta {
-        format: crate::model::Format::from_path(Path::new(&page.path)).into(),
+        format: crate::vocab::Format::from_path(Path::new(&page.path)).into(),
         name: page.name.clone(),
     };
     let mut properties = Vec::new();
@@ -483,7 +483,7 @@ fn decode_page_meta(
         return Err("invalid registry page kind".into());
     }
     Ok(PageMeta {
-        format: crate::model::Format::from_path(Path::new(&path)).into(),
+        format: crate::vocab::Format::from_path(Path::new(&path)).into(),
         name,
     })
 }

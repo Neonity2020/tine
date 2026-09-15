@@ -3,11 +3,6 @@
 
 use super::*;
 
-/// Page input is accepted only through depth 128. All operation-time
-/// nested walks use this fixed root-to-leaf frame ceiling, so traversal does
-/// not consume attacker-controlled call stack or an uncharged all-node stack.
-pub(crate) const MAX_BLOCK_DEPTH: usize = 128;
-
 #[derive(Clone, Copy)]
 #[cfg(test)]
 struct BlockDtoWalkFrame<'a> {

@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { modelModuleSource, rustModuleSource } from "./rustModelSource.test-helpers";
+import { rustModuleSource } from "./rustModelSource.test-helpers";
 
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
@@ -53,7 +53,7 @@ describe("I-22 hostile-content shape guard", () => {
     expect(rustModuleSource("crates/tine-core/src/query.rs"))
       .toContain("QUERY_NESTING_MAX: usize = 64");
     expect(source("src/render/PeekPopup.tsx")).toContain("MAX_PEEK_BLOCK_DEPTH = 64");
-    expect(modelModuleSource())
+    expect(rustModuleSource("crates/tine-core/src/vocab.rs"))
       .toContain("pub(crate) const MAX_BLOCK_DEPTH: usize = 128");
   });
 });

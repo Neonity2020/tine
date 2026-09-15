@@ -6,7 +6,9 @@
 //! editing tree (see plan). File-backed runtime UUIDs are deterministic structural
 //! locators; persisted `id::` values remain a separate external reference identity.
 
-use crate::config::{Config, FileNameFormat};
+use crate::config::Config;
+#[cfg(test)]
+use crate::config::FileNameFormat;
 use crate::date::{JournalDate, JournalFormat};
 use crate::doc::{self, DocBlock, Document, StructuralLayoutIdentity};
 use crate::graph_text_path::{
@@ -20,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -37,10 +38,9 @@ mod asset_refs;
 mod asset_reserve;
 mod assets;
 mod atomic_copy;
-mod atomic_fs;
-mod block_dto;
 mod bounded_walks;
 mod budgets;
+mod config_writes;
 mod conflicts;
 mod derived_cache;
 mod direct_query;
@@ -73,24 +73,26 @@ mod pdf;
 mod persistent_map;
 pub use atomic_copy::*;
 mod projection_rename;
-pub(crate) use bounded_walks::*;
+use bounded_walks::*;
 use budgets::*;
 use graph_text_capture::*;
 pub use graph_text_errors::*;
 pub(crate) use projection_rename::*;
 mod projection_fs;
-pub use atomic_fs::*;
+pub(crate) use crate::filesystem_durability::*;
+pub use crate::filesystem_durability::{
+    atomic_update, atomic_write, dir_fsync_error_is_unsupported, sync_dir_for_rename,
+};
 use projection_fs::*;
 mod trash;
 use asset_files::*;
 use asset_refs::*;
 use asset_reserve::*;
-pub use block_dto::*;
 pub use derived_cache::*;
 pub use editor_types::*;
 use graph_dir::*;
 pub use graph_text_state::*;
-pub(crate) use page_cache_index::*;
+use page_cache_index::*;
 use page_header::*;
 pub(crate) use page_parse::*;
 use trash::*;
@@ -98,19 +100,16 @@ mod write_gate;
 pub use dto::*;
 use write_gate::*;
 mod projection_lifetime;
+mod retired_files;
+use retired_files::*;
 mod queries;
+mod query_graph;
 mod save_path;
 mod search;
 mod sync_file;
 mod write_receipts;
+pub use crate::vocab::*;
 use persistent_map::{PersistentMap, PersistentMapNode};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PageKind {
-    Journal,
-    Page,
-}
 
 const LOGSEQ_TEXT_EXTENSIONS: [&str; 3] = ["md", "markdown", "org"];
 
@@ -122,36 +121,6 @@ thread_local! {
     /// hydration, but a counter a test can read is what keeps the claim from
     /// quietly becoming "pages loaded is at most the whole graph".
     static DIRECT_HYDRATED_PAGES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// On-disk file format of a page. Markdown (`.md`/`.markdown`) is the default; Logseq org
-/// graphs use `.org`. A graph may mix the two — format is decided per file by
-/// extension, never graph-wide (matching OG, which stores `:block/format` per
-/// page). The graph's `:preferred-format` only chooses the extension for NEW
-/// files (see [`Graph::preferred_format`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    #[default]
-    Md,
-    Org,
-}
-
-impl Format {
-    /// Format of a page file by its extension (`.org` → Org, else Md).
-    pub fn from_path(p: &Path) -> Format {
-        match p.extension().and_then(|e| e.to_str()) {
-            Some(extension) if extension.eq_ignore_ascii_case("org") => Format::Org,
-            _ => Format::Md,
-        }
-    }
-    /// File extension (no dot) for this format.
-    pub fn ext(self) -> &'static str {
-        match self {
-            Format::Md => "md",
-            Format::Org => "org",
-        }
-    }
 }
 
 fn is_logseq_text_extension(extension: &str) -> bool {
@@ -183,108 +152,6 @@ fn is_page_file(path: &Path) -> bool {
 
 fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-/// If `stem` is a sync tool's conflict copy of another file, return the base file
-/// stem it shadows. Recognises the GENERATED shapes only (a page whose name
-/// merely resembles one stays a real page):
-///
-/// - Syncthing: `name.sync-conflict-YYYYMMDD-HHMMSS-DEVICEID`
-///   (`conflictName` in syncthing `lib/model/folder_sendrecv.go`; the device id
-///   is the modifying device's short id — up to 7 base32 chars `[A-Z2-7]`,
-///   empty when unknown — and pre-1.1.0 versions omitted `-DEVICEID`).
-/// - Seafile: `name (SFConflict [modifier ]YYYY-MM-DD-HH-MM-SS)`
-///   (`gen_conflict_path` in seafile `common/vc-common.c`; the modifier is the
-///   editing user's id when known).
-/// - Dropbox: `name (conflicted copy …)` / `name (<user>'s conflicted copy …)`.
-///
-/// Deliberately NOT recognized (too ambiguous to distinguish from a real page
-/// name, so treating them as conflict copies would deindex real pages):
-/// OneDrive's `name-COMPUTERNAME.ext` and Google Drive's `name (1).ext`.
-///
-/// A conflict copy is NOT a real page — the versioned graph-text policy keeps it
-/// out of normal discovery and exact page resolution. The explicit conflict
-/// workflow has its own retained-capability path.
-pub fn sync_conflict_base(stem: &str) -> Option<&str> {
-    const SYNCTHING_TAG: &str = ".sync-conflict-";
-    let mut search = 0;
-    while let Some(found) = stem[search..].find(SYNCTHING_TAG) {
-        let i = search + found;
-        if syncthing_conflict_tail(&stem[i + SYNCTHING_TAG.len()..]) {
-            return Some(&stem[..i]);
-        }
-        search = i + SYNCTHING_TAG.len();
-    }
-    const SEAFILE_TAG: &str = " (SFConflict ";
-    if let Some(inner) = stem.strip_suffix(')') {
-        if let Some(i) = inner.rfind(SEAFILE_TAG) {
-            let args = &inner[i + SEAFILE_TAG.len()..];
-            let timestamp = args.rsplit(' ').next().unwrap_or(args);
-            if seafile_conflict_timestamp(timestamp) && !args.contains(')') {
-                return Some(&stem[..i]);
-            }
-        }
-    }
-    // Dropbox: "<base> (conflicted copy …)" or "<base> (<user>'s conflicted copy …)".
-    if let Some(i) = stem.find(" (") {
-        if stem[i..].contains("conflicted copy") {
-            return Some(&stem[..i]);
-        }
-    }
-    None
-}
-
-/// Whether the text after `.sync-conflict-` matches Syncthing's generated
-/// `YYYYMMDD-HHMMSS[-DEVICEID]` tail exactly to the end of the stem.
-fn syncthing_conflict_tail(tail: &str) -> bool {
-    let bytes = tail.as_bytes();
-    if bytes.len() < 15
-        || !bytes[..8].iter().all(u8::is_ascii_digit)
-        || bytes[8] != b'-'
-        || !bytes[9..15].iter().all(u8::is_ascii_digit)
-    {
-        return false;
-    }
-    match &bytes[15..] {
-        // Pre-1.1.0 Syncthing: no `-DEVICEID` suffix at all.
-        [] => true,
-        // The short device id: up to 7 chars of RFC 4648 base32 (`[A-Z2-7]`),
-        // empty when the modifying device is unknown (zero ShortID).
-        [b'-', device @ ..] => {
-            device.len() <= 7
-                && device
-                    .iter()
-                    .all(|&b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
-        }
-        _ => false,
-    }
-}
-
-/// Whether `text` is Seafile's `%Y-%m-%d-%H-%M-%S` conflict timestamp
-/// (`gen_conflict_path` in seafile `common/vc-common.c`).
-fn seafile_conflict_timestamp(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() == 19
-        && bytes.iter().enumerate().all(|(i, &b)| {
-            if matches!(i, 4 | 7 | 10 | 13 | 16) {
-                b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }
-        })
-}
-
-/// Whether `stem` names a sync-tool conflict copy (see [`sync_conflict_base`]).
-pub fn is_sync_conflict(stem: &str) -> bool {
-    sync_conflict_base(stem).is_some()
-}
-
-/// Whether `path`'s file stem names a sync-tool conflict copy — the `Path`-level
-/// convenience used by the watcher (which works in paths, not stems).
-pub fn path_is_sync_conflict(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(is_sync_conflict)
 }
 
 /// Error for an ambiguous page that exists in multiple supported text extensions.

@@ -1,6 +1,5 @@
 use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
-use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::query::registry_cache::{CommittedRegistryCache, RegistryCapture};
 use crate::query::registry_sql::{self, PageRegistryMetadata};
 use crate::query::PropertyFacetAccumulator;
@@ -8,6 +7,7 @@ use crate::query_cursor::drain_after;
 use crate::query_jobs::{
     OwnedAdmission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY, QUERY_JOB_WAIT,
 };
+use crate::vocab::{Format, PageEntry, PageKind, ReferenceKind};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2844,7 +2844,7 @@ fn physical_page(
 fn block_projection_key(runtime_id: &str) -> [u8; 16] {
     match Uuid::parse_str(runtime_id) {
         Ok(uuid) => uuid.into_bytes(),
-        Err(_) => crate::model::live_runtime_id_key(runtime_id).into_bytes(),
+        Err(_) => crate::vocab::live_runtime_id_key(runtime_id).into_bytes(),
     }
 }
 
@@ -3076,7 +3076,7 @@ pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
 /// selection on 2026-09-09, on a loaded hosted runner, in two tests that
 /// pass locally in 0.05s. Every fixture that reopens a projection database
 /// calls this first.
-pub(crate) fn release_projection(graph: &crate::model::Graph) {
+pub(crate) fn release_projection<G: crate::query::graph::QueryGraph>(graph: &G) {
     let Some(projection) = graph.direct_projection_test() else {
         return;
     };
@@ -3105,7 +3105,7 @@ pub(crate) fn release_projection(graph: &crate::model::Graph) {
 /// loaded machine and passes every time on an idle one, which is how
 /// `current_snapshot_write_failure_recovers_from_authoritative_source` took
 /// down the Linux release selection on 2026-09-10 after passing all night.
-pub(crate) fn recover_until_ready(graph: &crate::model::Graph) {
+pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G) {
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_secs(30);
     loop {

@@ -41,7 +41,7 @@ pub fn union_pre(mine: Option<&str>, theirs: Option<&str>) -> Option<String> {
 
 /// True if any block in the subtree has a non-empty line that isn't a `key::`
 /// property line — i.e. the page is more than an empty/placeholder bullet.
-pub(super) fn doc_has_content(blocks: &[DocBlock]) -> bool {
+pub(crate) fn doc_has_content(blocks: &[DocBlock]) -> bool {
     blocks.iter().any(|b| {
         b.raw
             .lines()
@@ -543,7 +543,7 @@ pub(crate) fn existing_document_page_dto(
 /// Whether a page should load read-only: an org file whose on-disk bytes don't
 /// round-trip through Tine's org parser/serializer, so Tine must never rewrite
 /// it (lest it corrupt the user's graph). Markdown pages are always editable.
-pub(super) fn read_only_org(path: &Path, content: &str) -> bool {
+pub(crate) fn read_only_org(path: &Path, content: &str) -> bool {
     Format::from_path(path) == Format::Org && !crate::org::org_editable(content)
 }
 
@@ -687,7 +687,7 @@ pub(crate) fn decode_page_name(stem: &str, fmt: FileNameFormat) -> String {
 
 /// Decode `%XX` percent-escapes (UTF-8 aware, like JS `decodeURIComponent`). An
 /// invalid or truncated escape is left literal rather than dropped.
-pub(super) fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     if !s.contains('%') {
         return s.to_string();
     }

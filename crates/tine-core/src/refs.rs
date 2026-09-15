@@ -468,9 +468,9 @@ fn rewrite_org_file_link(
         Some((s, e)) => (s, format!(".{e}")),
         None => (file, String::new()),
     };
-    let decoded = crate::model::decode_page_name(stem, file_name_format);
+    let decoded = crate::vocab::decode_page_name(stem, file_name_format);
     let to = renames.get(&normalize(&decoded))?;
-    let new_stem = crate::model::encode_page_name(to, file_name_format);
+    let new_stem = crate::vocab::encode_page_name(to, file_name_format);
     let desc_part = desc.map(|d| format!("][{d}")).unwrap_or_default();
     Some(format!("[[file:{dir}{new_stem}{ext}{desc_part}]]"))
 }

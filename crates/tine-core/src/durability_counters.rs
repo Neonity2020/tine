@@ -569,7 +569,12 @@ mod tests {
         let wrappers = without_inline_test_modules(include_str!("durability_counters.rs"));
         assert_eq!(wrappers.matches("note(Barrier::File);").count(), 1);
         assert_eq!(wrappers.matches("note(Barrier::Directory);").count(), 1);
-        let filesystem_wrappers = include_str!("filesystem_durability.rs");
+        let filesystem_wrappers =
+            crate::test_support::rust_module_production_files("filesystem_durability.rs")
+                .into_iter()
+                .map(|path| without_inline_test_modules(&fs::read_to_string(path).unwrap()))
+                .collect::<Vec<_>>()
+                .join("\n");
         assert_eq!(
             filesystem_wrappers
                 .matches("note(crate::durability_counters::Barrier::Filesystem);")

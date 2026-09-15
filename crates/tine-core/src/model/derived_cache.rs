@@ -115,24 +115,6 @@ pub(super) fn result_cache_key_estimated_bytes(key: &str) -> usize {
     key.len().saturating_mul(2).saturating_add(128)
 }
 
-pub fn block_dto_estimated_bytes(block: &BlockDto) -> usize {
-    block.id.len()
-        + block.raw.len()
-        + block.breadcrumb.iter().map(String::len).sum::<usize>()
-        + block.tags.iter().map(String::len).sum::<usize>()
-        + block
-            .properties
-            .iter()
-            .map(|(key, value)| key.len() + value.len())
-            .sum::<usize>()
-        + block
-            .children
-            .iter()
-            .map(block_dto_estimated_bytes)
-            .sum::<usize>()
-        + 128
-}
-
 /// Conservative owned-memory estimate for a result payload. Tauri commands use
 /// this before serialization as a second guard beside the row cap; derived
 /// caches use the same accounting so transport and retention budgets cannot

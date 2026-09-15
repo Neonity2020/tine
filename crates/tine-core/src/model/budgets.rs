@@ -267,10 +267,6 @@ impl AsRef<str> for BudgetedString {
     }
 }
 
-pub(super) fn allocation_overflow() -> io::Error {
-    graph_text_inventory_limit_error("aggregate retained content bytes")
-}
-
 pub(super) fn checked_add_bytes(left: u64, right: u64) -> io::Result<u64> {
     left.checked_add(right).ok_or_else(allocation_overflow)
 }
@@ -351,8 +347,4 @@ pub(super) fn graph_text_page_entry_retained_upper_bound(entry: &PageEntry) -> i
     )?;
     bytes = checked_add_bytes(bytes, owned_string_upper_bound(&entry.rel_path)?)?;
     checked_add_bytes(bytes, owned_path_upper_bound(&entry.path)?)
-}
-
-pub(super) fn usize_to_u64(value: usize) -> io::Result<u64> {
-    u64::try_from(value).map_err(|_| allocation_overflow())
 }

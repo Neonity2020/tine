@@ -982,6 +982,38 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "open.create",
             1,
         ),
+        // K5 (2026-09-15) moved the shared atomic filesystem machinery out of
+        // model; only its production path changed, not its primitive totals.
+        (
+            "crates/tine-core/src/filesystem_durability.rs",
+            "fs.create_dir_all",
+            1,
+        ),
+        (
+            "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
+            "fs.remove_file",
+            8,
+        ),
+        (
+            "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
+            "fs.rename",
+            2,
+        ),
+        (
+            "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
+            "libc.renameat2",
+            1,
+        ),
+        (
+            "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
+            "open.create_new",
+            2,
+        ),
+        (
+            "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
+            "windows.MoveFileW",
+            1,
+        ),
         // K3 (2026-09-15) moved these out of model.rs verbatim; the module's
         // totals did not change.
         (
@@ -1003,7 +1035,7 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/model/atomic_copy.rs",
             "fs.create_dir_all",
-            2,
+            1,
         ),
         (
             "crates/tine-core/src/model/atomic_copy.rs",
@@ -1015,32 +1047,6 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "crates/tine-core/src/model/atomic_copy.rs",
             "open.create_new",
             3,
-        ),
-        (
-            "crates/tine-core/src/model/atomic_fs.rs",
-            "fs.create_dir_all",
-            1,
-        ),
-        (
-            "crates/tine-core/src/model/atomic_fs.rs",
-            "fs.remove_file",
-            8,
-        ),
-        ("crates/tine-core/src/model/atomic_fs.rs", "fs.rename", 2),
-        (
-            "crates/tine-core/src/model/atomic_fs.rs",
-            "libc.renameat2",
-            1,
-        ),
-        (
-            "crates/tine-core/src/model/atomic_fs.rs",
-            "open.create_new",
-            2,
-        ),
-        (
-            "crates/tine-core/src/model/atomic_fs.rs",
-            "windows.MoveFileW",
-            1,
         ),
         (
             "crates/tine-core/src/model/conflicts.rs",
@@ -1091,6 +1097,11 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
         (
             "crates/tine-core/src/model/projection_rename.rs",
             "windows.NtSetInformationFile",
+            1,
+        ),
+        (
+            "crates/tine-core/src/model/retired_files.rs",
+            "fs.create_dir_all",
             1,
         ),
         (

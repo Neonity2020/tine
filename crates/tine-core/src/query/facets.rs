@@ -175,12 +175,12 @@ impl PropertyFacetAccumulator {
 
 /// Distinct property keys (each with its sorted distinct values) used across the
 /// graph. Drives the query builder's property-filter pickers.
-pub fn property_facets(graph: &Graph) -> Vec<(String, Vec<String>)> {
+pub fn property_facets(graph: &impl QueryGraph) -> Vec<(String, Vec<String>)> {
     property_facets_bounded(graph, usize::MAX, usize::MAX).0
 }
 
 pub fn property_facets_bounded(
-    graph: &Graph,
+    graph: &impl QueryGraph,
     max_values: usize,
     max_bytes: usize,
 ) -> (Vec<(String, Vec<String>)>, bool) {
@@ -235,13 +235,13 @@ const OG_AUTOCOMPLETE_HIDDEN_PROPS: &[&str] = &[
     "done",
 ];
 
-pub fn autocomplete_property_facets_bounded(
-    graph: &Graph,
+pub fn autocomplete_property_facets_bounded<G: QueryGraph>(
+    graph: &G,
     max_items: usize,
     max_bytes: usize,
 ) -> (Vec<(String, Vec<String>)>, bool) {
     let mut accumulator = PropertyFacetAccumulator::autocomplete(
-        &graph.config.block_hidden_properties,
+        &graph.config().block_hidden_properties,
         max_items,
         max_bytes,
     );

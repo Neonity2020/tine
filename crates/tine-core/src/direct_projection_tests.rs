@@ -142,7 +142,12 @@ fn every_fixture_that_reopens_a_projection_database_releases_the_previous_worker
                 if attaches >= 2 && releases == 0 && current != TWO_OWNERS {
                     offenders.push(format!("{}::{current}", file.display()));
                 }
-                current = rest.split('(').next().unwrap_or_default().trim().to_owned();
+                current = rest
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
                 attaches = 0;
                 releases = 0;
             }
@@ -216,7 +221,12 @@ fn every_fixture_drives_projection_recovery_through_the_retrying_helper() {
                 .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
                 .or_else(|| trimmed.strip_prefix("pub fn "))
             {
-                current = rest.split('(').next().unwrap_or_default().trim().to_owned();
+                current = rest
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
             }
             if trimmed.starts_with("///") || trimmed.starts_with("//") {
                 continue;

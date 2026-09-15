@@ -45,13 +45,13 @@ use tine_storage::sqlite::{
 };
 
 use crate::direct_projection::page_kind_from_sql;
-use crate::model::{
-    block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, BlockDto,
-    PageKind, RefGroup, ShallowBlockFacets,
-};
 use crate::query::rank::PageRecencyPrograms;
 use crate::query::sql::{page_statement, SqlQuery};
 use crate::query::{ConstructionBudget, ConstructionProfile, PreViewGroups, ResultViewGroup};
+use crate::vocab::{
+    block_dto_estimated_bytes, doc_runtime_id_for_order, shallow_block_facets_dto, BlockDto,
+    PageKind, RefGroup, ShallowBlockFacets,
+};
 
 // The gates. `#[path]` keeps the file beside this one so the shared
 // production-source scanner sees a `*_tests.rs` sibling include and blanks it

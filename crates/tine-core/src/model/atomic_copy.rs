@@ -105,24 +105,6 @@ pub fn atomic_copy_file_new(input: &mut fs::File, dst: &Path, max_bytes: u64) ->
     res
 }
 
-/// Read–modify–write a small text file (config.edn, device settings) under a lock,
-/// committed via [`atomic_write`]. The ONE guarded path every settings writer goes
-/// through, so the discipline is uniform rather than re-derived per call site:
-///   - a MISSING file is the empty document `{}`, but any OTHER read error
-///     (permission, NFS stale handle, transient I/O) ABORTS — otherwise `edit` would
-///     rebuild the whole file from `{}` and destroy every other key (audit H2);
-///   - the `lock` serializes concurrent writers to the same logical file so a
-///     read-modify-write can't clobber a concurrent one (audit M1/M2);
-///   - `edit` returns the new full contents, or an `Err` to abort without writing;
-///   - the commit is atomic (temp + fsync + rename), so a crash can't truncate it.
-pub fn atomic_update(
-    path: &Path,
-    lock: &std::sync::Mutex<()>,
-    edit: impl Fn(&str) -> io::Result<String>,
-) -> io::Result<()> {
-    atomic_update_with_hooks(path, lock, edit, |_| {}, |_| {})
-}
-
 /// Read-modify-write one small app-private authority file through the typed
 /// durable directory-publication boundary.
 ///
@@ -242,60 +224,4 @@ fn durable_private_authority_directory(path: &Path) -> io::Result<(Dir, String)>
         }
     }
     Dir::open_ambient_dir(parent, ambient_authority()).map(|directory| (directory, filename))
-}
-
-pub(super) fn atomic_update_with_hooks(
-    path: &Path,
-    lock: &std::sync::Mutex<()>,
-    edit: impl Fn(&str) -> io::Result<String>,
-    before_recheck: impl Fn(usize),
-    before_publish: impl Fn(usize),
-) -> io::Result<()> {
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for attempt in 0..4 {
-        let baseline = match fs::read_to_string(path) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        let next = edit(baseline.as_deref().unwrap_or("{}\n"))?;
-        // CONFIG_LOCK serializes Tine writers, but Logseq/Syncthing do not take
-        // it. Re-read immediately before publish and retry the key-local edit on
-        // their new bytes instead of overwriting an external update with our stale
-        // full-file copy.
-        before_recheck(attempt);
-        let current = match fs::read_to_string(path) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        if current != baseline {
-            continue;
-        }
-        before_publish(attempt);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match baseline.as_deref() {
-            // Creation is already no-clobber: `create_new` + no-replace rename.
-            None => match atomic_write_new(path, next.as_bytes()) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            },
-            // Update: the recheck above narrows the race but cannot close it -
-            // an external writer can still land between it and the rename. Make
-            // the publish itself conditional so their bytes cannot be lost.
-            Some(current) => {
-                match atomic_replace_expected(path, current.as_bytes(), next.as_bytes())? {
-                    AtomicReplaceOutcome::Published => return Ok(()),
-                    AtomicReplaceOutcome::ExternalChanged => continue,
-                }
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        "config changed repeatedly during update",
-    ))
 }

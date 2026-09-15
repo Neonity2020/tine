@@ -196,16 +196,6 @@ pub(super) fn graph_text_capture_limit_error(resource: &'static str) -> io::Erro
     )
 }
 
-pub(super) fn graph_text_inventory_limit_error(resource: &'static str) -> io::Error {
-    DirectSaveError::into_io(
-        DirectSaveFailureCode::PrecheckLimit,
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("graph text inventory {resource} bound exceeded"),
-        ),
-    )
-}
-
 pub(super) fn graph_text_inventory_alias_error(
     resource: &'static str,
     first: &str,

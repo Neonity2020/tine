@@ -627,10 +627,7 @@ fn fixed_excluded(components: &[&str]) -> bool {
         .any(|component| component.eq_ignore_ascii_case("node_modules"))
         || starts_with(components, &["assets"])
         || starts_with(components, &["publish"])
-        || starts_with(
-            components,
-            &[crate::publish::query_export::PUBLISHED_QUERIES_DIR],
-        )
+        || starts_with(components, &[crate::vocab::PUBLISHED_QUERIES_DIR])
         || starts_with(components, &[".tine-sync"])
         || starts_with(components, &["logseq", ".recycle"])
         || starts_with(components, &["logseq", "bak"])
@@ -652,7 +649,7 @@ fn provider_conflict_copy(filename: &str) -> bool {
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(filename);
-    crate::model::is_sync_conflict(stem)
+    crate::vocab::is_sync_conflict(stem)
 }
 
 #[cfg(test)]

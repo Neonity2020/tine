@@ -63,3 +63,32 @@ pub(crate) fn model_module_source() -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Every production file in a split Rust module, root first and then child
+/// seams in path order. Test-only seam files are excluded; callers can strip
+/// inline `#[cfg(test)]` modules with their existing source masker.
+pub(crate) fn rust_module_production_files(module_root: &str) -> Vec<PathBuf> {
+    fn seams(directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).expect("Rust module directory is readable") {
+            let path = entry.expect("Rust module entry is readable").path();
+            if path.is_dir() {
+                seams(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && !path.to_string_lossy().ends_with("_tests.rs")
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = src.join(module_root);
+    let directory = root.with_extension("");
+    let mut files = Vec::new();
+    if directory.is_dir() {
+        seams(&directory, &mut files);
+    }
+    files.sort();
+    files.insert(0, root);
+    files
+}

@@ -5,8 +5,8 @@
 //! re-bulleted parse input to `DocBlock::raw`; query surfaces then select a
 //! canonical page/alias set without reparsing or inventing another matcher.
 
-use crate::model::{ReferenceKind, ReferenceOccurrence, ReferenceSpan};
 use crate::refs;
+use crate::vocab::{ReferenceKind, ReferenceOccurrence, ReferenceSpan};
 use lsdoc::ast::{Block, Inline, ListItem, Span, Url};
 use std::ops::Range;
 use unicode_normalization::UnicodeNormalization;

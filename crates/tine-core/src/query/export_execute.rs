@@ -2,7 +2,6 @@
 
 use tine_storage::sqlite::PhysicalProjectionQuerySnapshot;
 
-use crate::model::BlockDto;
 use crate::query::export_results::{
     apply_located_view, hydrate_located_export_queries, select_located_export_queries,
     ExportSubtreeInputs,
@@ -21,6 +20,7 @@ use crate::query::{
     ConstructionProfile, ExportSelectionAnswer, QueryExportBatch, QueryExportResult,
     QueryExportSpec, QueryInput, QUERY_EXPORT_CONSTRUCTION_BYTES, QUERY_EXPORT_CONSTRUCTION_ROWS,
 };
+use crate::vocab::BlockDto;
 
 #[cfg(test)]
 #[path = "export_execute_tests.rs"]

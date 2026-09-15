@@ -25,7 +25,7 @@ use std::io;
 use std::path::PathBuf;
 
 /// Sibling of `publish/`; every query export is one leaf directory under it.
-pub const PUBLISHED_QUERIES_DIR: &str = "published-queries";
+pub use crate::vocab::PUBLISHED_QUERIES_DIR;
 /// Folder names are portable slugs; longer titles are truncated.
 pub const FOLDER_MAX_CHARS: usize = 64;
 const FOLDER_FALLBACK: &str = "query";

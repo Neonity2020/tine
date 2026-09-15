@@ -6,14 +6,18 @@
 //! block-query result contract.  The plan/result types are the seam that a
 //! durable query workspace can grow into later.
 
+#![cfg_attr(test, allow(private_bounds))]
+
 #[cfg(test)]
 use crate::doc::DocBlock;
 #[cfg(test)]
 use crate::model::Graph;
-use crate::model::{BlockDto, PageEntry, PageKind};
+#[cfg(test)]
+use crate::query::graph::QueryGraph;
 #[cfg(test)]
 use crate::refs;
 use crate::search_query::{canonical_fold, Matcher, Term};
+use crate::vocab::{BlockDto, PageEntry, PageKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -584,14 +588,18 @@ impl QueryPlan {
     /// Execute all graph-backed branches.  Cancellation is checked between page
     /// candidates and before every block projection; no partial result escapes.
     #[cfg(test)]
-    pub fn execute(&self, graph: &Graph, cancelled: impl Fn() -> bool) -> QueryExecution {
+    pub fn execute<G: QueryGraph>(
+        &self,
+        graph: &G,
+        cancelled: impl Fn() -> bool,
+    ) -> QueryExecution {
         self.execute_with_explain(graph, cancelled, true)
     }
 
     #[cfg(test)]
-    pub fn execute_with_explain(
+    pub fn execute_with_explain<G: QueryGraph>(
         &self,
-        graph: &Graph,
+        graph: &G,
         cancelled: impl Fn() -> bool,
         explain: bool,
     ) -> QueryExecution {
@@ -1707,9 +1715,9 @@ fn best_page_match(
 }
 
 #[cfg(test)]
-fn execute_pages(
+fn execute_pages<G: QueryGraph>(
     plan: &QueryPlan,
-    graph: &Graph,
+    graph: &G,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
 ) -> Option<(Vec<QueryHit>, bool)> {
@@ -1987,7 +1995,7 @@ where
                 // Search hits are result identities, not independent copies
                 // of their entire descendant trees. The source page owns the
                 // hierarchy and live consumers hydrate it once per page.
-                let mut dto = crate::model::block_to_shallow_dto(winner.block);
+                let mut dto = crate::vocab::block_to_shallow_dto(winner.block);
                 dto.breadcrumb = winner.breadcrumb;
                 QueryHit::Block {
                     page: winner.page.name.clone(),
@@ -2006,9 +2014,9 @@ where
 }
 
 #[cfg(test)]
-fn execute_blocks(
+fn execute_blocks<G: QueryGraph>(
     plan: &QueryPlan,
-    graph: &Graph,
+    graph: &G,
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
 ) -> Option<(Vec<QueryHit>, bool)> {
@@ -2032,8 +2040,8 @@ fn execute_blocks(
 /// search/query consumers. Hits arrive in global relevance order; only contiguous
 /// hits from the same page are coalesced, so flattening the groups preserves that
 /// order even when a page appears in more than one group.
-pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::model::RefGroup> {
-    let mut groups: Vec<crate::model::RefGroup> = Vec::new();
+pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::vocab::RefGroup> {
+    let mut groups: Vec<crate::vocab::RefGroup> = Vec::new();
     for hit in hits {
         let QueryHit::Block {
             page, kind, block, ..
@@ -2047,7 +2055,7 @@ pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::model::Ref
                 continue;
             }
         }
-        groups.push(crate::model::RefGroup {
+        groups.push(crate::vocab::RefGroup {
             page,
             kind,
             blocks: vec![block],
@@ -2180,7 +2188,11 @@ mod tests {
             .collect()
     }
 
-    fn reference_literal_search(graph: &Graph, query: &str, limit: usize) -> Vec<(String, String)> {
+    fn reference_literal_search<G: QueryGraph>(
+        graph: &G,
+        query: &str,
+        limit: usize,
+    ) -> Vec<(String, String)> {
         if limit == 0 || query.is_empty() {
             return Vec::new();
         }

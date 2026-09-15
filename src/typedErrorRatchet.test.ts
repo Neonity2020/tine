@@ -283,6 +283,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
 
   it("pins the Rust typed boundaries and the living contract", () => {
     const model = modelModuleSource();
+    const vocab = rustModuleSource("crates/tine-core/src/vocab.rs");
     const contract = source("docs/contracts/typed-errors.md");
     const directClassifier = model.slice(
       model.indexOf("pub fn direct_save_conflict_epoch"),
@@ -331,9 +332,9 @@ describe("I-9/I-11 typed backend error boundary", () => {
       for (const row of rows) expect(row.split("|").length).toBe(7);
     }
 
-    const directImpl = model.slice(
-      model.indexOf("impl DirectSaveFailureCode"),
-      model.indexOf("/// Typed inner error", model.indexOf("impl DirectSaveFailureCode")),
+    const directImpl = vocab.slice(
+      vocab.indexOf("impl DirectSaveFailureCode"),
+      vocab.indexOf("/// Typed inner error", vocab.indexOf("impl DirectSaveFailureCode")),
     );
     const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority)\.[a-z_]+|unknown)"/g)]
       .map((match) => match[1]);

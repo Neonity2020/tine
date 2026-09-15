@@ -85,11 +85,21 @@ describe("config live-reload contract matches the source", () => {
 
   it("routes every settings write through one funnel that records it", () => {
     expect(reload).toContain("`Graph::write_config` is therefore the single funnel");
-    const config = readFileSync("crates/tine-core/src/config.rs", "utf8");
-    expect(config).toContain("fn write_config(");
     // No setter may go around it, or the watcher stops being able to tell
-    // Tine's own write from an outside one.
-    expect(config).not.toContain("crate::model::atomic_update(&path, &CONFIG_LOCK");
+    // Tine's own write from an outside one. Count the lock-taking write at any
+    // module path and anywhere in the crate: K5 moved `atomic_update` out of
+    // `model`, and a pattern spelled with the old path went blind (I-11).
+    const crateRoot = "crates/tine-core/src";
+    const crate = (readdirSync(crateRoot, { recursive: true }) as string[])
+      .filter((file) => file.endsWith(".rs"))
+      .sort()
+      .map((file) => readFileSync(join(crateRoot, file), "utf8"))
+      .join("\n");
+    expect([...crate.matchAll(/\batomic_update\([^)]*&CONFIG_LOCK\b/g)]).toHaveLength(1);
+    const funnelStart = model.indexOf("fn write_config(");
+    expect(funnelStart).toBeGreaterThan(-1);
+    const funnel = model.slice(funnelStart, model.indexOf("\n    }\n", funnelStart));
+    expect(funnel).toMatch(/\batomic_update\(path, &CONFIG_LOCK\b/);
     expect(watcher).toContain("lease.recent_config_write() == disk");
   });
 

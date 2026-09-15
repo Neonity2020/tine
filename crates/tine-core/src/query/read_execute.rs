@@ -21,6 +21,29 @@ use super::{
     QueryExecutionError,
 };
 
+/// One operation-owned current-main reader supplied by the publication
+/// boundary. The renderer parses every authored surface, while the backend
+/// adapter owns the coherent snapshot, registry and cancellation lifetime.
+pub(crate) trait PublicationQueryRead {
+    fn run_subtrees(
+        &self,
+        query: &crate::query::ir::Query,
+        view: &ViewSettings,
+        bounds: Bounds,
+        context: &ExecutionContext,
+    ) -> Result<crate::query::export_execute::SubtreeQueryResult, QueryExecutionError>;
+
+    fn run(
+        &self,
+        query: &crate::query::ir::Query,
+        view: &ViewSettings,
+        bounds: Bounds,
+        context: &ExecutionContext,
+    ) -> Result<QueryResult, QueryExecutionError>;
+
+    fn ensure_current(&self) -> Result<(), QueryExecutionError>;
+}
+
 pub(crate) struct SnapshotQueryInputs<'a> {
     pub(crate) registry: &'a Registry,
     pub(crate) identity: &'a ResultIdentity,
@@ -178,7 +201,7 @@ impl<'a> SnapshotQueryReader<'a> {
     }
 }
 
-impl crate::publish::PublicationQueryRead for SnapshotQueryReader<'_> {
+impl PublicationQueryRead for SnapshotQueryReader<'_> {
     fn run_subtrees(
         &self,
         query: &Query,

@@ -145,7 +145,7 @@ impl JournalDays {
         }
         let filename = std::path::Path::new(rel_path).file_name()?.to_str()?;
         let (stem, _) = filename.rsplit_once('.')?;
-        let decoded = crate::model::decode_page_name(stem, self.file_name_format);
+        let decoded = crate::vocab::decode_page_name(stem, self.file_name_format);
         self.format.parse(&decoded).map(|date| date.ordinal_key())
     }
 }

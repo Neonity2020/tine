@@ -117,7 +117,7 @@ fn production_docblock_struct_literals_are_reviewed() {
             "DocBlock::new is the raw-only canonical constructor",
         ),
         (
-            "crates/tine-core/src/model/block_dto.rs",
+            "crates/tine-core/src/vocab/block_dto.rs",
             "dto_block_to_doc_block",
             "the one BlockDto field mapping",
         ),

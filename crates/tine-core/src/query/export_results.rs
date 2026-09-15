@@ -42,7 +42,6 @@ use std::collections::{HashMap, HashSet};
 
 use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
-use crate::model::{block_dto_estimated_bytes, BlockDto, PageKind, RefGroup};
 use crate::query::ir::ViewSettings;
 use crate::query::results::{
     blob16, count, integer, placeholders, read_admitted_payload, resolve_identity,
@@ -53,6 +52,7 @@ use crate::query::{
     finish_result_view_groups, select_export_queries_over, ExportSelectionAnswer,
     QueryExportResult, QueryExportSpec, QueryOpts, SelectedExportQueryOf,
 };
+use crate::vocab::{block_dto_estimated_bytes, BlockDto, PageKind, RefGroup};
 
 // The gates. `#[path]` keeps the file beside this one so the shared
 // production-source scanner sees a `*_tests.rs` sibling include and blanks it

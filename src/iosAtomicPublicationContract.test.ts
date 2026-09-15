@@ -1,8 +1,15 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { modelModuleFiles, modelModuleSource } from "./rustModelSource.test-helpers";
+import {
+  modelModuleFiles,
+  modelModuleSource,
+  rustModuleFiles,
+} from "./rustModelSource.test-helpers";
 
-const sources = modelModuleFiles();
+const sources = [
+  ...modelModuleFiles(),
+  ...rustModuleFiles("crates/tine-core/src/filesystem_durability.rs"),
+];
 
 describe("iOS atomic publication platform boundary", () => {
   it("routes every Darwin renameatx publication through the iOS implementation", () => {

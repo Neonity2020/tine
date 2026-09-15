@@ -4,8 +4,11 @@
 
 use crate::doc::{self, DocBlock};
 use crate::model::{BlockDto, Graph, PageKind, RefGroup};
-use crate::query::ir::{Bounds, ExecutionContext, PageRow, QueryResult, QueryRows, ViewSettings};
+#[cfg(test)]
+use crate::query::ir::ViewSettings;
+use crate::query::ir::{Bounds, ExecutionContext, PageRow, QueryResult, QueryRows};
 use crate::query::macro_text::is_query_macro_name;
+use crate::query::read_execute::PublicationQueryRead;
 use crate::query::QueryExecutionError;
 use crate::refs::block_id;
 use cap_std::ambient_authority;
@@ -131,29 +134,6 @@ pub fn slug(name: &str) -> String {
 /// used as the single source of truth for every filename, cross-page link, and
 /// search-index entry — so a link can never diverge from the file it points at.
 type SlugMap = std::collections::HashMap<String, String>;
-
-/// One operation-owned current-main reader supplied by the publication
-/// boundary. The renderer parses every authored surface, while the backend
-/// adapter owns the coherent snapshot, registry and cancellation lifetime.
-pub(crate) trait PublicationQueryRead {
-    fn run_subtrees(
-        &self,
-        query: &crate::query::ir::Query,
-        view: &ViewSettings,
-        bounds: Bounds,
-        context: &ExecutionContext,
-    ) -> Result<crate::query::export_execute::SubtreeQueryResult, QueryExecutionError>;
-
-    fn run(
-        &self,
-        query: &crate::query::ir::Query,
-        view: &ViewSettings,
-        bounds: Bounds,
-        context: &ExecutionContext,
-    ) -> Result<QueryResult, QueryExecutionError>;
-
-    fn ensure_current(&self) -> Result<(), QueryExecutionError>;
-}
 
 #[derive(Debug)]
 pub enum PrintPreparationError {

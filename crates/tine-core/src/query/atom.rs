@@ -32,12 +32,11 @@
 //! `BlockProjection.refs_page`, which aggregates the whole block's refs without
 //! saying which property value produced each (K11).
 
-use unicode_normalization::UnicodeNormalization;
-
 use crate::config::ParseConfig;
 use crate::date::{JournalDate, JournalFormat};
 use crate::doc::property_key_norm;
 use crate::query::ir::ObservedType;
+pub use crate::vocab::atom_key;
 
 /// Whether a page is Markdown or Org — the only thing the atomizer needs to
 /// know about the file it came from (the inline grammar differs).
@@ -48,11 +47,11 @@ pub enum AtomFormat {
     Org,
 }
 
-impl From<crate::model::Format> for AtomFormat {
-    fn from(format: crate::model::Format) -> AtomFormat {
+impl From<crate::vocab::Format> for AtomFormat {
+    fn from(format: crate::vocab::Format) -> AtomFormat {
         match format {
-            crate::model::Format::Org => AtomFormat::Org,
-            crate::model::Format::Md => AtomFormat::Markdown,
+            crate::vocab::Format::Org => AtomFormat::Org,
+            crate::vocab::Format::Md => AtomFormat::Markdown,
         }
     }
 }
@@ -104,18 +103,6 @@ pub struct Atom {
     /// [`CompareMode::Both`] (SPEC §8 v16 evidence correction: "Do not add OG's
     /// string-index quirk to production typed matching").
     pub og_string_len: Option<u32>,
-}
-
-/// The comparison form of an atom's text: **NFC-lowercased trimmed** (Q20).
-///
-/// This is deliberately NOT `refs::page_key`: that function additionally removes
-/// one slash at each boundary because a page's *identity* does not depend on
-/// them, and an atom is not a page name (`/x/` is a value a user may have typed
-/// and compared against). The Unicode steps — `to_lowercase` then NFC, never
-/// NFKC and never accent folding — are the same, so a ref atom and the page it
-/// names still compare equal for every name without a boundary slash.
-pub fn atom_key(text: &str) -> String {
-    text.trim().to_lowercase().nfc().collect()
 }
 
 /// OG `gp-property/unparsed-built-in-properties` (`property.cljs:110-121`):

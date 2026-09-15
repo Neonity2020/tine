@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
 use crate::direct_projection::page_kind_from_sql;
-use crate::model::{BlockDto, PageEntry, PageKind};
 use crate::query::ir::FriendlyPageMatchScope;
 use crate::query::rank::QueryRankPrograms;
 use crate::query::results::{
@@ -27,6 +26,7 @@ use crate::query_plan::{
     ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation, QueryHasMore, QueryHit,
     QueryPlan, QueryTarget,
 };
+use crate::vocab::{BlockDto, PageEntry, PageKind};
 
 /// Everything the shared Friendly reader needs besides its caller-owned
 /// snapshot. `explain` preserves the existing public route's cheap opt-out;

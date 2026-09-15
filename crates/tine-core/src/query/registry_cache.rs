@@ -274,7 +274,7 @@ mod tests {
                     }),
                 &|_| {
                     Some(PageMeta {
-                        format: crate::model::Format::Md.into(),
+                        format: crate::vocab::Format::Md.into(),
                         name: "Page".into(),
                     })
                 },

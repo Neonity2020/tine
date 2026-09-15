@@ -5,6 +5,10 @@
 //! `cfg(test)`, as that lowering's oracle. Advanced datalog outside the mapped
 //! clause subset is reported as unsupported rather than guessed.
 
+// Public query entry points retain their established signatures while this
+// crate-private capability keeps the query layer independent of `model::Graph`.
+#![allow(private_bounds)]
+
 pub mod atom;
 mod export_select;
 pub use export_select::*;
@@ -49,6 +53,7 @@ pub(crate) mod statistics;
 pub(crate) mod export_execute;
 pub(crate) mod export_results;
 pub(crate) mod friendly;
+pub(crate) mod graph;
 pub(crate) mod tql;
 pub mod view;
 // The walk: the SQL lowering's correctness oracle, test-only (see `walk.rs`).
@@ -65,12 +70,15 @@ use ir::{Anchor, Attr, CmpOp, Filter, Quant, Query, Rel, SortDir, Source, Value,
 use self::sort::{compare_sort_decorations, lexical_property_sort_text, SortDecor};
 use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
-use crate::model::{
+#[cfg(test)]
+use crate::model::Graph;
+use crate::refs;
+use crate::vocab::{
     block_to_shallow_dto, BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget,
-    BlockDto, BlockPreview, Format, Graph, PageEntry, PageKind, RefGroup, ReferenceBlockEvidence,
+    BlockDto, BlockPreview, Format, PageEntry, PageKind, RefGroup, ReferenceBlockEvidence,
     ReferenceDiagnosticTrace, ReferenceDiagnostics, ReferenceKind, TemplateDto,
 };
-use crate::refs;
+use graph::QueryGraph;
 #[cfg(test)]
 use ir::Leaf;
 use std::collections::HashMap;
@@ -544,8 +552,8 @@ thread_local! {
 /// Collect matching blocks from an exact candidate set, or from the complete
 /// already-parsed graph when no safe candidate set is available. The parser
 /// remains the semantic authority; this helper performs no disk I/O or parsing.
-fn collect_bounded_candidates(
-    graph: &Graph,
+fn collect_bounded_candidates<G: QueryGraph>(
+    graph: &G,
     candidate_pages: Option<Vec<(PageEntry, std::sync::Arc<Document>)>>,
     mut keep: impl FnMut(&DocBlock) -> bool,
     mut keep_page_properties: impl FnMut(&PageEntry, &str) -> Option<BlockDto>,
@@ -569,7 +577,7 @@ fn collect_bounded_candidates(
                 if let Some(property_ref) = keep_page_properties(entry, pre) {
                     if budget.admit_estimated(
                         &entry.name,
-                        crate::model::block_dto_estimated_bytes(&property_ref),
+                        crate::vocab::block_dto_estimated_bytes(&property_ref),
                     ) {
                         matched.push(property_ref);
                     }
@@ -711,7 +719,7 @@ fn sorted_alias_owners(
         .collect()
 }
 
-pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
+pub fn page_aliases<G: QueryGraph>(graph: &G) -> Vec<(String, String)> {
     graph.with_pages(|pages| {
         let mut owned = Vec::new();
         for (entry, doc) in pages {
@@ -723,7 +731,7 @@ pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
     })
 }
 
-pub(crate) fn page_aliases_with_owners(graph: &Graph) -> Vec<(String, String, String)> {
+pub(crate) fn page_aliases_with_owners<G: QueryGraph>(graph: &G) -> Vec<(String, String, String)> {
     graph.with_pages(|pages| {
         let mut owned = Vec::new();
         for (entry, doc) in pages {
@@ -746,7 +754,7 @@ pub(crate) fn page_aliases_with_owners(graph: &Graph) -> Vec<(String, String, St
 
 pub(crate) type RealPageNames = std::collections::HashMap<String, (std::path::PathBuf, String)>;
 
-pub(crate) fn real_page_names(graph: &Graph) -> RealPageNames {
+pub(crate) fn real_page_names<G: QueryGraph>(graph: &G) -> RealPageNames {
     if let Some(indexed) = graph.reference_real_page_names() {
         return indexed;
     }
@@ -828,8 +836,8 @@ pub(crate) fn equivalent_page_names(
     (canonical, component.into_iter().collect(), self_page)
 }
 
-fn graph_equivalent_page_names(
-    graph: &Graph,
+fn graph_equivalent_page_names<G: QueryGraph>(
+    graph: &G,
     aliases: &[(String, String)],
     target: &str,
 ) -> (String, Vec<String>, String) {
@@ -939,8 +947,8 @@ fn block_has_reference(
     )
 }
 
-fn collect_reference_occurrences(
-    graph: &Graph,
+fn collect_reference_occurrences<G: QueryGraph>(
+    graph: &G,
     canonical: &str,
     self_page: &str,
     names_norm: &[String],
@@ -958,8 +966,8 @@ fn collect_reference_occurrences(
     .groups
 }
 
-fn collect_reference_occurrences_bounded(
-    graph: &Graph,
+fn collect_reference_occurrences_bounded<G: QueryGraph>(
+    graph: &G,
     canonical: &str,
     self_page: &str,
     names_norm: &[String],
@@ -1035,18 +1043,18 @@ pub(crate) fn reset_reference_classifications() {
 /// answer) and finding the occurrences inside them is not. Both reference
 /// surfaces and both policies share this one body; there is no second copy that
 /// could drift from it.
-fn collect_reference_occurrences_in(
-    graph: &Graph,
+fn collect_reference_occurrences_in<G: QueryGraph>(
+    graph: &G,
     canonical: &str,
     self_page: &str,
     names_norm: &[String],
     kind: ReferenceKind,
-    candidate_pages: &crate::model::ReferenceCandidatePages,
+    candidate_pages: &crate::vocab::ReferenceCandidatePages,
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
     let exclude =
-        refs::ReferenceSourceExclusions::new(self_page, graph.config.favorites_page.as_deref());
+        refs::ReferenceSourceExclusions::new(self_page, graph.config().favorites_page.as_deref());
     let mut accumulator = BoundedReferenceGroups::new(max_rows, max_bytes);
     let pages = candidate_pages.pages.as_slice();
     let mut sources = pages.iter().collect::<Vec<_>>();
@@ -1062,17 +1070,17 @@ fn collect_reference_occurrences_in(
             .and_then(|pre| page_property_block(entry, pre))
         {
             if accumulator.closed() {
-                if block_has_reference(&block, names_norm, kind, &graph.config) {
+                if block_has_reference(&block, names_norm, kind, graph.config()) {
                     accumulator.deny();
                 }
             } else if let Some(hit) =
-                block_reference_evidence(&block, canonical, names_norm, kind, &graph.config)
+                block_reference_evidence(&block, canonical, names_norm, kind, graph.config())
             {
                 // The page-property DTO is the estimate's own input here, so it
                 // is built before admission on this one row (unchanged).
                 let mut dto = block_to_shallow_dto(&block);
                 dto.page_property = true;
-                let estimated = crate::model::block_dto_estimated_bytes(&dto)
+                let estimated = crate::vocab::block_dto_estimated_bytes(&dto)
                     .saturating_add(reference_evidence_estimated_bytes(&hit));
                 accumulator.admit(slot, dto, Some(hit), estimated);
             }
@@ -1094,9 +1102,9 @@ fn collect_reference_occurrences_in(
                     return None;
                 }
                 if construction_closed.get() {
-                    block_has_reference(block, names_norm, kind, &graph.config).then_some(None)
+                    block_has_reference(block, names_norm, kind, graph.config()).then_some(None)
                 } else {
-                    block_reference_evidence(block, canonical, names_norm, kind, &graph.config)
+                    block_reference_evidence(block, canonical, names_norm, kind, graph.config())
                         .map(Some)
                 }
             },
@@ -1138,8 +1146,8 @@ fn collect_reference_occurrences_in(
 /// whether a block set was present at all keeps the gate from passing
 /// vacuously on a corpus where the index never named one.
 #[cfg(test)]
-pub(crate) fn reference_occurrences_narrowed_and_walked(
-    graph: &Graph,
+pub(crate) fn reference_occurrences_narrowed_and_walked<G: QueryGraph>(
+    graph: &G,
     target: &str,
     kind: ReferenceKind,
     max_rows: usize,
@@ -1193,7 +1201,7 @@ pub(crate) struct NarrowingReceipt {
     pub walked_classifications: usize,
 }
 
-pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
+pub fn backlinks<G: QueryGraph>(graph: &G, target: &str) -> Vec<RefGroup> {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences(
@@ -1205,8 +1213,8 @@ pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
     )
 }
 
-pub fn backlinks_bounded(
-    graph: &Graph,
+pub fn backlinks_bounded<G: QueryGraph>(
+    graph: &G,
     target: &str,
     max_rows: usize,
     max_bytes: usize,
@@ -1228,8 +1236,8 @@ pub fn backlinks_bounded(
 /// [`backlinks_bounded`], but a projection that is mid-turn is REPORTED rather
 /// than answered by parsing every page in the graph. The caller owns the
 /// readiness retry, exactly as a query block does.
-pub fn backlinks_bounded_indexed(
-    graph: &Graph,
+pub fn backlinks_bounded_indexed<G: QueryGraph>(
+    graph: &G,
     target: &str,
     max_rows: usize,
     max_bytes: usize,
@@ -1314,7 +1322,7 @@ pub(crate) fn backlink_filter_entry(
         add_facet: &mut impl FnMut(&str),
         truncated: &mut bool,
     ) {
-        if depth > crate::model::MAX_BLOCK_DEPTH {
+        if depth > crate::vocab::MAX_BLOCK_DEPTH {
             *truncated = true;
             return;
         }
@@ -1381,8 +1389,8 @@ pub(crate) fn backlink_filter_entry_estimated_bytes(entry: &BacklinkFilterEntry)
 /// one rendered panel. This deliberately does not rerun backlink selection and
 /// cannot turn into a graph-sized arbitrary export: the request is ID-scoped,
 /// de-duplicated, and the response has both per-root and total byte ceilings.
-pub fn backlink_filter_context(
-    graph: &Graph,
+pub fn backlink_filter_context<G: QueryGraph>(
+    graph: &G,
     target: &str,
     targets: &[BacklinkFilterTarget],
 ) -> BacklinkFilterContext {
@@ -1486,7 +1494,7 @@ pub fn backlink_filter_context(
 /// grouped by source page. Unlike page `backlinks`, this passes `exclude: None`,
 /// so a referrer on the *same page* as the target is included — matching OG's
 /// `get-block-referenced-blocks` (no self-page exclusion at the block level).
-pub fn block_referrers(graph: &Graph, uuid: &str) -> Vec<RefGroup> {
+pub fn block_referrers<G: QueryGraph>(graph: &G, uuid: &str) -> Vec<RefGroup> {
     let u = uuid.trim();
     if u.is_empty() {
         return Vec::new();
@@ -1503,8 +1511,8 @@ pub fn block_referrers(graph: &Graph, uuid: &str) -> Vec<RefGroup> {
     .groups
 }
 
-pub fn block_referrers_bounded(
-    graph: &Graph,
+pub fn block_referrers_bounded<G: QueryGraph>(
+    graph: &G,
     uuid: &str,
     max_rows: usize,
     max_bytes: usize,
@@ -1533,7 +1541,7 @@ pub fn block_referrers_bounded(
 /// Unlinked references: parser-visible plain occurrences outside explicit
 /// reference syntax. A block containing both kinds appears once in each surface,
 /// with the corresponding occurrence evidence.
-pub fn unlinked_refs(graph: &Graph, target: &str) -> Vec<RefGroup> {
+pub fn unlinked_refs<G: QueryGraph>(graph: &G, target: &str) -> Vec<RefGroup> {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences(
@@ -1545,8 +1553,8 @@ pub fn unlinked_refs(graph: &Graph, target: &str) -> Vec<RefGroup> {
     )
 }
 
-pub fn unlinked_refs_bounded(
-    graph: &Graph,
+pub fn unlinked_refs_bounded<G: QueryGraph>(
+    graph: &G,
     target: &str,
     max_rows: usize,
     max_bytes: usize,
@@ -1566,8 +1574,8 @@ pub fn unlinked_refs_bounded(
 
 /// Unlinked references for an interactive panel. See
 /// [`backlinks_bounded_indexed`]; the only difference is the reference kind.
-pub fn unlinked_refs_bounded_indexed(
-    graph: &Graph,
+pub fn unlinked_refs_bounded_indexed<G: QueryGraph>(
+    graph: &G,
     target: &str,
     max_rows: usize,
     max_bytes: usize,
@@ -1591,7 +1599,7 @@ pub fn unlinked_refs_bounded_indexed(
 /// Target-scoped trace for bug reports. Membership comes from the exact same
 /// occurrence engine as the panels; the deliberately uncached parser path makes
 /// projection-cache drift visible. No launcher history is read or returned.
-pub fn reference_diagnostics(graph: &Graph, target: &str) -> ReferenceDiagnostics {
+pub fn reference_diagnostics<G: QueryGraph>(graph: &G, target: &str) -> ReferenceDiagnostics {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let excluded_page = refs::page_key(&self_page);
@@ -1605,7 +1613,7 @@ pub fn reference_diagnostics(graph: &Graph, target: &str) -> ReferenceDiagnostic
                     block.is_org,
                     &canonical,
                     &names_norm,
-                    &graph.config,
+                    graph.config(),
                 );
                 let raw_lower = block.raw.to_lowercase();
                 let textual_candidate = names_norm.iter().any(|name| raw_lower.contains(name));
@@ -2229,7 +2237,7 @@ pub(crate) struct ResultViewGroup<B> {
     pub(crate) page: String,
     pub(crate) kind: PageKind,
     pub(crate) blocks: Vec<B>,
-    pub(crate) evidence: Vec<crate::model::ReferenceBlockEvidence>,
+    pub(crate) evidence: Vec<crate::vocab::ReferenceBlockEvidence>,
 }
 
 impl From<RefGroup> for ResultViewGroup<BlockDto> {
@@ -2363,8 +2371,8 @@ pub(crate) fn apply_result_view_directives<B: ResultViewBlock>(
 /// is context-free, so the `{query, view}` a caller holds may have been parsed
 /// on another page, on another day, or by another window; the binding happens
 /// here, per execution.
-pub fn run_query_result_ir(
-    graph: &Graph,
+pub fn run_query_result_ir<G: QueryGraph>(
+    graph: &G,
     query: &Query,
     view: &ViewSettings,
     bounds: ir::Bounds,
@@ -2382,8 +2390,8 @@ pub fn run_query_result_ir(
 }
 
 /// Explain one IR query over Direct Files through the captured database read.
-pub fn explain_empty_query(
-    graph: &Graph,
+pub fn explain_empty_query<G: QueryGraph>(
+    graph: &G,
     query: &Query,
     view: &ViewSettings,
     bounds: ir::Bounds,
@@ -3203,8 +3211,8 @@ fn sort_key(b: &BlockDto, page: &str, field: &str) -> String {
 /// Literal fuzzy full-text autocomplete for the `((` block picker, grouped by
 /// page and capped at `limit` total blocks. Ctrl-K uses `run_graph_search*` and
 /// retains the shared search dialect through `QueryPlan::friendly*`.
-pub fn search(
-    graph: &Graph,
+pub fn search<G: QueryGraph>(
+    graph: &G,
     query: &str,
     limit: usize,
 ) -> Result<Vec<RefGroup>, QueryExecutionError> {
@@ -3215,8 +3223,8 @@ pub fn search(
 /// callback is checked before each block projection, so a superseded rare-prefix
 /// scan does not finish walking a huge page in the background.
 #[cfg(test)]
-pub fn search_cancellable(
-    graph: &Graph,
+pub fn search_cancellable<G: QueryGraph>(
+    graph: &G,
     query: &str,
     limit: usize,
     cancelled: impl Fn() -> bool,
@@ -3231,7 +3239,7 @@ pub fn search_cancellable(
 }
 
 /// Find every `template:: <name>` block and the blocks an insertion produces.
-pub fn templates(graph: &Graph) -> Vec<TemplateDto> {
+pub fn templates<G: QueryGraph>(graph: &G) -> Vec<TemplateDto> {
     graph.with_pages(|pages| {
         let mut out: Vec<TemplateDto> = Vec::new();
         for (entry, doc) in pages {
@@ -3368,7 +3376,7 @@ fn finish_quick_switch_top(
 
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
-pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> {
+pub fn quick_switch(graph: &impl QueryGraph, query: &str, limit: usize) -> Vec<PageEntry> {
     crate::query_plan::legacy_page_search_entries(
         graph.list_pages(),
         graph.page_aliases_with_owners(),
@@ -3381,7 +3389,7 @@ pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> 
 /// Resolve a `((uuid))` block reference to a shallow identity/result row.
 /// Descendants are owned by the source page; explicit bounded consumers use
 /// `preview_block`.
-pub fn resolve_block(graph: &Graph, uuid: &str) -> Option<RefGroup> {
+pub fn resolve_block<G: QueryGraph>(graph: &G, uuid: &str) -> Option<RefGroup> {
     // Jump to the owning page via the uuid index, falling back to a full scan if
     // the hint is missing or stale (so a lagging index can never give a wrong
     // answer — just a slower one).
@@ -3426,7 +3434,7 @@ pub fn resolve_block(graph: &Graph, uuid: &str) -> Option<RefGroup> {
 /// absent) falls back to a SINGLE whole-graph scan. Match semantics + first-block-
 /// wins ordering are identical to `resolve_block`. Output is positional and
 /// per-input (duplicate input uuids each get their own `Some(..)`/`None`).
-pub fn resolve_blocks(graph: &Graph, uuids: &[String]) -> Vec<Option<RefGroup>> {
+pub fn resolve_blocks<G: QueryGraph>(graph: &G, uuids: &[String]) -> Vec<Option<RefGroup>> {
     resolve_blocks_bounded(graph, uuids, usize::MAX, usize::MAX).0
 }
 
@@ -3451,8 +3459,8 @@ pub(crate) fn logseq_uuid_owner<T>(
     }
 }
 
-pub fn resolve_blocks_bounded(
-    graph: &Graph,
+pub fn resolve_blocks_bounded<G: QueryGraph>(
+    graph: &G,
     uuids: &[String],
     max_rows: usize,
     max_bytes: usize,
@@ -3516,7 +3524,7 @@ pub fn resolve_blocks_bounded(
             let group = resolved.get(u.as_str())?;
             let block = group.blocks.first()?;
             output_budget
-                .admit_estimated(&group.page, crate::model::block_dto_estimated_bytes(block))
+                .admit_estimated(&group.page, crate::vocab::block_dto_estimated_bytes(block))
                 .then(|| group.clone())
         })
         .collect();
@@ -3558,7 +3566,7 @@ fn block_to_bounded_dto(
         return None;
     }
     let mut dto = block_to_shallow_dto(block);
-    let dto_bytes = crate::model::block_dto_estimated_bytes(&dto);
+    let dto_bytes = crate::vocab::block_dto_estimated_bytes(&dto);
     if dto_bytes > *remaining_bytes {
         return None;
     }
@@ -3576,7 +3584,11 @@ fn block_to_bounded_dto(
 /// Resolve one block for a hover/export consumer that explicitly needs a
 /// subtree. This compatibility wrapper applies the caller's node bound; native
 /// and export consumers use `preview_block_with_budget` to add a byte bound.
-pub fn preview_block(graph: &Graph, uuid: &str, max_nodes: usize) -> Option<BlockPreview> {
+pub fn preview_block<G: QueryGraph>(
+    graph: &G,
+    uuid: &str,
+    max_nodes: usize,
+) -> Option<BlockPreview> {
     preview_block_with_budget(graph, uuid, max_nodes, usize::MAX)
 }
 
@@ -3586,8 +3598,8 @@ pub fn preview_block(graph: &Graph, uuid: &str, max_nodes: usize) -> Option<Bloc
 /// fit, the preview is returned with an empty block list and the exact omitted
 /// count; callers can disclose truncation without confusing "too large" with
 /// "block not found".
-pub fn preview_block_with_budget(
-    graph: &Graph,
+pub fn preview_block_with_budget<G: QueryGraph>(
+    graph: &G,
     uuid: &str,
     max_nodes: usize,
     max_bytes: usize,

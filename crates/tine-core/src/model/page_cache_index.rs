@@ -60,19 +60,6 @@ pub(super) enum DirectCreationEvidence {
     },
 }
 
-pub(crate) struct ReferenceCandidatePages {
-    pub pages: Vec<(PageEntry, Arc<Document>)>,
-    /// The referring blocks, when the index named them. `None` means "classify
-    /// every block of every candidate page", which is what every caller did
-    /// before this field existed, so the walk is the behaviour a partial or
-    /// absent index falls back to rather than a lossy shortcut.
-    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub indexed: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub full_page_count: usize,
-}
-
 #[derive(Default)]
 pub(super) struct PageCacheBuild {
     pub(super) pages: Vec<ParsedPage>,

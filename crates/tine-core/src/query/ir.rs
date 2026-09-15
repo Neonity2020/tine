@@ -1044,7 +1044,7 @@ pub struct PageRow {
     /// Physical graph-relative owner path. Display names are not unique.
     pub path: String,
     pub name: String,
-    pub kind: crate::model::PageKind,
+    pub kind: crate::vocab::PageKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_day: Option<i64>,
     /// Authored page properties, in source order and original spelling.
@@ -1067,7 +1067,7 @@ pub struct QueryReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "anchor", rename_all = "snake_case")]
 pub enum QueryRows {
-    Block { groups: Vec<crate::model::RefGroup> },
+    Block { groups: Vec<crate::vocab::RefGroup> },
     Page { pages: Vec<PageRow> },
 }
 

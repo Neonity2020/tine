@@ -14,7 +14,7 @@
 //! is the architectural fact that keeps the delegation in place.
 
 use crate::date::JournalDate;
-use crate::model::{PageDto, PageEntry, PageKind};
+use crate::vocab::{PageDto, PageEntry, PageKind};
 
 /// One rendered feed page plus the day cursor that continues it.
 #[derive(Debug)]
