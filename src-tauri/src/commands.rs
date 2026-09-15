@@ -666,7 +666,7 @@ pub(crate) async fn rename_page(
 mod graph_wide_command_boundary_tests {
     #[test]
     fn expensive_reference_and_rename_commands_cross_the_blocking_pool() {
-        let source = include_str!("commands.rs");
+        let source = crate::test_support::rust_module_production_source("commands.rs");
         // `delete_page` was omitted here until the 2026-08-09 perf audit (F3)
         // measured it at 757 ms on an 8,006-file graph, on the command thread.
         for name in [
@@ -3910,10 +3910,8 @@ mod query_command_surface_tests {
         // Only the PRODUCTION half of this file: the negative assertions below
         // name the retired producers, so a whole-file scan would find its own
         // test data.
-        let whole = include_str!("commands.rs");
-        let source = &whole[..whole
-            .find("mod query_command_surface_tests {")
-            .expect("this test lives in that module")];
+        let production = crate::test_support::rust_module_production_source("commands.rs");
+        let source = production.as_str();
         let body = |name: &str| -> &str {
             let at = source
                 .find(&format!("pub(crate) async fn {name}("))

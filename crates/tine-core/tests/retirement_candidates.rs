@@ -27,7 +27,9 @@
 #[path = "support/production_source.rs"]
 mod production_source;
 
-use production_source::{compiled_source, production_source_files, relative_path, repo_root};
+use production_source::{
+    compiled_source, module_raw_source, production_source_files, relative_path, repo_root,
+};
 use std::collections::BTreeSet;
 
 const MARKER: &str = "// RETIREMENT-CANDIDATE:";
@@ -155,7 +157,7 @@ fn the_walk_records_itself_as_the_correctness_oracle() {
         );
     }
     // Test-only is what took the walk off the retirement list, so pin it.
-    let query = std::fs::read_to_string(root.join("crates/tine-core/src/query.rs")).unwrap();
+    let query = module_raw_source(&root, "crates/tine-core/src/query.rs");
     assert!(
         query.contains("#[cfg(test)]\nmod walk;"),
         "the walk is the oracle, compiled only under cfg(test); a production \

@@ -2219,7 +2219,7 @@ mod tests {
 
     #[test]
     fn uncertain_asset_rescan_is_metadata_only_and_does_not_invent_deletions() {
-        let source = include_str!("watcher.rs");
+        let source = crate::test_support::rust_module_production_source("watcher.rs");
         let body = source
             .split_once("fn collect_asset_files(")
             .unwrap()

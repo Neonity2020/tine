@@ -348,10 +348,45 @@ pub fn line_of(source: &str, offset: usize) -> usize {
 /// module through here, raw (`fs::read_to_string`) or through
 /// [`compiled_source`]. The in-crate twin is `test_support::model_module_files`.
 pub fn model_module_files(root: &Path) -> Vec<PathBuf> {
-    let src = root.join("crates/tine-core/src");
+    module_files(root, "crates/tine-core/src/model.rs")
+}
+
+/// Every production file of the module whose root file is `module_root`, given
+/// repository-relative, for example `"crates/tine-core/src/query.rs"`. The root
+/// comes first, then each `.rs` under its sibling directory in path order,
+/// without `*_tests.rs` test bodies. A guard that reads a split module's root
+/// file alone passes vacuously for code a seam cut moved (I-11). K3 split
+/// `model`; K7 split `query`, `publish`, `watcher` and `commands`.
+/// `src/rustModelSourceGuard.test.ts` fails on such a solo read.
+pub fn module_files(root: &Path, module_root: &str) -> Vec<PathBuf> {
+    let file = root.join(module_root);
+    let directory = file.with_extension("");
     let mut files = Vec::new();
-    collect_rs_files(&src, &src.join("model"), &mut files);
+    if directory.is_dir() {
+        collect_rs_files(root, &directory, &mut files);
+    }
+    files.retain(|path| !path.to_string_lossy().ends_with("_tests.rs"));
     files.sort();
-    files.insert(0, src.join("model.rs"));
+    files.insert(0, file);
     files
+}
+
+/// The module's production code: [`module_files`] read through
+/// [`compiled_source`] and joined.
+pub fn module_source(root: &Path, module_root: &str) -> String {
+    module_files(root, module_root)
+        .iter()
+        .map(|file| compiled_source(file))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// [`module_files`] read raw and joined. Comments, strings and test regions are
+/// kept, for a guard that pins a declaration such as `#[cfg(test)] mod walk;`.
+pub fn module_raw_source(root: &Path, module_root: &str) -> String {
+    module_files(root, module_root)
+        .iter()
+        .map(|file| fs::read_to_string(file).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
