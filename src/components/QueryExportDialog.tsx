@@ -20,7 +20,7 @@ export function QueryExportDialog(): JSX.Element {
 
 type Destination = "create" | "replace" | "separate";
 
-/** Mirrors `QUERY_EXPORT_BUDGET_REASON` in `src-tauri/src/commands.rs`. */
+/** Mirrors `QUERY_EXPORT_BUDGET_REASON` in `src-tauri/src/commands/publication_helpers.rs`. */
 export const QUERY_EXPORT_BUDGET_REASON = "export_asset_budget_exceeded";
 
 function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {

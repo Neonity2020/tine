@@ -1,5 +1,20 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+
+function rustModuleSource(path: string): string {
+  const files = [path];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = path.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 import {
   dispatchAndroidBack,
   installAndroidBackHandler,
@@ -202,7 +217,7 @@ describe("GH #161 Android SafeBack owner", () => {
   it("keeps Android root Back as frontend preparation then explicit activity exit", () => {
     const app = readFileSync("src/App.tsx", "utf8");
     const androidBack = readFileSync("src/androidBack.ts", "utf8");
-    const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
+    const commands = rustModuleSource("src-tauri/src/commands.rs");
     const lib = readFileSync("src-tauri/src/lib.rs", "utf8");
     const nativePlugin = readFileSync("src-tauri/src/android_safe_back.rs", "utf8");
     const defaultCapability = JSON.parse(

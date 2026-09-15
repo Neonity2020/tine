@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -15,6 +15,21 @@ import {
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
+
+function rustModuleSource(path: string): string {
+  const root = join(process.cwd(), path);
+  const files = [root];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) visit(child);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) files.push(child);
+    }
+  };
+  const moduleDirectory = root.replace(/\.rs$/, "");
+  if (existsSync(moduleDirectory)) visit(moduleDirectory);
+  return files.sort().map((file) => readFileSync(file, "utf8")).join("\n");
+}
 
 function hasStringErrorResult(text: string): boolean {
   let rest = text;
@@ -280,7 +295,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(contract).toContain("TauriBackend.call");
 
     const commandError = source("src-tauri/src/command_error.rs");
-    const commands = source("src-tauri/src/commands.rs");
+    const commands = rustModuleSource("src-tauri/src/commands.rs");
     const state = source("src-tauri/src/state.rs");
     const parity = source("src-tauri/src/backend_command_parity.rs");
     expect(commandError).toContain("impl Serialize for CommandError");
@@ -342,7 +357,7 @@ describe("I-9/I-11 typed backend error boundary", () => {
     const rustDir = join(process.cwd(), "src-tauri/src");
     const rustFiles = readdirSync(rustDir)
       .filter((file) => file.endsWith(".rs"))
-      .map((file) => ({ file, text: readFileSync(join(rustDir, file), "utf8") }));
+      .map((file) => ({ file, text: rustModuleSource(`src-tauri/src/${file}`) }));
     expect(rustFiles.filter(({ text }) => hasStringErrorResult(text)).map(({ file }) => file)).toEqual([]);
     expect(
       rustFiles.filter(({ text }) => /map_err\(\|\w+\|\s*\w+\.to_string\(\)\)/.test(text)).map(({ file }) => file),

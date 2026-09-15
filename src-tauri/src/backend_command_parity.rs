@@ -184,22 +184,15 @@ fn line_containing(source: &str, char_index: usize) -> String {
 /// same hole one level up: a command added in a NEW file would be invisible.
 #[cfg(test)]
 fn commands_that_reopen_the_graph() -> BTreeSet<String> {
-    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&source_dir)
-        .expect("src-tauri/src must be readable")
-        .map(|entry| entry.expect("readable directory entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .collect();
-    entries.sort();
+    let modules = crate::test_support::rust_module_sources();
     assert!(
-        entries.len() > 10,
+        modules.len() > 10,
         "the src-tauri/src scan found {} sources -- the scanner broke, not the code",
-        entries.len()
+        modules.len()
     );
 
     let mut names = BTreeSet::new();
-    for path in entries {
-        let source = std::fs::read_to_string(&path).expect("readable source");
+    for (_, source) in modules {
         for (name, body) in tauri_command_bodies(&source) {
             if body.contains("refresh_graph(") {
                 names.insert(name);
@@ -505,23 +498,16 @@ mod tests {
                 "Result<MediaCaptureResult, crate::command_error::CommandError>".into(),
             );
         }
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let selected = if module_path.is_empty() {
             None
         } else {
             Some(format!("{module_path}.rs"))
         };
         let mut matches = Vec::new();
-        for entry in std::fs::read_dir(source_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let file = path.file_name().unwrap().to_string_lossy().to_string();
+        for (file, source) in crate::test_support::rust_module_sources() {
             if selected.as_ref().is_some_and(|selected| selected != &file) {
                 continue;
             }
-            let source = std::fs::read_to_string(path).unwrap();
             for (found, signature) in command_signatures(&source) {
                 if found == name {
                     matches.push((file.clone(), signature));
@@ -553,7 +539,9 @@ mod tests {
 
     #[test]
     fn phase_a_command_error_manifest_is_exact_for_every_target() {
-        let commands = include_str!("commands.rs");
+        let commands = crate::test_support::rust_module_source_at(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands.rs"),
+        );
         let state = include_str!("state.rs");
         let command_error = include_str!("command_error.rs");
         assert!(
@@ -613,7 +601,7 @@ mod tests {
         );
 
         let worker_mapper = ".map_err(CommandError::worker)";
-        let mut rest = commands;
+        let mut rest = commands.as_str();
         while let Some(at) = rest.find(worker_mapper) {
             assert!(
                 rest[..at].trim_end().ends_with(".await"),
@@ -645,19 +633,12 @@ mod tests {
     /// plugin system, whose only producer is `plugins.rs`.
     #[test]
     fn native_platform_calls_convert_through_a_family_constructor() {
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
         let mut checked = 0_usize;
-        for entry in std::fs::read_dir(&source_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let file = path.file_name().unwrap().to_string_lossy().to_string();
+        for (file, source) in crate::test_support::rust_module_sources() {
             if file == "backend_command_parity.rs" {
                 continue;
             }
-            let source = std::fs::read_to_string(&path).unwrap();
             for call in ["run_mobile_plugin", ".open_url("] {
                 let mut offset = 0;
                 while let Some(relative) = source[offset..].find(call) {
@@ -697,22 +678,13 @@ mod tests {
 
     #[test]
     fn phase_b_command_error_manifest_is_exact_for_every_target() {
-        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut string_results = Vec::new();
         let mut phase_b_sources = Vec::new();
-        for entry in std::fs::read_dir(source_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).unwrap();
+        for (file, source) in crate::test_support::rust_module_sources() {
             if result_error_is_string(&source) {
-                string_results.push(path.file_name().unwrap().to_string_lossy().to_string());
+                string_results.push(file.clone());
             }
-            phase_b_sources.push((
-                path.file_name().unwrap().to_string_lossy().to_string(),
-                source,
-            ));
+            phase_b_sources.push((file, source));
         }
         assert!(
             string_results.is_empty(),
