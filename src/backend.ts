@@ -171,11 +171,6 @@ export interface MediaCaptureResult {
   ext?: string | null;
 }
 
-/** Result of the process-wide native shutdown preparation. Direct Files has no
- * native runtime to drain, so the answer is always `safe`; the shape stays so
- * Android's exit path keeps one typed question. */
-export type TineQuitPreparation = { status: "safe" };
-
 export interface KnownGraph {
   path: string;
   name: string;
@@ -504,9 +499,6 @@ export interface Backend {
    *  the caller MUST have flushed pending edits first. Does not resolve — the
    *  process exits. */
   quit(): Promise<void>;
-  /** Process-wide shutdown preparation. Android calls this before handing the
-   * final activity exit to SafeBack. */
-  prepareQuit(): Promise<TineQuitPreparation>;
   closeGraphWindow(): Promise<void>;
   /** Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
    *  debugging. No-op on a build without devtools compiled in. */
@@ -1327,9 +1319,6 @@ class TauriBackend implements Backend {
   }
   quit() {
     return this.call<void>("tine_quit");
-  }
-  prepareQuit() {
-    return this.call<TineQuitPreparation>("prepare_tine_quit");
   }
   closeGraphWindow() {
     return this.call<void>("close_graph_window");

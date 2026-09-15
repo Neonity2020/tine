@@ -199,10 +199,9 @@ describe("GH #161 Android SafeBack owner", () => {
     expect(safeBackPlugin).not.toContain("isEnabled = false");
   });
 
-  it("keeps Android root Back as typed preparation then explicit activity exit", () => {
+  it("keeps Android root Back as frontend preparation then explicit activity exit", () => {
     const app = readFileSync("src/App.tsx", "utf8");
     const androidBack = readFileSync("src/androidBack.ts", "utf8");
-    const backend = readFileSync("src/backend.ts", "utf8");
     const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
     const lib = readFileSync("src-tauri/src/lib.rs", "utf8");
     const nativePlugin = readFileSync("src-tauri/src/android_safe_back.rs", "utf8");
@@ -210,23 +209,12 @@ describe("GH #161 Android SafeBack owner", () => {
       readFileSync("src-tauri/capabilities/default.json", "utf8"),
     ) as { permissions: string[] };
 
-    expect(backend).toContain("prepareQuit(): Promise<TineQuitPreparation>");
-    expect(backend).toContain('return this.call<TineQuitPreparation>("prepare_tine_quit");');
-    expect(app).toContain("prepareNativeClose: () => backend().prepareQuit()");
-    expect(app).toContain("Couldn't close the app. Your graph remains open.");
-    expect(androidBack).toContain("NativePartiallyPrepared");
-    expect(androidBack).toContain("native_prepare_uncertain");
-    expect(androidBack).toContain("native_prepare_refused");
-    expect(androidBack).toContain("native_prepare_partial");
     expect(app).toContain("finishActivity: exitAndroidActivity");
     expect(androidBack).toContain('import("@tauri-apps/plugin-process")');
     expect(androidBack).toContain("await exit(0)");
     expect(defaultCapability.permissions).toContain("process:allow-exit");
-    expect(commands).toContain("enum TineQuitPreparation");
-    expect(commands).toContain("TineQuitPreparation::Safe");
-    expect(commands).toMatch(/pub\(crate\) fn prepare_tine_quit\([\s\S]*?TineQuitPreparation::Safe/);
     expect(commands).toMatch(/pub\(crate\) fn tine_quit\([\s\S]*?app\.exit\(0\)/);
-    expect(lib).toMatch(/generate_handler!\[[\s\S]*?prepare_tine_quit,[\s\S]*?tine_quit,/);
+    expect(lib).toMatch(/generate_handler!\[[\s\S]*?\btine_quit,/);
     expect(lib).toContain("builder.plugin(android_safe_back::init())");
     expect(nativePlugin).toContain('Builder::new("safe-back")');
     expect(nativePlugin).toContain('register_android_plugin(PLUGIN_IDENTIFIER, "SafeBackPlugin")');

@@ -89,42 +89,16 @@ export function installAndroidBackHandler(deps: AndroidBackInstallDeps): () => v
 
 export type AndroidRootCloseResult =
   | SafeClosePrepareResult
-  | "native_prepare_refused"
-  | "native_prepare_partial"
-  | "native_prepare_uncertain"
   | "exit_requested"
   | "exit_failed";
 
-/** The only response that can authorize Android's final activity exit is
- * `safe`. A `partial` result records concrete progress across graph slots; a
- * transport failure is deliberately treated as equally uncertain. */
-export type AndroidNativePrepareResult =
-  | { status: "safe" }
-  | { status: "refused"; detail: string }
-  | { status: "partial"; safe_slots: string[]; detail: string };
-
-export type AndroidNativePrepareFailure = Exclude<AndroidNativePrepareResult, { status: "safe" }>
-  | { status: "transport_unknown"; detail: string };
-
-function isAndroidNativePrepareResult(value: unknown): value is AndroidNativePrepareResult {
-  if (value === null || typeof value !== "object") return false;
-  const result = value as Partial<AndroidNativePrepareResult>;
-  if (result.status === "safe") return true;
-  if (result.status === "refused") return typeof result.detail === "string";
-  return result.status === "partial"
-    && typeof result.detail === "string"
-    && Array.isArray(result.safe_slots)
-    && result.safe_slots.every((slot) => typeof slot === "string");
-}
-
-/** The actor remains active through frontend preparation, then becomes
- * deliberately non-editable once native progress is partial/uncertain. */
+/** Once frontend preparation is accepted the graph is durable, and the only
+ * remaining step is the activity exit. Direct Files has no native runtime to
+ * drain before it (ADR 0066). */
 export enum AndroidRootClosePhase {
   Idle = "Idle",
   PreparingFrontend = "PreparingFrontend",
-  PreparingNative = "PreparingNative",
-  NativePartiallyPrepared = "NativePartiallyPrepared",
-  NativePreparedAwaitingFinish = "NativePreparedAwaitingFinish",
+  PreparedAwaitingExit = "PreparedAwaitingExit",
 }
 
 interface AndroidRootCloseState {
@@ -136,33 +110,17 @@ export interface AndroidRootCloseCoordinator {
   phase(): AndroidRootClosePhase;
 }
 
-/** Android's root-close path has two native operations with distinct
- * retry semantics. A typed zero-progress refusal may re-arm the editor;
- * partial/unknown native progress can only retry native preparation. */
+/** Android's root close: the shared safe-close transaction, then the activity
+ * exit. A failed exit keeps the transition shield, and a later Back retries
+ * only the exit, never the flush. */
 export async function requestAndroidRootClose(
   safeClose: SafeCloseCoordinator,
   state: AndroidRootCloseState,
-  prepareNativeClose: () => Promise<AndroidNativePrepareResult>,
   finishActivity: () => Promise<void>,
-  nativePrepareFailed: (failure: AndroidNativePrepareFailure) => void,
   finishActivityFailed: () => void,
 ): Promise<AndroidRootCloseResult> {
-  if (state.phase === AndroidRootClosePhase.NativePreparedAwaitingFinish) {
+  if (state.phase === AndroidRootClosePhase.PreparedAwaitingExit) {
     return requestAndroidActivityExit(finishActivity, finishActivityFailed);
-  }
-  if (state.phase === AndroidRootClosePhase.NativePartiallyPrepared) {
-    state.phase = AndroidRootClosePhase.PreparingNative;
-    // A previous Partial or transport failure may already have made native
-    // progress. Even a later typed refusal cannot unmake that progress.
-    return requestAndroidNativePreparation(
-      safeClose,
-      state,
-      prepareNativeClose,
-      finishActivity,
-      nativePrepareFailed,
-      finishActivityFailed,
-      true,
-    );
   }
   if (state.phase !== AndroidRootClosePhase.Idle) return "in_flight";
 
@@ -181,16 +139,8 @@ export async function requestAndroidRootClose(
     return prepared;
   }
 
-  state.phase = AndroidRootClosePhase.PreparingNative;
-  return requestAndroidNativePreparation(
-    safeClose,
-    state,
-    prepareNativeClose,
-    finishActivity,
-    nativePrepareFailed,
-    finishActivityFailed,
-    false,
-  );
+  state.phase = AndroidRootClosePhase.PreparedAwaitingExit;
+  return requestAndroidActivityExit(finishActivity, finishActivityFailed);
 }
 
 async function requestAndroidActivityExit(
@@ -201,83 +151,26 @@ async function requestAndroidActivityExit(
     await finishActivity();
     return "exit_requested";
   } catch {
-    // Native shutdown is already durable. Keep the transition shield in place:
-    // a later Back must only retry this activity-exit handoff.
+    // The graph is already durable. Keep the transition shield in place: a
+    // later Back must only retry this activity-exit handoff.
     finishActivityFailed();
     return "exit_failed";
   }
 }
 
-async function requestAndroidNativePreparation(
-  safeClose: SafeCloseCoordinator,
-  state: AndroidRootCloseState,
-  prepareNativeClose: () => Promise<AndroidNativePrepareResult>,
-  finishActivity: () => Promise<void>,
-  nativePrepareFailed: (failure: AndroidNativePrepareFailure) => void,
-  finishActivityFailed: () => void,
-  mayAlreadyHaveNativeProgress: boolean,
-): Promise<AndroidRootCloseResult> {
-  let preparation: AndroidNativePrepareResult;
-  try {
-    const result: unknown = await prepareNativeClose();
-    if (!isAndroidNativePrepareResult(result)) {
-      throw new Error("native shutdown returned an unrecognized result");
-    }
-    preparation = result;
-  } catch (error) {
-    // The command might have completed on the native side after transport was
-    // interrupted. Preserve the frontend shield and do not replay its flush.
-    state.phase = AndroidRootClosePhase.NativePartiallyPrepared;
-    nativePrepareFailed({ status: "transport_unknown", detail: String(error) });
-    return "native_prepare_uncertain";
-  }
-
-  if (preparation.status === "safe") {
-    state.phase = AndroidRootClosePhase.NativePreparedAwaitingFinish;
-    return requestAndroidActivityExit(finishActivity, finishActivityFailed);
-  }
-  if (preparation.status === "refused" && !mayAlreadyHaveNativeProgress) {
-    // A typed zero-progress refusal proves that nothing crossed the
-    // native-safe boundary. It is therefore safe to reopen the editor and let
-    // the next Back perform the complete frontend + native transaction.
-    safeClose.reset();
-    state.phase = AndroidRootClosePhase.Idle;
-    nativePrepareFailed(preparation);
-    return "native_prepare_refused";
-  }
-
-  // Partial is explicit native progress. A refusal after an earlier Partial or
-  // unknown transport cannot prove zero historical progress either, so both
-  // remain non-editable and retry only native preparation.
-  state.phase = AndroidRootClosePhase.NativePartiallyPrepared;
-  nativePrepareFailed(preparation);
-  return "native_prepare_partial";
-}
-
 export function createAndroidRootCloseCoordinator(
   safeClose: SafeCloseCoordinator,
   {
-    prepareNativeClose,
     finishActivity,
-    nativePrepareFailed,
     finishActivityFailed,
   }: {
-    prepareNativeClose: () => Promise<AndroidNativePrepareResult>;
     finishActivity: () => Promise<void>;
-    nativePrepareFailed: (failure: AndroidNativePrepareFailure) => void;
     finishActivityFailed: () => void;
   },
 ): AndroidRootCloseCoordinator {
   const state: AndroidRootCloseState = { phase: AndroidRootClosePhase.Idle };
   return {
-    request: () => requestAndroidRootClose(
-      safeClose,
-      state,
-      prepareNativeClose,
-      finishActivity,
-      nativePrepareFailed,
-      finishActivityFailed,
-    ),
+    request: () => requestAndroidRootClose(safeClose, state, finishActivity, finishActivityFailed),
     phase: () => state.phase,
   };
 }

@@ -409,7 +409,6 @@ mod tests {
         "list_known_graphs",
         "list_spellcheck_dictionaries",
         "load_plugin_registry_cache",
-        "prepare_tine_quit",
         "rescan_graph_now",
         "startup_graph_path",
         "take_data_home_fallback_notice",

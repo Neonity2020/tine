@@ -1967,25 +1967,6 @@ pub(crate) fn stream_asset_path(
     Ok(format!("{}/{}", slot.binding_generation, name))
 }
 
-/// The process-wide quit-preparation result. Direct Files needs no native
-/// shutdown proof, so preparation is always `Safe`; the enum stays on the wire
-/// because Android's SafeBack owner and the frontend consume the tagged shape.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum TineQuitPreparation {
-    Safe,
-}
-
-/// The native half of a process-wide clean quit, kept separate from actually
-/// exiting so Android can hand the final activity exit to its native SafeBack
-/// owner.
-#[tauri::command]
-pub(crate) fn prepare_tine_quit(
-    _state: tauri::State<'_, crate::state::AppState>,
-) -> TineQuitPreparation {
-    TineQuitPreparation::Safe
-}
-
 /// Quit the app cleanly. Linux first SIGKILLs WebKitGTK's helper subprocesses
 /// so they do not run their buggy GL-driver atexit teardown and dump a SIGABRT
 /// core on exit (GH #28). The JS close handler calls this only after

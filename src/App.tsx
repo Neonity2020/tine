@@ -215,9 +215,7 @@ export const safeClose = createSafeCloseCoordinator({
 });
 
 const androidRootClose = createAndroidRootCloseCoordinator(safeClose, {
-  prepareNativeClose: () => backend().prepareQuit(),
   finishActivity: exitAndroidActivity,
-  nativePrepareFailed: () => pushToast("Couldn't close the app. Your graph remains open.", "error"),
   finishActivityFailed: () => pushToast(
     "Tine couldn't close the Android activity. Tap Back to retry closing.",
     "error",

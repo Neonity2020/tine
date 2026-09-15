@@ -675,9 +675,6 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     },
     async applySpellcheck() {},
     async setSystemBarAppearance() {},
-    async prepareQuit() {
-      return { status: "safe" as const };
-    },
     async quit() {},
     async closeGraphWindow() {},
     async openDevtools() {},
@@ -846,7 +843,6 @@ export const PUBLISHED_CONSTANT_METHODS = [
   "listSpellcheckDictionaries",
   "applySpellcheck",
   "setSystemBarAppearance",
-  "prepareQuit",
   "quit",
   "closeGraphWindow",
   "openDevtools",

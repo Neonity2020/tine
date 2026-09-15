@@ -105,7 +105,6 @@ const KNOWN_COMMANDS: &[&str] = &[
     "page_print_html",
     "pick_graph_folder",
     "prepare_graph_folder",
-    "prepare_tine_quit",
     "present_conflict_override",
     "preview_block",
     "publish_html",
