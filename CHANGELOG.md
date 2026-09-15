@@ -41,6 +41,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Queries answer every comparison they accept. `like` on `task`, `priority`
+  and `page.namespace` (for example `task like 'DO%'`), `page.journal != …`,
+  `page.name not in (…)` and `content in (…)` / `not in (…)` used to return
+  nothing. `like` on a date or checkbox (`scheduled`, `deadline`, `page.day`,
+  `page.journal`) is now reported as an error instead of silently matching
+  nothing.
+
 - While the query index is still building, property autocomplete now offers
   an Org page's own properties (its `:PROPERTIES:` drawer) and no longer
   offers a `key::` line that sits inside a code block, the same suggestions

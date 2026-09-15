@@ -163,15 +163,11 @@ pub(crate) fn eval_page(filter: &Filter, ctx: &EvalCtx) -> bool {
         Filter::Leaf { leaf } => match leaf {
             Leaf::Attr { attr, op, value } => match attr {
                 Attr::Name => eval_page_name(*op, value, ctx.page_name),
-                Attr::Journal => {
-                    matches!(
-                        (op, value),
-                        (CmpOp::Eq, Value::Bool { value: true }) if ctx.is_journal
-                    ) || matches!(
-                        (op, value),
-                        (CmpOp::Eq, Value::Bool { value: false }) if !ctx.is_journal
-                    )
-                }
+                Attr::Journal => match (op, value) {
+                    (CmpOp::Eq, Value::Bool { value }) => ctx.is_journal == *value,
+                    (CmpOp::NotEq, Value::Bool { value }) => ctx.is_journal != *value,
+                    _ => false,
+                },
                 Attr::Day => eval_day(*op, value, ctx.journal, ctx.today),
                 Attr::Namespace => {
                     // The immediate parent segment (Tine-only, M20).
@@ -698,10 +694,18 @@ fn compare_atom_text(op: CmpOp, value: &Value, key: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn eval_content(op: CmpOp, value: &Value, block: &DocBlock, ctx: &EvalCtx) -> bool {
-    let Value::Text { text } = value else {
-        return false;
-    };
     let projection = block.projection();
+    let text = match (op, value) {
+        // `content in (…)` is `=` against any one of the listed texts (§4.2.3).
+        (CmpOp::In | CmpOp::NotIn, Value::List { items }) => {
+            let listed = items.iter().any(|item| {
+                matches!(item, Value::Text { text } if projection.visible_lower == canonical_fold(text))
+            });
+            return if op == CmpOp::In { listed } else { !listed };
+        }
+        (_, Value::Text { text }) => text,
+        _ => return false,
+    };
     match op {
         CmpOp::Like => like_matches(&projection.visible_lower, &canonical_fold(text)),
         CmpOp::StartsWith => projection.visible_lower.starts_with(&canonical_fold(text)),
@@ -756,6 +760,19 @@ fn eval_optional_text(op: CmpOp, value: &Value, actual: Option<&str>) -> bool {
             }),
             _ => false,
         },
+        // `like` folds ASCII case on both sides, as `=` does above.
+        (CmpOp::Like, Some(actual)) => match value {
+            Value::Text { text } => {
+                like_matches(&actual.to_ascii_lowercase(), &text.to_ascii_lowercase())
+            }
+            _ => false,
+        },
+        (CmpOp::StartsWith, Some(actual)) => match value {
+            Value::Text { text } => actual
+                .to_ascii_lowercase()
+                .starts_with(&text.to_ascii_lowercase()),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -768,6 +785,10 @@ fn eval_page_name(op: CmpOp, value: &Value, page_name: &str) -> bool {
         (CmpOp::StartsWith, Value::Text { text }) => key.starts_with(&page_prefix_key(text)),
         (CmpOp::Like, Value::Text { text }) => like_matches(&key, &canonical_fold(text)),
         (CmpOp::In, Value::List { items }) => items.iter().any(|item| match item {
+            Value::Text { text } => key == refs::page_key(text),
+            _ => false,
+        }),
+        (CmpOp::NotIn, Value::List { items }) => !items.iter().any(|item| match item {
             Value::Text { text } => key == refs::page_key(text),
             _ => false,
         }),

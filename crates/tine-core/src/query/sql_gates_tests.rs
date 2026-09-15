@@ -3630,3 +3630,121 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
 /// Enough repeats that a sub-millisecond answer is not reported as its own
 /// timer resolution, few enough that thirteen shapes stay a minute of work.
 const OBSERVED_REPEATS: u32 = 20;
+
+/// K4 (consolidation): every operator the §4.2.3 operator × type matrix
+/// accepts answers its SQL meaning in BOTH engines. Before K4 these leaves
+/// parsed cleanly and then fell into a `_ =>` arm in the walk and the
+/// lowering alike, so each query silently answered nothing: `like` on
+/// `task` / `priority` / `page.namespace`, `content in`/`not in`,
+/// `page.journal !=` and `page.name not in`. Membership is pinned
+/// independently first; then the walk and SQL must each reach it.
+#[test]
+fn every_operator_the_matrix_accepts_answers_in_both_engines() {
+    let _serial = serialize();
+    let root = scratch("matrix-operators");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    std::fs::create_dir_all(root.join("journals")).expect("journals");
+    std::fs::write(
+        root.join("pages/tasks.md"),
+        "- TODO write report\n- DOING [#A] review draft\n- DONE [#b] ship it\n- plain block\n",
+    )
+    .expect("tasks");
+    std::fs::write(
+        root.join("pages/alpha.md"),
+        "title:: proj/alpha\n\n- alpha body\n",
+    )
+    .expect("alpha");
+    std::fs::write(
+        root.join("pages/beta.md"),
+        "title:: other/beta\n\n- beta body\n",
+    )
+    .expect("beta");
+    std::fs::write(root.join("pages/gamma.md"), "- gamma body\n").expect("gamma");
+    std::fs::write(root.join("journals/2026_09_01.md"), "- journal entry\n").expect("journal");
+    let corpus = Corpus::open(root, true);
+
+    let valid = |source: &str| {
+        let (parsed, _) = crate::query::parse_query_text(source, QueryDialect::Tql, corpus.today());
+        assert!(
+            !parsed.is_invalid(),
+            "the matrix accepts {source}: {:?}",
+            parsed.diagnostics
+        );
+    };
+
+    let id = |page: &str, needle: &str| corpus.block_id_containing(page, needle);
+    let block_cases: Vec<(&str, BTreeSet<String>)> =
+        vec![
+        (
+            "task like 'DO%'",
+            [id("tasks", "review draft"), id("tasks", "ship it")].into(),
+        ),
+        ("task like '%ing'", [id("tasks", "review draft")].into()),
+        ("priority like 'a'", [id("tasks", "review draft")].into()),
+        ("priority like 'B%'", [id("tasks", "ship it")].into()),
+        ("page.namespace like 'pro%'", [id("proj/alpha", "alpha body")].into()),
+        ("page.namespace like '%ER'", [id("other/beta", "beta body")].into()),
+        (
+            "content in ('alpha body', 'Beta Body')",
+            [id("proj/alpha", "alpha body"), id("other/beta", "beta body")].into(),
+        ),
+        (
+            "content not in ('alpha body', 'beta body') and page.name in ('proj/alpha', 'gamma')",
+            [id("gamma", "gamma body")].into(),
+        ),
+    ];
+    for (source, expected) in &block_cases {
+        valid(source);
+        assert_eq!(
+            &corpus.walk(source, QueryDialect::Tql),
+            expected,
+            "walk for {source}"
+        );
+        assert_eq!(
+            &corpus.sql(source, QueryDialect::Tql),
+            expected,
+            "SQL for {source}"
+        );
+    }
+
+    let page_cases: &[(&str, &[&str])] = &[
+        (
+            "@page and journal != true and name in ('tasks', 'gamma')",
+            &["gamma", "tasks"],
+        ),
+        (
+            "@page and journal != false and name in ('tasks', 'gamma')",
+            &[],
+        ),
+        (
+            "@page and name not in ('tasks', 'gamma') and name in ('tasks', 'gamma', 'proj/alpha')",
+            &["proj/alpha"],
+        ),
+    ];
+    for (source, expected) in page_cases {
+        valid(source);
+        let expected = expected_page_names(expected);
+        assert_eq!(
+            corpus.walk_page_names(source),
+            expected,
+            "walk membership for {source}"
+        );
+        assert_eq!(
+            corpus.sql_page_names(source),
+            expected,
+            "SQL membership for {source}"
+        );
+    }
+
+    // `journal != false` is `journal = true`, and it finds the one journal.
+    let journals = corpus.walk_page_names("@page and journal = true");
+    assert_eq!(journals.len(), 1, "the fixture has one journal page");
+    assert_eq!(
+        corpus.walk_page_names("@page and journal != false"),
+        journals
+    );
+    assert_eq!(
+        corpus.sql_page_names("@page and journal != false"),
+        journals
+    );
+}

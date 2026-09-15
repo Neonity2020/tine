@@ -1065,9 +1065,16 @@ impl Lower<'_> {
         self.build(target, CmpOp::Regex, Value::text(text), ValueType::Text)
     }
 
+    /// The pattern is always text, but whether `like` applies is decided by the
+    /// TARGET's type, as `presence` does: §4.2.3 refuses it on a date or
+    /// checkbox attribute.
     fn like(&mut self, left: &Expr, pattern: &Expr, scope: Scope) -> Filter {
         let Some(target) = self.target(left, scope) else {
             return Filter::False;
+        };
+        let ty = match &target {
+            Target::Attr { ty, .. } => *ty,
+            _ => ValueType::Text,
         };
         let Some(Value::Text { text }) = self.value(pattern, ValueType::Text) else {
             return self.reject(
@@ -1076,13 +1083,8 @@ impl Lower<'_> {
             );
         };
         match starts_with_prefix(&text) {
-            Some(prefix) => self.build(
-                target,
-                CmpOp::StartsWith,
-                Value::text(prefix),
-                ValueType::Text,
-            ),
-            None => self.build(target, CmpOp::Like, Value::text(text), ValueType::Text),
+            Some(prefix) => self.build(target, CmpOp::StartsWith, Value::text(prefix), ty),
+            None => self.build(target, CmpOp::Like, Value::text(text), ty),
         }
     }
 
@@ -2413,6 +2415,38 @@ mod tests {
         match filter {
             Filter::Raw { text, kind, span } => (text.as_str(), *kind, *span),
             other => panic!("expected a retained Raw leaf, got {other:?}"),
+        }
+    }
+
+    /// K4: `like` is checked against the ATTRIBUTE's type (§4.2.3 marks it ✗
+    /// for dates and checkboxes), not the pattern's. Before K4 the parser
+    /// passed the pattern's Text type, so `scheduled like '2026%'` was
+    /// accepted and then silently matched nothing.
+    #[test]
+    fn like_on_a_date_or_checkbox_attribute_is_a_syntax_diagnostic() {
+        for (source, what) in [
+            ("scheduled like '2026%'", "`scheduled`"),
+            ("deadline like '%09%'", "`deadline`"),
+            ("page.day like '2026%'", "`day`"),
+            ("page.journal like 't%'", "`journal`"),
+        ] {
+            let query = parse(source);
+            assert!(
+                query.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == DiagnosticKind::Syntax
+                        && diagnostic.message == format!("`like` does not apply to {what}")
+                }),
+                "{source}: {:?}",
+                query.diagnostics
+            );
+        }
+        // The text attributes keep `like`.
+        for source in [
+            "task like 'DO%'",
+            "page.namespace like '%x%'",
+            "content like '%x%'",
+        ] {
+            assert!(parse(source).diagnostics.is_empty(), "{source}");
         }
     }
 

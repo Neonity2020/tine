@@ -1466,10 +1466,20 @@ impl Compiler<'_> {
     /// `BlockProjection::visible_lower`, which is the same fold of the same
     /// text.
     fn content(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
-        let Value::Text { text } = value else {
-            return "0".to_string();
-        };
         let column = format!("{b}.query_visible_folded");
+        let text = match (op, value) {
+            (CmpOp::In | CmpOp::NotIn, Value::List { items }) => {
+                let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
+                // No text operand: `in` is false and `not in` true, as in the walk.
+                return match self.text_list(items, canonical_fold) {
+                    Some(list) => format!("{column} {membership} ({list})"),
+                    None if op == CmpOp::In => "0".to_string(),
+                    None => "1".to_string(),
+                };
+            }
+            (_, Value::Text { text }) => text,
+            _ => return "0".to_string(),
+        };
         match op {
             CmpOp::Like => {
                 let pattern = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
@@ -1695,6 +1705,17 @@ impl Compiler<'_> {
                 let sub = facet(format!("{alias}.marker {membership} ({list})"));
                 self.member(&owner, &sub, false)
             }
+            CmpOp::Like | CmpOp::StartsWith => {
+                let Value::Text { text } = value else {
+                    return "0".to_string();
+                };
+                let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(
+                    op,
+                    &text.to_ascii_uppercase(),
+                )));
+                let sub = facet(format!("{alias}.marker LIKE {pattern} ESCAPE '\\'"));
+                self.member(&owner, &sub, false)
+            }
             _ => "0".to_string(),
         }
     }
@@ -1759,6 +1780,20 @@ impl Compiler<'_> {
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
                 let sub = facet(format!(
                     "({present} AND {alias}.priority {membership} ({list}))"
+                ));
+                self.member(&owner, &sub, false)
+            }
+            // A pattern cannot use the index anyway, so fold the column.
+            CmpOp::Like | CmpOp::StartsWith => {
+                let Value::Text { text } = value else {
+                    return "0".to_string();
+                };
+                let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(
+                    op,
+                    &text.to_ascii_uppercase(),
+                )));
+                let sub = facet(format!(
+                    "({present} AND upper({alias}.priority) LIKE {pattern} ESCAPE '\\')"
                 ));
                 self.member(&owner, &sub, false)
             }
@@ -2043,11 +2078,11 @@ impl Compiler<'_> {
                     // `pages.text_kind`, not `journal_day IS NOT NULL`: a journal
                     // page whose stem does not parse has kind Journal and no day,
                     // and the walk reads the kind (`eval_page`'s `Attr::Journal`).
-                    (CmpOp::Eq, Value::Bool { value: true }) => {
-                        format!("{p}.text_kind = {TEXT_KIND_JOURNAL}")
-                    }
-                    (CmpOp::Eq, Value::Bool { value: false }) => {
-                        format!("{p}.text_kind <> {TEXT_KIND_JOURNAL}")
+                    // `= true` and `!= false` both select the journal pages.
+                    (CmpOp::Eq, Value::Bool { value }) | (CmpOp::NotEq, Value::Bool { value }) => {
+                        let journal = (*op == CmpOp::Eq) == *value;
+                        let comparison = if journal { "=" } else { "<>" };
+                        format!("{p}.text_kind {comparison} {TEXT_KIND_JOURNAL}")
                     }
                     _ => "0".to_string(),
                 },
@@ -2094,8 +2129,12 @@ impl Compiler<'_> {
                     None => "0".to_string(),
                 }
             }
-            // `eval_page_name` has no other arm; `not in` on a page name is
-            // false in the walk, so it is false here.
+            (CmpOp::NotIn, Value::List { items }) => {
+                match self.text_list(items, |text| refs::page_key(text)) {
+                    Some(list) => format!("{column} NOT IN ({list})"),
+                    None => "1".to_string(),
+                }
+            }
             _ => "0".to_string(),
         }
     }
@@ -2185,6 +2224,19 @@ impl Compiler<'_> {
                     })
                     .collect();
                 format!("({has_parent} AND NOT ({}))", parts.join(" OR "))
+            }
+            (CmpOp::Like | CmpOp::StartsWith, Value::Text { text }) => {
+                // The parent is the key up to its last `/`: `rtrim` strips the
+                // trailing characters that are not slashes, then the slash goes.
+                let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(
+                    op,
+                    &text.to_ascii_lowercase(),
+                )));
+                let through_slash = format!("rtrim({column}, replace({column}, '/', ''))");
+                format!(
+                    "({has_parent} AND substr({through_slash}, 1, length({through_slash}) - 1) \
+                     LIKE {pattern} ESCAPE '\\')"
+                )
             }
             _ => "0".to_string(),
         }
@@ -3116,6 +3168,17 @@ fn compact_parameters(
         at = end;
     }
     (out, kept)
+}
+
+/// The bound operand of a `like` leaf: the pattern as written for `Like`, and
+/// for the `StartsWith` a trailing-`%` pattern lowers to, the escaped prefix
+/// followed by `%`.
+fn like_pattern(op: CmpOp, text: &str) -> String {
+    if op == CmpOp::StartsWith {
+        format!("{}%", like_escape(text))
+    } else {
+        text.to_string()
+    }
 }
 
 /// Escape `%`, `_` and the escape character itself for a `LIKE … ESCAPE '\'`
