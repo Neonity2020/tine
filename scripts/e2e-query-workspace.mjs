@@ -809,20 +809,27 @@ await withApp(2, async (browser) => {
   await unlinkedHeader.scrollIntoView();
   await unlinkedHeader.click();
   await browser.$(".unlinked-references .reference-bulk-controls").waitForExist({ timeout: 10_000 });
+  // The bounded excerpt must show BOTH mentions of the page and offer a way to
+  // reach each one. Since GH #200 round 2 the highlighted mention IS that
+  // control, and the numbered jump row is rendered only for mentions the
+  // excerpt cannot show - so a numbered row on this block would be the
+  // duplication the reporter objected to, and its absence is the assertion.
   const unlinkedProof = await browser.execute((expectedRaw) => {
     const groups = [...document.querySelectorAll(".unlinked-references .reference-group")];
     const source = groups.find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Unlinked source");
     const excerpt = source?.querySelector(".reference-excerpt-text")?.textContent ?? "";
+    const marks = [...(source?.querySelectorAll(".reference-excerpt-mark") ?? [])];
     return {
       groupCount: groups.length,
-      mentions: source?.querySelector(".reference-mention-count")?.textContent?.trim(),
-      jumps: source?.querySelectorAll(".reference-occurrence-jump").length,
-      marks: source?.querySelectorAll("mark").length,
+      markText: marks.map((mark) => mark.textContent?.trim()),
+      marksAreControls: marks.every((mark) => mark instanceof HTMLButtonElement),
+      redundantJumpRow: source?.querySelectorAll(".reference-occurrence-jump").length,
       bounded: excerpt.length < expectedRaw.length,
     };
   }, unlinkedRaw);
-  if (unlinkedProof.groupCount < 2 || unlinkedProof.mentions !== "2 mentions"
-    || unlinkedProof.jumps !== 2 || unlinkedProof.marks !== 2 || !unlinkedProof.bounded) {
+  if (unlinkedProof.groupCount < 2 || !unlinkedProof.bounded || !unlinkedProof.marksAreControls
+    || unlinkedProof.redundantJumpRow !== 0
+    || JSON.stringify(unlinkedProof.markText) !== JSON.stringify(["Query parity", "Query parity"])) {
     throw new Error(`unlinked reference evidence is incomplete: ${JSON.stringify(unlinkedProof)}`);
   }
 
@@ -861,12 +868,12 @@ await withApp(2, async (browser) => {
   const jumped = await browser.execute(() => {
     const source = [...document.querySelectorAll(".unlinked-references .reference-group")]
       .find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Unlinked source");
-    const jump = source?.querySelectorAll(".reference-occurrence-jump")[1];
+    const jump = source?.querySelectorAll(".reference-excerpt-mark")[1];
     if (!(jump instanceof HTMLButtonElement)) return false;
     jump.click();
     return true;
   });
-  if (!jumped) throw new Error("second unlinked occurrence control is missing");
+  if (!jumped) throw new Error("the second unlinked mention does not open its source");
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Unlinked source", {
     timeout: 10_000, timeoutMsg: "occurrence jump did not open its source page",
   });
@@ -878,9 +885,13 @@ await withApp(2, async (browser) => {
       ? { value: textarea.value, start: textarea.selectionStart, end: textarea.selectionEnd }
       : null;
   });
+  // A SELECTION of the mention, not a collapsed caret: iOS paints no caret for a
+  // programmatic focus, so a caret answered "which mention did I ask for?" only
+  // on desktop (GH #200).
   const expectedOffset = unlinkedRaw.lastIndexOf("Query parity");
-  if (!caret || caret.value !== unlinkedRaw || caret.start !== expectedOffset || caret.end !== expectedOffset) {
-    throw new Error(`exact occurrence jump landed at the wrong caret: ${JSON.stringify({ caret, expectedOffset })}`);
+  const expectedEnd = expectedOffset + "Query parity".length;
+  if (!caret || caret.value !== unlinkedRaw || caret.start !== expectedOffset || caret.end !== expectedEnd) {
+    throw new Error(`exact occurrence jump did not select the mention: ${JSON.stringify({ caret, expectedOffset, expectedEnd })}`);
   }
 });
 
