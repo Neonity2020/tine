@@ -41,7 +41,7 @@ interface ConsoleSiteLocation extends ConsoleSite {
 // from (c) to (d): it keeps a failure's type, size and identity and drops its
 // message.
 type ConsoleBucket = "a" | "b" | "c" | "d";
-const CONSOLE_ALLOWLIST_SIZE = 20;
+const CONSOLE_ALLOWLIST_SIZE = 21;
 
 // Rows are keyed by CONTENT, not by line number, and that is the whole point of
 // the `anchor` column.
@@ -65,6 +65,7 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class:
   { file: "capture.tsx", anchor: "3de353ced60a", method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
   { file: "capture.tsx", anchor: "c302419aed10", method: "log", bucket: "d", class: "numeric-shape", why: "capture-window sizing measurements contain only numbers" },
   { file: "components/Block.tsx", anchor: "ca982a4fd092", method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() — the facet query carries the property prefix being typed" },
+  { file: "components/FailureBoundary.tsx", anchor: "826addd8f4d5", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() plus `region`, which is a fixed seam name chosen in source, never a page or path" },
   { file: "logbook.ts", anchor: "f27172cceded", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — the marker transition runs over the block's own text" },
   { file: "main.tsx", anchor: "3de353ced60a", method: "error", bucket: "d", class: "local-error", why: "wasm module init failure; the parser is handed no document at bootstrap" },
   { file: "main.tsx", anchor: "e4a2943c031b", method: "error", bucket: "d", class: "local-error", why: "window reveal failure is a native window-manager error, not a graph operation" },
@@ -196,7 +197,7 @@ describe("I-5 content-out-of-logs ratchet", () => {
     const contract = source("docs/contracts/diagnostics.md");
     const rustRatchet = source("crates/tine-core/tests/content_out_of_logs.rs");
     expect(contract).toContain("18 Rust production print sites");
-    expect(contract).toContain("20 variable-bearing frontend console sites");
+    expect(contract).toContain("21 variable-bearing frontend console sites");
     expect(contract).toContain("debug_enabled()");
     expect(contract).toContain("runtime_debug_diagnostics_enabled()");
     expect(rustRatchet).toContain("const RUST_PRINT_SITE_COUNT: usize = 18;");
