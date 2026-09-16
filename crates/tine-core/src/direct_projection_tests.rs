@@ -5022,3 +5022,93 @@ fn source_of_this_file() -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/direct_projection.rs"))
         .unwrap()
 }
+
+/// Manual scale probe for GH #543 ("Search is stuck on 'Indexing — waiting for
+/// search to be ready…'"). Search readiness IS Direct-projection readiness
+/// (RET2 made the public Direct query route projection-only, with no walk arm),
+/// so the reporter's stuck search is the projection never publishing readiness.
+/// `wait_ready` above allows 15 s; the recorded product ceiling is 10 s and
+/// linear. This probe REPORTS rather than asserts, because the number is the
+/// finding — a pass/fail would hide whether a big graph is slow or never
+/// converges at all.
+#[test]
+#[ignore = "manual scale probe: set TINE_WARM_SCALE_GRAPH to a graph directory"]
+fn warm_scale_probe_reports_time_to_projection_ready() {
+    let Some(source) = std::env::var_os("TINE_WARM_SCALE_GRAPH") else {
+        eprintln!("skipped: set TINE_WARM_SCALE_GRAPH to a graph directory");
+        return;
+    };
+    let _serial = serialize_projection_tests();
+    let root = scratch("warm-scale-probe");
+    probe_copy_tree(std::path::Path::new(&source), &root);
+    let count = |dir: &str| {
+        std::fs::read_dir(root.join(dir))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    let (pages, journals) = (count("pages"), count("journals"));
+
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+
+    let started = Instant::now();
+    graph.warm_cache();
+    let warmed = started.elapsed();
+
+    let budget_secs: u64 = std::env::var("TINE_WARM_SCALE_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(600);
+    let budget = Duration::from_secs(budget_secs);
+    let state = || {
+        graph
+            .direct_projection_test()
+            .map(|projection| projection.debug_state_test())
+            .unwrap_or_else(|| "no projection".to_owned())
+    };
+
+    let mut ready_at = None;
+    let mut last_report = Instant::now();
+    while started.elapsed() < budget {
+        if graph.direct_projection_ready_test() {
+            ready_at = Some(started.elapsed());
+            break;
+        }
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            last_report = Instant::now();
+            println!("WARM-SCALE t={:?} {}", started.elapsed(), state());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let searched = Instant::now();
+    let answer = match graph.search("zqx1", 50) {
+        Ok(groups) => format!("ok({} groups)", groups.len()),
+        Err(crate::query::QueryExecutionError::NotReady(reason)) => {
+            format!("NotReady({})", reason.as_str())
+        }
+        Err(_) => "other-error".to_owned(),
+    };
+    println!(
+        "WARM-SCALE RESULT pages={pages} journals={journals} warm_cache={warmed:?} \
+         ready_at={ready_at:?} budget={budget_secs}s search={answer} search_took={:?} state={}",
+        searched.elapsed(),
+        state()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn probe_copy_tree(source: &std::path::Path, target: &std::path::Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let to = target.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            probe_copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), to).unwrap();
+        }
+    }
+}

@@ -11436,6 +11436,31 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before evidence: tine-agents/evidence/move-front-door/h2-h3-fail-before.log (pass-after: h2-h3-pass-after.log). Blocking core operation with a durable consequence: the duplicate was rendered twice AND serialized twice, so it reached the file. User outcome: pressing the move shortcut twice in quick succession on a selection in the journal feed added the selected blocks to the target day, then added them again. Root cause: moveSelectionItems captured the selected ids, awaited the source pre-flush, and then applied the stale capture; the underlying crossMoveBlocks unconditionally pushes into the destination's root list, so the second pass appended ids the first pass had already placed. moveBlocksRelative was immune only because it happened to re-plan and compare after its await \u2014 the same accident was absent from all three other shapes. Fix: the one front door src/crossPageMove.ts re-runs the caller's plan() after the await and compares it against the intent captured before, so a plan that no longer describes the same roots, sources and destination is abandoned instead of applied; moveSelectionItems re-reads topSelected() there and aborts when the selection has already reached the target. This makes the stale-capture class unwritable for every shape that goes through the door rather than fixing the one call site. jsdom + backend spies assert both that no root appears twice in the target day's serialized roots and that the root list holds no duplicates at all."
+    },
+    {
+      "id": "UI-SEARCH-LARGE-GRAPH-NEVER-READY-543",
+      "title": "Search returns results on a large graph instead of staying on \u201cIndexing \u2014 waiting for search to be ready\u2026\u201d indefinitely, in both Ctrl+K and the search tab",
+      "family": "search",
+      "sources": {
+        "issues": [
+          543
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "windows",
+        "linux",
+        "macos"
+      ],
+      "layer": "native",
+      "status": "reported",
+      "coverage": {
+        "tests": [],
+        "scenario": null,
+        "failBefore": "unavailable"
+      },
+      "notes": "Blocking core operation: search is unusable, and the reporter rolled back to v0.6.982 to keep working. User outcome: after typing a query in Ctrl+K or the search tab on a large graph (reporter: fine below roughly 10,000 pages, broken above; Windows 11, though other Windows 11 users differ), the panel stays on \u201cIndexing \u2014 waiting for search to be ready\u2026\u201d for at least 20 minutes and never returns rows, while Tine keeps consuming CPU and disk when idle. Accepted 2026-09-16 from GH #543. Mechanism established by reading only, NOT yet reproduced here: search readiness IS Direct-projection readiness, because RET2 made the public Direct query route projection-only with no walk arm (crates/tine-core/src/model/search.rs read_friendly_plan -> dispatch_direct_query), so an un-ready projection can only produce a retried spinner. src/queryReadiness.ts retries QueryNotReadyError forever (100ms doubling to an 800ms cap, no total bound), which accounts for the idle CPU and disk. Both call sites (QuickSwitcher.tsx:136, Block.tsx:1602) discard the error's own reason and hardcode the word Indexing, so a graph waiting for any other reason (busy, pending_edits, recovering) still reads as indexing. Suspected root cause under measurement: stream_warm_replacements (model/page_cache.rs) abandons the warm stream whenever cache_gen drifts, and abandon_warm_stream latches needs_full so only a full inventory may publish readiness again; a long warm on a large graph is therefore easy to restart repeatedly. Unverified: whether a 10k-page graph converges slowly or never. Also outstanding regardless of cause: a recorded product ceiling says a full rebuild must not exceed 10 seconds and must be linear, and the codebase's own wait_ready allows 15 seconds."
     }
   ]
 }
