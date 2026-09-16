@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { clickWhenReachable } from "./lib/e2e-click.mjs";
 import {
   startWebdriverApplication,
   stopWebdriverApplication,
@@ -1725,7 +1726,12 @@ try {
     throw new Error("switching from PDF A wrote A's pending state or baseline into PDF B");
   }
 
-  await browser.$(`[data-block-ref="${SECOND_SECOND_ID}"]`).click();
+  // Intercepted on the hosted Linux runner while every local run clicked it
+  // (release run 35158841575). Wait for the chip to be the node a click at
+  // its centre reaches, and name whatever is on top if it never is.
+  await clickWhenReachable(browser, `[data-block-ref="${SECOND_SECOND_ID}"]`, {
+    what: "the same-PDF block reference",
+  });
   await browser.waitUntil(() => browser.execute((highlightId) =>
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-highlight-target") === highlightId &&
     document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId, SECOND_SECOND_ID), {

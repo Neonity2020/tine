@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { clickWhenReachable } from "./lib/e2e-click.mjs";
 import { createHash } from "node:crypto";
 import {
   startWebdriverApplication,
@@ -89,9 +90,12 @@ try {
   // The contract starts at the named page's menu, not at today's journal.
   // Route through the visible application search control so a different valid
   // startup surface cannot fail the safety journey before it begins.
-  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
-  await search.waitForClickable({ timeout: 20_000 });
-  await search.click();
+  // "still not clickable after 20000ms" on the Windows runner (release run
+  // 35158841575) named the button, never what was covering it.
+  await clickWhenReachable(browser, 'button[title^="Search (Ctrl+K)"]', {
+    timeout: 20_000,
+    what: "the application search control",
+  });
   const input = await browser.$(".switcher-input");
   await input.waitForExist({ timeout: 10_000 });
   await input.setValue("Print proof");
