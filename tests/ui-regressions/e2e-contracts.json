@@ -473,13 +473,20 @@
      "class": "core-operation",
      "userOutcome": "Page property actions preserve literal header structure through edit, guarded save, reload, and keyboard traversal.",
      "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "An arbitrary property added to a BLOCK from that block's context menu, on a routed named page, reaches the file under that block without disturbing the block's own text, and is still there after the page is reopened.",
+     "blocking": true
     }
    ],
    "acceptableVariations": [
-    "Panel layout and native form-control styling may evolve."
+    "Panel layout and native form-control styling may evolve.",
+    "Which properties a page contributes to the form, and therefore how many controls sit between the last preset and Done."
    ],
    "nonRequirements": [
-    "Exact section spacing, control dimensions, or debounce timing."
+    "Exact section spacing, control dimensions, or debounce timing.",
+    "Field order beyond the five presets, the number of rows a page contributes, or the exact stop list of the Tab traversal after Public."
    ],
    "stability": "stable"
   },
