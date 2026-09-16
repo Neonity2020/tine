@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.984] - 2026-09-16
+
 ### Added
 
 - **A part of Tine that fails now says so, where it failed, with a Retry — instead
