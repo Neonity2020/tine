@@ -5120,6 +5120,68 @@ fn warm_scale_probe_reports_time_to_projection_ready() {
     }
 }
 
+/// Manual cost probe for GH #543: how much of one search's per-block work is
+/// `canonical_fold` (which the projection ALREADY stores as
+/// `blocks.query_visible_folded`) versus the relevance scan itself. The answer
+/// decides the fix: if folding dominates, passing the stored fold through
+/// `QueryRankPrograms::bind_pair` is a semantics-free win; if the scan
+/// dominates, the fix must instead reduce how many blocks are ranked at all.
+///
+/// `block_relevance` is module-private, so this times fold-only and
+/// fold+relevance (`rank_block_text`) and reports the difference rather than
+/// claiming to measure the scan directly.
+#[test]
+#[ignore = "manual cost probe: set TINE_RANK_CORPUS to a NUL-separated block corpus"]
+fn rank_cost_split_probe() {
+    let Some(path) = std::env::var_os("TINE_RANK_CORPUS") else {
+        eprintln!("skipped: set TINE_RANK_CORPUS to a NUL-separated block corpus");
+        return;
+    };
+    let corpus = std::fs::read_to_string(path).unwrap();
+    let texts: Vec<&str> = corpus.split('\0').collect();
+    let bytes: usize = texts.iter().map(|text| text.len()).sum();
+    let plan = crate::query_plan::QueryPlan::block_search_literal("zqx1", 50);
+    let branch = &plan.branches[0];
+
+    let started = Instant::now();
+    let mut folded_len = 0usize;
+    for text in &texts {
+        folded_len += crate::search_query::canonical_fold(text).len();
+    }
+    let fold_only = started.elapsed();
+
+    let started = Instant::now();
+    let mut ranked = 0usize;
+    for text in &texts {
+        if crate::query_plan::rank_block_text(&plan, branch, text).is_some() {
+            ranked += 1;
+        }
+    }
+    let fold_and_rank = started.elapsed();
+
+    // Price the alternative design: if the rank program took a PAIR
+    // (visible, stored fold) through `framed_pair_sql`, SQL would concatenate
+    // both texts per row. That must be cheaper than the fold it replaces, or the
+    // pair design buys nothing.
+    let started = Instant::now();
+    let mut framed_len = 0usize;
+    for text in &texts {
+        let folded = text; // same bytes on this corpus; the SHAPE is what is priced
+        framed_len += format!("{}:{}{}", text.len(), text, folded).len();
+    }
+    let framing_only = started.elapsed();
+    println!("RANK-COST-FRAMING framed_len={framed_len} framing_only={framing_only:?}");
+
+    println!(
+        "RANK-COST blocks={} bytes={bytes} folded_len={folded_len} ranked={ranked} \
+         fold_only={fold_only:?} fold_and_rank={fold_and_rank:?} relevance_only~={:?} \
+         fold_share={:.0}%",
+        texts.len(),
+        fold_and_rank.saturating_sub(fold_only),
+        100.0 * fold_only.as_secs_f64() / fold_and_rank.as_secs_f64().max(f64::MIN_POSITIVE),
+    );
+}
+
 fn probe_copy_tree(source: &std::path::Path, target: &std::path::Path) {
     std::fs::create_dir_all(target).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
