@@ -12,9 +12,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Any property can be edited from the UI, on a page or on a block.** The
   properties form offered five fixed page keys and nothing at all for blocks, so
-  every other `key:: value` line had to be typed by hand. Right-click a page
-  title for **Page properties…** (or type `/page properties`), or right-click a
-  block for **Properties…**: the form lists the properties that are really
+  every other `key:: value` line had to be typed by hand. Use **Page actions**
+  beside a page title, or right-click the title, for **Page properties…** (or
+  type `/page properties`), and right-click a block for **Properties…**: the
+  form lists the properties that are really
   there, **Add a property** takes any key you like, and any non-preset key can be
   removed outright. A key is accepted exactly when the property reader can match
   it back, so anything that can be added can also be changed and removed —
