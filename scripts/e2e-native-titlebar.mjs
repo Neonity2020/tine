@@ -159,7 +159,7 @@ try {
   // The same real production binary must expose its safe report through native
   // IPC. This catches command-registration, app-data, report-schema and Settings
   // wiring failures that a browser render test cannot see.
-  await browser.$("button=Diagnostics").click();
+  await browser.$('.settings-nav-item[data-settings-tab="diagnostics"]').click();
   const createReport = await browser.$("button=Create diagnostic report");
   await createReport.waitForExist({ timeout: 5_000 });
   await createReport.click();

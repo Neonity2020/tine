@@ -151,17 +151,17 @@ try {
     timeout: 15_000, timeoutMsg: "PDF export did not create its print frame",
   });
   const proof = await browser.execute(() => window.__tinePrintSecurityProof);
-  console.log(JSON.stringify({ backend: backendName, binary: APP,
+  console.log(JSON.stringify({ binary: APP,
     binarySha256: createHash("sha256").update(fs.readFileSync(APP)).digest("hex"), ...proof }));
   const sandbox = new Set((proof.sandbox ?? "").split(/\s+/).filter(Boolean));
   if (sandbox.has("allow-scripts") || !sandbox.has("allow-same-origin") || !sandbox.has("allow-modals")) {
     throw new Error(`unsafe print sandbox: ${JSON.stringify(proof.sandbox)}`);
   }
   for (const expected of ["print-selected-private-root", "print-required-child", "print-required-grandchild", '<table class="sheet-table">']) {
-    if (!proof.srcdoc.includes(expected)) throw new Error(`${backendName} Print omitted ${expected}`);
+    if (!proof.srcdoc.includes(expected)) throw new Error(`Print omitted ${expected}`);
   }
   if (proof.srcdoc.includes("Query results are unavailable for this render.") || proof.srcdoc.includes("non-public pages omitted")) {
-    throw new Error(`${backendName} Print lost its personal query scope or operation reader`);
+    throw new Error("Print lost its personal query scope or operation reader");
   }
   if (/<script\b/i.test(proof.srcdoc) || /cdn\.jsdelivr\.net/i.test(proof.srcdoc)
     || !/script-src 'none'/.test(proof.srcdoc) || !/class="katex/.test(proof.srcdoc)

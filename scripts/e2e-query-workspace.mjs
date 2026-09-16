@@ -203,7 +203,30 @@ async function assertInPageFind(browser, query, activeSelector, slowTyping = fal
     }));
     throw new Error(`${String(error)}; proof=${JSON.stringify(proof)}`);
   }
-  await browser.$(activeSelector).waitForExist({ timeout: 5_000 });
+  try {
+    await browser.$(activeSelector).waitForExist({ timeout: 5_000 });
+  } catch (error) {
+    // A found-but-not-marked match is a different failure from a missing match,
+    // and the two are indistinguishable from the selector alone. Name which
+    // surface the active mark actually landed on, and what each surface offers
+    // in-page find AFTER its interactive controls are excluded - the searchable
+    // text is not the visible text.
+    const proof = await browser.execute(() => ({
+      count: document.querySelector(".inpage-find-count")?.textContent,
+      active: [...document.querySelectorAll(".inpage-find-active-block")]
+        .map((element) => element.className),
+      surfaces: [...document.querySelectorAll("[data-inpage-find-surface]")].map((element) => {
+        const clone = element.cloneNode(true);
+        for (const control of clone.querySelectorAll("button,input,textarea,select")) control.remove();
+        return {
+          id: element.getAttribute("data-inpage-find-surface"),
+          visible: element.textContent?.trim().slice(0, 160),
+          searchable: clone.textContent?.trim().slice(0, 160),
+        };
+      }),
+    }));
+    throw new Error(`${String(error)}; proof=${JSON.stringify(proof)}`);
+  }
   await browser.execute(() => document.querySelector(".inpage-find-input")?.dispatchEvent(
     new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true })
   ));

@@ -174,6 +174,9 @@ export function ReferenceExcerptBlocks(props: {
                       <button
                         type="button"
                         class="reference-excerpt-mark"
+                        // The mark is a control, but its text is the excerpt's
+                        // text; in-page find must still see it (src/inpageFind.ts).
+                        data-inpage-find-text=""
                         title={`Open this mention in ${props.page}`}
                         aria-label={`Open mention ${ordinalOf(segment.span!)} in ${props.page}`}
                         onClick={() => jumpTo(segment.span!)}

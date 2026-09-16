@@ -409,6 +409,11 @@ export function Settings(): JSX.Element {
               {(t) => (
                 <button
                   class="settings-nav-item"
+                  // The tab's identity, so a test or a deep link addresses the tab
+                  // rather than its label. Labels are presentation: "Diagnostics"
+                  // became "Help & diagnostics" and every label-coupled selector
+                  // broke with it.
+                  data-settings-tab={t.id}
                   classList={{ active: tab() === t.id }}
                   onClick={() => setTab(t.id)}
                 >

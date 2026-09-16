@@ -416,7 +416,15 @@ function textPartsForRoot(root: HTMLElement): { parts: TextPart[]; text: string 
       if (!value) return NodeFilter.FILTER_REJECT;
       const parent = node.parentElement;
       const control = parent?.closest("button,input,textarea,select");
-      if (!parent || (control && control !== root)) return NodeFilter.FILTER_REJECT;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      // A control is chrome — "Show full block", a jump circle, a filter — and its
+      // label is not page text, so find skips it. A control that CARRIES content
+      // says so with `data-inpage-find-text`: an unlinked-reference excerpt makes
+      // each marked mention a button that opens the source page there (GH #200),
+      // and those are the very words the reader typed into find.
+      if (control && control !== root && !control.hasAttribute("data-inpage-find-text")) {
+        return NodeFilter.FILTER_REJECT;
+      }
       return NodeFilter.FILTER_ACCEPT;
     },
   });
