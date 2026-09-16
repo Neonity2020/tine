@@ -82,7 +82,9 @@ import {
   persistBlockRefTarget,
   resolveBlockRef,
   reloadPageIfStillSafe,
+  pageWritable,
 } from "./store";
+import { pageProperties } from "./render/block";
 import { saveBaselineFor, setBaseRev } from "./persistence";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
@@ -273,6 +275,36 @@ describe("properties-only first block", () => {
       pre_block: "alias:: book\n\nklíč:: hodnota\n\nIntro",
       blocks: [{ raw: "Reading list" }],
     });
+  });
+
+  // GH #164 packet, spec section B2. An org file that round-trips byte-for-byte
+  // loads WRITABLE (read_only_org -> org_editable -> org_round_trips, and that
+  // module's own corpus pins `#+TITLE:`/`#+FILETAGS:` pages as editable), and
+  // pageWritable applies no format test. But setPageProperty takes its
+  // first-root branch only when format is "md" and otherwise falls through to
+  // upsertPropertyLine, which emits markdown `key:: value`. Org carries page
+  // properties as `#+KEY:` directives or a `:PROPERTIES:` drawer, so the line
+  // Tine writes is not a property to org at all: neither Tine's own org reader
+  // (render/block.ts pageProperties) nor Logseq reads it back. I-4.
+  it("writes a page property on an org page in org's own form (GH #164)", () => {
+    loadSingle({
+      name: "Test", kind: "page", title: "Test",
+      pre_block: "#+TITLE: My Page\n#+FILETAGS: :work:",
+      blocks: [blk("first")], format: "org",
+    });
+    // Guard against a silent no-op: if the page were read-only, setPageProperty
+    // would return early and the assertions below would "pass" by vacuity.
+    expect(pageWritable("Test")).toBe(true);
+
+    setPageProperty("Test", "tags", "reference");
+
+    // The write must have happened at all...
+    expect(isDirty("Test")).toBe(true);
+    // ...and it must be readable back through the org reader. Fail-before: the
+    // preBlock gains a markdown `tags:: reference` line, so this reads [] for
+    // `tags` and the property silently does not exist for org or for Logseq.
+    expect(pageProperties(doc.pages[0].preBlock, "org")).toContainEqual(["tags", "reference"]);
+    expect(doc.pages[0].preBlock).not.toContain("tags:: reference");
   });
 
   it("fails closed on an invalid marked header draft and keeps the draft editable", () => {

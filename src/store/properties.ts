@@ -4,7 +4,7 @@ import { blockWritable, bumpCollapseEpoch, bumpCollapseEpochs, doc, formatForBlo
 import { ensurePageLoaded } from "./lifecycle";
 import { facetsOf } from "../render/facets";
 import { graphBinding } from "../persistence";
-import { isBuiltinHidden, isPageHeaderPropertiesOnly, isPropertiesOnly, joinProps, markdownRawWithProperty, orgRawWithProperty, readPropertyValue, splitPagePreamble, splitProps, upsertPropertyLine } from "../editor/properties";
+import { PROP_LINE, isBuiltinHidden, isPageHeaderPropertiesOnly, isPropertiesOnly, joinProps, markdownRawWithProperty, orgPreBlockWithProperty, orgRawWithProperty, readPropertyValue, splitPagePreamble, splitProps, upsertPropertyLine } from "../editor/properties";
 import { produce } from "solid-js/store";
 import { pushUndo, withUndoUnit } from "./undo";
 
@@ -14,8 +14,6 @@ export function registerSelectedIds(fn: () => string[]): void {
   selectedIdsImpl = fn;
 }
 
-
-const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
 
 /** Current value of a block property, read through the ONE lsdoc-backed
  *  recognizer (facetsOf) — a raw line scan here returned property-lookalikes
@@ -98,7 +96,18 @@ export function setPageProperty(pageName: string, key: string, value: string | n
     markDirty(pageName);
     return;
   }
-  setDoc("pages", idx, "preBlock", upsertPropertyLine(doc.pages[idx].preBlock, key, value));
+  // The preamble's form is the file's, not the caller's convenience: org pages
+  // carry page properties as `#+key:` directives, and a markdown `key:: value`
+  // line written into an org preamble is body text to org and to Logseq, so the
+  // property silently would not exist (I-4, GH #164).
+  setDoc(
+    "pages",
+    idx,
+    "preBlock",
+    page.format === "org"
+      ? orgPreBlockWithProperty(doc.pages[idx].preBlock, key, value)
+      : upsertPropertyLine(doc.pages[idx].preBlock, key, value)
+  );
   markDirty(pageName);
 }
 

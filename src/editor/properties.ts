@@ -3,7 +3,18 @@
 
 import { transitionFence, displayMathOpenAfter, closesDisplayMath, type FenceState } from "./fences";
 
-export const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
+/** The editor's `key:: value` matcher for reading and rewriting property lines.
+ * The key class is the same Unicode class as `PAGE_HEADER_KEY` below. lsdoc's
+ * canonical recognizer (`crates/tine-core/src/property_line.rs`) does not use a
+ * character class at all — a key is any nonempty run without a colon, parser
+ * space, CR or LF — so an ASCII-only class here made a non-ASCII key WRITE-ONCE:
+ * the new-key path created it unconditionally, then no later edit could match
+ * the line, and an update prepended a second line with the same key instead of
+ * replacing the first (GH #164). Only the charset is widened: the `::`
+ * separator rule stays as it is, because the page-header grammar
+ * (`parsePageHeaderPropertyLine`) is deliberately a different, laxer rule for a
+ * different job, pinned by its own tests. */
+export const PROP_LINE = /^([\p{L}\p{M}\p{N}_./-]+):: ?(.*)$/u;
 
 const PAGE_HEADER_KEY = /^[\p{L}\p{M}\p{N}_./-]+$/u;
 
@@ -503,4 +514,52 @@ export function orgRawWithProperty(raw: string, key: string, value: string | nul
     ":END:",
     ...rest.slice(planEnd),
   ].join("\n");
+}
+
+/** A page's org PRE-BLOCK with one page property set, updated or removed.
+ *
+ *  Org carries PAGE properties as `#+key: value` file directives; the
+ *  `:PROPERTIES:` drawer that {@link orgRawWithProperty} writes is the BLOCK
+ *  form. Logseq splits the same way and this is transcribed from its page
+ *  writer, `frontend.util.page-property/insert-property`
+ *  (og 6e7afa8eb, `src/main/frontend/util/page_property.cljs:10-32`), against
+ *  its block writer `frontend.util.property/build-properties-str`
+ *  (`property.cljs:169-177`), which is the one that emits the drawer. Writing a
+ *  markdown `key:: value` line into an org preamble instead is not a property
+ *  to org at all: neither Tine's own org reader nor Logseq reads it back, and
+ *  the metadata silently does not exist (I-4, GH #164).
+ *
+ *  Transcribed exactly: the key is lower-cased, and an existing directive is
+ *  found case-insensitively by the `#+key: ` prefix INCLUDING its trailing
+ *  space, so `#+TAGS: x` is matched and `#+TAGS:x` is not. A new key is
+ *  prepended, as OG's `cons` does.
+ *
+ *  Two deliberate departures. Duplicate keys collapse to the first slot rather
+ *  than being left in place as OG leaves them, so this agrees with
+ *  {@link upsertPropertyLine}; an org page and a markdown page must not
+ *  disagree about what a second `tags` line means. And removal has no OG
+ *  counterpart at all — its value is never null — so dropping the matching
+ *  directive is Tine's own complement of the same markdown rule.
+ *
+ *  Returns null when no nonblank content remains. */
+export function orgPreBlockWithProperty(
+  preBlock: string | null,
+  key: string,
+  value: string | null
+): string | null {
+  const v = value == null ? null : value.trim();
+  const prefix = `#+${key.toLowerCase()}: `;
+  const lines = preBlock == null || preBlock === "" ? [] : preBlock.split("\n");
+  const out: string[] = [];
+  let matched = false;
+  for (const line of lines) {
+    if (line.toLowerCase().startsWith(prefix)) {
+      if (!matched && v) out.push(`${prefix}${v}`);
+      matched = true;
+      continue;
+    }
+    out.push(line);
+  }
+  if (!matched && v) out.unshift(`${prefix}${v}`);
+  return out.some((line) => line.trim() !== "") ? out.join("\n") : null;
 }

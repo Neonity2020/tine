@@ -12,6 +12,7 @@ import {
   isPageHeaderPropertiesOnly,
   parsePageHeaderPropertyLine,
   splitPagePreamble,
+  orgPreBlockWithProperty,
 } from "./properties";
 
 describe("canonical Markdown page-header grammar (GH #163)", () => {
@@ -88,6 +89,65 @@ describe("property line helpers", () => {
 
   it("trims the value while preserving blank separators", () => {
     expect(upsertPropertyLine("\n\ntags:: x\n\n", "alias", "  Foo  ")).toBe("alias:: Foo\n\n\ntags:: x\n\n");
+  });
+
+  // GH #164 packet, spec section B3. The canonical recognizer is
+  // crates/tine-core/src/property_line.rs (transcribed from lsdoc's
+  // markdown_property_line): a key is non-empty and contains no colon, parser
+  // space, CR or LF -- it is NOT an ASCII character class, which is why
+  // `unicode.klíč` parses there (property_line.rs:100-103). PROP_LINE here is
+  // ASCII-only, so it WRITES a non-ASCII key (the new-key path is an
+  // unconditional unshift) but can never MATCH one again: the property becomes
+  // write-once, and neither an update nor a removal can reach it. The page is
+  // meanwhile happy to LIST it -- parsePageHeaderPropertyLine accepts Unicode
+  // keys (pinned above, line 19), as does render/block.ts pageProperties.
+  it("updates and removes a property whose key is not ASCII (GH #164)", () => {
+    // Fail-before: today this returns "klíč:: nová\nklíč:: hodnota" -- the
+    // original line is not matched, so the edit duplicates the key instead of
+    // replacing it.
+    expect(upsertPropertyLine("klíč:: hodnota", "klíč", "nová")).toBe("klíč:: nová");
+
+    // Fail-before: today the line survives, so the property cannot be deleted.
+    expect(upsertPropertyLine("klíč:: hodnota", "klíč", null)).toBe(null);
+
+    // And the single-key reader cannot see it at all, so the editor would show
+    // an empty field for a property that is plainly present in the text.
+    expect(readPropertyValue("klíč:: hodnota", "klíč")).toBe("hodnota");
+  });
+
+  // GH #164 packet, spec section B2. Org carries PAGE properties as `#+key:`
+  // file directives; the `:PROPERTIES:` drawer is the BLOCK form, which is why
+  // orgRawWithProperty is the wrong tool for a preamble. Transcribed from
+  // Logseq `frontend.util.page-property/insert-property` (og 6e7afa8eb,
+  // src/main/frontend/util/page_property.cljs:10-32) against its block writer
+  // `frontend.util.property/build-properties-str` (property.cljs:169-177).
+  it("writes an org page property as a lower-cased `#+key:` directive (GH #164)", () => {
+    expect(orgPreBlockWithProperty("#+TITLE: My Page", "tags", "reference"))
+      .toBe("#+tags: reference\n#+TITLE: My Page");
+
+    // An existing directive is matched case-insensitively and replaced IN
+    // PLACE, so the file's own property order is user data, not formatting.
+    expect(orgPreBlockWithProperty("#+TITLE: My Page\n#+TAGS: old", "tags", "new"))
+      .toBe("#+TITLE: My Page\n#+tags: new");
+
+    // OG matches on the `#+key: ` prefix INCLUDING its trailing space, so a
+    // directive written without one is not this key and is left alone.
+    expect(orgPreBlockWithProperty("#+TAGS:x", "tags", "new"))
+      .toBe("#+tags: new\n#+TAGS:x");
+  });
+
+  // The two deliberate departures from OG, pinned because the writer's
+  // docstring claims them: OG replaces only the first match and leaves later
+  // duplicates in the file, and it has no null-value path at all. Tine collapses
+  // duplicates to the first slot and removes on null, so an org page and a
+  // markdown page agree about what a second `tags` line means.
+  it("collapses duplicate org directives and removes the key on a null value (GH #164)", () => {
+    expect(orgPreBlockWithProperty("#+tags: one\n#+TITLE: P\n#+TAGS: two", "tags", "three"))
+      .toBe("#+tags: three\n#+TITLE: P");
+    expect(orgPreBlockWithProperty("#+TITLE: P\n#+tags: one", "tags", null))
+      .toBe("#+TITLE: P");
+    // Nothing nonblank left: the preamble becomes null, as upsertPropertyLine does.
+    expect(orgPreBlockWithProperty("#+tags: one", "tags", null)).toBe(null);
   });
 
   it("preserves the issue-163 page-property layout byte-for-byte outside the edited line", () => {

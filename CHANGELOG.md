@@ -41,6 +41,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Page properties on an Org page are written in Org's own form.** Setting a
+  page property such as `tags` on an `.org` page put a Markdown
+  `tags:: reference` line into the file's header, which Org does not define as a
+  property — so neither Tine nor Logseq read it back and the property silently
+  did not exist, while the app showed it as saved. Tine now writes a
+  `#+tags: reference` file directive, the same form Logseq writes
+  (UI-ORG-PAGE-PROP-BYTES-164).
+- **A property whose key is not plain ASCII can be changed and removed again.**
+  A key such as `klíč::` could be created once and then never matched, so
+  editing its value added a second line with the same key instead of replacing
+  the first, and deleting it did nothing — while the page went on listing the
+  property (UI-PROP-KEY-GRAMMAR-164).
 - Search no longer stays on “Indexing — waiting for search to be ready…”, and
   the search index is no longer rebuilt from scratch on every launch. Opening a
   graph threw its saved index away and re-indexed every page, so on a large
