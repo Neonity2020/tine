@@ -267,7 +267,14 @@ try {
   // transform: the released failure made one Ctrl+ step overshoot, then visibly
   // shrink when the 120 ms settled render replaced it.
   await browser.execute(() => {
-    const probe = window.__tinePdfZoomProbe = { startedAt: performance.now(), samples: [], done: false };
+    // Sample the zoom ANIMATION, so the window has to start when the zoom
+    // actually changes - not when the probe was installed. A fixed 750 ms
+    // window closed before the keystroke landed on 2026-09-16 and reported
+    // "Ctrl+ did not change focused PDF zoom" on a build where it does.
+    const startZoom = document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "";
+    const probe = window.__tinePdfZoomProbe = {
+      startedAt: performance.now(), samples: [], done: false, startZoom, changedAt: null,
+    };
     const frame = (now) => {
       const scroll = document.querySelector(".pdf-scroll");
       const viewport = scroll?.getBoundingClientRect();
@@ -289,14 +296,19 @@ try {
           transform: canvas.style.transform,
         });
       }
-      if (now - probe.startedAt < 750) requestAnimationFrame(frame);
+      const zoom = document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "";
+      if (probe.changedAt === null && zoom !== probe.startZoom) probe.changedAt = now;
+      const keepSampling = probe.changedAt === null
+        ? now - probe.startedAt < 4_000
+        : now - probe.changedAt < 750;
+      if (keepSampling) requestAnimationFrame(frame);
       else probe.done = true;
     };
     requestAnimationFrame(frame);
   });
   await browser.keys(["Control", "="]);
   await browser.waitUntil(() => browser.execute(() => window.__tinePdfZoomProbe?.done === true), {
-    timeout: 5_000,
+    timeout: 8_000,
     timeoutMsg: "PDF zoom frame probe did not finish",
   });
   const zoomProbe = await browser.execute(() => window.__tinePdfZoomProbe);
