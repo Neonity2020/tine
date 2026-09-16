@@ -68,7 +68,7 @@ use eval::EvalCtx;
 use ir::{Anchor, Attr, CmpOp, Filter, Quant, Query, Rel, SortDir, Source, Value, ViewSettings};
 
 use self::sort::{compare_sort_decorations, lexical_property_sort_text, SortDecor};
-use crate::date::JournalDate;
+use crate::date::{JournalDate, JournalFormat};
 use crate::doc::{property_key_norm, DocBlock, Document};
 #[cfg(test)]
 use crate::model::Graph;
@@ -841,7 +841,43 @@ fn graph_equivalent_page_names<G: QueryGraph>(
     aliases: &[(String, String)],
     target: &str,
 ) -> (String, Vec<String>, String) {
-    equivalent_page_names(&real_page_names(graph), aliases, target)
+    let real_pages = real_page_names(graph);
+    let mut resolved = equivalent_page_names(&real_pages, aliases, target);
+    let config = graph.config();
+    let format = JournalFormat::new(
+        config.journal_file_name_format.as_deref(),
+        config.journal_page_title_format.as_deref(),
+    );
+    let Some(target_day) = format.parse(target) else {
+        return resolved;
+    };
+    let Some(journal) = graph.list_pages().into_iter().find(|entry| {
+        entry.kind == PageKind::Journal && format.parse(&entry.name) == Some(target_day)
+    }) else {
+        return resolved;
+    };
+
+    let accepted_spellings = [
+        journal.name.as_str().to_string(),
+        format.title(target_day),
+        format.file_stem(target_day),
+        target_day.title(),
+        target_day.file_stem(),
+        format!(
+            "{:04}-{:02}-{:02}",
+            target_day.year, target_day.month, target_day.day
+        ),
+    ];
+    for spelling in accepted_spellings {
+        let key = refs::page_key(&spelling);
+        if !resolved.1.contains(&key) {
+            resolved.1.push(key);
+        }
+    }
+    resolved.1.sort();
+    resolved.0 = journal.name.clone();
+    resolved.2 = journal.name;
+    resolved
 }
 
 fn org_property_line(line: &str) -> bool {

@@ -2,6 +2,154 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-DIAGNOSTICS-INTENTIONAL-PARSER-DIVERGENCE-006",
+      "title": "Help and diagnostics does not offer intentional nested-dollar parser behavior as a bug report",
+      "family": "settings",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/devtools/lsdoc-diff/orchestrator.intentional.test.ts",
+          "src/components/ImproveTab.test.tsx",
+          "src/components/DiagnosticsTab.test.tsx"
+        ],
+        "scenario": "settings.help-diagnostics-suppresses-intentional-parser-difference",
+        "failBefore": "proven"
+      },
+      "notes": "lsdoc GH #6 is documented intentional divergence D48: Tine preserves dollar math nested inside Markdown emphasis. The in-app comparison now classifies the exact complete delta fail-closed, excludes it from reportable findings, and places parser comparison in the single Help & diagnostics Settings tab."
+    },
+    {
+      "id": "UI-WINDOWS-SESSION-END-EXIT-455",
+      "title": "Windows session shutdown terminates Tine after its bounded durability drain",
+      "family": "lifecycle",
+      "sources": {
+        "issues": [455],
+        "commits": []
+      },
+      "platforms": ["windows"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/windowsShutdownCloseGate.test.ts",
+          "src-tauri/src/lib.rs::concord_exit_drain_tests"
+        ],
+        "scenario": "lifecycle.windows-session-end-exits",
+        "failBefore": "proven"
+      },
+      "notes": "GH #455. tao delivers RunEvent::Exit for WM_ENDSESSION but its Windows message loop does not receive WM_QUIT or an exit control-flow transition. Tine now terminates the Windows process only after its existing bounded Concord drain and clean-shutdown marker. The source-level state-machine fixture proves the old non-exit; final Windows-host shutdown verification remains a platform boundary."
+    },
+    {
+      "id": "UI-ANDROID-NATIVE-PICKER-EDITOR-493",
+      "title": "An Android picker blur does not discard the editor that initiated durable asset insertion",
+      "family": "media",
+      "sources": {
+        "issues": [493],
+        "commits": []
+      },
+      "platforms": ["android"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.mobileCapture.test.tsx",
+          "src/components/Block.assetPaste.test.tsx"
+        ],
+        "scenario": "media.android-picker-preserves-initiating-editor",
+        "failBefore": "proven"
+      },
+      "notes": "GH #493. The native picker and durable import succeeded, but Android could deliver the editor blur before document focus changed, ending edit identity and refusing Markdown insertion. The initiating block now treats blur as transient only while its own native picker is pending; graph and block staleness guards remain intact. On-device verification remains required."
+    },
+    {
+      "id": "UI-JOURNAL-ISO-LINKED-REFERENCES-481",
+      "title": "A journal collects linked references written in another accepted date spelling",
+      "family": "references",
+      "sources": {
+        "issues": [481],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/issue481_journal_linked_references.rs",
+          "src/components/Page.journalLinkedReferences.test.tsx"
+        ],
+        "scenario": "references.journal-date-aliases-share-backlinks",
+        "failBefore": "proven"
+      },
+      "notes": "GH #481. Default-title and configured-title journal references already worked. The remaining reproduced gap was an ISO date link such as [[2026-09-20]] in a graph whose journal display title is Sep 20th, 2026. Reference lookup now treats accepted date spellings as aliases only when the matching real page is a journal, preserving ordinary date-like page identity when no such journal exists."
+    },
+    {
+      "id": "UI-EXPAND-REFERENCES-BOUNDED-408",
+      "title": "Expanding a large outline does not eagerly mount every off-screen block embed before visible references can render",
+      "family": "references",
+      "sources": {
+        "issues": [408],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.standaloneMacroDeferral.test.tsx",
+          "scripts/research/issue-408-expand-refs-delay.mjs"
+        ],
+        "scenario": "references.large-expanded-outline-bounds-offscreen-macros",
+        "failBefore": "proven"
+      },
+      "notes": "GH #408. The exact 8,000-child research fixture mounted all 4,000 standalone embed macros synchronously, blocked the main thread for about 2.4 seconds on Linux, and delayed resolved content to about 4.5 seconds; the same-size backend batch took only 319 ms. The shared near-viewport gate now bounds standalone macro mounting just as it already bounds ordinary AstBody rendering. The reporter's Windows magnitude remains a platform verification boundary."
+    },
+    {
+      "id": "UI-BLOCK-SHEET-OVERFLOW-ALIGNMENT-473",
+      "title": "An overflowing query table or sheet keeps its left edge aligned with its owning bullet and scrolls internally",
+      "family": "sheets",
+      "sources": {
+        "issues": [473],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "browser",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/SheetGrid.test.tsx::keeps an overflowing block sheet aligned and internally scrollable",
+          "scripts/probe-query-overflow-473.mjs"
+        ],
+        "scenario": "sheets.block-overflow-keeps-bullet-alignment",
+        "failBefore": "proven"
+      },
+      "notes": "GH #473. Flexible presentation invariant: a block-owned result may choose its width and scrollbar implementation, but may not use a negative breakout margin that moves the left edge outside the owning bullet. The research Chromium probe measured 126-281 px left shifts whenever the sheet overflowed."
+    },
+    {
+      "id": "UI-BLOCK-REF-SOFT-BREAK-506",
+      "title": "A bare block reference preserves every visible line after a soft line break",
+      "family": "references",
+      "sources": {
+        "issues": [506],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/blockRefSoftBreak.test.tsx",
+          "src/render/blockRefTaskState.test.tsx"
+        ],
+        "scenario": "references.block-ref-preserves-soft-breaks",
+        "failBefore": "proven"
+      },
+      "notes": "GH #506. The parser, projection and body extractor already retained both lines; BlockRefView alone selected visibleBody(...)[0]. Bare references now render every visible line with explicit breaks while labeled references, task chips, live refresh, embeds and hover previews retain their existing contracts."
+    },
+    {
       "id": "UI-CLOSE-UNSAVED-RECOVERY",
       "title": "Failed close identifies and preserves unsaved page drafts",
       "family": "conflict-resolution",

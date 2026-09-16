@@ -1288,8 +1288,8 @@ function UserMacroView(props: { name: string; template: string; args: string[]; 
   }
 }
 
-// Inline block reference. Bare `((uuid))` shows the referenced block's first
-// line; the labeled form `[label](((uuid)))` shows the label instead. Both
+// Inline block reference. Bare `((uuid))` shows the referenced block's full
+// visible body; the labeled form `[label](((uuid)))` shows the label instead. Both
 // navigate to the source page on click and show a hover preview of the full
 // referenced block (mirrors OG); a missing target falls back to a short id.
 function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
@@ -1317,8 +1317,13 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
     if (resolved === null) return undefined;
     return liveTarget()?.raw ?? resolved?.blocks[0].raw;
   };
-  // Visible text: an explicit label wins; otherwise the target's first line.
-  const text = () => props.label ?? (targetRaw() ? visibleBody(targetRaw()!)[0] : undefined);
+  // An explicit label wins. Bare references retain soft line breaks instead of
+  // silently truncating the referenced block at its first line (GH #506).
+  const lines = () => props.label !== undefined
+    ? [props.label]
+    : targetRaw()
+      ? visibleBody(targetRaw()!)
+      : undefined;
   // Mirror the source's state with its shared recognizer and chip styling.
   // Explicit aliases remain label-only; targetRaw keeps live and unloaded
   // references current without another resolver (GH #518).
@@ -1418,11 +1423,18 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
           else openPageAtBlock({ name: ref.page, pageKind: ref.pageKind, block: ref.uuid, ...(ref.path ? { path: ref.path } : {}) });
         }}
       >
-        <Show when={text() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>
+        <Show when={lines() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>
           <Show when={marker()}>
             {(m) => <><span class={`block-marker marker-${m().toLowerCase()}`}>{m()}</span>{" "}</>}
           </Show>
-          <InlineText text={text()!} format={fmt()} preserveMarker={props.label === undefined} />
+          <For each={lines()!}>
+            {(line, index) => (
+              <>
+                <Show when={index() > 0}><br /></Show>
+                <InlineText text={line} format={fmt()} preserveMarker={props.label === undefined} />
+              </>
+            )}
+          </For>
         </Show>
       </span>
       <Show when={peek.open() && preview() && capped().blocks.length > 0}>

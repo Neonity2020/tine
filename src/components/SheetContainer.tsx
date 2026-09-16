@@ -41,7 +41,7 @@ function observeMainContentForSheets(main: HTMLElement | null, schedule: () => v
   };
 }
 
-export function SheetContainer(props: { children: JSX.Element }): JSX.Element {
+export function SheetContainer(props: { children: JSX.Element; allowBreakout?: boolean }): JSX.Element {
   let el: HTMLDivElement | undefined;
   let scrollEl: HTMLDivElement | undefined;
   let frame = 0;
@@ -107,7 +107,10 @@ export function SheetContainer(props: { children: JSX.Element }): JSX.Element {
       el.style.setProperty("--sheet-breakout-shift", `${breakoutShift}px`);
     }
 
-    el.classList.toggle("sheet-breakout", !nested && naturalWidth > normalWidth + 1);
+    // Block-owned sheets keep their left edge aligned with their bullet and
+    // scroll inside that indented box (GH #473). The breakout machinery stays
+    // available only for an explicitly standalone surface.
+    el.classList.toggle("sheet-breakout", !!props.allowBreakout && !nested && naturalWidth > normalWidth + 1);
     scheduleVerify();
   };
 

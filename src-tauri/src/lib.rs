@@ -1030,6 +1030,13 @@ pub fn run() {
                 .collect();
             drain_concord_ledgers_for_exit(slots.iter().map(|slot| slot.as_ref()));
             mark_clean_shutdown();
+            // tao delivers this callback for WM_ENDSESSION, but on that path its
+            // Windows message loop neither receives WM_QUIT nor switches to an
+            // exiting ControlFlow. Returning would therefore leave Tine alive
+            // until Windows force-terminates it (GH #455). The durability work
+            // above is deliberately bounded, so terminate once it is complete.
+            #[cfg(target_os = "windows")]
+            std::process::exit(0);
         }
     });
 }
@@ -1060,9 +1067,12 @@ mod concord_exit_drain_tests {
         let run = &source[source.find("app.run(|").expect("the event loop")..];
         let run = &run[..run.find("});").expect("the end of the event loop")];
         assert!(
-            run.contains("RunEvent::Exit") && run.contains("drain_concord_ledgers_for_exit("),
+            run.contains("RunEvent::Exit")
+                && run.contains("drain_concord_ledgers_for_exit(")
+                && run.contains("std::process::exit(0)"),
             "I-24: the RunEvent::Exit arm must drain every registered graph's Concord \
-             ledger before Tine exits, beside mark_clean_shutdown()"
+             ledger before Tine exits, beside mark_clean_shutdown(); Windows must then \
+             terminate because WM_ENDSESSION does not break tao's message loop"
         );
         let destroyed = &source[source
             .find("tauri::WindowEvent::Destroyed =>")

@@ -13280,6 +13280,83 @@ fn concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// RESEARCH FIXTURE (2026-09-16, private live-save conflict card; see
+/// tine-agents/opencode/reports/2026-09-16-live-save-conflict-research.md).
+///
+/// Mirrors `scripts/e2e-concord-live-save.mjs`'s quarantined Direct leg at
+/// every decisive difference from the green sibling test above: a ONE-block
+/// page, external replacements that swap the inode (rename, the way
+/// Syncthing/Dropbox and the journey's `atomicReplace` do — twice), and an
+/// all-"mine" decision sweep applied through the durable (restart) capsule
+/// authority. If Apply resolution fails in the app with
+/// `Direct Files could not save (reason code: unknown)`, this fixture is the
+/// narrowest layer that can still see the typed error before the command
+/// boundary flattens it.
+#[test]
+fn research_concord_live_save_all_mine_after_rename_restart() {
+    let root = scratch("research-live-save-all-mine");
+    let path = root.join("pages/B3EKeepDraft.md");
+    let staged = root.join("pages/B3EKeepDraft.md.external");
+    fs::write(&path, "- common mine base\n").unwrap();
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    let mut page = graph
+        .load_by_path("pages/B3EKeepDraft.md")
+        .unwrap()
+        .unwrap();
+    let activation = graph
+        .activate_editor(
+            "pages/B3EKeepDraft.md",
+            ActivationIntent::Replace,
+            page.rev.as_deref(),
+        )
+        .unwrap();
+    page.activation = Some(activation.activation.as_u64());
+    page.blocks[0].raw = "direct retained laptop draft".into();
+    // The journey's `atomicReplace`: a new inode lands under the same name.
+    fs::write(&staged, "- direct current phone body\n").unwrap();
+    fs::rename(&staged, &path).unwrap();
+    let shown = gh254_shown(&graph.save_page(&page, page.rev.as_deref()).unwrap_err());
+    let capture = graph
+        .capture_live_save_conflict(&page, page.rev.as_deref(), shown)
+        .unwrap();
+    drop(graph);
+
+    // The outage write — again a replacement on a fresh inode.
+    fs::write(&staged, "- direct newer phone body during outage\n").unwrap();
+    fs::rename(&staged, &path).unwrap();
+
+    let reopened = Graph::open(&root);
+    reopened.warm_cache();
+    let diff = reopened
+        .durable_live_save_conflict_diff(&page, capture.base_text.as_deref())
+        .unwrap();
+    let decisions = diff
+        .rows
+        .iter()
+        .filter(|row| row.kind != crate::sync_diff::RowKind::Unchanged)
+        .map(|row| (row.id.clone(), "mine".to_owned()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let result =
+        reopened.resolve_durable_live_save_conflict(&page, &diff.conflict_rev, &decisions, "union");
+    match result {
+        Ok(_) => {
+            let resolved = fs::read_to_string(&path).unwrap();
+            assert!(
+                resolved.contains("direct retained laptop draft"),
+                "keep-mine must write the retained draft: {resolved}"
+            );
+        }
+        Err(error) => panic!(
+            "research fixture: durable all-mine resolve failed before the \
+             command boundary: code={} kind={:?} display={error:?}",
+            direct_save_failure_code(&error),
+            error.kind(),
+        ),
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Make `dto` an EDITOR's DTO, the way the frontend does.
 ///
 /// Since increment 3 a loaded page and a live editor are different things: a

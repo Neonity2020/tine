@@ -654,6 +654,14 @@ try {
       const container = block.querySelector(".block-sheet-container");
       const heading = block.querySelector(".heading-text");
       if (!container || boards.length === 0) return { found: true, boards: boards.length, reason: "missing container or board" };
+      // WebDriver scrolls the selected card into view before clicking it. Since
+      // block-owned sheets now overflow through their internal scroller rather
+      // than a negative-margin breakout (GH #473), that expected scroll moves
+      // the board's raw DOM rect left of the clipping viewport. Normalize the
+      // viewport before measuring the layout contract itself.
+      const scroller = container.querySelector(":scope > .sheet-scroll");
+      const priorScrollLeft = scroller?.scrollLeft ?? 0;
+      if (scroller) scroller.scrollLeft = 0;
       const boardRect = boards[0].getBoundingClientRect();
       const containerRect = container.getBoundingClientRect();
       const headingRect = heading?.getBoundingClientRect() ?? null;
@@ -674,6 +682,7 @@ try {
         contained,
         noHeadingOverlap,
         noNextOverlap,
+        priorScrollLeft,
         board: rectObj(boardRect),
         container: rectObj(containerRect),
         heading: headingRect ? rectObj(headingRect) : null,

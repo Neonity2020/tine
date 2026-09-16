@@ -1,6 +1,5 @@
 import { For, Show, Suspense, createEffect, createMemo, createResource, createSignal, createUniqueId, on, onCleanup, onMount, type JSX } from "solid-js";
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
-import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
 import { DiagnosticsTab } from "./DiagnosticsTab";
 import {
@@ -208,9 +207,8 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "backups", label: "Backups & recovery" },
   { id: "graph", label: "Graph" },
   { id: "plugins", label: "Plugins" },
-  { id: "improve", label: "Help improve Tine" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
-  { id: "diagnostics", label: "Diagnostics" },
+  { id: "diagnostics", label: "Help & diagnostics" },
   { id: "about", label: "About" },
 ];
 
@@ -225,7 +223,7 @@ type SettingSearchEntry = {
   desktopOnly?: true;
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
-  { tab: "diagnostics", label: "Diagnostic report", description: "bug report flight recorder timings previous run privacy" },
+  { tab: "diagnostics", label: "Help & diagnostics", description: "bug report flight recorder timings previous run privacy parser divergences anonymize" },
   { tab: "appearance", label: "Theme mode", description: "light dark system" },
   { tab: "appearance", label: "Style", description: "typography journal headings presentation notnote" },
   { tab: "appearance", label: "Color scheme", description: "default nord solarized gruvbox theme package colors" },
@@ -272,7 +270,6 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   },
   { tab: "graph", label: "Graph", description: "folder export publish" },
   { tab: "graph", label: "Home page", description: "home start startup open automatically landing" },
-  { tab: "improve", label: "Help improve Tine", description: "diagnostics divergences anonymize" },
   { tab: "shortcuts", label: "Keyboard shortcuts", description: "key bindings commands remap" },
   { tab: "about", label: "About", description: "version licenses updates" },
 ];
@@ -348,7 +345,7 @@ export function Settings(): JSX.Element {
     const requested = settingsTabRequest();
     if (!requested) return;
     if (requested === "plugins" && settingsPlatformResource.loading) return;
-    setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested);
+    setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested === "improve" ? "diagnostics" : requested);
     clearSettingsTabRequest();
   });
 
@@ -516,9 +513,6 @@ export function Settings(): JSX.Element {
               </Show>
               <Show when={tab() === "plugins" && pluginsAvailable()}>
                 <PluginsTab />
-              </Show>
-              <Show when={tab() === "improve"}>
-                <ImproveTab />
               </Show>
               <Show when={tab() === "shortcuts"}>
                 <ShortcutsSettingsPane

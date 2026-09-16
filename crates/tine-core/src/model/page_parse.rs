@@ -157,6 +157,31 @@ fn replace_page_title_property(raw: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Rebind a page's own Markdown `title::` identity during rename, but only
+/// when it still names the page being moved. An unrelated/custom title is
+/// user content and must not be rewritten merely because the filename moves.
+pub(super) fn rebind_matching_page_title_property(
+    raw: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Option<String> {
+    for line in raw.lines() {
+        let Some((key, value)) = doc::parse_property_line(line) else {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                break;
+            }
+            continue;
+        };
+        if key.eq_ignore_ascii_case("title") {
+            return crate::refs::same_page(value.trim(), old_name)
+                .then(|| replace_page_title_property(raw, new_name))
+                .flatten();
+        }
+    }
+    None
+}
+
 pub(super) fn bind_markdown_title_property(content: &str, name: &str) -> String {
     replace_page_title_property(content, name)
         .unwrap_or_else(|| format!("title:: {name}\n\n{content}"))

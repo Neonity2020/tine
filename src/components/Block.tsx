@@ -201,6 +201,7 @@ import { shouldOpenBlockContextMenu } from "../contextMenuPolicy";
 import { applySheetViewSlashAction } from "./block/sheetSlashAction";
 import { bodyContainsQueryMacro, detectMacro } from "./block/macroDetection";
 import { beginDrag, dragId, dragMoved, dropInd } from "./block/pointerDrag";
+import { DeferredStandaloneMacro } from "./DeferredStandaloneMacro";
 
 export { applySheetViewSlashAction };
 
@@ -883,6 +884,7 @@ function Rendered(props: {
       when={!macro()}
       fallback={
         <div class="block-content macro-host" onMouseDown={onMouseDown}>
+          <DeferredStandaloneMacro blockId={props.id} raw={node().raw}>
           <Switch>
             <Match when={macro()!.kind === "query"}>
               <QueryMacro body={macro()!.inner} blockId={props.id} />
@@ -891,6 +893,7 @@ function Rendered(props: {
               <EmbedMacro body={macro()!.inner} blockId={props.id} />
             </Match>
           </Switch>
+          </DeferredStandaloneMacro>
         </div>
       }
     >
@@ -1791,6 +1794,7 @@ export function Editor(props: { id: string }): JSX.Element {
     && editingId() === token.editingBlockId;
   const reportStaleAsset = () =>
     pushToast("The asset was saved, but it was not inserted because the graph or block changed.", "info");
+  let nativeAssetPickerPending = false;
 
   const insertAssetBytes = async (
     token: AssetEditorToken,
@@ -2006,11 +2010,14 @@ export function Editor(props: { id: string }): JSX.Element {
     const editorToken = captureAssetEditorToken();
     if (!editorToken) return;
     let res;
+    nativeAssetPickerPending = true;
     try {
       res = await backend().capturePhoto();
     } catch (err) {
       pushToast(`Couldn’t capture a photo (${String(err)})`, "error");
       return;
+    } finally {
+      nativeAssetPickerPending = false;
     }
     if (res.status === "ok" && res.path) {
       const candidate = captureAssetFileName(res.ext || "jpg");
@@ -3612,6 +3619,17 @@ export function Editor(props: { id: string }): JSX.Element {
     // edit mode so Escape can restore the caret instead of remounting rendered
     // content underneath the user.
     if (inPageFindPreservesEditorBlur()) {
+      commit(ref.value);
+      savedSel = { start: ref.selectionStart, end: ref.selectionEnd };
+      return;
+    }
+    // Android can blur the WebView editor before document.hasFocus() reflects
+    // that the external camera/file-picker activity covered the app. This is
+    // still the same edit transaction: keep its identity and caret until the
+    // picker returns, so a successfully imported asset can be inserted into
+    // the initiating block (GH #493). Graph/block changes remain guarded by
+    // assetEditorIsCurrent after the native await.
+    if (nativeAssetPickerPending) {
       commit(ref.value);
       savedSel = { start: ref.selectionStart, end: ref.selectionEnd };
       return;

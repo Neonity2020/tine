@@ -14,6 +14,7 @@ import {
 } from "../graphVerification";
 import { platformKind } from "../platform";
 import { pushToast } from "../ui";
+import { ImproveTab } from "./ImproveTab";
 
 export const DIAGNOSTIC_PREVIEW_LIMIT = 64 * 1024;
 const DIAGNOSTIC_PREVIEW_TAIL = 8 * 1024;
@@ -160,7 +161,7 @@ export function DiagnosticsTab() {
 
   return (
     <section class="diagnostics-tab settings-section">
-      <h2>Diagnostics</h2>
+      <h2>Help & diagnostics</h2>
       <p>
         Tine keeps a small, bounded flight recorder for the current and previous run. It records
         operation names, outcomes, timings, counts, platform and build information.
@@ -274,6 +275,10 @@ export function DiagnosticsTab() {
             </div>
           )}
         </Show>
+      </div>
+      <div class="diagnostics-parser-comparison">
+        <h3>Help improve Tine's parser</h3>
+        <ImproveTab />
       </div>
     </section>
   );
