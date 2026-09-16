@@ -1278,6 +1278,12 @@ fn search_cache_isolates_one_page_projection_panic() {
     fs::write(&sibling.path, format!("- {needle}\n")).unwrap();
     let sibling_path = sibling.rel_path.clone();
     let bad_path = bad.rel_path.clone();
+    // Both files were rewritten behind the graph's back, which in the product
+    // is a watcher event. `list_pages` above now joins the shared page-build
+    // flight (GH #550), so without that event the query below would be served
+    // the parse from before these writes and never reach the panic isolation
+    // this test is about. The build is still cold afterwards.
+    g.invalidate_cache();
 
     let execution = crate::query_plan::QueryPlan::friendly(needle, 0, 8).execute_with_explain(
         &g,
@@ -3923,10 +3929,16 @@ fn warm_page_inventory_survives_rename_without_graph_reread_or_reparse() {
         .iter()
         .any(|entry| entry.rel_path == "pages/Original.md"));
     assert!(after_rename.iter().any(|entry| {
-        // An explicit title remains the effective identity; the physical
-        // move must not silently reinterpret it from the new filename.
-        entry.name == "Original" && entry.rel_path == "pages/Renamed.md"
+        // A `title::` that named the page being renamed is rebound by the
+        // rename itself (GH #451), so the effective identity moves with the
+        // file instead of stranding the page under its old name. A title that
+        // named something else is user content and is left alone; that is
+        // `gh451_research.rs`.
+        entry.name == "Renamed" && entry.rel_path == "pages/Renamed.md"
     }));
+    assert!(fs::read_to_string(dir.join("pages/Renamed.md"))
+        .unwrap()
+        .starts_with("title:: Renamed\n"));
     assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
     assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
     let _ = fs::remove_dir_all(&dir);
@@ -12788,7 +12800,14 @@ fn namespace_rename_budget_has_exact_pass_fail_and_retry_boundary() {
         "- [[Project/Child]]\n"
     );
     assert!(!rejected.join("pages/Archive.md").exists());
-    assert!(graph.cache.read().unwrap().is_none());
+    // The rejected rename must leave nothing of itself behind. The parsed
+    // cache may legitimately be warm here — `list_pages` joins the shared
+    // page-build flight (GH #550) — but every page in it must still be the
+    // page that is on disk, which is the graph before the rename.
+    if let Some(pages) = graph.cache.read().unwrap().as_ref() {
+        assert!(pages.iter().any(|(entry, _)| entry.name == "Project"));
+        assert!(!pages.iter().any(|(entry, _)| entry.name == "Archive"));
+    }
     assert!(graph.recent_writes.lock().unwrap().is_empty());
 
     set_graph_text_content_budget_limit(peak);

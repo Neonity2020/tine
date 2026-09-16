@@ -1361,7 +1361,9 @@ mod tests {
         // has neither — otherwise the only discoverable way to set a property is
         // still to type the raw line.
         assert!(page.markdown.contains("**Page properties…**"));
-        assert!(page.markdown.contains("right-click a block for **Properties…**"));
+        assert!(page
+            .markdown
+            .contains("right-click a block for **Properties…**"));
         assert!(page.markdown.contains("**Add a property**"));
         assert!(page.markdown.contains("offers no property editing at all"));
         // A non-ASCII key is an ordinary property, not a curiosity: it was

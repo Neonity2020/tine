@@ -22,16 +22,86 @@ impl Graph {
         // of the page-build flight used by templates, queries and background
         // warm-up. On first open those passes competed for every core and for
         // storage, starving the three-page journal feed (GH #550). Join the
-        // existing generation-scoped flight instead; its install publishes the
-        // same effective, title-aware inventory and parse failures.
-        let entries = self.with_pages(|pages| {
-            pages
-                .iter()
-                .map(|(entry, _)| entry.clone())
-                .collect::<Vec<_>>()
-        });
+        // existing generation-scoped flight instead.
+        //
+        // Except after a known parse failure. `publish_warm_page_inventory`
+        // deliberately leaves the memo absent then, so that the next listing
+        // revalidates the failed path from disk; the flight answers from the
+        // parsed cache, which still holds the page as it was before it became
+        // unreadable, so joining it here would republish exactly the stale
+        // entry that mechanism exists to drop. Cold open has no failures, so
+        // it keeps the shared flight.
+        let entries = if self.page_index_failures.read().unwrap().is_empty() {
+            self.with_pages(|pages| {
+                pages
+                    .iter()
+                    .map(|(entry, _)| entry.clone())
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            match self.exact_page_inventory_from_disk() {
+                Some(entries) => entries,
+                None => return Vec::new(),
+            }
+        };
         *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
         entries
+    }
+
+    /// Read and parse every graph-text file, exactly as it is on disk right
+    /// now, and republish the parse failures found on the way.
+    ///
+    /// This is the expensive path. It exists for one case: a file whose parse
+    /// failed under the watcher must be revalidated from its bytes rather than
+    /// answered from a cache that predates the failure. `None` means the graph
+    /// text scope itself could not be read; the caller then lists nothing, and
+    /// the reason is left in `page_index_failures`.
+    fn exact_page_inventory_from_disk(&self) -> Option<Vec<PageEntry>> {
+        let built = self.admit_retained_graph_text_writer().and_then(|permit| {
+            let entries = self.graph_text_entries(&permit)?;
+            let limits = graph_text_inventory_limits();
+            let mut raw_bytes = 0_u64;
+            let mut effective = Vec::with_capacity(entries.len());
+            let mut failures = Vec::new();
+            for entry in entries {
+                let loaded = self.graph_text_read_optional_text_with_identity(&permit, &entry.path);
+                let parsed = match loaded {
+                    Ok(Some((content, _))) => {
+                        raw_bytes = raw_bytes
+                            .checked_add(usize_to_u64(content.len())?)
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate text bytes")
+                            })?;
+                        if raw_bytes > limits.retained_content_bytes {
+                            return Err(graph_text_inventory_limit_error("aggregate text bytes"));
+                        }
+                        parse_exact_page(self, &entry, &content)
+                    }
+                    Ok(None) => {
+                        failures.push(format!(
+                            "{}: disappeared during graph text listing",
+                            entry.rel_path
+                        ));
+                        continue;
+                    }
+                    Err(error) => Err(error),
+                };
+                match parsed {
+                    Ok((entry, _, _)) => effective.push(entry),
+                    Err(_) => failures.push(entry.rel_path),
+                }
+            }
+            *self.page_index_failures.write().unwrap() = failures;
+            Ok(effective)
+        });
+        match built {
+            Ok(entries) => Some(entries),
+            Err(error) => {
+                *self.page_index_failures.write().unwrap() =
+                    vec![format!("graph-text-scope: {error}")];
+                None
+            }
+        }
     }
 
     /// Publish the exact physical/effective page inventory already represented by
