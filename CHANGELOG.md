@@ -44,6 +44,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **In Unlinked References, the highlighted mention is now the control.** Click a
+  highlighted word to open its source page with that exact mention selected. The
+  numbered jump circles now appear only when the excerpt cannot show every
+  mention — on a short block they repeated what the highlighting already said —
+  and **Show full block** marks every mention instead of dropping the
+  highlighting. Every jump, in both reference panels, now lands on the mention
+  *selected* rather than leaving an invisible caret on it, which is what made the
+  circles look inert on iPhone and iPad. Unlinked-reference highlighting also now
+  uses the same colour as search and the quick switcher; it had been a much
+  fainter tint. (GH #200)
+
 - **Managed Storage, the experimental Testing-only sync mode, is removed.**
   Direct Files is Tine's only storage mode. A graph that used Managed Storage
   opens as an ordinary Markdown/Org graph, and sync between devices stays with

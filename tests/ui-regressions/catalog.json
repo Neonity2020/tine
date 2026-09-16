@@ -11587,6 +11587,31 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before PROVEN on base 3d7f1689 (evidence: tine-agents/evidence/props-164/fail-before/a8-propkey-grammar.log). Updating a non-ASCII-keyed property did not merely fail to take effect: upsertPropertyLine failed to MATCH the existing line and prepended a second line carrying the same key, so the observed result was the new line followed by the stale one. The user-visible harm is therefore duplication in the file on top of an uneditable property. Exact safety/interoperability: the canonical recognizer is crates/tine-core/src/property_line.rs:37-72, transcribed from lsdoc markdown_property_line and shared with lsdoc-wasm. Its rule is not a character class: the key is non-empty and contains no colon, parser space, CR or LF, and :: must be followed by a literal space unless the value is empty - so unicode.klic parses (pinned at property_line.rs:100-103) and key::value does not (:106). The TypeScript matcher PROP_LINE (src/editor/properties.ts:6) is wrong in BOTH directions: narrower on charset (ASCII only) and laxer on the separator (the space is optional). User outcome: a page property with a non-ASCII key is listed by pageProperties (pinned at src/render/block.test.ts:46, src/store.test.ts:259-273, src/editor/properties.test.ts:19-23) but readPageProperty cannot read it and upsertPropertyLine cannot MATCH it, while the new-key path writes it unconditionally - so it can be created and then never updated or deleted. A generalized property editor would list exactly such a row and silently fail to save changes to it, which is why the fix precedes the feature. No existing test pins the buggy behaviour (src/editor/properties.test.ts:68-112 uses only ASCII keys), so widening breaks no pinned expectation. Scope: this row covers the editor's own read/write path only. The app-wide TypeScript recognition census - src/render/block.ts:43,49 isPropertyLine feeding rendering, export and macro detection, plus src/store/paste.ts:77, src/editor/autocomplete.ts:130,162,176,258, src/sheet/renameField.ts:91, src/mock.ts:180 - is deliberately deferred to its own packet, because changing what counts as a property line app-wide moves what renders as a chip versus body text."
+    },
+    {
+      "id": "UI-UNLINKED-REF-OCCURRENCE-MARKS-001",
+      "title": "Unlinked References makes the highlighted mention itself the jump control, and drops the numbered jump row when the excerpt already shows every mention",
+      "family": "references",
+      "sources": {
+        "issues": [
+          200
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ReferenceEvidence.test.tsx",
+          "src/components/UnlinkedReferences.test.tsx"
+        ],
+        "scenario": "references.unlinked-occurrence-marks-are-the-affordance",
+        "failBefore": "proven"
+      },
+      "notes": "GH #200, round 2. Follows UI-BACKLINK-OCCURRENCE-CONTROLS-001, which gated the controls at >1 mention. A reporter on iPadOS then showed a SHORT unlinked-reference block carrying four highlighted marks AND four numbered circles: the excerpt already displayed every mention, so the row said the same thing twice, and because each circle navigates to the same block and differs only in where it leaves the caret, and iOS paints no caret for a programmatic focus, every circle was indistinguishable there. Three changes. (1) A marked run in the unlinked-reference excerpt is now a real button that opens the source page at that mention. (2) OccurrenceControls takes a `visible` count and renders only when total > what the surface already shows - derived from the excerpt, not a tuned constant - so the row survives exactly for mentions past the excerpt's three windows, and 'Show full block' (which now marks every span instead of dropping the highlighting) retires it. (3) Both jump paths, here and in Linked References, land on a SELECTION of the mention rather than a collapsed caret, so the result is visible on every platform. Fail-before proven: the two behaviour tests fail on pre-fix production code while the long-block control arm passes on both sides. Unlinked-reference match highlighting also moved onto the shared --match-mark-bg token: it had been a 22% accent tint, far fainter than the same marking in search and the quick switcher, which is why the reporter asked for a highlight that already existed."
     }
   ]
 }

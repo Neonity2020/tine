@@ -1323,6 +1323,10 @@ mod tests {
         assert!(page
             .markdown
             .contains(":ref/linked-references-collapsed-threshold"));
+        // The unlinked-reference highlight is itself the way into the source
+        // block (GH #200); nothing in the UI announces that a highlighted word
+        // is clickable, so the Guide has to.
+        assert!(page.markdown.contains("the highlight is clickable"));
         assert!(page.markdown.contains("available page/tag chips"));
         assert!(page.markdown.contains("**Copy / export**"));
         assert!(page.markdown.contains("dotted underline"));

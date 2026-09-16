@@ -315,17 +315,21 @@ export function LiveRefGroup(props: {
                       <div class="reference-live-evidence">
                         <OccurrenceControls
                           evidence={item()}
-                          onOccurrence={(offset) => startEditing(
-                            id,
-                            rawOffsetToVisibleOffset(
-                              doc.byId[id]?.raw ?? "",
-                              offset,
-                              isBuiltinHidden,
-                              formatForPage(props.page),
-                            ),
-                            null,
-                            surface,
-                          )}
+                          onOccurrence={(span) => {
+                            // Select the mention rather than collapsing a caret
+                            // onto it: a caret is invisible on iOS, so every
+                            // numbered jump looked identical there (GH #200).
+                            const raw = doc.byId[id]?.raw ?? "";
+                            const format = formatForPage(props.page);
+                            const start = rawOffsetToVisibleOffset(raw, span.start, isBuiltinHidden, format);
+                            const end = rawOffsetToVisibleOffset(raw, span.end, isBuiltinHidden, format);
+                            startEditing(
+                              id,
+                              { start, end: Math.max(start, end), direction: "forward" },
+                              null,
+                              surface,
+                            );
+                          }}
                         />
                       </div>
                     )}
