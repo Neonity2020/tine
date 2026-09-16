@@ -1220,11 +1220,35 @@ pub(crate) fn rank_block_text(
     branch: &QueryBranch,
     visible: &str,
 ) -> Option<BlockTextRank> {
+    rank_block_text_folded(plan, branch, visible, &canonical_fold(visible))
+}
+
+/// [`rank_block_text`] for a caller that ALREADY holds the fold, so ranking a
+/// whole projection does not recompute it per row.
+///
+/// `folded` MUST be exactly `canonical_fold(visible)`; every ranking property
+/// of [`rank_block_text`] is preserved only under that equality, and passing
+/// any other string silently changes which blocks a search admits. The
+/// projection stores the pair in adjacent columns -- `block_text.query_visible`
+/// and `blocks.query_visible_folded`, written together from one
+/// `BlockProjection` -- and that they satisfy this equality on real rows is
+/// pinned by `the_projection_stores_the_exact_fold_of_every_visible_text`, not
+/// by this comment.
+///
+/// `visible` is still required in EVERY mode: the rank key's `text_len`
+/// component counts UTF-16 units of the original, and a regex predicate matches
+/// the original directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn rank_block_text_folded(
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    visible: &str,
+    folded: &str,
+) -> Option<BlockTextRank> {
     if branch.target != QueryTarget::Blocks {
         return None;
     }
-    let lower = canonical_fold(visible);
-    block_relevance(plan, &branch.predicate, visible, &lower)
+    block_relevance(plan, &branch.predicate, visible, folded)
         .map(|relevance| BlockTextRank { relevance })
 }
 

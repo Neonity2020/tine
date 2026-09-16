@@ -2092,6 +2092,66 @@ fn manager_regex_missing_payload_is_a_read_error() {
     );
 }
 
+/// The projection stores each block's exact visible text and its fold in
+/// adjacent columns, and `blocks.query_visible_folded` is EXACTLY
+/// `canonical_fold(block_text.query_visible)` on real rows.
+///
+/// This is a correctness precondition of ranking, not an implementation note.
+/// `read_friendly_plan`'s block rank program reads the STORED fold through
+/// `framed_pair_sql` rather than folding every candidate row, because that
+/// per-row `canonical_fold` measured 72-77% of total search time on a
+/// 605k-block graph (GH #543). If any producer wrote something else into that
+/// column, every search would silently admit the wrong blocks -- and the only
+/// thing standing behind the substitution would be a comment in
+/// `direct_projection.rs` saying the pair is written together from one
+/// `BlockProjection`.
+///
+/// `write_fast_corpus` is deliberately the fixture rather than a new one:
+/// `SHOUTING case`, `Uppercase\u{c9}clair`, the decomposed `Cafe\u{301}` and the
+/// three-space and tab runs each separate the fold from the raw spelling, which
+/// is what lets the final assertion below refuse a vacuous pass.
+#[test]
+fn the_projection_stores_the_exact_fold_of_every_visible_text() {
+    let _serial = serialize();
+    let root = scratch("stored-fold-producer");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let rows = corpus
+        .reader
+        .run_projection_query(
+            "SELECT bt.query_visible, b.query_visible_folded \
+             FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id",
+            &[],
+        )
+        .expect("the projection answers the stored-fold query");
+    assert!(
+        !rows.is_empty(),
+        "the fixture must project blocks for this gate to say anything at all"
+    );
+    let mut differing = 0usize;
+    for row in &rows {
+        let (visible, folded) = match (row.first(), row.get(1)) {
+            (Some(PhysicalQueryValue::Text(visible)), Some(PhysicalQueryValue::Text(folded))) => {
+                (visible, folded)
+            }
+            other => panic!("both columns are TEXT NOT NULL, got {other:?}"),
+        };
+        assert_eq!(
+            folded,
+            &crate::search_query::canonical_fold(visible),
+            "blocks.query_visible_folded must be canonical_fold(block_text.query_visible)"
+        );
+        if folded != visible {
+            differing += 1;
+        }
+    }
+    assert!(
+        differing > 0,
+        "this fixture must hold text whose fold DIFFERS from its visible spelling, \
+         or a producer that stored the raw text would satisfy this gate vacuously"
+    );
+}
+
 #[test]
 fn a_regex_predicate_reads_the_exact_visible_text_through_a_statement_scoped_table() {
     let _serial = serialize();

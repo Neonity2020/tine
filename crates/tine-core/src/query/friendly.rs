@@ -22,9 +22,9 @@ use crate::query::results::{
 };
 use crate::query::sql::{block_sort_expression, page_sort_expression, SortBinder};
 use crate::query_plan::{
-    admitted_block_evidence, admitted_page_evidence, rank_block_text, rank_page_text,
-    ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation, QueryHasMore, QueryHit,
-    QueryPlan, QueryTarget,
+    admitted_block_evidence, admitted_page_evidence, rank_block_text, rank_block_text_folded,
+    rank_page_text, ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation,
+    QueryHasMore, QueryHit, QueryPlan, QueryTarget,
 };
 use crate::vocab::{BlockDto, PageEntry, PageKind};
 
@@ -207,11 +207,17 @@ pub(crate) fn read_friendly_results(
             QueryTarget::Blocks => {
                 let rank_plan = Arc::clone(&plan);
                 let rank_branch = branch.clone();
-                let rank = programs.bind(move |visible| {
+                // The fold arrives from the projection's own
+                // `blocks.query_visible_folded` rather than being recomputed for
+                // every candidate row: on a 605k-block graph the per-row
+                // `canonical_fold` was 72-77% of total search time.
+                let rank = programs.bind_pair(move |visible, folded| {
                     #[cfg(test)]
                     run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
-                    Ok(rank_block_text(&rank_plan, &rank_branch, visible)
-                        .map(|rank| rank.order_key().to_vec()))
+                    Ok(
+                        rank_block_text_folded(&rank_plan, &rank_branch, visible, folded)
+                            .map(|rank| rank.order_key().to_vec()),
+                    )
                 });
                 branches.push(BoundBranch::Blocks {
                     branch: branch.clone(),
@@ -546,6 +552,9 @@ fn read_pages(
     let content_ctes = content.map(|(_, rank)| {
         params.push(PhysicalQueryValue::Integer(rank as i64));
         let program = params.len();
+        // Page-by-content reuses the Blocks branch's already-bound program, so
+        // it must frame its pair exactly as that statement does.
+        let framed_block_text = framed_pair_sql("bt.query_visible", "b.query_visible_folded");
         // In Both, a page that also matched by name keeps its NAMES winner:
         // the union is by physical identity, and the name evidence is the
         // stronger statement about why the page is in the answer.
@@ -557,7 +566,7 @@ fn read_pages(
         format!(
             "content_ranked AS MATERIALIZED (\
                  SELECT b.page_id, bt.query_visible AS matched_text, \
-                        tine_query_rank(?{program}, bt.query_visible) AS content_key \
+                        tine_query_rank(?{program}, {framed_block_text}) AS content_key \
                  FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id\
              ), content_choices AS (\
                  SELECT k.*, ROW_NUMBER() OVER (\
@@ -892,6 +901,12 @@ fn read_blocks(
         format!("{}, r.path COLLATE BINARY, r.preorder", authored.join(", "))
     };
     let limit = limit_clause(branch.limit, &mut params);
+    // `(exact visible text, its stored fold)` framed for `bind_pair`, so ranking
+    // this statement's candidate rows does not recompute the fold per row. Both
+    // columns are `TEXT NOT NULL` and `b` is the driving table here, so the
+    // framing can never see a NULL operand and silently drop a row; the
+    // `bt.block_id IS NULL` arm below keeps textless blocks out of the call.
+    let framed_block_text = framed_pair_sql("bt.query_visible", "b.query_visible_folded");
     let sql = format!(
         "WITH ranked AS MATERIALIZED (\
              SELECT b.block_id, b.page_id, b.parent_block_id, b.order_key, \
@@ -899,7 +914,7 @@ fn read_blocks(
                     q.page_id AS result_page_id, q.preorder, q.result_id, q.estimated_bytes, q.tag_count, \
                     q.property_count, \
                     CASE WHEN bt.block_id IS NULL THEN zeroblob(1) \
-                         ELSE tine_query_rank(?1, bt.query_visible) END AS rank_key, \
+                         ELSE tine_query_rank(?1, {framed_block_text}) END AS rank_key, \
                     CASE WHEN bt.block_id IS NULL THEN 1 ELSE 0 END AS missing_text \
              FROM blocks b \
              LEFT JOIN block_text bt ON bt.block_id = b.block_id \
