@@ -194,6 +194,25 @@ export function SheetContainer(props: { children: JSX.Element; allowBreakout?: b
       scheduleMeasureAfterDelay(150);
     }, () => scheduleMeasureAfterFrames(2));
     const unobserveMain = observeMainContentForSheets(el.closest(".main-content") as HTMLElement | null, scheduleMeasure);
+    let surface = scrollEl?.firstElementChild ?? null;
+    let resizeObserver: ResizeObserver | null = null;
+    const surfaceObserver = typeof MutationObserver === "undefined" || !scrollEl
+      ? null
+      : new MutationObserver(() => {
+          const next = scrollEl?.firstElementChild ?? null;
+          if (next === surface) return;
+          if (surface) resizeObserver?.unobserve(surface);
+          surface = next;
+          if (surface) resizeObserver?.observe(surface);
+          // A wide Table can leave this shared viewport scrolled hundreds of
+          // pixels right. When the user switches to Board/Grid, carrying that
+          // offset makes the new surface begin left of its owning block even
+          // though the container itself is correctly aligned (GH #473).
+          if (scrollEl) scrollEl.scrollLeft = 0;
+          scheduleMeasure();
+        });
+    surfaceObserver?.observe(scrollEl!, { childList: true });
+    onCleanup(() => surfaceObserver?.disconnect());
     if (typeof ResizeObserver === "undefined") {
       window.addEventListener("resize", scheduleMeasure);
       onCleanup(() => {
@@ -203,15 +222,15 @@ export function SheetContainer(props: { children: JSX.Element; allowBreakout?: b
       });
       return;
     }
-    const ro = new ResizeObserver(scheduleMeasure);
-    ro.observe(el);
-    if (scrollEl) ro.observe(scrollEl);
-    if (scrollEl?.firstElementChild) ro.observe(scrollEl.firstElementChild);
-    if (el.parentElement) ro.observe(el.parentElement);
+    resizeObserver = new ResizeObserver(scheduleMeasure);
+    resizeObserver.observe(el);
+    if (scrollEl) resizeObserver.observe(scrollEl);
+    if (surface) resizeObserver.observe(surface);
+    if (el.parentElement) resizeObserver.observe(el.parentElement);
     window.addEventListener("resize", scheduleMeasure);
     onCleanup(() => {
       cancelScheduledMeasures();
-      ro.disconnect();
+      resizeObserver?.disconnect();
       window.removeEventListener("resize", scheduleMeasure);
       unobserveMain();
     });
