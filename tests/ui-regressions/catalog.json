@@ -2,6 +2,48 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-WINDOWS-SESSION-END-EXIT-455",
+      "title": "Windows session shutdown terminates Tine after its bounded durability drain",
+      "family": "lifecycle",
+      "sources": {
+        "issues": [455],
+        "commits": []
+      },
+      "platforms": ["windows"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/windowsShutdownCloseGate.test.ts",
+          "src-tauri/src/lib.rs::concord_exit_drain_tests"
+        ],
+        "scenario": "lifecycle.windows-session-end-exits",
+        "failBefore": "proven"
+      },
+      "notes": "GH #455. tao delivers RunEvent::Exit for WM_ENDSESSION but its Windows message loop does not receive WM_QUIT or an exit control-flow transition. Tine now terminates the Windows process only after its existing bounded Concord drain and clean-shutdown marker. The source-level state-machine fixture proves the old non-exit; final Windows-host shutdown verification remains a platform boundary."
+    },
+    {
+      "id": "UI-ANDROID-NATIVE-PICKER-EDITOR-493",
+      "title": "An Android picker blur does not discard the editor that initiated durable asset insertion",
+      "family": "media",
+      "sources": {
+        "issues": [493],
+        "commits": []
+      },
+      "platforms": ["android"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.mobileCapture.test.tsx",
+          "src/components/Block.assetPaste.test.tsx"
+        ],
+        "scenario": "media.android-picker-preserves-initiating-editor",
+        "failBefore": "proven"
+      },
+      "notes": "GH #493. The native picker and durable import succeeded, but Android could deliver the editor blur before document focus changed, ending edit identity and refusing Markdown insertion. The initiating block now treats blur as transient only while its own native picker is pending; graph and block staleness guards remain intact. On-device verification remains required."
+    },
+    {
       "id": "UI-JOURNAL-ISO-LINKED-REFERENCES-481",
       "title": "A journal collects linked references written in another accepted date spelling",
       "family": "references",

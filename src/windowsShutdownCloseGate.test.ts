@@ -38,7 +38,7 @@ interface SessionEndLoop {
  *  full trace. The one behavior that makes this fixture fail-against-a-fix:
  *  the WM_ENDSESSION path delivers Tine's exit callback but never breaks the
  *  message loop, so nothing but the OS can end the process. */
-function createSessionEndLoop(tineExitCallback: () => void): SessionEndLoop {
+function createSessionEndLoop(tineExitCallback: () => number | undefined): SessionEndLoop {
   let clockMs = 0;
   let controlFlow: "wait" | "exit" = "wait";
   let exitCallbackRan = false;
@@ -63,7 +63,7 @@ function createSessionEndLoop(tineExitCallback: () => void): SessionEndLoop {
     // marks the clean shutdown, then returns.
     wmEndSession() {
       if (controlFlow !== "exit") controlFlow = "wait";
-      tineExitCallback();
+      processExit = tineExitCallback();
       exitCallbackRan = true;
     },
     // tauri-runtime-wry lib.rs:4361 Message::RequestExit — AppHandle::exit.
@@ -171,30 +171,28 @@ function safeCloseHarness(overrides: Partial<SafeCloseDeps> = {}) {
   return { deps, safeClose: createSafeCloseCoordinator(deps) };
 }
 
-describe("GH #455 research: Windows session-end exit machine", () => {
-  it("agrees to WM_QUERYENDSESSION, runs the exit callback on WM_ENDSESSION, then never exits — only the OS can kill it", () => {
+describe("GH #455: Windows session-end exit machine", () => {
+  it("agrees to WM_QUERYENDSESSION and exits after Tine's bounded cleanup callback", () => {
     const drained: string[] = [];
-    const loop = createSessionEndLoop(() => drained.push("drain+marker"));
+    const loop = createSessionEndLoop(() => {
+      drained.push("drain+marker");
+      return 0;
+    });
 
     expect(loop.wmQueryEndSession()).toBe("agree");
     loop.wmEndSession();
     expect(loop.exitCallbackRan()).toBe(true);
     expect(drained).toEqual(["drain+marker"]);
 
-    // Well past both Windows timeouts the process is still alive: Tine has
-    // answered every message, yet never self-terminates, so the OS shows the
-    // "app is preventing shutdown" screen naming Tine and finally
-    // force-terminates it. This is the reported behavior, every time.
+    expect(loop.processExitCode()).toBe(0);
     loop.pump(WINDOWS_HUNG_APP_TIMEOUT_MS + 1_000);
-    expect(loop.hungScreenShownAt()).not.toBeNull();
-    expect(loop.processExitCode()).toBeUndefined();
+    expect(loop.hungScreenShownAt()).toBeNull();
     loop.pump(WINDOWS_WAIT_TO_KILL_APP_TIMEOUT_MS + 1_000);
-    expect(loop.forceKilledAt()).not.toBeNull();
-    expect(loop.processExitCode()).toBeUndefined();
+    expect(loop.forceKilledAt()).toBeNull();
   });
 
   it("normal control: AppHandle::exit breaks the loop at the first boundary and the process exits", () => {
-    const loop = createSessionEndLoop(() => {});
+    const loop = createSessionEndLoop(() => undefined);
     loop.requestExit(0);
     loop.pump(1);
     expect(loop.processExitCode()).toBe(0);
@@ -274,7 +272,7 @@ describe("GH #455 research: close-request gate", () => {
   });
 });
 
-describe("GH #455 research: master still carries the causal shapes", () => {
+describe("GH #455: production exit shapes", () => {
   it("App.tsx still turns every close request into a prevented, async transaction", () => {
     const app = readFileSync("src/App.tsx", "utf8");
     expect(app).toContain("unlisten = await w.onCloseRequested(async (e) => {");
@@ -288,7 +286,7 @@ describe("GH #455 research: master still carries the causal shapes", () => {
     expect(app).toContain("await w.close();");
   });
 
-  it("the RunEvent::Exit callback cleans up but cannot exit the process itself", () => {
+  it("the RunEvent::Exit callback cleans up and terminates Windows itself", () => {
     const lib = readFileSync("src-tauri/src/lib.rs", "utf8");
     const start = lib.indexOf("app.run(|");
     expect(start).toBeGreaterThanOrEqual(0);
@@ -296,10 +294,6 @@ describe("GH #455 research: master still carries the causal shapes", () => {
     expect(run).toContain("RunEvent::Exit");
     expect(run).toContain("drain_concord_ledgers_for_exit(");
     expect(run).toContain("mark_clean_shutdown()");
-    // The process exit must come from the runtime on this path — and on
-    // WM_ENDSESSION, traced through tao/tauri-runtime-wry/tauri, it never
-    // does. Tine's callback ends the drain and returns into a message loop
-    // that only the OS terminates.
-    expect(run).not.toMatch(/process::exit|app\.exit/);
+    expect(run).toContain("std::process::exit(0)");
   });
 });

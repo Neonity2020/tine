@@ -107,7 +107,7 @@ function startCaptureWithPickerUp(handles: CaptureHandles): ReturnType<typeof mo
 }
 
 describe("mobile photo capture editor-token staleness (GH #493)", () => {
-  it("saves the picked asset but refuses insertion when the picker's blur exits edit mode", async () => {
+  it("preserves the initiating editor across Android's picker blur and inserts the saved asset", async () => {
     loadSingle(page("Assets", [blk("photo-android", "")]));
     const id = pageByName("Assets")!.roots[0];
     startEditing(id, 0);
@@ -138,12 +138,11 @@ describe("mobile photo capture editor-token staleness (GH #493)", () => {
       handles.finishImport("20260916_120000_123-1.jpg");
       await settle();
 
-      // The asset WAS durably saved (import ran) but no Markdown was inserted,
-      // and the exact stale-asset toast is the only report of it.
+      // The asset was durably saved and the same initiating editor receives
+      // the Markdown despite Android's focus-event ordering.
       expect(backend().importNativeCapture).toHaveBeenCalledOnce();
-      expect(doc.byId[id].raw).toBe("");
-      expect(doc.byId[id].raw).not.toContain("../assets/");
-      expect(toasts().some((toast) => toast.message === STALE_ASSET_TOAST)).toBe(true);
+      expect(doc.byId[id].raw).toBe("![](../assets/20260916_120000_123-1.jpg)");
+      expect(toasts().some((toast) => toast.message === STALE_ASSET_TOAST)).toBe(false);
     } finally {
       dispose();
     }
