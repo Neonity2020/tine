@@ -20,14 +20,10 @@
 //!   and should pass after the fix): after the rename, the page must answer
 //!   to its NEW name.
 
-use std::collections::HashMap;
-use std::io;
 use std::path::PathBuf;
 
-use tine_core::model::direct_save_conflict_epoch;
-use tine_core::model::{BlockDto, PageKind};
-use tine_core::sync_diff::{DiffRow, RowKind};
-use tine_core::{ConflictOverride, EditorActivationHandle, Graph, PageDto};
+use tine_core::model::PageKind;
+use tine_core::Graph;
 
 const OLD_NAME: &str = "tine-guide/Feature Showcase";
 const NEW_NAME: &str = "tine-guide2/Feature Showcase";
@@ -79,48 +75,8 @@ fn old_path(root: &std::path::Path) -> PathBuf {
     root.join("pages").join("tine-guide%2FFeature Showcase.md")
 }
 
-/// An absent-editor DTO exactly the way the frontend builds one for the empty
-/// route (`emptyPage` + `activateAbsentEditor`): no path, no revision, an
-/// activation minted against the prospective target.
-fn first_edit_dto(graph: &Graph) -> (PageDto, EditorActivationHandle) {
-    let handle = graph
-        .activate_absent_editor(NEW_NAME, PageKind::Page)
-        .expect("absent-editor activation for the renamed destination");
-    let dto = PageDto {
-        name: NEW_NAME.into(),
-        kind: PageKind::Page,
-        title: NEW_NAME.into(),
-        pre_block: None,
-        blocks: vec![BlockDto {
-            // A real UUID: the projection refuses a placeholder id.
-            id: "4510a2e-6f3a-4b1e-9a11-2c3d4e5f6a7b".into(),
-            raw: "first edit on the empty route".into(),
-            ..Default::default()
-        }],
-        rev: None,
-        format: Default::default(),
-        read_only: false,
-        path: String::new(),
-        activation: Some(handle.activation.as_u64()),
-        guide: false,
-    };
-    (dto, handle)
-}
-
-fn accept_suggestions(rows: &[DiffRow], out: &mut HashMap<String, String>) {
-    for row in rows {
-        if row.kind != RowKind::Unchanged {
-            out.insert(
-                row.id.clone(),
-                row.suggestion.clone().unwrap_or_else(|| "both".to_owned()),
-            );
-        }
-        accept_suggestions(&row.children, out);
-    }
-}
-
 #[test]
-fn gh451_current_state_namespace_rename_sequence() {
+fn gh451_namespace_rename_rebinds_identity_and_survives_restart() {
     let (root, graph) = gh451_graph("current");
 
     // The reporter's rename: only the namespace prefix changes.
@@ -139,101 +95,47 @@ fn gh451_current_state_namespace_rename_sequence() {
         "referrer must be rewritten: {referrer}"
     );
 
-    // (b) CURRENT BEHAVIOR: the moved file's `title::` is STALE — it still
-    // names the OLD page.
+    // The moved page's own identity property follows the file move.
     let content = std::fs::read_to_string(&moved).unwrap();
     assert!(
-        content.contains("title:: tine-guide/Feature Showcase"),
-        "current state: stale title:: after rename: {content}"
+        content.contains("title:: tine-guide2/Feature Showcase"),
+        "renamed title:: missing: {content}"
     );
-    assert!(!content.contains("title:: tine-guide2/Feature Showcase"));
+    assert!(!content.contains("title:: tine-guide/Feature Showcase"));
 
-    // (c) CURRENT BEHAVIOR: the effective (title::-aware) identity is still
-    // the OLD name; no page answers to the new name.
+    // The effective identity, routing and link existence all move together.
     let pages = graph.list_pages();
     assert!(
         pages
             .iter()
-            .any(|p| p.name == "tine-guide/Feature Showcase"),
-        "current state: page list still carries the old effective name: {:?}",
+            .any(|p| p.name == "tine-guide2/Feature Showcase"),
+        "new identity missing: {:?}",
         pages.iter().map(|p| p.name.clone()).collect::<Vec<_>>()
     );
     assert!(!pages
         .iter()
-        .any(|p| p.name == "tine-guide2/Feature Showcase"));
-    assert!(
-        graph
-            .existing_page_names(&[NEW_NAME.to_string()])
-            .is_empty(),
-        "current state: the new name is a dead link"
+        .any(|p| p.name == "tine-guide/Feature Showcase"));
+    assert_eq!(
+        graph.existing_page_names(&[NEW_NAME.to_string()]),
+        vec![NEW_NAME.to_string()]
     );
-
-    // (d) CURRENT BEHAVIOR: routing to the new name finds nothing → the app
-    // opens an absent editor → the user sees an EMPTY page.
     assert!(
         graph
             .load_named(NEW_NAME, PageKind::Page)
             .expect("load_named")
-            .is_none(),
-        "current state: the renamed destination does not resolve"
+            .is_some(),
+        "renamed destination must resolve"
     );
 
-    // (e) CURRENT BEHAVIOR: the first edit on that empty route cannot save —
-    // the moved file is on disk under the new name's target path, so the save
-    // meets a baseline it never loaded (SaveBaselinePresent) and raises the
-    // conflict capsule.
-    let (first_edit, _handle) = first_edit_dto(&graph);
-    let refusal = graph
-        .save_page(&first_edit, None)
-        .expect_err("current state: first edit on the empty route must conflict");
-    assert_eq!(refusal.kind(), io::ErrorKind::AlreadyExists, "{refusal}");
-    let epoch = direct_save_conflict_epoch(&refusal)
-        .expect("the refusal must be a banner-class conflict carrying its observation epoch");
-    let shown = ConflictOverride {
-        observation_epoch: epoch,
-    };
-
-    // (f) The user merges ("Apply resolution" with the default union
-    // pre-block choice) — this is the app's live-save conflict resolution.
-    let diff = graph
-        .live_save_conflict_diff(&first_edit, None, shown)
-        .expect("live-save conflict diff");
-    let mut decisions = HashMap::new();
-    accept_suggestions(&diff.rows, &mut decisions);
-    let resolved = graph
-        .resolve_live_save_conflict(&first_edit, None, shown, &decisions, "union")
-        .expect("apply resolution");
-    // In-session the resolved DTO carries the new name, so the page LOOKS
-    // right ("Tine shows the page with the title changed")…
-    assert_eq!(resolved.name, NEW_NAME);
-
-    // (g) CURRENT BEHAVIOR: …but the merged file on disk KEEPS the stale
-    // `title::` (union_pre takes the on-disk side's pre-block; an existing
-    // file never re-binds its title at save).
-    let merged = std::fs::read_to_string(&moved).unwrap();
-    assert!(
-        merged.contains("title:: tine-guide/Feature Showcase"),
-        "current state: the merge must not repair the stale title:: — it does not: {merged}"
-    );
-    assert!(merged.contains("first edit on the empty route"), "{merged}");
-
-    // (h) CURRENT BEHAVIOR: restart — the merged page still does not answer to
-    // its new name, so the loop repeats from (d).
+    // Reopen recomputes identity from disk and must preserve the corrected route.
     drop(graph);
     let graph = Graph::open(&root);
     assert!(
         graph
             .load_named(NEW_NAME, PageKind::Page)
             .expect("load_named")
-            .is_none(),
-        "current state: after restart the merged page still routes empty"
-    );
-    assert!(
-        graph
-            .list_pages()
-            .iter()
-            .any(|p| p.name == "tine-guide/Feature Showcase"),
-        "current state: after restart the effective identity is still the old name"
+            .is_some(),
+        "after restart the renamed page must still resolve"
     );
 
     drop(graph);
@@ -241,7 +143,7 @@ fn gh451_current_state_namespace_rename_sequence() {
 }
 
 #[test]
-fn gh451_current_state_real_guide_copy() {
+fn gh451_real_guide_copy_rename_rebinds_identity() {
     // Fidelity variant: the reporter's literal first step — "Copy the guide
     // inside your graph (pressing the button to do it)" — through the real
     // onboarding code path, then the same rename.
@@ -275,8 +177,6 @@ fn gh451_current_state_real_guide_copy() {
         )
         .expect("rename succeeds");
 
-    // CURRENT BEHAVIOR: the moved guide page keeps its stale `title::`, the
-    // effective identity stays the old name, and the new name routes nowhere.
     let guide_file = root.join("pages").join("tine-guide2%2FFeature Showcase.md");
     assert!(
         guide_file.exists(),
@@ -285,25 +185,25 @@ fn gh451_current_state_real_guide_copy() {
     );
     let content = std::fs::read_to_string(&guide_file).unwrap();
     assert!(
-        content.contains("title:: tine-guide/Feature showcase"),
-        "current state: stale guide title:: after rename: {content}"
+        content.contains("title:: tine-guide2/Feature Showcase"),
+        "guide title:: must follow rename: {content}"
     );
     let pages = graph.list_pages();
     assert!(
         pages
             .iter()
-            .any(|p| p.name == "tine-guide/Feature showcase"),
-        "current state: effective identity is still the old name"
+            .any(|p| p.name == "tine-guide2/Feature Showcase"),
+        "guide must use its new effective identity"
     );
     assert!(!pages
         .iter()
-        .any(|p| p.name == "tine-guide2/Feature Showcase"));
+        .any(|p| p.name == "tine-guide/Feature showcase"));
     assert!(
         graph
             .load_named("tine-guide2/Feature Showcase", PageKind::Page)
             .expect("load_named")
-            .is_none(),
-        "current state: the renamed destination routes to an empty page"
+            .is_some(),
+        "renamed guide destination must route to its content"
     );
 
     drop(graph);

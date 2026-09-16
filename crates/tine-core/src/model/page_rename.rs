@@ -294,7 +294,16 @@ impl Graph {
                 rename_rewrite_upper_bound(&inline, &rename_map, false)?,
                 "graph rename tags rewrite construction bound",
             )?;
-            let updated = crate::refs::rename_tags_property_multi(&inline, &rename_map, is_org);
+            let mut updated = crate::refs::rename_tags_property_multi(&inline, &rename_map, is_org);
+            if move_dst.contains_key(&entry.path) {
+                if let Some(new_name) = rename_map.get(&crate::refs::normalize(&entry.name)) {
+                    if let Some(rebound) =
+                        rebind_matching_page_title_property(&updated, &entry.name, new_name)
+                    {
+                        updated = rebound;
+                    }
+                }
+            }
             updated_reservation.resize(
                 usize_to_u64(updated.capacity())?,
                 "graph rename replacement bytes",

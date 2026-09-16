@@ -3,6 +3,43 @@
  "entries": [
 
 {
+ "id": "REG-PAGE-RENAME-REBIND-TITLE-451",
+ "title": "Renaming a page rebinds an own title property that carries its old identity",
+ "family": "direct-files",
+ "sources": {
+  "issues": [451],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/tests/gh451_research.rs"],
+  "scenario": "direct-files.rename-rebinds-own-title",
+  "failBefore": "proven"
+ },
+ "notes": "GH #451. A namespace page copied from the guide carried title:: old/name; rename moved its file and references but left that identity property stale, so the new route was empty and first edit conflicted. The rename transaction now rebinds only an own title property equal to the moved page's old identity."
+},
+{
+ "id": "REG-COLD-OPEN-SHARED-PAGE-BUILD-550",
+ "title": "Cold page inventory shares the whole-graph parse flight with startup consumers",
+ "family": "direct-files",
+ "sources": {
+  "issues": [550],
+  "commits": []
+ },
+ "platforms": ["all"],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": ["crates/tine-core/tests/issue550_cold_open_contention.rs"],
+  "scenario": "direct-files.cold-open-single-page-build-flight",
+  "failBefore": "proven"
+ },
+ "notes": "GH #550. list_pages and find_entry used an independent cold whole-graph parse while templates and warm-up owned the page-build flight, starving first content on slower Android hardware. Inventory now joins the shared flight, removing the duplicate parse. Android wall-clock verification remains a platform boundary."
+},
+
+{
  "id": "REG-QE-BLOCK-INDEXED-BACKLINK-NARROWING",
  "title": "Indexed explicit-reference candidate blocks preserve walked results while reducing classifications",
  "family": "query-engine",

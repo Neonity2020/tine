@@ -18,50 +18,18 @@ impl Graph {
             *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
             return entries;
         }
-        let entries = match self.admit_retained_graph_text_writer().and_then(|permit| {
-            let entries = self.graph_text_entries(&permit)?;
-            let limits = graph_text_inventory_limits();
-            let mut raw_bytes = 0_u64;
-            let mut effective = Vec::with_capacity(entries.len());
-            let mut failures = Vec::new();
-            for entry in entries {
-                let loaded = self.graph_text_read_optional_text_with_identity(&permit, &entry.path);
-                let parsed = match loaded {
-                    Ok(Some((content, _))) => {
-                        raw_bytes = raw_bytes
-                            .checked_add(usize_to_u64(content.len())?)
-                            .ok_or_else(|| {
-                                graph_text_inventory_limit_error("aggregate text bytes")
-                            })?;
-                        if raw_bytes > limits.retained_content_bytes {
-                            return Err(graph_text_inventory_limit_error("aggregate text bytes"));
-                        }
-                        parse_exact_page(self, &entry, &content)
-                    }
-                    Ok(None) => {
-                        failures.push(format!(
-                            "{}: disappeared during graph text listing",
-                            entry.rel_path
-                        ));
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                };
-                match parsed {
-                    Ok((entry, _, _)) => effective.push(entry),
-                    Err(_) => failures.push(entry.rel_path),
-                }
-            }
-            *self.page_index_failures.write().unwrap() = failures;
-            Ok(effective)
-        }) {
-            Ok(entries) => entries,
-            Err(error) => {
-                *self.page_index_failures.write().unwrap() =
-                    vec![format!("graph-text-scope: {error}")];
-                return Vec::new();
-            }
-        };
+        // Cold inventory used to run its own whole-graph parse, independently
+        // of the page-build flight used by templates, queries and background
+        // warm-up. On first open those passes competed for every core and for
+        // storage, starving the three-page journal feed (GH #550). Join the
+        // existing generation-scoped flight instead; its install publishes the
+        // same effective, title-aware inventory and parse failures.
+        let entries = self.with_pages(|pages| {
+            pages
+                .iter()
+                .map(|(entry, _)| entry.clone())
+                .collect::<Vec<_>>()
+        });
         *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
         entries
     }
