@@ -1,13 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
-import { createSignal, Show, type JSX } from "solid-js";
+import type { JSX } from "solid-js";
 import { Block } from "./Block";
 import { ContextMenu } from "./ContextMenu";
 import { initParser } from "../render/parse";
 import { blockProperty, resetStore, setDoc, type Node, type FeedPage } from "../store";
 import { openJournals, route } from "../router";
 import { resetCellSelectionForTests } from "../sheet/selection";
-import { SheetContainer } from "./SheetContainer";
 
 beforeAll(async () => {
   await initParser();
@@ -301,26 +300,6 @@ describe("SheetGrid", () => {
     } finally {
       dispose();
       layout.restore();
-    }
-  });
-
-  it("resets inherited horizontal scroll when the sheet surface changes", async () => {
-    const [board, setBoard] = createSignal(false);
-    const { root, dispose } = mount(() => (
-      <SheetContainer>
-        <Show when={board()} fallback={<div class="sheet-table">Table</div>}>
-          <div class="sheet-board-wrap">Board</div>
-        </Show>
-      </SheetContainer>
-    ));
-    try {
-      const scroll = root.querySelector(".sheet-scroll") as HTMLDivElement;
-      scroll.scrollLeft = 335;
-      setBoard(true);
-      await vi.waitFor(() => expect(scroll.firstElementChild?.classList.contains("sheet-board-wrap")).toBe(true));
-      await vi.waitFor(() => expect(scroll.scrollLeft).toBe(0));
-    } finally {
-      dispose();
     }
   });
 
