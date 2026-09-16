@@ -182,10 +182,18 @@ async function proveBacktickScaffold() {
   await browser.keys(["`"]);
   await browser.keys(["`"]);
   await browser.keys(["`"]);
+  // GH #507: the scaffold offers the language picker on its opener line, which
+  // stays visible so a language can be typed at all. Declining it with Escape
+  // is what lands the caret inside the body-only view (the GH #413 outcome).
+  await browser.waitUntil(async () => {
+    const receipt = await activeEditorReceipt("507-fence-language-picker");
+    return receipt.active && receipt.value.includes("```") && receipt.selectionStart === 3;
+  }, { timeout: 5_000, timeoutMsg: "third backtick did not offer the fence language picker on the opener line" });
+  await browser.keys(["Escape"]);
   await browser.waitUntil(async () => {
     const receipt = await activeEditorReceipt("413-backtick-scaffold");
     return receipt.active && !receipt.value.includes("```") && receipt.selectionStart === 0 && receipt.selectionEnd === 0;
-  }, { timeout: 5_000, timeoutMsg: "third backtick did not enter the body-only scaffold interior" });
+  }, { timeout: 5_000, timeoutMsg: "declining the language picker did not enter the body-only scaffold interior" });
   await browser.keys(["Escape"]);
   await browser.waitUntil(() => (fs.readFileSync(PAGE_FILE, "utf8").match(/```/g) ?? []).length === 4, {
     timeout: 10_000,

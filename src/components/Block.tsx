@@ -1362,6 +1362,26 @@ export function Editor(props: { id: string }): JSX.Element {
     const p = codeShown();
     return p ? codeBodyJoin(p, text) : null;
   };
+  // One door to the fence language picker: `/Code block` and the hand-typed
+  // ``` scaffold both come here (GH #507). While it is open `codeShown` keeps
+  // the raw view, so the opener line the language goes on stays visible;
+  // choosing a language — or Escape — then drops into the body-only code view.
+  const openFenceLanguagePicker = (raw: string, fenceEnd: number) => {
+    setAc({ kind: "code-language", query: "", start: fenceEnd, end: fenceEnd });
+    setAcIndex(0);
+    setAcItems(codeLanguageItems("").map((language) => ({
+      label: language.label,
+      sub: [language.id, ...language.aliases].join(" · "),
+      insert: language.id,
+      caret: language.id.length + 1,
+    })));
+    queueMicrotask(() => {
+      ref.value = raw;
+      ref.setSelectionRange(fenceEnd, fenceEnd);
+      ref.focus();
+      autosize();
+    });
+  };
   const [propertyValueKey, setPropertyValueKey] = createSignal<string | null>(null);
   let propertyFacets: [string, string[]][] = [];
   let acListRef: HTMLDivElement | undefined;
@@ -2361,31 +2381,11 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
       case "code-block": {
-        // Keep the familiar complete fence scaffold, but open the language
-        // picker immediately even though an empty hand-typed fence stays quiet.
-        const scaffold = "```\n\n```";
-        const result = applyCompletion(ref.value, t.start, t.end, scaffold, 3);
-        const languageTrigger: Trigger = {
-          kind: "code-language",
-          query: "",
-          start: t.start + 3,
-          end: t.start + 3,
-        };
+        // The familiar complete fence scaffold, with the language picker open on
+        // its opener line — the same door the hand-typed ``` scaffold uses.
+        const result = applyCompletion(ref.value, t.start, t.end, "```\n\n```", 3);
         commit(result.raw);
-        setAc(languageTrigger);
-        setAcIndex(0);
-        setAcItems(codeLanguageItems("").map((language) => ({
-          label: language.label,
-          sub: [language.id, ...language.aliases].join(" · "),
-          insert: language.id,
-          caret: language.id.length + 1,
-        })));
-        queueMicrotask(() => {
-          ref.value = result.raw;
-          ref.setSelectionRange(result.caret, result.caret);
-          ref.focus();
-          autosize();
-        });
+        openFenceLanguagePicker(result.raw, result.caret);
         return;
       }
       case "page-props": {
@@ -2723,8 +2723,10 @@ export function Editor(props: { id: string }): JSX.Element {
       // matching closing fence and land the caret between them. This wins over
       // the generic symmetric-backtick pairing below (which stacked a fourth
       // backtick and never added the closer). Whole-buffer only: a `` ` `` run
-      // inside prose keeps the ordinary inline behavior. With the scaffold
-      // committed, the editor is in the body-only code view below.
+      // inside prose keeps the ordinary inline behavior. The scaffold then
+      // offers the language picker on its still-visible opener line (GH #507):
+      // the body-only code view below hides that line, so landing in it at once
+      // left no way to set a language at all.
       if (
         !handled && ch === "`" && pageFmt() === "md" &&
         !isCalc() && codeShown() === null &&
@@ -2733,14 +2735,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const scaffold = "```\n\n```";
         ref.value = scaffold;
         commit(scaffold);
-        queueMicrotask(() => {
-          const body = codeShown()?.body;
-          if (body !== undefined) ref.value = body;
-          ref.setSelectionRange(0, 0);
-          ref.focus();
-          autosize();
-          refreshAutocompleteAfterInput();
-        });
+        openFenceLanguagePicker(scaffold, 3);
         return;
       }
       if (!handled && autoPairing()) {

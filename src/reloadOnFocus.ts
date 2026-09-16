@@ -30,6 +30,7 @@ import { sweepReplaceable } from "./store";
 import { pushToast } from "./ui";
 import { graphBinding } from "./persistence";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "./landAsync";
+import { isPublishedExport } from "./publishedBackend";
 
 /** Minimum spacing between focus-driven rescans. Below this, returning to the
  *  window is answered by the sweep alone (which is pure in-memory work). */
@@ -129,6 +130,10 @@ export function trackGraphChangeApplication(work: Promise<unknown>): void {
 
 /** Exported for tests; `installReloadOnFocus` wires it to focus/visibility. */
 export function refreshOnReturnToWindow(now = Date.now()): Promise<void> {
+  // A published export is an immutable snapshot with no watcher behind it, and
+  // its backend refuses the rescan, so asking only produced an error toast on
+  // every refocus (GH #549). There is nothing to refresh and nothing deferred.
+  if (isPublishedExport()) return Promise.resolve();
   // Always cheap: replay anything already deferred that has become replaceable.
   sweepReplaceable();
   const bindingChanged = retireChangedBinding();
@@ -195,7 +200,7 @@ export function resetFocusRescanThrottle(): void {
 }
 
 export function installReloadOnFocus(): void {
-  if (installed || typeof window === "undefined") return;
+  if (installed || typeof window === "undefined" || isPublishedExport()) return;
   installed = true;
   installFreshnessInputGate();
   window.addEventListener("focus", () => void refreshOnReturnToWindow());

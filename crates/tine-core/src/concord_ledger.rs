@@ -17,6 +17,9 @@
 //! - Writes are enqueued to one background worker thread and are best-effort:
 //!   failures are logged to stderr, never surfaced. The foreground cost of an
 //!   update is one channel send.
+//! - Quitting waits at most `EXIT_DRAIN_BUDGET` for the queue (the app calls
+//!   `drain_for_exit` from every exit path). An update still queued after that
+//!   is lost, so that page's next conflict merges against an older base.
 //!
 //! Layout (all files atomic tmp+rename, schema `LEDGER_SCHEMA`):
 //! - `blobs/<sha256-of-content>`         — content bytes (content-addressed)
@@ -37,12 +40,20 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// On-disk schema of index/pin entries; named by `docs/storage-sync-contract.md`
 /// §4 (a doc-code consistency test below keeps the two in step). Bumping it
 /// invalidates the disposable ledger (entries with another schema read as
 /// "no base") and costs nothing but a repopulation.
 pub const LEDGER_SCHEMA: u32 = 1;
+
+/// How long quitting Tine waits, in total, for queued ledger updates (Martin,
+/// 2026-09-15). Quitting right after a save is the ordinary multi-device
+/// pattern Concord exists for, so that save's base must land; the bound keeps
+/// a wedged disk from holding up the exit. Named with its value in
+/// `docs/storage-sync-contract.md` §4.
+pub const EXIT_DRAIN_BUDGET: Duration = Duration::from_millis(200);
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -144,10 +155,29 @@ impl ConcordLedger {
     /// Wait until every previously enqueued job has been processed. Test /
     /// measurement aid; never called on a hot path.
     pub fn flush(&self) {
+        // 30 s bounds a wedged worker; the ledger is disposable, so give up.
         let (done_tx, done_rx) = mpsc::channel();
         self.enqueue(Job::Flush(done_tx));
-        // 30 s bounds a wedged worker; the ledger is disposable, so give up.
-        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        let _ = done_rx.recv_timeout(Duration::from_secs(30));
+    }
+
+    /// Quitting: wait until `deadline` for every update queued so far to land,
+    /// and answer whether they did. Never starts the worker, so a graph that
+    /// queued nothing costs nothing at exit.
+    pub fn drain_for_exit(&self, deadline: Instant) -> bool {
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let guard = self.tx.lock().unwrap();
+            let Some(tx) = guard.as_ref() else {
+                return true;
+            };
+            if tx.send(Job::Flush(done_tx)).is_err() {
+                return false;
+            }
+        }
+        done_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
     }
 
     fn enqueue(&self, job: Job) {
@@ -434,6 +464,8 @@ mod tests {
         assert!(contract.contains("keyed by the graph's root id"));
         assert!(contract.contains("index and pin entries naming a blob that is absent"));
         assert!(contract.contains("never warns,\nrefuses, or reports a missing blob to the user"));
+        assert!(contract.contains("`concord_ledger::EXIT_DRAIN_BUDGET` (200 ms)"));
+        assert_eq!(EXIT_DRAIN_BUDGET, Duration::from_millis(200));
     }
 
     #[test]
@@ -448,6 +480,36 @@ mod tests {
         ledger.record_now("pages/A.md", "- one edited\n").unwrap();
         assert_eq!(ledger.base("pages/A.md").as_deref(), Some("- one edited\n"));
         std::fs::remove_dir_all(ledger.dir()).ok();
+    }
+
+    #[test]
+    fn exit_drain_lands_every_queued_update() {
+        let ledger = ConcordLedger::new(scratch("exit-drain"));
+        for n in 0..64 {
+            ledger.record(&format!("pages/P{n}.md"), &format!("- {n}\n"));
+        }
+        // A generous deadline: this pins "the drain waits for the queue", not
+        // the production budget, which a loaded test machine could miss.
+        assert!(ledger.drain_for_exit(Instant::now() + Duration::from_secs(10)));
+        for n in 0..64 {
+            let expected = format!("- {n}\n");
+            assert_eq!(
+                ledger.base(&format!("pages/P{n}.md")).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+        std::fs::remove_dir_all(ledger.dir()).ok();
+    }
+
+    #[test]
+    fn exit_drain_never_starts_the_worker() {
+        let ledger = ConcordLedger::new(scratch("exit-idle"));
+        assert!(ledger.drain_for_exit(Instant::now()));
+        assert!(
+            ledger.tx.lock().unwrap().is_none(),
+            "a graph that queued nothing must not spawn a thread at quit"
+        );
+        assert!(!ledger.dir().exists());
     }
 
     #[test]

@@ -736,9 +736,11 @@ pub fn run() {
                     }
                 }
                 tauri::WindowEvent::Destroyed => {
-                    state.graphs.write().unwrap().remove(label);
+                    let removed = state.graphs.write().unwrap().remove(label);
                     state::poke_watcher(&state);
                     if state.graphs.read().unwrap().len() == 0 {
+                        // Unregistered above, so `RunEvent::Exit` cannot reach it.
+                        drain_concord_ledgers_for_exit(removed.as_deref());
                         #[cfg(target_os = "linux")]
                         platform::kill_webkit_children();
                         app.exit(0);
@@ -1015,11 +1017,65 @@ pub fn run() {
     // clearing it anywhere later never runs and every quit is falsely reported
     // as unclean on the next launch (the flight recorder's `session-active`
     // marker survives).
-    app.run(|_app_handle, event| {
+    app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            let slots: Vec<_> = app_handle
+                .state::<AppState>()
+                .graphs
+                .read()
+                .unwrap()
+                .entries()
+                .into_iter()
+                .map(|(_, slot)| slot)
+                .collect();
+            drain_concord_ledgers_for_exit(slots.iter().map(|slot| slot.as_ref()));
             mark_clean_shutdown();
         }
     });
+}
+
+/// Quitting waits at most `tine_core::concord_ledger::EXIT_DRAIN_BUDGET`, in
+/// total, for the queued Concord ledger updates of `slots`, so a save made just
+/// before quitting keeps its merge base. `concord_exit_drain_tests` pins that
+/// every exit path reaches this.
+fn drain_concord_ledgers_for_exit<'a>(slots: impl IntoIterator<Item = &'a state::GraphSlot>) {
+    let deadline = std::time::Instant::now() + tine_core::concord_ledger::EXIT_DRAIN_BUDGET;
+    for slot in slots {
+        let _ =
+            slot.with_filesystem_graph(|graph| Ok(graph.drain_concord_ledger_for_exit(deadline)));
+    }
+}
+
+#[cfg(test)]
+mod concord_exit_drain_tests {
+    /// Quitting waits, bounded by `tine_core::concord_ledger::EXIT_DRAIN_BUDGET`,
+    /// for every open graph's queued Concord ledger updates, so a save made just
+    /// before quitting keeps its merge base (Martin, 2026-09-15). `tine_quit` and
+    /// `close_graph_window` exit with their graphs still registered, so the
+    /// `RunEvent::Exit` arm drains them. The last window's `Destroyed` handler
+    /// unregisters its graph before exiting, so it drains that slot first.
+    #[test]
+    fn every_exit_path_drains_the_concord_ledgers() {
+        let source = include_str!("lib.rs");
+        let run = &source[source.find("app.run(|").expect("the event loop")..];
+        let run = &run[..run.find("});").expect("the end of the event loop")];
+        assert!(
+            run.contains("RunEvent::Exit") && run.contains("drain_concord_ledgers_for_exit("),
+            "I-24: the RunEvent::Exit arm must drain every registered graph's Concord \
+             ledger before Tine exits, beside mark_clean_shutdown()"
+        );
+        let destroyed = &source[source
+            .find("tauri::WindowEvent::Destroyed =>")
+            .expect("the Destroyed handler")..];
+        let destroyed = &destroyed[..destroyed
+            .find("app.exit(0);")
+            .expect("the last-window exit")];
+        assert!(
+            destroyed.contains("drain_concord_ledgers_for_exit("),
+            "I-24: the last window's Destroyed handler unregisters its graph before \
+             app.exit(0), so it must drain that slot's Concord ledger first"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -600,7 +600,7 @@ export function PageView(): JSX.Element {
               <NamespaceHierarchy name={pagesToRender()[0].name} />
             </Show>
             <Show
-              when={pagesToRender()[0].kind === "page" && !pagesToRender()[0].guide && tagTableEnabled(pagesToRender()[0].name)}
+              when={pagesToRender()[0].kind === "page" && !pagesToRender()[0].guide && tagTableEnabled(pagesToRender()[0].name) && !isPublishedExport()}
               fallback={<Show when={!pagesToRender()[0].guide}><LinkedReferences name={pagesToRender()[0].name} /></Show>}
             >
               <TagPageTable pageName={pagesToRender()[0].name} />
@@ -1132,12 +1132,17 @@ function taggedCount(groups: readonly RefGroup[] | undefined): number {
 }
 
 export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
+  // A published export has no query engine behind `runQuery` and cannot save the
+  // page property this button toggles. Asking anyway made the refusal a reason
+  // to show the button, so every page carried a "⊞ Table" whose tooltip was the
+  // refusal text (GH #549).
+  const live = !isPublishedExport();
   const [groups, pending] = createReadyQueryResource(
-    () => (props.page.kind === "page" ? `${props.page.name}\0${dataRev()}` : null),
+    () => (live && props.page.kind === "page" ? `${props.page.name}\0${dataRev()}` : null),
     (requestKey, signal) => sharedTagQuery(props.page.name, requestKey, signal)
   );
   const enabled = () => tagTableEnabled(props.page.name);
-  const visible = () => props.page.kind === "page" && (enabled() || pending() || groups.error || taggedCount(groups()) > 0);
+  const visible = () => live && props.page.kind === "page" && (enabled() || pending() || groups.error || taggedCount(groups()) > 0);
   return (
     <Show when={visible()}>
       <button

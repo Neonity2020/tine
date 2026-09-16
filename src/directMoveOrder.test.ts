@@ -21,10 +21,13 @@
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { initParser } from "./render/parse";
-import { backend } from "./backend";
+import { backend, SaveConflictError } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
 import { resetStorageDispatchCounters } from "./storageDispatch";
 import {
+  flushAll,
+  flushPage,
+  isDirty,
   loadFeed,
   moveBlock,
   moveBlocksRelative,
@@ -32,7 +35,9 @@ import {
   pageByName,
   resetStore,
   selectBlock,
+  setRaw,
   settleDirectMovesForTest,
+  undo,
 } from "./store";
 import { carryDay, carryDaysBack } from "./carry";
 import { journalTitle } from "./journal";
@@ -229,6 +234,50 @@ describe("the four durable steps, in contract order", () => {
   });
 });
 
+describe("a carry whose destination save conflicts", () => {
+  // Carry is a cross-page move, so it needs the same barrier as the other four
+  // shapes (audit C#1): while today's write is not durable, nothing may save a
+  // source day's post-removal state. `carryUnfinished` leaves the source days
+  // clean and `carry.ts` marks them only after today lands, but nothing HELD
+  // them, so an unrelated edit to a source day while today sat conflicted wrote
+  // the carried task out of the only file that still had it.
+  it("does not write the task out of its source day when a later edit saves that day", async () => {
+    const today = journalTitle(new Date());
+    const day = new Date();
+    day.setDate(day.getDate() - 1);
+    const source = journalTitle(day);
+    for (const name of [today, source]) clearConflict(name);
+    await loadFeed([
+      page(today, "journals/today.md", "today-r1", [block("today-root", "")], "journal"),
+      page(source, "journals/back-1.md", "back-1-r1", [
+        block("carried-task", "TODO carry me"),
+        block("staying-note", "a note that stays"),
+      ], "journal"),
+    ]);
+    vi.spyOn(backend(), "beginDirectCrossPageMove").mockResolvedValue(MOVE_ID);
+    vi.spyOn(backend(), "finishDirectCrossPageMove").mockResolvedValue(true);
+    const sourceWrites: string[][] = [];
+    vi.spyOn(backend(), "savePage").mockImplementation(async (dto: PageDto) => {
+      // Syncthing delivered a newer today: every write of today is refused.
+      if (dto.name === today) throw new SaveConflictError(7);
+      if (dto.name === source) sourceWrites.push(dto.blocks.map((b) => b.raw));
+      return { revision: `${dto.rev ?? "r"}-next` } as any;
+    });
+
+    await carryDay(source);
+    expect(pageByName(today)!.roots).toContain("carried-task");
+
+    // An unrelated edit to the source day, flushed as the debounce would.
+    setRaw("staying-note", "a note that stays, edited");
+    await flushPage(source);
+
+    // Today is not on disk, so every write of the source must still hold the task…
+    for (const raws of sourceWrites) expect(raws).toContain("TODO carry me");
+    // …and the edit itself is written or still pending, never dropped.
+    expect(sourceWrites.some((raws) => raws.includes("a note that stays, edited")) || isDirty(source)).toBe(true);
+  });
+});
+
 describe("shapes that must NOT compose a record", () => {
   it("a same-page reorder composes none: it is one ordinary save, already atomic", async () => {
     await loadTwoPages();
@@ -260,5 +309,80 @@ describe("a record that could not be composed", () => {
     ]);
     expect(pageByName("Destination")!.roots).toContain("source-a");
     expect(pageByName("Source")!.roots).toEqual(["source-b"]);
+  });
+});
+
+describe("undo of a cross-page move", () => {
+  // H2 (K6 move census §1.3). `applyEntry` restores both page snapshots, marks
+  // both dirty, and `scheduleSave` writes them in parallel: no destination-first
+  // order, no source barrier, no recovery record. Undoing a move A→B makes A the
+  // page that GAINS the blocks, so if B's removal lands while A's save is
+  // refused, the blocks are in neither file. The five forward shapes are all
+  // held; undo is the sixth shape `docs/contracts/direct-move-recovery.md` §1
+  // does not name.
+  it("does not write the losing page while the gaining page's save is refused", async () => {
+    await loadTwoPages();
+    let refuseSource = false;
+    const writes: string[] = [];
+    vi.spyOn(backend(), "beginDirectCrossPageMove").mockResolvedValue(MOVE_ID);
+    vi.spyOn(backend(), "finishDirectCrossPageMove").mockResolvedValue(true);
+    vi.spyOn(backend(), "savePage").mockImplementation(async (dto: PageDto) => {
+      if (refuseSource && dto.name === "Source") throw new SaveConflictError(7);
+      writes.push(dto.name);
+      return { revision: `${dto.rev ?? "r"}-next` } as any;
+    });
+
+    await moveBlock("source-a", null, 1, "Destination");
+    await settleDirectMovesForTest();
+    expect(pageByName("Destination")!.roots).toContain("source-a");
+
+    // The user changes their mind. Source is now the gaining page, and an
+    // external write has landed on it in the meantime, so its save is refused.
+    refuseSource = true;
+    writes.length = 0;
+    undo();
+    await flushAll();
+    await settleDirectMovesForTest();
+
+    expect(pageByName("Source")!.roots).toContain("source-a");
+    // Destination is the losing page: its removal must not reach disk while the
+    // block is not back in Source's file.
+    expect(writes).not.toContain("Destination");
+  });
+});
+
+describe("two cross-page selection moves in one burst", () => {
+  // H3 (K6 move census §1.3). `moveSelectionItems` captures the page and the
+  // root check BEFORE awaiting `feedNeighbor` and `prepareCrossPageSources`, and
+  // `crossMoveBlocks` then pushes the ids into the target's roots
+  // unconditionally. A second keypress arriving while the first is still
+  // awaiting a real flush re-adds ids the target already holds, so the block
+  // renders twice and serializes twice — a duplicate `id::` if it carries one.
+  it("never leaves the same root twice in the target day", async () => {
+    clearConflict("Sep 1st, 2026");
+    clearConflict("Sep 2nd, 2026");
+    await loadFeed([
+      page("Sep 2nd, 2026", "journals/2026_09_02.md", "d2-r1", [block("newer", "newer")], "journal"),
+      page("Sep 1st, 2026", "journals/2026_09_01.md", "d1-r1", [block("older", "older")], "journal"),
+    ]);
+    vi.spyOn(backend(), "beginDirectCrossPageMove").mockResolvedValue(MOVE_ID);
+    vi.spyOn(backend(), "finishDirectCrossPageMove").mockResolvedValue(true);
+    vi.spyOn(backend(), "savePage").mockImplementation(async (dto: PageDto) => {
+      return { revision: `${dto.rev ?? "r"}-next` } as any;
+    });
+    // The source day is dirty, which is the ordinary state right after the user
+    // stopped typing: the pre-flush then really awaits, and the repeated key
+    // lands inside that window.
+    setRaw("newer", "newer, edited");
+    selectBlock("newer");
+
+    const first = moveSelectionItems(1);
+    const second = moveSelectionItems(1);
+    await Promise.all([first, second]);
+    await settleDirectMovesForTest();
+
+    const roots = pageByName("Sep 1st, 2026")!.roots;
+    expect(roots.filter((id) => id === "newer")).toHaveLength(1);
+    expect(new Set(roots).size).toBe(roots.length);
   });
 });

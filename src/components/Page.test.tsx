@@ -1,7 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
-import { backend, QueryNotReadyError } from "../backend";
+import { backend, PublishedExportReadOnlyError, QueryNotReadyError } from "../backend";
+import { PUBLISHED_META_NAME } from "../publishedBackend";
 import { addDirty, graphBinding, setBaseRev } from "../persistence";
 import { notifyGraphRebound } from "../modeHooks";
 import { initParser } from "../render/parse";
@@ -943,6 +944,26 @@ describe("tag-page table", () => {
     expect(samePerInvalidation).toEqual(Array.from({ length: INVALIDATIONS }, () => 1));
     expect(distinctPerInvalidation).toEqual(Array.from({ length: INVALIDATIONS }, () => 3));
     expect(distinctPagesAsked.size).toBe(names.length);
+  });
+
+  // GH #549 sibling: a published export has no query engine behind `runQuery`.
+  // Its refusal counted as a reason to show the toggle, so every ordinary page
+  // in the export carried a "⊞ Table" button whose tooltip was the refusal text.
+  it("offers no tag-table toggle in a published export", async () => {
+    const meta = document.createElement("meta");
+    meta.name = PUBLISHED_META_NAME;
+    meta.content = "snapshot.json";
+    document.head.append(meta);
+    try {
+      vi.spyOn(backend(), "runQuery").mockRejectedValue(new PublishedExportReadOnlyError());
+      const { root, dispose } = mount(() => <TagTableToggle page={page("Tag", "page", [])} />);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick();
+      expect(root.querySelector(".tag-table-toggle")).toBeNull();
+      dispose();
+    } finally {
+      meta.remove();
+    }
   });
 
   it("keeps journal tag-table resources keyed off", async () => {

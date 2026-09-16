@@ -48,12 +48,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   unusable for many minutes and the app kept working the disk while nothing was
   happening. An unchanged graph now reuses the index it already built, and only
   pages that actually changed are re-indexed (GH #543).
+- **Undoing a move between pages can no longer lose the moved blocks.** Undo and
+  redo of a cross-page move (a drag, a journal-day move, or a carry) now write
+  the page that regains the blocks first and hold the other page's save until it
+  lands, inside the same crash-recovery record the original move used. Before,
+  both pages were saved at once, so if the regaining page's save was refused —
+  for example because another program had changed that file — the other page's
+  removal could still be written and the blocks were left in neither file.
+- **Two quick nudges of a selection across a journal-day boundary no longer
+  duplicate a block.** Repeating the move shortcut while the first move was still
+  saving could add the same blocks to the target day twice, which then appeared
+  twice and was written to the file twice.
+- A move between pages that cannot start because a page has unsaved changes now
+  always says so. Keyboard moves across a journal-day boundary failed silently.
+- Typing ``` to start a code block lets you set its language again. The three backticks used to drop the cursor straight inside the block, which hides the line the language goes on, so there was no way to choose one except the `/Code block` command. The language list now opens on that line; pressing Escape puts the cursor inside the block as before. (GH #507)
+- Typing a workspace name with Chinese or another input method (IME) now works. The name field used to be rebuilt on every keystroke, which cancelled the character being composed. (GH #498)
+- Returning to the browser tab of a published export no longer shows a "couldn't finish checking for external changes" error. The read-only export has nothing to re-check, so it no longer tries. An export also no longer shows a stray “⊞ Table” button on every page, or an error after zooming or scrolling a PDF. (GH #549)
+- Carrying unfinished tasks to today while today's journal had a sync conflict no longer lets a later edit to one of the earlier days delete those tasks from that day's file. Tine now keeps the earlier days unchanged on disk until today is saved, as it already did for other block moves. Moving blocks into the same page twice before it saved also no longer leaves the first move's source page unable to save.
 - Queries answer every comparison they accept. `like` on `task`, `priority`
   and `page.namespace` (for example `task like 'DO%'`), `page.journal != …`,
   `page.name not in (…)` and `content in (…)` / `not in (…)` used to return
   nothing. `like` on a date or checkbox (`scheduled`, `deadline`, `page.day`,
   `page.journal`) is now reported as an error instead of silently matching
   nothing.
+
+- Quitting Tine right after saving no longer throws away the copy of that
+  page Tine keeps for merging sync conflicts. Tine now waits up to 0.2 s at
+  quit for those updates, so a later conflict on the page still gets
+  three-way merge suggestions instead of more lines to review by hand.
 
 - While the query index is still building, property autocomplete now offers
   an Org page's own properties (its `:PROPERTIES:` drawer) and no longer

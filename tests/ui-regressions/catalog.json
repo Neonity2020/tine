@@ -9153,7 +9153,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible."
+      "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible. 2026-09-15: the scaffold's caret no longer lands in the body immediately — it offers the language picker on the opener line first (GH #507, row UI-CODE-FENCE-LANGUAGE-507); Escape keeps the interior-caret outcome this row asserts."
     },
     {
       "id": "UI-EMBED-ARROW-UP-EXIT-415",
@@ -11310,6 +11310,132 @@
         "failBefore": "proven"
       },
       "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page + the view compared under viewKey, which folds the engine's dense ViewSettings and the app's sparse resolution together) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export…, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. The Playwright journey passed a five-round sequential unchanged-binary burn-in (Direct and Managed exports, 27/27 each round, binary built from 5ab70870) on 2026-09-15 and runs in linux-release."
+    },
+    {
+      "id": "UI-PUBLISH-FOCUS-NO-RESCAN-549",
+      "title": "Returning to a published export's tab shows no error: the read-only app does not ask for a rescan it cannot run",
+      "family": "publishing",
+      "sources": {
+        "issues": [
+          549
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx",
+          "src/components/PdfViewer.test.tsx",
+          "src/reloadOnFocus.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a reader of a published export (ADR 0065 Stage 2) who switches away and back sees no toast. Classification: flexible presentation, but a false error ('Editing is available, but reopen the page…') in an app that has no editing at all, shown on every refocus. Root cause: App.tsx installs the Concord L0 reload-on-focus fallback unconditionally; in a published export refreshOnReturnToWindow reached backend().rescanGraphNow(), which the published backend refuses (PUBLISHED_REFUSED_METHODS), and the catch toasted the refusal. Fix: refreshOnReturnToWindow returns at once and installReloadOnFocus does not install when isPublishedExport(). Fail-before on master 6db9d7e5: rescanGraphNow called once on focus with the published meta tag present. Evidence: tine-agents/evidence/shell-quick-fixes/. Sibling sweep (every refused backend call that fires without a user action in the published app): two more were visible and are fixed here. (1) TagTableToggle ran `runQuery` on every ordinary page; the refusal counted as a reason to show the button, so each page carried a stray '⊞ Table' whose tooltip was the refusal text. It no longer queries or renders in an export, and a page whose author enabled the tag table falls back to its baked linked references. (2) PdfViewer's debounced view-position save after a zoom or scroll, and its flush on close, were refused and toasted. The export no longer schedules it. Fail-before proven for both. Left as follow-ups: creating a PDF highlight in an export is still offered and fails with an honest toast (user action, not automatic); Macro 'why empty?' shows the refusal text on click; several Settings-only ui.ts setters lack a published gate, but the Settings entry is hidden."
+    },
+    {
+      "id": "UI-WORKSPACE-NAME-IME-498",
+      "title": "Chinese and other IME input works when naming or renaming a workspace",
+      "family": "workspaces",
+      "sources": {
+        "issues": [
+          498
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/WorkspaceSwitcher.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: a user typing with an IME (the report: Chinese on Windows 11) can enter a workspace name in the switcher's New workspace / Rename field. Classification: blocking stateful UX for CJK users; the name cannot be entered at all. Root cause: the form rendered under <Show when={edit()} keyed> and onInput called setEdit({...state, value}), so every input event created a new key and Solid rebuilt the form and its <input>; the first composition input destroyed the composing element and Windows TSF cancelled it. Latin typing survived because the value was re-seeded and the caret landed at the end. Present since the component was created (9f6a3f3b); not a 0.6.982 regression. Fix: the typed text lives in its own signal, the keyed Show changes only when an edit opens or closes, the input keeps its initial value so nothing rewrites input.value mid-composition, and Escape ignores isComposing/keyCode 229 like the other text fields. Fail-before on master: the <input> element was replaced after the first input event. jsdom proves element identity, not Windows TSF behaviour; a Windows IME check was not run."
+    },
+    {
+      "id": "UI-CODE-FENCE-LANGUAGE-507",
+      "title": "A language can be set on a code block typed with three backticks",
+      "family": "editor-typing",
+      "sources": {
+        "issues": [
+          507,
+          413
+        ],
+        "commits": [],
+        "internal": ""
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.codeFenceScaffold.test.tsx",
+          "src/components/Block.codeFenceAutocomplete.test.tsx",
+          "scripts/e2e-editor-interactions.mjs"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "User outcome: after typing ``` to open a code block, the user can still say which language it is, so highlighting works. Classification: blocking core operation — with no language there is no syntax highlighting and no other control anywhere in the UI offers one. Root cause: a regression from the GH #413 scaffold (d365bf5d, shipped in v0.6.981). The third backtick scaffolded the complete fence and dropped the caret into the body-only code view, which hides the opening fence line; the language autocomplete only triggers on a visible ```<char> line, so the only remaining path was the /Code block command. Fix: both paths now go through one door (Block.tsx `openFenceLanguagePicker`), which opens the same empty language picker on the still-visible opener; Escape or a non-language keystroke falls into the body exactly as before, keeping #413's closing fence and interior caret. Fail-before: tine-agents/evidence/code-fence-language/507-fail-before.log (4 of 5 scaffold tests fail; the unrelated mid-text test passes). Evidence layer: render (jsdom) plus the native editor-interactions journey. Covered at master c9e2b435: the native editor-interactions journey ran against that exact staged build and the coordinator recorded its real-app gate."
+    },
+    {
+      "id": "UI-MOVE-UNDO-CROSS-PAGE-DURABLE-ORDER-001",
+      "title": "Undoing or redoing a move of blocks between two pages never leaves those blocks in neither file: the page that regains them is written first and the other page's write is held until it lands",
+      "family": "history",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "tine-agents/subagent-tasks/notes/2026-09-15-k6-store-move-census.md \u00a71.3 hazard H2 (internal store-move census; no reporter)"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/directMoveOrder.test.ts::undo of a cross-page move::does not write the losing page while the gaining page's save is refused"
+        ],
+        "scenario": "move.undo-cross-page-durable-order",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before evidence: tine-agents/evidence/move-front-door/h2-h3-fail-before.log (pass-after: h2-h3-pass-after.log). Exact safety: this is a data-loss shape, not a presentation one. User outcome: undo of a drag, a journal-day move or a carry that had crossed pages, at a moment when the page regaining the blocks cannot be saved (an external editor or a sync service changed that file, or a concurrent Tine instance holds it), left the blocks written out of the page that had them and never written into the page getting them back \u2014 present in neither file on disk, with only the editor's memory holding them. Root cause: undo/redo was the ONE cross-page-move shape that never went through the move choreography. applyEntry restored both pages and marked both dirty, and scheduleSave wrote them in parallel: no source barrier, no destination-first order, no crash-recovery record. The other five shapes had all been converged on that choreography; the census found undo/redo had simply never been counted as a sixth shape (docs/contracts/direct-move-recovery.md \u00a71 omitted it). Fix: crossPageRestore in src/store/undo.ts derives the direction from the entry itself \u2014 the scoped page whose snapshot holds blocks that currently live on another scoped page is the one regaining them \u2014 and hands it to the same persistCrossPage every other shape uses, so the barrier, the destination-first order and the record bracket are shared rather than re-implemented. Derived rather than recorded at pushUndo: it covers undo and redo symmetrically and no future pushUndo call site can forget it. jsdom + backend spies observe the literal write order; the contract doc's step list and the Rust crash matrix already cover recovery from the record."
+    },
+    {
+      "id": "UI-MOVE-SELECTION-BURST-DUPLICATE-001",
+      "title": "Repeating the move-selection shortcut across a journal-day boundary before the first move has saved does not put the same blocks in the target day twice",
+      "family": "journals",
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "tine-agents/subagent-tasks/notes/2026-09-15-k6-store-move-census.md \u00a71.3 hazard H3 (internal store-move census; no reporter)"
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/directMoveOrder.test.ts::two cross-page selection moves in one burst::never leaves the same root twice in the target day"
+        ],
+        "scenario": "move.selection-burst-duplicate",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before evidence: tine-agents/evidence/move-front-door/h2-h3-fail-before.log (pass-after: h2-h3-pass-after.log). Blocking core operation with a durable consequence: the duplicate was rendered twice AND serialized twice, so it reached the file. User outcome: pressing the move shortcut twice in quick succession on a selection in the journal feed added the selected blocks to the target day, then added them again. Root cause: moveSelectionItems captured the selected ids, awaited the source pre-flush, and then applied the stale capture; the underlying crossMoveBlocks unconditionally pushes into the destination's root list, so the second pass appended ids the first pass had already placed. moveBlocksRelative was immune only because it happened to re-plan and compare after its await \u2014 the same accident was absent from all three other shapes. Fix: the one front door src/crossPageMove.ts re-runs the caller's plan() after the await and compares it against the intent captured before, so a plan that no longer describes the same roots, sources and destination is abandoned instead of applied; moveSelectionItems re-reads topSelected() there and aborts when the selection has already reached the target. This makes the stale-capture class unwritable for every shape that goes through the door rather than fixing the one call site. jsdom + backend spies assert both that no root appears twice in the target day's serialized roots and that the root list holds no duplicates at all."
     }
   ]
 }

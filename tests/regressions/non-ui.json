@@ -4143,31 +4143,81 @@
  },
  "notes": "Blocking core operation: a query the parser accepted silently matched nothing, and like on a date was accepted instead of refused. Found by the K4 census of CmpOp wildcard arms. Both engines are asserted against an explicit expected set, so a shared wrong answer cannot pass as parity. Fail-before on a2aaae07 + K4.1: the walk for task like 'DO%' returned {} and scheduled like '2026%' carried no diagnostic. Evidence: tine-agents/evidence/consolidation/k4/matrix-fail-before.log and matrix-pass-after.log."
 },
- {
-  "id": "REG-QUERY-PROJECTION-REUSE-543",
-  "title": "Reopening a graph reuses the persisted query index instead of erasing and rebuilding it, so search becomes ready promptly on a large graph",
-  "family": "query-readiness",
-  "sources": {
-   "issues": [
-    543
-   ],
-   "commits": [],
-   "internal": ""
-  },
-  "platforms": [
-   "all"
+{
+ "id": "REG-CONCORD-LEDGER-EXIT-DRAIN-001",
+ "title": "Quitting right after a save keeps that save's Concord merge base: every exit path waits, at most 200 ms in total, for the queued ledger updates of every open graph",
+ "family": "concord-base-ledger",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "tine-agents/specs/campaigns/2026-09-consolidation/PLAN.md §7 (Concord exit wait); Martin 2026-09-15 (T2)"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core-tauri-boundary",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/concord_ledger.rs::tests::exit_drain_lands_every_queued_update",
+   "crates/tine-core/src/concord_ledger.rs::tests::exit_drain_never_starts_the_worker",
+   "crates/tine-core/src/concord_ledger.rs::tests::storage_contract_names_the_concord_ledger_and_its_schema",
+   "src-tauri/src/lib.rs::concord_exit_drain_tests::every_exit_path_drains_the_concord_ledgers"
   ],
-  "layer": "rust-core",
-  "status": "covered",
-  "coverage": {
-   "tests": [
-    "crates/tine-core/src/direct_projection_tests.rs::a_query_before_the_warm_keeps_a_clean_reopen_clean",
-    "crates/tine-core/src/direct_projection_tests.rs::a_repair_in_flight_reports_work_in_progress_not_a_stale_projection"
-   ],
-   "scenario": "query.projection-reuse",
-   "failBefore": "proven"
-  },
-  "notes": "Blocking core operation: Ctrl-K and the search tab stayed on “Indexing — waiting for search to be ready…” indefinitely on a graph over ~10,000 pages, and the app wrote continuously while idle. Root cause: the app issues queries (journal feed, backlinks, Ctrl-K) before `warm_cache_async` reaches the projection; such a query found the worker idle, unvalidated and not yet failed, which `progress_at` reports as `Stale`, and the `Stale` repair latched `pending.rebuild`. The worker consumes that flag with the warm it scheduled, so it `reset()` the database — dropping every source stamp — and re-lowered every page on EVERY launch. Fail-before on the exact test: lowerings()==2 instead of 0 on an unchanged two-page reopen. Measured at the observation boundary on a 32,250-file corpus (real app, Linux): before, three consecutive unchanged restarts took 97 s / 102 s / 142 s to search-ready and rewrote a 524 MB WAL each time, although all 32,250 stored source revisions were byte-identical across the restart. After the fix, the same unchanged reopen of that corpus reached search-ready with real results in 14 s and left the database file untouched. A second defect surfaced while fixing: without the erase\u2019s side effect of publishing `pending.rebuild`, two concurrent startup queries raced on the recovery lock and the loser reported the terminal \u201cThe query index could not be read\u201d; a repair now publishes an in-flight marker that `progress_at` reports as Working(Recovering), so the losing query retries."
- }
+  "scenario": "concord.ledger-exit-drain",
+  "failBefore": "proven"
+ },
+ "notes": "Flexible degraded behaviour, not data loss: the ledger is a merge hint and no note text is ever lost. ConcordLedger::flush() had only test callers, so app.exit(0) dropped queued Record/Pin/DropPin/Prune jobs and the next conflict on that page merged against an older base (more lines to review by hand). Quitting right after a save is the ordinary multi-device case Concord serves, so Martin chose a bounded exit wait over a doc-only fix. Fail-before: the lib.rs exit-path guard failed on base a36724c7 because the RunEvent::Exit arm did not drain. Evidence: tine-agents/evidence/concord-exit-flush/."
+},
+{
+ "id": "REG-DIRECT-CARRY-SOURCE-BARRIER-001",
+ "title": "Carried or moved blocks are never written out of their source page before they are on disk in the destination: carry holds its source days behind today, and a second move into one page no longer strands the first move's sources",
+ "family": "direct-save-data-safety",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "tine-agents/subagent-tasks/notes/2026-09-15-k6-store-move-census.md (H1); tine-agents/specs/campaigns/2026-09-consolidation/PLAN.md §7"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/directMoveOrder.test.ts::does not write the task out of its source day when a later edit saves that day",
+   "src/persistenceMoveBarrier.test.ts::releases every source held behind one destination, not only the latest move's"
+  ],
+  "scenario": "direct-markdown.move-barrier",
+  "failBefore": "proven"
+ },
+ "notes": "Exact safety (data loss). Carry was the one cross-page move with no source barrier (audit C#1): carryUnfinished left the source days clean and carry.ts marked them only after today saved, but nothing held them, so when today's save conflicted (e.g. Syncthing delivered a newer today) an unrelated edit to a source day wrote the post-removal file and the carried tasks survived only in memory and the move record. Fail-before on base a36724c7: the source day was written as ['a note that stays, edited'] without the task. Neighbour: holdSourcesForDest replaced an earlier hold on the same destination, so the first move's sources stayed held after it landed and their edits could never save. Evidence: tine-agents/evidence/move-carry-barrier/."
+},
+{
+ "id": "REG-QUERY-PROJECTION-REUSE-543",
+ "title": "Reopening a graph reuses the persisted query index instead of erasing and rebuilding it, so search becomes ready promptly on a large graph",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_query_before_the_warm_keeps_a_clean_reopen_clean",
+   "crates/tine-core/src/direct_projection_tests.rs::a_repair_in_flight_reports_work_in_progress_not_a_stale_projection"
+  ],
+  "scenario": "query.projection-reuse",
+  "failBefore": "proven"
+ },
+ "notes": "Blocking core operation: Ctrl-K and the search tab stayed on “Indexing — waiting for search to be ready…” indefinitely on a graph over ~10,000 pages, and the app wrote continuously while idle. Root cause: the app issues queries (journal feed, backlinks, Ctrl-K) before `warm_cache_async` reaches the projection; such a query found the worker idle, unvalidated and not yet failed, which `progress_at` reports as `Stale`, and the `Stale` repair latched `pending.rebuild`. The worker consumes that flag with the warm it scheduled, so it `reset()` the database — dropping every source stamp — and re-lowered every page on EVERY launch. Fail-before on the exact test: lowerings()==2 instead of 0 on an unchanged two-page reopen. Measured at the observation boundary on a 32,250-file corpus (real app, Linux): before, three consecutive unchanged restarts took 97 s / 102 s / 142 s to search-ready and rewrote a 524 MB WAL each time, although all 32,250 stored source revisions were byte-identical across the restart. After the fix, the same unchanged reopen of that corpus reached search-ready with real results in 14 s and left the database file untouched. A second defect surfaced while fixing: without the erase\u2019s side effect of publishing `pending.rebuild`, two concurrent startup queries raced on the recovery lock and the loser reported the terminal \u201cThe query index could not be read\u201d; a repair now publishes an in-flight marker that `progress_at` reports as Working(Recovering), so the losing query retries."
+}
 ]
 }

@@ -14,6 +14,12 @@ import { Block } from "./Block";
 // the generic symmetric-backtick auto-pairing (which used to leave FOUR
 // backticks and no closer). Single inline backticks and all bracket/ref
 // pairing are unchanged.
+//
+// GH #507: the scaffold used to drop the caret straight into the body-only code
+// view, which hides the opener line, so a language could no longer be typed.
+// The third backtick now opens the same language picker as /Code block, on the
+// still-visible opener; choosing a language or pressing Escape then lands the
+// caret inside.
 
 beforeAll(() => initParser());
 
@@ -55,8 +61,15 @@ function typeChar(ta: HTMLTextAreaElement, ch: string) {
   ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
 }
 
+function key(ta: HTMLTextAreaElement, k: string) {
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true }));
+}
+
+const pickerItems = () => [...document.body.querySelectorAll(".autocomplete .ac-item")];
+const pickerLabels = () => pickerItems().map((item) => item.querySelector(".ac-label")?.textContent);
+
 describe("triple-backtick code fence scaffold (GH #413)", () => {
-  it("three backticks insert a complete fence scaffold with an interior caret — exactly three, never four", async () => {
+  it("three backticks insert a complete fence scaffold — exactly three, never four — and Escape lands the caret inside", async () => {
     const { textarea, blockId, dispose } = mountEditor("");
     try {
       typeChar(textarea, "`");
@@ -65,17 +78,19 @@ describe("triple-backtick code fence scaffold (GH #413)", () => {
       typeChar(textarea, "`");
       typeChar(textarea, "`");
       // The scaffold replaces the third-backtick pairing: no fourth backtick,
-      // a matching closing fence appears, and the caret lands between them.
+      // and a matching closing fence appears.
       expect(doc.byId[blockId].raw).toBe("```\n\n```");
       expect(doc.byId[blockId].raw).not.toContain("````");
-      // The body-only editor now shows just the (empty) payload, caret inside.
-      expect(textarea.value).not.toContain("```");
-      // The view swap resolves on the microtask after the input handler.
+      // GH #507: the language picker is offered first. Escape declines it and
+      // swaps to the body-only view with the caret between the fences.
+      await vi.waitFor(() => expect(pickerItems().length).toBeGreaterThan(0));
+      key(textarea, "Escape");
       await vi.waitFor(() => {
+        expect(textarea.value).not.toContain("```");
         expect(textarea.selectionStart).toBe(0);
         expect(textarea.selectionEnd).toBe(0);
       });
-      expect(textarea.value).not.toContain("```");
+      expect(doc.byId[blockId].raw).toBe("```\n\n```");
     } finally {
       dispose();
     }
@@ -90,6 +105,7 @@ describe("triple-backtick code fence scaffold (GH #413)", () => {
       // No fence scaffold was synthesized inline: the block stays one line of prose.
       expect(doc.byId[blockId].raw).not.toContain("\n");
       expect(doc.byId[blockId].raw.startsWith("note ")).toBe(true);
+      expect(pickerItems()).toHaveLength(0);
     } finally {
       dispose();
     }
@@ -104,8 +120,45 @@ describe("triple-backtick code fence scaffold (GH #413)", () => {
       typeChar(textarea, "`");
       typeChar(textarea, "`");
       expect(doc.byId[blockId].raw).toBe("```\n\n```");
+      await vi.waitFor(() => expect(pickerItems().length).toBeGreaterThan(0));
+      key(textarea, "Escape");
+      await vi.waitFor(() => {
+        expect(textarea.value).not.toContain("```");
+        expect(textarea.selectionStart).toBe(0);
+      });
+    } finally {
+      dispose();
+    }
+  });
+});
+
+describe("typed code fence language (GH #507)", () => {
+  it("offers the language picker on the still-visible opener line", async () => {
+    const { textarea, dispose } = mountEditor("");
+    try {
+      for (const ch of "```") typeChar(textarea, ch);
+      await vi.waitFor(() => expect(pickerItems().length).toBeGreaterThan(0));
+      expect(textarea.value).toBe("```\n\n```");
+      expect(textarea.selectionStart).toBe(3);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("lets the user type a language after the fence, then lands in the code body", async () => {
+    const { textarea, blockId, dispose } = mountEditor("");
+    try {
+      for (const ch of "```") typeChar(textarea, ch);
+      await vi.waitFor(() => expect(pickerItems().length).toBeGreaterThan(0));
+      for (const ch of "pyth") typeChar(textarea, ch);
+      expect(doc.byId[blockId].raw).toBe("```pyth\n\n```");
+      await vi.waitFor(() => expect(pickerLabels()).toContain("Python"));
+
+      const python = pickerItems().find((item) => item.querySelector(".ac-label")?.textContent === "Python")!;
+      python.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      await vi.waitFor(() => expect(doc.byId[blockId].raw).toBe("```python\n\n```"));
       expect(textarea.value).not.toContain("```");
-      await vi.waitFor(() => expect(textarea.selectionStart).toBe(0));
+      expect(textarea.selectionStart).toBe(0);
     } finally {
       dispose();
     }
