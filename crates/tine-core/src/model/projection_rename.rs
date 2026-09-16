@@ -240,7 +240,7 @@ fn rename_projection_noreplace_platform(dir: &Dir, from: &str, to: &str) -> io::
 }
 
 #[cfg(windows)]
-fn rename_projection_between_noreplace(
+pub(super) fn rename_projection_between_noreplace(
     source_dir: &Dir,
     from: &str,
     destination_dir: &Dir,
@@ -363,7 +363,7 @@ fn rename_projection_noreplace_platform(_dir: &Dir, _from: &str, _to: &str) -> i
 /// two-step publication would leave a reserved-but-empty live name behind a
 /// crash. A filesystem that cannot provide the primitive fails the write, on
 /// every platform (`docs/storage-sync-contract.md` §2.10b).
-fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+pub(super) fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     rename_projection_noreplace_platform(dir, from, to).map_err(|error| {
         projection_platform_error(
             PROJECTION_NOREPLACE_RENAME_OPERATION,

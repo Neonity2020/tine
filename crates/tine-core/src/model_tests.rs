@@ -10554,9 +10554,20 @@ fn projection_missing_capture_rejects_reparse_intermediate_without_escape() {
     assert!(graph
         .read_projection_input(&GraphTextPath::parse(relative).unwrap())
         .is_err());
-    assert!(graph
-        .write_projection_exact(relative, None, b"- target\n")
-        .is_err());
+    // The write side refuses at the same admission boundary. Its exact-byte
+    // writer went with Managed Storage (ADR 0066), so the assertion names what
+    // that writer called first: resolving a target through the reparse
+    // intermediate must fail before any byte is published.
+    let refused = match graph.admit_retained_graph_text_writer() {
+        Ok(permit) => graph
+            .graph_text_target(&permit, &dir.join(relative), false)
+            .is_err(),
+        Err(_) => true,
+    };
+    assert!(
+        refused,
+        "a reparse intermediate must not resolve to a writable graph-text target"
+    );
     assert!(!outside.join("deep/Projection.md").exists());
     assert!(dir.join("pages/linked").symlink_metadata().is_ok());
 
@@ -10981,18 +10992,20 @@ fn native_case_alias_requires_retirement_before_new_spelling() {
         let _ = fs::remove_dir_all(&dir);
         return;
     }
-    let graph = Graph::open(&dir);
+    let pages = Dir::open_ambient_dir(dir.join("pages"), ambient_authority()).unwrap();
+    fs::write(dir.join("pages/staged"), target).unwrap();
 
-    let conflict = graph
-        .write_projection_exact("pages/Foo.md", None, target)
-        .unwrap_err();
-    assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
+    // A new spelling only becomes live through the graph tree's no-clobber
+    // publication. On a case-insensitive filesystem the existing `foo.md` IS
+    // the destination, so publication must refuse rather than replace it, and
+    // the old spelling must be retired first. (Managed Storage's exact-byte
+    // writer performed this rename; ADR 0066 removed the writer, not the rule.)
+    let conflict = rename_projection_noreplace(&pages, "staged", "Foo.md").unwrap_err();
+    assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists, "{conflict}");
     assert_eq!(fs::read(&old).unwrap(), base);
 
-    graph.remove_projection_exact("pages/foo.md", base).unwrap();
-    graph
-        .write_projection_exact("pages/Foo.md", None, target)
-        .unwrap();
+    fs::remove_file(&old).unwrap();
+    rename_projection_noreplace(&pages, "staged", "Foo.md").unwrap();
     assert_eq!(fs::read(&new).unwrap(), target);
 
     let _ = fs::remove_dir_all(&dir);
@@ -13096,9 +13109,11 @@ fn windows_live_graph_root_move_is_denied_without_rebinding() {
         Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
     );
     assert_eq!(graph.graph_text_scope_binding().unwrap(), binding);
-    graph
-        .write_projection_exact("pages/still-bound.md", None, b"- retained\n")
-        .unwrap();
+    // The retained binding still writes. The exact-byte writer this used went
+    // with Managed Storage (ADR 0066); the user path proves the same thing.
+    graph.warm_cache();
+    let page = markdown_page_dto("still-bound", "still-bound", "- retained\n").unwrap();
+    graph.save_page(&page, None).unwrap();
     assert_eq!(
         fs::read(dir.join("pages/still-bound.md")).unwrap(),
         b"- retained\n"
