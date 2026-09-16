@@ -482,11 +482,13 @@
    ],
    "acceptableVariations": [
     "Panel layout and native form-control styling may evolve.",
-    "Which properties a page contributes to the form, and therefore how many controls sit between the last preset and Done."
+    "Which properties a page contributes to the form, and therefore how many controls sit between the last preset and Done.",
+    "Whether the first-run Guide announcement is showing at startup: the journey clears only the KNOWN startup notices before it clicks anything, and an unexpected toast is still allowed to intercept a click and fail the run."
    ],
    "nonRequirements": [
     "Exact section spacing, control dimensions, or debounce timing.",
-    "Field order beyond the five presets, the number of rows a page contributes, or the exact stop list of the Tab traversal after Public."
+    "Field order beyond the five presets, the number of rows a page contributes, or the exact stop list of the Tab traversal after Public.",
+    "The wording, kind, or screen position of startup notices."
    ],
    "stability": "stable"
   },

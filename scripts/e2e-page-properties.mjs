@@ -17,6 +17,7 @@ import {
 import { waitForFileText } from "./e2e-file-poll.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { openPageByName } from "./lib/e2e-navigation.mjs";
+import { dismissStartupNotices } from "./lib/e2e-toasts.mjs";
 
 await ensureDisplay();
 
@@ -497,6 +498,15 @@ try {
   // not a named-page `.page-title`; waiting for the latter prevented openPage()
   // from ever exercising the routed page-properties journey on WebView2.
   await browser.$(".ls-block, .journal-title, .page-title").waitForExist({ timeout: 20_000 });
+  // A fresh profile always announces the Guide, and that notice is sticky and
+  // bottom-right - exactly where this panel's Done button sits once the page
+  // carries enough properties to fill the panel. Clear the known first-run
+  // notices before anything is clicked; unexpected toasts deliberately stay up.
+  // Done here, before the first waitForFile, so the dismissal's own graph-meta
+  // write cannot race an assertion about page content.
+  for (const notice of await dismissStartupNotices(browser)) {
+    console.log(`setup: dismissed startup notice: ${notice}`);
+  }
   await openPage("Property detailed");
   await exerciseNativeFormTabTraversal("Test Record, Alternate");
   const customRow = await browser.execute(() => {
