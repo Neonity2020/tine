@@ -14,6 +14,13 @@ icon:: 🔗
 - ## Aliases
   - Put `alias:: Another name, Third name` among the page properties at the top of a page — as [[Feature showcase]] does with `alias:: Kitchen sink (features)` — and links under those names land on the same page.
   - The page then shows read-only **aka** chips for every name it answers to ("Also known as — other names that link here"), and the raw `alias::` property stays out of the under-title property list.
+- ## Page and block properties
+  - Properties are the `key:: value` lines at the top of a page and under a block's first line, and every one of them is editable from a form — not only by typing raw lines. Right-click a page's title for **Page properties…**, or type `/page properties` while editing; right-click a block for **Properties…**. The form lists the properties that page or block really has, so you are never left looking at a property you cannot change.
+  - A page's form always offers **Aliases**, **Tags**, **Display title**, **Icon** and **Public**, even when the page has none of them yet. Every other property the page carries follows, each under its own key and each removable outright. **Add a property** takes any key you like; leave the value empty to write the key on its own.
+  - Machine-managed properties stay out of the form: `id::` and `collapsed::` are never listed, and the `tine.` keys behind Sheets and saved searches are edited from those surfaces instead.
+  - Each property is written in the form its own file uses. A Markdown page gets `key:: value`; an Org page gets a `#+key: value` file directive, and an Org block its `:PROPERTIES:` drawer — the shapes Logseq itself reads back.
+  - A key does not have to be plain ASCII. `klíč:: hodnota` is an ordinary property: it can be added, changed, and removed again like any other.
+  - A read-only page — a bundled Guide page, or one Tine cannot safely rewrite — offers no property editing at all, rather than a form whose writes would be dropped.
 - ## Block references and embeds
   - Type `((` while editing: the popup full-text-searches blocks, and choosing one inserts a durable `((reference))` — Tine first writes a stable `id::` on the source block, so the reference survives renames, reloads, and restarts.
   - The reference renders as a link-styled copy of the source text — not a grey chip — and stays in sync: edit the source and every reference updates. A per-block reference-count badge reveals the referencing blocks, grouped by page with ancestor breadcrumbs.

@@ -13,6 +13,7 @@ import {
   parsePageHeaderPropertyLine,
   splitPagePreamble,
   orgPreBlockWithProperty,
+  hideAll,
 } from "./properties";
 
 describe("canonical Markdown page-header grammar (GH #163)", () => {
@@ -148,6 +149,23 @@ describe("property line helpers", () => {
       .toBe("#+TITLE: P");
     // Nothing nonblank left: the preamble becomes null, as upsertPropertyLine does.
     expect(orgPreBlockWithProperty("#+tags: one", "tags", null)).toBe(null);
+  });
+
+  // GH #164 packet, spec section B3, remaining counterexample INSIDE the file
+  // whose grammar B3 widened. splitProps classifies each raw line through
+  // propLineKey, which carried its own ASCII-only regex, so a non-ASCII-keyed
+  // property line was never offered to `isHidden` at all. Every BUILTIN hidden
+  // key is ASCII (`id`, `collapsed`, `logseq.order-list-type`), which is why
+  // isBuiltinHidden cannot expose this; hideAll can, and hideAll is a real path
+  // -- annotation (PDF highlight) blocks hide every property and edit only their
+  // text, so such a block would show raw metadata in its edit textarea.
+  it("hides a non-ASCII-keyed property line like any other (GH #164)", () => {
+    const raw = "Body line\nklíč:: hodnota";
+    const { visible, hidden } = splitProps(raw, hideAll);
+    expect(visible).toBe("Body line");
+    expect(hidden).toBe("klíč:: hodnota");
+    // And the split must be reversible, like every other property split.
+    expect(joinProps(visible, hidden)).toBe(raw);
   });
 
   it("preserves the issue-163 page-property layout byte-for-byte outside the edited line", () => {

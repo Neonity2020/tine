@@ -901,9 +901,16 @@ export const [queryBuilderAutoOpen, setQueryBuilderAutoOpen] = createSignal<stri
 
 // Page-properties panel (alias / public / tags / icon / title), opened from the
 // page-title gear or the "/Page properties" command. Anchored at x,y.
-export const [pagePropsPanel, setPagePropsPanel] = createSignal<{ name: string; x: number; y: number } | null>(null);
+// One panel, two scopes (GH #164): a page's pre-block properties, or one
+// block's. The scope picks the reader/writer pair; the transient-layer id stays
+// "page-properties" for both, because that id is a pinned contract.
+export type PropsPanelScope = { kind: "page"; name: string } | { kind: "block"; id: string };
+export const [pagePropsPanel, setPagePropsPanel] = createSignal<{ scope: PropsPanelScope; x: number; y: number } | null>(null);
 export function openPageProps(name: string, x: number, y: number) {
-  setPagePropsPanel({ name, x, y });
+  setPagePropsPanel({ scope: { kind: "page", name }, x, y });
+}
+export function openBlockProps(id: string, x: number, y: number) {
+  setPagePropsPanel({ scope: { kind: "block", id }, x, y });
 }
 export function closePageProps() {
   setPagePropsPanel(null);

@@ -1345,6 +1345,18 @@ mod tests {
             .contains("Unlinked References header identifies that waiting state"));
         assert!(page.markdown.contains("Save page"));
         assert!(page.markdown.contains("tine.view::"));
+        // GH #164: properties became editable as a form for ANY key, on a page
+        // and on a block. Nothing else in the app tells a reader the control
+        // exists, so the page must name both doors and say that a read-only page
+        // has neither — otherwise the only discoverable way to set a property is
+        // still to type the raw line.
+        assert!(page.markdown.contains("**Page properties…**"));
+        assert!(page.markdown.contains("right-click a block for **Properties…**"));
+        assert!(page.markdown.contains("**Add a property**"));
+        assert!(page.markdown.contains("offers no property editing at all"));
+        // A non-ASCII key is an ordinary property, not a curiosity: it was
+        // uneditable until this release, so the page says plainly that it is not.
+        assert!(page.markdown.contains("does not have to be plain ASCII"));
         assert!(page.markdown.contains("[[Workflows/Find and revisit]]"));
 
         let index = GUIDE_TEMPLATES

@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Any property can be edited from the UI, on a page or on a block.** The
+  properties form offered five fixed page keys and nothing at all for blocks, so
+  every other `key:: value` line had to be typed by hand. Right-click a page
+  title for **Page properties…** (or type `/page properties`), or right-click a
+  block for **Properties…**: the form lists the properties that are really
+  there, **Add a property** takes any key you like, and any non-preset key can be
+  removed outright. A key is accepted exactly when the property reader can match
+  it back, so anything that can be added can also be changed and removed —
+  including keys that are not plain ASCII. A read-only page offers no property
+  editing at all (UI-PROPS-ARBITRARY-EDIT-164, GH #164).
 - **Export…** on any query publishes the pages its results live on as a
   standalone HTML site under `published-queries/<name>/`, regardless of
   `public::`. The dialog reviews the page list first; a block query exports

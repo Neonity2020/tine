@@ -13,6 +13,7 @@ import {
   graphMeta,
   setJournalTemplate,
   openPageProps,
+  openBlockProps,
   openExportModal,
   openPdfExport,
   openFormulaEditor,
@@ -240,7 +241,7 @@ export function ContextMenu(): JSX.Element {
           >
             <Switch>
               <Match when={m().kind === "block"}>
-                <BlockMenu id={(m() as { blockId: string }).blockId} close={close} />
+                <BlockMenu id={(m() as { blockId: string }).blockId} x={m().x} y={m().y} close={close} />
               </Match>
               <Match when={m().kind === "blockref"}>
                 <BlockRefMenu
@@ -393,7 +394,7 @@ function ShowChildrenAsSubmenu(props: { id: string; close: () => void }): JSX.El
   );
 }
 
-function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
+function BlockMenu(props: { id: string; x: number; y: number; close: () => void }): JSX.Element {
   const hasChildren = () => (doc.byId[props.id]?.children.length ?? 0) > 0;
   const readOnly = () => blockPageReadOnly(props.id);
   const headingTargets = () => {
@@ -429,7 +430,7 @@ function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
 
       <Show when={!readOnly() || headingsWritable()}><div class="ctx-sep" /></Show>
 
-      <For each={blockActions(props.id)}>
+      <For each={blockActions(props.id, props.x, props.y)}>
         {(it) => (
           <div
             class="ctx-item"
@@ -1177,7 +1178,7 @@ function RenamePage(props: {
   );
 }
 
-function blockActions(id: string): { label: string; run: () => void; danger?: boolean }[] {
+function blockActions(id: string, x: number, y: number): { label: string; run: () => void; danger?: boolean }[] {
   const numbered = blockProperty(id, "logseq.order-list-type") === "number";
   // If this block is itself a template (`template:: name`), offer to set it as the
   // new-journal default (or clear it if it already is) — right where templates live.
@@ -1202,6 +1203,10 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
     { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
     { label: "Zoom into block", run: () => zoomInto(id) },
     { label: "Open in new tab", run: () => openBlockInNewTab(id) },
+    // Editing this block's properties (GH #164). Deliberately in the WRITABLE
+    // arm: the read-only arm above returns early, so a read-only block offers no
+    // property editing at all, and the panel fails closed again on its own.
+    { label: "Properties…", run: () => openBlockProps(id, x, y) },
     // The keyboard route to "a block above this one" is Enter at offset 0, which
     // splits. A block that owns its own Enter key — a code block, where Enter
     // inserts a newline — therefore has no keyboard route, and when it is the

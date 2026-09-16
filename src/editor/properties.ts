@@ -16,6 +16,22 @@ import { transitionFence, displayMathOpenAfter, closesDisplayMath, type FenceSta
  * different job, pinned by its own tests. */
 export const PROP_LINE = /^([\p{L}\p{M}\p{N}_./-]+):: ?(.*)$/u;
 
+/** Whether `key` may be committed as a property key from the UI.
+ *
+ *  This deliberately asks the very matcher that will later have to FIND the key
+ *  ({@link PROP_LINE}) instead of carrying its own rule, so anything accepted
+ *  here is guaranteed matchable for update and removal. A validator that
+ *  disagrees with the finder is precisely how GH #164's write-once bug existed:
+ *  the new-key path wrote unconditionally while the matcher could not find what
+ *  it had written.
+ *
+ *  It compares the recovered key rather than just testing the line, because a
+ *  key such as `a::b` produces a line the matcher happily accepts by binding
+ *  `a` and treating `b:: value` as the value. */
+export function isEditablePropertyKey(key: string): boolean {
+  return PROP_LINE.exec(`${key}:: value`)?.[1] === key;
+}
+
 const PAGE_HEADER_KEY = /^[\p{L}\p{M}\p{N}_./-]+$/u;
 
 /** Parse one canonical Markdown page-header property line. This grammar is
@@ -126,7 +142,12 @@ export const isSheetCellHidden = (key: string): boolean =>
 export const hideAll = (_key: string): boolean => true;
 
 function propLineKey(line: string): string | null {
-  const m = /^\s*([A-Za-z0-9_./-]+)::/.exec(line);
+  // Same Unicode key class as PROP_LINE. An ASCII-only class here meant a
+  // non-ASCII-keyed property line was never classified as a property at all, so
+  // `isHidden` was never consulted for it: with `hideAll` (annotation blocks,
+  // which hide every property and edit only their text) the line stayed visible
+  // as raw metadata in the edit textarea (GH #164).
+  const m = /^\s*([\p{L}\p{M}\p{N}_./-]+)::/u.exec(line);
   return m ? m[1].toLowerCase() : null;
 }
 
