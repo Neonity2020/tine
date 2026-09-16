@@ -5,64 +5,103 @@
       "id": "UI-CLOSE-UNSAVED-RECOVERY",
       "title": "Failed close identifies and preserves unsaved page drafts",
       "family": "conflict-resolution",
-      "sources": { "issues": [540], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [
+          540
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "reported",
-      "coverage": { "tests": ["src/App.test.tsx", "src/components/UnsavedRecovery.test.tsx", "scripts/e2e-concord-live-save.mjs"], "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/App.test.tsx",
+          "src/components/UnsavedRecovery.test.tsx",
+          "scripts/e2e-concord-live-save.mjs"
+        ],
+        "failBefore": "proven"
+      },
       "notes": "Close must expose affected pages, current save state and non-destructive recovery before any discard. Generic native confirmation does not identify drafts. Preserve existing guarded writes."
     },
     {
       "id": "UI-MISSING-PHYSICAL-CONFLICT-RECOVERY",
       "title": "Unavailable conflict page exposes its retained draft without retargeting files",
       "family": "conflict-resolution",
-      "sources": { "issues": [541], "commits": [] },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [
+          541
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "reported",
-      "coverage": { "tests": ["src/components/Page.test.tsx", "src/components/ConflictResolution.test.tsx", "crates/tine-core/src/model_tests.rs", "scripts/e2e-concord-live-save.mjs"], "failBefore": "proven" },
+      "coverage": {
+        "tests": [
+          "src/components/Page.test.tsx",
+          "src/components/ConflictResolution.test.tsx",
+          "crates/tine-core/src/model_tests.rs",
+          "scripts/e2e-concord-live-save.mjs"
+        ],
+        "failBefore": "proven"
+      },
       "notes": "A failed pinned page read must not hide retained conflict recovery; never fall back to a different same-name physical file or create a new graph file implicitly."
     },
     {
       "id": "UI-FOCUS-RESCAN-INPUT-STALL-GH539",
       "title": "Returning to a graph completes its freshness check without stranding editing",
       "family": "external-changes",
-      "sources": { "issues": [539], "commits": [] },
-      "platforms": ["windows"],
+      "sources": {
+        "issues": [
+          539
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
       "layer": "native",
       "status": "reported",
       "coverage": {
-        "tests": ["scripts/e2e-concord-focus-freshness.mjs", "src/reloadOnFocus.test.tsx"],
+        "tests": [
+          "scripts/e2e-concord-focus-freshness.mjs",
+          "src/reloadOnFocus.test.tsx"
+        ],
         "scenario": "focus-rescan-input-stall-gh539",
         "failBefore": "unavailable"
       },
       "notes": "Blocking stateful UX report on Windows 11 v0.6.982: intermittent input stall followed by missing watcher-rescan completion toast. Exact 1a091d74 Linux/WebKit native external-winner-before-edit journey and ten focused tests pass; this does not reproduce or resolve the Windows report. Both reported tag and candidate use a 30-second completion timeout; reporter estimates 3-5 seconds. Native rescan is process-wide and serial across all bound graph lanes, so unrelated graph work can delay completion, but no specific stalled lane or event-delivery failure is proven. Preserve freshness admission safety. Need affected-run debug log, storage/watch mode, graph/window counts and timing evidence. Receipt: tine-agents/evidence/new-bugs-20260914/GH539/RECEIPT.md."
     },
-{
-  "id": "UI-EXTERNAL-ASSET-WATCH-LEXICAL-ALIAS",
-  "title": "Approved external assets refresh for symlink-spelled native events",
-  "family": "media",
-  "sources": {
-    "issues": [
-      127
-    ],
-    "commits": []
-  },
-  "platforms": [
-    "linux"
-  ],
-  "layer": "native",
-  "status": "reported",
-  "coverage": {
-    "tests": [
-      "scripts/e2e-external-assets.mjs",
-      "src-tauri/src/watcher.rs::external_asset_alias_events_refresh_replacement_and_deletion"
-    ],
-    "scenario": "external-assets-lexical-watch-alias",
-    "failBefore": "proven"
-  },
-  "notes": "Exact db6f8bc2 full suite and isolated native rerun retain stale loaded blob after atomic replacement; no asset-changed event delivered. Kernel inotify proof gives identical descriptor1 for canonical external directory and graph/assets symlink. Pinned notify recursive follow_links(true) and paths.insert overwrite lexical descriptor owner; HashSet watch order can select graph/assets while canonical AssetWatchState rejects the path. Evidence tine-agents/evidence/external-assets-diagnostic-20260913/. Root owns normalization repair and final native proof; replacement/deletion and shared approved targets must remain covered."
-},
+    {
+      "id": "UI-EXTERNAL-ASSET-WATCH-LEXICAL-ALIAS",
+      "title": "Approved external assets refresh for symlink-spelled native events",
+      "family": "media",
+      "sources": {
+        "issues": [
+          127
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux"
+      ],
+      "layer": "native",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-external-assets.mjs",
+          "src-tauri/src/watcher.rs::external_asset_alias_events_refresh_replacement_and_deletion"
+        ],
+        "scenario": "external-assets-lexical-watch-alias",
+        "failBefore": "proven"
+      },
+      "notes": "Exact db6f8bc2 full suite and isolated native rerun retain stale loaded blob after atomic replacement; no asset-changed event delivered. Kernel inotify proof gives identical descriptor1 for canonical external directory and graph/assets symlink. Pinned notify recursive follow_links(true) and paths.insert overwrite lexical descriptor owner; HashSet watch order can select graph/assets while canonical AssetWatchState rejects the path. Evidence tine-agents/evidence/external-assets-diagnostic-20260913/. Root owns normalization repair and final native proof; replacement/deletion and shared approved targets must remain covered."
+    },
     {
       "id": "UI-CONCORD-DURABLE-REVIEW-CURRENT-AUTHORITY",
       "title": "Restarted Concord review binds Apply to the current displayed disk revision",
@@ -87,96 +126,96 @@
       },
       "notes": "Exact a65 native SIGKILL restart displays newer outage bytes but Apply rejects AlreadyExists because the review returns pre-crash capsule disk_rev as authority. Both drafts and external bytes remain safe. Native before receipt: tine-agents/evidence/release-concord-window-20260913/RECEIPT.md and diagnose-callback-wire/after-apply-mine.json. Focused render regression fails disk-rev versus newer-disk-rev. Core post-review external-write rejection remains required. Both review adapters now mint authority from the displayed diff revision. The post-review disk check remains mandatory and returns typed conflict.base_rev without changing newer bytes. Focused render and core checks pass; combined native pass-after and deployment remain pending."
     },
-{
-  "id": "UI-CAPTURE-COLD-START-GRAPH-BINDING",
-  "title": "Quick Capture shown during main graph startup obtains its read-only graph binding before autocomplete",
-  "family": "quick-capture",
-  "sources": {
-    "issues": [],
-    "commits": []
-  },
-  "platforms": [
-    "linux"
-  ],
-  "layer": "native",
-  "status": "reproduced",
-  "coverage": {
-    "tests": [
-      "scripts/e2e-capture.mjs"
-    ],
-    "failBefore": "proven"
-  },
-  "notes": "Native a65 cold-process restart failed after ordered physical input with no graph bound for quick capture. The native pending-show handoff now binds the graph before mapping Capture and rejects superseded show completion/focus. Exact release-profile candidate31876e1e passed the complete Linux/WebKit Capture journey in one attempt, including initial page/tag input and save, hidden-window policy refresh, and cold restarted typed-policy autocomplete. Evidence: release-capture-pair-20260913/NATIVE-PASS-31876e1e.md. Integration/deployment and final combined release gates remain pending; Windows/macOS native confirmation is not claimed. Frontend reads never retarget the selected graph."
-},
-{
-  "id": "UI-QUERY-SINGLE-SLASH-COMMAND",
-  "title": "One Query slash command routes to the query builder",
-  "family": "query-builder",
-  "sources": {
-    "issues": [],
-    "commits": []
-  },
-  "platforms": [
-    "all"
-  ],
-  "layer": "render",
-  "status": "reported",
-  "coverage": {
-    "tests": [
-      "src/editor/autocomplete.test.ts::filters by label substring",
-      "src/components/QueryMacro.test.tsx::choosing the Query slash command opens its sheet and field chooser"
-    ],
-    "scenario": "ui-query-single-slash-command",
-    "failBefore": "unavailable"
-  },
-  "notes": "The assertion checks exactly one Query label and query-builder action, with duplicate legacy label removed from the preserved ranking fixture. Mounted QueryMacro regression now exercises textarea input, autocomplete mousedown and the real Block completion handoff through scaffold persistence, edit exit, mounted sheet and chooser. Render-harness autofocus probe found focus outside the chooser; autofocus and native acceptance remain unverified. 2026-09-13 QueryMacro render suite passes 38 tests including the mounted slash handoff; no fail-before or native receipt. Full candidate CI pending."
-},
-{
-  "id": "UI-QUERY-TYPED-READINESS-RESOURCE",
-  "title": "Typed pending query reads retry while permanent failures remain terminal",
-  "family": "query-builder",
-  "sources": {
-    "issues": [],
-    "commits": []
-  },
-  "platforms": [
-    "all"
-  ],
-  "layer": "render",
-  "status": "reported",
-  "coverage": {
-    "tests": [
-      "src/queryReadiness.test.ts",
-      "src/createReadyQueryResource.test.tsx",
-      "src/components/QueryResultSections.test.tsx::q3_pending_and_failure_are_not_the_empty_state"
-    ],
-    "scenario": "ui-query-typed-readiness-resource",
-    "failBefore": "unavailable"
-  },
-  "notes": "Typed reason-code tests cover pending backoff, terminal failure preservation and cancellation; ready-resource tests cover retained current rows and clearing stale graph rows; result sections distinguish pending/error from empty results. Partial surface coverage: this registration does not establish rendered Search, Ctrl+K and block-picker Retry controls or their complete integration. Those three surface acceptance paths remain to be mapped or tested. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
-},
-{
-  "id": "UI-QUERY-ADVANCED-TEXT-ONLY",
-  "title": "Advanced query reports do not offer the filter builder or Simple conversion",
-  "family": "query-builder",
-  "sources": {
-    "issues": [],
-    "commits": []
-  },
-  "platforms": [
-    "all"
-  ],
-  "layer": "render",
-  "status": "reported",
-  "coverage": {
-    "tests": [
-      "src/components/QueryMacro.test.tsx::renders an advanced query's report without offering the filter builder"
-    ],
-    "scenario": "ui-query-advanced-text-only",
-    "failBefore": "unavailable"
-  },
-  "notes": "Mounted Block/ContextMenu test verifies ran: task report, retained count, absent sentence/sheet and absent Simple conversion button. It covers the advanced-query rendering path; no native workflow or exhaustive lossless handwritten-source roundtrip is claimed. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
-},
+    {
+      "id": "UI-CAPTURE-COLD-START-GRAPH-BINDING",
+      "title": "Quick Capture shown during main graph startup obtains its read-only graph binding before autocomplete",
+      "family": "quick-capture",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux"
+      ],
+      "layer": "native",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-capture.mjs"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Native a65 cold-process restart failed after ordered physical input with no graph bound for quick capture. The native pending-show handoff now binds the graph before mapping Capture and rejects superseded show completion/focus. Exact release-profile candidate31876e1e passed the complete Linux/WebKit Capture journey in one attempt, including initial page/tag input and save, hidden-window policy refresh, and cold restarted typed-policy autocomplete. Evidence: release-capture-pair-20260913/NATIVE-PASS-31876e1e.md. Integration/deployment and final combined release gates remain pending; Windows/macOS native confirmation is not claimed. Frontend reads never retarget the selected graph."
+    },
+    {
+      "id": "UI-QUERY-SINGLE-SLASH-COMMAND",
+      "title": "One Query slash command routes to the query builder",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "src/editor/autocomplete.test.ts::filters by label substring",
+          "src/components/QueryMacro.test.tsx::choosing the Query slash command opens its sheet and field chooser"
+        ],
+        "scenario": "ui-query-single-slash-command",
+        "failBefore": "unavailable"
+      },
+      "notes": "The assertion checks exactly one Query label and query-builder action, with duplicate legacy label removed from the preserved ranking fixture. Mounted QueryMacro regression now exercises textarea input, autocomplete mousedown and the real Block completion handoff through scaffold persistence, edit exit, mounted sheet and chooser. Render-harness autofocus probe found focus outside the chooser; autofocus and native acceptance remain unverified. 2026-09-13 QueryMacro render suite passes 38 tests including the mounted slash handoff; no fail-before or native receipt. Full candidate CI pending."
+    },
+    {
+      "id": "UI-QUERY-TYPED-READINESS-RESOURCE",
+      "title": "Typed pending query reads retry while permanent failures remain terminal",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "src/queryReadiness.test.ts",
+          "src/createReadyQueryResource.test.tsx",
+          "src/components/QueryResultSections.test.tsx::q3_pending_and_failure_are_not_the_empty_state"
+        ],
+        "scenario": "ui-query-typed-readiness-resource",
+        "failBefore": "unavailable"
+      },
+      "notes": "Typed reason-code tests cover pending backoff, terminal failure preservation and cancellation; ready-resource tests cover retained current rows and clearing stale graph rows; result sections distinguish pending/error from empty results. Partial surface coverage: this registration does not establish rendered Search, Ctrl+K and block-picker Retry controls or their complete integration. Those three surface acceptance paths remain to be mapped or tested. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
+    },
+    {
+      "id": "UI-QUERY-ADVANCED-TEXT-ONLY",
+      "title": "Advanced query reports do not offer the filter builder or Simple conversion",
+      "family": "query-builder",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.test.tsx::renders an advanced query's report without offering the filter builder"
+        ],
+        "scenario": "ui-query-advanced-text-only",
+        "failBefore": "unavailable"
+      },
+      "notes": "Mounted Block/ContextMenu test verifies ran: task report, retained count, absent sentence/sheet and absent Simple conversion button. It covers the advanced-query rendering path; no native workflow or exhaustive lossless handwritten-source roundtrip is claimed. Registered from existing test assertions on 2026-09-13. No new execution or fail-before/pass-after receipt; full candidate CI pending."
+    },
     {
       "id": "UI-MULTILINE-DRAG-ENDPOINT-20260913",
       "title": "Dragging from a rendered multiline block keeps the text selection endpoint under the pointer",
@@ -9153,7 +9192,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible. 2026-09-15: the scaffold's caret no longer lands in the body immediately — it offers the language picker on the opener line first (GH #507, row UI-CODE-FENCE-LANGUAGE-507); Escape keeps the interior-caret outcome this row asserts."
+      "notes": "GH #413: with auto-pairing ON (the default), the third backtick hit the generic symmetric-pair path and stacked a FOURTH backtick, no closing fence was ever added, and once the code block opened, the fences stayed visible while editing. The third backtick of a whole-buffer fence trigger is now an explicit scaffold decision (``` then blank line then closing fence, caret inside) that runs BEFORE pairing and regardless of the pairing toggle; single inline backticks and every bracket/ref pairing are untouched, and mid-text runs keep inline behavior. With the body-only code view (the GH #412 shared contract) an open complete code block shows only its payload; the /code language picker and typed language completion keep working because the view swap waits for the picker (its query lives on the opening fence line). Fail-before proven on base 848ae2ab: scaffold assertions failed with a lone '```' raw and a four-backtick buffer, and the body-view assertions failed with fences visible. 2026-09-15: the scaffold's caret no longer lands in the body immediately \u2014 it offers the language picker on the opener line first (GH #507, row UI-CODE-FENCE-LANGUAGE-507); Escape keeps the interior-caret outcome this row asserts."
     },
     {
       "id": "UI-EMBED-ARROW-UP-EXIT-415",
@@ -11273,18 +11312,28 @@
     },
     {
       "id": "UI-QUERY-EXPORT-DIALOG-001",
-      "title": "Export… on a query reviews the owner pages, requires acknowledging whole-page export for block queries, and offers Replace or a separate folder on a taken name",
+      "title": "Export\u2026 on a query reviews the owner pages, requires acknowledging whole-page export for block queries, and offers Replace or a separate folder on a taken name",
       "family": "publishing",
-      "sources": { "issues": [], "commits": [], "internal": "2026-09-14 publish-query stage 1 (Martin, rich export idea)" },
-      "platforms": ["all"],
+      "sources": {
+        "issues": [],
+        "commits": [],
+        "internal": "2026-09-14 publish-query stage 1 (Martin, rich export idea)"
+      },
+      "platforms": [
+        "all"
+      ],
       "layer": "render",
       "status": "covered",
       "coverage": {
-        "tests": ["src/components/QueryExportDialog.test.tsx", "src/components/Settings.queryExportBudget.test.tsx", "scripts/e2e-publish-query.mjs"],
+        "tests": [
+          "src/components/QueryExportDialog.test.tsx",
+          "src/components/Settings.queryExportBudget.test.tsx",
+          "scripts/e2e-publish-query.mjs"
+        ],
         "scenario": "publish.query-export-dialog",
         "failBefore": "proven"
       },
-      "notes": "Blocking stateful UX. The plan's folder and fingerprint travel back unchanged on confirm (stateless preview→commit). An over-budget refusal (typed query-unavailable / export_asset_budget_exceeded) shows 'Adjust limit in Settings…' which opens Settings → Graph in one click. Native real-app coverage (scripts/e2e-publish-query.mjs, Direct and Managed, linux-release since 2026-09-15): the Export… button opens the dialog, an untitled query asks for a name, the plan lists exactly the owner pages, Export stays disabled until whole-page export is acknowledged, and the folder is written. The Replace / separate-folder choice on a taken name is covered by the render test only. See REG-QUERY-EXPORT-CLOSURE-001 for the core contract."
+      "notes": "Blocking stateful UX. The plan's folder and fingerprint travel back unchanged on confirm (stateless preview\u2192commit). An over-budget refusal (typed query-unavailable / export_asset_budget_exceeded) shows 'Adjust limit in Settings\u2026' which opens Settings \u2192 Graph in one click. Native real-app coverage (scripts/e2e-publish-query.mjs, Direct and Managed, linux-release since 2026-09-15): the Export\u2026 button opens the dialog, an untitled query asks for a name, the plan lists exactly the owner pages, Export stays disabled until whole-page export is acknowledged, and the folder is written. The Replace / separate-folder choice on a taken name is covered by the render test only. See REG-QUERY-EXPORT-CLOSURE-001 for the core contract."
     },
     {
       "id": "UI-QUERY-EXPORT-APP-001",
@@ -11309,7 +11358,7 @@
         "scenario": "publish.query-export-app",
         "failBefore": "proven"
       },
-      "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page + the view compared under viewKey, which folds the engine's dense ViewSettings and the app's sparse resolution together) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export…, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. The Playwright journey passed a five-round sequential unchanged-binary burn-in (Direct and Managed exports, 27/27 each round, binary built from 5ab70870) on 2026-09-15 and runs in linux-release."
+      "notes": "Blocking stateful UX. The export's app/ is the same frontend build over app/snapshot.json (schema 1); backend() selects the published backend by the tine-published meta. parseQuery/queryRun are lookups keyed exactly as Macro.tsx asks (dialect + tine.* properties + text; stable IR key + current page + the view compared under viewKey, which folds the engine's dense ViewSettings and the app's sparse resolution together) and a miss is a typed query-unavailable / published_export_static. Every other Backend method is classified answered / constant / refused (published-export-read-only) by the guard test, so a new method cannot silently reach a reader's browser. Builder, view switcher, Export\u2026, agenda, today's empty journal and the org read-only banner are not offered. Served over HTTP the root redirects to app/; file:// or ?static keeps the static site. The Playwright journey passed a five-round sequential unchanged-binary burn-in (Direct and Managed exports, 27/27 each round, binary built from 5ab70870) on 2026-09-15 and runs in linux-release."
     },
     {
       "id": "UI-PUBLISH-FOCUS-NO-RESCAN-549",
@@ -11336,7 +11385,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "User outcome: a reader of a published export (ADR 0065 Stage 2) who switches away and back sees no toast. Classification: flexible presentation, but a false error ('Editing is available, but reopen the page…') in an app that has no editing at all, shown on every refocus. Root cause: App.tsx installs the Concord L0 reload-on-focus fallback unconditionally; in a published export refreshOnReturnToWindow reached backend().rescanGraphNow(), which the published backend refuses (PUBLISHED_REFUSED_METHODS), and the catch toasted the refusal. Fix: refreshOnReturnToWindow returns at once and installReloadOnFocus does not install when isPublishedExport(). Fail-before on master 6db9d7e5: rescanGraphNow called once on focus with the published meta tag present. Evidence: tine-agents/evidence/shell-quick-fixes/. Sibling sweep (every refused backend call that fires without a user action in the published app): two more were visible and are fixed here. (1) TagTableToggle ran `runQuery` on every ordinary page; the refusal counted as a reason to show the button, so each page carried a stray '⊞ Table' whose tooltip was the refusal text. It no longer queries or renders in an export, and a page whose author enabled the tag table falls back to its baked linked references. (2) PdfViewer's debounced view-position save after a zoom or scroll, and its flush on close, were refused and toasted. The export no longer schedules it. Fail-before proven for both. Left as follow-ups: creating a PDF highlight in an export is still offered and fails with an honest toast (user action, not automatic); Macro 'why empty?' shows the refusal text on click; several Settings-only ui.ts setters lack a published gate, but the Settings entry is hidden."
+      "notes": "User outcome: a reader of a published export (ADR 0065 Stage 2) who switches away and back sees no toast. Classification: flexible presentation, but a false error ('Editing is available, but reopen the page\u2026') in an app that has no editing at all, shown on every refocus. Root cause: App.tsx installs the Concord L0 reload-on-focus fallback unconditionally; in a published export refreshOnReturnToWindow reached backend().rescanGraphNow(), which the published backend refuses (PUBLISHED_REFUSED_METHODS), and the catch toasted the refusal. Fix: refreshOnReturnToWindow returns at once and installReloadOnFocus does not install when isPublishedExport(). Fail-before on master 6db9d7e5: rescanGraphNow called once on focus with the published meta tag present. Evidence: tine-agents/evidence/shell-quick-fixes/. Sibling sweep (every refused backend call that fires without a user action in the published app): two more were visible and are fixed here. (1) TagTableToggle ran `runQuery` on every ordinary page; the refusal counted as a reason to show the button, so each page carried a stray '\u229e Table' whose tooltip was the refusal text. It no longer queries or renders in an export, and a page whose author enabled the tag table falls back to its baked linked references. (2) PdfViewer's debounced view-position save after a zoom or scroll, and its flush on close, were refused and toasted. The export no longer schedules it. Fail-before proven for both. Left as follow-ups: creating a PDF highlight in an export is still offered and fails with an honest toast (user action, not automatic); Macro 'why empty?' shows the refusal text on click; several Settings-only ui.ts setters lack a published gate, but the Settings entry is hidden."
     },
     {
       "id": "UI-WORKSPACE-NAME-IME-498",
@@ -11389,7 +11438,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "User outcome: after typing ``` to open a code block, the user can still say which language it is, so highlighting works. Classification: blocking core operation — with no language there is no syntax highlighting and no other control anywhere in the UI offers one. Root cause: a regression from the GH #413 scaffold (d365bf5d, shipped in v0.6.981). The third backtick scaffolded the complete fence and dropped the caret into the body-only code view, which hides the opening fence line; the language autocomplete only triggers on a visible ```<char> line, so the only remaining path was the /Code block command. Fix: both paths now go through one door (Block.tsx `openFenceLanguagePicker`), which opens the same empty language picker on the still-visible opener; Escape or a non-language keystroke falls into the body exactly as before, keeping #413's closing fence and interior caret. Fail-before: tine-agents/evidence/code-fence-language/507-fail-before.log (4 of 5 scaffold tests fail; the unrelated mid-text test passes). Evidence layer: render (jsdom) plus the native editor-interactions journey. Covered at master c9e2b435: the native editor-interactions journey ran against that exact staged build and the coordinator recorded its real-app gate."
+      "notes": "User outcome: after typing ``` to open a code block, the user can still say which language it is, so highlighting works. Classification: blocking core operation \u2014 with no language there is no syntax highlighting and no other control anywhere in the UI offers one. Root cause: a regression from the GH #413 scaffold (d365bf5d, shipped in v0.6.981). The third backtick scaffolded the complete fence and dropped the caret into the body-only code view, which hides the opening fence line; the language autocomplete only triggers on a visible ```<char> line, so the only remaining path was the /Code block command. Fix: both paths now go through one door (Block.tsx `openFenceLanguagePicker`), which opens the same empty language picker on the still-visible opener; Escape or a non-language keystroke falls into the body exactly as before, keeping #413's closing fence and interior caret. Fail-before: tine-agents/evidence/code-fence-language/507-fail-before.log (4 of 5 scaffold tests fail; the unrelated mid-text test passes). Evidence layer: render (jsdom) plus the native editor-interactions journey. Covered at master c9e2b435: the native editor-interactions journey ran against that exact staged build and the coordinator recorded its real-app gate."
     },
     {
       "id": "UI-MOVE-UNDO-CROSS-PAGE-DURABLE-ORDER-001",
@@ -11454,13 +11503,13 @@
         "macos"
       ],
       "layer": "native",
-      "status": "reported",
+      "status": "reproduced",
       "coverage": {
         "tests": [],
         "scenario": null,
-        "failBefore": "unavailable"
+        "failBefore": "reconstructed"
       },
-      "notes": "Blocking core operation: search is unusable, and the reporter rolled back to v0.6.982 to keep working. User outcome: after typing a query in Ctrl+K or the search tab on a large graph (reporter: fine below roughly 10,000 pages, broken above; Windows 11, though other Windows 11 users differ), the panel stays on \u201cIndexing \u2014 waiting for search to be ready\u2026\u201d for at least 20 minutes and never returns rows, while Tine keeps consuming CPU and disk when idle. Accepted 2026-09-16 from GH #543. Mechanism established by reading only, NOT yet reproduced here: search readiness IS Direct-projection readiness, because RET2 made the public Direct query route projection-only with no walk arm (crates/tine-core/src/model/search.rs read_friendly_plan -> dispatch_direct_query), so an un-ready projection can only produce a retried spinner. src/queryReadiness.ts retries QueryNotReadyError forever (100ms doubling to an 800ms cap, no total bound), which accounts for the idle CPU and disk. Both call sites (QuickSwitcher.tsx:136, Block.tsx:1602) discard the error's own reason and hardcode the word Indexing, so a graph waiting for any other reason (busy, pending_edits, recovering) still reads as indexing. Suspected root cause under measurement: stream_warm_replacements (model/page_cache.rs) abandons the warm stream whenever cache_gen drifts, and abandon_warm_stream latches needs_full so only a full inventory may publish readiness again; a long warm on a large graph is therefore easy to restart repeatedly. Unverified: whether a 10k-page graph converges slowly or never. Also outstanding regardless of cause: a recorded product ceiling says a full rebuild must not exceed 10 seconds and must be linear, and the codebase's own wait_ready allows 15 seconds."
+      "notes": "Blocking core operation: search is unusable, and the reporter rolled back to v0.6.982 to keep working. User outcome: after typing a query in Ctrl+K or the search tab on a large graph (reporter: fine below roughly 10,000 pages, broken above; Windows 11, though other Windows 11 users differ), the panel stays on \u201cIndexing \u2014 waiting for search to be ready\u2026\u201d for at least 20 minutes and never returns rows, while Tine keeps consuming CPU and disk when idle. Accepted 2026-09-16 from GH #543. MEASURED here 2026-09-16; evidence tine-agents/evidence/gh-543/measurements.md. Two fixtures with the SAME 10,365 files (10,000 pages + 365 journals) differing only in per-file size, which isolates total text bytes from page count: time-to-projection-ready 20.8 s at 1.4 MB and 161 s at 60 MB; after ready, five successive searches took 11.5-13.0 s each at 60 MB versus 0.34 s at 1.4 MB, flat across five different tokens, so that is steady-state per-query cost and not a one-time index build. TWO INDEPENDENT DEFECTS. (1) Time to first searchable state is about 2 ms per file plus a per-byte term - 10,365 files alone account for the 20.8 s case - so a 10k-page graph breaches the recorded 10 s rebuild ceiling before any content is considered; until readiness every query is a genuine NotReady(indexing), which is the reporter's literal symptom. (2) After ready, each search ranks EVERY block in the graph: crates/tine-core/src/query/friendly.rs:895 builds \"WITH ranked AS MATERIALIZED (... tine_query_rank(?1, bt.query_visible) ... FROM blocks b LEFT JOIN block_text bt ...)\" with NO text predicate inside the CTE and filters on the computed rank afterwards, so cost scales with total graph text. Search cannot use the trigram index at all because QueryPlan::block_search_literal and friendly_search_plan use TextMatchMode::Fuzzy (OG ordered-subsequence), which no substring index can serve. REFUTED BY MEASUREMENT - do not re-derive: the FTS is COMPLETE and Ready (search_fts_build phase=1, search_substring_fts=50730=pages(10365)+blocks(40365), outbox=0), so this is not an unbuilt index, and advance_search_index_build is a deferred-mode backfill this projection does not use because apply_graph_projection_rows -> reconcile_fts_rows maintains rows inline. Also refuted: warm-stream abandon/needs_full restart loops (needs_full=false and no generation drift in any run); and Busy capacity exhaustion from typing (both call sites pass a lane - quick-switch, quick-switch:current-page, block-picker - and run_graph_search_latest_displayed bumps a per-lane epoch so superseded jobs self-cancel via check_lane). STILL UNREPRODUCED: the reporter's \u201cnever returns\u201d wording; what is measured is a severe slowdown proportional to graph size in both phases. Separately outstanding regardless of cause: both call sites (src/components/QuickSwitcher.tsx:136, src/components/Block.tsx:1602) discard the error's own QueryReadinessReason and hardcode the word Indexing, so busy/pending_edits/recovering all read as indexing; and src/queryReadiness.ts retries with no total bound."
     }
   ]
 }

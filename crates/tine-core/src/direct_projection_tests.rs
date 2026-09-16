@@ -5083,21 +5083,41 @@ fn warm_scale_probe_reports_time_to_projection_ready() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let searched = Instant::now();
-    let answer = match graph.search("zqx1", 50) {
-        Ok(groups) => format!("ok({} groups)", groups.len()),
-        Err(crate::query::QueryExecutionError::NotReady(reason)) => {
-            format!("NotReady({})", reason.as_str())
+    // Several successive queries, because one timing cannot separate a one-time
+    // index materialization from the steady-state per-query cost, and the fix
+    // for those two is not the same.
+    let mut timings = Vec::new();
+    let mut answer = String::new();
+    for (i, token) in ["zqx1", "zqx1", "zqx500", "outline", "Topic-00042"]
+        .into_iter()
+        .enumerate()
+    {
+        let searched = Instant::now();
+        let outcome = match graph.search(token, 50) {
+            Ok(groups) => format!("ok({} groups)", groups.len()),
+            Err(crate::query::QueryExecutionError::NotReady(reason)) => {
+                format!("NotReady({})", reason.as_str())
+            }
+            Err(_) => "other-error".to_owned(),
+        };
+        let took = searched.elapsed();
+        println!("WARM-SCALE SEARCH #{i} token={token} took={took:?} {outcome}");
+        timings.push(format!("{token}={took:?}"));
+        if i == 0 {
+            answer = outcome;
         }
-        Err(_) => "other-error".to_owned(),
-    };
+    }
     println!(
         "WARM-SCALE RESULT pages={pages} journals={journals} warm_cache={warmed:?} \
-         ready_at={ready_at:?} budget={budget_secs}s search={answer} search_took={:?} state={}",
-        searched.elapsed(),
+         ready_at={ready_at:?} budget={budget_secs}s search={answer} searches=[{}] state={}",
+        timings.join(" "),
         state()
     );
-    let _ = std::fs::remove_dir_all(&root);
+    if std::env::var_os("TINE_WARM_SCALE_KEEP").is_some() {
+        println!("WARM-SCALE KEEP root={}", root.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 fn probe_copy_tree(source: &std::path::Path, target: &std::path::Path) {
