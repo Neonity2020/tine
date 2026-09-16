@@ -3,7 +3,7 @@ import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
 import { closeSwitcher, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
 import { activeId, closeTab, route, tabRoute, tabs } from "../router";
-import { backend } from "../backend";
+import { backend, QueryNotReadyError } from "../backend";
 import { closePane, focusPane, layoutPaneIds, paneRouter, resetPaneLayoutToSingle, setFocusedPaneId, splitPane } from "../panes";
 import { loadSingle, resetStore } from "../store";
 import type { PageDto } from "../types";
@@ -30,6 +30,27 @@ afterEach(() => {
 });
 
 describe("QuickSwitcher search syntax help", () => {
+
+  it("says a rebuild is a rebuild while search is not ready", async () => {
+    // The index is REBUILDING, not merely catching up on edits. Keeping that
+    // distinction is the whole point of `searchIndexPendingMessage`, and it
+    // reaches the user only if this call site actually uses it: hardcoding the
+    // indexing sentence here still satisfied the helper's own unit test.
+    // Rejection is persistent on purpose — `runQueryWhenReady` retries on a real
+    // 100ms timer, so a reject-then-resolve mock would race the retry and could
+    // miss the pending state this test exists to observe.
+    vi.spyOn(backend(), "runGraphSearch").mockRejectedValue(new QueryNotReadyError("recovering"));
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    openSwitcher();
+    const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+    input.value = "Needle";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+
+    await vi.waitFor(() => expect(root.textContent).toContain("Rebuilding the search index"));
+    dispose();
+  });
 
   it.each([
     [true, true],

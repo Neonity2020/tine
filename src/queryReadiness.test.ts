@@ -31,6 +31,24 @@ describe("query availability wire", () => {
   });
 });
 
+describe("searchIndexPendingMessage", () => {
+  it("names a rebuild and collapses the rest, as the reference panel does", async () => {
+    const { searchIndexPendingMessage } = await import("./queryReadiness");
+    expect(searchIndexPendingMessage(null)).toBeNull();
+    // A rebuild takes noticeably longer than a catch-up, so it is the one reason
+    // worth distinguishing — the same split `referenceIndexPendingMessage` makes
+    // and pins for its own surface. Without this, every reason read as indexing.
+    expect(searchIndexPendingMessage(new QueryNotReadyError("recovering"))).toBe(
+      "Rebuilding the search index — waiting for search to be ready…"
+    );
+    for (const reason of ["indexing", "pending_edits", "busy"] as const) {
+      expect(searchIndexPendingMessage(new QueryNotReadyError(reason))).toBe(
+        "Indexing — waiting for search to be ready…"
+      );
+    }
+  });
+});
+
 describe("owned query readiness", () => {
   it("backs off pending attempts and returns the actual answer", async () => {
     vi.useFakeTimers();

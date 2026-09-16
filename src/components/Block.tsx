@@ -2,7 +2,7 @@ import { captureEditorScrollAnchor } from "../editor/scrollAnchor";
 import { Show, Switch, Match, For, createMemo, createSignal, createContext, useContext, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { autocompleteFacets, backend } from "../backend";
-import { runQueryWhenReady } from "../queryReadiness";
+import { runQueryWhenReady, searchIndexPendingMessage } from "../queryReadiness";
 import { graphBinding } from "../persistence";
 import { clearClipboardSlot, normalize, peekClipboardSlot, writeClipboardText } from "../clipboard";
 import {
@@ -1599,7 +1599,7 @@ export function Editor(props: { id: string }): JSX.Element {
         groups = await runQueryWhenReady(() => backend().search(t.query, 20, "block-picker"), {
           signal: controller.signal,
           isCurrent,
-          onPending: (error) => setBlockSearchPending(error ? "Indexing — waiting for search to be ready…" : null),
+          onPending: (error) => setBlockSearchPending(searchIndexPendingMessage(error)),
         });
       } catch (error) {
         if (isCurrent()) setBlockSearchError(error instanceof Error ? error.message : String(error));

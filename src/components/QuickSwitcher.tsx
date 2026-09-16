@@ -1,5 +1,5 @@
 import { For, Show, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
-import { runQueryWhenReady } from "../queryReadiness";
+import { runQueryWhenReady, searchIndexPendingMessage } from "../queryReadiness";
 import { backend } from "../backend";
 import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
@@ -133,7 +133,7 @@ export function QuickSwitcher(): JSX.Element {
         ), {
       signal: controller.signal,
       isCurrent,
-      onPending: (error) => setSearchPending(error ? "Indexing — waiting for search to be ready…" : null),
+      onPending: (error) => setSearchPending(searchIndexPendingMessage(error)),
     }).then((answer) => { if (isCurrent()) setGraphResults(answer); })
       .catch((error: unknown) => {
         if (isCurrent()) setSearchError(error instanceof Error ? error.message : String(error));

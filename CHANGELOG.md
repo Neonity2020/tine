@@ -41,6 +41,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Search on a large graph is roughly twice as fast per query.** Every search
+  used to re-fold each block's text while ranking it; it now reads the folded
+  text the graph index already stores, which is the same comparison done once at
+  indexing time instead of once per block per keystroke. Results and their order
+  are unchanged. Search on a graph that large is still slow, and the separate
+  wait for the index to become ready in the first place is not improved by this
+  change; both remain open. (GH #543)
+- While search is waiting for the index, a rebuild now says it is rebuilding
+  rather than "Indexing", so a long wait is distinguishable from a brief
+  catch-up. The reference panels already made this distinction.
 - **Undoing a move between pages can no longer lose the moved blocks.** Undo and
   redo of a cross-page move (a drag, a journal-day move, or a carry) now write
   the page that regains the blocks first and hold the other page's save until it

@@ -100,3 +100,22 @@ export async function runQueryWhenReady<T>(
     if (!owner.signal.aborted && owner.isCurrent()) owner.onPending(null);
   }
 }
+
+/** What the SEARCH surfaces say while they wait for the query index.
+ *
+ * Sibling of `referenceIndexPendingMessage` (`src/lib/referenceFetch.ts`),
+ * worded for this subject — a Quick Switcher / search-tab status line, not a
+ * reference count and not a query block's "Updating query results…".
+ *
+ * `recovering` is the one reason worth naming, because a rebuild takes
+ * noticeably longer than a catch-up and the user is deciding whether to keep
+ * waiting. `indexing`, `pending_edits` and `busy` all read as indexing: that is
+ * the same editorial choice the reference panel makes and pins in its own test,
+ * not an oversight. Both call sites previously hardcoded the indexing sentence
+ * and so lost the rebuild distinction entirely. */
+export function searchIndexPendingMessage(error: QueryNotReadyError | null): string | null {
+  if (!error) return null;
+  return error.reasonCode === "recovering"
+    ? "Rebuilding the search index — waiting for search to be ready…"
+    : "Indexing — waiting for search to be ready…";
+}
