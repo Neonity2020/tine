@@ -1,5 +1,5 @@
-//! GH #550 research fixture: cold-open contention on the first foreground
-//! commands. Not a product regression test — a measurement harness.
+//! GH #550 regression/measurement fixture: cold-open contention on the first
+//! foreground commands.
 //!
 //! The Android report (0.6.982, build 33175f2) showed a Direct Files open that
 //! finished in 384 ms, then `journal_feed_page` (8.4 s), `list_pages` (14.3 s),
@@ -200,7 +200,8 @@ fn gh550_cold_open_contention_measurements() {
     let (root_b, _) = build_fixture("contended");
 
     // -- Control: cold open, no warm running; each surface measured in
-    // isolation. This is the desktop-experience baseline.
+    // isolation. This is the desktop-experience baseline; list_pages now owns
+    // (or joins) the same page-build flight as templates.
     let graph = Graph::open(&root_a);
     let t = Instant::now();
     let feed_loaded = feed_window_core(&graph);
@@ -245,7 +246,7 @@ fn gh550_cold_open_contention_measurements() {
             Reading {
                 label: "list_pages",
                 ms: ms(list_pages_alone),
-                detail: "cold fallback parses every file",
+                detail: "shared page-build flight",
             },
             Reading {
                 label: "list_templates",
@@ -263,7 +264,8 @@ fn gh550_cold_open_contention_measurements() {
     // -- Contended open: mirrors the app's real cold start. The four surfaces
     // fire concurrently (as the frontend's post-binding fetches do) while the
     // background warm (`warm_cache_async`, 250 ms delayed in
-    // src-tauri/src/graph.rs) parses the same graph.
+    // src-tauri/src/graph.rs) joins or observes the same generation-scoped
+    // build instead of starting another inventory parse.
     let graph = Graph::open(&root_b);
     let g = std::sync::Arc::new(graph);
 
@@ -330,12 +332,12 @@ fn gh550_cold_open_contention_measurements() {
             Reading {
                 label: "list_pages",
                 ms: list_ms,
-                detail: "independent whole-graph parse, not the flight",
+                detail: "shared page-build flight",
             },
             Reading {
                 label: "get_page (newest journal)",
                 ms: named_ms,
-                detail: "find_entry -> list_pages under contention",
+                detail: "find_entry -> shared inventory under contention",
             },
             Reading {
                 label: "list_templates",
