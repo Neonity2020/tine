@@ -96,17 +96,13 @@ describe("block reference to a soft-line-break block (GH #506)", () => {
     }
   });
 
-  it("CURRENT (GH #506): the bare ((ref)) renders only the first line of the soft-break block", async () => {
+  it("renders every visible line of a bare ((ref)) across a soft break", async () => {
     const { host, dispose } = setup(TARGET_RAW, `((${ID}))`);
     try {
       await vi.waitFor(() => expect(host.querySelector(".block-ref")).toBeTruthy());
-      // CURRENT (GH #506): truncated to "A".
-      // FIXED expectation: the reference displays the full content — e.g.
-      // textContent "AB" with a <br> between (the RefBlocks.tsx embed/panel
-      // shape), or however the fix chooses to show the soft break.
-      expect(host.querySelector(".block-ref")?.textContent).toBe("A");
-      expect(host.querySelector(".block-ref")?.textContent).not.toContain("B");
-      expect(host.querySelector(".block-ref br")).toBeNull();
+      expect(host.querySelector(".block-ref")?.textContent).toBe("AB");
+      expect(host.querySelector(".block-ref")?.textContent).toContain("B");
+      expect(host.querySelectorAll(".block-ref br")).toHaveLength(1);
     } finally {
       dispose();
     }

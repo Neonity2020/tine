@@ -152,12 +152,10 @@ fn journal_page_target_collects_referrers_by_iso_title_format() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// (3b) The cross-format gap: with the DEFAULT title format, a link written in
-/// the ISO shape refs an ordinary page named "2026-09-20", not the journal —
-/// establishing where the reported workflow can silently break for a user
-/// whose linking habit assumes ISO names are journal pages.
+/// (3b) The reproduced cross-format gap: with the DEFAULT title format, a link
+/// written in the ISO shape is an accepted spelling of the real journal day.
 #[test]
-fn iso_link_under_default_title_format_is_not_the_journal_page() {
+fn iso_link_under_default_title_format_reaches_the_journal_page() {
     let dir = scratch("iso-default");
     std::fs::write(
         dir.join("journals/2026_09_20.md"),
@@ -178,17 +176,22 @@ fn iso_link_under_default_title_format_is_not_the_journal_page() {
             .is_some(),
         "journal resolves under its default display title"
     );
-    // …so the journal page's linked references are EMPTY …
-    assert!(
-        g.backlinks("Sep 20th, 2026").is_empty(),
-        "no refs reach the journal when the referrer wrote the ISO shape"
+    // …but the ISO spelling resolves into the same date-equivalence set.
+    assert_eq!(
+        group_pages(&g.backlinks("Sep 20th, 2026")),
+        vec!["Notes".to_string()],
+        "the real journal collects a referrer written with the ISO spelling"
     );
-    // …and the ISO-shaped link is a ref to a nonexistent ordinary page.
     assert_eq!(
         group_pages(&g.backlinks("2026-09-20")),
         vec!["Notes".to_string()],
-        "the ISO-shaped link targets an ordinary (here phantom) page name"
+        "looking up the ISO spelling resolves the same journal backlinks"
     );
+
+    let indexed = g
+        .backlinks_bounded_indexed("Sep 20th, 2026", 10_000, 16 * 1024 * 1024)
+        .expect("indexed backlinks must answer on a settled graph");
+    assert_eq!(group_pages(&indexed.groups), vec!["Notes".to_string()]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
