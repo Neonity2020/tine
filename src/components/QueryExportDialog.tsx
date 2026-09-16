@@ -3,6 +3,7 @@ import { backend, QueryUnavailableError } from "../backend";
 import { queryExportRequest, closeQueryExport, openSettings, pushToast } from "../ui";
 import { registerTransientLayer } from "../transientLayers";
 import type { QueryPublicationPlan, QueryPublicationRequest } from "../types";
+import { readLatestOr } from "../resourceRead";
 
 /** "Export query results…": plan → review the page set → confirm.
  *
@@ -49,7 +50,7 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
   // failure names the limit and offers the setting in one click.
   const [overBudget, setOverBudget] = createSignal(false);
 
-  const [plan] = createResource(
+  const [planResource] = createResource(
     () => plannedName(),
     async (forName): Promise<QueryPublicationPlan | { refused: string }> => {
       if (!forName.trim()) return { refused: "Give the export a name." };
@@ -60,12 +61,13 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
       }
     },
   );
+  const plan = () => readLatestOr(planResource, undefined, "query export plan");
   const planned = (): QueryPublicationPlan | undefined => {
-    const p = plan.latest;
+    const p = plan();
     return p && !("refused" in p) ? p : undefined;
   };
   const refusal = (): string | undefined => {
-    const p = plan.latest;
+    const p = plan();
     return p && "refused" in p ? p.refused : undefined;
   };
   const blockAnchored = () => planned()?.anchor === "block";
@@ -190,7 +192,7 @@ function Dialog(props: { request: QueryPublicationRequest }): JSX.Element {
           <Show when={refusal()}>
             {(message) => <div class="query-export-refused" role="alert">{message()}</div>}
           </Show>
-          <Show when={plan.loading && !planned()}>
+          <Show when={planResource.loading && !planned()}>
             <div class="query-export-note">Resolving pages…</div>
           </Show>
 

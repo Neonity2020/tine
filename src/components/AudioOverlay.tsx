@@ -10,6 +10,7 @@ import { audioPlayer, setAudioPlayer } from "../ui";
 import { backend, isTauri } from "../backend";
 import { acquireMediaBlobFallback, type MediaBlobLease } from "../mediaBlobFallback";
 import { registerTransientLayer } from "../transientLayers";
+import { readOr } from "../resourceRead";
 
 /** Bare `assets/`-relative path of a media URL (mirrors inline.tsx's helper). */
 function relOf(url: string): string | null {
@@ -63,7 +64,7 @@ function drawWave(canvas: HTMLCanvasElement | undefined, progress: number): void
 export function AudioOverlay(): JSX.Element {
   // Resolve to a range-aware native URL for graph assets (same path as the inline
   // embed), or the direct URL for external/http audio.
-  const [src] = createResource(
+  const [srcResource] = createResource(
     () => audioPlayer()?.url ?? null,
     async (u) => {
       if (isExternal(u)) return u;
@@ -72,6 +73,9 @@ export function AudioOverlay(): JSX.Element {
     }
   );
   const [blobFallback, setBlobFallback] = createSignal("");
+  // A stream that fails leaves no src; the blob fallback below is exactly the
+  // path that already handles "this element could not get a source".
+  const src = () => readOr(srcResource, undefined, "overlay audio asset");
   const resolvedSrc = () => blobFallback() || src();
   let tryingBlobFallback = false;
   let blobLease: MediaBlobLease | null = null;

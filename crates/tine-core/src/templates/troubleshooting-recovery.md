@@ -40,6 +40,11 @@ icon:: 🛟
 	- 2. If the message mentions that Tine is still waiting on operations that have been running for a while, give it a moment and retry again: the region is failing because the backend has not answered yet, not because anything is wrong with your notes.
 	- 3. If it comes back every time, use **Create diagnostic report** below and include the message shown in the region.
 	- 4. What you should see: your notes on disk are untouched either way — a region that cannot be displayed is a display failure, not a data failure.
+- ## A panel says it could not load something
+	- Meaning: one panel could not fetch what it needed — references to a block, the results of a query, the list of pages. It says so instead of drawing itself empty, because an empty panel would tell you there is nothing there, which is a different thing from not being able to find out.
+	- 1. **Retry**, where the panel offers one, re-fetches just that panel. The rest of the page, and the rest of that panel, keep working.
+	- 2. Smaller pieces degrade quietly rather than saying anything: a code block that could not be highlighted shows as plain text, a formula that could not be typeset shows its LaTeX, a preview that could not load shows nothing in its place. These are display-only, and reopening the page re-tries them.
+	- 3. What you should see: the panel keeps its heading and its controls, and the rest of the window is unaffected. Nothing on disk changes.
 - ## Create a privacy-safe diagnostic report
 	- 1. Open Settings → **Diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
 	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.

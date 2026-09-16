@@ -41,7 +41,7 @@ interface ConsoleSiteLocation extends ConsoleSite {
 // from (c) to (d): it keeps a failure's type, size and identity and drops its
 // message.
 type ConsoleBucket = "a" | "b" | "c" | "d";
-const CONSOLE_ALLOWLIST_SIZE = 21;
+const CONSOLE_ALLOWLIST_SIZE = 22;
 
 // Rows are keyed by CONTENT, not by line number, and that is the whole point of
 // the `anchor` column.
@@ -78,6 +78,7 @@ const CONSOLE_ALLOWLIST: readonly (ConsoleSite & { bucket: ConsoleBucket; class:
   { file: "print.ts", anchor: "99eb03faa4fe", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — pagePrintHtml errors name the page" },
   { file: "render/parse.ts", anchor: "1e8f76713ce3", method: "warn", bucket: "d", class: "build-token", why: "compares two public parser build tags" },
   { file: "sheet/formulaEval.ts", anchor: "8259b2f56d25", method: "warn", bucket: "d", class: "internal-id-count", why: "performance warning carries an internal owner id and numeric count" },
+  { file: "resourceRead.ts", anchor: "eeeb3a5fdd36", method: "warn", bucket: "d", class: "scrubbed-error", why: "failureShape() plus `what`, a fixed label chosen in source — never the page, path or query the resource was about" },
   { file: "ui.ts", anchor: "22fb47f1f860", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule persistence errors carry the conflicted page and path" },
   { file: "ui.ts", anchor: "350928478727", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule retirement errors carry the conflicted page and path" },
   { file: "ui.ts", anchor: "ebb833424c2f", method: "error", bucket: "d", class: "scrubbed-error", why: "failureShape() — capsule refresh errors carry the conflicted page and path" },
@@ -197,7 +198,7 @@ describe("I-5 content-out-of-logs ratchet", () => {
     const contract = source("docs/contracts/diagnostics.md");
     const rustRatchet = source("crates/tine-core/tests/content_out_of_logs.rs");
     expect(contract).toContain("18 Rust production print sites");
-    expect(contract).toContain("21 variable-bearing frontend console sites");
+    expect(contract).toContain("22 variable-bearing frontend console sites");
     expect(contract).toContain("debug_enabled()");
     expect(contract).toContain("runtime_debug_diagnostics_enabled()");
     expect(rustRatchet).toContain("const RUST_PRINT_SITE_COUNT: usize = 18;");

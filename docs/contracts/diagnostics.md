@@ -110,7 +110,7 @@ allowlist currently contains 18 Rust production print sites, each with a class,
 reason, and gate. A deletion changes the census just as an addition does.
 
 `src/contentOutOfLogs.ratchet.test.ts` walks production TypeScript and TSX and
-classifies 21 variable-bearing frontend console sites. It also pins the parser
+classifies 22 variable-bearing frontend console sites. It also pins the parser
 failure shape and the two allowlist counts in this document. Changes to either
 census require an explicit contract review.
 

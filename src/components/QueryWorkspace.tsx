@@ -45,6 +45,7 @@ import { blockDtoExternalId } from "../blockIdentity";
 import { isSaveConflictFailure } from "../persistence";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
 import { createReadyQueryResource } from "../createReadyQueryResource";
+import { readLatestOr } from "../resourceRead";
 import { runQueryWhenReady } from "../queryReadiness";
 import { onGraphRebound } from "../modeHooks";
 import { markdownRawWithProperty, orgRawWithProperty } from "../editor/properties";
@@ -60,6 +61,7 @@ import {
 } from "../editor/queryDisplayDraft";
 import { QueryResultSections } from "./QueryResultSections";
 import { QueryPageResults, MarkedText, hitMatchSpans, type QueryPageHit } from "./QueryPageResults";
+import { readOr } from "../resourceRead";
 
 const PAGE_LIMIT = 40;
 const BLOCK_LIMIT = 100;
@@ -537,7 +539,7 @@ function AdvancedModal(props: {
   // RET2-Direct: `query_parse` can report typed readiness, so this pair takes
   // the shared readiness owner and its binding/epoch cancellation, exactly as
   // the workspace's execution resource does.
-  const [builderSession] = createReadyQueryResource(dsl, async (text): Promise<BuilderSession> => {
+  const [builderSessionResource] = createReadyQueryResource(dsl, async (text): Promise<BuilderSession> => {
     const parsed = await backend().parseQuery(text, "og");
     return { query: parsed.query, view: parsed.view };
   });
@@ -649,7 +651,7 @@ function AdvancedModal(props: {
         <Show when={draftKind() === "search"} fallback={
           <div class="query-dsl-editor">
             <QueryBuilder
-              session={() => builderSession.latest}
+              session={() => readLatestOr(builderSessionResource, undefined, "query builder session")}
               onChange={(next) => void applyBuilderEdit(next)}
               paneDialect="og"
               sheetAlwaysOpen
@@ -923,7 +925,7 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   );
 
   const execution = createMemo<(QueryExecution & { statistics?: QueryStatistics }) | undefined>(
-    (previous) => executionResource.error ? previous : executionResource(),
+    (previous) => executionResource.error ? previous : readOr(executionResource, undefined, "query execution"),
   );
   const statisticsSummary = createMemo(() => querySummary({ statistics: execution()?.statistics }));
   const hits = () => execution()?.hits ?? [];

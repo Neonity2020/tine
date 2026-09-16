@@ -23,6 +23,8 @@ import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from ".
 import { NamespaceTree } from "./Namespace";
 import type { PageKind } from "../types";
 import { registerTransientLayer } from "../transientLayers";
+import { readOr } from "../resourceRead";
+import { ResourceFailure } from "./ResourceFailure";
 
 // Cap the rendered "All pages" list. Beyond this, rendering every row (each
 // reading route() for its active state) makes both the initial render and every
@@ -636,7 +638,10 @@ export function GraphSwitcher(props: {
   actions: GraphNavigationActions;
 }): JSX.Element {
   const [open, setOpen] = createSignal(false);
-  const [knownGraphs, { refetch }] = createResource(() => backend().listKnownGraphs());
+  const [knownGraphsResource, { refetch }] = createResource(() => backend().listKnownGraphs());
+  // An unreadable list must not read as "you have no other graphs": the menu
+  // still offers Open…, and the row below says which half failed.
+  const knownGraphs = () => readOr(knownGraphsResource, undefined, "known graphs");
   const close = () => setOpen(false);
 
   createEffect(() => {
@@ -678,6 +683,7 @@ export function GraphSwitcher(props: {
           }}
         />
         <div class="ctx-menu graph-switch-menu">
+          <ResourceFailure of={knownGraphsResource} what="your other graphs" onRetry={() => void refetch()} />
           <For each={knownGraphs() ?? []}>
             {(graph) => (
               <div

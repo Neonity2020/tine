@@ -3,6 +3,7 @@ import { backend } from "./backend";
 import { dataRev, graphEpoch, pageInventoryRev } from "./ui";
 import { waitForWarmCache } from "./warmCache";
 import type { PageEntry } from "./types";
+import { readOr } from "./resourceRead";
 
 // ONE graph-wide physical page list and reference-name list, shared by every
 // namespace + sidebar consumer. Physical entries keep paths/owners for All Pages;
@@ -26,7 +27,7 @@ import type { PageEntry } from "./types";
 export const __pagesTestHooks: { onMergePageNames?: () => void } = {};
 
 const pageInventory = createRoot(() => {
-  const [physicalPages] = createResource(
+  const [physicalPagesResource] = createResource(
     () => ({ epoch: graphEpoch(), inventory: pageInventoryRev() }),
     async ({ epoch, inventory }) => {
       const pages = await backend().listPages().catch(() => [] as PageEntry[]);
@@ -41,7 +42,7 @@ const pageInventory = createRoot(() => {
   // be JSON-parsed on the UI thread. (Direct Files performance audit 2026-08-09,
   // finding F7.) Reset on a graph switch: digests are per-graph.
   let known: { epoch: number; digest: number; names: string[] } | null = null;
-  const [referencedNames] = createResource(
+  const [referencedNamesResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev(), inventory: pageInventoryRev() }),
     async ({ epoch, revision, inventory }) => {
       // `referenced_page_names` deliberately returns empty before the Rust warm
@@ -67,6 +68,12 @@ const pageInventory = createRoot(() => {
   // Physical display spellings win case-insensitively; the reference-only names
   // then fill gaps. This is the sole complete page-name inventory for namespace
   // consumers, while `allPages` intentionally remains physical-only.
+  // Both fetchers already catch their own backend rejection, so these guard the
+  // remaining paths (a rejected warm-cache wait, a throwing source). The memo
+  // below runs inside whichever component reads `allPages()`, so a throw here
+  // lands in an arbitrary consumer's render.
+  const physicalPages = () => readOr(physicalPagesResource, undefined, "page inventory");
+  const referencedNames = () => readOr(referencedNamesResource, undefined, "referenced page names");
   const names = createMemo(() => {
     __pagesTestHooks.onMergePageNames?.();
     const seen = new Set<string>();

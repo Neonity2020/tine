@@ -40,6 +40,7 @@ import {
 } from "./QuerySheet";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { createReadyQueryResource } from "../createReadyQueryResource";
+import { readLatestOr } from "../resourceRead";
 import { runQueryWhenCurrent } from "../queryReadiness";
 import { graphBinding } from "../persistence";
 import { QueryDisplay } from "./QueryDisplay";
@@ -220,7 +221,7 @@ function QueryTextPane(props: {
   // spelled itself — that was the twin this packet removed. The printer's answer
   // carries the session it was computed for, so a print that lands after the
   // block changed underneath cannot be shown as that block's text.
-  const [printed] = createResource(
+  const [printedResource] = createResource(
     () => (props.visible() ? props.session() : undefined),
     async (session) => {
       const key = { query: session.query, view: session.view };
@@ -240,7 +241,7 @@ function QueryTextPane(props: {
    *  — a response that arrived in order but is now about a previous reading is
    *  not this block's text either. */
   const printedNow = () => {
-    const landed = printed.latest;
+    const landed = readLatestOr(printedResource, undefined, "query print");
     const current = props.session();
     if (!landed || !current) return undefined;
     return landed.query === current.query && landed.view === current.view ? landed : undefined;
@@ -610,8 +611,7 @@ export function createQueryRegistryAccess(active: () => boolean): RegistryAccess
     // same synchronous update, so Solid discards that rejection rather than
     // storing it. This is the net under that, never a state to render: a
     // cancellation is the absence of an answer, not one.
-    if (registrySnapshot.error !== undefined) return undefined;
-    const landed = registrySnapshot.latest;
+    const landed = readLatestOr(registrySnapshot, undefined, "query registry snapshot");
     return landed && landed.scope === registryScope() && landed.key === registryKey()
     ? landed : undefined;
   };

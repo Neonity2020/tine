@@ -22,6 +22,7 @@ import {
 import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
 import { ReferenceExportChooser } from "./ReferenceExportChooser";
+import { readOr } from "../resourceRead";
 
 
 type BoundedEvidence = NonNullable<RefGroup["evidence"]>[number] & {
@@ -67,10 +68,13 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
     setLoadError,
     setIndexPending,
   });
-  const [groups] = createResource(
+  const [groupsResource] = createResource(
     () => props.name,
     (n) => fetchReferences(n, () => backend().getUnlinkedRefs(n))
   );
+  // `createReferenceFetcher` already routes a failure to `loadError` (rendered
+  // below), so this covers the read itself rather than replacing that channel.
+  const groups = () => readOr(groupsResource, undefined, "unlinked references");
   const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
   const count = () => mergedGroups().reduce((a, g) => a + g.blocks.length, 0);
   const groupKey = (group: RefGroup) => pageIdentityKey(group.page);
@@ -105,7 +109,7 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
         <Show when={groups()}>
           <span class="references-count">{count()}</span>
         </Show>
-        <Show when={groups.loading}>
+        <Show when={groupsResource.loading}>
           <span class="references-loading"> {referenceIndexPendingMessage(indexPending()) ?? "Loading…"}</span>
         </Show>
         <button

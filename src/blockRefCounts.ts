@@ -3,6 +3,7 @@ import { backend } from "./backend";
 import { dataRev, graphEpoch } from "./ui";
 import { waitForWarmCache } from "./warmCache";
 import { blockExternalId } from "./store";
+import { readOr } from "./resourceRead";
 
 // One graph-wide `block uuid → referrer count` map, fetched once per graph and
 // after each landed save, and shared by every block's count badge (Block.tsx). Reading
@@ -10,7 +11,7 @@ import { blockExternalId } from "./store";
 // update together when the graph changes (a new ref is saved → graphEpoch bumps →
 // refetch). Created in its own root: it lives for the app's lifetime by design.
 const countsMap = createRoot(() => {
-  const [counts] = createResource(
+  const [countsResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev() }),
     async ({ epoch }) => {
       if (!(await waitForWarmCache(epoch))) return {};
@@ -18,7 +19,9 @@ const countsMap = createRoot(() => {
       return backend().getBlockRefCounts().catch(() => ({}) as Record<string, number>);
     }
   );
-  return counts;
+  // Read by `blockRefCount` from inside Block.tsx's render; a throw here would
+  // cost the whole page for a badge. No counts means no badges.
+  return () => readOr(countsResource, undefined, "block reference counts");
 });
 
 /** Number of blocks that reference block `id` in the current graph (0 if none /

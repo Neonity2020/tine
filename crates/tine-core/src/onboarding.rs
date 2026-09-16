@@ -763,6 +763,9 @@ mod tests {
         assert!(page
             .markdown
             .contains("Part of the window says it could not be displayed"));
+        assert!(page
+            .markdown
+            .contains("A panel says it could not load something"));
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page

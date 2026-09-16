@@ -78,6 +78,7 @@ import {
   type QuerySheetDropTarget,
 } from "./querySheetReorder";
 import { dismissOnOutsidePointer, registerTransientLayer, type TransientLayer } from "../transientLayers";
+import { readOr } from "../resourceRead";
 
 // **The query builder's two states (SPEC §7.2, design §2.1).**
 //
@@ -765,7 +766,9 @@ function PageInput(props: {
     dqTimer = setTimeout(() => setDq(s), 120);
   });
   onCleanup(() => clearTimeout(dqTimer));
-  const [matches] = createResource(dq, (s) => backend().quickSwitch(s, 8));
+  const [matchesResource] = createResource(dq, (s) => backend().quickSwitch(s, 8));
+  // A failed lookup offers no completions; the next keystroke re-runs it.
+  const matches = () => readOr(matchesResource, undefined, "value editor completions");
   return (
     <div class="qs-value-editor">
       <input

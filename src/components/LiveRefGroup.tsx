@@ -12,6 +12,7 @@ import { isBuiltinHidden, rawOffsetToVisibleOffset } from "../editor/properties"
 import { graphBinding } from "../persistence";
 import { visibleBody } from "../render/block";
 import { LinkDepthContext } from "./linkDepth";
+import { readOr } from "../resourceRead";
 
 // The "near the viewport" lazy-mount observer is shared app-wide (block bodies
 // use it too) — see src/lazyObserve.ts.
@@ -58,7 +59,7 @@ export function LiveRefGroup(props: {
   });
 
   // Load the source page only once the group is near the viewport.
-  const [ready] = createResource(
+  const [readyResource] = createResource(
     () => (near() ? { p: props.page, k: props.kind, path: props.path } : null),
     async ({ p, k, path }) => {
       const occupied = pageByName(p);
@@ -102,6 +103,9 @@ export function LiveRefGroup(props: {
   // O(N) per row → O(N²) per group (250k iterations on a 500-block hub group).
   const byId = createMemo(() => new Map(props.blocks.map((b) => [b.id, b] as const)));
   const evidenceById = createMemo(() => new Map((props.evidence ?? []).map((item) => [item.block_id, item])));
+  // A source page that failed to load leaves the group on its DTO path below,
+  // which is the same path it uses before the page is near the viewport.
+  const ready = () => readOr(readyResource, undefined, "reference group source page");
   const dtoById = (id: string) => byId().get(id);
   const liveBreadcrumb = (id: string): string[] | null => {
     if (!ready() || !doc.byId[id]) return null;

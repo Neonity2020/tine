@@ -40,6 +40,7 @@ import { selectedThemePresentation } from "../themeGallery";
 import { TodayTaskSummary } from "./TodayTaskSummary";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { FailureBoundary } from "./FailureBoundary";
+import { readLatestOr, readOr } from "../resourceRead";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -1157,7 +1158,9 @@ export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
     (requestKey, signal) => sharedTagQuery(props.page.name, requestKey, signal)
   );
   const enabled = () => tagTableEnabled(props.page.name);
-  const visible = () => live && props.page.kind === "page" && (enabled() || pending() || groups.error || taggedCount(groups()) > 0);
+  const tagGroups = () => readOr(groups, undefined, "tag table results");
+  const visible = () => live && props.page.kind === "page"
+    && (enabled() || pending() || groups.error || taggedCount(tagGroups()) > 0);
   return (
     <Show when={visible()}>
       <button
@@ -1188,11 +1191,11 @@ export function TagPageTable(props: { pageName: string }): JSX.Element {
     <div class="tag-page-table">
       <Show when={pending()}>{error => <span class="query-readiness-status" role="status">{error().message}</span>}</Show>
       <Show when={groups.error}>{error => <div role="alert">{String(error())}</div>}</Show>
-      <Show when={!groups.error && (!groups.loading || groups.latest)}>
+      <Show when={!groups.error && (!groups.loading || readLatestOr(groups, undefined, "tag table results"))}>
       <SheetTable
         ownerId={`tag-page:${encodeURIComponent(props.pageName)}`}
         rowSource="query"
-        groups={groups.error ? [] : groups() ?? []}
+        groups={readOr(groups, undefined, "tag table results") ?? []}
         addRow={addRow}
         addRowLabel={`Add ${tagRef(props.pageName)} row`}
         schemaPage={props.pageName}

@@ -83,6 +83,7 @@ import { blockDtoExternalId } from "../blockIdentity";
 import { ExternalLink } from "./ExternalLink";
 import { editingId } from "../editorController";
 import { createQueryRefreshRevision } from "../queryResultGrace";
+import { readLatestOr, readOr } from "../resourceRead";
 
 // Recognize the typed Logseq input without treating an example in a string or
 // `;;` comment as live. Only a direct token in the :inputs vector makes query
@@ -344,7 +345,7 @@ export function QueryMacro(props: {
   });
   // Keep each reading paired with the exact inputs it describes. A displayed
   // reading can intentionally lag a local edit while its replacement loads.
-  const parsed = { get latest() { return parsedSnapshot.latest?.reading; } };
+  const parsed = { get latest() { return readLatestOr(parsedSnapshot, undefined, "query reading")?.reading; } };
   // `latest` rather than `parsed()`: a re-parse after an edit keeps the previous
   // reading visible instead of blanking the query for a frame.
   const source = (): Source | undefined => parsed.latest?.query.source;
@@ -485,8 +486,7 @@ export function QueryMacro(props: {
     // Linked References); with no error boundary above, that throw would blank
     // the page. A rejected execution parse is "no runnable form", and the
     // refusal is surfaced through `emptyResultsMessage` instead.
-    if (executionParsed.error) return undefined;
-    const snapshot = executionParsed.latest;
+    const snapshot = readLatestOr(executionParsed, undefined, "query execution reading");
     return snapshot && snapshot.request.argument === executionArg() ? snapshot.reading : undefined;
   };
   /** The reading the EXECUTION runs. Every authoring and display derivation keeps
@@ -596,7 +596,7 @@ export function QueryMacro(props: {
     const rawAtStart = doc.byId[props.blockId].raw;
     const epochAtStart = graphEpoch();
     const request = parseRequest();
-    const baseline = parsedSnapshot.latest;
+    const baseline = readLatestOr(parsedSnapshot, undefined, "query reading");
     if (baseline && (baseline.request.argument !== request.argument || baseline.request.name !== request.name)) {
       setPrintError("The query text changed. Wait for it to refresh, then try this edit again.");
       return false;
@@ -1273,7 +1273,7 @@ export function QueryMacro(props: {
       pendingFocusedOperation = undefined;
       return; // Keep the previous coherent rows/statistics pair with error status.
     }
-    const candidate = groupResource();
+    const candidate = readOr(groupResource, undefined, "query results");
     if (!candidate) {
       pendingFocusedOperation = undefined;
       setDisplayedOperation(undefined);
@@ -1418,11 +1418,11 @@ export function QueryMacro(props: {
    *  unsupported query has no counts to report, and an empty row list without
    *  its diagnostics would read as "every conjunct matches nothing" instead of
    *  "this query never ran" (I-9). */
-  const explainRows = (): EmptyExplanation[] => explained.error ? [] : explained()?.rows ?? [];
+  const explainRows = (): EmptyExplanation[] => readOr(explained, undefined, "query explanation")?.rows ?? [];
   const explainNotice = (): string | null => {
     if (explanationPending()) return explanationPending()!.message;
     if (explained.error) return explained.error instanceof Error ? explained.error.message : String(explained.error);
-    const answer = explained();
+    const answer = readOr(explained, undefined, "query explanation");
     if (!answer) return null;
     const blocking = (answer.diagnostics ?? []).filter((d) => !d.disabled);
     if (blocking.length) return blocking.map((d) => d.message).join(" · ");
@@ -2655,7 +2655,7 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
       && pageIdentityKey(sourcePage) === pageIdentityKey(targetPage);
   };
 
-  const [data] = createResource(
+  const [dataResource] = createResource(
     () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`,
     async () => {
     const t = target();
@@ -2675,6 +2675,9 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
     }
     return null;
   });
+  // An embed whose target could not be resolved shows the embed-missing marker
+  // below — the same thing it shows for a target that does not exist.
+  const data = () => readOr(dataResource, undefined, "embed target");
 
   return (
     <div class="embed-block">

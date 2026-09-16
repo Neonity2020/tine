@@ -156,6 +156,7 @@ import {
   setLauncherRankingEnabled,
 } from "../launcherRanking";
 import { registerTransientLayer } from "../transientLayers";
+import { readOr } from "../resourceRead";
 import {
   DEFAULT_CUSTOM_WIDE_CONTENT_WIDTH,
   DEFAULT_STANDARD_CONTENT_WIDTH,
@@ -289,7 +290,7 @@ function advancedMatch(tab: Tab, query: string): boolean {
 export function Settings(): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("appearance");
   const [settingsQuery, setSettingsQuery] = createSignal("");
-  const [settingsPlatform] = createResource(async () => {
+  const [settingsPlatformResource] = createResource(async () => {
     try {
       return await platformKind();
     } catch {
@@ -298,6 +299,9 @@ export function Settings(): JSX.Element {
       return undefined;
     }
   });
+  // Same "fail closed to unknown" answer the fetcher already gives, now also
+  // reachable when the read itself would have thrown.
+  const settingsPlatform = () => readOr(settingsPlatformResource, undefined, "settings platform");
   const pluginsAvailable = () => settingsPlatform() === "desktop" || settingsPlatform() === "android";
   const availableTabs = createMemo(() => pluginsAvailable() ? TABS : TABS.filter((entry) => entry.id !== "plugins"));
   const matches = createMemo(() => {
@@ -336,14 +340,14 @@ export function Settings(): JSX.Element {
   };
 
   createEffect(() => {
-    if (!settingsPlatform.loading && tab() === "plugins" && !pluginsAvailable()) setTab("appearance");
+    if (!settingsPlatformResource.loading && tab() === "plugins" && !pluginsAvailable()) setTab("appearance");
   });
 
   createEffect(() => {
     if (!settingsOpen()) return;
     const requested = settingsTabRequest();
     if (!requested) return;
-    if (requested === "plugins" && settingsPlatform.loading) return;
+    if (requested === "plugins" && settingsPlatformResource.loading) return;
     setTab(requested === "plugins" && !pluginsAvailable() ? "appearance" : requested);
     clearSettingsTabRequest();
   });
@@ -697,7 +701,11 @@ function PluginsTab(): JSX.Element {
   const [busy, setBusy] = createSignal<string | null>(null);
   const [view, setView] = createSignal<"browse" | "installed">("browse");
   const [selectedPluginKey, setSelectedPluginKey] = createSignal<string | null>(null);
-  const [currentPlatform] = createResource(platformKind);
+  const [currentPlatformResource] = createResource(platformKind);
+  // Unlike its two siblings in this file, `platformKind` is uncaught here; an
+  // unknown platform reads as "not yet known", which is what the buttons below
+  // already render.
+  const currentPlatform = () => readOr(currentPlatformResource, undefined, "plugin platform");
   const selectedPlugin = () => {
     const key = selectedPluginKey();
     return key ? installedPlugins().find((plugin) => `${plugin.manifest.id}@${plugin.manifest.version}` === key) : undefined;
@@ -1728,7 +1736,10 @@ function AppearanceTab(props: { search: string }): JSX.Element {
 // to the chosen template's block. Uses existing concepts only: templates + the
 // config pointer. No catalogue, no built-in default.
 function JournalTemplateField(): JSX.Element {
-  const [templates] = createResource(() => backend().listTemplates());
+  const [templatesResource] = createResource(() => backend().listTemplates());
+  // An unreadable template list offers no templates; the field still shows and
+  // still accepts the configured pointer.
+  const templates = () => readOr(templatesResource, undefined, "journal templates");
   const current = () => graphMeta()?.default_journal_template ?? "";
   const list = () => templates() ?? [];
   const selected = () => list().find((t) => t.name === current());
@@ -2164,11 +2175,12 @@ function HomePageField(): JSX.Element {
   onCleanup(() => clearTimeout(dqTimer));
   // Page picker over the existing quick-switch index; home pages are ordinary
   // pages, so journals are filtered out here and at open time.
-  const [matches] = createResource(dq, async (s) => {
+  const [matchesResource] = createResource(dq, async (s) => {
     if (value() && !picking()) return [];
     const hits = await backend().quickSwitch(s, 8).catch(() => [] as PageEntry[]);
     return (hits ?? []).filter((p) => p.kind === "page");
   });
+  const matches = () => readOr(matchesResource, undefined, "home page picker completions");
 
   createEffect(on(root, async (r) => {
     setValue(null);
@@ -2639,7 +2651,7 @@ function JournalConflictsPanel(): JSX.Element {
 // unrequested diff in a graph kept in git (invariant 4, write-shyness). It is
 // now proposed here and applied only on this button, after a snapshot.
 function JournalFilenamePanel(): JSX.Element {
-  const [pending, { refetch }] = createResource(async () => {
+  const [pendingResource, { refetch }] = createResource(async () => {
     // Best-effort like the other inventories: an absent panel beats a broken
     // Backups tab.
     try {
@@ -2648,6 +2660,8 @@ function JournalFilenamePanel(): JSX.Element {
       return [];
     }
   });
+  // The panel's own comment: an absent panel beats a broken Backups tab.
+  const pending = () => readOr(pendingResource, undefined, "journal filename migrations");
   const [busy, setBusy] = createSignal(false);
   const apply = async () => {
     const files = pending() ?? [];
@@ -2831,13 +2845,15 @@ function reviewInPage(path: string, name: string, kind: "page" | "journal"): voi
 function FilesTab(props: { search: string }): JSX.Element {
   // Unknown platforms fail closed to "not desktop": a section whose backend
   // command errors on this platform must not be offered.
-  const [filesPlatform] = createResource(async () => {
+  const [filesPlatformResource] = createResource(async () => {
     try {
       return await platformKind();
     } catch {
       return undefined;
     }
   });
+  // Fails closed to "not desktop", exactly as the fetcher's own catch does.
+  const filesPlatform = () => readOr(filesPlatformResource, undefined, "files platform");
   // Live preview of the asset-name template, on a fixed sample so every token is
   // visible (and the example doesn't jitter by the second). Shows both a named
   // drag/insert and a clipboard paste (which has no name → timestamp fallback).

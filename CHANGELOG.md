@@ -22,6 +22,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   operations are outstanding and how long they have been running, since that is
   usually the real explanation and retrying is usually the fix
   (UI-REGION-FAILURE-BOUNDARY-001, GH #490, GH #332).
+- **A background load that fails now costs only the thing it was loading, and a
+  panel that cannot fetch its contents says so rather than drawing itself
+  empty.** Every value Tine fetches in the background — syntax highlighting, a
+  typeset formula, a page preview, the references to a block, the results of a
+  query, the list of pages — used to throw when its fetch failed, which took
+  down the region around it. Each of those places already had a written answer
+  for "no value yet", and none of those answers could ever run. They run now: a
+  code block that could not be highlighted shows as plain text, a formula shows
+  its LaTeX, a preview shows nothing in its place, and the page carries on. For
+  panels where being empty would instead assert something false — "no references
+  to this block" when Tine merely could not look — the panel keeps its heading
+  and controls and shows **Couldn't load …**, with a **Retry** where refetching
+  is possible (UI-RESOURCE-READ-FALLBACK-002, GH #490, GH #332).
 - **Any property can be edited from the UI, on a page or on a block.** The
   properties form offered five fixed page keys and nothing at all for blocks, so
   every other `key:: value` line had to be typed by hand. Use **Page actions**

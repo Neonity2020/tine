@@ -23,6 +23,7 @@ import { pageIdentityKey } from "../pageIdentity";
 import { mergeReferenceGroups } from "../lib/referenceGroups";
 import { ReferenceExportChooser } from "./ReferenceExportChooser";
 import { createLongPress } from "../render/longPress";
+import { readOr } from "../resourceRead";
 
 // One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
 // old private `norm` (trim+toLowerCase) split NFC/NFD and boundary-slash
@@ -115,10 +116,13 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     setLoadError,
     setIndexPending: () => {},
   });
-  const [groups] = createResource(
+  const [groupsResource] = createResource(
     () => props.name,
     (n) => fetchReferences(n, () => backend().getBacklinks(n))
   );
+  // `createReferenceFetcher` already routes a failure to `loadError` (rendered
+  // below), so this covers the read itself rather than replacing that channel.
+  const groups = () => readOr(groupsResource, undefined, "linked references");
   const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
   // GH #272: held outside the component so a remount cannot silently re-collapse
   // a section the user expanded. See referenceSectionState.
@@ -169,13 +173,16 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     )
   );
   const needsNativeContext = () => filterOpen() || Object.keys(filters()).length > 0;
-  const [nativeContext] = createResource(
+  const [nativeContextResource] = createResource(
     () => {
       if (!needsNativeContext() || !groups()) return null;
       return { name: props.name, targets: targets() };
     },
     ({ name, targets }) => backend().getBacklinkFilterContext(name, targets)
   );
+  // The "Couldn't index descendant text" row below was unreachable: reading a
+  // rejected `nativeContext` threw before any Show could render it.
+  const nativeContext = () => readOr(nativeContextResource, undefined, "reference filter index");
   const fallbackByRoot = createMemo(() =>
     new Map(
       mergedGroups().flatMap((group) =>
@@ -227,7 +234,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   const textMatchedGroups = createMemo<RefGroup[]>(() => {
     const parsed = parsedSearch();
     const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
-    if (!searching || nativeContext.loading) return mergedGroups();
+    if (!searching || nativeContextResource.loading) return mergedGroups();
     return filterGroups(mergedGroups(), (group, block) => {
       const entry = rootEntry(group, block);
       return matcherMatches(parsed, entry.normalizedText, entry.text);
@@ -278,7 +285,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     // one, so a fallback miss cannot prove a real miss and dropping the root
     // would hide a genuine match. Once the index arrives filtering is
     // synchronous. The summary says so rather than reporting a filtered count.
-    if ((searching || ins.length || outs.length) && nativeContext.loading) return mergedGroups();
+    if ((searching || ins.length || outs.length) && nativeContextResource.loading) return mergedGroups();
     if (!ins.length && !outs.length) return textMatchedGroups();
     // GH #273: positive include chips OR — a backlink stays when ANY included
     // page/tag is present, and zero positive chips leaves the facet side
@@ -336,7 +343,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
    *  so the list below is deliberately UNFILTERED. Say that instead of
    *  reporting "N of N references", which asserts a finished filter. */
   const filterPending = () => {
-    if (!nativeContext.loading) return false;
+    if (!nativeContextResource.loading) return false;
     const parsed = parsedSearch();
     const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
     return searching || Object.keys(filters()).length > 0;
@@ -444,7 +451,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                   fallback={
                     <>
                       {count()} of {totalCount()} references
-                      <Show when={nativeContext.loading}> · indexing…</Show>
+                      <Show when={nativeContextResource.loading}> · indexing…</Show>
                     </>
                   }
                 >
@@ -454,7 +461,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
               <Show when={searchError()}>
                 {(error) => <div class="reference-filter-error">Invalid search: {error()}</div>}
               </Show>
-              <Show when={nativeContext.error}>
+              <Show when={nativeContextResource.error}>
                 <div class="reference-filter-error">Couldn’t index descendant text; searching visible root text only.</div>
               </Show>
               <Show when={nativeContext()?.truncated || nativeContext()?.entries.some((entry) => entry.truncated)}>

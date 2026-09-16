@@ -71,6 +71,7 @@ import {
   seedSuggestedOrNoLoss,
 } from "./DiffRows";
 import type { ConflictObject, DiffRow, MergeDecision, PageDto, SyncConflictDiff } from "../types";
+import { readOr } from "../resourceRead";
 
 function errorDetail(error: unknown): string {
   // Tauri rejects a `Result<T, String>` with the bare string; keep its text.
@@ -300,7 +301,7 @@ export function PageConflictResolution(props: { conflict: ConflictObject; unavai
   // versions…", and every other DOM effect batched with it, so one unreadable
   // conflict froze the panel AND blanked the page body (GH #490). A failure is
   // an absent diff here; the fallback below says what happened.
-  const diffValue = (): SyncConflictDiff | null => (diff.error ? null : diff() ?? null);
+  const diffValue = (): SyncConflictDiff | null => readOr(diff, null, "conflict diff") ?? null;
 
   // Every fresh alignment restarts from the suggested resolution (and the
   // no-loss choice where there is no suggestion). Row decisions belong to ONE

@@ -11638,6 +11638,33 @@
         "failBefore": "proven"
       },
       "notes": "GH #490 diagnosed it inside the conflict panel; GH #332 is the user cost. Solid's runUpdates (solid-js 1.9.13, dist/solid.js:820) sets `Effects = null` and then handleError RETHROWS when no boundary is registered - and Tine registered none anywhere. So one unreadable value dropped every effect batched with it, left the window as an uncaught error a Tauri webview shows the user nothing about, and rescheduled nothing: permanent blank until restart. GH #332's diagnostics carry the shape exactly - runtime.started 37,053ms against a 1,690ms baseline, frontend.health uncaught_error, a post-open list_pages that threw - and the reporter, seeing an empty window, reasonably read it as lost notes and stayed on an August release. What this row covers: a failing region reports itself in place with a Retry, its siblings keep rendering, and when the backend is still past the slow threshold the region says how many operations have been running and for how long, because that is what makes Retry the right next step rather than a shot in the dark. NOT a claim that the tear disappears: `Effects = null` runs BEFORE handleError, so co-batched effects are still lost; the boundary converts a silent permanent blank into a visible message plus a way forward. Seams are an architectural fact, so they live in a test: src/failureBoundarySeams.guard.test.ts walks the TSX AST for each required mount and fails naming the file and line - it caught a second, unwrapped PageConflictResolution mount in this very packet. Fail-before PROVEN by a control arm kept permanently in FailureBoundary.test.tsx: with no boundary the throw escapes render and the healthy sibling never mounts. Not proven at the native observation boundary - the GH #332 path needs a 37-second startup to reproduce - so the release claim for that reporter stays tentative until he retests."
+    },
+    {
+      "id": "UI-RESOURCE-READ-FALLBACK-002",
+      "title": "A failed background fetch degrades to the fallback the site already drew, and a panel that cannot load its contents says so instead of rendering empty",
+      "family": "shell",
+      "sources": {
+        "issues": [
+          490,
+          332
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/resourceRead.test.tsx",
+          "src/components/ResourceFailure.test.tsx",
+          "src/resourceReads.guard.test.ts"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "The other half of UI-REGION-FAILURE-BOUNDARY-001. The boundary catches the throw; this row is about the throw happening at all. Reading a Solid resource is how this app throws into render: read() (solid-js 1.9.13, dist/solid.js:318-322) does `if (err !== undefined && !pr) throw err`, and the `latest` getter (:390-397) does the same - so `hljs()`, `katex()`, `preview()`, `contentDays()`, `icons()` on a rejected fetch threw, and runUpdates discarded every effect batched with it. The finding that shaped the fix: nearly every one of these sites had ALREADY written what to do without a value - escaped plain text for un-highlighted code, the raw TeX for an un-typeset formula, `?? {}`, `?? []` - and not one of those branches could ever run, because the read threw first. So the fix is behaviour-preserving on the happy path: readOr/readLatestOr (src/resourceRead.ts) consult resource.error, which never throws, and hand back the fallback the site already had; 42 reads across 21 files. What this row covers: a failed background fetch costs only the value it was fetching, and a panel whose emptiness would MISINFORM says so instead - ResourceFailure (src/components/ResourceFailure.tsx) keeps the panel's heading and controls and shows 'Couldn't load <what>' with a Retry where refetching is possible, in the sidebar page list and in Block References. Linked and Unlinked References are NOT in that set and do not need to be: createReferenceFetcher (src/lib/referenceFetch.ts) catches its own failures into loadError and already renders a role=alert row, so those resources never reject. Deliberately NOT a boundary per panel: a boundary costs the panel's whole subtree and its state, and a panel that knows its own resource failed can keep its place. Fail-before PROVEN by a control arm kept permanently in src/resourceRead.test.tsx: a settled-rejected resource throws on both `resource()` and `resource.latest`, and the bare render leaves its healthy sibling unmounted where the readOr render shows both. Recurrence is prevented by shape plus a ratchet: src/resourceReads.guard.test.ts walks the TSX AST of every non-test file in src/, scopes each binding to its own function (Page.tsx has a resource named `groups` AND a parameter named `groups`), and fails on any call of a resource binding or any read of a non-safe property - `.latest` is explicitly not safe. It carries two self-checks because an earlier version parsed the file twice and compared scope nodes by identity, which silently made the whole scan vacuous. Evidence layer: render/unit. Not driven at the native observation boundary - a failing backend fetch is not reproducible in a stable E2E journey - so the claim is that the fallback path is reachable and correct, not that a specific field failure is cured."
     }
   ]
 }

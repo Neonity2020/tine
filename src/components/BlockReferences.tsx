@@ -8,6 +8,8 @@ import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from ".
 import { LiveRefGroup } from "./LiveRefGroup";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { blockExternalId } from "../store";
+import { readOr } from "../resourceRead";
+import { ResourceFailure } from "./ResourceFailure";
 
 // Block-level "linked references": the blocks that reference THIS block (via
 // `((uuid))` / `[..](((uuid)))` / `{{embed ((uuid))}}`), grouped by page. Toggled
@@ -15,10 +17,14 @@ import { blockExternalId } from "../store";
 // LinkedReferences, minus the co-reference filter chips (OG doesn't show those on
 // the block-ref panel). Refetches when the graph generation changes.
 export function BlockReferences(props: { id: string }): JSX.Element {
-  const [groups] = createResource(
+  const [groupsResource, { refetch }] = createResource(
     () => ({ id: blockExternalId(props.id) ?? props.id, epoch: graphEpoch(), revision: dataRev() }),
     ({ id }) => backend().getBlockReferrers(id)
   );
+  // Unlike the page-level panels this one has no fetcher wrapper, so it owns
+  // both halves: readOr keeps a failed read out of the page's render, and the
+  // row below keeps the panel from silently claiming there are no references.
+  const groups = () => readOr(groupsResource, undefined, "block references");
   const count = () => (groups() ?? []).reduce((acc, g) => acc + g.blocks.length, 0);
 
   // GH #344: group-level collapse for the compact title-only overview. LOCAL
@@ -44,6 +50,8 @@ export function BlockReferences(props: { id: string }): JSX.Element {
   };
 
   return (
+    <>
+      <ResourceFailure of={groupsResource} what="references to this block" onRetry={() => void refetch()} />
     <Show when={groups() && groups()!.length > 0}>
       <div class="block-references-inner">
         <div class="block-references-header">
@@ -100,5 +108,6 @@ export function BlockReferences(props: { id: string }): JSX.Element {
         </For>
       </div>
     </Show>
+    </>
   );
 }
