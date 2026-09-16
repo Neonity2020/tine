@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **A part of Tine that fails now says so, where it failed, with a Retry — instead
+  of leaving the window blank.** Until now a single unreadable value anywhere in
+  the interface tore down the whole render and showed nothing at all, with no
+  message and no way back except restarting; at least one report of an "empty
+  app" was this, not lost notes. The page, the sidebar, Linked and Unlinked
+  References and the conflict panel now each fail on their own: the region that
+  broke shows what went wrong and a **Retry** that re-renders just that region,
+  and everything else keeps working. If the failure happened while Tine was
+  still waiting on a slow backend operation, the message says how many
+  operations are outstanding and how long they have been running, since that is
+  usually the real explanation and retrying is usually the fix
+  (UI-REGION-FAILURE-BOUNDARY-001, GH #490, GH #332).
 - **Any property can be edited from the UI, on a page or on a block.** The
   properties form offered five fixed page keys and nothing at all for blocks, so
   every other `key:: value` line had to be typed by hand. Use **Page actions**

@@ -760,6 +760,9 @@ mod tests {
             .markdown
             .contains("Create a privacy-safe diagnostic report"));
         assert!(page.markdown.contains("**Verify synchronized graph**"));
+        assert!(page
+            .markdown
+            .contains("Part of the window says it could not be displayed"));
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page

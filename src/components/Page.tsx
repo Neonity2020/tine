@@ -39,6 +39,7 @@ import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from ".
 import { selectedThemePresentation } from "../themeGallery";
 import { TodayTaskSummary } from "./TodayTaskSummary";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
+import { FailureBoundary } from "./FailureBoundary";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -549,7 +550,9 @@ export function PageView(): JSX.Element {
             {(conflict) => <>
               <p>The conflict's original file is unavailable. Your retained draft is available below; copy it before making changes to the files on disk.</p>
               <RecoveryDraft page={conflict().live!.page} />
-              <PageConflictResolution conflict={conflict()} unavailable onResolved={() => setLoadAttempt((n) => n + 1)} />
+              <FailureBoundary region="The conflict panel">
+                <PageConflictResolution conflict={conflict()} unavailable onResolved={() => setLoadAttempt((n) => n + 1)} />
+              </FailureBoundary>
             </>}
           </Show>
           <button onClick={() => setLoadAttempt((n) => n + 1)}>Try opening again</button>
@@ -601,12 +604,20 @@ export function PageView(): JSX.Element {
             </Show>
             <Show
               when={pagesToRender()[0].kind === "page" && !pagesToRender()[0].guide && tagTableEnabled(pagesToRender()[0].name) && !isPublishedExport()}
-              fallback={<Show when={!pagesToRender()[0].guide}><LinkedReferences name={pagesToRender()[0].name} /></Show>}
+              fallback={
+                <Show when={!pagesToRender()[0].guide}>
+                  <FailureBoundary region="Linked References">
+                    <LinkedReferences name={pagesToRender()[0].name} />
+                  </FailureBoundary>
+                </Show>
+              }
             >
               <TagPageTable pageName={pagesToRender()[0].name} />
             </Show>
             <Show when={!pagesToRender()[0].guide}>
-              <UnlinkedReferences name={pagesToRender()[0].name} />
+              <FailureBoundary region="Unlinked References">
+                <UnlinkedReferences name={pagesToRender()[0].name} />
+              </FailureBoundary>
             </Show>
           </Show>
         </div>
@@ -840,7 +851,11 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
       <ExternalChangeBar name={props.page.name} />
       {/* Concord L4: the conflict is resolved AT the page, block by block. */}
       <Show when={conflictObjectFor(props.page.path, props.page.name)}>
-        {(conflict) => <PageConflictResolution conflict={conflict()} />}
+        {(conflict) => (
+          <FailureBoundary region="The conflict panel">
+            <PageConflictResolution conflict={conflict()} />
+          </FailureBoundary>
+        )}
       </Show>
       <Show when={props.page.kind === "page"}>
         <NamespaceCrumb name={props.page.name} />

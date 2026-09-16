@@ -2,6 +2,7 @@
 // browser (Vite dev / Playwright screenshots) we fall back to an in-memory mock
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
+import { createSignal } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
 import type { GraphSearchDisplayOptions } from "./editor/queryIr";
@@ -1170,6 +1171,44 @@ const DIAGNOSTIC_COMMANDS = new Set([
 ]);
 const SLOW_IPC_MS = 500;
 
+/**
+ * Commands that passed SLOW_IPC_MS and have not settled, with the moment each
+ * started.
+ *
+ * Tine already RECORDED that it was being slow — GH #332's diagnostics show
+ * `runtime.started` at 37s with a wall of `slow` phases — and told the user
+ * nothing, so a blank window was indistinguishable from lost notes. A failure
+ * surface that can say "the backend has been busy for 37 seconds" turns that
+ * into a diagnosis the reporter can act on. Module-level rather than per-call
+ * because the reader is a different component entirely.
+ */
+const slowCommandsInFlight = new Map<number, { command: string; startedAt: number }>();
+let slowCommandSeq = 0;
+const [slowCommandRevision, bumpSlowCommandRevision] = createSignal(0, { equals: false });
+
+export interface SlowBackendState {
+  /** Commands over SLOW_IPC_MS that have not returned. */
+  count: number;
+  /** Milliseconds the longest-running of them has been waiting. */
+  longestMs: number;
+}
+
+/** Reactive: re-reads whenever a command crosses or leaves the slow threshold. */
+export function slowBackendState(): SlowBackendState {
+  slowCommandRevision();
+  let longestMs = 0;
+  const now = performance.now();
+  for (const entry of slowCommandsInFlight.values()) {
+    longestMs = Math.max(longestMs, now - entry.startedAt);
+  }
+  return { count: slowCommandsInFlight.size, longestMs: Math.round(longestMs) };
+}
+
+export function resetSlowBackendStateForTests() {
+  slowCommandsInFlight.clear();
+  bumpSlowCommandRevision(0);
+}
+
 class TauriBackend implements Backend {
   private invoke!: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   private convertFileSrc!: (path: string, protocol?: string) => string;
@@ -1203,9 +1242,19 @@ class TauriBackend implements Backend {
         elapsedMs: Math.max(0, Math.round(elapsedMs)),
       }).catch(() => {});
     };
+    let slowTicket: number | undefined;
+    const releaseSlowTicket = () => {
+      if (slowTicket === undefined) return;
+      slowCommandsInFlight.delete(slowTicket);
+      slowTicket = undefined;
+      bumpSlowCommandRevision(0);
+    };
     if (!DIAGNOSTIC_COMMANDS.has(cmd)) {
       slowTimer = setTimeout(() => {
         slow = true;
+        slowTicket = ++slowCommandSeq;
+        slowCommandsInFlight.set(slowTicket, { command: cmd, startedAt: started });
+        bumpSlowCommandRevision(0);
         reportPhase("slow", performance.now() - started);
       }, SLOW_IPC_MS);
     }
@@ -1214,6 +1263,7 @@ class TauriBackend implements Backend {
       result = await this.invoke<T>(cmd, leasedArgs);
     } catch (error) {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
+      releaseSlowTicket();
       recordGraphOpenCommand(cmd, started, "failed");
       reportPhase("failed", performance.now() - started);
       // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
@@ -1221,6 +1271,7 @@ class TauriBackend implements Backend {
       throw classifyNativeCallError(error);
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
+    releaseSlowTicket();
     recordGraphOpenCommand(cmd, started, "completed");
     if (slow) reportPhase("completed", performance.now() - started);
     // A command that makes the core REBIND — `refresh_graph` installs a fresh

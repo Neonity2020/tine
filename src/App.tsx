@@ -175,6 +175,7 @@ import { currentPdfOwnership } from "./pdfOwnership";
 import { hlsPageName } from "./pdf";
 import { createStartupRecoveryController } from "./startupRecovery";
 import { writeClipboardTextResilient } from "./clipboard";
+import { FailureBoundary } from "./components/FailureBoundary";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -614,7 +615,9 @@ function PaneRouteBody(props: {
           class={props.scrollerClass}
           identifyPane={props.identifyPane}
         >
-          <PaneContent router={props.router} />
+          <FailureBoundary region="This page">
+            <PaneContent router={props.router} />
+          </FailureBoundary>
         </PaneScroller>
       }
     >
@@ -1425,7 +1428,9 @@ export function App(): JSX.Element {
             <Show when={mobileDrawerMode()}>
               <button class="mobile-drawer-close" type="button" aria-label="Close navigation sidebar" onClick={() => dismissDrawerAndRestore("explicit")}>Close</button>
             </Show>
-            <Sidebar onActiveNavigationComplete={completeActiveLeftNavigation} />
+            <FailureBoundary region="The sidebar">
+              <Sidebar onActiveNavigationComplete={completeActiveLeftNavigation} />
+            </FailureBoundary>
           </div>
           <div
             class="sidebar-resizer"

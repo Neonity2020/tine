@@ -34,6 +34,12 @@ icon:: 🛟
 	- 2. **Open another graph…** — pick a different folder and leave this one untouched.
 	- 3. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
 	- 4. What you should see: nothing about the graph has been changed by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
+- ## Part of the window says it could not be displayed
+	- Meaning: one region — the page, the sidebar, Linked or Unlinked References, the conflict panel — hit an error it could not render through. It is reported in place, with a **Retry**, and the rest of the window keeps working.
+	- 1. **Retry** — re-renders just that region. A failure caused by something transient, such as a command that lost a race with a slow startup, usually clears on the first retry.
+	- 2. If the message mentions that Tine is still waiting on operations that have been running for a while, give it a moment and retry again: the region is failing because the backend has not answered yet, not because anything is wrong with your notes.
+	- 3. If it comes back every time, use **Create diagnostic report** below and include the message shown in the region.
+	- 4. What you should see: your notes on disk are untouched either way — a region that cannot be displayed is a display failure, not a data failure.
 - ## Create a privacy-safe diagnostic report
 	- 1. Open Settings → **Diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
 	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.

@@ -11612,6 +11612,32 @@
         "failBefore": "proven"
       },
       "notes": "GH #200, round 2. Follows UI-BACKLINK-OCCURRENCE-CONTROLS-001, which gated the controls at >1 mention. A reporter on iPadOS then showed a SHORT unlinked-reference block carrying four highlighted marks AND four numbered circles: the excerpt already displayed every mention, so the row said the same thing twice, and because each circle navigates to the same block and differs only in where it leaves the caret, and iOS paints no caret for a programmatic focus, every circle was indistinguishable there. Three changes. (1) A marked run in the unlinked-reference excerpt is now a real button that opens the source page at that mention. (2) OccurrenceControls takes a `visible` count and renders only when total > what the surface already shows - derived from the excerpt, not a tuned constant - so the row survives exactly for mentions past the excerpt's three windows, and 'Show full block' (which now marks every span instead of dropping the highlighting) retires it. (3) Both jump paths, here and in Linked References, land on a SELECTION of the mention rather than a collapsed caret, so the result is visible on every platform. Fail-before proven: the two behaviour tests fail on pre-fix production code while the long-block control arm passes on both sides. Unlinked-reference match highlighting also moved onto the shared --match-mark-bg token: it had been a 22% accent tint, far fainter than the same marking in search and the quick switcher, which is why the reporter asked for a highlight that already existed."
+    },
+    {
+      "id": "UI-REGION-FAILURE-BOUNDARY-001",
+      "title": "A region that throws reports itself in place with a Retry instead of silently blanking the whole window",
+      "family": "shell",
+      "sources": {
+        "issues": [
+          490,
+          332
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/FailureBoundary.test.tsx",
+          "src/failureBoundarySeams.guard.test.ts"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "GH #490 diagnosed it inside the conflict panel; GH #332 is the user cost. Solid's runUpdates (solid-js 1.9.13, dist/solid.js:820) sets `Effects = null` and then handleError RETHROWS when no boundary is registered - and Tine registered none anywhere. So one unreadable value dropped every effect batched with it, left the window as an uncaught error a Tauri webview shows the user nothing about, and rescheduled nothing: permanent blank until restart. GH #332's diagnostics carry the shape exactly - runtime.started 37,053ms against a 1,690ms baseline, frontend.health uncaught_error, a post-open list_pages that threw - and the reporter, seeing an empty window, reasonably read it as lost notes and stayed on an August release. What this row covers: a failing region reports itself in place with a Retry, its siblings keep rendering, and when the backend is still past the slow threshold the region says how many operations have been running and for how long, because that is what makes Retry the right next step rather than a shot in the dark. NOT a claim that the tear disappears: `Effects = null` runs BEFORE handleError, so co-batched effects are still lost; the boundary converts a silent permanent blank into a visible message plus a way forward. Seams are an architectural fact, so they live in a test: src/failureBoundarySeams.guard.test.ts walks the TSX AST for each required mount and fails naming the file and line - it caught a second, unwrapped PageConflictResolution mount in this very packet. Fail-before PROVEN by a control arm kept permanently in FailureBoundary.test.tsx: with no boundary the throw escapes render and the healthy sibling never mounts. Not proven at the native observation boundary - the GH #332 path needs a 37-second startup to reproduce - so the release claim for that reporter stays tentative until he retests."
     }
   ]
 }
