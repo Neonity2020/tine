@@ -54,7 +54,7 @@ function gitShow(ref, path) {
 }
 
 /** Like gitShow, but null when the path does not exist at that revision
- *  (e.g. values-night/ was introduced after v0.5.9). */
+ *  (e.g. values-night/colors.xml does not exist at v0.5.9). */
 function gitShowOrNull(ref, path) {
   try {
     return gitShow(ref, path);
@@ -98,7 +98,7 @@ function readRevision(ref) {
   const plugin = gitShow(ref, REPO_FILES.plugin);
   const activity = gitShow(ref, REPO_FILES.activity);
   const valuesColors = gitShow(ref, REPO_FILES.valuesColors);
-  const nightColors = gitShow(ref, REPO_FILES.nightColors);
+  const nightColors = gitShowOrNull(ref, REPO_FILES.nightColors);
 
   // Does the Activity pad the content root with the system-bar insets?
   // (Introduced by 945337d0 in v0.6.981; moves strip painting page -> window.)
@@ -127,13 +127,21 @@ function readRevision(ref) {
   }
   // The one-authority rule is void if a night-qualified override exists.
   const nightOverride =
-    nightColors.includes("tine_system_bar_light") || nightColors.includes("tine_system_bar_dark");
+    (nightColors ?? "").includes("tine_system_bar_light") ||
+    (nightColors ?? "").includes("tine_system_bar_dark");
 
   // DayNight window background resolved by the ANDROID night setting:
   // the pre-restore initial paint, and (before ef7a5fcd) the whole session.
-  const windowLight = parseColor(valuesColors, "tine_window_background");
+  // Older revisions (v0.5.9) carry no tine_window_background -- there the page
+  // painted the strip, so the stand-ins below carry polarity only.
+  const windowLight =
+    parseColor(valuesColors, "tine_window_background") ??
+    parseColor(valuesColors, "tine_system_bar_light") ??
+    WHITE;
   const windowDark =
-    parseColor(nightColors ?? "", "tine_window_background") ?? windowLight;
+    parseColor(nightColors ?? "", "tine_window_background") ??
+    parseColor(valuesColors, "tine_system_bar_dark") ??
+    { r: 26 / 255, g: 27 / 255, b: 30 / 255 };
 
   return {
     ref,
