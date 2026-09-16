@@ -262,18 +262,26 @@ try {
   // pane, so select the reader before exercising its keyboard zoom contract.
   await click(browser, ".pdf-scroll");
 
+  // Read the zoom the reader has ACTUALLY settled on. Fit-to-width is still
+  // animating when this step is reached - the probe once opened at 73% and read
+  // 80% on its first frame - so a probe installed mid-settle measures the
+  // settle, sees "the zoom changed", closes its window, and reports that Ctrl+
+  // did nothing. Waiting for two equal readings makes the keyboard step the
+  // only thing under test.
+  const settledZoom = await browser.waitUntil(async () => {
+    const first = await browser.execute(() => document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "");
+    await browser.pause(120);
+    const second = await browser.execute(() => document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "");
+    return first && first === second ? first : false;
+  }, { timeout: 10_000, timeoutMsg: "the PDF reader never settled on a zoom before the keyboard zoom step" });
+
   // A retained ordinary canvas is already width/height:100% of its page
   // wrapper. During optimistic zoom it must never receive a second scale
   // transform: the released failure made one Ctrl+ step overshoot, then visibly
   // shrink when the 120 ms settled render replaced it.
-  await browser.execute(() => {
-    // Sample the zoom ANIMATION, so the window has to start when the zoom
-    // actually changes - not when the probe was installed. A fixed 750 ms
-    // window closed before the keystroke landed on 2026-09-16 and reported
-    // "Ctrl+ did not change focused PDF zoom" on a build where it does.
-    const startZoom = document.querySelector(".pdf-zoom-level")?.textContent?.trim() ?? "";
+  await browser.execute((settledZoom) => {
     const probe = window.__tinePdfZoomProbe = {
-      startedAt: performance.now(), samples: [], done: false, startZoom, changedAt: null,
+      startedAt: performance.now(), samples: [], done: false, startZoom: settledZoom, changedAt: null,
     };
     const frame = (now) => {
       const scroll = document.querySelector(".pdf-scroll");
@@ -305,7 +313,7 @@ try {
       else probe.done = true;
     };
     requestAnimationFrame(frame);
-  });
+  }, settledZoom);
   await browser.keys(["Control", "="]);
   await browser.waitUntil(() => browser.execute(() => window.__tinePdfZoomProbe?.done === true), {
     timeout: 8_000,
@@ -315,7 +323,7 @@ try {
   observations.push({ label: "single-step-zoom", zoomProbe });
   assert(zoomProbe?.samples?.length > 2, "PDF zoom probe collected too few frames", zoomProbe);
   const finalZoom = zoomProbe.samples.at(-1)?.zoom;
-  assert(finalZoom && finalZoom !== zoomProbe.samples[0]?.zoom, "Ctrl+ did not change focused PDF zoom", zoomProbe);
+  assert(finalZoom && finalZoom !== settledZoom, "Ctrl+ did not change focused PDF zoom", { settledZoom, ...zoomProbe });
   const maxCanvasToPage = Math.max(...zoomProbe.samples.map((entry) => entry.canvasToPage));
   assert(maxCanvasToPage <= 1.02, "ordinary PDF canvas overshot its resized wrapper during zoom", {
     maxCanvasToPage,

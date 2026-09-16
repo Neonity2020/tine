@@ -313,6 +313,16 @@ await withApp(0, async (browser) => {
     el.dispatchEvent(new Event("input", { bubbles: true }));
   }, typo.slice(0, -1));
   await pane.click();
+  // Say WHERE the keystroke goes. Assigning `value` leaves the caret at 0, and a
+  // click only moves it if nothing re-renders the input before the key arrives -
+  // which is a race with the pane's own debounced re-read. It lost once, and the
+  // pane then held "'@block and stauts = 'active": the right character, typed on
+  // the keyboard, inserted at the front.
+  await browser.execute(() => {
+    const el = document.querySelector(".query-text-pane-input");
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  });
   await browser.keys([typo.slice(-1)]);
   await sleep(300);
   const echoed = await pane.getValue();
