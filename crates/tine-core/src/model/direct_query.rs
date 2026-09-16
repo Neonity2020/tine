@@ -158,7 +158,11 @@ impl Graph {
             },
             DirectAttempt::FailedRead(_) => true,
         };
-        self.direct_projection_repair(reset_before_rebuild);
+        if reset_before_rebuild {
+            self.direct_projection_recover_after_failed_read();
+        } else {
+            self.direct_projection_repair(false);
+        }
         match attempt_captured() {
             DirectAttempt::Answered(answer) => Ok(answer),
             DirectAttempt::Cancelled => Err(cancelled()),
