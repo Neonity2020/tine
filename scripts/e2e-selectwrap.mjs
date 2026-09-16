@@ -10,7 +10,12 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 
 const PORT = Number(process.env.E2E_PREVIEW_PORT || 5197);
-const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
+// Spawn the binary, not `npx`. `npx` forks its own `node .../vite` child, so
+// SIGKILL on the npx shell left the preview server running: one orphaned vite
+// per full-suite run, each holding ~90 MB, until a release E2E run was killed
+// for memory (2026-09-16). Every other preview launcher in scripts/ already
+// spawns ./node_modules/.bin/vite directly.
+const server = spawn("./node_modules/.bin/vite", ["preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 const waitForServer = (url, tries = 60) => waitForHttpServer(url, tries, 250);
 
 let failures = 0;
