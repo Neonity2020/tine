@@ -2,6 +2,28 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-DIAGNOSTICS-INTENTIONAL-PARSER-DIVERGENCE-006",
+      "title": "Help and diagnostics does not offer intentional nested-dollar parser behavior as a bug report",
+      "family": "settings",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/devtools/lsdoc-diff/orchestrator.intentional.test.ts",
+          "src/components/ImproveTab.test.tsx",
+          "src/components/DiagnosticsTab.test.tsx"
+        ],
+        "scenario": "settings.help-diagnostics-suppresses-intentional-parser-difference",
+        "failBefore": "proven"
+      },
+      "notes": "lsdoc GH #6 is documented intentional divergence D48: Tine preserves dollar math nested inside Markdown emphasis. The in-app comparison now classifies the exact complete delta fail-closed, excludes it from reportable findings, and places parser comparison in the single Help & diagnostics Settings tab."
+    },
+    {
       "id": "UI-WINDOWS-SESSION-END-EXIT-455",
       "title": "Windows session shutdown terminates Tine after its bounded durability drain",
       "family": "lifecycle",

@@ -41,11 +41,11 @@ icon:: 🛟
 	- 3. If it comes back every time, use **Create diagnostic report** below and include the message shown in the region.
 	- 4. What you should see: your notes on disk are untouched either way — a region that cannot be displayed is a display failure, not a data failure.
 - ## Create a privacy-safe diagnostic report
-	- 1. Open Settings → **Diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
+	- 1. Open Settings → **Help & diagnostics** and choose **Create diagnostic report**. Tine previews its bounded current-and-previous-run flight recorder: fixed operation names, outcomes, timings, counts, platform, version, and build information.
 	- 2. Review the JSON, then choose **Copy report** (or **Save report…** on desktop). Nothing is uploaded automatically. The recorder excludes graph content, paths, page titles, queries, URLs, credentials, and the opt-in detailed debug log.
 	- 3. For a suspected Syncthing/Dropbox mismatch, use **Verify synchronized graph** in the same tab on both devices, exchange the generated reports, and compare them. This check includes paths and page names but never note contents.
 	- 4. What you should see: a report you can attach to an issue without first setting up `adb`, SSH, or a terminal. **Clear recorded events** removes the retained flight-recorder history after you are done.
 - ## Something parses or renders wrong
-	- 1. Open Settings → **Help improve Tine**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every place they disagree plus a parse-speed comparison.
+	- 1. Open Settings → **Help & diagnostics** → **Help improve Tine's parser**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every actionable place they disagree plus a parse-speed comparison. Known intentional parser differences are suppressed and shown only in the details count.
 	- 2. Copy the report shown there — every snippet is anonymized (page names and words are scrubbed, markup shape kept) and re-verified to still reproduce the divergence before it is shown. Nothing is uploaded.
 	- 3. What you should see: a local report, including the Tine version, that you can paste into an issue.

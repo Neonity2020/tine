@@ -56,6 +56,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Settings now has one **Help & diagnostics** tab containing the flight-recorder
+  report, synchronized-graph verification, and the parser comparison. The parser
+  comparison no longer offers known intentional lsdoc differences, such as
+  dollar math preserved inside Markdown emphasis, as reportable bugs.
+
 - **In Unlinked References, the highlighted mention is now the control.** Click a
   highlighted word to open its source page with that exact mention selected. The
   numbered jump circles now appear only when the excerpt cannot show every
@@ -74,6 +79,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   designed afresh.
 
 ### Fixed
+
+- Expanding a large outline no longer mounts every off-screen block embed or
+  query before visible Linked References can render (GH #408).
+- Renaming a namespaced page now updates an own `title::` property that carried
+  its old identity, so the renamed page opens at its new route and remains there
+  after restart (GH #451).
+- Windows session shutdown now terminates Tine after its bounded durability
+  drain instead of leaving the process alive until Windows force-closes it
+  (GH #455).
+- Wide query tables and sheets inside a block keep their left edge aligned with
+  the owning bullet and scroll internally (GH #473).
+- Linked References on a journal now include references written with another
+  accepted spelling of the same date, such as `[[2026-09-20]]` for
+  `Sep 20th, 2026` (GH #481).
+- Returning from Android's photo/file picker no longer discards the editor that
+  initiated the capture before the saved asset link can be inserted (GH #493).
+- A bare block reference now renders every line after a soft line break instead
+  of showing only its first line (GH #506).
+- Cold graph opening no longer runs an independent whole-graph parse for page
+  inventory alongside the shared startup parse, reducing first-open contention
+  on slower devices (GH #550).
 
 - **Page properties on an Org page are written in Org's own form.** Setting a
   page property such as `tags` on an `.org` page put a Markdown

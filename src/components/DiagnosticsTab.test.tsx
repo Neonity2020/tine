@@ -26,6 +26,8 @@ describe("DiagnosticsTab", () => {
     await vi.waitFor(() => expect(root.querySelector("textarea")?.value).toContain('"schemaVersion": 1'));
     expect(root.textContent).toContain("Nothing is uploaded automatically");
     expect(root.textContent).toContain("page titles");
+    expect(root.textContent).toContain("Help improve Tine's parser");
+    expect(root.textContent).toContain("Run comparison");
     dispose();
   });
 
