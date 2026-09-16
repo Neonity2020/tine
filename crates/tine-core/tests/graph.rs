@@ -986,7 +986,7 @@ fn search_cache_reflects_saves_and_deletes() {
     ready_query::attach_projection(&g, &root);
     // Warms the cache on first search.
     assert_eq!(
-        g.search("zonkwort", 10).unwrap().len(),
+        ready_query::when_ready(|| g.search("zonkwort", 10)).len(),
         0,
         "token absent initially"
     );
@@ -1019,7 +1019,7 @@ fn search_cache_reflects_saves_and_deletes() {
     // preserves what this test asserts and hides nothing: `when_ready` fails the
     // fixture immediately on any error that is not `NotReady`.
     ready_query::when_search_hits(&g, "zonkwort", 1);
-    let hits = g.search("zonkwort", 10).unwrap();
+    let hits = ready_query::when_ready(|| g.search("zonkwort", 10));
     assert_eq!(hits.len(), 1, "saved page should be searchable");
     assert_eq!(hits[0].page, "Fresh");
 
@@ -1135,7 +1135,7 @@ fn search_ignores_hidden_property_metadata() {
         "visible body still matches"
     );
     assert_eq!(
-        g.search("qzxmeta", 10).unwrap().len(),
+        ready_query::when_ready(|| g.search("qzxmeta", 10)).len(),
         0,
         "token only in a property line should not be a search hit"
     );
@@ -1317,7 +1317,7 @@ fn save_refuses_to_clobber_external_change() {
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
     // Build the cache (Tine now "knows" N = "- one"), then load it for editing.
-    g.search("one", 10).unwrap();
+    ready_query::when_ready(|| g.search("one", 10));
     let mut dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
     as_editor(&g, &mut dto);
 
@@ -1353,7 +1353,7 @@ fn save_conflicts_when_file_deleted_externally() {
     // read. Provision one exactly as the other query fixtures here do; its own
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
-    g.search("one", 10).unwrap(); // warm cache
+    ready_query::when_ready(|| g.search("one", 10)); // warm cache
     let dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
 
     // The file is deleted on disk (Syncthing / Logseq) after we loaded it.
@@ -1456,7 +1456,7 @@ fn sync_file_detects_external_change_and_suppresses_self() {
     // read. Provision one exactly as the other query fixtures here do; its own
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
-    g.search("before", 10).unwrap(); // build the cache (S = "- before")
+    ready_query::when_ready(|| g.search("before", 10)); // build the cache (S = "- before")
 
     // No external change yet → sync reports nothing.
     assert!(g.sync_file(&path).is_none());
@@ -1476,7 +1476,7 @@ fn sync_file_detects_external_change_and_suppresses_self() {
         1,
         "cache updated to new content"
     );
-    assert_eq!(g.search("before", 10).unwrap().len(), 0);
+    assert_eq!(ready_query::when_ready(|| g.search("before", 10)).len(), 0);
 
     // Re-syncing the same content is a no-op (self-write suppression).
     assert!(g.sync_file(&path).is_none());
@@ -1504,7 +1504,7 @@ fn noop_save_does_not_bump_cache_generation() {
     // read. Provision one exactly as the other query fixtures here do; its own
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
-    g.search("x", 10).unwrap(); // build the cache
+    ready_query::when_ready(|| g.search("x", 10)); // build the cache
     let mk = |raw: &str| PageDto {
         name: "N".into(),
         kind: PageKind::Page,
@@ -1559,7 +1559,7 @@ fn self_write_marker_does_not_outlive_its_save() {
     // read. Provision one exactly as the other query fixtures here do; its own
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
-    g.search("x", 10).unwrap();
+    ready_query::when_ready(|| g.search("x", 10));
     let page = PageDto {
         name: "C".into(),
         kind: PageKind::Page,
@@ -1607,7 +1607,7 @@ fn disk_rev_fast_path_is_fresh_and_detects_external_change() {
     // read. Provision one exactly as the other query fixtures here do; its own
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
-    g.search("x", 10).unwrap(); // build the cache
+    ready_query::when_ready(|| g.search("x", 10)); // build the cache
     let page = PageDto {
         name: "R".into(),
         kind: PageKind::Page,
@@ -1668,7 +1668,7 @@ fn self_write_is_not_reported_as_external_change() {
     // read. Provision one exactly as the other query fixtures here do; its own
     // `warm_cache` is the cache-building this test already relied on.
     ready_query::attach_projection(&g, &root);
-    g.search("x", 10).unwrap(); // build the cache
+    ready_query::when_ready(|| g.search("x", 10)); // build the cache
 
     let path = root.join("pages").join("W.md");
     let page = PageDto {

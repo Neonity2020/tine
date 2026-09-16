@@ -272,11 +272,11 @@ fn search_reflects_toggle_on_named_page() {
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DOING");
     g.save_page(&dto, dto.rev.as_deref()).expect("save");
     assert!(
-        !g.search("DOING", 20).unwrap().is_empty(),
+        !ready_query::when_ready(|| g.search("DOING", 20)).is_empty(),
         "named: DOING found after save"
     );
     assert!(
-        g.search("TODO", 20).unwrap().is_empty(),
+        ready_query::when_ready(|| g.search("TODO", 20)).is_empty(),
         "named: TODO gone after toggle"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -297,11 +297,11 @@ fn search_reflects_toggle_on_journal_page() {
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DOING");
     g.save_page(&dto, dto.rev.as_deref()).expect("journal save");
     assert!(
-        !g.search("DOING", 20).unwrap().is_empty(),
+        !ready_query::when_ready(|| g.search("DOING", 20)).is_empty(),
         "journal: DOING found after save"
     );
     assert!(
-        g.search("TODO", 20).unwrap().is_empty(),
+        ready_query::when_ready(|| g.search("TODO", 20)).is_empty(),
         "journal: TODO gone after toggle"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -561,7 +561,7 @@ fn highlight_write_is_not_seen_as_external_change() {
     // `search` answers from the projection now, so a bare graph has nothing to
     // read; `attach_projection` also does the cache warming this line wanted.
     ready_query::attach_projection(&g, &root);
-    g.search("x", 10).unwrap();
+    ready_query::when_ready(|| g.search("x", 10));
 
     let r = Rect {
         top: 0.0,
