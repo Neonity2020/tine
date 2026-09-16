@@ -124,7 +124,7 @@ import {
   secondarySelectionActions,
   type SelectionAction,
 } from "../editor/selectionActions";
-import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm, visibleBody } from "../render/block";
+import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "../render/block";
 import { effectiveHeadingLevel, facetsOf, EMPTY_FACETS, type Facets } from "../render/facets";
 import type { Format } from "../render/ast";
 import type { Node as StoreNode } from "../store";
@@ -201,32 +201,9 @@ import { shouldOpenBlockContextMenu } from "../contextMenuPolicy";
 import { applySheetViewSlashAction } from "./block/sheetSlashAction";
 import { bodyContainsQueryMacro, detectMacro } from "./block/macroDetection";
 import { beginDrag, dragId, dragMoved, dropInd } from "./block/pointerDrag";
-import { observeNear, renderedBlocks, unobserveNear } from "../lazyObserve";
+import { DeferredStandaloneMacro } from "./DeferredStandaloneMacro";
 
 export { applySheetViewSlashAction };
-
-function DeferredStandaloneMacro(props: { blockId: string; raw: string; children: JSX.Element }): JSX.Element {
-  const [near, setNear] = createSignal(renderedBlocks.has(props.blockId));
-  let deferredEl: Element | undefined;
-  const observe = (el: Element) => {
-    deferredEl = el;
-    observeNear(el, () => {
-      renderedBlocks.add(props.blockId);
-      setNear(true);
-    });
-  };
-  onCleanup(() => {
-    if (deferredEl) unobserveNear(deferredEl);
-  });
-  return (
-    <Show
-      when={near()}
-      fallback={<span ref={observe} class="ast-fallback ast-deferred">{visibleBody(props.raw).join("\n")}</span>}
-    >
-      {props.children}
-    </Show>
-  );
-}
 
 // (Rendered-property hidden set lives in render/block.ts as RENDER_HIDDEN_PROPS /
 // isRenderHiddenProp, shared with body.tsx's renderProps.)
