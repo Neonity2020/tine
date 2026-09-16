@@ -12,7 +12,7 @@ use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
     PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
@@ -370,6 +370,13 @@ struct ProjectionShared {
     statement_reads: AtomicU64,
     #[cfg(test)]
     registry_capture_attempts: AtomicU64,
+    /// Repairs currently computing the payload they will enqueue. A repair
+    /// that has not reached its `enqueue_*` yet has published nothing, so
+    /// without this a query racing it reads the queue as idle and stale and
+    /// its own repair attempt as one that "did not take" — a terminal
+    /// `Unavailable(ReadFailed)` on a projection that is being repaired
+    /// perfectly well by the thread beside it.
+    repairs_in_flight: AtomicUsize,
     /// §5.9's failed-read injection: one read through the seam fails, exactly as
     /// a torn or truncated projection file, a disk error or a resource limit
     /// makes it fail. It exists because the obligation a failed read carries —
@@ -779,6 +786,7 @@ impl DirectProjection {
             statement_reads: AtomicU64::new(0),
             #[cfg(test)]
             registry_capture_attempts: AtomicU64::new(0),
+            repairs_in_flight: AtomicUsize::new(0),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
@@ -796,6 +804,21 @@ impl DirectProjection {
     }
 
     /// Keep repair requested until a complete source inventory or parser snapshot arrives.
+    /// Publish that a repair is computing its payload. `progress_at` reports
+    /// `Working(Recovering)` for as long as the returned guard lives, so a
+    /// concurrent query waits for it instead of declaring the repair failed.
+    pub(crate) fn begin_repair(&self) -> RepairInFlight {
+        self.shared.repairs_in_flight.fetch_add(1, Ordering::AcqRel);
+        RepairInFlight(Arc::clone(&self.shared))
+    }
+
+    /// True while the last worker turn failed. The flag clears on the next
+    /// successful turn, so it names a projection that owes a reset — not one
+    /// that has merely never started.
+    pub(crate) fn worker_failed(&self) -> bool {
+        self.shared.worker_failed.load(Ordering::Acquire)
+    }
+
     pub(crate) fn request_rebuild(&self) {
         let mut pending = self.shared.pending.lock().unwrap();
         pending.rebuild = true;
@@ -1787,6 +1810,9 @@ impl DirectProjection {
         if pending.rebuild || pending.needs_full || pending.full.is_some() {
             return ProjectionProgress::Working(Reason::Recovering);
         }
+        if self.shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
+            return ProjectionProgress::Working(Reason::Recovering);
+        }
         if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
             return ProjectionProgress::Working(Reason::Indexing);
         }
@@ -2028,6 +2054,16 @@ impl std::fmt::Display for ProjectionRefusal {
             }
             Self::Failed(error) => f.write_str(error),
         }
+    }
+}
+
+/// Lives for one repair attempt; see `DirectProjection::begin_repair`.
+pub(crate) struct RepairInFlight(Arc<ProjectionShared>);
+
+impl Drop for RepairInFlight {
+    fn drop(&mut self) {
+        self.0.repairs_in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_all();
     }
 }
 

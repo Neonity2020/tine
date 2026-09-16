@@ -146,11 +146,17 @@ impl Graph {
         Some(self.rel_path(&winner))
     }
 
+    /// `force` skips the readiness shortcut below. A repair that has latched
+    /// `pending.rebuild` MUST force: the worker consumes that flag only
+    /// together with a full or warm payload, so a skipped snapshot would leave
+    /// the rebuild latched with nothing to ride in on and every later capture
+    /// refused for the lifetime of the graph.
     pub(super) fn direct_projection_enqueue_full(
         &self,
         generation: u64,
         pages: Arc<Vec<(PageEntry, Arc<Document>)>>,
         revisions: Arc<std::collections::HashMap<PathBuf, String>>,
+        force: bool,
     ) {
         if let Some(projection) = self
             .direct_projection
@@ -162,7 +168,7 @@ impl Graph {
             // R6: a projection already READY at this generation was validated
             // from the same bytes this snapshot was parsed from; a redundant
             // snapshot would only open a NotReady window while it re-validates.
-            if projection.ready_at(generation) {
+            if !force && projection.ready_at(generation) {
                 return;
             }
             projection.enqueue_full(

@@ -133,7 +133,11 @@ impl Graph {
                 result
             }
         };
-        match attempt_captured() {
+        // Whether the repair must ERASE the disposable database before
+        // rebuilding it. A failed read owes that; an idle projection that has
+        // simply not started yet does not, and erasing it there discarded the
+        // whole persisted index on every launch (GH #543).
+        let reset_before_rebuild = match attempt_captured() {
             DirectAttempt::Answered(answer) => return Ok(answer),
             DirectAttempt::Cancelled => return Err(cancelled()),
             DirectAttempt::Unavailable(reason) => return Err(Error::Unavailable(reason)),
@@ -147,12 +151,14 @@ impl Graph {
                 Some(ProjectionProgress::Stopped) | None => {
                     return Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }
-                // Idle and stale: nothing is coming, so repair.
-                Some(ProjectionProgress::Stale) => {}
+                // Idle and stale: nothing is coming, so repair. The repair
+                // still resets when the worker actually failed; it validates
+                // when the projection is merely not started yet.
+                Some(ProjectionProgress::Stale) => false,
             },
-            DirectAttempt::FailedRead(_) => {}
-        }
-        self.direct_projection_recover_after_failed_read();
+            DirectAttempt::FailedRead(_) => true,
+        };
+        self.direct_projection_repair(reset_before_rebuild);
         match attempt_captured() {
             DirectAttempt::Answered(answer) => Ok(answer),
             DirectAttempt::Cancelled => Err(cancelled()),
@@ -840,12 +846,41 @@ impl Graph {
     /// no parsed cache, or reuses an already-owned parsed snapshot. It never
     /// builds a parsed graph solely to reconstruct the disposable database.
     pub(crate) fn direct_projection_recover_after_failed_read(&self) {
+        self.direct_projection_repair(true);
+    }
+
+    /// The repair itself. `reset` erases the disposable database first.
+    ///
+    /// Erasing is the repair a torn or unreadable file owes, and it is never
+    /// the repair an intact one owes: `reset()` drops every source stamp, so
+    /// the complete inventory that follows re-lowers EVERY page. The app runs
+    /// queries before its background warm reaches the projection — the journal
+    /// feed, backlinks, Ctrl-K — and such a query finds the worker idle,
+    /// unvalidated and not yet failed, which `progress_at` reports as `Stale`.
+    /// Resetting there threw away a perfectly good persisted index on every
+    /// single launch, so search on a large graph sat on "Indexing — waiting for
+    /// search to be ready…" for minutes while the app wrote continuously with
+    /// nobody touching it (GH #543). A projection that has not failed is
+    /// repaired by validating it against the source revisions it already
+    /// stores, never by erasing it.
+    fn direct_projection_repair(&self, reset: bool) {
         let Ok(_repair) = self.projection_recovery.try_lock() else {
             return;
         };
-        if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
-            projection.request_rebuild();
-        }
+        let (reset, _in_flight) = {
+            let projection = self.direct_projection.lock().unwrap();
+            let Some(projection) = projection.as_ref() else {
+                return;
+            };
+            let reset = reset || projection.worker_failed();
+            if reset {
+                projection.request_rebuild();
+            }
+            // Published BEFORE the payload is computed, which takes seconds on
+            // a large graph: a query racing this repair must read it as work in
+            // progress, not as an idle stale projection nobody is repairing.
+            (reset, projection.begin_repair())
+        };
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
             // The existing worker resets the disposable projection before
@@ -856,7 +891,8 @@ impl Graph {
             return;
         };
         let revisions = self.disk_revs.read().unwrap().clone();
-        self.direct_projection_enqueue_full(generation, pages, Arc::new(revisions));
+        // A reset must be followed by a payload; see `direct_projection_enqueue_full`.
+        self.direct_projection_enqueue_full(generation, pages, Arc::new(revisions), reset);
     }
 
     pub(super) fn direct_projection_note_fallback_read(&self) {

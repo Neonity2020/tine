@@ -2741,6 +2741,123 @@ fn coalesced_edits_keep_first_insertion_page_order_and_readds_append() {
     assert_eq!(position(&pending, "z-first"), 2);
 }
 
+/// GH #543: the first query after a reopen must not throw the persisted
+/// projection away.
+///
+/// The app issues queries before the background warm reaches the projection --
+/// the journal feed, backlinks, and Ctrl-K all run while `warm_cache_async` is
+/// still sleeping its 250 ms. Such a query finds the worker idle, unvalidated
+/// and not yet failed, which `progress_at` reported as `Stale`; recovery then
+/// latched `pending.rebuild`, and the warm it scheduled rode in on that flag,
+/// so the worker `reset()` the database and re-lowered EVERY page. On a small
+/// fixture that is invisible; on a real graph it is the whole index rebuilt on
+/// every launch, which is why search stayed on "Indexing -- waiting for search
+/// to be ready..." for minutes and the app wrote continuously while idle.
+///
+/// A projection that has not failed is repaired by validating it, never by
+/// erasing it.
+#[test]
+fn a_query_before_the_warm_keeps_a_clean_reopen_clean() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("reopen-query-first");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
+    std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
+    let database = scratch("reopen-query-first-db").join("projection.sqlite");
+
+    reset_lowerings(&root);
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert_eq!(lowerings(), 2, "the first open lowers both pages");
+        release_projection(&graph);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    reset_lowerings(&root);
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        // Exactly what the app does: a query arrives before the warm.
+        let _ = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert_eq!(
+            lowerings(),
+            0,
+            "a query before the warm must not re-lower an unchanged graph"
+        );
+        assert_eq!(
+            signature(
+                &graph
+                    .run_query_bounded("(task TODO)", 100, 1_000_000)
+                    .expect("the ready projection answers the public bounded route")
+                    .groups
+            ),
+            signature(
+                &crate::query::run_query_bounded(&graph, "(task TODO)", 100, 1_000_000).groups
+            )
+        );
+        release_projection(&graph);
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
+#[test]
+fn a_repair_in_flight_reports_work_in_progress_not_a_stale_projection() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("repair-in-flight");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
+    let database = scratch("repair-in-flight-db").join("projection.sqlite");
+
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let generation = graph.cache_generation();
+    assert!(
+        matches!(
+            projection.progress_at(generation),
+            ProjectionProgress::Stale
+        ),
+        "a fresh unvalidated projection with an empty queue is idle and stale"
+    );
+
+    {
+        // A repair spends seconds computing its payload on a real graph
+        // before it enqueues anything. Only one repair holds
+        // `projection_recovery` at a time, so the query that loses that race
+        // must still see work in progress and retry -- otherwise it reports
+        // the terminal "the query index could not be read" over a projection
+        // the thread beside it is repairing perfectly well.
+        let _repair = projection.begin_repair();
+        assert!(
+            matches!(
+                projection.progress_at(generation),
+                ProjectionProgress::Working(crate::query::QueryReadinessReason::Recovering)
+            ),
+            "a repair that has not enqueued its payload yet is still progress"
+        );
+    }
+
+    assert!(
+        matches!(
+            projection.progress_at(generation),
+            ProjectionProgress::Stale
+        ),
+        "the marker lasts exactly one repair attempt"
+    );
+
+    drop(projection);
+    release_projection(&graph);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
 #[test]
 fn clean_reopen_reuses_sqlite_and_external_edit_relowers_only_one_page() {
     let _serial = serialize_projection_tests();
@@ -4454,6 +4571,7 @@ fn empty_projection_shared() -> ProjectionShared {
         worker_resources: Mutex::new(Some(Vec::new())),
         validated: AtomicBool::new(false),
         after_sql_commit: Mutex::new(None),
+        repairs_in_flight: AtomicUsize::new(0),
         #[cfg(test)]
         capture_thread: Mutex::new(None),
         #[cfg(test)]

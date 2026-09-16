@@ -41,6 +41,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Search no longer stays on “Indexing — waiting for search to be ready…”, and
+  the search index is no longer rebuilt from scratch on every launch. Opening a
+  graph threw its saved index away and re-indexed every page, so on a large
+  graph (roughly 10,000 pages and up) Ctrl+K and the search tab could stay
+  unusable for many minutes and the app kept working the disk while nothing was
+  happening. An unchanged graph now reuses the index it already built, and only
+  pages that actually changed are re-indexed (GH #543).
 - Queries answer every comparison they accept. `like` on `task`, `priority`
   and `page.namespace` (for example `task like 'DO%'`), `page.journal != …`,
   `page.name not in (…)` and `content in (…)` / `not in (…)` used to return
