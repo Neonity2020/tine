@@ -228,7 +228,7 @@ impl Graph {
             .installs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
-        self.direct_projection_enqueue_full(expected_generation, pages, Arc::new(revs));
+        self.direct_projection_enqueue_full(expected_generation, pages, Arc::new(revs), false);
         PageCacheInstallOutcome::Installed
     }
 
