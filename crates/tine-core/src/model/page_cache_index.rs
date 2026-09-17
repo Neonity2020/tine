@@ -143,6 +143,9 @@ impl PageBuildFlight {
 #[derive(Default)]
 pub(super) struct PageBuildTestState {
     pub(super) owner_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// GH #543: pause one warm validation after it has announced itself and
+    /// before it reads page bytes, so a test can land a query in that window.
+    pub(super) warm_validation_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) joined: std::sync::Mutex<usize>,
     pub(super) joined_changed: std::sync::Condvar,
     pub(super) force_warm_failure: std::sync::atomic::AtomicBool,
@@ -159,14 +162,14 @@ pub(super) struct PageBuildTestState {
 }
 
 #[cfg(test)]
-pub(super) struct PageBuildTestPause {
-    pub(super) reached: std::sync::Barrier,
-    pub(super) release: std::sync::Barrier,
+pub(crate) struct PageBuildTestPause {
+    pub(crate) reached: std::sync::Barrier,
+    pub(crate) release: std::sync::Barrier,
 }
 
 #[cfg(test)]
 impl PageBuildTestPause {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             reached: std::sync::Barrier::new(2),
             release: std::sync::Barrier::new(2),

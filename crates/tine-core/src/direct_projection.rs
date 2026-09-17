@@ -390,6 +390,15 @@ struct ProjectionShared {
     /// `Unavailable(ReadFailed)` on a projection that is being repaired
     /// perfectly well by the thread beside it.
     repairs_in_flight: AtomicUsize,
+    /// Warm validations currently reading page bytes for the inventory they
+    /// will enqueue (GH #543). Same shape as `repairs_in_flight`: until
+    /// `enqueue_warm` the warm has published nothing, so a query landing in
+    /// that window read the projection as idle and stale and started its own
+    /// repair — a second warm on the query thread, racing the open path's.
+    /// Whichever lost fell to the whole-graph parse; whichever won streamed
+    /// the graph on the query thread. The Windows verify probe measured that
+    /// as a 10k-page cold open going from 150 s to 587 s with 35 GB written.
+    warms_in_flight: AtomicUsize,
     /// §5.9's failed-read injection: one read through the seam fails, exactly as
     /// a torn or truncated projection file, a disk error or a resource limit
     /// makes it fail. It exists because the obligation a failed read carries —
@@ -822,6 +831,7 @@ impl DirectProjection {
             #[cfg(test)]
             registry_capture_attempts: AtomicU64::new(0),
             repairs_in_flight: AtomicUsize::new(0),
+            warms_in_flight: AtomicUsize::new(0),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
             #[cfg(test)]
@@ -849,6 +859,16 @@ impl DirectProjection {
     pub(crate) fn begin_repair(&self) -> RepairInFlight {
         self.shared.repairs_in_flight.fetch_add(1, Ordering::AcqRel);
         RepairInFlight(Arc::clone(&self.shared))
+    }
+
+    /// Announce a warm validation BEFORE it reads a single page byte, so a
+    /// query landing during that read reports `NotReady(Indexing)` and
+    /// retries instead of repairing an "idle" projection (GH #543). Held
+    /// until the warm has enqueued (from then on the queue itself says
+    /// Indexing) or given up.
+    pub(crate) fn begin_warm(&self) -> WarmInFlight {
+        self.shared.warms_in_flight.fetch_add(1, Ordering::AcqRel);
+        WarmInFlight(Arc::clone(&self.shared))
     }
 
     /// True while the last worker turn failed. The flag clears on the next
@@ -1947,7 +1967,11 @@ impl DirectProjection {
         if self.shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
             return ProjectionProgress::Working(Reason::Recovering);
         }
-        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
+        if pending.warm.is_some()
+            || pending.warm_stream.is_some()
+            || pending.order.is_some()
+            || self.shared.warms_in_flight.load(Ordering::Acquire) > 0
+        {
             return ProjectionProgress::Working(Reason::Indexing);
         }
         if !pending.deltas.is_empty() {
@@ -2193,6 +2217,17 @@ impl std::fmt::Display for ProjectionRefusal {
 
 /// Lives for one repair attempt; see `DirectProjection::begin_repair`.
 pub(crate) struct RepairInFlight(Arc<ProjectionShared>);
+
+/// Lives from a warm validation's first page read until it has enqueued or
+/// given up; see `DirectProjection::begin_warm`.
+pub(crate) struct WarmInFlight(Arc<ProjectionShared>);
+
+impl Drop for WarmInFlight {
+    fn drop(&mut self) {
+        self.0.warms_in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_all();
+    }
+}
 
 impl Drop for RepairInFlight {
     fn drop(&mut self) {
