@@ -2736,13 +2736,6 @@ fn projection_source_revision(
     format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{digest}:{content_revision}")
 }
 
-/// The Direct Files producer, reachable from the cross-backend parity guard.
-///
-/// Named as a seam rather than widened: the guard has to compare the rows this
-/// exact function emits against the walk's,
-/// and a reimplementation in the test would prove only that the test agrees
-/// with itself (§5.8 G1, I-19).
-#[cfg(test)]
 /// The page and block text a snapshot projects — the input to
 /// `projection_budget::build_page_cache_budget`, because the build's cache
 /// working set is a schema-fixed multiple of it, not of the page count.
@@ -2761,6 +2754,13 @@ fn projected_text_bytes(pages: &[tine_storage::sqlite::PhysicalPage]) -> u64 {
         .sum()
 }
 
+/// The Direct Files producer, reachable from the cross-backend parity guard.
+///
+/// Named as a seam rather than widened: the guard has to compare the rows this
+/// exact function emits against the walk's,
+/// and a reimplementation in the test would prove only that the test agrees
+/// with itself (§5.8 G1, I-19).
+#[cfg(test)]
 pub(crate) fn physical_page_for_test(
     entry: &PageEntry,
     document: &Document,
