@@ -4282,6 +4282,32 @@
   "failBefore": "tine-agents/evidence/gh543-build-path/core-fail-before.log (a_full_build_sizes_the_writer_cache_and_hands_it_back against the pre-fix apply_pending: cache budget stayed at the 2,048,000-byte default; probe curves in probe-1k.log and probe-knee.log)"
  },
  "notes": "Blocking core operation: on a 10,000-page graph the first index build (fresh install, upgrade, or repair) never reached search-ready on Windows within 10 minutes and search stayed on the indexing notice. Root cause: the whole-graph build is one SQLite transaction inserting every row of every UUID-keyed index onto a random B-tree leaf while the connection ran at SQLite's ~2 MiB default page cache, so each dirty page was spilled to the WAL and read back (8.8M cache misses, 27 GB read / 19 GB written for 49 MB of Markdown); Windows makes each of those round trips ~10x dearer. Fix (tine-storage v0.20.1 + tine-core): the writer's page cache is sized to the build from the projected text bytes (`model::projection_budget`, RAM-capped, returned after commit), and a build into an empty projection creates its 35 secondary indexes once after the rows instead of maintaining them per row. Measured in tine-storage's `gh543_build_probe` (recorded in the packet record)."
+},
+{
+ "id": "REG-QUERY-PROJECTION-REFERENCE-NAMES-543",
+ "title": "Search and autocomplete on a large graph answer within seconds of launch instead of after a per-launch read storm over the reference index",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::direct_projection_matches_fuzzy_search_and_virtual_reference_names",
+   "crates/tine-core/src/direct_projection_tests.rs::real_corpus_projection_converges_and_matches_task_query"
+  ],
+  "scenario": "query.projection-build-cost",
+  "failBefore": "tine-agents/evidence/gh543-reader/fail-before.md (EXPLAIN QUERY PLAN of the v0.20.1 reader on the 10k projection: SCAN + TEMP B-TREE FOR ORDER BY, 1.37 s per 512-row batch, 65 s full drain; the plan guard rejects that exact query as its built-in counterexample; local-543-reopen-io.log shows the storm on a reopen with a finished index)"
+ },
+ "notes": "Blocking core operation, all platforms: every launch drains `navigation_reference_names_after` (tine-core `referenced_page_names`, called by page inventory / autocomplete) in 512-row keyset batches ordered by the joined page path, which no index serves, so each batch scanned and sorted all 600,000 postings (110,000 distinct rows at 10,000 pages): O(N^2), 215 batches x 1.3 s, ~11 GB of reads, 30-40 s on one tokio worker before Ctrl+K answered, on a reopen as well as after a cold build. Fix (tine-storage v0.20.2): both navigation readers page on the columns of an existing index with a row-value keyset; signatures and cursor tuples unchanged, only row order, and the one consumer builds an order-independent set. Full drain on that projection: 65 s -> 1.3 s. The plan-shape guard and the batch-edge paging test live in tine-storage (`paged_navigation_readers_use_an_index_range`, `navigation_reference_names_page_without_gaps_or_repeats`, certified with the v0.20.2 pin receipt); the tine-core tests listed here drive the real consumer against the reordered reader and the anonymized-corpus oracle, proving the answer is order-independent."
 }
 ]
 }
