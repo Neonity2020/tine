@@ -1460,9 +1460,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-17: GH #543 partial admission pinned v0.20.3 and added the
     // `set_build_durability` calls (the stream's relaxed durability, and its
     // restore in `restore_build_settings`) in direct_projection.rs.
+    // 2026-09-17: the bounded-reads packet drove BOTH Friendly block reads from
+    // the trigram index instead of filtering a full scan with it, which binds a
+    // candidate literal and a candidate cap per read: query/friendly.rs gains
+    // `PhysicalQueryValue::Text(` and `PhysicalQueryValue::Integer(` sites.
+    // Read-side binds only. The write crossings asserted above are unchanged,
+    // no call site was added to a storage writer, and the pin is still v0.20.3.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "e5d56c800e77d74da8b99e312534ee6a7a190857a3af9bdd1f8262bd1f1f7b27",
+        "8d3af88e280015a04f1ad1ebb0c133ac1c115349e0946b455aad60eed1d55721",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
