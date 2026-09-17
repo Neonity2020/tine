@@ -59,14 +59,21 @@ local one.
    in the non-UI inventory). Public Fixed entries reference their GitHub issue;
    internal reports use a stable catalog ID. An exemption needs substitute
    evidence and a reason.
-4. Regenerate the canonical Guide site and prove the checked-in
+4. Run `node scripts/check-issue-receipts.mjs` and post any receipt it names.
+   Every issue the Fixed section claims must already carry a maintainer
+   `fixed-on-master` receipt: root cause/invariant, the literal end-to-end path
+   exercised, the sibling matrix reviewed, the platform and evidence layer, and
+   anything still unverified. v0.6.984 claimed fifteen issue fixes and eleven
+   had no receipt at all, so the reporters learned nothing until publication and
+   the close-out had to reconstruct the evidence from commits.
+5. Regenerate the canonical Guide site and prove the checked-in
    `website/guide/` output, bundled Guide pages, links, block references, and
    assets are current.
-5. Run the complete Linux release E2E catalog (`npm run e2e:linux:release`)
+6. Run the complete Linux release E2E catalog (`npm run e2e:linux:release`)
    against the production-protocol candidate binary. Retain screenshots, DOM,
    console/backend logs, graph diff, JUnit, and JSON on failure. See
    `docs/UI-REGRESSION-TESTING.md` for the exact binary and evidence contract.
-6. As soon as that frozen candidate passes its local exact-commit gates, deploy
+7. As soon as that frozen candidate passes its local exact-commit gates, deploy
    that exact tested artifact to `~/research/tine` without waiting to be asked.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual
    release candidate while the slower platform workflows run. If using
@@ -75,13 +82,13 @@ local one.
    not count as release evidence. When an exact signed Android APK is available,
    also copy it to `~/research/tine.apk` and verify its SHA-256 against the
    versioned source artifact before asking Martin to test it.
-7. The Windows x64 real-app smoke suite is advisory when available. Separately,
+8. The Windows x64 real-app smoke suite is advisory when available. Separately,
    step 9's Windows CI evidence is blocking: it compiles all `tine-core` test
    targets against the exact certified `tine-storage` pin, then runs the
    contract-selected cross-layer parity/durability/lifecycle smokes. The full
    physical storage suite belongs to a new `tine-storage` version's independent
    certification, not to ordinary Tine releases. See `docs/CI.md`.
-8. Set `scripts/bench-policy.json`'s `previousRelease.ref` to the most recently
+9. Set `scripts/bench-policy.json`'s `previousRelease.ref` to the most recently
    published release (never the unshipped candidate). Do not advance the
    immutable baseline. Push the exact candidate and require the same-machine A/B
    performance job to pass; an expected budget breach is a stop/consult decision,
@@ -89,14 +96,14 @@ local one.
    the immutable v0.4.7 native binary, retain its timing JSON and early-frame
    sequence, and inspect those frames for new blank, intermediate, or corrupt
    paints before shipping.
-9. Push the frozen exact candidate, manually dispatch `ci.yml` with
+10. Push the frozen exact candidate, manually dispatch `ci.yml` with
    `scope=full`, and require all nine full jobs to succeed on that SHA,
    including the Linux nextest inventory contract and all four hash shards plus
    the blocking Windows core compile + integration-smoke job. Record the Actions URL
    and confirm it with `scripts/check-ci-evidence.mjs`.
    PR or focused CI is not release evidence. Any source/rebase/version change
    creates a new SHA and requires a new full run. See `docs/CI.md`.
-10. Manually dispatch `release.yml` on that same frozen ref. Its preflight must
+11. Manually dispatch `release.yml` on that same frozen ref. Its preflight must
     use `mode=build`, `publish=false` and verify the exact-SHA CI evidence before
     packaging begins. Record the successful source run ID. Tag only after the
     exact commit's platform builds, Linux E2E, Android, real offline Flatpak job,
@@ -112,15 +119,15 @@ local one.
     the publishing promotion. Any unclassified, ambiguous, added/deleted/renamed,
     non-descendant, or product-identity change requires fresh full CI and a new
     `mode=build` candidate.
-11. After publication, inventory the real assets and prepare issue-specific
+12. After publication, inventory the real assets and prepare issue-specific
    reporter follow-ups. Comment/closure authority remains in the canonical
    agent agreement.
-12. As release housekeeping, advance `previousRelease.ref` to the tag that was
+13. As release housekeeping, advance `previousRelease.ref` to the tag that was
     just published, run `node scripts/check-bench-policy.mjs`, and push that
     change to `master`. Tagged-candidate preflight deliberately compares with
     the release before the candidate; ordinary post-release `master` must point
     at the newly published tag so cumulative patch-cycle drift stays visible.
-13. On every successful publication **and every aborted release**, run
+14. On every successful publication **and every aborted release**, run
     `tine-coordination release-unfreeze --owner <release-owner>`, followed by
     `tine-coordination status`. The release cycle is not operationally complete
     until status prints `IDLE master integration is available`. The bounded
