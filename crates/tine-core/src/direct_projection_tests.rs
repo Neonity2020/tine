@@ -4933,6 +4933,7 @@ fn empty_projection_shared() -> ProjectionShared {
         validated: AtomicBool::new(false),
         after_sql_commit: Mutex::new(None),
         repairs_in_flight: AtomicUsize::new(0),
+        warms_in_flight: AtomicUsize::new(0),
         #[cfg(test)]
         capture_thread: Mutex::new(None),
         #[cfg(test)]
@@ -5598,6 +5599,206 @@ fn warm_scale_probe_reports_time_to_projection_ready() {
     );
     if std::env::var_os("TINE_WARM_SCALE_KEEP").is_some() {
         println!("WARM-SCALE KEEP root={}", root.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// GH #543: a query landing while the open-path warm is still reading page
+/// bytes (seconds on a 10k-page graph, tens on Windows) must be told
+/// `Indexing` and retry, not read the projection as idle and start a repair —
+/// its repair ran a SECOND warm validation on the query thread, racing the
+/// open path's: whichever lost fell to the whole-graph parse and superseded
+/// the stream with a one-transaction snapshot, whichever won streamed the
+/// graph on the query thread. The Windows verify probe measured that as a
+/// 10k-page cold open going from 150 s to 587 s with 35 GB written and the
+/// switcher frozen at "Indexing 240 of 10,000".
+#[test]
+fn a_query_during_the_warm_inventory_read_retries_instead_of_repairing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("query-during-warm-read");
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let pause = graph.pause_next_warm_validation_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    // The warm has announced itself and is about to read the inventory.
+    pause.reached.wait();
+    let during = graph.search_latest("switcher", "target", 50);
+    assert!(
+        matches!(
+            during,
+            Err(crate::query::QueryExecutionError::NotReady(
+                crate::query::QueryReadinessReason::Indexing
+            ))
+        ),
+        "a query during the warm's inventory read must report Indexing, got {during:?}"
+    );
+    assert!(
+        !graph.has_parsed_cache_test(),
+        "the query must not have parsed the graph beside the warm"
+    );
+    pause.release.wait();
+    warm.join().unwrap();
+    wait_ready(&graph);
+    let groups = when_ready(|| graph.search_latest("switcher", "target", 50));
+    assert!(
+        !groups.is_empty(),
+        "the same query answers once the warm has converged"
+    );
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Manual scale probe for GH #543, packet 3 follow-up: the switcher POLLS while
+/// the build streams (`query_index_progress` every 750 ms, `search` every 2 s in
+/// the "switcher" lane), which the plain probe above never did. The Windows
+/// verify run 35225823831 stalled at "Indexing 240 of 10,000" for nine minutes
+/// with the process idle, and wrote 35 GB; this reproduces that shape locally.
+#[test]
+#[ignore = "manual scale probe: set TINE_WARM_SCALE_GRAPH to a graph directory"]
+fn warm_scale_probe_with_switcher_polling() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(source) = std::env::var_os("TINE_WARM_SCALE_GRAPH") else {
+        eprintln!("skipped: set TINE_WARM_SCALE_GRAPH to a graph directory");
+        return;
+    };
+    let _serial = serialize_projection_tests();
+    let root = scratch("warm-scale-poll");
+    probe_copy_tree(std::path::Path::new(&source), &root);
+    let token = std::env::var("TINE_WARM_SCALE_TOKEN").unwrap_or_else(|_| "sentinel543".to_owned());
+    let budget_secs: u64 = std::env::var("TINE_WARM_SCALE_BUDGET_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(600);
+    let budget = Duration::from_secs(budget_secs);
+    let io = || {
+        std::fs::read_to_string("/proc/self/io")
+            .ok()
+            .map(|text| {
+                let field = |name: &str| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .and_then(|rest| rest.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                (field("read_bytes:"), field("write_bytes:"))
+            })
+            .unwrap_or((0, 0))
+    };
+    let wal_bytes = {
+        let path = root.join("private/projection.sqlite-wal");
+        move || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    };
+
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let started = Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // The app's open path: warm on its own thread.
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || {
+            let warmed = graph.warm_cache_cancellable(|| false);
+            (warmed, started.elapsed())
+        })
+    };
+    // The switcher: one search every 2 s in one lane, timed.
+    let searcher = {
+        let graph = Arc::clone(&graph);
+        let stop = Arc::clone(&stop);
+        let token = token.clone();
+        std::thread::spawn(move || {
+            let mut first_results = None;
+            let mut slowest = Duration::ZERO;
+            let mut calls = 0u32;
+            // The app's first switcher search lands a second or two after the
+            // open-path warm has started.
+            std::thread::sleep(Duration::from_millis(1500));
+            while !stop.load(Ordering::Acquire) && started.elapsed() < budget {
+                let at = started.elapsed();
+                let searched = Instant::now();
+                let outcome = match graph.search_latest("switcher", &token, 50) {
+                    Ok(groups) => {
+                        if !groups.is_empty() && first_results.is_none() {
+                            first_results = Some(at);
+                        }
+                        format!("ok({} groups)", groups.len())
+                    }
+                    Err(crate::query::QueryExecutionError::NotReady(reason)) => {
+                        format!("NotReady({})", reason.as_str())
+                    }
+                    Err(error) => format!("err({error})"),
+                };
+                let took = searched.elapsed();
+                slowest = slowest.max(took);
+                calls += 1;
+                println!(
+                    "WARM-POLL SEARCH at={at:?} took={took:?} {outcome} progress={:?}",
+                    graph.query_index_progress()
+                );
+                std::thread::sleep(Duration::from_millis(2000));
+            }
+            (first_results, slowest, calls)
+        })
+    };
+
+    let state = || {
+        graph
+            .direct_projection_test()
+            .map(|projection| projection.debug_state_test())
+            .unwrap_or_else(|| "no projection".to_owned())
+    };
+    let (read0, write0) = io();
+    let mut ready_at = None;
+    let mut last_report = Instant::now();
+    while started.elapsed() < budget {
+        if graph.direct_projection_ready_test() {
+            ready_at = Some(started.elapsed());
+            break;
+        }
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            last_report = Instant::now();
+            let (r, w) = io();
+            println!(
+                "WARM-POLL t={:?} progress={:?} wal_mib={} read_mib={} write_mib={} parsed_cache={} {}",
+                started.elapsed(),
+                graph.query_index_progress(),
+                wal_bytes() >> 20,
+                (r - read0) >> 20,
+                (w - write0) >> 20,
+                graph.has_parsed_cache_test(),
+                state()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    stop.store(true, Ordering::Release);
+    let (first_results, slowest, calls) = searcher.join().unwrap();
+    let warm_outcome = if warm.is_finished() {
+        Some(warm.join().unwrap())
+    } else {
+        None
+    };
+    let (r, w) = io();
+    println!(
+        "WARM-POLL RESULT ready_at={ready_at:?} first_results={first_results:?} searches={calls} slowest_search={slowest:?} \
+         warm={warm_outcome:?} read_mib={} write_mib={} wal_mib={} state={}",
+        (r - read0) >> 20,
+        (w - write0) >> 20,
+        wal_bytes() >> 20,
+        state()
+    );
+    if std::env::var_os("TINE_WARM_SCALE_KEEP").is_some() {
+        println!("WARM-POLL KEEP root={}", root.display());
     } else {
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -318,7 +318,10 @@ complete inventory at the exact current graph cache generation. What
 stays refused is an image nobody is converging: a rebuild or inventory still
 owed, a failed write, or an idle projection this session has never validated
 (its rows may be stale from an earlier session); the query's bounded repair
-starts the warm there. A warm stream is never superseded by a parsed snapshot
+starts the warm there. A warm validation announces itself before it reads
+the first page byte, so a query landing during that read reports
+`NotReady(Indexing)` and retries; it never reads the projection as idle and
+never starts a second warm on the query thread (GH #543). A warm stream is never superseded by a parsed snapshot
 that arrives beside it, and generation drift restarts the warm validation
 (resuming at the pages the abandoned stream had not reached) rather than
 falling back to a whole-graph parse; a turn deferred for want of an

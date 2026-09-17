@@ -27,6 +27,7 @@ const LAYERS: &[(&str, &[&str])] = &[
             "projection_budget",
             "property_line",
             "search_query",
+            "projection_budget",
         ],
     ),
     (

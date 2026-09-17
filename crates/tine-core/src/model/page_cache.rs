@@ -389,6 +389,27 @@ impl Graph {
         else {
             return Outcome::Unavailable;
         };
+        // GH #543: announce this warm before the inventory read below. On a
+        // 10k-page graph that read takes seconds (tens on Windows), and a
+        // query landing inside it must see Indexing, not an idle projection
+        // it should repair — its repair would be a second warm racing this
+        // one on the query thread.
+        let in_flight = projection.begin_warm();
+        #[cfg(test)]
+        {
+            // Bind first: an `if let` scrutinee would hold the guard across
+            // the pause and block the very second warm the test provokes.
+            let pause = self
+                .page_build_test
+                .warm_validation_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
+        }
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
             return Outcome::Unavailable;
         };
@@ -419,7 +440,11 @@ impl Graph {
             return Outcome::Retry;
         }
         let parse_config = Arc::new(self.config.parse_config());
-        if !projection.enqueue_warm(generation, sources, Arc::clone(&parse_config), text_bytes) {
+        let enqueued =
+            projection.enqueue_warm(generation, sources, Arc::clone(&parse_config), text_bytes);
+        // From here the queue itself reports Indexing (or the refusal reason).
+        drop(in_flight);
+        if !enqueued {
             // Refused: the worker is gone or failed without a rebuild queued
             // (nothing a retry changes), or the queue outranks this
             // generation / still holds deltas (a retry sees them drained).
@@ -700,6 +725,15 @@ impl Graph {
         self.page_build_test
             .on_demand_parses
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// GH #543 test hook: pause the NEXT warm validation after it has
+    /// announced itself and before it reads page bytes.
+    #[cfg(test)]
+    pub(crate) fn pause_next_warm_validation_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.warm_validation_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
     }
 
     #[cfg(test)]

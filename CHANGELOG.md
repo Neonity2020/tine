@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- A search typed while the query index was still being read for validation
+  at launch no longer starts a second index build on the search thread
+  (GH #543). On a 10,000-page graph on Windows that race made the cold open
+  take 587 s instead of 150 s, wrote 35 GB, and froze the switcher at
+  "Indexing 240 of 10,000"; the search now reports "indexing" and retries.
+
 - Opening a large graph no longer spends most of its time re-reading the
   query index it is building (GH #543). A whole-graph build inserts every
   row onto a random B-tree leaf, so at SQLite's ~2 MiB default page cache
