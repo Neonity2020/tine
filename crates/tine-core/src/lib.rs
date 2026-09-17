@@ -20,7 +20,6 @@ pub mod directory_identity;
 pub mod doc;
 pub mod edn;
 mod filesystem_durability;
-pub(crate) mod projection_budget;
 
 pub mod durability_counters;
 pub mod graph_text_path;
