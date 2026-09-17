@@ -8,6 +8,7 @@ import {
   LINUX_CORE_RELEASE_FILTERSET,
   LINUX_CORE_RELEASE_EXCLUDED_TEST_NAMES,
   LINUX_TINE_CORE_SHARD_COUNT,
+  nextestRemedy,
   KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES,
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_SMOKE_FILTERSET,
@@ -223,5 +224,23 @@ for (const [ledger, names] of [
       + "rather than carrying a green name forward as known-red."
   );
 }
+
+// The absence of cargo nextest must read as its own remedy. Two of the three
+// call sites run with stdio:"inherit" and cannot improve cargo's own text, so
+// the probe is the only place this can be said -- and it is worth nothing if it
+// stops recognising what cargo actually prints.
+assert.equal(
+  typeof nextestRemedy("error: no such command: `nextest`\n\nhelp: a command with a similar name exists: `test`"),
+  "string",
+  "nextestRemedy no longer recognises cargo's missing-subcommand message, so a gate run from a "
+    + "shell that has not sourced scripts/env.sh goes back to suggesting `cargo search cargo-nextest`."
+);
+assert.match(nextestRemedy("error: no such command: nextest"), /source scripts\/env\.sh/);
+assert.equal(
+  nextestRemedy("error: test run failed: 3 tests failed"),
+  null,
+  "nextestRemedy must not claim a missing toolchain when the tests simply failed."
+);
+assert.equal(nextestRemedy(undefined), null);
 
 console.log("tine-core nextest contract fixture tests passed.");
