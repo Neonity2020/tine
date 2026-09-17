@@ -292,6 +292,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-process-group.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A scenario that leaves a process behind is reported and its orphan killed, so one leaking journey cannot exhaust the machine for every later journey in the run.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The polling attempts and interval that separate ordinary teardown lag from a real orphan may change."
+   ],
+   "nonRequirements": [
+    "Any product behaviour; zombie (reaped-but-unwaited) processes, which hold no memory and no port."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-journal-format.mjs": {
    "contracts": [
     {
