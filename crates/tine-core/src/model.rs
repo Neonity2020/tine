@@ -78,7 +78,6 @@ use budgets::*;
 use graph_text_capture::*;
 pub use graph_text_errors::*;
 pub(crate) use projection_rename::*;
-pub(crate) mod projection_budget;
 mod projection_fs;
 pub(crate) use crate::filesystem_durability::*;
 pub use crate::filesystem_durability::{

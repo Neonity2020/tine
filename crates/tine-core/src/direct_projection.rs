@@ -152,7 +152,7 @@ struct PendingWarm {
     parse_config: Arc<ParseConfig>,
     /// Total bytes of the graph text the warm read for its revisions. A
     /// stream this warm opens sizes the writer's page cache from it
-    /// (`model::projection_budget`), exactly as the one-transaction full
+    /// (`projection_budget`), exactly as the one-transaction full
     /// route does (GH #543).
     text_bytes: u64,
 }
@@ -2508,9 +2508,9 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                             let database = writer_slot.as_ref().unwrap();
                             database
                                 .set_page_cache_budget(
-                                    crate::model::projection_budget::build_page_cache_budget(
+                                    crate::projection_budget::build_page_cache_budget(
                                         text_bytes,
-                                        crate::model::projection_budget::physical_memory_bytes(),
+                                        crate::projection_budget::physical_memory_bytes(),
                                     ),
                                 )
                                 .map_err(|error| error.to_string())?;
@@ -2706,7 +2706,7 @@ fn restore_build_settings(
         .set_build_durability(false)
         .map_err(|error| error.to_string())?;
     database
-        .shrink_page_cache_budget(crate::model::projection_budget::resting_page_cache_budget(
+        .shrink_page_cache_budget(crate::projection_budget::resting_page_cache_budget(
             text_bytes,
         ))
         .map_err(|error| error.to_string())
@@ -2886,12 +2886,12 @@ fn apply_pending(
             .deleted
             .extend(source_delta.deletions.iter().copied());
         // GH #543: size the writer's page cache to this build and hand the
-        // memory back once it commits (`model::projection_budget`).
+        // memory back once it commits (`projection_budget`).
         let text_bytes = projected_text_bytes(&replacements);
         database
-            .set_page_cache_budget(crate::model::projection_budget::build_page_cache_budget(
+            .set_page_cache_budget(crate::projection_budget::build_page_cache_budget(
                 text_bytes,
-                crate::model::projection_budget::physical_memory_bytes(),
+                crate::projection_budget::physical_memory_bytes(),
             ))
             .map_err(|error| error.to_string())?;
         let applied_snapshot = database
@@ -2907,7 +2907,7 @@ fn apply_pending(
             )
             .map_err(|error| error.to_string());
         database
-            .shrink_page_cache_budget(crate::model::projection_budget::resting_page_cache_budget(
+            .shrink_page_cache_budget(crate::projection_budget::resting_page_cache_budget(
                 text_bytes,
             ))
             .map_err(|error| error.to_string())?;
