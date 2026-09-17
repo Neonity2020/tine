@@ -24,6 +24,7 @@ const LAYERS: &[(&str, &[&str])] = &[
             "backend_error",
             "directory_identity",
             "filesystem_durability",
+            "projection_budget",
             "property_line",
             "search_query",
         ],

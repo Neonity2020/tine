@@ -2980,7 +2980,7 @@ fn a_parse_config_change_moves_every_source_revision() {
 /// indexes per row.
 #[test]
 fn a_full_build_sizes_the_writer_cache_and_hands_it_back() {
-    use crate::model::projection_budget::{resting_page_cache_budget, RESTING_CACHE_FLOOR_BYTES};
+    use crate::projection_budget::{resting_page_cache_budget, RESTING_CACHE_FLOOR_BYTES};
     let _serial = serialize_projection_tests();
     let root = scratch("full-build-cache-budget");
     std::fs::create_dir_all(&root).unwrap();

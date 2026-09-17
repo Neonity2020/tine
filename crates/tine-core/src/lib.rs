@@ -32,6 +32,7 @@ pub mod onboarding;
 pub mod org;
 mod outline;
 pub mod pdf;
+pub(crate) mod projection_budget;
 #[cfg(test)]
 pub(crate) mod projection_producer_census;
 mod property_line;

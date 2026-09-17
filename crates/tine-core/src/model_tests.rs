@@ -10030,9 +10030,17 @@ fn direct_query_bench_open() -> (PathBuf, Graph, usize, usize) {
 fn wait_for_direct_query_projection(graph: &Graph) {
     let started = Instant::now();
     while !graph.direct_projection_ready_test() {
+        // A budget that reports only "did not converge" costs a whole rerun to
+        // learn anything. This fixture takes 0.04 s alone and has blown the
+        // 60 s budget under contention -- a 1500x spread -- so the one thing
+        // the failure must say is WHICH state it was stuck in: `Working` is a
+        // slow machine and the budget is wrong, `Stale` or `Stopped` is a
+        // product defect that no amount of waiting would have fixed.
         assert!(
             started.elapsed() < Duration::from_secs(60),
-            "Direct query test projection did not converge"
+            "Direct query test projection did not converge: progress={:?}, cache generation {}",
+            graph.direct_projection_progress(),
+            graph.cache_generation(),
         );
         std::thread::sleep(Duration::from_millis(2));
     }
