@@ -4274,14 +4274,14 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/model/projection_budget.rs::small_graph_gets_the_floor_and_large_graph_the_ceiling",
-   "crates/tine-core/src/model/projection_budget.rs::physical_memory_caps_the_budget_but_never_below_the_floor",
+   "crates/tine-core/src/projection_budget.rs::small_graph_gets_the_floor_and_large_graph_the_ceiling",
+   "crates/tine-core/src/projection_budget.rs::physical_memory_caps_the_budget_but_never_below_the_floor",
    "crates/tine-core/src/direct_projection_tests.rs::a_full_build_sizes_the_writer_cache_and_hands_it_back"
   ],
   "scenario": "query.projection-build-cost",
   "failBefore": "tine-agents/evidence/gh543-build-path/core-fail-before.log (a_full_build_sizes_the_writer_cache_and_hands_it_back against the pre-fix apply_pending: cache budget stayed at the 2,048,000-byte default; probe curves in probe-1k.log and probe-knee.log)"
  },
- "notes": "Blocking core operation: on a 10,000-page graph the first index build (fresh install, upgrade, or repair) never reached search-ready on Windows within 10 minutes and search stayed on the indexing notice. Root cause: the whole-graph build is one SQLite transaction inserting every row of every UUID-keyed index onto a random B-tree leaf while the connection ran at SQLite's ~2 MiB default page cache, so each dirty page was spilled to the WAL and read back (8.8M cache misses, 27 GB read / 19 GB written for 49 MB of Markdown); Windows makes each of those round trips ~10x dearer. Fix (tine-storage v0.20.1 + tine-core): the writer's page cache is sized to the build from the projected text bytes (`model::projection_budget`, RAM-capped, returned after commit), and a build into an empty projection creates its 35 secondary indexes once after the rows instead of maintaining them per row. Measured in tine-storage's `gh543_build_probe` (recorded in the packet record)."
+ "notes": "Blocking core operation: on a 10,000-page graph the first index build (fresh install, upgrade, or repair) never reached search-ready on Windows within 10 minutes and search stayed on the indexing notice. Root cause: the whole-graph build is one SQLite transaction inserting every row of every UUID-keyed index onto a random B-tree leaf while the connection ran at SQLite's ~2 MiB default page cache, so each dirty page was spilled to the WAL and read back (8.8M cache misses, 27 GB read / 19 GB written for 49 MB of Markdown); Windows makes each of those round trips ~10x dearer. Fix (tine-storage v0.20.1 + tine-core): the writer's page cache is sized to the build from the projected text bytes (`projection_budget`, RAM-capped, returned after commit), and a build into an empty projection creates its 35 secondary indexes once after the rows instead of maintaining them per row. Measured in tine-storage's `gh543_build_probe` (recorded in the packet record)."
 },
 {
  "id": "REG-QUERY-PROJECTION-REFERENCE-NAMES-543",
@@ -4337,6 +4337,31 @@
   "failBefore": "tine-agents/evidence/gh543-partial-admission/fail-before.md (the three tine-core tests against the pre-packet admission predicate and warm driver: NotReady(Indexing) during the stream, an empty snapshot erasing the streamed pages, and drift falling to the whole-graph parse; the master warm-scale probe log showing the stream superseded by its own derived-map parse at 10,000 pages)"
  },
  "notes": "Blocking core operation, all platforms: Ctrl+K and the `((` picker on a cold or changed graph refused with NotReady(Indexing) until the whole graph was lowered (minutes at 10,000 pages on Windows), and the build itself was restarted by every path that parsed the whole graph beside the stream (page inventory, reference names, the warm task's own derived maps) and by any save during the stream (abandon -> needs_full -> parse fallback -> one huge transaction on a half-filled file). Fix: query capture is admitted while a warm validation or stream is in flight (answer over the committed rows, labelled by `query_index_progress` = (indexed, total)); `enqueue_full` is a no-op while a stream is open unless a rebuild is requested; the warm task retries the validation on drift instead of parsing; a turn deferred for want of an inventory no longer marks the worker failed (so the retry warm applies without a reset); the streaming writer gets the build page-cache budget and relaxed durability (tine-storage v0.20.3 `set_build_durability`) restored when the stream closes. Readiness (`ready_at`) is unchanged and still waits for the complete inventory."
+},
+{
+ "id": "REG-QUERY-PROJECTION-WARM-ANNOUNCE-543",
+ "title": "A search typed while the query index is still being read for validation at launch retries as indexing instead of starting a second index build on the search thread",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": [],
+  "internal": "Windows diagnose543verify run 35225823831 on 6df34960"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_query_during_the_warm_inventory_read_retries_instead_of_repairing"
+  ],
+  "scenario": "query.projection-build-cost",
+  "failBefore": "tine-agents/evidence/gh543-warm-announce/fail-before.log (the test with the announce replaced by a no-op: the search thread traced `dispatch: repairing`, enqueued its own warm, streamed Replacements(5) and answered Ok; assertion panicked with \"must report Indexing, got Ok\")"
+ },
+ "notes": "Blocking core operation, all platforms, worst on Windows: the open-path warm published nothing until it had read every page's bytes for its inventory (seconds on Linux, tens of seconds on Windows at 10,000 files), so a search landing in that window read the projection as idle and stale, took the repair route and ran a second warm on the query thread racing the open path's; the loser retried and fell to the whole-graph parse, whose snapshot then superseded the stream with one huge transaction. Windows run 35225823831 measured the 10k cold open at 587 s (150 s before packet 3), 35.7 GB written, switcher frozen at \"Indexing 240 of 10,000\". Fix: `warm_projection_cancellable` holds a `WarmInFlight` marker from before its first page read until it has enqueued; `progress_at` reports Working(Indexing) while any is held, so the query retries."
 }
 ]
 }
