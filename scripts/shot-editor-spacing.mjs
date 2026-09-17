@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Runs the real frontend against the mock backend and writes four block crops to
 // screenshots/ for human inspection. This specifically covers the WebKitGTK
 // screenshots that exposed Noto Emoji keycap-base metrics in ordinary source.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

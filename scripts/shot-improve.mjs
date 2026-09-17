@@ -3,7 +3,7 @@
 // Headless Chromium over the mock backend. → screenshots/improve-*.png
 // Usage (after `source scripts/env.sh && npm run build`):
 //   node scripts/shot-improve.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

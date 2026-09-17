@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // right edge. jsdom applies no layout, so this measures the REAL engine over the
 // real built app rather than a model of the CSS.
 // Usage: source scripts/env.sh && npm run build && node scripts/shot-reference-header-align.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

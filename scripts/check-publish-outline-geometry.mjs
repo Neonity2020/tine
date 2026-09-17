@@ -1,6 +1,6 @@
 // Browser geometry regression for the exported Guide's outline connectors and
 // inline block-embed root. Run after `npm run docs:build`.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";

@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // edge it used to be drawn at `left: 100%` with no idea where the window ended.
 // jsdom applies no layout, so this measures the REAL engine over the built app.
 // Usage: source scripts/env.sh && npm run build && node scripts/shot-submenu-onscreen.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

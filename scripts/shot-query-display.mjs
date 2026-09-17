@@ -11,7 +11,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 //
 // Headless Chromium over the mock backend, the same seam `shot-query-sheet.mjs`
 // uses.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

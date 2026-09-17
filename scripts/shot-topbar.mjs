@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 const PORT = 5197;

@@ -1,7 +1,7 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Browser geometry and screenshot proof for GH #205.
 // Usage: npm run build && node scripts/shot-topbar-responsive.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import path from "node:path";

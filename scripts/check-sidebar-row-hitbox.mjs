@@ -16,7 +16,7 @@
 //
 // jsdom applies no CSS layout, so which element sits under a given pixel is only
 // answerable here. The render tests next to it assert what each element DOES.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

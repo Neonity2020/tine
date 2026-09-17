@@ -6,7 +6,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // drop-shadow + rounded corners the window manager gives the real floating
 // window, so the shot reads as a window rather than a bare div.
 // Usage: node scripts/shot-capture.mjs   (source scripts/env.sh first)
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

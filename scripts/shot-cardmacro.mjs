@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // (heading + paragraph + list) while inline macros (poem/hi) stay inline — the
 // Item 2 OG-parity behavior. Real frontend (Chromium + mock via vite preview).
 // Writes screenshots/macro-card-block.png + macro-inline.png (gitignored).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

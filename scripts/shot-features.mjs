@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // mock backend. Each shot is isolated so one failure doesn't abort the rest.
 // Usage (after `source scripts/env.sh && npm run build`):
 //   node scripts/shot-features.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

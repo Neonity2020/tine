@@ -1,7 +1,7 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Serve the built frontend (mock backend) and capture screenshots for visual
 // review. Usage: node scripts/screenshot.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

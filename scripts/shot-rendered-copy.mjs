@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // ((uuid)) block ref and a user {{macro}} resolve to what they render (not the
 // uuid / literal) in the "Rendered" preview. Real frontend (Chromium + mock via
 // vite preview). Kitchen-sink has the ref target + poem/hi macros.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

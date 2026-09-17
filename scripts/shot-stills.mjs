@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // (same approach as shot-features.mjs). Usage (after `source scripts/env.sh &&
 // npm run build`):  node scripts/shot-stills.mjs
 // Writes screenshots/feat-calc.png and screenshots/feat-callouts.png.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

@@ -1,7 +1,7 @@
 // Settings → About tab (GH #32): version, links, credits. Headless Chromium over
 // the mock backend, both themes. Usage (after `source scripts/env.sh && npm run build`):
 //   node scripts/shot-about.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

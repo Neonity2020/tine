@@ -12,7 +12,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // hard-coded pixel. A typography theme that changes the line height therefore
 // changes the oracle too, which is the point: the bullet column must follow the
 // text, not cancel one particular error with one particular constant.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import path from "node:path";

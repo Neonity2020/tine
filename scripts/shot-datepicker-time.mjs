@@ -6,7 +6,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // the native time control renders per-Chromium here, per-WebKitGTK in the real app.
 // (The mock is intentionally lossy and shows no scheduled chip, so we open the
 // picker via the slash command rather than by clicking a chip.)
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

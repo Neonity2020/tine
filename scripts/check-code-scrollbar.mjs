@@ -1,5 +1,5 @@
 // Run under xvfb-run on Linux: this probes an actual classic scrollbar.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { createServer } from "vite";
 import { realpathSync } from "node:fs";
 import assert from "node:assert/strict";

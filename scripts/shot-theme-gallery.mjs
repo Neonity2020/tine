@@ -6,7 +6,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 //   node scripts/shot-theme-gallery.mjs
 // Set TINE_UPDATE_THEME_THUMBNAILS=1 only when intentionally refreshing the
 // checked-in Settings thumbnails; ordinary verification leaves them untouched.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

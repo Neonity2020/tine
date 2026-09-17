@@ -2,7 +2,7 @@
 // Grounds how Tine's HTML EXPORT renders every page-level feature. NOTE: the export
 // path differs from the in-app render (it drops task markers/queries/embeds) — this
 // screenshots the export, not the app. Run after `npm run docs:build` (build-guide-site).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 const b = await chromium.launch();
 const page = await b.newPage({ viewport: { width: 820, height: 1400 }, deviceScaleFactor: 2 });
 const errors = [];

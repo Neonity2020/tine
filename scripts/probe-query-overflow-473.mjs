@@ -17,7 +17,7 @@
 //
 // Usage: npm run build && node scripts/probe-query-overflow-473.mjs
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
-import { chromium, webkit } from "playwright";
+import { chromium, webkit } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";

@@ -1,7 +1,7 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Screenshot the Formula1 namespace page (macro "Namespace" header + tree, and
 // the automatic "Hierarchy" breadcrumb section) to compare against real OG.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

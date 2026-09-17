@@ -1,6 +1,6 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Visual verification for packet C-5b's tier-3 toast and Deleted pages dock.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

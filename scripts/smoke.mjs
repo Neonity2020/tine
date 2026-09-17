@@ -2,7 +2,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Headless render smoke test against the mock backend. Catches runtime crashes
 // in the live sidebar/query paths (circular-import TDZ, render throws, etc.).
 // Usage: node scripts/smoke.mjs   (requires `npm run build` first)
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

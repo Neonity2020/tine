@@ -2,7 +2,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Guide screenshots for visual review.
 // Serves built dist over vite preview (http, not file://) against the mock backend.
 // Usage: npm run build && node scripts/shot-guide.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

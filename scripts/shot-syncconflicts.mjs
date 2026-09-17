@@ -2,7 +2,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Open Settings → Backups & recovery (with the ?conflicts gate so the mock
 // surfaces a sync-conflict copy), screenshot the panel, then open the merge modal
 // and screenshot it. Verifies the sync-conflict reconcile + block-merge UI.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

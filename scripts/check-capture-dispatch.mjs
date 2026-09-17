@@ -6,7 +6,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // drives real bubbling KeyboardEvents at the real title/editor nodes.  It owns
 // the Vite server and Chromium lifecycle so it can be used as both the P1B
 // fail-before recorder and the pass-after regression gate.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";

@@ -7,7 +7,7 @@
 // can see it. The contract asserted is the user outcome — the scrollbar and the
 // resize strip occupy disjoint columns, so moving a few pixels left off the
 // strip reaches the bar — not the particular widths.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

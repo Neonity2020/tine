@@ -1,7 +1,7 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Screenshot the sidebar graph-switcher control (R3a): closed header + open menu.
 // Also asserts the wiring: clicking the control toggles the menu (0→2 items).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

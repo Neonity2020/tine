@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // free-text property fallback — so the common cases need no typing. Headless
 // Chromium over the mock backend (the "Jun 14th, 2026" journal has a pure
 // {{query}} block whose SHEET footer carries the "+ sort" control).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

@@ -27,7 +27,7 @@
 // Orphan-vite note: run this node script DIRECTLY (no `timeout` wrapper); the
 // try/finally SIGKILLs the vite child by PID.
 
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

@@ -1,5 +1,5 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";

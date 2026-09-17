@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // journal has a `{{query (todo TODO DOING)}}` block whose builder bar now shows a
 // "+ summarize" pill. We open the popover, apply Count, then Group by page, then
 // Sum of a (non-numeric) property to confirm the skip surfacing.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

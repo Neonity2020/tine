@@ -1,5 +1,5 @@
 // Render and exercise the signed community catalogue against the browser mock.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { waitForHttpServer } from "./e2e-capabilities.mjs";

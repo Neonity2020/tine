@@ -1,7 +1,7 @@
 // Real Block rendered-to-editor drag compared with a native textarea click at
 // the same endpoint. The independent native control owns the pixel-to-offset
 // oracle; no copy of the production caret algorithm is used here.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
 import { createServer } from "vite";

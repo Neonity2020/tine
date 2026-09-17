@@ -8,7 +8,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 //
 // Usage: source scripts/env.sh && npm run build && node scripts/shot-website-050.mjs
 //        then copy the chosen files into website/img/ (see docs/SCREENSHOTS.md).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

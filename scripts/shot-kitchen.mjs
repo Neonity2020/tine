@@ -1,6 +1,6 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Render the kitchen-sink parity page and screenshot it (rendering parity net).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

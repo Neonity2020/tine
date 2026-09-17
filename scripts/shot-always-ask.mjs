@@ -2,7 +2,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Concord P5 visual check: the "always ask" bar. The policy is OFF by default,
 // so the demo gate turns it on and drives one external change through the
 // ordinary handler. Usage: npm run build && node scripts/shot-always-ask.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

@@ -12,7 +12,7 @@
 // The user contract is geometric, which is why this is a real layout check and
 // not a CSS-text assertion: the label stays inside the scrollport at both
 // scroll extremes. Its exact offset is not a contract.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

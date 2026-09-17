@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // long page, the slim pinned bar once the panel scrolls out of view, and the
 // unrolled-in-place sheet — at desktop and phone widths. Full-viewport shots,
 // so the bar's alignment with the pane (not covering the sidebar) is visible.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

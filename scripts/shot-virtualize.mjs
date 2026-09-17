@@ -10,7 +10,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Also dumps window.__tineParseStats if present (only in a dev build).
 //
 // Usage:  source scripts/env.sh && npm run build && node scripts/shot-virtualize.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

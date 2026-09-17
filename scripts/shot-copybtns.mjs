@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Forces the hover state visible so placement/appearance is checkable, plus a
 // genuine hover to confirm the natural reveal works. Not a README shot.
 // Usage: source scripts/env.sh && npm run build && node scripts/shot-copybtns.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

@@ -5,7 +5,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // startup toast pointing at Settings. The shot must show BOTH halves of what
 // replaced it: the row-by-row choices (so Merge is implicit) and the per-file
 // actions including Rename.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

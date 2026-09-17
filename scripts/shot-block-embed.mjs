@@ -3,7 +3,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // referenced root as the one interactive root bullet, with a heavier descendant
 // guide instead of an extra host bullet or enclosing box.
 // Usage: npm run build && node scripts/shot-block-embed.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

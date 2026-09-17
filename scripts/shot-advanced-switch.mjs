@@ -12,7 +12,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // installed as canned DATA through the mock-only fixture seam
 // (`src/mockQueryFixture.guard.test.ts` keeps it out of production), exactly as
 // `shot-query-sheet.mjs` does.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

@@ -4,6 +4,36 @@ This is Tine's durable ship contract. `scripts/check-release-readiness.mjs`
 enforces the machine-checkable parts; the canonical agent agreement defines who
 may tag, publish, comment, and close issues.
 
+## Step 0 — before the freeze
+
+Answer two questions before spending a minute on candidate work. Both were
+skipped for v0.6.984 and both cost real time: `master` was already red in hosted
+CI when the release began, so the first candidate's gates were spent
+rediscovering a failure that had nothing to do with the release, and every gate
+had to be rerun after the fix.
+
+0a. **Is `master` green in CI right now?**
+
+```bash
+gh run list --workflow=ci.yml --branch=master --limit=5 \
+  --json conclusion,event,headSha,displayTitle,url
+```
+
+A push-triggered run is NOT full CI — it runs "Landed-code validation" only and
+skips the Windows, Android, nextest-shard and performance jobs. Treat a red or
+absent result as work to finish *before* the freeze, not during it.
+
+0b. **Does the Rust job CI will run pass locally?**
+
+```bash
+source scripts/env.sh
+node scripts/tine-core-nextest-contract.mjs --mode linux --run-selection
+```
+
+This is the exact selection hosted CI runs, and it is not what `cargo test -p
+tine-core` runs. Running it here turns a ~20-minute hosted round trip into a
+local one.
+
 ## Every release
 
 1. Freeze the candidate and finish the version/changelog update.

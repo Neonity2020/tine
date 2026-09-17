@@ -2,7 +2,7 @@
 // clicks Run, so lsdoc-wasm parses and mldoc actually loads + runs in the Web
 // Worker inside a real browser. Validates the whole runtime pipeline. Chromium is
 // a strong proxy for Tine's WebKitGTK (the exact WebKitGTK check is the app run).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

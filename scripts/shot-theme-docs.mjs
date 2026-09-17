@@ -1,6 +1,6 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Capture Tine itself using the two launch theme packages.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";

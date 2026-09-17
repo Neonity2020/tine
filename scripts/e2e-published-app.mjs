@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 
 const here = path.dirname(new URL(import.meta.url).pathname);
 

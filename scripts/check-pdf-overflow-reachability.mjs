@@ -15,7 +15,7 @@
 // jsdom applies no CSS layout and no container queries, so this is the only
 // layer that can see it. The assertion is the user outcome, not the constants:
 // at each sampled width at least one copy of each tool is hit-testable.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

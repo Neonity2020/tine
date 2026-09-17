@@ -2,7 +2,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Self-verification shot for the fourth (merged) outcome: the in-page resolver
 // with mock row 4 (a both-changed row carrying a merged proposal). Three shots:
 // desktop collapsed, desktop expanded, and a phone-width collapsed layout.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

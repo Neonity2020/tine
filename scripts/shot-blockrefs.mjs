@@ -1,7 +1,7 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Verify the per-block reference-count badge + referrers panel on the kitchen-sink
 // target block (id 64b9c0e2…, referenced by a bare + a labeled ref → count 2).
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

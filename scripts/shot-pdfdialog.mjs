@@ -1,6 +1,6 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Open a page context menu → "Export to PDF…" → screenshot the export-options dialog.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

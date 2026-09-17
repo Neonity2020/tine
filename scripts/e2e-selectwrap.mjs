@@ -4,7 +4,7 @@
 // marks (`*`/`~`/`=`) wrap and double, including literal delimiter events with
 // Alt held (GH #83). Drives real keydown events, so it exercises Block.tsx's
 // keydown→wrapSelectionEdit→autocomplete path, not just the pure logic.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { waitForHttpServer } from "./e2e-capabilities.mjs";

@@ -8,7 +8,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 //
 // With no AFTER URL, the script starts `vite preview` on 5227. The baseline is
 // optional for ad-hoc after-only checks, but release evidence must supply it.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

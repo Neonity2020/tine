@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // that has rendered children, the parent-bullet center x and the guide-line
 // (.block-children border-left) x, and their delta. Usage (after env.sh):
 //   node scripts/measure-guides.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

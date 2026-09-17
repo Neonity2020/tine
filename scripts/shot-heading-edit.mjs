@@ -4,7 +4,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // the rendered view, and stays BODY-sized for a multi-line heading (uniline gate).
 // Real frontend (Chromium + mock backend via vite preview), modeled on
 // e2e-selectwrap.mjs. Writes PNGs to screenshots/ (gitignored) to eyeball.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 

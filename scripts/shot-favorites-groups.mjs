@@ -13,7 +13,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 //
 // Screenshot the one-level Favorites groups in the left sidebar (GH #102).
 // It asserts the wiring it photographs.
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";

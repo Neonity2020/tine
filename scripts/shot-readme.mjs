@@ -2,7 +2,7 @@ import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Focused screenshots for the README's "highlights" gallery. Each shot is
 // isolated in try/catch so one failure doesn't abort the rest. Skips the
 // PDF flow (slow/can hang headless). Usage: node scripts/shot-readme.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
