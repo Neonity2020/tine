@@ -411,11 +411,16 @@ function strictBase64(value) {
  * cannot see that distinction — it digests the whole working tree — so during
  * v0.6.984 every failed hypothesis about a journey had to be COMMITTED before
  * it could be run, and during a release each such commit produced a new
- * candidate SHA. This list is what `--allow-harness-delta` is allowed to
- * tolerate; everything else still refuses, because everything else can change
- * the product.
+ * candidate SHA. This is what `--allow-harness-delta` is allowed to tolerate;
+ * everything else still refuses, because everything else can change the
+ * product.
  */
-const HARNESS_PATH = /^(scripts\/(lib\/)?e2e-[A-Za-z0-9-]+\.mjs|tests\/.+)$/;
+// Deliberately the same rule `tine-coordination`'s `is_non_product_path` uses
+// for `integrate --test-only`, so "this cannot change the product" means one
+// thing in the repository rather than two. Keep them in step: scripts/**, any
+// tests/ directory, docs/** (see src/docsAreNotProduct.guard.test.ts for why
+// that is sound in Rust), and any *.test.* file.
+const HARNESS_PATH = /^(scripts\/|docs\/|.*\/tests\/|tests\/)|(^|\/)[^/]+\.test\.[a-z]+$/;
 
 /**
  * Every path that could differ from the one the receipt was built from.

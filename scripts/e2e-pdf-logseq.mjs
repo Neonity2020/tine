@@ -1048,12 +1048,19 @@ async function proveNativeUploadsThemesAndHighlights() {
 
   // Select the deterministic line with an actual pointer drag across the live
   // PDF.js text layer. No Range/selection event is synthesized in this proof.
-  await browser.waitUntil(() => browser.execute((expectedText) =>
-    [...document.querySelectorAll(".textLayer span")].some((span) => span.textContent?.trim() === expectedText), HIGHLIGHT_TEXT), {
-    timeout: 10_000,
-    timeoutMsg: "deterministic PDF text was not exposed for literal pointer selection",
-  });
-  const selectionTarget = await browser.execute((expectedText) => {
+  // Wait for the proposition the drag actually needs.
+  //
+  // This used to wait for "a span with this text exists", then require on the
+  // very next line that the span have geometry a pointer can traverse. Those
+  // are different propositions and PDF.js satisfies them in that order: the
+  // span enters the DOM before the text layer is laid out and scaled. On an
+  // idle machine the gap is invisible; pinned to two contended cores it is
+  // not, and the journey then failed on the geometry line having "waited" for
+  // something else (v0.6.984 F28, found with run-e2e --pin-cpus=2
+  // --under-load). Waiting for the geometry itself subsumes the existence
+  // check, and a text layer that genuinely never lays out still fails — now
+  // saying that is what happened.
+  const readSelectionTarget = () => browser.execute((expectedText) => {
     const span = [...document.querySelectorAll(".textLayer span")]
       .find((candidate) => candidate.textContent?.trim() === expectedText);
     const rect = span?.getBoundingClientRect();
@@ -1061,7 +1068,11 @@ async function proveNativeUploadsThemesAndHighlights() {
       ? { start: { x: rect.left + 1, y: rect.top + rect.height / 2 }, end: { x: rect.right, y: rect.top + rect.height / 2 }, right: rect.right }
       : null;
   }, HIGHLIGHT_TEXT);
-  if (!selectionTarget) throw new Error("deterministic PDF text has no usable native-drag geometry");
+  let selectionTarget = null;
+  await browser.waitUntil(async () => (selectionTarget = await readSelectionTarget()) !== null, {
+    timeout: 20_000,
+    timeoutMsg: "deterministic PDF text never gained usable native-drag geometry (>20x5px) for pointer selection",
+  });
   // A native xdotool drag across the WebKit text layer occasionally lands
   // without producing the selection: sometimes no selection at all (the color
   // menu never opens), sometimes a short prefix of the line. Both used to fail
