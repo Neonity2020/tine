@@ -52,6 +52,38 @@ describe("QuickSwitcher search syntax help", () => {
     dispose();
   });
 
+  it("shows how far the index build has got while search answers over the partial index (GH #543)", async () => {
+    // The search itself resolves: partial admission means results arrive
+    // during the build, so the only thing telling the user they may be
+    // incomplete is the polled progress line.
+    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
+      hits: [],
+      diagnostics: [],
+      pageResultsTruncated: false,
+      blockResultsTruncated: false,
+    } as unknown as Awaited<ReturnType<ReturnType<typeof backend>["runGraphSearch"]>>);
+    const progress = vi.spyOn(backend(), "queryIndexProgress").mockResolvedValue([1234, 10000]);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    openSwitcher();
+    const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+    input.value = "Needle";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+
+    await vi.waitFor(() => expect(root.textContent).toContain("Indexing 1,234 of 10,000 pages"));
+    expect(root.textContent).toContain("results may be incomplete");
+    // The build finished: the notice goes and the query is re-run once so
+    // the results become complete.
+    const searchesBefore = vi.mocked(backend().runGraphSearch).mock.calls.length;
+    progress.mockResolvedValue(null);
+    await vi.waitFor(() => expect(root.textContent).not.toContain("Indexing 1,234"), { timeout: 3000 });
+    await vi.waitFor(() =>
+      expect(vi.mocked(backend().runGraphSearch).mock.calls.length).toBeGreaterThan(searchesBefore),
+    );
+    dispose();
+  });
+
   it.each([
     [true, true],
     [false, false],

@@ -31,6 +31,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   every platform, also on a reopen with a finished index. tine-storage
   v0.20.2 pages both navigation readers on an existing index instead (full
   drain of that graph: 65 s → 1.3 s). Unit cost: unchanged; no schema change.
+- Search answers while the query index is still being built (GH #543). On a
+  cold or changed graph, Ctrl+K and the `((` picker return the pages indexed
+  so far and the switcher says "Indexing N of M pages — results may be
+  incomplete", re-running the query once the build completes; before, every
+  search waited for the whole graph to be indexed (minutes on a large graph
+  on Windows). The build itself no longer restarts: a parsed snapshot that
+  arrives beside the running index stream is dropped instead of superseding
+  it with one huge transaction, an edit during the build restarts only the
+  validation (resuming where it stopped) instead of parsing the whole graph,
+  and the streaming writer runs with the same page-cache budget as a
+  one-transaction build and without per-batch fsyncs (tine-storage v0.20.3).
+  Unit cost: unchanged per edit; single-page saves keep their durability.
 
 ## [0.6.984] - 2026-09-16
 

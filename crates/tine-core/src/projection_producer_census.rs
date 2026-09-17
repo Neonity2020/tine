@@ -1430,7 +1430,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.20.2\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.20.3\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1457,9 +1457,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // keysets); the pin string above moved twice, the v0.20.1 bump added
     // the `set_page_cache_budget`/`shrink_page_cache_budget` calls in
     // direct_projection.rs, and v0.20.2 changed no call site.
+    // 2026-09-17: GH #543 partial admission pinned v0.20.3 and added the
+    // `set_build_durability` calls (the stream's relaxed durability, and its
+    // restore in `restore_build_settings`) in direct_projection.rs.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "3ceb96086c01e6cdb215012554645ed31bd2da0fd6169e98af89de8218fd40d1",
+        "e5d56c800e77d74da8b99e312534ee6a7a190857a3af9bdd1f8262bd1f1f7b27",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

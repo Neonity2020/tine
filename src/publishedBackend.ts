@@ -606,6 +606,9 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     async warmDone() {
       return true;
     },
+    async queryIndexProgress() {
+      return null;
+    },
     async listInstalledPlugins() {
       return [];
     },
@@ -819,6 +822,7 @@ export const PUBLISHED_CONSTANT_METHODS = [
   "getSmoothScroll",
   "setSmoothScroll",
   "warmDone",
+  "queryIndexProgress",
   "listInstalledPlugins",
   "loadPluginRegistryCache",
   "readLocalImage",

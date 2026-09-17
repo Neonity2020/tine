@@ -99,6 +99,26 @@ export function QuickSwitcher(): JSX.Element {
   const [searchPending, setSearchPending] = createSignal<string | null>(null);
   const [searchError, setSearchError] = createSignal<string | null>(null);
   const [searchRetry, setSearchRetry] = createSignal(0);
+  // GH #543: while the query index is still being built, search answers over
+  // the partial index. Poll the build while the switcher is open so the user
+  // sees that results are incomplete, and re-run the query once it finishes.
+  const [indexProgress, setIndexProgress] = createSignal<[number, number] | null>(null);
+  createEffect(() => {
+    if (!switcherOpen()) { setIndexProgress(null); return; }
+    let live = true;
+    let building = false;
+    const poll = async () => {
+      let progress: [number, number] | null = null;
+      try { progress = await backend().queryIndexProgress(); } catch { progress = null; }
+      if (!live) return;
+      if (progress) building = true;
+      else if (building) { building = false; setSearchRetry((n) => n + 1); }
+      setIndexProgress(progress);
+    };
+    void poll();
+    const timer = setInterval(() => { void poll(); }, 750);
+    onCleanup(() => { live = false; clearInterval(timer); });
+  });
   let searchRequest = 0;
   createEffect(() => {
     searchRetry();
@@ -639,6 +659,13 @@ export function QuickSwitcher(): JSX.Element {
               <div class="switcher-empty switcher-error">
                 {graphResults()!.diagnostics.map((diagnostic) => diagnostic.message).join(" · ")}
               </div>
+            </Show>
+            <Show when={query().trim() && !commandsOnly() && indexProgress()}>
+              {(progress) => (
+                <div class="switcher-empty" role="status" data-testid="switcher-index-progress">
+                  {`Indexing ${progress()[0].toLocaleString()} of ${progress()[1].toLocaleString()} pages — results may be incomplete`}
+                </div>
+              )}
             </Show>
             <Show when={searchPending()}><div class="switcher-empty" role="status">{searchPending()}</div></Show>
             <Show when={searchError()}><div class="switcher-empty switcher-error" role="alert">{searchError()} <button onClick={() => setSearchRetry((n) => n + 1)}>Retry search</button></div></Show>

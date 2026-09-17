@@ -308,8 +308,24 @@ new physical facts. Warm validation compares the complete byte-derived source
 inventory, parses only changed or missing pages in bounded batches and retains
 no parsed graph; a clean reopen lowers none. One-page cache upserts and deletes
 enqueue coalesced page deltas. The editor, watcher, and save paths never wait
-for SQL. Indexed reads are admitted only when the worker has published the
-exact current graph cache generation. One app-private sidecar lease permits
+for SQL. Indexed reads are admitted over the committed image once this
+session's worker has validated the complete inventory, and — partial
+admission, GH #543 — while a warm validation or warm stream is still
+converging it: the answer is over the rows committed so far, and the surface
+labels it with the build's `(indexed, total)` progress (`query_index_progress`).
+Readiness itself is still published only for the complete inventory. What
+stays refused is an image nobody is converging: a rebuild or inventory still
+owed, a failed write, or an idle projection this session has never validated
+(its rows may be stale from an earlier session); the query's bounded repair
+starts the warm there. A warm stream is never superseded by a parsed snapshot
+that arrives beside it, and generation drift restarts the warm validation
+(resuming at the pages the abandoned stream had not reached) rather than
+falling back to a whole-graph parse; a turn deferred for want of an
+inventory is not a failure and forces no reset. During a stream the writer
+runs with the build's page-cache budget and `synchronous=OFF`, restored when
+the stream closes (crash mid-stream: WAL keeps the file consistent and each
+batch's source revisions are committed, so the next open resumes; a torn
+file after power loss fails `quick_check` and is rebuilt). One app-private sidecar lease permits
 only one graph instance to publish into a projection database at a time, which
 prevents an older instance from replacing facts behind another instance's
 locally-ready generation watermark. A public query against a missing, stale,

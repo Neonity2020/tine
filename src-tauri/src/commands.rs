@@ -597,6 +597,26 @@ pub(crate) async fn block_ref_counts(
     .map_err(CommandError::worker)?
 }
 
+/// GH #543: `[indexed, total]` pages while the query index is still being
+/// built for this graph, `null` when no build is in flight. Search surfaces
+/// answer over the partial index during a build and poll this to say so.
+#[tauri::command]
+pub(crate) async fn query_index_progress(
+    state: GraphContext<'_>,
+) -> Result<Option<[u64; 2]>, CommandError> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        Ok(slot
+            .graph()
+            .query_index_progress()
+            .map(|(indexed, total)| [indexed, total]))
+    })
+    .await
+    .map_err(CommandError::worker)?
+}
+
 /// The blocks that reference block `uuid`, grouped by page (the badge's referrers
 /// panel). Lazy: called only when a badge is clicked open.
 #[tauri::command]

@@ -183,6 +183,18 @@ impl Graph {
         }
     }
 
+    /// GH #543 partial admission: `(indexed, total)` pages while the attached
+    /// projection's warm validation or stream is converging, `None` when no
+    /// build is in flight (or no projection is attached). A search surface
+    /// shows results over the partial index and polls this to say so.
+    pub fn query_index_progress(&self) -> Option<(u64, u64)> {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|projection| projection.index_progress())
+    }
+
     /// The readiness lifecycle of the attached projection, or `None` when no
     /// projection is attached at all.
     pub(super) fn direct_projection_progress(
@@ -891,7 +903,7 @@ impl Graph {
             // validating this source inventory, then consumes bounded page
             // batches. Never call warm_cache here: its legacy fallback builds
             // the parsed graph when streaming cannot currently acquire ownership.
-            self.warm_projection_cancellable(&|| false);
+            let _ = self.warm_projection_cancellable(&|| false);
             return;
         };
         let revisions = self.disk_revs.read().unwrap().clone();

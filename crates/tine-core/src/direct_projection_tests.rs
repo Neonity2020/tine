@@ -523,12 +523,19 @@ fn current_snapshot_needs_no_saved_target_and_stays_coherent_across_edits() {
     assert_eq!(job.config.digest(), graph.config.parse_config().digest());
     assert!(job.registry.is_none());
     let acquired_revision = job.query_revision;
-    // Current snapshot reads cannot admit a partial warm image. This
-    // models the stream interval between replacement and ordering turns.
+    // GH #543 partial admission: a current-snapshot read IS admitted while a
+    // warm stream is open (the interval between replacement and ordering
+    // turns) — over the rows committed so far, labelled by `index_progress`.
+    // `a_query_is_admitted_over_the_partial_index_while_a_stream_is_open`
+    // drives the real stream; this pins the predicate on a ready image.
     projection.shared.pending.lock().unwrap().warm_stream = Some(graph.cache_generation());
     let partial = projection.open_current_query_job(RegistrySensitivity::Insensitive);
     projection.shared.pending.lock().unwrap().warm_stream = None;
-    assert!(matches!(partial, QueryJobOpen::NotReady));
+    assert!(
+        matches!(partial, QueryJobOpen::Job(_)),
+        "a query during an open stream is admitted over the partial image"
+    );
+    drop(partial);
     assert_eq!(
         projection.active_query_jobs_test(),
         1,
@@ -736,14 +743,22 @@ fn a_deferred_turn_is_silent_while_a_write_failure_is_reported() {
     graph.save_page(&page, baseline.as_deref()).unwrap();
 
     let started = Instant::now();
-    while !projection.shared.worker_failed.load(Ordering::Acquire)
-        && started.elapsed() < Duration::from_secs(3)
-    {
+    let turn_consumed = || {
+        let pending = projection.shared.pending.lock().unwrap();
+        pending.deltas.is_empty() && !projection.shared.worker_busy.load(Ordering::Acquire)
+    };
+    while !turn_consumed() && started.elapsed() < Duration::from_secs(3) {
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert!(turn_consumed(), "the worker took the delta turn");
     assert!(
-        projection.shared.worker_failed.load(Ordering::Acquire),
-        "the deferred turn still withdraws readiness: only a full inventory may publish it"
+        !graph.direct_projection_ready_test(),
+        "the deferred turn still withdraws readiness: only a complete inventory may publish it"
+    );
+    assert!(
+        !projection.shared.worker_failed.load(Ordering::Acquire),
+        "a deferred turn is not a failure (GH #543): the next warm validation \
+         resumes from the committed rows instead of resetting the file"
     );
     assert_eq!(
         reported_projection_failures_test(),
@@ -4060,6 +4075,261 @@ fn cold_open_streams_without_retaining_the_graph() {
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
+/// GH #543 partial admission: a graph of `count` one-block pages, each
+/// carrying the search sentinel, and its warm sources exactly as the warm
+/// task computes them (file bytes, nothing parsed).
+fn partial_admission_graph(tag: &str, count: usize) -> (PathBuf, PathBuf) {
+    let root = scratch(tag);
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    for i in 0..count {
+        std::fs::write(
+            root.join(format!("pages/p{i:03}.md")),
+            format!("- TODO task {i} sentinel543\n"),
+        )
+        .unwrap();
+    }
+    let database = scratch(&format!("{tag}-db")).join("projection.sqlite");
+    (root, database)
+}
+
+fn warm_sources(graph: &Graph) -> (Vec<(PageEntry, String)>, u64) {
+    let mut text_bytes = 0u64;
+    let sources = graph
+        .walk_entries_test()
+        .into_iter()
+        .map(|entry| {
+            let content = std::fs::read_to_string(&entry.path).unwrap();
+            text_bytes += content.len() as u64;
+            let revision = crate::model::content_rev(&content);
+            (entry, revision)
+        })
+        .collect();
+    (sources, text_bytes)
+}
+
+fn stream_item(entry: PageEntry) -> WarmStreamItem {
+    let content = std::fs::read_to_string(&entry.path).unwrap();
+    let mut document = crate::doc::parse(&content);
+    crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+    WarmStreamItem::Replace {
+        revision: crate::model::content_rev(&content),
+        entry,
+        document: Arc::new(document),
+        identity: DeltaIdentity::Structural,
+    }
+}
+
+fn wait_index_progress(projection: &DirectProjection, expected: Option<(u64, u64)>) {
+    let started = Instant::now();
+    while projection.index_progress() != expected {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "index progress did not reach {expected:?}: {:?} {}",
+            projection.index_progress(),
+            projection.debug_state_test()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// GH #543: search answers over the rows a warm stream has committed so far,
+/// labelled by `index_progress`, instead of `NotReady(Indexing)` until the
+/// whole graph is lowered. An idle projection this session has never
+/// validated is still refused: nothing is converging it.
+#[test]
+fn a_query_is_admitted_over_the_partial_index_while_a_stream_is_open() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = partial_admission_graph("partial-admission", 40);
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        matches!(
+            projection.open_current_query_job(RegistrySensitivity::Insensitive),
+            QueryJobOpen::NotReady
+        ),
+        "an idle, never-validated projection is refused; its repair starts the warm"
+    );
+    assert_eq!(projection.index_progress(), None);
+
+    let (sources, text_bytes) = warm_sources(&graph);
+    let config = Arc::new(graph.config.parse_config());
+    let generation = graph.cache_generation();
+    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+        panic!("a cold projection names every page");
+    };
+    assert_eq!(pages.len(), 40);
+    wait_index_progress(&projection, Some((0, 40)));
+
+    // The stream is open and nothing is lowered yet: admitted, over an empty
+    // image.
+    let job = projection.open_current_query_job(RegistrySensitivity::Insensitive);
+    assert!(
+        matches!(job, QueryJobOpen::Job(_)),
+        "a query during the stream must be admitted, got {}",
+        projection.debug_state_test()
+    );
+    drop(job);
+    assert!(
+        graph.search("sentinel543", 50).unwrap().is_empty(),
+        "nothing lowered yet"
+    );
+
+    // One page streamed: the public search route answers over it while the
+    // other 39 are still to come, and the progress says so.
+    assert!(projection.warm_stream_admit(generation, 1));
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        vec![stream_item(pages[0].clone())],
+        Arc::clone(&config),
+    ));
+    wait_index_progress(&projection, Some((1, 40)));
+    let groups = graph
+        .search("sentinel543", 50)
+        .expect("the partial index answers the public search route");
+    assert_eq!(groups.len(), 1, "exactly the one streamed page");
+    assert!(
+        !graph.direct_projection_ready_test(),
+        "readiness itself still waits for the complete inventory"
+    );
+
+    // The rest of the stream, then the closing order turn: ready, complete,
+    // and no progress to report.
+    assert!(projection.warm_stream_admit(generation, pages.len() - 1));
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        pages[1..].iter().cloned().map(stream_item).collect(),
+        Arc::clone(&config),
+    ));
+    assert!(projection.finish_warm_stream(generation));
+    wait_ready(&graph);
+    assert_eq!(projection.index_progress(), None);
+    assert_eq!(graph.search("sentinel543", 50).unwrap().len(), 40);
+    assert_eq!(
+        projection.build_settings_turns_test(),
+        (1, 1),
+        "the stream ran under the build settings once and restored them once"
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
+/// GH #543: a parsed snapshot that arrives while a stream is open (the
+/// page-inventory or reference-name parse flight of a not-yet-ready
+/// projection) is dropped, not applied over the stream. Applying it
+/// restarted the whole build as one transaction on a half-filled file.
+#[test]
+fn a_parsed_snapshot_beside_an_open_stream_does_not_supersede_it() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = partial_admission_graph("stream-not-superseded", 12);
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let (sources, text_bytes) = warm_sources(&graph);
+    let config = Arc::new(graph.config.parse_config());
+    let generation = graph.cache_generation();
+    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+        panic!("a cold projection names every page");
+    };
+    assert!(projection.warm_stream_admit(generation, 1));
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        vec![stream_item(pages[0].clone())],
+        Arc::clone(&config),
+    ));
+    wait_index_progress(&projection, Some((1, 12)));
+
+    // An EMPTY snapshot: had it superseded the stream, the projection would
+    // now hold no pages at all.
+    projection.enqueue_full(
+        generation,
+        Arc::new(Vec::new()),
+        Arc::new(HashMap::new()),
+        Arc::clone(&config),
+    );
+    {
+        let pending = projection.shared.pending.lock().unwrap();
+        assert!(
+            pending.full.is_none(),
+            "the snapshot is dropped, not queued"
+        );
+        assert!(!pending.warm_superseded, "the stream keeps ownership");
+        assert_eq!(pending.warm_stream, Some(generation));
+    }
+    assert!(projection.warm_stream_admit(generation, pages.len() - 1));
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        pages[1..].iter().cloned().map(stream_item).collect(),
+        Arc::clone(&config),
+    ));
+    assert!(projection.finish_warm_stream(generation));
+    wait_ready(&graph);
+    assert_eq!(graph.search("sentinel543", 50).unwrap().len(), 12);
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
+/// GH #543: a save that races the stream drifts the generation and abandons
+/// it. The warm task then runs the validation again — resuming at the pages
+/// the old stream never reached — instead of parsing the whole graph and
+/// superseding the projection with one huge transaction.
+#[test]
+fn drift_during_the_stream_restarts_the_warm_without_parsing_the_graph() {
+    let _serial = serialize_projection_tests();
+    let pages = 2 * WARM_STREAM_HIGH_WATER + 5;
+    let (root, database) = partial_admission_graph("stream-drift-retries", pages);
+    reset_lowerings(&root);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    // Drift exactly as a racing save would, from the worker's first commit
+    // (the warm turn that opens the stream): every batch the stream then
+    // offers is refused and the stream is abandoned before it lowered a page.
+    let drifted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let graph = Arc::clone(&graph);
+        let drifted = Arc::clone(&drifted);
+        *projection.shared.after_sql_commit.lock().unwrap() = Some(Box::new(move || {
+            graph.drift_generation_test();
+            drifted.store(true, Ordering::Release);
+        }));
+    }
+    assert!(
+        graph.warm_cache_cancellable(|| false),
+        "the warm still owns readiness after the drift"
+    );
+    assert!(drifted.load(Ordering::Acquire), "the hook fired");
+    wait_ready(&graph);
+    assert!(
+        !graph.has_parsed_cache_test(),
+        "drift must restart the warm, never parse the whole graph: stream parses {} installs {} {}",
+        graph.warm_stream_parses_test(),
+        graph.page_build_installs_test(),
+        projection.debug_state_test()
+    );
+    assert_eq!(
+        graph.page_build_installs_test(),
+        0,
+        "no parsed snapshot was built"
+    );
+    assert_eq!(
+        lowerings(),
+        pages as u64,
+        "every page was lowered exactly once"
+    );
+    assert_eq!(
+        graph.search("sentinel543", 50).unwrap().len(),
+        pages.min(50)
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
 #[test]
 fn publication_reader_uses_capture_ids_without_changing_live_editor_ids() {
     let _serial = serialize_projection_tests();
@@ -4673,6 +4943,10 @@ fn empty_projection_shared() -> ProjectionShared {
         fallback_reads: AtomicU64::new(0),
         referenced_name_reads: AtomicU64::new(0),
         fuzzy_candidate_reads: AtomicU64::new(0),
+        stream_indexed: AtomicU64::new(0),
+        stream_total: AtomicU64::new(0),
+        build_relaxed_turns: AtomicU64::new(0),
+        build_restored_turns: AtomicU64::new(0),
     }
 }
 

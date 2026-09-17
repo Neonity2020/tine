@@ -3,6 +3,28 @@
 
 use super::*;
 
+/// How many times the warm task re-runs the projection validation after a
+/// stream was abandoned (generation drift, a refused batch) before it gives
+/// up on projection-owned readiness for this warm (GH #543). Each retry
+/// resumes at the pages the previous stream had not reached.
+const WARM_DRIFT_RETRIES: usize = 24;
+const WARM_DRIFT_RETRY_BACKOFF_MS: u64 = 100;
+
+/// What `warm_projection_cancellable` achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WarmProjectionOutcome {
+    /// The projection (or a parsed snapshot already queued to it) owns
+    /// readiness at the generation the warm observed.
+    Owned,
+    /// The warm observed a generation that moved under it, or its enqueue was
+    /// refused by work the worker will drain shortly: run it again.
+    Retry,
+    /// No projection can own readiness: none attached, the graph text scope
+    /// unreadable, the writer lease held elsewhere, or the worker failed.
+    Unavailable,
+    Cancelled,
+}
+
 impl Graph {
     fn parse_page_entry_with_permit(
         &self,
@@ -280,12 +302,49 @@ impl Graph {
     pub fn warm_cache_cancellable(&self, cancelled: impl Fn() -> bool) -> bool {
         // R6: validate the projection from file bytes first. An unchanged graph
         // is READY after that with nothing parsed and nothing retained; a
-        // changed or cold one streams only its replacement pages. The full
-        // parse below is the fallback when no projection can own readiness.
-        if !self.warm_projection_cancellable(&cancelled)
-            && (!self.warm_page_cache_cancellable(&cancelled) || cancelled())
-        {
+        // changed or cold one streams only its replacement pages.
+        //
+        // GH #543: a save that races the stream drifts the generation and the
+        // stream is abandoned. That used to fall to the whole-graph parse
+        // below, which then superseded the projection with one huge
+        // transaction — the launch-time cost the issue reports. The warm is
+        // simply run again: pages the old stream already lowered validate
+        // clean, so each retry resumes where the last one stopped. The parse
+        // remains the fallback only when no projection can own readiness at
+        // all (none attached, lease held by another instance, worker gone).
+        let mut retries = 0;
+        let warmed = loop {
+            match self.warm_projection_cancellable(&cancelled) {
+                WarmProjectionOutcome::Owned => break true,
+                WarmProjectionOutcome::Cancelled => return false,
+                WarmProjectionOutcome::Retry if retries < WARM_DRIFT_RETRIES => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        WARM_DRIFT_RETRY_BACKOFF_MS * retries as u64,
+                    ));
+                }
+                WarmProjectionOutcome::Retry | WarmProjectionOutcome::Unavailable => break false,
+            }
+        };
+        if !warmed && (!self.warm_page_cache_cancellable(&cancelled) || cancelled()) {
             return false;
+        }
+        if warmed {
+            // The stream's closing order turn may still be running; the
+            // derived-map reads below use a bounded wait and would otherwise
+            // parse the whole graph (GH #543). Nothing is owed if readiness is
+            // no longer coming at this generation: the reads then take their
+            // ordinary route.
+            if let Some(projection) = self
+                .direct_projection
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(Arc::clone)
+            {
+                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                projection.wait_until_ready_at(generation, &cancelled);
+            }
         }
         if cancelled() {
             return false;
@@ -309,13 +368,17 @@ impl Graph {
     /// superseded it); `false` means the caller must fall back to the full
     /// parse — no projection, a lease held elsewhere, a failed worker,
     /// cancellation, or a mutation that raced the warm (generation drift).
-    pub(super) fn warm_projection_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
+    pub(super) fn warm_projection_cancellable(
+        &self,
+        cancelled: &impl Fn() -> bool,
+    ) -> WarmProjectionOutcome {
+        use WarmProjectionOutcome as Outcome;
         if cancelled() {
-            return false;
+            return Outcome::Cancelled;
         }
         if self.cache.read().unwrap().is_some() {
             // The full-snapshot path owns readiness while a parsed cache exists.
-            return false;
+            return Outcome::Owned;
         }
         let Some(projection) = self
             .direct_projection
@@ -324,24 +387,26 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         else {
-            return false;
+            return Outcome::Unavailable;
         };
         let Ok(permit) = self.admit_retained_graph_text_writer() else {
-            return false;
+            return Outcome::Unavailable;
         };
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Ok(entries) = self.page_build_entries(&permit) else {
-            return false;
+            return Outcome::Unavailable;
         };
         let mut sources = Vec::with_capacity(entries.len());
         let mut failures = Vec::new();
+        let mut text_bytes = 0u64;
         for (i, entry) in entries.into_iter().enumerate() {
             if cancelled() {
-                return false;
+                return Outcome::Cancelled;
             }
             match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
                 Ok(Some((content, _))) => {
                     let revision = content_rev(&content);
+                    text_bytes += content.len() as u64;
                     sources.push((entry, revision));
                 }
                 _ => failures.push(entry.rel_path),
@@ -351,21 +416,28 @@ impl Graph {
             }
         }
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-            return false;
+            return Outcome::Retry;
         }
         let parse_config = Arc::new(self.config.parse_config());
-        if !projection.enqueue_warm(generation, sources, Arc::clone(&parse_config)) {
-            return false;
+        if !projection.enqueue_warm(generation, sources, Arc::clone(&parse_config), text_bytes) {
+            // Refused: the worker is gone or failed without a rebuild queued
+            // (nothing a retry changes), or the queue outranks this
+            // generation / still holds deltas (a retry sees them drained).
+            return if projection.worker_failed() || !projection.worker_available() {
+                Outcome::Unavailable
+            } else {
+                Outcome::Retry
+            };
         }
         match projection.wait_warm_outcome() {
             crate::direct_projection::WarmOutcome::Clean => {
                 self.publish_page_index_failures(generation, failures);
-                true
+                Outcome::Owned
             }
-            crate::direct_projection::WarmOutcome::Superseded => true,
-            crate::direct_projection::WarmOutcome::Failed => false,
-            crate::direct_projection::WarmOutcome::Replacements(pages) => self
-                .stream_warm_replacements(
+            crate::direct_projection::WarmOutcome::Superseded => Outcome::Owned,
+            crate::direct_projection::WarmOutcome::Failed => Outcome::Unavailable,
+            crate::direct_projection::WarmOutcome::Replacements(pages) => {
+                if self.stream_warm_replacements(
                     &projection,
                     &permit,
                     generation,
@@ -373,7 +445,17 @@ impl Graph {
                     parse_config,
                     failures,
                     cancelled,
-                ),
+                ) {
+                    Outcome::Owned
+                } else if cancelled() {
+                    Outcome::Cancelled
+                } else {
+                    // Abandoned on drift or a refused batch: the projection
+                    // keeps every page streamed so far; the next warm names
+                    // only the rest.
+                    Outcome::Retry
+                }
+            }
         }
     }
 
@@ -581,6 +663,28 @@ impl Graph {
     pub(crate) fn page_build_parses_test(&self) -> usize {
         self.page_build_test
             .parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Move the cache generation as a save would, without a save: a warm
+    /// stream that observes it abandons, exactly as on a racing edit.
+    #[cfg(test)]
+    pub(crate) fn drift_generation_test(&self) {
+        self.cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The walk inventory as the warm sees it, parsing nothing.
+    #[cfg(test)]
+    pub(crate) fn walk_entries_test(&self) -> Vec<PageEntry> {
+        let permit = self.admit_retained_graph_text_writer().unwrap();
+        self.page_build_entries(&permit).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_build_installs_test(&self) -> usize {
+        self.page_build_test
+            .installs
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

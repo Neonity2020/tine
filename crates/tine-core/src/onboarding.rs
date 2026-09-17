@@ -1814,6 +1814,7 @@ mod tests {
             .markdown;
         for phrase in [
             "still being built",
+            "results may be incomplete",
             "says it is searching",
             "Retry",
             "nothing matched",
