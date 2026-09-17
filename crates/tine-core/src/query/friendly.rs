@@ -503,6 +503,22 @@ fn read_pages(
     // Names and aliases: unchanged selection, ranking, owner-local override and
     // virtual reference-name suggestions. `match_source` is a constant 0 here,
     // so a Names search orders exactly as it did before this packet.
+    //
+    // A page that exists only by reference can be spelled several ways
+    // (`[[Ghost Page]]` here, `[[ghost page]]` there). Which spelling is shown
+    // is a CROSS-PATH CONTRACT, not a local choice: `reference_choices` below
+    // and `DirectProjection::referenced_page_names` answer the same question
+    // for the same user-visible list, and `friendly_main_reader_matches_the_
+    // independent_walk_for_rank_and_identity_shapes` asserts they agree. The
+    // rule is **the lexicographically smallest raw spelling wins**, which both
+    // can compute from the name alone. This ordering used to lead with
+    // `p.path` — the spelling from the alphabetically first owner page — and
+    // the navigation reader agreed only by accident, because it ordered by the
+    // opaque `source_page_id` blob and that happened to rank the same row
+    // first on the fixture. When the navigation reader moved onto
+    // `reference_postings_navigation_names_idx` (tine-storage v0.24.0), which
+    // carries no path and no page id, that coincidence broke. Keep both sides
+    // keyed on `raw_name` or the two lists will disagree again.
     let names_ctes = if want_names {
         format!(
             "page_text_candidates(page_id, name, text_kind, journal_day, path, \
@@ -536,7 +552,7 @@ fn read_pages(
          ), reference_choices AS (\
              SELECT r.raw_name, r.normalized_name, ROW_NUMBER() OVER (\
                  PARTITION BY r.normalized_name \
-                 ORDER BY p.path, r.raw_name, r.normalized_name, r.source_page_id\
+                 ORDER BY r.raw_name, r.normalized_name, r.source_page_id\
              ) AS name_choice \
              FROM reference_postings r \
              JOIN pages p ON p.page_id = r.source_page_id \
