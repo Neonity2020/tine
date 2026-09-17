@@ -971,8 +971,21 @@ impl DirectProjection {
             || pending.latest_generation > generation
             || (self.shared.worker_failed.load(Ordering::Acquire) && !pending.rebuild)
         {
+            projection_diag(|| {
+                format!(
+                    "warm refused generation={generation} full={} deltas={} warm={} order={} stream={:?} latest={} failed={}",
+                    pending.full.is_some(),
+                    pending.deltas.len(),
+                    pending.warm.is_some(),
+                    pending.order.is_some(),
+                    pending.warm_stream,
+                    pending.latest_generation,
+                    self.shared.worker_failed.load(Ordering::Acquire),
+                )
+            });
             return false;
         }
+        let sources_len = sources.len();
         self.shared
             .stream_total
             .store(sources.len() as u64, Ordering::Release);
@@ -992,6 +1005,12 @@ impl DirectProjection {
         });
         pending.latest_generation = generation;
         self.shared.changed.notify_all();
+        projection_diag(|| {
+            format!(
+                "warm queued generation={generation} pages={sources_len} text_mib={:.1}",
+                text_bytes as f64 / (1024.0 * 1024.0)
+            )
+        });
         true
     }
 
@@ -2153,6 +2172,41 @@ const PROJECTION_UPDATE_FAILURE: &str = "is stale; indexed reads are unavailable
 /// storing parsed page text. I-9: the family still reaches the always-on
 /// record, because a user who is not running under `TINE_DEBUG` otherwise sees
 /// only an unavailable index. The prose stays on the directed debug channel.
+/// Process-relative clock for [`projection_diag`], started at the first line.
+static PROJECTION_DIAG_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Lines emitted this process, so the gating is checkable rather than asserted
+/// in a comment (I-11); a test cannot read stderr.
+#[cfg(test)]
+static PROJECTION_DIAG_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// One directed projection-lifecycle line, on the SAME opt-in channel as every
+/// other runtime diagnostic (`TINE_DEBUG=1` / `--debug`, I-12).
+///
+/// GH #543: the Windows verify probe could say only that a 10,000-page cold
+/// open took 139 s with the switcher stuck on "Indexing 0 of 10,001"; the
+/// app's debug log stopped at "Direct Files publish" and the next 105 s were
+/// unobserved, so no run could say which worker turn was running or why. The
+/// message is built behind a `FnOnce` so a process without diagnostics pays
+/// one relaxed atomic load and formats nothing.
+pub(crate) fn projection_diag(message: impl FnOnce() -> String) {
+    if !crate::backend_error::runtime_debug_diagnostics_enabled() {
+        return;
+    }
+    #[cfg(test)]
+    PROJECTION_DIAG_LINES.fetch_add(1, Ordering::Relaxed);
+    let elapsed = PROJECTION_DIAG_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis();
+    eprintln!("[tine] projection +{elapsed}ms {}", message());
+}
+
+#[cfg(test)]
+pub(crate) fn projection_diag_lines_test() -> u64 {
+    PROJECTION_DIAG_LINES.load(Ordering::Relaxed)
+}
+
 fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
     #[cfg(test)]
     REPORTED_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -2384,6 +2438,14 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         let had_full = full.is_some();
         let had_warm = warm.is_some();
         let stream_closed = order.is_some();
+        let turn_started = std::time::Instant::now();
+        projection_diag(|| {
+            format!(
+                "turn begin full={had_full} warm={} deltas={} order={stream_closed} stream_open={stream_open} rebuild={rebuild} generation={latest_generation} awaiting_inventory={awaiting_inventory} needs_rebuild={requires_full_rebuild}",
+                warm.as_ref().map_or(0, |warm| warm.sources.len()),
+                deltas.len(),
+            )
+        });
         let registry_config = full
             .as_ref()
             .map(|full| Arc::clone(&full.parse_config))
@@ -2519,12 +2581,24 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                                 .set_build_durability(true)
                                 .map_err(|error| error.to_string())?;
                             build_relaxed = Some(text_bytes);
+                            projection_diag(|| {
+                                format!(
+                                    "build cache relaxed text_mib={:.1} budget_mib={:.1}",
+                                    text_bytes as f64 / (1024.0 * 1024.0),
+                                    crate::projection_budget::build_page_cache_budget(
+                                        text_bytes,
+                                        crate::projection_budget::physical_memory_bytes(),
+                                    ) as f64
+                                        / (1024.0 * 1024.0),
+                                )
+                            });
                             #[cfg(test)]
                             shared.build_relaxed_turns.fetch_add(1, Ordering::Relaxed);
                         }
                         (false, Some(text_bytes)) => {
                             restore_build_settings(writer_slot.as_ref().unwrap(), text_bytes)?;
                             build_relaxed = None;
+                            projection_diag(|| "build settings restored".to_owned());
                             #[cfg(test)]
                             shared.build_restored_turns.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2613,8 +2687,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 shared.changed.notify_all();
                 if error.is_reportable_failure() {
                     report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
-                } else if crate::backend_error::runtime_debug_diagnostics_enabled() {
-                    eprintln!("[tine] Direct Files SQLite projection deferred this turn: {error}");
+                } else {
+                    projection_diag(|| {
+                        format!(
+                            "turn deferred after {}ms: {error}",
+                            turn_started.elapsed().as_millis()
+                        )
+                    });
                 }
                 continue;
             }
@@ -2641,6 +2720,18 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             shared.validated.store(true, Ordering::Release);
         }
         shared.worker_failed.store(false, Ordering::Release);
+        projection_diag(|| {
+            format!(
+                "turn applied in {}ms lowered={} relowered={} deleted={} stream_open={} indexed={}/{}",
+                turn_started.elapsed().as_millis(),
+                applied.pages.lowered.len(),
+                applied.pages.relowered_structurally.len(),
+                applied.pages.deleted.len(),
+                applied.stream_open,
+                shared.stream_indexed.load(Ordering::Acquire),
+                shared.stream_total.load(Ordering::Acquire),
+            )
+        });
         let mut pending = shared.pending.lock().unwrap();
         shared.worker_busy.store(false, Ordering::Release);
         if had_warm {
@@ -2667,6 +2758,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .ready_generation
                 .store(latest_generation, Ordering::Release);
             shared.ready.store(true, Ordering::Release);
+            projection_diag(|| format!("ready at generation={latest_generation}"));
         }
         drop(pending);
         shared.changed.notify_all();
