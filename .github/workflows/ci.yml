@@ -77,10 +77,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32-unknown-unknown
+          # `--profile minimal` is what this action installs, so rustfmt is
+          # not present unless it is asked for by name.
+          components: rustfmt
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+
+      # AGENTS.md calls `cargo fmt --all` the one canonical formatting
+      # operation and a clean-tree/integration gate, and until v0.6.984
+      # nothing enforced it: the rule lived only in prose, and master was red
+      # on it at the release base. Parsing only, so it runs before anything
+      # is compiled or installed.
+      - name: Rust formatting is canonical
+        run: cargo fmt --all -- --check
 
       - run: npm ci
 
