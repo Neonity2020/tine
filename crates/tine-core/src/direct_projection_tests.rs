@@ -2957,6 +2957,97 @@ fn a_parse_config_change_moves_every_source_revision() {
 /// the last enqueue happened to leave beside the queue, and never under a
 /// default that absence could stand in for.
 ///
+/// GH #543: a whole-graph build sizes the writer's SQLite page cache to the
+/// text it projects and hands the memory back after the commit, and a build
+/// into an empty projection builds its secondary indexes once after the rows.
+/// Fail-before: the writer stayed at SQLite's ~2 MiB default (`cache_size
+/// = -2000`) through and after the build, and every apply maintained all 35
+/// indexes per row.
+#[test]
+fn a_full_build_sizes_the_writer_cache_and_hands_it_back() {
+    use crate::model::projection_budget::{resting_page_cache_budget, RESTING_CACHE_FLOOR_BYTES};
+    let _serial = serialize_projection_tests();
+    let root = scratch("full-build-cache-budget");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut database = open_projection_database(&root.join("projection.sqlite")).unwrap();
+    let default_budget = database.page_cache_budget().unwrap();
+    assert!(
+        default_budget < RESTING_CACHE_FLOOR_BYTES,
+        "the fixture must start below the resting floor, not at {default_budget}"
+    );
+
+    let parse_config = Arc::new(ParseConfig::default());
+    let mut pages = Vec::new();
+    let mut revisions = HashMap::new();
+    for rel_path in ["alpha.md", "beta.md"] {
+        let path = root.join(rel_path);
+        let mut document = crate::doc::parse("- a block [[beta]] #tag\n- another block\n");
+        crate::model::assign_doc_runtime_ids(&mut document.roots, rel_path);
+        pages.push((
+            PageEntry {
+                name: rel_path.trim_end_matches(".md").to_owned(),
+                kind: PageKind::Page,
+                date_key: None,
+                rel_path: rel_path.to_owned(),
+                path: path.clone(),
+            },
+            Arc::new(document),
+        ));
+        revisions.insert(path, format!("sha256:{rel_path}"));
+    }
+    let full = PendingFull {
+        pages: Arc::new(pages),
+        revisions: Arc::new(revisions),
+        parse_config,
+    };
+    apply_pending(&mut database, Some(full), None, BTreeMap::new()).unwrap();
+
+    assert!(
+        database.last_apply_deferred_indexes(),
+        "a build into an empty projection builds its indexes once after the rows"
+    );
+    // A two-page graph projects well under the resting floor, so the budget
+    // the writer keeps is the floor — above SQLite's default, which is how the
+    // pre-fix writer is told apart.
+    assert_eq!(
+        database.page_cache_budget().unwrap(),
+        resting_page_cache_budget(0),
+        "after the commit the writer returns to the resting budget"
+    );
+    assert_eq!(resting_page_cache_budget(0), RESTING_CACHE_FLOOR_BYTES);
+    database.validate_schema().unwrap();
+
+    // A second apply into the populated projection keeps its indexes live.
+    let mut document = crate::doc::parse("- edited\n");
+    crate::model::assign_doc_runtime_ids(&mut document.roots, "alpha.md");
+    let deltas = BTreeMap::from([(
+        "alpha.md".to_owned(),
+        (
+            1_u64,
+            PageDelta::Replace {
+                entry: PageEntry {
+                    name: "alpha".to_owned(),
+                    kind: PageKind::Page,
+                    date_key: None,
+                    rel_path: "alpha.md".to_owned(),
+                    path: root.join("alpha.md"),
+                },
+                document: Arc::new(document),
+                revision: "sha256:alpha.md:2".to_owned(),
+                parse_config: Arc::new(ParseConfig::default()),
+                query_page_order: Some(0),
+                identity: DeltaIdentity::Live,
+            },
+        ),
+    )]);
+    apply_pending(&mut database, None, None, deltas).unwrap();
+    assert!(
+        !database.last_apply_deferred_indexes(),
+        "an edit into a populated projection maintains its indexes per row"
+    );
+    database.validate_schema().unwrap();
+}
+
 /// The stamp is what reconciliation compares, so a page carrying another
 /// page's config digest is a page whose rows answer a question the config
 /// no longer asks and which no later reopen will notice (J7, D-1).

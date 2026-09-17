@@ -2625,7 +2625,16 @@ fn apply_pending(
         applied
             .deleted
             .extend(source_delta.deletions.iter().copied());
+        // GH #543: size the writer's page cache to this build and hand the
+        // memory back once it commits (`model::projection_budget`).
+        let text_bytes = projected_text_bytes(&replacements);
         database
+            .set_page_cache_budget(crate::model::projection_budget::build_page_cache_budget(
+                text_bytes,
+                crate::model::projection_budget::physical_memory_bytes(),
+            ))
+            .map_err(|error| error.to_string())?;
+        let applied_snapshot = database
             .apply_with_source_revisions_aliases_and_page_order(
                 &PhysicalGraphProjectionChange {
                     replacements,
@@ -2636,7 +2645,13 @@ fn apply_pending(
                 &aliases,
                 &inventory,
             )
+            .map_err(|error| error.to_string());
+        database
+            .shrink_page_cache_budget(crate::model::projection_budget::resting_page_cache_budget(
+                text_bytes,
+            ))
             .map_err(|error| error.to_string())?;
+        applied_snapshot?;
     }
     if let Some(warm) = warm {
         turn.warm_outcome = Some(validate_warm(database, warm, applied)?);
@@ -2728,6 +2743,24 @@ fn projection_source_revision(
 /// and a reimplementation in the test would prove only that the test agrees
 /// with itself (§5.8 G1, I-19).
 #[cfg(test)]
+/// The page and block text a snapshot projects — the input to
+/// `projection_budget::build_page_cache_budget`, because the build's cache
+/// working set is a schema-fixed multiple of it, not of the page count.
+fn projected_text_bytes(pages: &[tine_storage::sqlite::PhysicalPage]) -> u64 {
+    pages
+        .iter()
+        .map(|page| {
+            let own = page.searchable_text.len() as u64
+                + page.preamble.as_ref().map_or(0, |text| text.len() as u64);
+            own + page
+                .blocks
+                .iter()
+                .map(|block| block.content.len() as u64)
+                .sum::<u64>()
+        })
+        .sum()
+}
+
 pub(crate) fn physical_page_for_test(
     entry: &PageEntry,
     document: &Document,

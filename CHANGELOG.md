@@ -8,6 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- Opening a large graph no longer spends most of its time re-reading the
+  query index it is building (GH #543). A whole-graph build inserts every
+  row onto a random B-tree leaf, so at SQLite's ~2 MiB default page cache
+  each dirty page spilled to the WAL and was read back — 8.8M cache misses
+  and 27 GB of reads for 49 MB of Markdown, ~10× dearer on Windows. The
+  writer now sizes its page cache from the text it is projecting (12 bytes
+  of cache per byte of text, clamped to 32–768 MiB and a quarter of physical
+  RAM; the ceiling is allocated on demand), hands it back after the build,
+  and builds the secondary indexes once after the rows instead of
+  maintaining them row by row (tine-storage v0.20.1: −13% build time, −4.6%
+  file size on the reporter-scale fixture). Unit cost: unchanged per edit;
+  the build's working set is now cached instead of streamed through the WAL.
+
 ## [0.6.984] - 2026-09-16
 
 ### Added

@@ -73,8 +73,7 @@ fn page_and_block_surfaces_share_candidates_within_designed_limits() {
     eprintln!("QUICK_SWITCH count={}", qs_names.len());
     eprintln!("QS first 12: {:?}", &qs_names[..qs_names.len().min(12)]);
 
-    let friendly =
-        ready_query::when_ready(|| graph.run_graph_search("医保", 100, 100, false));
+    let friendly = ready_query::when_ready(|| graph.run_graph_search("医保", 100, 100, false));
     let page_hits: Vec<&str> = friendly
         .hits
         .iter()

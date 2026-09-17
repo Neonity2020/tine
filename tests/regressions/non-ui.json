@@ -4255,6 +4255,33 @@
   "failBefore": "proven"
  },
  "notes": "Blocking core operation: Ctrl-K and the search tab stayed on “Indexing — waiting for search to be ready…” indefinitely on a graph over ~10,000 pages, and the app wrote continuously while idle. Root cause: the app issues queries (journal feed, backlinks, Ctrl-K) before `warm_cache_async` reaches the projection; such a query found the worker idle, unvalidated and not yet failed, which `progress_at` reports as `Stale`, and the `Stale` repair latched `pending.rebuild`. The worker consumes that flag with the warm it scheduled, so it `reset()` the database — dropping every source stamp — and re-lowered every page on EVERY launch. Fail-before on the exact test: lowerings()==2 instead of 0 on an unchanged two-page reopen. Measured at the observation boundary on a 32,250-file corpus (real app, Linux): before, three consecutive unchanged restarts took 97 s / 102 s / 142 s to search-ready and rewrote a 524 MB WAL each time, although all 32,250 stored source revisions were byte-identical across the restart. After the fix, the same unchanged reopen of that corpus reached search-ready with real results in 14 s and left the database file untouched. A second defect surfaced while fixing: without the erase\u2019s side effect of publishing `pending.rebuild`, two concurrent startup queries raced on the recovery lock and the loser reported the terminal \u201cThe query index could not be read\u201d; a repair now publishes an in-flight marker that `progress_at` reports as Working(Recovering), so the losing query retries."
+},
+{
+ "id": "REG-QUERY-PROJECTION-BUILD-CACHE-543",
+ "title": "A cold or rebuilt query index on a large graph finishes in bounded time instead of stalling for minutes inside row insertion",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model/projection_budget.rs::small_graph_gets_the_floor_and_large_graph_the_ceiling",
+   "crates/tine-core/src/model/projection_budget.rs::physical_memory_caps_the_budget_but_never_below_the_floor",
+   "crates/tine-core/src/direct_projection_tests.rs::a_full_build_sizes_the_writer_cache_and_hands_it_back"
+  ],
+  "scenario": "query.projection-build-cost",
+  "failBefore": "tine-agents/evidence/gh543-build-path/core-fail-before.log (a_full_build_sizes_the_writer_cache_and_hands_it_back against the pre-fix apply_pending: cache budget stayed at the 2,048,000-byte default; probe curves in probe-1k.log and probe-knee.log)"
+ },
+ "notes": "Blocking core operation: on a 10,000-page graph the first index build (fresh install, upgrade, or repair) never reached search-ready on Windows within 10 minutes and search stayed on the indexing notice. Root cause: the whole-graph build is one SQLite transaction inserting every row of every UUID-keyed index onto a random B-tree leaf while the connection ran at SQLite's ~2 MiB default page cache, so each dirty page was spilled to the WAL and read back (8.8M cache misses, 27 GB read / 19 GB written for 49 MB of Markdown); Windows makes each of those round trips ~10x dearer. Fix (tine-storage v0.20.1 + tine-core): the writer's page cache is sized to the build from the projected text bytes (`model::projection_budget`, RAM-capped, returned after commit), and a build into an empty projection creates its 35 secondary indexes once after the rows instead of maintaining them per row. Measured in tine-storage's `gh543_build_probe` (recorded in the packet record)."
 }
 ]
 }

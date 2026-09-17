@@ -58,9 +58,8 @@ fn ordinary_page_target_collects_referrer() {
         vec!["Notes".to_string()],
         "control: an ordinary page target must collect its referrer"
     );
-    let indexed = ready_query::when_ready(|| {
-        g.backlinks_bounded_indexed("Target", 10_000, 16 * 1024 * 1024)
-    });
+    let indexed =
+        ready_query::when_ready(|| g.backlinks_bounded_indexed("Target", 10_000, 16 * 1024 * 1024));
     assert_eq!(group_pages(&indexed.groups), vec!["Notes".to_string()]);
 
     let _ = std::fs::remove_dir_all(&dir);
