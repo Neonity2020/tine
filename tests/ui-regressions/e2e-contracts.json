@@ -340,6 +340,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-main-window.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A journey whose session attached to an auxiliary window (Quick Capture) moves to the application window instead of reporting the app's content as missing.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Which auxiliary windows exist, and the order the driver enumerates window handles in."
+   ],
+   "nonRequirements": [
+    "Any product behaviour, and any claim about which window the driver attaches to first."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-media.mjs": {
    "contracts": [
     {

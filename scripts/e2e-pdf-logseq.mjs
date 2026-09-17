@@ -17,6 +17,7 @@ import {
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
+import { ensureMainWindow } from "./lib/e2e-main-window.mjs";
 
 await ensureDisplay();
 
@@ -944,6 +945,7 @@ async function proveNativeUploadsThemesAndHighlights() {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "pdf-theme-relaunch", process.platform, webviewTarget.debuggerAddress),
   });
+  await ensureMainWindow(browser, { what: "the Tine window carrying the PDF fixtures" });
   await browser.$(".ls-block").waitForExist({ timeout: 30_000 });
   await routeToPage("PDF Outline");
   await reopenCurrentPagePdf(path.basename(OUTLINE_STORED), "Outline fixture", "outline-reopen-after-process-relaunch");
@@ -1341,6 +1343,10 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
+  // On Windows the driver does not reliably attach to the app window: this
+  // journey spent its whole 20 s budget hunting `.pdf-link` inside a Quick
+  // Capture window and reported the missing link rather than the wrong window.
+  await ensureMainWindow(browser, { what: "the Tine window carrying the PDF fixtures" });
   await browser.$(".ls-block").waitForExist({ timeout: 30_000 });
   const pdfLink = browser.$(".pdf-link");
   try {

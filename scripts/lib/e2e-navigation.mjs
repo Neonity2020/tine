@@ -34,6 +34,8 @@
 // `[[ ]]` link decoration is tolerated when routing through a rendered link,
 // since `:ui/show-brackets?` defaults to on.
 
+import { clickWhenReachable } from "./e2e-click.mjs";
+
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 const nfc = (value) => (value ?? "").trim().normalize("NFC");
@@ -101,15 +103,45 @@ export async function openPageByName(browser, name, opts = {}) {
   const pane = opts.pane;
   if ((await currentPageTitle(browser, pane)) === nfc(name)) return;
 
-  if ((opts.entry ?? "shortcut") === "button") {
-    const search = await browser.$('button[title^="Search (Ctrl+K)"]');
-    await search.waitForClickable({ timeout, timeoutMsg: "the Search control was never clickable" });
-    await search.click();
-  } else {
-    await browser.keys(["Control", "k"]);
+  // Opening is retried as a whole. One delivery of the opening gesture can be
+  // lost -- a click that lands before the control is wired, a keystroke that
+  // reaches a WebView2 not yet holding native keyboard focus -- and the symptom
+  // is identical either way: `.switcher-input` never exists and the journey
+  // fails with "Quick Switcher did not open", naming nothing that explains it.
+  // That is how `windows-smoke`'s `page-properties` failed on the Windows
+  // `entry: "button"` path. Re-delivering costs one gesture, and the switcher
+  // is idempotent about being asked to open while already open.
+  const byButton = (opts.entry ?? "shortcut") === "button";
+  const attemptBudget = Math.max(1_500, Math.floor(timeout / 3));
+  let input;
+  for (let attempt = 1; ; attempt += 1) {
+    if (byButton) {
+      await clickWhenReachable(browser, 'button[title^="Search (Ctrl+K)"]', {
+        timeout,
+        what: "the Search control",
+      });
+    } else {
+      await browser.keys(["Control", "k"]);
+    }
+    input = await browser.$(".switcher-input");
+    try {
+      await input.waitForExist({ timeout: attemptBudget });
+      break;
+    } catch {
+      if (attempt >= 3) {
+        const seen = await browser.execute(() => ({
+          url: location.href,
+          focused: document.activeElement?.className ?? "",
+          overlays: [...document.querySelectorAll(".switcher, .modal, .settings-modal")]
+            .map((node) => node.className),
+        }));
+        throw new Error(
+          `Quick Switcher did not open after ${attempt} attempts via `
+          + `${byButton ? "the Search control" : "Ctrl+K"}: ${JSON.stringify(seen)}`,
+        );
+      }
+    }
   }
-  const input = await browser.$(".switcher-input");
-  await input.waitForExist({ timeout, timeoutMsg: "Quick Switcher did not open" });
   await input.setValue(name);
 
   // One atomic attempt: find the exact page row and activate it in a single
