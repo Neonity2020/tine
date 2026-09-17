@@ -22,6 +22,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   maintaining them row by row (tine-storage v0.20.1: −13% build time, −4.6%
   file size on the reporter-scale fixture). Unit cost: unchanged per edit;
   the build's working set is now cached instead of streamed through the WAL.
+- Search and page autocomplete on a large graph answer within seconds of
+  launch instead of after a half-minute read storm (GH #543). Every launch
+  drains the distinct page-reference names from the query index in 512-row
+  batches, and the batches were ordered by the referencing page's path,
+  which no index serves: each batch scanned and sorted every reference in
+  the graph — 215 batches, ~11 GB of reads and 30–40 s at 10,000 pages, on
+  every platform, also on a reopen with a finished index. tine-storage
+  v0.20.2 pages both navigation readers on an existing index instead (full
+  drain of that graph: 65 s → 1.3 s). Unit cost: unchanged; no schema change.
 
 ## [0.6.984] - 2026-09-16
 
