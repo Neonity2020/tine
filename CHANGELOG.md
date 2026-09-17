@@ -17,6 +17,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   flag nothing is recorded (GH #543).
 
 ### Fixed
+- Typing a `[[` page link on a large graph no longer re-reads the whole
+  reference index on every lookup. Offering page suggestions needs the set of
+  page names the graph links to, and the index answered that by handing back
+  one row per link — 110,000 rows to name 10,010 pages on a 10,000-page
+  graph — which took about 1.4 seconds every time it was asked, whatever was
+  typed. That set is now remembered until the graph changes: the first lookup
+  after an edit still costs about 1.4 seconds, and every later one takes about
+  10 milliseconds. Page autocomplete, the quick capture picker, the query
+  sheet's page field and the settings page picker all share the one answer,
+  and a newly linked page still appears immediately
+  (REG-QUICKSWITCH-REFERENCE-NAMES-MEMO-001).
+
 - Searching a large graph no longer reads every block for every keystroke.
   Ctrl+K asked SQLite to materialise and rank every block in the graph and
   then keep the matches, and it did that twice per keystroke: once for the

@@ -458,6 +458,7 @@ impl Graph {
             derived_cache: RwLock::new(None),
             direct_projection: std::sync::Mutex::new(None),
             page_list_cache: RwLock::new(None),
+            referenced_names_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             recent_graph_text_states: std::sync::Mutex::new(std::collections::HashMap::new()),

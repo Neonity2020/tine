@@ -2098,6 +2098,73 @@ fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Q9: `[[ ]]` autocomplete and the frontend's own reference-name IPC both ask
+/// for this set, and the projection answers it by draining one row per (source
+/// page, referenced name) pair. On a 10,000-page graph that is 110,000 rows to
+/// yield 10,010 names — 1.29 s of the 1.41 s each autocomplete keystroke cost,
+/// paid again on every single call because nothing memoized it.
+#[test]
+fn referenced_names_are_read_once_per_cache_generation() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("referenced-names-memo");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/one.md"), "- links to [[Inline Page]]\n").unwrap();
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    let keys = |graph: &Graph| {
+        graph
+            .referenced_page_names()
+            .into_iter()
+            .map(|name| crate::refs::page_key(&name))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let first = keys(&graph);
+    assert!(first.contains("inline page"));
+    let reads = graph.direct_projection_referenced_name_reads_test();
+    assert!(reads > 0, "the first call must read the projection");
+
+    // The property the memo exists for: a second call at the same cache
+    // generation answers identically WITHOUT draining SQLite again.
+    assert_eq!(keys(&graph), first);
+    assert_eq!(
+        graph.direct_projection_referenced_name_reads_test(),
+        reads,
+        "a second call at one cache generation must not re-drain the projection"
+    );
+
+    // ...and the memo must not outlive the edit that invalidates it: a newly
+    // linked page has to reach autocomplete, and the replaced one has to leave.
+    let entry = graph
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.name == "one")
+        .unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "links to [[Replacement Page]]".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    wait_ready(&graph);
+
+    let after = keys(&graph);
+    assert!(
+        after.contains("replacement page"),
+        "a page linked after the memo was filled must still be offered"
+    );
+    assert!(!after.contains("inline page"));
+    assert!(
+        graph.direct_projection_referenced_name_reads_test() > reads,
+        "a new cache generation must re-read the projection"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
     let _serial = serialize_projection_tests();
@@ -5804,6 +5871,28 @@ fn read_latency_probe_reports_per_surface_timings() {
         "page_icons",
         "50 names",
         Box::new(|| graph.page_icons(&names).len()),
+    );
+
+    // Q9: the quick-switch candidate PRODUCERS, timed apart from the ranking
+    // they feed. `quick_switch` costs the same ~1.4 s for every needle and every
+    // hit count, so the cost cannot live in the match loop; it must be in the
+    // three whole-graph reads `legacy_page_search_entries` takes BY VALUE, all
+    // evaluated before the needle is consulted. Split them so the fix targets
+    // the one that actually pays.
+    measure(
+        "producer:list_pages",
+        "-",
+        Box::new(|| graph.list_pages().len()),
+    );
+    measure(
+        "producer:aliases",
+        "-",
+        Box::new(|| graph.page_aliases_with_owners().len()),
+    );
+    measure(
+        "producer:referenced",
+        "-",
+        Box::new(|| graph.referenced_page_names().len()),
     );
 
     if std::env::var_os("TINE_READ_PROBE_KEEP").is_some() {

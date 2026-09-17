@@ -388,6 +388,26 @@ pub struct Graph {
     /// keystroke. An externally-created page not yet seen by the watcher is at most
     /// one watcher tick (≤3s) stale here.
     page_list_cache: RwLock<Option<(u64, Vec<PageEntry>)>>,
+    /// Memoized `referenced_page_names()`, keyed by `cache_gen`, with the set's
+    /// digest stored beside it so a hit does not re-hash every name.
+    ///
+    /// The projection answers this question by draining one row per (source
+    /// page, referenced name) pair and folding it down to distinct names: on a
+    /// 10,000-page graph that is 110,000 rows for 10,010 names, measured at
+    /// 1.29 s — essentially the whole 1.41 s a `[[ ]]` autocomplete keystroke
+    /// used to cost, since `legacy_page_search_entries` takes this set BY VALUE
+    /// before the needle is looked at. Within one generation every later
+    /// keystroke, and every other caller of this set, then answers from here.
+    /// The first lookup after a save still pays the drain, because a save bumps
+    /// `cache_gen`; priming the memo at generation publish would only move that
+    /// 1.4 s behind every save instead.
+    ///
+    /// Batching does not help (512 → 16384 rows per statement leaves the cost
+    /// unchanged; the work is the scan, not the round trips) and neither does a
+    /// distinct-names query (`raw_name` is not indexed, so it is 2–13× SLOWER).
+    /// Keyed on `cache_gen`, this is exactly as fresh as the projection read it
+    /// replaces, which already refuses to answer at any other generation.
+    referenced_names_cache: RwLock<Option<(u64, u64, Vec<String>)>>,
     /// Memoized exact `find_entry(name, kind)` resolution, keyed by `cache_gen`.
     /// Unlike `list_pages()`, this index is built from raw `list_md` output so it
     /// preserves `find_entry`'s duplicate selection: date-stem file first, else

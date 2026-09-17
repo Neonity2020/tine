@@ -186,10 +186,32 @@ impl Graph {
     /// changes. It carries the count as well, so adding a name that collides with
     /// a removed one still shows up unless the count also matches.
     pub fn referenced_page_names_versioned(&self, known: Option<u64>) -> ReferencedPageNames {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((cached, digest, names)) = self.referenced_names_cache.read().unwrap().as_ref()
+        {
+            if *cached == generation {
+                return ReferencedPageNames::answer(*digest, names, known);
+            }
+        }
         if let Some(names) = self.direct_projection_referenced_page_names() {
             let digest = referenced_names_digest(&names);
-            return ReferencedPageNames::answer(digest, &names, known);
+            let answer = ReferencedPageNames::answer(digest, &names, known);
+            // Only a read that still matches the generation we keyed on may be
+            // memoized. The projection revalidates internally, but the
+            // generation can move between our load and its answer, and a set
+            // recorded under a stale key would outlive the edit that
+            // invalidated it — an autocomplete offering pages that no longer
+            // exist, or missing one just linked.
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
+                *self.referenced_names_cache.write().unwrap() = Some((generation, digest, names));
+            }
+            return answer;
         }
+        // The parser fallback is deliberately NOT memoized: it answers with an
+        // empty set when the page cache is not yet warm (it must not force a
+        // parse here), and caching that would make "this graph references no
+        // pages" stick for the whole generation — autocomplete would silently
+        // offer nothing until the next edit happened to bump it.
         let names = self.rebuild_referenced_page_names();
         let digest = referenced_names_digest(&names);
         ReferencedPageNames::answer(digest, &names, known)
