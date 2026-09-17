@@ -907,3 +907,98 @@ fn q3_friendly_sections_sort_the_complete_set_before_their_bound() {
     ));
     assert_eq!(capped, descending[..2].to_vec());
 }
+
+fn write_candidate_bound_corpus(root: &Path, filler: usize) {
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = (0..filler)
+        .map(|at| format!("- filler line {at}\n"))
+        .collect::<String>();
+    body.push_str("- Alpha ZQXWOOD upper\n");
+    body.push_str("- CJK \u{4f60}\u{597d}\u{4e16}\u{754c} block\n");
+    body.push_str("- block 4242 spread across words\n");
+    body.push_str("- a quoted needle here phrase\n");
+    body.push_str("- oo short pair\n");
+    std::fs::write(root.join("pages/Bound.md"), body).expect("bound page");
+}
+
+fn block_hits(answer: &QueryExecution) -> usize {
+    answer
+        .hits
+        .iter()
+        .filter(|hit| matches!(hit, QueryHit::Block { .. }))
+        .count()
+}
+
+/// The candidate bound, measured where it acts: rows RANKED, not rows returned.
+///
+/// The outer select already drops non-matches, so a bounded read and an
+/// unbounded one return the same rows — the difference is how many the
+/// statement had to materialize and rank to find them. Before the bound, TWO
+/// CTEs ranked every block in scope — the block results, and the page-by-content
+/// membership set — which is why a 10,000-page graph answered one Ctrl+K
+/// keystroke in ~4.5 s whether the needle matched 101 blocks (4524 ms) or none
+/// (4372 ms). Driven from the index those are 1721 ms and 1677 ms.
+#[test]
+fn a_selective_needle_ranks_only_its_candidates() {
+    let _serial = serialize();
+    let root = scratch("friendly-candidate-bound");
+    write_candidate_bound_corpus(&root, 200);
+    let corpus = Corpus::open(root, true);
+    // A ready path over an EMPTY index would pass this test while proving
+    // nothing, so both preconditions are asserted, not assumed.
+    assert!(corpus.fts_ready(), "the substring index must be built");
+    assert!(
+        corpus.substring_fts_rows() > 0,
+        "the substring index must hold block rows"
+    );
+    reset_friendly_read_census();
+    let answer = read(
+        &corpus,
+        &QueryPlan::friendly("zqxwood", 0, 20),
+        &ResultIdentity::session_owned(),
+    )
+    .expect("bounded read");
+    let census = friendly_read_census();
+    assert_eq!(block_hits(&answer), 1);
+    assert!(
+        census.block_rank_evaluations <= 4,
+        "one candidate, but the statement ranked {} rows of a 205-block page",
+        census.block_rank_evaluations
+    );
+}
+
+/// The correctness half: the bound NARROWS which rows are asked and never
+/// decides the answer, so every block the exact predicate admits must still
+/// come back — through a fold difference, a needle too short to index, a
+/// multi-word AND, a quoted phrase, a negation, and an unbounded OR arm.
+#[test]
+fn the_candidate_bound_drops_no_block_the_exact_predicate_admits() {
+    let _serial = serialize();
+    let root = scratch("friendly-bound-correctness");
+    write_candidate_bound_corpus(&root, 8);
+    let corpus = Corpus::open(root, true);
+    assert!(corpus.fts_ready() && corpus.substring_fts_rows() > 0);
+    for (query, expected) in [
+        // The query's case differs from the block's: both sides fold.
+        ("zqxwood", 1),
+        // Two characters yield no trigram, so this needle is unbounded — and
+        // answering it is not optional.
+        ("\u{4f60}\u{597d}", 1),
+        // AND of two terms: bounding by ONE of them can drop no match.
+        ("block 4242", 1),
+        // A quoted phrase still contains its own whitespace-free runs.
+        ("\"needle here\"", 1),
+        // The negated term supplies no needle; the positive one does.
+        ("-filler zqxwood", 1),
+        // One unbounded arm leaves the whole OR unbounded.
+        ("oo OR zqxwood", 2),
+    ] {
+        let answer = read(
+            &corpus,
+            &QueryPlan::friendly(query, 0, 20),
+            &ResultIdentity::session_owned(),
+        )
+        .unwrap_or_else(|error| panic!("{query} read failed: {error}"));
+        assert_eq!(block_hits(&answer), expected, "query {query}");
+    }
+}

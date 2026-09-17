@@ -5655,6 +5655,164 @@ fn a_query_during_the_warm_inventory_read_retries_instead_of_repairing() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// Manual read-latency probe for the bounded-reads packet: the same query
+/// surfaces, timed on ONE prebuilt graph, so a candidate bound can be compared
+/// against the scan it replaces on identical inputs. Martin's requirement for
+/// this work is that nothing gets slower, so the needle matrix deliberately
+/// includes the cases a trigram candidate bound CANNOT help — a needle every
+/// block contains, and a needle too short to have a trigram — beside the ones
+/// it should transform.
+///
+/// `TINE_READ_PROBE_GRAPH` is a graph directory; when it already carries
+/// `private/projection.sqlite` the probe reuses that index instead of building
+/// one. Each measurement is repeated and reported with its median, and every
+/// surface prints its result count so a before/after pair proves the answers
+/// did not change.
+#[test]
+#[ignore = "manual read probe: set TINE_READ_PROBE_GRAPH to a graph directory"]
+fn read_latency_probe_reports_per_surface_timings() {
+    let Some(source) = std::env::var_os("TINE_READ_PROBE_GRAPH") else {
+        eprintln!("skipped: set TINE_READ_PROBE_GRAPH to a graph directory");
+        return;
+    };
+    let _serial = serialize_projection_tests();
+    let root = scratch("read-latency-probe");
+    let source = std::path::PathBuf::from(&source);
+    probe_copy_tree(&source, &root);
+    // Reuse a prebuilt index when the source carries one: the probe measures
+    // READ latency, and rebuilding a 10,000-page index per run would dominate
+    // the comparison it exists to make.
+    if source.join("private").is_dir() {
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        for entry in std::fs::read_dir(source.join("private")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), root.join("private").join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    let label = std::env::var("TINE_READ_PROBE_LABEL").unwrap_or_else(|_| "probe".to_owned());
+    let repeats: usize = std::env::var("TINE_READ_PROBE_REPEATS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let warm_started = Instant::now();
+    graph.warm_cache();
+    let budget = Duration::from_secs(
+        std::env::var("TINE_READ_PROBE_BUDGET_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(900),
+    );
+    let waited = Instant::now();
+    while !graph.direct_projection_ready_test() {
+        assert!(
+            waited.elapsed() < budget,
+            "the probe graph never became ready: {}",
+            graph
+                .direct_projection_test()
+                .map(|projection| projection.debug_state_test())
+                .unwrap_or_else(|| "no projection".to_owned())
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(
+        "PROBE {label} ready_ms={} parsed_cache={}",
+        warm_started.elapsed().as_millis(),
+        graph.has_parsed_cache_test()
+    );
+
+    let measure = |surface: &str, needle: &str, mut run: Box<dyn FnMut() -> usize + '_>| {
+        let mut timings = Vec::with_capacity(repeats);
+        let mut hits = Vec::with_capacity(repeats);
+        for _ in 0..repeats {
+            let started = Instant::now();
+            let count = run();
+            timings.push(started.elapsed().as_millis());
+            hits.push(count);
+        }
+        assert!(
+            hits.windows(2).all(|pair| pair[0] == pair[1]),
+            "{surface}/{needle} answered differently across repeats: {hits:?}"
+        );
+        timings.sort_unstable();
+        println!(
+            "PROBE {label} surface={surface} needle={needle:?} median_ms={} runs_ms={timings:?} hits={}",
+            timings[repeats / 2],
+            hits[0]
+        );
+    };
+
+    // Zero-hit and every-block needles bracket the candidate bound: one should
+    // become trivial, the other cannot, and neither may regress.
+    for needle in [
+        "zqx1",
+        "sentinel543",
+        "outline",
+        // The MIDDLE of the selectivity range, which the rest of this matrix
+        // misses: every other needle here matches either nothing or nearly
+        // every block, and a candidate bound can only help in between. On this
+        // fixture the trigram index admits ~120 blocks for this one.
+        "4242",
+        "block 4242",
+        "Topic 4242",
+        "你好",
+        "b17",
+    ] {
+        // Ctrl-K itself. `QuickSwitcher.tsx` calls `runGraphSearch` with
+        // PAGE_POOL/BLOCK_POOL = 100 in the "quick-switch" lane, which compiles
+        // the block branch as Contains/Phrase. `search_latest` below is a
+        // DIFFERENT surface — the in-editor `((…))` block picker — and compiles
+        // Fuzzy. Measuring only that one is what made an earlier before/after
+        // pair show no change: the bound cannot apply to Fuzzy at all.
+        measure(
+            "graph_search",
+            needle,
+            Box::new(|| {
+                graph
+                    .run_graph_search_latest("quick-switch", needle, 100, 100, false)
+                    .map(|execution| execution.hits.len())
+                    .unwrap_or(usize::MAX)
+            }),
+        );
+        measure(
+            "search",
+            needle,
+            Box::new(|| {
+                graph
+                    .search_latest("read-probe", needle, 100)
+                    .map(|groups| groups.len())
+                    .unwrap_or(usize::MAX)
+            }),
+        );
+        measure(
+            "quick_switch",
+            needle,
+            Box::new(|| graph.quick_switch(needle, 50).len()),
+        );
+    }
+    measure("templates", "-", Box::new(|| graph.templates().len()));
+    let names = (0..50)
+        .map(|page| format!("Topic {page} 你好"))
+        .collect::<Vec<_>>();
+    measure(
+        "page_icons",
+        "50 names",
+        Box::new(|| graph.page_icons(&names).len()),
+    );
+
+    if std::env::var_os("TINE_READ_PROBE_KEEP").is_some() {
+        println!("PROBE {label} KEEP root={}", root.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 /// Manual scale probe for GH #543, packet 3 follow-up: the switcher POLLS while
 /// the build streams (`query_index_progress` every 750 ms, `search` every 2 s in
 /// the "switcher" lane), which the plain probe above never did. The Windows

@@ -126,7 +126,7 @@ use crate::search_query::{canonical_fold, AndGroup, Matcher, Term};
 
 /// `owner_type` as the projection spells it (`PhysicalEntityId::sql_parts`).
 const OWNER_PAGE: i64 = 0;
-const OWNER_BLOCK: i64 = 1;
+pub(crate) const OWNER_BLOCK: i64 = 1;
 
 /// `pages.text_kind` for a journal page (`page_kind_to_sql`).
 const TEXT_KIND_JOURNAL: i64 = 1;
@@ -2865,22 +2865,34 @@ fn match_program(compiled: &CompiledLeaves, source: &str) -> MatchProgram {
 /// it; using it as a candidate bound would select exactly the rows the arm
 /// rejects. Three scalars is the trigram tokenizer's own floor, not a tuning
 /// constant: a shorter needle produces no token and would match nothing.
+/// The one answer to "which part of a needle can the trigram index see?": its
+/// first whitespace-free run of at least three characters, or `None`.
+///
+/// Three because the index tokenizes trigrams. Whitespace-free because the
+/// indexed text is whitespace-COLLAPSED while the exact columns are not, so a
+/// run spanning a space can be absent from the index and present in the block,
+/// and a bound requiring it would exclude a true match. A NUL-bearing needle is
+/// not indexable at all. The legacy content lowering and the Friendly block read
+/// both ask this function, so "indexable needle" has ONE definition.
+pub(crate) fn fts_indexable_run(text: &str) -> Option<&str> {
+    if text.contains('\0') {
+        return None;
+    }
+    text.split_whitespace().find(|run| run.chars().count() >= 3)
+}
+
 fn fts_candidate_needle(group: &AndGroup) -> Option<&str> {
     group
         .iter()
-        .filter(|term| !term.negated && !term.text.contains('\0'))
-        .find_map(|term| {
-            term.text
-                .split_whitespace()
-                .find(|run| run.chars().count() >= 3)
-        })
+        .filter(|term| !term.negated)
+        .find_map(|term| fts_indexable_run(&term.text))
 }
 
 /// One FTS5 string literal holding `needle` as a single phrase: FTS5 quotes
 /// with `"` and escapes an embedded `"` by doubling it. Quoting is what keeps
 /// the needle a LITERAL rather than an expression — `-`, `*`, `(`, `:` and the
 /// bare words `AND`/`OR`/`NOT` are query syntax outside quotes.
-fn fts_phrase_literal(needle: &str) -> String {
+pub(crate) fn fts_phrase_literal(needle: &str) -> String {
     format!("\"{}\"", needle.replace('"', "\"\""))
 }
 

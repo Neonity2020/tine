@@ -224,7 +224,7 @@ impl Corpus {
     /// How many block rows the substring FTS holds. A ready path that measured
     /// an EMPTY index would prove nothing, so the gates assert this is nonzero
     /// before trusting a candidate bound.
-    fn substring_fts_rows(&self) -> i64 {
+    pub(crate) fn substring_fts_rows(&self) -> i64 {
         let rows = self
             .reader
             .run_projection_query("SELECT COUNT(*) FROM search_substring_fts", &[])

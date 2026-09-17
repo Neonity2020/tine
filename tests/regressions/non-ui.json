@@ -4362,6 +4362,30 @@
   "failBefore": "tine-agents/evidence/gh543-warm-announce/fail-before.log (the test with the announce replaced by a no-op: the search thread traced `dispatch: repairing`, enqueued its own warm, streamed Replacements(5) and answered Ok; assertion panicked with \"must report Indexing, got Ok\")"
  },
  "notes": "Blocking core operation, all platforms, worst on Windows: the open-path warm published nothing until it had read every page's bytes for its inventory (seconds on Linux, tens of seconds on Windows at 10,000 files), so a search landing in that window read the projection as idle and stale, took the repair route and ran a second warm on the query thread racing the open path's; the loser retried and fell to the whole-graph parse, whose snapshot then superseded the stream with one huge transaction. Windows run 35225823831 measured the 10k cold open at 587 s (150 s before packet 3), 35.7 GB written, switcher frozen at \"Indexing 240 of 10,000\". Fix: `warm_projection_cancellable` holds a `WarmInFlight` marker from before its first page read until it has enqueued; `progress_at` reports Working(Indexing) while any is held, so the query retries."
+},
+{
+ "id": "REG-FRIENDLY-BLOCK-CANDIDATE-BOUND-001",
+ "title": "Searching a large graph reads only the blocks that can match the typed needle, instead of every block in the graph for every keystroke",
+ "family": "waited-path-query-cost",
+ "sources": {
+  "issues": [],
+  "commits": [],
+  "internal": "2026-09-17 SQL full-scan census, first item; before/after measured with read_latency_probe_reports_per_surface_timings on the 10,000-page probe graph"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/query/friendly_tests.rs::a_selective_needle_ranks_only_its_candidates",
+   "crates/tine-core/src/query/friendly_tests.rs::the_candidate_bound_drops_no_block_the_exact_predicate_admits"
+  ],
+  "scenario": "friendly-search.block-cost-scales-with-selectivity",
+  "failBefore": "tine-agents/evidence/bounded-reads/fail-before.log (bound neutralised: one matching block, but the statement ranked all 205 rows of the page; assertion \"one candidate, but the statement ranked 205 rows of a 205-block page\"); before/after pair from one build in tine-agents/evidence/bounded-reads/ctrl-k-before-after.md (unbounded 4372 ms zero-hit and 4524 ms at 101 hits, bounded 1677 ms and 1721 ms, both runs exit 0)"
+ },
+ "notes": "Blocking stateful UX on large graphs. The Friendly read scanned every block in scope TWICE per keystroke: the block-results CTE carried no content condition, and the page-by-content membership CTE carried none either, so both materialised every block, called the rank program on each, and let the outer select keep the matches. Cost did not depend on the needle. On the 10,000-page probe graph (600k blocks) the median Ctrl+K search was 4372 ms for a needle matching nothing and 4524 ms for one matching 101 blocks. The fix derives a sound candidate needle from the branch predicate (VisibleContent, Contains or Phrase, first whitespace-free run of at least 3 characters, through And but never Or/Not/Regex/Fuzzy) and makes the trigram index over search_substring_fts the DRIVING table of both reads, through one shared helper so a future third reader cannot miss it. Driving is the load-bearing part: the same index used as a WHERE-clause filter left SCAN b in the query plan and only skipped the rank call, which measured as no useful saving. Measured after: 1677 ms zero-hit, 1721 ms at 101 hits, and no needle slower than its baseline by more than run-to-run noise (worst +53 ms, ranges overlapping). Above BLOCK_CANDIDATE_CAP = 20000 candidates the helper returns the unbounded scan, because driving a 600k-row candidate set measured 2045 ms against 1246 ms scanned; the cap probe costs 0-4 ms at every selectivity because it counts with LIMIT cap+1, which a bare COUNT would not. The bound only narrows which rows are asked: the exact predicate still decides the answer in SQL and is re-checked per row in Rust, so a wrong bound shows up as a missing result rather than a wrong one. A needle too short to index, or any shape supplying none, stays unbounded and is answered exactly as before. One semantic delta: the driven path reaches blocks through the text index, so a block carrying no block_text row is omitted rather than surfaced through missing_text = 1. No search result changes, because a textless block cannot satisfy a Contains predicate; the consequence is that the Friendly corruption tripwire for that shape now fires only on the scan path. The page-content CTE is an inner join and never had that arm."
 }
 ]
 }

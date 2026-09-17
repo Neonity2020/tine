@@ -9,6 +9,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ## [Unreleased]
 
 ### Fixed
+- Searching a large graph no longer reads every block for every keystroke.
+  Ctrl+K asked SQLite to materialise and rank every block in the graph and
+  then keep the matches, and it did that twice per keystroke: once for the
+  block results, and again to work out which pages had matching content. On a
+  10,000-page graph each keystroke cost about 4.5 seconds whether it matched a
+  hundred blocks or none at all. Both reads now start from the substring index
+  and visit only the blocks that can possibly match, bringing a selective
+  search down to about 1.7 seconds. A needle common enough to match more than
+  twenty thousand blocks still uses the old plan, which is genuinely the
+  faster one at that point. The answer is unchanged: the exact text predicate
+  still decides every row (REG-FRIENDLY-BLOCK-CANDIDATE-BOUND-001).
 
 - A search typed while the query index was still being read for validation
   at launch no longer starts a second index build on the search thread

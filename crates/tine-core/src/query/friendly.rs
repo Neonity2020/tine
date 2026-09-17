@@ -79,6 +79,8 @@ fn check_lane(
 pub(crate) struct FriendlyReadCensus {
     pub(crate) page_descriptors: usize,
     pub(crate) block_descriptors: usize,
+    /// Rows the block statement actually ranked (see the rank program).
+    pub(crate) block_rank_evaluations: usize,
     pub(crate) ancestor_statements: usize,
     pub(crate) ancestor_rows: usize,
 }
@@ -89,6 +91,7 @@ thread_local! {
         const { std::cell::Cell::new(FriendlyReadCensus {
             page_descriptors: 0,
             block_descriptors: 0,
+            block_rank_evaluations: 0,
             ancestor_statements: 0,
             ancestor_rows: 0,
         }) };
@@ -214,6 +217,13 @@ pub(crate) fn read_friendly_results(
                 let rank = programs.bind_pair(move |visible, folded| {
                     #[cfg(test)]
                     run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
+                    // One per ROW the statement ranked, which is the size of the
+                    // scan the candidate bound exists to cut. Counting returned
+                    // rows cannot see it: the outer select already drops
+                    // non-matches, so an unbounded read and a bounded one return
+                    // the same rows and rank wildly different numbers of them.
+                    #[cfg(test)]
+                    note_friendly(|census| census.block_rank_evaluations += 1);
                     Ok(
                         rank_block_text_folded(&rank_plan, &rank_branch, visible, folded)
                             .map(|rank| rank.order_key().to_vec()),
@@ -549,6 +559,20 @@ fn read_pages(
     // that block is chosen by the same block rank program the Blocks section
     // ranks with. Terms are never matched across unrelated blocks and blocks are
     // never concatenated — the window picks a single winning row per page.
+    // The page-by-content scan is the SECOND full read of every block one
+    // Ctrl-K keystroke performs, and it long outlived the first being bounded:
+    // with only the Blocks statement driven from the index, a zero-hit needle
+    // on a 10,000-page graph still cost ~1.6 s, all of it here. It ranks with
+    // the Blocks branch's own program, so the same needle admits the same
+    // blocks and the same candidate set is sound for it. Unlike the Blocks
+    // statement this join is INNER, so it never carried a textless arm and
+    // driving it changes no result at all.
+    let content_block_source = match content {
+        Some((content_branch, _)) => {
+            indexed_block_source(snapshot, &mut params, &content_branch.predicate)?
+        }
+        None => "blocks b".to_string(),
+    };
     let content_ctes = content.map(|(_, rank)| {
         params.push(PhysicalQueryValue::Integer(rank as i64));
         let program = params.len();
@@ -567,7 +591,7 @@ fn read_pages(
             "content_ranked AS MATERIALIZED (\
                  SELECT b.page_id, bt.query_visible AS matched_text, \
                         tine_query_rank(?{program}, {framed_block_text}) AS content_key \
-                 FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id\
+                 FROM {content_block_source} JOIN block_text bt ON bt.block_id = b.block_id\
              ), content_choices AS (\
                  SELECT k.*, ROW_NUMBER() OVER (\
                      PARTITION BY k.page_id ORDER BY k.content_key, k.matched_text\
@@ -854,6 +878,112 @@ struct BlockDescriptor {
     rank_key: Vec<u8>,
 }
 
+/// The trigram candidate needle for one Friendly BLOCK branch, or `None` when
+/// the branch supplies none — which leaves the read unbounded, exactly as every
+/// Friendly block read was before this bound existed.
+///
+/// Soundness, in one line per arm: a block matches only through
+/// `TextField::VisibleContent` (`block_relevance` returns `None` for any other
+/// field), `Contains` and `Phrase` both require the predicate's whole value to
+/// appear in the folded visible text, and the needle is a run OF that value —
+/// so every block the exact predicate admits contains the needle too. `And`
+/// requires every child, so bounding by one child can drop no match. `Or`,
+/// `Not`, `Regex`, `Fuzzy` and `Never` supply nothing and stay unbounded: the
+/// fallback direction is the one that cannot lose a row.
+fn block_candidate_needle(expr: &crate::query_plan::QueryExpr) -> Option<&str> {
+    use crate::query_plan::{QueryExpr, TextField, TextMatchMode};
+    match expr {
+        QueryExpr::Text(pred)
+            if pred.field == TextField::VisibleContent
+                && matches!(pred.mode, TextMatchMode::Contains | TextMatchMode::Phrase) =>
+        {
+            crate::query::sql::fts_indexable_run(&pred.value)
+        }
+        QueryExpr::And(children) => children.iter().find_map(block_candidate_needle),
+        _ => None,
+    }
+}
+
+/// How many candidate blocks still make the trigram index worth driving from.
+///
+/// Above this the index stops being a shortcut: the driven plan re-reads most
+/// of the table one indexed row at a time instead of scanning it once, which
+/// is SLOWER than the scan it replaced. Measured on a 600k-block projection —
+/// a needle matching 660 blocks reads in 6 ms driven against 1243 ms scanned,
+/// and a needle EVERY block contains costs 2045 ms driven against 1246 ms
+/// scanned. The capped probe that chooses between them costs 1-4 ms at every
+/// selectivity, including the run that hits the cap.
+const BLOCK_CANDIDATE_CAP: usize = 20_000;
+
+/// `true` when the trigram index admits at most [`BLOCK_CANDIDATE_CAP`] blocks
+/// for `literal`. The `LIMIT` is what keeps this cheap on the needle that
+/// matches everything: it stops counting at the cap instead of walking the
+/// whole index to learn a number we would only compare against the cap.
+fn candidate_count_within_cap(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    literal: &str,
+) -> Result<bool, ResultReadError> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM (\
+           SELECT fo.entity_id FROM search_substring_fts sf \
+           JOIN search_fts_owners fo ON fo.rowid = sf.rowid \
+           WHERE sf.normalized_text MATCH ?1 AND fo.entity_type = {} LIMIT ?2)",
+        crate::query::sql::OWNER_BLOCK
+    );
+    let params = [
+        PhysicalQueryValue::Text(literal.to_owned()),
+        PhysicalQueryValue::Integer(BLOCK_CANDIDATE_CAP as i64 + 1),
+    ];
+    let rows = snapshot
+        .run_projection_query(&sql, &params)
+        .map_err(|error| sql_or_cancelled(snapshot, error))?;
+    Ok(match rows.first().and_then(|row| row.first()) {
+        Some(PhysicalQueryValue::Integer(count)) => {
+            *count >= 0 && (*count as usize) <= BLOCK_CANDIDATE_CAP
+        }
+        _ => false,
+    })
+}
+
+/// `blocks b`, or the trigram index driving it, for one block predicate.
+///
+/// ONE producer for both block reads a Friendly search performs: the Blocks
+/// section's own statement, and the page-by-content membership CTE in
+/// [`read_pages`], which ranks with the SAME program and therefore admits
+/// exactly the same blocks. Before this existed only the first was bounded,
+/// and one Ctrl-K keystroke still scanned every block in the graph — through
+/// the other one.
+///
+/// The difference between driving and filtering is the whole point: as a
+/// `WHERE` clause the index only skips the rank call, so SQLite still walks
+/// every row; as the driving table it reads the candidates and nothing else.
+fn indexed_block_source(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    params: &mut Vec<PhysicalQueryValue>,
+    predicate: &crate::query_plan::QueryExpr,
+) -> Result<String, ResultReadError> {
+    const UNBOUNDED: &str = "blocks b";
+    let Some(needle) = block_candidate_needle(predicate) else {
+        return Ok(UNBOUNDED.to_string());
+    };
+    if !crate::query::results::probe_fts_ready(snapshot)? {
+        return Ok(UNBOUNDED.to_string());
+    }
+    let literal = crate::query::sql::fts_phrase_literal(needle);
+    if !candidate_count_within_cap(snapshot, &literal)? {
+        return Ok(UNBOUNDED.to_string());
+    }
+    params.push(PhysicalQueryValue::Text(literal));
+    Ok(format!(
+        "(SELECT fo.entity_id AS block_id FROM search_substring_fts sf \
+           JOIN search_fts_owners fo ON fo.rowid = sf.rowid \
+           WHERE sf.normalized_text MATCH ?{} AND fo.entity_type = {}) c \
+         JOIN blocks b ON b.block_id = c.block_id",
+        params.len(),
+        crate::query::sql::OWNER_BLOCK
+    ))
+}
+
 fn read_blocks(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     identity: &ResultIdentity,
@@ -868,10 +998,11 @@ fn read_blocks(
     }
     let mut params = vec![PhysicalQueryValue::Integer(rank_program as i64)];
     let scope = plan.page_scope();
-    let scope_sql = match scope {
+    let mut conditions: Vec<String> = Vec::new();
+    match scope {
         Some(scope) if scope.path.is_some() => {
             params.push(PhysicalQueryValue::Text(scope.path.clone().unwrap()));
-            format!(" WHERE p.path = ?{}", params.len())
+            conditions.push(format!("p.path = ?{}", params.len()));
         }
         Some(scope) => {
             params.push(PhysicalQueryValue::Integer(match scope.page_kind {
@@ -880,12 +1011,36 @@ fn read_blocks(
             }));
             let kind = params.len();
             params.push(PhysicalQueryValue::Text(crate::refs::page_key(&scope.name)));
-            format!(
-                " WHERE p.text_kind = ?{kind} AND p.name_key = ?{}",
+            conditions.push(format!(
+                "p.text_kind = ?{kind} AND p.name_key = ?{}",
                 params.len()
-            )
+            ));
         }
-        None => String::new(),
+        None => {}
+    }
+    // Drive the read from the trigram index instead of filtering a full scan
+    // with it. The difference is the whole point: as a WHERE clause the index
+    // only skips the rank call, so SQLite still scans every block in scope and
+    // one keystroke still costs seconds; as the driving table it reads the
+    // candidates and nothing else.
+    //
+    // Soundness is `block_candidate_needle`'s: every block the exact predicate
+    // admits contains the needle, so no admitted block is missing from the
+    // candidate set. `rank_key IS NOT NULL` below and the Rust re-rank after
+    // the read remain the exact predicate on both paths, so a needle that is
+    // wrong shows up as a MISSING result, never as a wrong one.
+    //
+    // ONE behaviour differs from the scan, deliberately: a block whose text row
+    // has vanished is not in the index either, so the driven read omits it
+    // rather than surfacing it through `missing_text = 1`. The scan path below
+    // still carries that arm. The Friendly damage contract
+    // (`friendly_tests.rs`) deletes a result row and cross-owns a page — both
+    // leave the block's text, so both still reach their checks here.
+    let block_source = indexed_block_source(snapshot, &mut params, &branch.predicate)?;
+    let scope_sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
     };
     // The Blocks section's own authored sort, over the COMPLETE matched set:
     // the bound below is applied after this ORDER BY, never before it.
@@ -916,7 +1071,7 @@ fn read_blocks(
                     CASE WHEN bt.block_id IS NULL THEN zeroblob(1) \
                          ELSE tine_query_rank(?1, {framed_block_text}) END AS rank_key, \
                     CASE WHEN bt.block_id IS NULL THEN 1 ELSE 0 END AS missing_text \
-             FROM blocks b \
+             FROM {block_source} \
              LEFT JOIN block_text bt ON bt.block_id = b.block_id \
              LEFT JOIN pages p ON p.page_id = b.page_id \
              LEFT JOIN query_block_results q ON q.block_id = b.block_id{scope_sql}\
