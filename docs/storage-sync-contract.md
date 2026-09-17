@@ -313,7 +313,8 @@ session's worker has validated the complete inventory, and — partial
 admission, GH #543 — while a warm validation or warm stream is still
 converging it: the answer is over the rows committed so far, and the surface
 labels it with the build's `(indexed, total)` progress (`query_index_progress`).
-Readiness itself is still published only for the complete inventory. What
+Readiness itself is still published only when the worker has validated the
+complete inventory at the exact current graph cache generation. What
 stays refused is an image nobody is converging: a rebuild or inventory still
 owed, a failed write, or an idle projection this session has never validated
 (its rows may be stale from an earlier session); the query's bounded repair
