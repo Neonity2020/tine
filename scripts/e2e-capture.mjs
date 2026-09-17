@@ -347,7 +347,10 @@ try {
   const settingsState = () => browser.execute(() => ({
     modalOpen: Boolean(document.querySelector(".settings-modal")),
     tabs: [...document.querySelectorAll(".settings-nav-item")].map((tab) => ({
-      label: tab.textContent?.trim() ?? "",
+      // The tab's identity, not its wording: "Diagnostics" became
+      // "Help & diagnostics" once already, and v0.8.0 localization reworks
+      // every label in the app at once.
+      id: tab.getAttribute("data-settings-tab") ?? "",
       active: tab.classList.contains("active"),
     })),
     advanced: [...document.querySelectorAll(".settings-advanced-toggle")].map((toggle) => ({
@@ -367,13 +370,13 @@ try {
     throw new Error(`${message}; settings=${JSON.stringify(last)}`);
   };
   const openedSettings = await waitForSettingsState((state) => state.modalOpen, "Settings UI did not open");
-  if (!openedSettings.tabs.some((tab) => tab.label === "Editor")) {
+  if (!openedSettings.tabs.some((tab) => tab.id === "editor")) {
     throw new Error(`Settings UI lacks its Editor tab; settings=${JSON.stringify(openedSettings)}`);
   }
-  const editorTab = await browser.$("//button[contains(concat(' ', normalize-space(@class), ' '), ' settings-nav-item ') and normalize-space(.)='Editor']");
+  const editorTab = await browser.$('.settings-nav-item[data-settings-tab="editor"]');
   await editorTab.click();
   let currentSettings = await waitForSettingsState(
-    (state) => state.tabs.some((tab) => tab.label === "Editor" && tab.active),
+    (state) => state.tabs.some((tab) => tab.id === "editor" && tab.active),
     "Settings UI did not activate the Editor tab",
   );
   if (!currentSettings.advanced.some((section) => section.expanded === "true")) {

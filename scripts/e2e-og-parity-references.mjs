@@ -123,7 +123,7 @@ const popupSnapshot = (browser) => browser.execute(() => ({
 const selectSetting = async (browser, value) => {
   await browser.$('button[title^="Settings"]').click();
   await browser.$(".settings-modal").waitForExist({ timeout: 5000 });
-  await browser.$("//button[contains(concat(' ', normalize-space(@class), ' '), ' settings-nav-item ') and normalize-space(.)='Editor']").click();
+  await browser.$('.settings-nav-item[data-settings-tab="editor"]').click();
   const advanced = await browser.$(".settings-advanced-toggle");
   if ((await advanced.getAttribute("aria-expanded")) !== "true") await advanced.click();
   const select = await browser.$('select[aria-label="Link autocomplete default"]');
@@ -533,7 +533,7 @@ try {
   await browser.keys(["Escape"]);
   await browser.$('button[title^="Settings"]').click();
   await browser.$(".settings-modal").waitForExist({ timeout: 5000 });
-  await browser.$("//button[contains(concat(' ', normalize-space(@class), ' '), ' settings-nav-item ') and normalize-space(.)='Keyboard shortcuts']").click();
+  await browser.$('.settings-nav-item[data-settings-tab="shortcuts"]').click();
   const insertLinkKeycap = await browser.$("//span[contains(concat(' ', normalize-space(@class), ' '), ' help-shortcut-id ') and normalize-space(.)='editor/insert-link']/ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' help-shortcut-row ')]//button[contains(concat(' ', normalize-space(@class), ' '), ' help-keycap-button ')]");
   await insertLinkKeycap.waitForExist({ timeout: 5000 });
   await insertLinkKeycap.click();

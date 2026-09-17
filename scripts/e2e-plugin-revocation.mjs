@@ -246,8 +246,8 @@ try {
     await assertNoContribution(browser, "cached-revoked");
 
     await browser.$('[title="Settings (t s)"]').click();
-    await browser.$("button=Plugins").click();
-    await browser.$("button=Installed (1)").click();
+    await browser.$('.settings-nav-item[data-settings-tab="plugins"]').click();
+    await browser.$('.plugin-settings-nav [data-plugin-view="installed"]').click();
     await browser.waitUntil(async () => browser.execute((id) => {
       const row = [...document.querySelectorAll(".settings-field")].find((candidate) => candidate.textContent?.includes(id));
       const toggle = row?.querySelector('[role="switch"]');
@@ -279,8 +279,8 @@ try {
     if (decorationKinds.includes("thread-lines")) await openDecorationPage(browser);
     await assertNoContribution(browser, "restart-without-cache");
     await browser.$('[title="Settings (t s)"]').click();
-    await browser.$("button=Plugins").click();
-    await browser.$("button=Installed (1)").click();
+    await browser.$('.settings-nav-item[data-settings-tab="plugins"]').click();
+    await browser.$('.plugin-settings-nav [data-plugin-view="installed"]').click();
     await browser.waitUntil(async () => browser.execute((id) => {
       const row = [...document.querySelectorAll(".settings-field")].find((candidate) => candidate.textContent?.includes(id));
       const toggle = row?.querySelector('[role="switch"]');
