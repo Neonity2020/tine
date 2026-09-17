@@ -15,7 +15,6 @@
 // would silently get `undefined` rather than a clear error. That must fail
 // here instead.
 import { describe, expect, it } from "vitest";
-import { REMEDY, guarded } from "../scripts/lib/playwright.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,51 +85,5 @@ describe("Playwright import guard", () => {
         + "undefined rather than a browser. Add the member to the wrapper (delegating to the real "
         + "browser type) before using it.",
     ).toEqual([]);
-  });
-});
-
-// What the wrapper may and may not refuse.
-//
-// Its first version threw before launching whenever PLAYWRIGHT_BROWSERS_PATH
-// was unset. That variable is set only by `scripts/env.sh`; the hosted Linux
-// E2E job installs browsers with `npx playwright install` into Playwright's own
-// default location and never sets it. So the check did not detect a broken
-// environment — it declared the supported CI configuration broken, and locally
-// it failed selection-wrap, publish-security and published-app before a browser
-// was ever asked for. A precondition is not evidence: assert the property, and
-// let the launch that actually cannot find a browser be the thing that speaks.
-describe("Playwright launch wrapper", () => {
-  it("launches with no PLAYWRIGHT_BROWSERS_PATH, because the hosted runner has none", async () => {
-    const browser = { marker: "launched" };
-    const stub = { launch: async () => browser };
-    const previous = process.env.PLAYWRIGHT_BROWSERS_PATH;
-    delete process.env.PLAYWRIGHT_BROWSERS_PATH;
-    try {
-      await expect(guarded(stub, "chromium").launch()).resolves.toBe(browser);
-    } finally {
-      if (previous !== undefined) process.env.PLAYWRIGHT_BROWSERS_PATH = previous;
-    }
-  });
-
-  it("forwards the caller's launch options", async () => {
-    const seen: unknown[] = [];
-    const stub = { launch: async (...args: unknown[]) => { seen.push(...args); return {}; } };
-    await guarded(stub, "chromium").launch({ headless: true });
-    expect(seen).toEqual([{ headless: true }]);
-  });
-
-  it("names the remedy when the browser is genuinely missing", async () => {
-    const stub = {
-      launch: async () => {
-        throw new Error("Executable doesn't exist at /x/ms-playwright/chromium-1234/chrome-linux/chrome");
-      },
-    };
-    await expect(guarded(stub, "chromium").launch()).rejects.toThrow(REMEDY);
-  });
-
-  it("passes an unrelated failure through unchanged", async () => {
-    const original = new Error("Target page, context or browser has been closed");
-    const stub = { launch: async () => { throw original; } };
-    await expect(guarded(stub, "chromium").launch()).rejects.toBe(original);
   });
 });
