@@ -737,6 +737,7 @@ pub(crate) enum QueryJobOpen {
 /// and translates them into the three answers the public boundary can act on.
 /// It adds no state of its own, because a second opinion about whether the
 /// worker is making progress is exactly the twin D-14 forbids.
+#[derive(Debug)]
 pub(crate) enum ProjectionProgress {
     /// Ready at this generation by the time the question was asked: the two
     /// reads straddled a save. Retryable.

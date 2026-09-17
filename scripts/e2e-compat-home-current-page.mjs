@@ -92,7 +92,7 @@ try {
   }
 
   await browser.$('button[title^="Settings"]').click();
-  await browser.$("//button[contains(concat(' ', normalize-space(@class), ' '), ' settings-nav-item ') and normalize-space(.)='Graph']").click();
+  await browser.$('.settings-nav-item[data-settings-tab="graph"]').click();
   const homeRow = await browser.$('[data-setting-label="Home page"]');
   await homeRow.waitForExist({ timeout: 10_000 });
   await browser.execute(() => {

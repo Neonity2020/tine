@@ -20,7 +20,6 @@ pub mod directory_identity;
 pub mod doc;
 pub mod edn;
 mod filesystem_durability;
-pub(crate) mod projection_budget;
 
 pub mod durability_counters;
 pub mod graph_text_path;
@@ -33,6 +32,7 @@ pub mod onboarding;
 pub mod org;
 mod outline;
 pub mod pdf;
+pub(crate) mod projection_budget;
 #[cfg(test)]
 pub(crate) mod projection_producer_census;
 mod property_line;

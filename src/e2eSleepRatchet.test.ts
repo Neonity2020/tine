@@ -40,6 +40,44 @@ export function sleepThenReadSites(source: string): number[] {
 }
 
 /**
+ * Sampling loops whose window closes on elapsed time alone.
+ *
+ * `e2e-pdf-scroll-resources` installed a requestAnimationFrame sampler, ran it
+ * for a flat 750 ms, and compared the first frame to the last — but the
+ * keystroke it was sampling was dispatched AFTER the probe started, so a late
+ * WebDriver key delivery closed the window before the zoom moved. It read
+ * "Ctrl+ did not change focused PDF zoom" over 88 identical frames: green at
+ * 20:15, red at 20:43, green at 20:57, no product change in between. That is
+ * the borderline-number-fixed-by-rerunning pattern, and it is repairable.
+ *
+ * The repair (`2d297ff7`) is the shape this detector blesses: the animation
+ * window is anchored to `changedAt`, the moment the zoom was OBSERVED to move,
+ * and the start-anchored duration survives only as the outer bound on how long
+ * to wait for that observation. So a start-anchored window is a finding only
+ * when nothing in the same expression anchors on an observed event — a bound is
+ * fine, a bet on input latency is not.
+ */
+export function unobservedSamplingWindows(source: string): number[] {
+  const elapsed = /(?:now|Date\.now\(\)|performance\.now\(\))\s*-\s*([A-Za-z_$][\w$.]*)\s*[<>]=?\s*[\d_]+/g;
+  const lines = source.split("\n");
+  const sites: number[] = [];
+  for (let match = elapsed.exec(source); match; match = elapsed.exec(source)) {
+    const line = source.slice(0, match.index).split("\n").length;
+    const near = lines.slice(Math.max(0, line - 16), line + 15).join("\n");
+    if (!/requestAnimationFrame|setInterval/.test(near)) continue;
+    let start = match.index;
+    while (start > 0 && !";{}\n".includes(source[start - 1]!)) start -= 1;
+    const semicolon = source.indexOf(";", match.index);
+    const statement = source.slice(start, semicolon < 0 ? match.index : semicolon);
+    const anchors = [...statement.matchAll(/(?:now|Date\.now\(\)|performance\.now\(\))\s*-\s*([A-Za-z_$][\w$.]*)/g)]
+      .map((anchor) => anchor[1]!);
+    if (anchors.some((anchor) => !/start|begin/i.test(anchor))) continue;
+    sites.push(line);
+  }
+  return sites;
+}
+
+/**
  * The count each journey carried when the ratchet was written. A journey absent
  * from this map must have zero. Lowering an entry is always welcome — convert a
  * site to `waitForFileText` and drop the number; the test then pins the gain.
@@ -77,6 +115,46 @@ describe("E2E readiness ratchet", () => {
       'const saved = fs.readFileSync(sessionPath, "utf8");',
     ].join("\n");
     expect(sleepThenReadSites(fixed)).toEqual([]);
+  });
+
+  it("detects a sampling window that closes on the clock alone", () => {
+    const regression = [
+      "const frame = () => {",
+      "  const now = performance.now();",
+      "  probe.samples.push(read());",
+      "  if (now - probe.startedAt < 750) requestAnimationFrame(frame);",
+      "  else probe.done = true;",
+      "};",
+    ].join("\n");
+    expect(unobservedSamplingWindows(regression)).toEqual([4]);
+  });
+
+  it("accepts a window anchored to the event it samples", () => {
+    const fixed = [
+      "const frame = () => {",
+      "  const now = performance.now();",
+      "  if (probe.changedAt === null && zoom !== probe.startZoom) probe.changedAt = now;",
+      "  const keepSampling = probe.changedAt === null",
+      "    ? now - probe.startedAt < 4_000",
+      "    : now - probe.changedAt < 750;",
+      "  if (keepSampling) requestAnimationFrame(frame);",
+      "};",
+    ].join("\n");
+    expect(unobservedSamplingWindows(fixed)).toEqual([]);
+  });
+
+  it("no journey samples on a bet about input latency", () => {
+    const offenders = journeys.flatMap((name) =>
+      unobservedSamplingWindows(fs.readFileSync(path.join(scriptsDir, name), "utf8"))
+        .map((line) => `scripts/${name}:${line}`));
+    expect(
+      offenders,
+      "A sampling loop that stops after a fixed duration measured from its own start is "
+      + "betting that the thing it samples happens inside that window. Anchor the window to "
+      + "the moment the change is OBSERVED and keep the start-anchored duration only as the "
+      + "outer bound on waiting for it -- scripts/e2e-pdf-scroll-resources.mjs (the "
+      + "`changedAt` probe) is the exemplar.",
+    ).toEqual([]);
   });
 
   for (const journey of journeys) {

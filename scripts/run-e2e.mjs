@@ -6,6 +6,8 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { reapProcessGroup } from "./lib/e2e-process-group.mjs";
+import { describeMachine, machineSnapshot } from "./lib/e2e-machine-probe.mjs";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
 import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
 import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release-proof-reuse-lib.mjs";
@@ -736,6 +738,7 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal }));
     });
     clearTimeout(timer);
+    const leaked = process.platform === "win32" ? [] : await reapProcessGroup(child.pid);
     if (process.platform === "win32") {
       fs.writeFileSync(
         path.join(dir, "webview2-profile.json"),
@@ -746,7 +749,14 @@ async function runScenario([id, script, extraEnv], contractEntry) {
     fs.closeSync(stderr);
     const output = fs.readFileSync(path.join(dir, "stdout.log"), "utf8");
     const errors = fs.readFileSync(path.join(dir, "stderr.log"), "utf8");
-    const status = result.code === 0 && !timedOut ? "passed" : "failed";
+    let status = result.code === 0 && !timedOut ? "passed" : "failed";
+    if (leaked.length > 0) {
+      process.stdout.write(
+        `LEAK ${id}: ${leaked.length} process(es) survived the scenario and were killed: `
+        + `${leaked.map((entry) => `${entry.pid} ${entry.args}`).join(" | ")}\n`,
+      );
+      status = "failed";
+    }
     const retryDriver = isRetryableDriverTransportFailure(output, errors, timedOut);
     const retryNativeHarness = isRetryableNativeHarnessFailure(id, output, errors, timedOut);
     if (status === "failed" && attempt === 1 && (retryDriver || retryNativeHarness)) {
@@ -775,11 +785,19 @@ async function runScenario([id, script, extraEnv], contractEntry) {
       attempts: attempt,
       infrastructureRetries: attempt - 1,
       durationMs: Date.now() - started,
+      leakedProcesses: leaked,
       blocking: failureIsBlocking(status, contractEntry, id),
     };
     if (status === "failed") {
       const failurePath = path.join(dir, "failure.json");
+      // Measured only now, on the failure path, and never on a green run: a
+      // journey that waited 10s for an external change and did not see it is
+      // reporting the product only if the machine was answering. See
+      // scripts/lib/e2e-machine-probe.mjs for what this cost us once.
+      const machine = machineSnapshot(dir);
       record.failure = {
+        machine,
+        machineVerdict: describeMachine(machine),
         testedCommit: buildProvenance.testedCommit,
         buildProvenance,
         scenario: id,
@@ -798,7 +816,10 @@ async function runScenario([id, script, extraEnv], contractEntry) {
     }
     fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify(record, null, 2) + "\n");
     process.stdout.write(`${status === "passed" ? "PASS" : "FAIL"} ${id} (${(record.durationMs / 1000).toFixed(1)}s)\n`);
-    if (status === "failed") process.stdout.write(`FAILURE CAPSULE ${JSON.stringify(record.failure)}\n`);
+    if (status === "failed") {
+      process.stdout.write(`MACHINE ${id}: ${record.failure.machineVerdict}\n`);
+      process.stdout.write(`FAILURE CAPSULE ${JSON.stringify(record.failure)}\n`);
+    }
     return record;
   }
   throw new Error(`unreachable scenario retry state for ${id}`);

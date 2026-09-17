@@ -843,8 +843,12 @@ function PluginsTab(): JSX.Element {
       </Show>
       <Show when={!selectedPlugin()}>
         <div class="plugin-settings-nav" role="tablist" aria-label="Plugin settings sections">
-          <button role="tab" aria-selected={view() === "browse"} classList={{ active: view() === "browse" }} onClick={() => setView("browse")}>Browse</button>
-          <button role="tab" aria-selected={view() === "installed"} classList={{ active: view() === "installed" }} onClick={() => setView("installed")}>Installed ({installedPlugins().length})</button>
+          {/* Same reasoning as data-settings-tab above: the view's identity, not
+              its wording. This label also carries a COUNT, so a selector keyed
+              on it breaks when the fixture installs a different number of
+              plugins, not only when the wording changes. */}
+          <button role="tab" data-plugin-view="browse" aria-selected={view() === "browse"} classList={{ active: view() === "browse" }} onClick={() => setView("browse")}>Browse</button>
+          <button role="tab" data-plugin-view="installed" aria-selected={view() === "installed"} classList={{ active: view() === "installed" }} onClick={() => setView("installed")}>Installed ({installedPlugins().length})</button>
         </div>
       <Show when={view() === "browse"}>
       <div class="settings-section">Experimental plugin platform</div>

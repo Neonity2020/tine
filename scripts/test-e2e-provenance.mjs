@@ -19,14 +19,48 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helper = path.join(root, "scripts/build-e2e-receipt.mjs");
 const runner = path.join(root, "scripts/run-e2e.mjs");
 const packageManifest = path.join(root, "package.json");
-const inputHelper = path.join(root, "scripts/build-e2e-inputs.mjs");
-const proofReuseHelper = path.join(root, "scripts/release-proof-reuse-lib.mjs");
 const proofOnlyRegistry = path.join(root, "scripts/release-proof-only.json");
-const capabilities = path.join(root, "scripts/e2e-capabilities.mjs");
 const contracts = path.join(root, "tests/ui-regressions/e2e-contracts.json");
+// The asset name is only ever written INTO the fixture -- its stub `index.html`
+// and its stub app binary -- so this suite never needs a real frontend build.
+// It reads one when present purely to keep the fixture's name realistic.
+// Requiring `dist/` would have kept this out of `npm test`, which is how a
+// missing fixture file reached hosted CI in the first place.
 const index = path.join(root, "dist/index.html");
-const asset = fs.readFileSync(index, "utf8").match(/[A-Za-z0-9_]+-[A-Za-z0-9_-]+\.(?:js|css)/)?.[0];
-if (!asset) throw new Error(`could not find a current frontend asset in ${index}`);
+const asset = (fs.existsSync(index)
+  ? fs.readFileSync(index, "utf8").match(/[A-Za-z0-9_]+-[A-Za-z0-9_-]+\.(?:js|css)/)?.[0]
+  : null) ?? "index-provenance-fixture.js";
+
+/**
+ * Copy an entry script into a fixture checkout ALONG WITH every module it
+ * imports, transitively.
+ *
+ * The fixture used to be assembled from a hand-written file list. That list is
+ * a claim about `run-e2e.mjs`'s imports, and nothing checked it: when
+ * `run-e2e.mjs` grew `./lib/e2e-process-group.mjs` the list stayed as it was,
+ * every local gate stayed green (this suite is not part of `npm test`), and the
+ * hosted Linux job failed with ERR_MODULE_NOT_FOUND inside the fixture -- a
+ * 20-minute round trip to learn that a `cp` was missing. Deriving the set from
+ * the source means the next helper cannot repeat it.
+ */
+function copyModuleGraph(entry, destinationRoot) {
+  const pending = [entry];
+  const copied = new Set();
+  while (pending.length > 0) {
+    const file = pending.pop();
+    if (copied.has(file)) continue;
+    copied.add(file);
+    const relative = path.relative(root, file);
+    const destination = path.join(destinationRoot, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(file, destination);
+    const source = fs.readFileSync(file, "utf8");
+    for (const match of source.matchAll(/(?:^|\n)\s*(?:import|export)[^;\n]*?from\s+["'](\.[^"']+)["']/g)) {
+      pending.push(path.resolve(path.dirname(file), match[1]));
+    }
+  }
+  return [...copied].map((file) => path.relative(root, file)).sort();
+}
 
 function runNode(args, options = {}) {
   return spawnSync(process.execPath, args, { encoding: "utf8", ...options });
@@ -50,13 +84,10 @@ try {
   fs.mkdirSync(path.join(fixture, "src-tauri/gen/schemas"), { recursive: true });
   fs.mkdirSync(path.join(fixture, "node_modules/@tauri-apps/cli"), { recursive: true });
   fs.mkdirSync(path.join(fixture, "tests/ui-regressions"), { recursive: true });
-  fs.copyFileSync(helper, path.join(fixture, "scripts/build-e2e-receipt.mjs"));
-  fs.copyFileSync(inputHelper, path.join(fixture, "scripts/build-e2e-inputs.mjs"));
-  fs.copyFileSync(proofReuseHelper, path.join(fixture, "scripts/release-proof-reuse-lib.mjs"));
+  copyModuleGraph(runner, fixture);
+  copyModuleGraph(helper, fixture);
   fs.copyFileSync(proofOnlyRegistry, path.join(fixture, "scripts/release-proof-only.json"));
-  fs.copyFileSync(runner, path.join(fixture, "scripts/run-e2e.mjs"));
   fs.copyFileSync(packageManifest, path.join(fixture, "package.json"));
-  fs.copyFileSync(capabilities, path.join(fixture, "scripts/e2e-capabilities.mjs"));
   fs.copyFileSync(contracts, path.join(fixture, "tests/ui-regressions/e2e-contracts.json"));
   fs.writeFileSync(path.join(fixture, "scripts/e2e-multigraph.mjs"), "// Provenance validation reached the selected scenario.\n");
   fs.writeFileSync(path.join(fixture, "source.txt"), "before\n");
@@ -257,14 +288,11 @@ try {
   for (const directory of ["dist", "scripts", "src-tauri/gen/schemas", "tests/ui-regressions"]) {
     fs.mkdirSync(path.join(promotionFixture, directory), { recursive: true });
   }
+  copyModuleGraph(runner, promotionFixture);
+  copyModuleGraph(helper, promotionFixture);
   for (const [source, destination] of [
-    [helper, "scripts/build-e2e-receipt.mjs"],
-    [inputHelper, "scripts/build-e2e-inputs.mjs"],
-    [proofReuseHelper, "scripts/release-proof-reuse-lib.mjs"],
     [proofOnlyRegistry, "scripts/release-proof-only.json"],
-    [runner, "scripts/run-e2e.mjs"],
     [packageManifest, "package.json"],
-    [capabilities, "scripts/e2e-capabilities.mjs"],
     [contracts, "tests/ui-regressions/e2e-contracts.json"],
   ]) fs.copyFileSync(source, path.join(promotionFixture, destination));
   fs.writeFileSync(path.join(promotionFixture, "scripts/e2e-page-properties.mjs"), "// source proof\n");

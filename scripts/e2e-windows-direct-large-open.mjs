@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ensureMainWindow } from "./lib/e2e-main-window.mjs";
 import {
   startWebdriverApplication,
   stopWebdriverApplication,
@@ -83,6 +84,11 @@ try {
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
   });
+  // The Windows driver does not reliably attach to the app window: it can land
+  // on the Quick Capture window, where every application selector is legitimately
+  // absent. Three windows-smoke journeys failed that way in one run, each
+  // reporting its own missing element instead of the shared cause.
+  await ensureMainWindow(browser);
   await browser.$(".ls-block").waitForExist({ timeout: 90_000 });
   await browser.waitUntil(async () => (await browser.$("body").getText()).includes(marker), {
     timeout: 90_000,

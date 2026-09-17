@@ -212,7 +212,44 @@ export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory) {
   };
 }
 
+// Probe the tool this script is entirely about, so its absence reads as its
+// own remedy.
+//
+// `cargo nextest` lives in the sibling `.toolchain/`, which `scripts/env.sh`
+// puts on PATH. Run this contract from a shell that has not sourced it — the
+// ordinary case when a coordinator gate is launched from a fresh process — and
+// cargo answers "no such command: `nextest`" with a suggestion to
+// `cargo search cargo-nextest`, i.e. install a second copy of a binary the
+// machine already has. Two of the three call sites below use stdio:"inherit"
+// and cannot see that text to improve it, so the check belongs here, once.
+//
+// This probes the TOOL, not a variable that stands in for it: the failing
+// input is a shell without the toolchain on PATH, and there is no supported
+// configuration in which `cargo nextest --version` fails but the run succeeds.
+// (The Playwright wrapper's first version got this distinction wrong and threw
+// on an unset PLAYWRIGHT_BROWSERS_PATH, which is legitimately unset on a
+// hosted runner -- see scripts/playwright-wrapper.test.mjs.)
+export function nextestRemedy(stderr) {
+  return /no such command:? .?nextest/i.test(String(stderr ?? ""))
+    ? "cargo nextest is not on PATH. Run `source scripts/env.sh` first: the toolchain lives in the "
+      + "sibling .toolchain/, outside the repo. Do NOT `cargo install cargo-nextest` — it builds a "
+      + "second copy of a binary this machine already has."
+    : null;
+}
+
+let nextestProbed = false;
+function requireNextest() {
+  if (nextestProbed) return;
+  const probe = spawnSync("cargo", ["nextest", "--version"], { cwd: process.cwd(), encoding: "utf8" });
+  if (probe.error) fail(`could not start cargo: ${probe.error.message}`);
+  if (probe.status !== 0) {
+    fail(nextestRemedy(probe.stderr) ?? `cargo nextest --version failed:\n${probe.stderr}`);
+  }
+  nextestProbed = true;
+}
+
 function nextestList(profile, packageName, { partition, filterset } = {}) {
+  requireNextest();
   const args = ["nextest", "list", "--profile", profile, "--package", packageName, "--message-format", "json"];
   if (partition) args.push("--partition", partition);
   if (filterset) args.push("--filterset", filterset);
@@ -230,6 +267,7 @@ function nextestList(profile, packageName, { partition, filterset } = {}) {
 }
 
 function runWindowsSmoke(packageName, filterset, label) {
+  requireNextest();
   const result = spawnSync(
     "cargo",
     ["nextest", "run", "--profile", "ci-windows", "--package", packageName, "--filterset", filterset],
@@ -240,6 +278,7 @@ function runWindowsSmoke(packageName, filterset, label) {
 }
 
 function runLinuxSelection({ shard } = {}) {
+  requireNextest();
   const args = [
     "nextest",
     "run",
