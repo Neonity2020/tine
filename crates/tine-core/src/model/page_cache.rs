@@ -395,6 +395,10 @@ impl Graph {
         // it should repair — its repair would be a second warm racing this
         // one on the query thread.
         let in_flight = projection.begin_warm();
+        let warm_started = std::time::Instant::now();
+        crate::direct_projection::projection_diag(|| {
+            "warm announced; reading inventory".to_owned()
+        });
         #[cfg(test)]
         {
             // Bind first: an `if let` scrutinee would hold the guard across
@@ -437,8 +441,23 @@ impl Graph {
             }
         }
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            crate::direct_projection::projection_diag(|| {
+                format!(
+                    "warm abandoned on drift after {}ms",
+                    warm_started.elapsed().as_millis()
+                )
+            });
             return Outcome::Retry;
         }
+        crate::direct_projection::projection_diag(|| {
+            format!(
+                "warm inventory read in {}ms pages={} failures={} text_mib={:.1}",
+                warm_started.elapsed().as_millis(),
+                sources.len(),
+                failures.len(),
+                text_bytes as f64 / (1024.0 * 1024.0),
+            )
+        });
         let parse_config = Arc::new(self.config.parse_config());
         let enqueued =
             projection.enqueue_warm(generation, sources, Arc::clone(&parse_config), text_bytes);
@@ -454,7 +473,22 @@ impl Graph {
                 Outcome::Retry
             };
         }
-        match projection.wait_warm_outcome() {
+        let outcome_started = std::time::Instant::now();
+        let outcome = projection.wait_warm_outcome();
+        crate::direct_projection::projection_diag(|| {
+            format!(
+                "warm validation returned {} after {}ms",
+                match &outcome {
+                    crate::direct_projection::WarmOutcome::Clean => "clean".to_owned(),
+                    crate::direct_projection::WarmOutcome::Superseded => "superseded".to_owned(),
+                    crate::direct_projection::WarmOutcome::Failed => "failed".to_owned(),
+                    crate::direct_projection::WarmOutcome::Replacements(pages) =>
+                        format!("replacements({})", pages.len()),
+                },
+                outcome_started.elapsed().as_millis()
+            )
+        });
+        match outcome {
             crate::direct_projection::WarmOutcome::Clean => {
                 self.publish_page_index_failures(generation, failures);
                 Outcome::Owned
@@ -503,6 +537,7 @@ impl Graph {
     ) -> bool {
         use crate::direct_projection::WarmStreamItem;
         const BATCH: usize = 16;
+        let stream_started = std::time::Instant::now();
         let total = pages.len();
         let mut batch = Vec::with_capacity(BATCH.min(total));
         for (i, entry) in pages.into_iter().enumerate() {
@@ -549,6 +584,15 @@ impl Graph {
             };
             batch.push(item);
             if batch.len() == BATCH || i + 1 == total {
+                if (i / BATCH) % 32 == 0 || i + 1 == total {
+                    crate::direct_projection::projection_diag(|| {
+                        format!(
+                            "stream parsed {}/{total} pages in {}ms",
+                            i + 1,
+                            stream_started.elapsed().as_millis()
+                        )
+                    });
+                }
                 if !projection.warm_stream_admit(generation, batch.len())
                     || self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation
                     || !projection.enqueue_warm_stream(

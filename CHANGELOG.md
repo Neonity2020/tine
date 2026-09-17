@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's
+  lifecycle: when a validation starts reading the graph, how long that read
+  took, how many pages it queued, each worker turn's duration and rows, how far
+  a partial build has streamed, and when the index becomes ready. Without the
+  flag nothing is recorded (GH #543).
+
 ### Fixed
 - Searching a large graph no longer reads every block for every keystroke.
   Ctrl+K asked SQLite to materialise and rank every block in the graph and

@@ -5813,6 +5813,58 @@ fn read_latency_probe_reports_per_surface_timings() {
     }
 }
 
+/// GH #543: the projection lifecycle is the one part of a long build nobody
+/// could observe. The Windows verify probe could say only that a 10,000-page
+/// cold open took 139 s with the switcher stuck on "Indexing 0 of 10,001";
+/// the app's debug log stopped at "Direct Files publish" and the next 105 s
+/// were unrecorded. These lines are that record — and they must stay on the
+/// opt-in channel, because they name the graph's page counts and timings.
+#[test]
+fn projection_lifecycle_diagnostics_follow_the_debug_flag() {
+    struct RestoreFlag;
+    impl Drop for RestoreFlag {
+        fn drop(&mut self) {
+            crate::backend_error::set_runtime_debug_diagnostics(false);
+        }
+    }
+    let _serial = serialize_projection_tests();
+    let _restore = RestoreFlag;
+
+    crate::backend_error::set_runtime_debug_diagnostics(false);
+    let silent_root = r6_graph("projection-diag-off");
+    let silent = Graph::open(&silent_root);
+    silent
+        .attach_direct_projection(silent_root.join("private/projection.sqlite"))
+        .unwrap();
+    let before = crate::direct_projection::projection_diag_lines_test();
+    silent.warm_cache();
+    wait_ready(&silent);
+    assert_eq!(
+        crate::direct_projection::projection_diag_lines_test(),
+        before,
+        "a run without TINE_DEBUG must emit no projection lifecycle line"
+    );
+
+    crate::backend_error::set_runtime_debug_diagnostics(true);
+    let loud_root = r6_graph("projection-diag-on");
+    let loud = Graph::open(&loud_root);
+    loud.attach_direct_projection(loud_root.join("private/projection.sqlite"))
+        .unwrap();
+    let before = crate::direct_projection::projection_diag_lines_test();
+    loud.warm_cache();
+    wait_ready(&loud);
+    assert!(
+        crate::direct_projection::projection_diag_lines_test() > before,
+        "a run under TINE_DEBUG must record the warm announcing, queueing and converging"
+    );
+
+    for (graph, root) in [(silent, silent_root), (loud, loud_root)] {
+        let projection = graph.direct_projection_test().unwrap();
+        assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Manual scale probe for GH #543, packet 3 follow-up: the switcher POLLS while
 /// the build streams (`query_index_progress` every 750 ms, `search` every 2 s in
 /// the "switcher" lane), which the plain probe above never did. The Windows

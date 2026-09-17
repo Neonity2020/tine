@@ -121,9 +121,9 @@ struct AllowedSite {
 const RUST_PRINT_SITE_COUNT: usize = 18;
 const ALLOWLIST: &[AllowedSite] = &[
     AllowedSite { file: "crates/tine-core/src/concord_ledger.rs", function: "run", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "best-effort ledger update failure carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
+    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_diag", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "the projection lifecycle channel interpolates only counts, byte totals, durations, generations and booleans; the one error value reaching it is a ProjectionRefusal that is NOT a reportable failure, i.e. AwaitingFullInventory, whose Display is a fixed literal, and projection_lifecycle_lines_carry_no_graph_content holds every caller to that shape", gate: "runtime_debug_diagnostics_enabled" },
     AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "content-free-error", why: "projection directory creation carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
     AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[1], bucket: "d", class: "content-free-error", why: "projection lease acquisition carries only a std::io::Error, whose Display never includes the path", gate: "always-on reviewed failure" },
-    AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "projection_worker", macro_name: "eprintln", occurrences: &[2], bucket: "a", class: "fixed-debug", why: "the deferred-turn line is the ELSE arm of is_reportable_failure, so the only ProjectionRefusal that reaches it is AwaitingFullInventory, whose Display is a fixed literal; Failed(_) takes the reviewed report_projection_failure path instead", gate: "runtime_debug_diagnostics_enabled" },
     AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "report_projection_failure", macro_name: "eprintln", occurrences: &[0], bucket: "d", class: "fixed-family-report", why: "report_projection_failure's always-on line is the fixed failure family and no error value", gate: "always-on reviewed failure" },
     AllowedSite { file: "crates/tine-core/src/direct_projection.rs", function: "report_projection_failure", macro_name: "eprintln", occurrences: &[1], bucket: "b", class: "directed-core-detail", why: "report_projection_failure's detail line repeats the family with the raw error, for a directed investigation", gate: "runtime_debug_diagnostics_enabled" },
     AllowedSite { file: "crates/tine-core/src/model/page_parse.rs", function: "isolate_page_parse", macro_name: "eprintln", occurrences: &[0], bucket: "a", class: "content-free-debug", why: "reconcile and isolated-parse failures contain no path, title, content, or raw error", gate: "runtime_debug_diagnostics_enabled" },
@@ -251,6 +251,77 @@ fn production_print_sites_equal_the_reviewed_content_free_census() {
     assert!(
         removed.is_empty(),
         "{repair}\ncensused but no longer present: {removed:#?}"
+    );
+}
+
+/// I-5: the projection lifecycle channel is content-free BY ITS CALLERS.
+///
+/// `projection_diag` is a single censused print site, but its payload is
+/// written at every call site. A future caller interpolating a page name would
+/// change what a shipped binary can emit without adding, removing or moving any
+/// print site, so the function-anchored census above cannot see it. This scan
+/// can. The blessed exemplar is `page_cache.rs`'s "warm inventory read in {}ms
+/// pages={} failures={} text_mib={:.1}": counts, byte totals, durations,
+/// generations, booleans and fixed families only.
+#[test]
+fn projection_lifecycle_lines_carry_no_graph_content() {
+    let root = repo_root();
+    // Whole identifiers, so a byte/millisecond counter such as `text_bytes` or
+    // `text_mib` stays legal while `page_name` or `raw` does not.
+    let content_bearing = Regex::new(
+        r"\b(?:name|page_name|title|path|text|raw|content|needle|value|prose|message)\b",
+    )
+    .unwrap();
+    let mut sites = 0usize;
+    let mut violations = Vec::new();
+    for file in production_source_files() {
+        let source = compiled_source(&file);
+        let relative = relative_path(&root, &file);
+        for (offset, _) in source.match_indices("projection_diag(||") {
+            sites += 1;
+            // Balance the call's own parentheses: a single-expression closure
+            // ends `));`, and a window that scanned for `});` instead would run
+            // past it into unrelated code and flag words that are not in the
+            // line at all.
+            let rest = &source[offset..];
+            let open = rest.find('(').expect("projection_diag( matched");
+            let mut depth = 0usize;
+            let mut end = rest.len();
+            for (at, character) in rest.char_indices().skip(open) {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = at + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let call = &rest[..end];
+            for found in content_bearing.find_iter(call) {
+                violations.push(format!(
+                    "{relative}:{} interpolates `{}`",
+                    line_of(&source, offset),
+                    found.as_str()
+                ));
+            }
+        }
+    }
+    assert!(
+        sites >= 8,
+        "the projection lifecycle scan matched {sites} call sites; it must not pass by finding \
+         nothing — `projection_diag(||` is the shape it looks for"
+    );
+    assert!(
+        violations.is_empty(),
+        "I-5: a projection lifecycle line may interpolate only counts, byte totals, durations, \
+         generations, booleans and fixed families — never a page name, path, title or block \
+         text. The channel is on whenever a user runs with TINE_DEBUG=1 and its stderr goes \
+         into bug reports. Exemplar: `model/page_cache.rs`'s \"warm inventory read in {{}}ms \
+         pages={{}} failures={{}} text_mib={{:.1}}\". Violations: {violations:#?}"
     );
 }
 

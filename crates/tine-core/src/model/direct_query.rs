@@ -883,6 +883,12 @@ impl Graph {
         let Ok(_repair) = self.projection_recovery.try_lock() else {
             return;
         };
+        crate::direct_projection::projection_diag(|| {
+            format!(
+                "repair requested reset={reset} parsed_cache={}",
+                self.cache.read().unwrap().is_some()
+            )
+        });
         let (reset, _in_flight) = {
             let projection = self.direct_projection.lock().unwrap();
             let Some(projection) = projection.as_ref() else {
