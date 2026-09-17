@@ -1689,7 +1689,11 @@ try {
     timeout: 10_000,
     timeoutMsg: "the first PDF annotation block reference did not resolve",
   });
-  await firstSecondRef.click();
+  // Same class as the chip below: an inline reference chip clicked while the
+  // PDF pane is switching. Route it through the same preconditions.
+  await clickWhenReachable(browser, `[data-block-ref="${SECOND_FIRST_ID}"]`, {
+    what: "the first PDF annotation block reference",
+  });
   try {
     await browser.waitUntil(() => browser.execute((highlightId) =>
       document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-second.pdf" &&
@@ -1798,7 +1802,9 @@ try {
 
   // Exercise the sibling entry surface too: navigate to the hls page and click
   // a different rendered annotation badge, not merely an inline ((block ref)).
-  await browser.$(`[data-block-ref="${SECOND_FIRST_ID}"]`).click();
+  await clickWhenReachable(browser, `[data-block-ref="${SECOND_FIRST_ID}"]`, {
+    what: "the first PDF annotation block reference (return path)",
+  });
   await browser.waitUntil(() => browser.execute((highlightId) =>
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-second.pdf" &&
     document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId, SECOND_FIRST_ID), {
@@ -1811,7 +1817,9 @@ try {
   await hlsLink.click();
   await browser.$(`.pdf-annotation-line .hl-prefix[data-highlight-id="${SECOND_SECOND_ID}"]`)
     .waitForExist({ timeout: 10_000 });
-  await browser.$(`.pdf-annotation-line .hl-prefix[data-highlight-id="${SECOND_SECOND_ID}"]`).click();
+  await clickWhenReachable(browser, `.pdf-annotation-line .hl-prefix[data-highlight-id="${SECOND_SECOND_ID}"]`, {
+    what: "the annotation line highlight prefix",
+  });
   await browser.waitUntil(() => browser.execute((highlightId) =>
     document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId, SECOND_SECOND_ID), {
     timeout: 10_000,
