@@ -19,6 +19,7 @@ import { ensureDisplay } from "./lib/e2e-display.mjs";
 import { openPageByName } from "./lib/e2e-navigation.mjs";
 import { dismissStartupNotices } from "./lib/e2e-toasts.mjs";
 
+import { ensureMainWindow } from "./lib/e2e-main-window.mjs";
 await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -493,6 +494,11 @@ try {
     connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
+  // The Windows driver does not reliably attach to the app window: it can land
+  // on the Quick Capture window, where every application selector is legitimately
+  // absent. Three windows-smoke journeys failed that way in one run, each
+  // reporting its own missing element instead of the shared cause.
+  await ensureMainWindow(browser);
   // This fixture starts on today's journal so it has a durable navigation
   // source for the seeded pages. Journals render blocks (and a journal title),
   // not a named-page `.page-title`; waiting for the latter prevented openPage()

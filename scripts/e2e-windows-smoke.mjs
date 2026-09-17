@@ -13,6 +13,7 @@ import {
 } from "./e2e-capabilities.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 
+import { ensureMainWindow } from "./lib/e2e-main-window.mjs";
 await ensureDisplay();
 
 if (process.platform !== "win32") throw new Error("windows smoke must run on Windows");
@@ -52,6 +53,11 @@ try {
     connectionRetryCount: 1,
     connectionRetryTimeout: 60000,
   });
+  // The Windows driver does not reliably attach to the app window: it can land
+  // on the Quick Capture window, where every application selector is legitimately
+  // absent. Three windows-smoke journeys failed that way in one run, each
+  // reporting its own missing element instead of the shared cause.
+  await ensureMainWindow(browser);
   // The first journal block can paint before the application shell's reactive
   // content subtree is mounted on WebView2. Observe the shell, scroll pane, and
   // block atomically in one document evaluation; separate element waits can

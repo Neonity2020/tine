@@ -18,6 +18,7 @@ import {
 } from "./e2e-capabilities.mjs";
 import { ensureDisplay } from "./lib/e2e-display.mjs";
 
+import { ensureMainWindow } from "./lib/e2e-main-window.mjs";
 await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -87,6 +88,11 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "default", process.platform, webviewTarget.debuggerAddress),
   });
+  // The Windows driver does not reliably attach to the app window: it can land
+  // on the Quick Capture window, where every application selector is legitimately
+  // absent. Three windows-smoke journeys failed that way in one run, each
+  // reporting its own missing element instead of the shared cause.
+  await ensureMainWindow(browser);
   // The contract starts at the named page's menu, not at today's journal.
   // Route through the visible application search control so a different valid
   // startup surface cannot fail the safety journey before it begins.
