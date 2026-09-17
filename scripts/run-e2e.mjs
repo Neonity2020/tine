@@ -13,7 +13,98 @@ import { assertPromotionPlan, validatePromotionPlanForCheckout } from "./release
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const contractsPath = path.join(root, "tests/ui-regressions/e2e-contracts.json");
 const suiteName = process.argv[2] ?? "linux-smoke";
-const only = process.argv.find((arg) => arg.startsWith("--scenario="))?.slice("--scenario=".length);
+
+/**
+ * Flags, parsed strictly.
+ *
+ * `--scenario=` used to be read with a bare `argv.find(...)`, so an unknown
+ * flag was silently ignored and a REPEATED `--scenario=` silently kept only
+ * the first. Both cost debugging time during v0.6.984: a command that looked
+ * like it honoured the flag ran a different set of scenarios and reported it
+ * as if nothing were wrong. A typo must fail, loudly, before anything starts.
+ */
+const OPTIONS = {
+  "--scenario": { kind: "value", usage: "--scenario=<id>            run one scenario from the suite" },
+  "--validate-build-receipt-only": { kind: "flag", usage: "--validate-build-receipt-only  validate the build receipt and exit" },
+  "--allow-harness-delta": { kind: "flag", usage: "--allow-harness-delta      permit uncommitted journey/test edits (never for a candidate)" },
+  "--under-load": { kind: "optional", usage: "--under-load[=N]           run N CPU burners alongside the suite (default: one per core)" },
+  "--pin-cpus": { kind: "value", usage: "--pin-cpus=<N>             confine the suite to CPUs 0..N-1 (Linux)" },
+};
+
+function optionsUsage() {
+  return Object.values(OPTIONS).map((option) => `  ${option.usage}`).join("\n");
+}
+
+function optionFailure(message) {
+  console.error(`run-e2e: ${message}\nknown options:\n${optionsUsage()}`);
+  process.exit(2);
+}
+
+function parseOptions(args) {
+  const values = new Map();
+  for (const arg of args) {
+    const equals = arg.indexOf("=");
+    const name = equals < 0 ? arg : arg.slice(0, equals);
+    const spec = OPTIONS[name];
+    if (!spec) optionFailure(`unknown option ${arg}`);
+    if (values.has(name)) optionFailure(`${name} given more than once`);
+    if (spec.kind === "flag" && equals >= 0) optionFailure(`${name} takes no value`);
+    if (spec.kind === "value" && equals < 0) optionFailure(`${name} requires a value`);
+    values.set(name, equals < 0 ? true : arg.slice(equals + 1));
+  }
+  return values;
+}
+
+function positiveCount(values, name, fallback) {
+  const raw = values.get(name);
+  if (raw === undefined) return 0;
+  if (raw === true) return fallback;
+  const count = Number(raw);
+  if (!Number.isInteger(count) || count < 1) optionFailure(`${name} needs a positive whole number, not ${JSON.stringify(raw)}`);
+  return count;
+}
+
+const options = parseOptions(process.argv.slice(3));
+const only = options.get("--scenario") === true ? undefined : options.get("--scenario");
+if (only !== undefined && !only) optionFailure("--scenario= needs a scenario id");
+const allowHarnessDelta = options.has("--allow-harness-delta");
+const cpuCount = os.cpus().length;
+const underLoad = positiveCount(options, "--under-load", cpuCount);
+const pinCpus = positiveCount(options, "--pin-cpus", cpuCount);
+if (pinCpus) {
+  if (process.platform !== "linux") optionFailure("--pin-cpus needs taskset, which is Linux only");
+  if (pinCpus > cpuCount) optionFailure(`--pin-cpus=${pinCpus} exceeds the ${cpuCount} CPUs this machine has`);
+  if (spawnSync("taskset", ["--version"]).status !== 0) optionFailure("--pin-cpus needs taskset on PATH (util-linux)");
+}
+const pinnedCpuList = pinCpus ? Array.from({ length: pinCpus }, (_, index) => index).join(",") : null;
+
+/**
+ * Reproduce a "hosted-only" failure locally.
+ *
+ * A hosted runner differs from this machine mainly in speed: fewer cores, all
+ * of them contended. During v0.6.984 two hosted assembly round trips (~90
+ * minutes each) were spent guessing at a failure that `--pin-cpus=2
+ * --under-load` reproduced in 40 seconds. The burners exit on their own if
+ * this process dies, so an interrupted run cannot leave the machine loaded.
+ */
+const BURN = "const parent=process.ppid;let n=0;"
+  + "for(;;){Math.sqrt(Math.random());if((n=(n+1)%5000000)===0&&process.ppid!==parent)process.exit(0);}";
+let burners = [];
+function startLoad() {
+  if (!underLoad) return;
+  burners = Array.from({ length: underLoad }, () => spawn(
+    pinnedCpuList ? "taskset" : process.execPath,
+    pinnedCpuList ? ["-c", pinnedCpuList, process.execPath, "-e", BURN] : ["-e", BURN],
+    { stdio: "ignore", detached: false },
+  ));
+  console.log(`LOAD ${underLoad} CPU burners${pinnedCpuList ? ` pinned to CPUs ${pinnedCpuList}` : ""}`);
+}
+function stopLoad() {
+  for (const burner of burners) { try { burner.kill("SIGKILL"); } catch {} }
+  burners = [];
+}
+process.on("exit", stopLoad);
+for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { stopLoad(); process.exit(1); });
 const app = path.resolve(process.env.TINE_APP || path.join(root, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine"));
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
 const longFocusedWindows = suiteName === "windows-smoke" && only === "windows-direct-large-open";
@@ -267,6 +358,28 @@ function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+let activeHarnessDelta = null;
+
+function harnessDeltaOnly(receipt) {
+  if (e2eMode === "release") {
+    throw new Error("--allow-harness-delta is refused in release mode: a release candidate is proved on an exact, committed tree.");
+  }
+  if (promotionPlanPath) {
+    throw new Error("--allow-harness-delta is refused with a promotion plan: promotion proves an exact, committed tree.");
+  }
+  const delta = receiptDelta(receipt.sourceRevision);
+  const product = delta.filter((relative) => !HARNESS_PATH.test(relative));
+  if (product.length) {
+    throw receiptRemediation(
+      `--allow-harness-delta cannot cover ${product.length} non-harness path(s): ${product.slice(0, 12).join(", ")}`
+      + `${product.length > 12 ? ", …" : ""} — these can change the product, so the binary must be rebuilt`,
+    );
+  }
+  if (!delta.length) return false;
+  activeHarnessDelta = delta;
+  return true;
+}
+
 function receiptRemediation(detail) {
   return new Error(`${detail}. Run scripts/deploy.sh or the build receipt helper for the exact app binary before running E2E.`);
 }
@@ -288,6 +401,50 @@ function strictBase64(value) {
   if (typeof value !== "string") return undefined;
   const bytes = Buffer.from(value, "base64");
   return bytes.toString("base64") === value ? bytes : undefined;
+}
+
+/**
+ * Paths that are observers, not product.
+ *
+ * A journey script and a test fixture are compiled into nothing: the binary
+ * under test is byte-identical whether or not they changed. The build receipt
+ * cannot see that distinction — it digests the whole working tree — so during
+ * v0.6.984 every failed hypothesis about a journey had to be COMMITTED before
+ * it could be run, and during a release each such commit produced a new
+ * candidate SHA. This list is what `--allow-harness-delta` is allowed to
+ * tolerate; everything else still refuses, because everything else can change
+ * the product.
+ */
+const HARNESS_PATH = /^(scripts\/(lib\/)?e2e-[A-Za-z0-9-]+\.mjs|tests\/.+)$/;
+
+/**
+ * Every path that could differ from the one the receipt was built from.
+ *
+ * Mirrors `build-e2e-inputs.mjs`'s pathspecs exactly: docs and the generated
+ * Tauri schemas are not build inputs, so they cannot be part of a delta the
+ * receipt would have noticed. Reads git's RAW output — `gitOutput` trims, which
+ * eats the leading space of a ` M path` status line and shifts every path by
+ * one character.
+ */
+function receiptDelta(receiptRevision) {
+  const pathspecs = ["--", ".", ":(exclude)docs/**", ":(exclude)src-tauri/gen/schemas/**"];
+  const status = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", ...pathspecs],
+    { cwd: root, encoding: "utf8" });
+  if (status.status !== 0) throw status.error || new Error(`git status failed: ${String(status.stderr || "").trim()}`);
+  // In `-z` output a rename/copy is TWO records: "R  <new>" then a bare
+  // "<old>". Consume the second explicitly rather than slicing three
+  // characters off a path that has no status prefix.
+  const records = status.stdout.split("\0").filter(Boolean);
+  const worktree = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    worktree.push(record.slice(3));
+    if (/^[RC]/.test(record)) worktree.push(records[index += 1]);
+  }
+  const committed = receiptRevision === checkoutRevision
+    ? []
+    : gitOutput(["diff", "--name-only", receiptRevision, checkoutRevision, ...pathspecs]).split(/\r?\n/).filter(Boolean);
+  return [...new Set([...worktree, ...committed])].sort();
 }
 
 function validateBuildReceiptInputs() {
@@ -333,6 +490,12 @@ function validateBuildReceiptInputs() {
       throw receiptRemediation(`promotion plan ${promotionPlanPath} does not authorize this binary/proof checkout (${error.message})`);
     }
     activePromotionPlan = plan;
+  } else if (allowHarnessDelta && harnessDeltaOnly(receipt)) {
+    // Deliberately skips the digest, revision and dirty checks below: every
+    // differing path is an observer, so the binary still IS this source's
+    // product. The summary and every failure capsule record which files
+    // differed, so such a run cannot be mistaken for candidate evidence.
+    console.log(`HARNESS DELTA (not candidate evidence): ${activeHarnessDelta.join(", ")}`);
   } else {
     let checkoutState;
     try {
@@ -354,8 +517,19 @@ function validateBuildReceiptInputs() {
       throw receiptRemediation(`build receipt ${receiptPath} was built from ${receipt.sourceRevision}, not checkout ${checkoutRevision}`);
     }
   }
-  if (receipt.buildInputsDirty) {
-    throw receiptRemediation(`build receipt ${receiptPath} records dirty binary/frontend inputs`);
+  if (receipt.buildInputsDirty && !activeHarnessDelta) {
+    // NOT `receiptRemediation`: "run deploy.sh" is the wrong remedy here and
+    // sent v0.6.984 into a rebuild that could not possibly help. Dirtiness is
+    // computed from the GIT WORKING TREE, so a rebuild recomputes the same
+    // dirty flag; only committing (or reverting) the paths clears it.
+    const changes = receipt.buildInputChanges.slice(0, 12).join(", ");
+    throw new Error(
+      `build receipt ${receiptPath} records dirty binary/frontend inputs: ${changes}`
+      + `${receipt.buildInputChanges.length > 12 ? ", …" : ""}. Dirtiness is computed from the git working `
+      + "tree, not from the binary, so rebuilding recomputes the same flag. Commit (or revert) those paths "
+      + "and rebuild. If every one of them is a journey or test file, rerun with --allow-harness-delta — "
+      + "which is refused for a release candidate.",
+    );
   }
   return receipt;
 }
@@ -380,6 +554,7 @@ function validateBuildReceiptArtifact(receipt, appSha256, frontendAsset) {
     productInputDigest: receipt.productInputDigest,
     buildInputsDirty: receipt.buildInputsDirty,
     buildInputChanges: receipt.buildInputChanges,
+    ...(activeHarnessDelta ? { harnessDelta: activeHarnessDelta } : {}),
     ...(activePromotionPlan ? {
       promotion: {
         sourceRunId: activePromotionPlan.sourceRunId,
@@ -531,12 +706,16 @@ async function runScenario([id, script, extraEnv], contractEntry) {
     // cannot forward the next scenario into the previous app. Processes spawned
     // inside one scenario still share the bus, preserving the multigraph and
     // Quick Capture handoff coverage.
-    const command = nativeLinux ? "xvfb-run" : process.execPath;
-    const args = nativeLinux
+    const runner = nativeLinux ? "xvfb-run" : process.execPath;
+    const runnerArgs = nativeLinux
       // Xvfb must wrap the private bus: D-Bus-activated GTK portal services need
       // DISPLAY in the activation environment for auxiliary-window behavior.
       ? ["-a", process.env.DBUS_RUN_SESSION || "dbus-run-session", "--", process.execPath, path.join(root, script)]
       : [path.join(root, script)];
+    // `taskset` wraps the OUTERMOST process so the whole scenario tree — xvfb,
+    // the bus, the driver and the app — inherits the reduced CPU set.
+    const command = pinnedCpuList ? "taskset" : runner;
+    const args = pinnedCpuList ? ["-c", pinnedCpuList, runner, ...runnerArgs] : runnerArgs;
     const child = spawn(command, args, { cwd: root, env, detached: process.platform !== "win32", stdio: ["ignore", stdout, stderr] });
     let timedOut = false;
     const scenarioTimeoutMs = Number(env.E2E_SCENARIO_TIMEOUT_MS || timeoutMs);
@@ -632,7 +811,7 @@ if (!fs.existsSync(app)) {
 const frontendAsset = validateEmbeddedFrontend();
 const appSha256 = sha256(app);
 const buildProvenance = validateBuildReceiptArtifact(receipt, appSha256, frontendAsset);
-if (process.argv.includes("--validate-build-receipt-only")) {
+if (options.has("--validate-build-receipt-only")) {
   console.log(`PASS build receipt ${receiptPath}`);
   process.exit(0);
 }
@@ -641,7 +820,12 @@ fs.rmSync(artifactRoot, { recursive: true, force: true });
 fs.mkdirSync(artifactRoot, { recursive: true });
 
 const results = [];
-for (const scenario of scenarios) results.push(await runScenario(scenario, selectedContracts.get(scenario[1])));
+startLoad();
+try {
+  for (const scenario of scenarios) results.push(await runScenario(scenario, selectedContracts.get(scenario[1])));
+} finally {
+  stopLoad();
+}
 const summary = {
   schemaVersion: 1,
   suite: suiteName,
@@ -650,6 +834,9 @@ const summary = {
   appSha256,
   buildProvenance,
   platform: `${os.platform()}-${os.arch()}`,
+  // A green run under load is stronger evidence than a green idle run, and a
+  // run with a harness delta is weaker than either. Say which this was.
+  load: { burners: underLoad, pinnedCpus: pinnedCpuList, cpuCount },
   startedAt: suiteStartedAt,
   passed: results.filter((result) => result.status === "passed").length,
   failed: results.filter((result) => result.status === "failed").length,

@@ -189,6 +189,47 @@ try {
   assert.equal(fs.existsSync(launchProbe), false, "run-e2e launched an app before rejecting changed build inputs");
   assert.equal(fs.existsSync(artifacts), false, "run-e2e started E2E artifact work before checking changed build inputs");
 
+  // --allow-harness-delta: a journey edit is an observer change, not a product
+  // change, so it may be RUN without first being committed — but only when
+  // every differing path is an observer, and never silently.
+  fs.writeFileSync(path.join(fixture, "source.txt"), "before\n");
+  const journey = path.join(fixture, "scripts/e2e-multigraph.mjs");
+  const journeyOriginal = fs.readFileSync(journey, "utf8");
+  fs.writeFileSync(journey, `${journeyOriginal}// an uncommitted hypothesis about this journey\n`);
+  const harnessEnv = {
+    ...process.env,
+    TINE_APP: fixtureApp,
+    TINE_E2E_BUILD_RECEIPT: normalizedReceipt,
+    TINE_E2E_LAUNCH_PROBE: launchProbe,
+    E2E_ARTIFACT_DIR: path.join(temporary, "harness-delta-artifacts"),
+  };
+  const harnessRefused = runNode(
+    [path.join(fixture, "scripts/run-e2e.mjs"), "linux-smoke", "--scenario=multigraph", "--validate-build-receipt-only"],
+    { cwd: fixture, env: harnessEnv },
+  );
+  assert.notEqual(harnessRefused.status, 0, "a journey edit must still refuse by default");
+  const harnessAllowed = runNode(
+    [path.join(fixture, "scripts/run-e2e.mjs"), "linux-smoke", "--scenario=multigraph", "--validate-build-receipt-only", "--allow-harness-delta"],
+    { cwd: fixture, env: harnessEnv },
+  );
+  assert.equal(harnessAllowed.status, 0, harnessAllowed.stderr || harnessAllowed.stdout);
+  assert.match(harnessAllowed.stdout, /HARNESS DELTA \(not candidate evidence\): scripts\/e2e-multigraph\.mjs/);
+  const harnessInRelease = runNode(
+    [path.join(fixture, "scripts/run-e2e.mjs"), "linux-smoke", "--scenario=multigraph", "--validate-build-receipt-only", "--allow-harness-delta"],
+    { cwd: fixture, env: { ...harnessEnv, TINE_E2E_MODE: "release" } },
+  );
+  assert.notEqual(harnessInRelease.status, 0, "a release candidate must be proved on an exact, committed tree");
+  assert.match(harnessInRelease.stderr, /refused in release mode/);
+  fs.writeFileSync(path.join(fixture, "source.txt"), "a product change alongside the journey edit\n");
+  const harnessPlusProduct = runNode(
+    [path.join(fixture, "scripts/run-e2e.mjs"), "linux-smoke", "--scenario=multigraph", "--validate-build-receipt-only", "--allow-harness-delta"],
+    { cwd: fixture, env: harnessEnv },
+  );
+  assert.notEqual(harnessPlusProduct.status, 0, "--allow-harness-delta must not cover a product change");
+  assert.match(harnessPlusProduct.stderr, /cannot cover 1 non-harness path\(s\): source\.txt/);
+  fs.writeFileSync(journey, journeyOriginal);
+  fs.writeFileSync(path.join(fixture, "source.txt"), "after\n");
+
   const fakeApp = path.join(temporary, process.platform === "win32" ? "unreceipted.cmd" : "unreceipted-app");
   if (process.platform === "win32") {
     fs.writeFileSync(fakeApp, `@echo off\r\necho launched > "${launchProbe}"\r\nrem ${asset}\r\n`);
