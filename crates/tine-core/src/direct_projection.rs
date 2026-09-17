@@ -1640,22 +1640,15 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let mut names = std::collections::HashMap::<String, String>::new();
         drain_after(
-            |after: Option<(String, String, String, [u8; 16])>, batch| {
+            |after: Option<(String, String)>, batch| {
                 read.navigation_reference_names_after(
-                    after.as_ref().map(|(path, raw, normalized, id)| {
-                        (path.as_str(), raw.as_str(), normalized.as_str(), id)
-                    }),
+                    after
+                        .as_ref()
+                        .map(|(normalized, raw)| (normalized.as_str(), raw.as_str())),
                     batch,
                 )
             },
-            |row| {
-                (
-                    row.owner_path.clone(),
-                    row.raw_name.clone(),
-                    row.normalized_name.clone(),
-                    row.source_page_id,
-                )
-            },
+            |row| (row.normalized_name.clone(), row.raw_name.clone()),
             |row| {
                 names
                     .entry(crate::refs::page_key(&row.raw_name))

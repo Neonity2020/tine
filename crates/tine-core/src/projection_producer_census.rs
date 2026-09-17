@@ -1430,7 +1430,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.20.3\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.24.0\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1466,6 +1466,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `PhysicalQueryValue::Text(` and `PhysicalQueryValue::Integer(` sites.
     // Read-side binds only. The write crossings asserted above are unchanged,
     // no call site was added to a storage writer, and the pin is still v0.20.3.
+    // 2026-09-17: GH #543 pinned v0.24.0, which keys the navigation
+    // reference-name read to `reference_postings_navigation_names_idx` and
+    // narrows its statement to the DISTINCT it wants. The pin string above
+    // moved v0.20.3 → v0.24.0. `direct_projection.rs`'s cursor closure changed
+    // SHAPE — `navigation_reference_names_after` takes `(normalized_name,
+    // raw_name)` where it took a 4-tuple — but that is an argument change at an
+    // existing call site, not a new or removed one, so no inventory row moved
+    // and the digest below held (the same way the v0.20.2 bump did).
     assert_eq!(
         inventory_digest(&dependency_surface),
         "8d3af88e280015a04f1ad1ebb0c133ac1c115349e0946b455aad60eed1d55721",

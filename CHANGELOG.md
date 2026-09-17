@@ -22,12 +22,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   page names the graph links to, and the index answered that by handing back
   one row per link — 110,000 rows to name 10,010 pages on a 10,000-page
   graph — which took about 1.4 seconds every time it was asked, whatever was
-  typed. That set is now remembered until the graph changes: the first lookup
-  after an edit still costs about 1.4 seconds, and every later one takes about
-  10 milliseconds. Page autocomplete, the quick capture picker, the query
+  typed. That set is now remembered until the graph changes, so a lookup takes
+  about 10 milliseconds. Page autocomplete, the quick capture picker, the query
   sheet's page field and the settings page picker all share the one answer,
   and a newly linked page still appears immediately
   (REG-QUICKSWITCH-REFERENCE-NAMES-MEMO-001).
+
+- The first `[[` page lookup after an edit is no longer slow either. Remembering
+  the set of linked page names fixed every repeat lookup, but the first one
+  after each edit still had to read the whole reference index. The index now
+  keeps those names in an order it can read straight through, without consulting
+  the pages themselves, so collecting every linked name on a 10,000-page graph
+  takes about 20 milliseconds instead of 1.3 seconds. Two consequences worth
+  knowing: the first launch after this update rebuilds the graph's search index
+  once, which takes longer than a normal start, and the finished index uses
+  about 5% more disk. Saving is unaffected
+  (REG-QUICKSWITCH-REFERENCE-NAMES-INDEX-001).
 
 - Searching a large graph no longer reads every block for every keystroke.
   Ctrl+K asked SQLite to materialise and rank every block in the graph and
