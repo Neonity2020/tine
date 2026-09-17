@@ -45,6 +45,17 @@ graph object, split it:
 `crates/tine-core/src/direct_projection.rs::report_projection_failure` is the
 exemplar — the fixed failure family always-on, the raw error behind the flag.
 
+The projection's lifecycle channel, `direct_projection.rs::projection_diag`, is
+a class (a) core line of this kind: it records when a warm validation announces
+itself, how long its inventory read took, how many pages it queued, each worker
+turn's duration and applied rows, how far a partial build has streamed, and the
+generation at which readiness is published (GH #543). Its payload is written at
+every call site rather than at the print site, so the function-anchored census
+cannot see a caller that begins interpolating a page name;
+`projection_lifecycle_lines_carry_no_graph_content` scans the call sites for
+exactly that. What may be interpolated is counts, byte totals, durations,
+generations, booleans and fixed refusal families.
+
 Frontend `console` output is not captured, persisted, or transmitted, and is
 included in no report — but the WebView inspector ships in release builds, so a
 console line is one panel away on a user's machine. Variable-bearing calls

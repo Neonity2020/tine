@@ -321,7 +321,7 @@ owed, a failed write, or an idle projection this session has never validated
 starts the warm there. A warm validation announces itself before it reads
 the first page byte, so a query landing during that read reports
 `NotReady(Indexing)` and retries; it never reads the projection as idle and
-never starts a second warm on the query thread (GH #543). A warm stream is never superseded by a parsed snapshot
+never starts a second warm on the query thread (GH #543). Under `TINE_DEBUG=1` (or `--debug`) the projection records its lifecycle on the runtime diagnostic channel: the warm announcing itself, its inventory read, the pages queued, each worker turn's duration, applied rows and stream state, how far the stream has parsed, the build page-cache switch, a deferred or failed turn, a requested repair, and the generation at which readiness is published. Without the flag none of it is emitted, which the `projection_lifecycle_diagnostics_follow_the_debug_flag` regression pins: these lines name page counts and timings of the user's own graph. A warm stream is never superseded by a parsed snapshot
 that arrives beside it, and generation drift restarts the warm validation
 (resuming at the pages the abandoned stream had not reached) rather than
 falling back to a whole-graph parse; a turn deferred for want of an
