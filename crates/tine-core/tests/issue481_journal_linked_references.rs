@@ -18,6 +18,9 @@
 
 use tine_core::model::Graph;
 
+#[path = "support/ready_query.rs"]
+mod ready_query;
+
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "tine-481-{}-{}-{}",
@@ -55,9 +58,9 @@ fn ordinary_page_target_collects_referrer() {
         vec!["Notes".to_string()],
         "control: an ordinary page target must collect its referrer"
     );
-    let indexed = g
-        .backlinks_bounded_indexed("Target", 10_000, 16 * 1024 * 1024)
-        .expect("indexed backlinks must answer on a settled graph");
+    let indexed = ready_query::when_ready(|| {
+        g.backlinks_bounded_indexed("Target", 10_000, 16 * 1024 * 1024)
+    });
     assert_eq!(group_pages(&indexed.groups), vec!["Notes".to_string()]);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -103,9 +106,9 @@ fn journal_page_target_collects_referrers_by_default_title() {
         want,
         "GH #481: a journal page target must collect referrers by its display title"
     );
-    let indexed = g
-        .backlinks_bounded_indexed("Sep 20th, 2026", 10_000, 16 * 1024 * 1024)
-        .expect("indexed backlinks must answer on a settled graph");
+    let indexed = ready_query::when_ready(|| {
+        g.backlinks_bounded_indexed("Sep 20th, 2026", 10_000, 16 * 1024 * 1024)
+    });
     assert_eq!(group_pages(&indexed.groups), want);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -144,9 +147,9 @@ fn journal_page_target_collects_referrers_by_iso_title_format() {
         vec!["Notes".to_string()],
         "a journal page named in the graph's ISO title format must collect referrers"
     );
-    let indexed = g
-        .backlinks_bounded_indexed("2026-09-20", 10_000, 16 * 1024 * 1024)
-        .expect("indexed backlinks must answer on a settled graph");
+    let indexed = ready_query::when_ready(|| {
+        g.backlinks_bounded_indexed("2026-09-20", 10_000, 16 * 1024 * 1024)
+    });
     assert_eq!(group_pages(&indexed.groups), vec!["Notes".to_string()]);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -188,9 +191,9 @@ fn iso_link_under_default_title_format_reaches_the_journal_page() {
         "looking up the ISO spelling resolves the same journal backlinks"
     );
 
-    let indexed = g
-        .backlinks_bounded_indexed("Sep 20th, 2026", 10_000, 16 * 1024 * 1024)
-        .expect("indexed backlinks must answer on a settled graph");
+    let indexed = ready_query::when_ready(|| {
+        g.backlinks_bounded_indexed("Sep 20th, 2026", 10_000, 16 * 1024 * 1024)
+    });
     assert_eq!(group_pages(&indexed.groups), vec!["Notes".to_string()]);
 
     let _ = std::fs::remove_dir_all(&dir);
