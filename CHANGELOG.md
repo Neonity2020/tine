@@ -17,13 +17,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   flag nothing is recorded (GH #543).
 
 ### Fixed
-- Renaming a page no longer leaves search offering its old name. A delete has
-  always told the index what changed; a rename only told it that something had,
-  and the index is allowed to keep answering from what it already holds while
-  it catches up — so with nothing on its way, it answered with the old name and
-  path forever, and clicking that result opened a page that no longer existed.
-  The rename now hands the index the pages it rewrote, which it already holds,
-  so no rebuild is needed (GH #543).
+- Renaming, merging or rescuing a page no longer leaves search answering from
+  the page it used to be. A delete has always told the index what changed;
+  these three only told it that something had, and the index is allowed to keep
+  answering from what it already holds while it catches up — so with nothing on
+  its way, it answered from the old file forever. A rename kept offering the old
+  name, and clicking that result opened a page that no longer existed; a merge
+  went on returning BOTH pages, one of them already in the trash; a rescued file
+  was never findable under its new name. Each now hands the index the pages it
+  changed, which it already holds, so no rebuild is needed — and hands them over
+  in one step, because a half-told change let the index report itself complete
+  while a page was missing from it (GH #543).
 
 - Search can no longer stop indexing when two parts of the app read the graph
   at the same time. The index kept one slot for "the answer to the check that

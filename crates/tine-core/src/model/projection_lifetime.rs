@@ -212,6 +212,39 @@ impl Graph {
         }
     }
 
+    /// The ONE way a mutation that changes the page SET tells the index what it
+    /// did. Renames, merges and file rescues all move or retire physical page
+    /// paths, and each one that skipped this left the index holding rows for a
+    /// file that no longer exists — with nothing queued, no progress shown, and
+    /// search answering from it indefinitely, because a successful answer never
+    /// reaches the repair a refusal would start (GH #543, third and fourth
+    /// audits). `cache_upsert`/`cache_remove` are the one-page equivalents for
+    /// an ordinary save and delete.
+    ///
+    /// The whole change goes in one call: published one delta at a time, the
+    /// queue can empty between them and readiness is announced for a generation
+    /// that is only half enqueued.
+    pub(super) fn direct_projection_publish_page_set(
+        &self,
+        generation: u64,
+        changes: Vec<crate::direct_projection::PageSetChange>,
+    ) {
+        for change in &changes {
+            if let crate::direct_projection::PageSetChange::Delete { entry } = change {
+                self.session_page_ids.write().unwrap().remove(&entry.path);
+            }
+        }
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_page_set(generation, changes, Arc::new(self.config.parse_config()));
+        }
+    }
+
     pub(super) fn direct_projection_enqueue_delete(&self, generation: u64, entry: PageEntry) {
         self.session_page_ids.write().unwrap().remove(&entry.path);
         if let Some(projection) = self

@@ -2,6 +2,7 @@
 //! to a page, page paths, and create-if-absent for pages and assets.
 
 use super::*;
+use crate::direct_projection::PageSetChange;
 
 impl Graph {
     /// Reconcile a duplicate-day pair: append every block of `src_rel` to the end of
@@ -96,9 +97,12 @@ impl Graph {
         // failure aborts the merge cleanly before any write — and if the dst write
         // then fails we roll the move back, so neither the merge nor the source is
         // lost. On success src sits in the recoverable trash.
+        // Retained for the projection: once the merge commits, this page's file
+        // is in the trash and its rows must go with it.
+        let src_entry = self.entry_for_path(&src);
         let trash = typed_trash_dir(
             &self.root,
-            match self.entry_for_path(&src).map(|e| e.kind) {
+            match src_entry.as_ref().map(|e| e.kind) {
                 Some(PageKind::Journal) => TrashEntryKind::Journal,
                 _ => TrashEntryKind::Page,
             },
@@ -131,6 +135,17 @@ impl Graph {
             let _ = graph_text_write_during_rollback_hook();
             let _ = self.graph_text_move_noreplace(&write, &staged, &src);
             return Err(e);
+        }
+        // GH #543: the merged destination publishes itself through `write_page`,
+        // but nothing retired the source — so search kept returning BOTH pages,
+        // with the index `ready` and claiming to be complete, while the source's
+        // file sat in the trash. A successful answer never reaches the repair a
+        // refusal would start, so the ghost never went away (fourth audit A4-N1).
+        if let Some(entry) = src_entry {
+            self.direct_projection_publish_page_set(
+                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                vec![PageSetChange::Delete { entry }],
+            );
         }
         Ok(())
     }
@@ -227,6 +242,8 @@ impl Graph {
         }
         self.graph_text_create_dir_all(&write, &dir)?;
         let dst = dir.join(format!("{enc}.{ext}"));
+        // Retained for the projection before the move takes the path away.
+        let src_entry = self.entry_for_path(&src);
         self.graph_text_move_noreplace(&write, &src, &dst)?;
         // Reopen only the committed destination, not the graph: this binds the
         // inventory entry to the exact bytes that now own the new name even if an
@@ -257,6 +274,39 @@ impl Graph {
         if let Some((inventory, failures)) = updated_page_inventory {
             self.publish_page_inventory_snapshot(inventory, failures);
         }
+        // GH #543: the rescue moved a page's file and told the index only that
+        // something had changed. Nothing was queued, so search went on offering
+        // the page under its OLD path and never found the rescued one — and
+        // because those answers SUCCEEDED, no repair was ever started (fourth
+        // audit A4-N1). Retire the old path and publish the new one together:
+        // published separately, the queue can empty between them and readiness
+        // is announced over a graph missing the page (A4-N2).
+        let mut page_set = Vec::new();
+        if let Some(entry) = src_entry {
+            page_set.push(PageSetChange::Delete { entry });
+        }
+        let replacement = self
+            .graph_text_read_to_string(&write, &dst)
+            .ok()
+            .and_then(|content| {
+                let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
+                parse_exact_page(self, &provisional, &content).ok()
+            });
+        match replacement {
+            Some((entry, document, revision)) => page_set.push(PageSetChange::Replace {
+                entry,
+                document: Arc::new(document),
+                revision,
+            }),
+            // Stale beats absent: without the replacement the old rows are the
+            // only evidence this page exists, so leave them and let a later warm
+            // reconcile. `page_index_failures` already names it.
+            None => page_set.clear(),
+        }
+        self.direct_projection_publish_page_set(
+            self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+            page_set,
+        );
         Ok(())
     }
 

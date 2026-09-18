@@ -109,6 +109,21 @@ enum PageDelta {
     },
 }
 
+/// One page the caller has added, rewritten or removed, as the model layer
+/// describes it. A mutation that changes the page SET — a rename, a merge, a
+/// file rescue — hands its whole change over as one of these lists; see
+/// [`DirectProjection::enqueue_page_set`].
+pub(crate) enum PageSetChange {
+    Replace {
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+    },
+    Delete {
+        entry: PageEntry,
+    },
+}
+
 /// R6 session identity rule (WARM-IDENTITY-ORDER-CONTRACT.md item 3): where a
 /// replacement's runtime ids came from decides whether the page joins or
 /// leaves `ProjectionShared::session_pages`.
@@ -1507,6 +1522,51 @@ impl DirectProjection {
 
     pub(crate) fn enqueue_delete(&self, generation: u64, entry: PageEntry) {
         self.enqueue_delta(generation, PageDelta::Delete { entry });
+    }
+
+    /// One page-set change published as ONE queue transaction.
+    ///
+    /// The worker drains whatever is queued the moment it wakes, so a producer
+    /// that enqueues its deltas one at a time can have the queue empty
+    /// underneath it: a rename's `Delete` was drained on its own, the watermark
+    /// already read as the new generation, and readiness was published over an
+    /// image whose `Replace` had not been enqueued yet — search answered
+    /// "complete" over a graph that was missing the page entirely (fourth audit
+    /// A4-N2). Taking the lock once makes the whole change one step.
+    ///
+    /// This does not gate ADMISSION: answering from the rows committed so far
+    /// while a producer runs is exactly what partial admission is for. It gates
+    /// only the claim that a generation is COMPLETE.
+    pub(crate) fn enqueue_page_set(
+        &self,
+        generation: u64,
+        changes: Vec<PageSetChange>,
+        parse_config: Arc<ParseConfig>,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        self.shared.ready.store(false, Ordering::Release);
+        let mut pending = self.shared.pending.lock().unwrap();
+        for change in changes {
+            let delta = match change {
+                PageSetChange::Replace {
+                    entry,
+                    document,
+                    revision,
+                } => PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config: Arc::clone(&parse_config),
+                    query_page_order: None, // Filled under this lock, before coalescing.
+                    identity: DeltaIdentity::Live,
+                },
+                PageSetChange::Delete { entry } => PageDelta::Delete { entry },
+            };
+            pending.record_delta(generation, delta);
+        }
+        self.shared.changed.notify_all();
     }
 
     fn enqueue_delta(&self, generation: u64, delta: PageDelta) {

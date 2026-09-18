@@ -2,6 +2,7 @@
 //! lifecycle), page deletion, and the page-mutation target and external-scope guards.
 
 use super::*;
+use crate::direct_projection::PageSetChange;
 
 impl Graph {
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every
@@ -626,6 +627,7 @@ impl Graph {
         // losing them: stale beats absent, and `page_index_failures` already
         // names it (the same rule as an unreadable page in a warm).
         let projection_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let mut page_set = Vec::new();
         for edit in &edits {
             let replacement = self
                 .graph_inventory_entry(&edit.dst)
@@ -636,18 +638,17 @@ impl Graph {
                 continue;
             };
             if edit.is_move && edit.dst != edit.src {
-                self.direct_projection_enqueue_delete(
-                    projection_generation,
-                    edit.src_entry.clone(),
-                );
+                page_set.push(PageSetChange::Delete {
+                    entry: edit.src_entry.clone(),
+                });
             }
-            self.direct_projection_enqueue_replace(
-                projection_generation,
-                effective,
-                Arc::new(document),
+            page_set.push(PageSetChange::Replace {
+                entry: effective,
+                document: Arc::new(document),
                 revision,
-            );
+            });
         }
+        self.direct_projection_publish_page_set(projection_generation, page_set);
         self.finish_successful_rename_editor_lifecycle();
         Ok(RenameOutcome {
             skipped_conflicted_referrers,

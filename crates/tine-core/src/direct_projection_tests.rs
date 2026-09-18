@@ -7308,3 +7308,128 @@ fn a_rename_converges_search_instead_of_answering_with_the_old_name() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The page-set family: a merge retires its source, a rescue retires the old
+/// path and publishes the new one. Each of these moved a physical page out of
+/// the live graph and told the index only that *something* had changed, so the
+/// index kept rows for a file that no longer existed — with nothing queued, no
+/// progress shown, and searches answering from it indefinitely, because a
+/// successful answer never reaches the repair a refusal would start (fourth
+/// audit A4-N1). A rename had the same hole (A3-F1); this is the family it
+/// belonged to.
+#[test]
+fn a_merge_and_a_rescue_tell_the_index_what_they_changed() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh543-page-set-family");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::write(root.join("pages/source.md"), "- zebrafish source\n").unwrap();
+    std::fs::write(root.join("pages/destination.md"), "- destination body\n").unwrap();
+    std::fs::write(root.join("pages/stray.md"), "- narwhal stray\n").unwrap();
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    let pages = |token: &str| {
+        graph.search(token, 20).map(|groups| {
+            let mut names = groups
+                .iter()
+                .map(|group| group.page.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        })
+    };
+    let settle = |want: &str, token: &str| {
+        for _ in 0..600 {
+            if pages(token)
+                .map(|names| names == vec![want.to_owned()])
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+
+    assert_eq!(pages("zebrafish").unwrap(), vec!["source".to_owned()]);
+    let before = projection.shared.pending.lock().unwrap().latest_generation;
+    graph
+        .merge_pages("pages/source.md", "pages/destination.md")
+        .unwrap();
+    assert!(
+        projection.shared.pending.lock().unwrap().latest_generation > before,
+        "the merge queued nothing to retire the source it trashed: {}",
+        projection.debug_state_test()
+    );
+    assert!(
+        !root.join("pages/source.md").exists(),
+        "the fixture did not actually merge"
+    );
+    assert!(
+        settle("destination", "zebrafish"),
+        "search still offers the merged-away page: {:?} — {}",
+        pages("zebrafish"),
+        projection.debug_state_test()
+    );
+
+    assert_eq!(pages("narwhal").unwrap(), vec!["stray".to_owned()]);
+    let before = projection.shared.pending.lock().unwrap().latest_generation;
+    graph
+        .rename_file_to_page("pages/stray.md", "rescued")
+        .unwrap();
+    assert!(
+        projection.shared.pending.lock().unwrap().latest_generation > before,
+        "the rescue queued nothing, so nothing will ever correct the index: {}",
+        projection.debug_state_test()
+    );
+    assert!(
+        settle("rescued", "narwhal"),
+        "search still offers the rescued page under its old path: {:?} — {}",
+        pages("narwhal"),
+        projection.debug_state_test()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A mutation that changes the page SET publishes its whole change through ONE
+/// call. Published a delta at a time, the queue empties between them and the
+/// worker announces readiness for a generation that is only half enqueued — a
+/// rename's `Delete` drained on its own left the index `ready` over a graph
+/// missing the page entirely (fourth audit A4-N2). The one-page save and delete
+/// paths keep their own single-delta entry points; these three do not.
+#[test]
+fn a_page_set_mutation_publishes_through_one_front_door() {
+    for file in ["model/page_rename.rs", "model/pages_merge.rs"] {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join(file),
+        )
+        .unwrap();
+        assert!(
+            source.contains("direct_projection_publish_page_set("),
+            "{file} changes the page set but never tells the index what it changed"
+        );
+        for single in [
+            "direct_projection_enqueue_replace(",
+            "direct_projection_enqueue_delete(",
+        ] {
+            assert!(
+                !source.contains(single),
+                "{file} publishes a page-set change one delta at a time via \
+                 `{single}`. Use `direct_projection_publish_page_set`, which takes \
+                 the queue lock once: otherwise the worker can drain half the \
+                 change and publish readiness over an incomplete generation \
+                 (GH #543, fourth audit A4-N2)."
+            );
+        }
+    }
+}
