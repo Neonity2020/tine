@@ -508,7 +508,7 @@ impl Graph {
             )
         });
         let parse_config = Arc::new(self.config.parse_config());
-        let enqueued = projection.enqueue_warm(
+        let attempt = projection.enqueue_warm(
             generation,
             sources,
             retained,
@@ -517,7 +517,7 @@ impl Graph {
         );
         // From here the queue itself reports Indexing (or the refusal reason).
         drop(in_flight);
-        if !enqueued {
+        let Some(attempt) = attempt else {
             // Refused: the worker is gone or failed without a rebuild queued
             // (nothing a retry changes), or the queue outranks this
             // generation / still holds deltas (a retry sees them drained).
@@ -526,9 +526,11 @@ impl Graph {
             } else {
                 Outcome::Retry
             };
-        }
+        };
         let outcome_started = std::time::Instant::now();
-        let outcome = projection.wait_warm_outcome();
+        // Waiting on THIS attempt's verdict: a warm admitted after this one
+        // owns the queue, and its verdict is not ours to take (GH #543).
+        let outcome = projection.wait_warm_outcome(attempt);
         crate::direct_projection::projection_diag(|| {
             format!(
                 "warm validation returned {} after {}ms",

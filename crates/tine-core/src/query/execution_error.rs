@@ -11,6 +11,16 @@ pub enum QueryReadinessReason {
 }
 
 impl QueryReadinessReason {
+    /// Every variant, so a consumer that must enumerate the wire vocabulary —
+    /// the diagnostic record's reason filter — derives it from here instead of
+    /// keeping a copy that silently falls behind (GH #543, re-audit A2-N3).
+    pub const ALL: [Self; 4] = [
+        Self::Indexing,
+        Self::Recovering,
+        Self::PendingEdits,
+        Self::Busy,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Indexing => "indexing",
@@ -33,6 +43,15 @@ pub enum QueryUnavailableReason {
 }
 
 impl QueryUnavailableReason {
+    /// Every variant; see [`QueryReadinessReason::ALL`].
+    pub const ALL: [Self; 5] = [
+        Self::ProjectionUnavailable,
+        Self::ReadFailed,
+        Self::InvalidSnapshot,
+        Self::UnsupportedRelation,
+        Self::StatisticsResourceLimit,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProjectionUnavailable => "projection_unavailable",

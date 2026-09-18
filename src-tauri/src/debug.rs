@@ -439,6 +439,29 @@ fn set_session_active(active: bool) {
     }
 }
 
+/// The exact reason vocabulary a diagnostic record may carry.
+///
+/// Every code is one this frontend assigned itself from a Rust enum
+/// (`QueryReadinessReason::as_str`, `QueryUnavailableReason::as_str`), never a
+/// message from the backend or a thrown value's own text: an arbitrary string
+/// could carry a path or graph content into a report the user is invited to
+/// publish. `unavailable:` used to be checked by CHARACTER PATTERN, which
+/// admits any lowercase word this side has never heard of — the one thing this
+/// filter exists to refuse (GH #543, re-audit A2-N3).
+fn diagnostic_reason_is_known(reason: &str) -> bool {
+    matches!(reason, "cancelled" | "other")
+        || reason.strip_prefix("not-ready:").is_some_and(|code| {
+            tine_core::query::QueryReadinessReason::ALL
+                .iter()
+                .any(|reason| reason.as_str() == code)
+        })
+        || reason.strip_prefix("unavailable:").is_some_and(|code| {
+            tine_core::query::QueryUnavailableReason::ALL
+                .iter()
+                .any(|reason| reason.as_str() == code)
+        })
+}
+
 fn record_fixed_event(event: &'static str, fields: Map<String, Value>) {
     let mut line = Map::new();
     line.insert("schemaVersion".into(), json!(FLIGHT_SCHEMA_VERSION));
@@ -580,18 +603,7 @@ pub(crate) fn diagnostic_ipc_event(
     // written, so no message text, path or graph content can reach a report
     // the user may publish. Without it a reporter's "7,520 failed run_query"
     // says nothing about whether they were waiting or broken (GH #543).
-    if let Some(reason) = reason.filter(|reason| {
-        matches!(reason.as_str(), "cancelled" | "other")
-            || reason
-                .strip_prefix("not-ready:")
-                .is_some_and(|code| matches!(code, "indexing" | "recovering" | "busy"))
-            || reason.strip_prefix("unavailable:").is_some_and(|code| {
-                code.len() <= 32
-                    && code
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_')
-            })
-    }) {
+    if let Some(reason) = reason.filter(|reason| diagnostic_reason_is_known(reason)) {
         fields.insert("reason".into(), json!(reason));
     }
     record_fixed_event("ipc.command", fields);
@@ -876,6 +888,45 @@ pub(crate) fn clear_diagnostics() -> Result<(), crate::command_error::CommandErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GH #543 (re-audit A2-N3): the diagnostic record's reason filter promised
+    /// a fixed vocabulary and delivered a character pattern for one of its two
+    /// arms, while the other had silently fallen behind a fourth readiness
+    /// reason. Both halves are asserted here: every code the core can actually
+    /// produce survives the filter, and nothing else does.
+    #[test]
+    fn the_diagnostic_reason_filter_is_exactly_the_cores_vocabulary() {
+        for reason in tine_core::query::QueryReadinessReason::ALL {
+            let wire = format!("not-ready:{}", reason.as_str());
+            assert!(
+                diagnostic_reason_is_known(&wire),
+                "the core produces {wire} and the diagnostic drops it"
+            );
+        }
+        for reason in tine_core::query::QueryUnavailableReason::ALL {
+            let wire = format!("unavailable:{}", reason.as_str());
+            assert!(
+                diagnostic_reason_is_known(&wire),
+                "the core produces {wire} and the diagnostic drops it"
+            );
+        }
+        assert!(diagnostic_reason_is_known("cancelled"));
+        assert!(diagnostic_reason_is_known("other"));
+        for refused in [
+            // A lowercase word no enum produces: what the character pattern let
+            // through, and the only thing this filter exists to refuse.
+            "unavailable:no_such_reason",
+            "not-ready:no_such_reason",
+            "unavailable:/home/someone/graph/pages/secret",
+            "the projection at /tmp/graph could not be read",
+            "",
+        ] {
+            assert!(
+                !diagnostic_reason_is_known(refused),
+                "the diagnostic would have written {refused:?} into a report the user may publish"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "child-process probe for stderr capture"]

@@ -1295,10 +1295,18 @@ class TauriBackend implements Backend {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
       releaseSlowTicket();
       recordGraphOpenCommand(cmd, started, "failed");
-      reportPhase("failed", performance.now() - started, diagnosticFailureReason(error));
       // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
-      // save_page and left the resolver recovery branch dead).
-      throw classifyNativeCallError(error);
+      // save_page and left the resolver recovery branch dead) — and BEFORE
+      // reporting. `invoke` rejects with the wire payload, an object or a JSON
+      // string, never a frontend error instance, while
+      // `diagnosticFailureReason` recognises only instances. Reporting first
+      // recorded every native failure as `other`, erasing precisely the
+      // distinction the diagnostic exists to draw: a retryable wait for the
+      // index, a terminal unavailable projection, and a cancelled job
+      // (GH #543, re-audit A2-N3).
+      const classified = classifyNativeCallError(error);
+      reportPhase("failed", performance.now() - started, diagnosticFailureReason(classified));
+      throw classified;
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
     releaseSlowTicket();

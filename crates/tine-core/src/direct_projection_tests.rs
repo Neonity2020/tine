@@ -4166,6 +4166,12 @@ fn partial_admission_graph(tag: &str, count: usize) -> (PathBuf, PathBuf) {
     (root, database)
 }
 
+/// `enqueue_warm` hands back the attempt id its verdict is keyed by; a test
+/// that queues a warm must wait on that exact id (GH #543, re-audit A2-B1).
+fn require_warm(attempt: Option<u64>) -> u64 {
+    attempt.expect("the warm was refused by the queue")
+}
+
 fn warm_sources(graph: &Graph) -> (Vec<(PageEntry, String)>, u64) {
     let mut text_bytes = 0u64;
     let sources = graph
@@ -4229,14 +4235,14 @@ fn a_query_is_admitted_over_the_partial_index_while_a_stream_is_open() {
     let (sources, text_bytes) = warm_sources(&graph);
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(
+    let attempt = require_warm(projection.enqueue_warm(
         generation,
         sources,
         Vec::new(),
         Arc::clone(&config),
-        text_bytes
+        text_bytes,
     ));
-    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome(attempt) else {
         panic!("a cold projection names every page");
     };
     assert_eq!(pages.len(), 40);
@@ -4331,14 +4337,14 @@ fn a_drift_keeps_serving_the_rows_a_validated_session_already_holds() {
     // validated — the whole inventory has been compared to disk.
     let (sources, text_bytes) = warm_sources(&graph);
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(
+    let attempt = require_warm(projection.enqueue_warm(
         generation,
         sources,
         Vec::new(),
         Arc::clone(&config),
-        text_bytes
+        text_bytes,
     ));
-    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome(attempt) else {
         panic!("a cold projection names every page");
     };
     assert!(projection.warm_stream_admit(generation, pages.len()));
@@ -4361,14 +4367,14 @@ fn a_drift_keeps_serving_the_rows_a_validated_session_already_holds() {
     graph.drift_generation_test();
     let (sources, text_bytes) = warm_sources(&graph);
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(
+    let attempt = require_warm(projection.enqueue_warm(
         generation,
         sources,
         Vec::new(),
         Arc::clone(&config),
-        text_bytes
+        text_bytes,
     ));
-    let WarmOutcome::Replacements(_) = projection.wait_warm_outcome() else {
+    let WarmOutcome::Replacements(_) = projection.wait_warm_outcome(attempt) else {
         panic!("the edited page is a replacement");
     };
     assert!(
@@ -4411,14 +4417,14 @@ fn a_parsed_snapshot_beside_an_open_stream_does_not_supersede_it() {
     let (sources, text_bytes) = warm_sources(&graph);
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(
+    let attempt = require_warm(projection.enqueue_warm(
         generation,
         sources,
         Vec::new(),
         Arc::clone(&config),
-        text_bytes
+        text_bytes,
     ));
-    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome(attempt) else {
         panic!("a cold projection names every page");
     };
     assert!(projection.warm_stream_admit(generation, 1));
@@ -5180,6 +5186,7 @@ fn empty_projection_shared() -> ProjectionShared {
         worker_available: AtomicBool::new(true),
         worker_failed: AtomicBool::new(false),
         worker_busy: AtomicBool::new(false),
+        worker_building: AtomicBool::new(false),
         worker_finished: AtomicBool::new(false),
         worker_resources: Mutex::new(Some(Vec::new())),
         validated: AtomicBool::new(false),
@@ -6457,8 +6464,14 @@ fn a_failed_read_during_a_stream_does_not_latch_rebuild_forever() {
     let (sources, bytes) = warm_sources(&graph);
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, Vec::new(), config.clone(), bytes));
-    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+    let attempt = require_warm(projection.enqueue_warm(
+        generation,
+        sources,
+        Vec::new(),
+        config.clone(),
+        bytes,
+    ));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome(attempt) else {
         panic!("expected replacements");
     };
 
@@ -6599,8 +6612,14 @@ fn a_parsed_cache_does_not_own_readiness_while_an_inventory_is_owed() {
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
     let (sources, bytes) = warm_sources(&graph);
-    assert!(projection.enqueue_warm(generation, sources, Vec::new(), config.clone(), bytes));
-    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+    let attempt = require_warm(projection.enqueue_warm(
+        generation,
+        sources,
+        Vec::new(),
+        config.clone(),
+        bytes,
+    ));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome(attempt) else {
         panic!("expected replacements");
     };
     assert!(projection.enqueue_warm_stream(
@@ -6615,8 +6634,9 @@ fn a_parsed_cache_does_not_own_readiness_while_an_inventory_is_owed() {
     // beside it — the snapshot is dropped, the cache stays.
     std::fs::write(root.join("pages/a.md"), "- sentinel543 changed\n").unwrap();
     let (sources, bytes) = warm_sources(&graph);
-    assert!(projection.enqueue_warm(generation, sources, Vec::new(), config, bytes));
-    let WarmOutcome::Replacements(_) = projection.wait_warm_outcome() else {
+    let attempt =
+        require_warm(projection.enqueue_warm(generation, sources, Vec::new(), config, bytes));
+    let WarmOutcome::Replacements(_) = projection.wait_warm_outcome(attempt) else {
         panic!("expected replacements");
     };
     graph.with_pages(|pages| assert_eq!(pages.len(), 1));
@@ -6696,14 +6716,111 @@ fn a_torn_projection_header_is_recreated_rather_than_stopping_the_worker() {
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(5)));
 }
 
-/// GH #543: `install_built` validates a parsed snapshot's generation under the
-/// cache write lock, then RELEASES that lock before enqueueing it. A save can
-/// publish the next generation and queue its delta in that gap — and the
-/// arriving snapshot used to clear every delta and set `latest_generation`
-/// back to its own, older, value. The saved text then simply was not in search
-/// until something else happened to touch the page. A snapshot older than the
-/// queue is not a supersession, it is a rollback.
+/// GH #543 (re-audit A2-B1): the stolen verdict the idle escape could NOT
+/// catch. A warm descheduled before reading the slot used to take a LATER
+/// warm's verdict; that later warm then waited for a producer that had already
+/// run, and the earlier one acted on a verdict computed for a generation it
+/// does not carry. The escape hatch cannot fire for the robbed waiter, because
+/// its own stream is open — so nothing released it, and it holds the
+/// process-wide warm mutex while every later graph warm queues behind it.
 #[test]
+fn a_warm_does_not_take_a_later_attempts_verdict() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-stolen-verdict");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+    let config = Arc::new(graph.config.parse_config());
+
+    // Attempt A announces a warm and is descheduled before reading its verdict.
+    let (sources, bytes) = warm_sources(&graph);
+    let attempt_a = require_warm(projection.enqueue_warm(
+        graph.cache_generation(),
+        sources,
+        Vec::new(),
+        Arc::clone(&config),
+        bytes,
+    ));
+    for _ in 0..500 {
+        if projection
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .warm_outcome
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        projection
+            .shared
+            .pending
+            .lock()
+            .unwrap()
+            .warm_outcome
+            .is_some(),
+        "the first warm's verdict never landed: {}",
+        projection.debug_state_test()
+    );
+
+    // The source changes underneath it and attempt B is admitted, clearing the
+    // slot and taking over the stream.
+    let path = graph.walk_entries_test()[0].path.clone();
+    std::fs::write(&path, "- gh543 stolen verdict sentinel\n").unwrap();
+    graph.drift_generation_test();
+    for _ in 0..500 {
+        let idle = {
+            let pending = projection.shared.pending.lock().unwrap();
+            !pending.has_work() && pending.warm_stream.is_none() && pending.order.is_none()
+        };
+        if idle && !projection.shared.worker_busy.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (sources, bytes) = warm_sources(&graph);
+    let attempt_b = require_warm(projection.enqueue_warm(
+        graph.cache_generation(),
+        sources,
+        Vec::new(),
+        config,
+        bytes,
+    ));
+    assert_ne!(attempt_a, attempt_b);
+
+    // A wakes. B's verdict is not A's to take.
+    let outcome_a = projection.wait_warm_outcome(attempt_a);
+    assert!(
+        matches!(outcome_a, WarmOutcome::Superseded),
+        "the first warm took a verdict computed for another attempt: {outcome_a:?}"
+    );
+
+    // And B still receives its own, on a thread so a regression times out here
+    // rather than hanging the suite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = Arc::clone(&projection);
+    let joined = std::thread::spawn(move || {
+        let _ = tx.send(waiter.wait_warm_outcome(attempt_b));
+    });
+    let outcome_b = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the second warm never received its own verdict");
+    joined.join().unwrap();
+    assert!(
+        !matches!(outcome_b, WarmOutcome::Superseded | WarmOutcome::Failed),
+        "the second warm lost its own verdict: {outcome_b:?} {}",
+        projection.debug_state_test()
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(5)));
+}
+
 /// GH #543 (audit finding F1): `warm_outcome` is a single slot with no attempt
 /// key, so a warm that is descheduled before it reads the slot can find its
 /// outcome already taken by a second warm. Such a waiter must not block
@@ -6723,15 +6840,18 @@ fn a_warm_waiter_with_no_producer_does_not_block_forever() {
 
     // The state a loser of that race is left in: nothing queued, an idle
     // worker, and an empty outcome slot.
-    {
+    let attempt = {
         let pending = projection.shared.pending.lock().unwrap();
         assert!(pending.warm.is_none() && pending.warm_stream.is_none());
         assert!(pending.warm_outcome.is_none());
-    }
+        // The CURRENT attempt id: this waiter has not been superseded, so only
+        // the idle-worker escape can release it.
+        pending.warm_attempt
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     let waiter = Arc::clone(&projection);
     let joined = std::thread::spawn(move || {
-        let _ = tx.send(waiter.wait_warm_outcome());
+        let _ = tx.send(waiter.wait_warm_outcome(attempt));
     });
     let outcome = rx
         .recv_timeout(Duration::from_secs(10))
@@ -6786,8 +6906,9 @@ fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
     assert_eq!(retained.len(), 1, "fixture did not contain the page");
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, retained, config, bytes));
-    let outcome = projection.wait_warm_outcome();
+    let attempt =
+        require_warm(projection.enqueue_warm(generation, sources, retained, config, bytes));
+    let outcome = projection.wait_warm_outcome(attempt);
     wait_ready(&graph);
 
     assert!(
@@ -6801,6 +6922,70 @@ fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
     );
 }
 
+/// GH #543 (re-audit A2-N2): `retained` keeps an unreadable page's EXISTING
+/// rows — but on a COLD or just-reset index that page has no rows at all, and
+/// naming it in the order inventory broke `reconcile_query_page_order`'s
+/// exact-cover requirement. The worker read that bookkeeping mismatch as a
+/// failed projection turn: `worker_failed`, readiness revoked, a full rebuild
+/// demanded. One unreadable file failed indexing for the whole graph.
+#[test]
+fn a_retained_page_with_no_rows_yet_does_not_fail_the_whole_graph() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-retained-cold");
+    std::fs::write(root.join("pages/unreadable.md"), "- gh543 cold retained\n").unwrap();
+    let graph = Graph::open(&root);
+    // A COLD projection: nothing has ever been lowered, so no page has a row.
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+
+    // The first walk already cannot read that page: it is absent from
+    // `sources` and named `retained`, with nothing stored to retain.
+    let (all, bytes) = warm_sources(&graph);
+    let (unreadable, sources): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|(entry, _)| entry.rel_path.ends_with("unreadable.md"));
+    let retained = unreadable
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1, "fixture did not contain the page");
+    let config = Arc::new(graph.config.parse_config());
+    let generation = graph.cache_generation();
+    let attempt =
+        require_warm(projection.enqueue_warm(generation, sources, retained, config.clone(), bytes));
+    let outcome = projection.wait_warm_outcome(attempt);
+    if let crate::direct_projection::WarmOutcome::Replacements(pages) = outcome {
+        assert!(projection.enqueue_warm_stream(
+            generation,
+            pages.into_iter().map(stream_item).collect(),
+            config
+        ));
+        assert!(projection.finish_warm_stream(generation));
+    }
+    wait_ready(&graph);
+
+    assert!(
+        projection.worker_available() && !projection.worker_failed(),
+        "one unreadable page failed the whole projection turn: {}",
+        projection.debug_state_test()
+    );
+    assert!(
+        !graph.search("target", 50).unwrap().is_empty(),
+        "the readable pages never became searchable: {}",
+        projection.debug_state_test()
+    );
+}
+
+/// GH #543: `install_built` validates a parsed snapshot's generation under the
+/// cache write lock, then RELEASES that lock before enqueueing it. A save can
+/// publish the next generation and queue its delta in that gap — and the
+/// arriving snapshot used to clear every delta and set `latest_generation`
+/// back to its own, older, value. The saved text then simply was not in search
+/// until something else happened to touch the page. A snapshot older than the
+/// queue is not a supersession, it is a rollback.
+#[test]
 fn a_full_snapshot_older_than_the_queue_does_not_roll_it_back() {
     let _serial = serialize_projection_tests();
     let root = r6_graph("gh543-stale-full");
@@ -6874,6 +7059,88 @@ fn a_full_snapshot_older_than_the_queue_does_not_roll_it_back() {
     assert!(
         found,
         "the save was lost to a stale snapshot: {}",
+        projection.debug_state_test()
+    );
+}
+
+/// GH #543 (re-audit A2-N1): the rebuild EXCEPTION to the rule above. A reset
+/// repair must apply its payload — refusing it leaves an emptied index with
+/// nothing queued to fill it — but the payload is a parsed snapshot of an
+/// older generation, not a fresh read of disk. Clearing the queue beside it
+/// erased a save that had already committed, and the stored revision then
+/// asserted the old rows were current, so no later comparison corrected it.
+#[test]
+fn a_rebuild_does_not_discard_a_save_newer_than_its_snapshot() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-stale-full-rebuild");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    let mut pages = Vec::new();
+    let mut revisions = HashMap::new();
+    for entry in graph.list_pages() {
+        revisions.insert(
+            entry.path.clone(),
+            graph.load_page(&entry).unwrap().rev.unwrap(),
+        );
+        let mut document = crate::doc::parse(&std::fs::read_to_string(&entry.path).unwrap());
+        crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+        pages.push((entry, Arc::new(document)));
+    }
+    let pages = Arc::new(pages);
+    let revisions = Arc::new(revisions);
+    let config = Arc::clone(
+        &projection
+            .shared
+            .committed_registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .config,
+    );
+    let stale_generation = graph.cache_generation();
+
+    // The save lands while the repair holds its snapshot.
+    let entry = graph.list_pages().into_iter().next().unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "gh543 rebuild sentinel".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    let saved_generation = graph.cache_generation();
+    assert!(saved_generation > stale_generation);
+
+    // A reset repair: the database is emptied, so this older payload IS
+    // applied — and the newer delta must survive on top of it.
+    projection.request_rebuild();
+    projection.enqueue_full(stale_generation, pages, revisions, config);
+    let latest = projection.shared.pending.lock().unwrap().latest_generation;
+    assert!(
+        latest >= saved_generation,
+        "the rebuild rolled the queue back from generation {saved_generation} to {latest}: {}",
+        projection.debug_state_test()
+    );
+
+    let mut found = false;
+    for _ in 0..600 {
+        if graph
+            .search("gh543 rebuild sentinel", 50)
+            .map(|groups| !groups.is_empty())
+            .unwrap_or(false)
+        {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        found,
+        "the save was erased by the rebuild's older snapshot: {}",
         projection.debug_state_test()
     );
 }

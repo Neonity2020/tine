@@ -918,7 +918,23 @@ impl Graph {
             (reset, projection.begin_repair())
         };
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
+        // Take the revisions WHILE STILL HOLDING the cache read lock. A
+        // publisher inserts into `disk_revs` and bumps `cache_gen` under one
+        // held cache WRITE lock (`page_cache.rs`), releasing `disk_revs`
+        // between the two — so a reader that lets go of the cache lock in
+        // between can read the NEW revision and then re-read the OLD
+        // generation. The re-check below passes, and stale documents are
+        // published stamped with the hash of the current file, which defeats
+        // the very comparison a later warm would use to notice they are stale
+        // (re-audit A2-N1). Lock order is cache → disk_revs, the same order
+        // the publisher takes, so holding both here cannot deadlock.
+        let snapshot = self
+            .cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|pages| (Arc::clone(pages), self.disk_revs.read().unwrap().clone()));
+        let Some((pages, revisions)) = snapshot else {
             // The existing worker resets the disposable projection before
             // validating this source inventory, then consumes bounded page
             // batches. Never call warm_cache here: its legacy fallback builds
@@ -939,15 +955,11 @@ impl Graph {
             }
             return;
         };
-        let revisions = self.disk_revs.read().unwrap().clone();
-        // The generation, the pages and the revisions were read under three
-        // separate locks, so a save landing between them pairs OLD documents
-        // with NEW source revisions — which stamps stale content with the hash
-        // of the current file and defeats the very comparison a later warm
-        // would use to notice it was stale. Re-read the generation: if it
-        // moved, this pair may straddle two of them and must not be published
-        // (GH #543). The obligation a `reset` created goes with it, or it would
-        // be latched with no payload behind it.
+        // The pages and revisions are now coherent with each other, but the
+        // generation was read before either. Re-read it: if it moved, this pair
+        // is older than the queue and must not be published (GH #543). The
+        // obligation a `reset` created goes with it, or it would be latched
+        // with no payload behind it.
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             crate::direct_projection::projection_diag(|| {
                 "repair snapshot abandoned: generation moved while it was assembled".to_owned()

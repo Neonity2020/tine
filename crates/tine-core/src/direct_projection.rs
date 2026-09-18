@@ -234,7 +234,15 @@ struct PendingProjection {
     /// R6 warm validation queued for the worker.
     warm: Option<PendingWarm>,
     /// R6: the worker's verdict on the last warm validation.
-    warm_outcome: Option<WarmOutcome>,
+    /// R6: the decided warm's verdict, KEYED BY THE ATTEMPT that asked for
+    /// it. One unkeyed slot let a warm that was descheduled before reading it
+    /// take a later attempt's verdict, leaving that later attempt waiting for
+    /// a producer that had already run — forever, while holding the
+    /// process-wide warm mutex (GH #543, re-audit A2-B1).
+    warm_outcome: Option<(u64, WarmOutcome)>,
+    /// The attempt id of the most recent admitted warm. Monotonic; a waiter
+    /// whose id is older has been superseded and must not wait.
+    warm_attempt: u64,
     /// R6: a warm stream is open at this generation. Readiness never publishes
     /// while it is `Some`, and deltas recorded meanwhile carry no order
     /// position (see `PageDelta::Replace::query_page_order`).
@@ -351,6 +359,14 @@ struct ProjectionShared {
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
+    /// True while the worker is EXECUTING a turn that carries a build — a full
+    /// snapshot, a warm validation, a stream batch, or the closing order. The
+    /// queue empties the moment the worker takes that payload, so testing the
+    /// queue alone reported `None` (idle) for the whole SQL transaction, and a
+    /// surface that reruns on the completion edge announced a build finished
+    /// in its most loaded moment (GH #543, re-audit A2-F1). `worker_busy` on
+    /// its own is too broad: an ordinary one-page save turn is not a build.
+    worker_building: AtomicBool,
     /// The writer worker has RETURNED, and every resource it owned — the
     /// SQLite writer connection and the exclusive writer lease — is closed.
     ///
@@ -847,6 +863,7 @@ impl DirectProjection {
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
             worker_busy: AtomicBool::new(false),
+            worker_building: AtomicBool::new(false),
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
             awaiting_inventory: AtomicBool::new(false),
@@ -1016,10 +1033,14 @@ impl DirectProjection {
         // the page. The snapshot's own pages are stale by construction at that
         // point — the delta is the newer truth (GH #543).
         //
-        // A requested rebuild is the exception: it resets the database, so its
-        // payload must be applied even though the deltas are newer. They are
-        // re-derived from source by the inventory the rebuild carries.
-        if generation < pending.latest_generation && !pending.rebuild {
+        // A requested rebuild is the exception, because it RESETS the database:
+        // refusing its payload would leave an empty index with nothing queued
+        // to fill it. So the snapshot is applied — but its own pages are still
+        // the older truth, and clearing the queue beside it erased saved text
+        // that had already committed (re-audit A2-N1). The deltas are kept and
+        // replay on top of the snapshot, and the generation is not lowered.
+        let stale = generation < pending.latest_generation;
+        if stale && !pending.rebuild {
             projection_diag(|| {
                 format!(
                     "full refused: snapshot generation={generation} older than queue {}",
@@ -1030,14 +1051,58 @@ impl DirectProjection {
         }
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
-        pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        if stale {
+            // The surviving deltas must stay in the order: a page that exists
+            // only in them is absent from this older snapshot, and the order
+            // turn requires the inventory to cover every page the projection
+            // ends up holding. Their positions are re-derived by that turn, so
+            // each one is re-marked unordered rather than carrying a position
+            // from the map this seed replaces.
+            let mut ordered = pages
+                .iter()
+                .map(|(entry, _)| entry.rel_path.clone())
+                .collect::<Vec<_>>();
+            let covered = ordered
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            ordered.extend(
+                pending
+                    .deltas
+                    .iter()
+                    .filter(|(path, (_, delta))| {
+                        matches!(delta, PageDelta::Replace { .. }) && !covered.contains(*path)
+                    })
+                    .map(|(path, _)| path.clone()),
+            );
+            pending.seed_page_order(ordered.iter().map(String::as_str));
+            for (_, delta) in pending.deltas.values_mut() {
+                if let PageDelta::Replace {
+                    query_page_order, ..
+                } = delta
+                {
+                    *query_page_order = None;
+                }
+            }
+            projection_diag(|| {
+                format!(
+                    "rebuild kept {} newer delta(s) over snapshot generation={generation} queue={}",
+                    pending.deltas.len(),
+                    pending.latest_generation
+                )
+            });
+        } else {
+            pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        }
         pending.full = Some(PendingFull {
             pages,
             revisions,
             parse_config,
         });
-        pending.deltas.clear();
-        pending.latest_generation = generation;
+        if !stale {
+            pending.deltas.clear();
+            pending.latest_generation = generation;
+        }
         // R6: a complete parsed snapshot owns readiness from here. A warm
         // validation or stream still in flight must not lower beside it — its
         // deltas carry no order positions and would erase the snapshot's.
@@ -1046,7 +1111,7 @@ impl DirectProjection {
             pending.warm_stream = None;
             pending.order = None;
             pending.warm_superseded = true;
-            pending.warm_outcome = Some(WarmOutcome::Superseded);
+            pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Superseded));
         }
         pending.needs_full = false;
         self.shared.changed.notify_all();
@@ -1064,9 +1129,9 @@ impl DirectProjection {
         retained: Vec<PageEntry>,
         parse_config: Arc<ParseConfig>,
         text_bytes: u64,
-    ) -> bool {
+    ) -> Option<u64> {
         if !self.shared.worker_available.load(Ordering::Acquire) {
-            return false;
+            return None;
         }
         let mut pending = self.shared.pending.lock().unwrap();
         // `needs_full` (an abandoned stream) is satisfied by this warm: the
@@ -1093,7 +1158,7 @@ impl DirectProjection {
                     self.shared.worker_failed.load(Ordering::Acquire),
                 )
             });
-            return false;
+            return None;
         }
         let sources_len = sources.len();
         self.shared
@@ -1112,6 +1177,8 @@ impl DirectProjection {
         // again in the same turn when the outcome is `Clean`.
         pending.warm_stream = Some(generation);
         pending.warm_outcome = None;
+        pending.warm_attempt += 1;
+        let attempt = pending.warm_attempt;
         pending.warm_superseded = false;
         pending.warm = Some(PendingWarm {
             sources,
@@ -1123,11 +1190,11 @@ impl DirectProjection {
         self.shared.changed.notify_all();
         projection_diag(|| {
             format!(
-                "warm queued generation={generation} pages={sources_len} text_mib={:.1}",
+                "warm queued attempt={attempt} generation={generation} pages={sources_len} text_mib={:.1}",
                 text_bytes as f64 / (1024.0 * 1024.0)
             )
         });
-        true
+        Some(attempt)
     }
 
     /// GH #543 partial admission: `(indexed, total)` while a warm validation
@@ -1162,7 +1229,11 @@ impl DirectProjection {
             || pending.needs_full
             || self.shared.awaiting_inventory.load(Ordering::Acquire)
             || self.shared.warms_in_flight.load(Ordering::Acquire) > 0
-            || self.shared.repairs_in_flight.load(Ordering::Acquire) > 0;
+            || self.shared.repairs_in_flight.load(Ordering::Acquire) > 0
+            // The queue empties the instant the worker TAKES the payload, so
+            // without this the whole SQL transaction of a full build read as
+            // idle (re-audit A2-F1).
+            || self.shared.worker_building.load(Ordering::Acquire);
         if !in_flight || pending.stop {
             return None;
         }
@@ -1175,25 +1246,47 @@ impl DirectProjection {
         Some((indexed, total))
     }
 
-    /// Block until the worker has decided the queued warm validation.
-    pub(crate) fn wait_warm_outcome(&self) -> WarmOutcome {
+    /// Block until the worker has decided the warm `attempt` asked for.
+    ///
+    /// `attempt` is the id [`Self::enqueue_warm`] returned. A waiter only ever
+    /// takes ITS OWN verdict: the slot used to be a single unkeyed value, so a
+    /// warm descheduled before reading it could take a later attempt's verdict
+    /// and leave that later attempt waiting for a producer that had already
+    /// run. Nothing scheduled another — and the loser holds the process-wide
+    /// warm mutex, so every later graph warm queued behind it and the app
+    /// stopped indexing altogether (GH #543, re-audit A2-B1).
+    pub(crate) fn wait_warm_outcome(&self, attempt: u64) -> WarmOutcome {
         let mut pending = self.shared.pending.lock().unwrap();
         loop {
-            if let Some(outcome) = pending.warm_outcome.take() {
-                return outcome;
+            match pending.warm_outcome.as_ref().map(|(id, _)| *id) {
+                // This attempt's own verdict.
+                Some(id) if id == attempt => {
+                    return pending.warm_outcome.take().expect("just observed").1;
+                }
+                // Somebody else's. Leave it for them; a verdict for a LATER
+                // attempt also proves this one was superseded.
+                Some(_) => return WarmOutcome::Superseded,
+                None => {}
             }
             if !self.shared.worker_available.load(Ordering::Acquire) || pending.stop {
                 return WarmOutcome::Failed;
             }
-            // `warm_outcome` is ONE slot with no attempt key, so a second warm
-            // that started while this waiter was descheduled clears the slot
-            // and publishes its own outcome; both waiters then race for that
-            // one value and the loser would block here forever — while holding
-            // the process-wide warm mutex, so every later graph warm queues
-            // behind it (GH #543). Nothing queued and an idle worker means no
-            // outcome is coming for THIS waiter: say so instead of waiting.
-            // The caller checks `owes_inventory()` before reading Superseded
-            // as "another producer owns readiness".
+            // A later warm was admitted, which cleared the slot and took over
+            // the stream. This attempt's verdict is never coming.
+            if pending.warm_attempt != attempt {
+                projection_diag(|| {
+                    format!(
+                        "warm attempt={attempt} superseded by attempt={}",
+                        pending.warm_attempt
+                    )
+                });
+                return WarmOutcome::Superseded;
+            }
+            // Belt and braces for an attempt that is still current but has
+            // nothing left to produce its verdict: nothing queued and an idle
+            // worker means no outcome is coming. The caller checks
+            // `owes_inventory()` before reading Superseded as "another
+            // producer owns readiness".
             if pending.warm.is_none()
                 && pending.warm_stream.is_none()
                 && !self.shared.worker_busy.load(Ordering::Acquire)
@@ -1298,8 +1391,12 @@ impl DirectProjection {
 
     /// Abandon an open warm stream (R6: cancellation, drift, or a refused
     /// batch). Rows already validated or streamed are consistent, but the
-    /// replacements not yet streamed are stale; only a full snapshot may
-    /// publish readiness again. In-scope scenario: a save racing the warm.
+    /// replacements not yet streamed are stale, so a COMPLETE INVENTORY is
+    /// owed before readiness may be published again — a full snapshot or the
+    /// next warm validation, which resumes from exactly those replacements
+    /// (`needs_full`, `owes_inventory`). This used to say only a full snapshot
+    /// would do, which is what made drift fall back to a whole-graph parse
+    /// (GH #543). In-scope scenario: a save racing the warm.
     /// Returns whether a full snapshot superseded the stream — in which case
     /// that snapshot owns readiness and the caller has nothing to fall back to.
     pub(crate) fn abandon_warm_stream(&self, generation: u64) -> bool {
@@ -2175,7 +2272,7 @@ impl DirectProjection {
             pending.full.is_some(),
             pending.deltas.len(),
             pending.warm.is_some(),
-            pending.warm_outcome.as_ref().map(|outcome| match outcome {
+            pending.warm_outcome.as_ref().map(|(_, outcome)| match outcome {
                 WarmOutcome::Clean => "Clean".to_owned(),
                 WarmOutcome::Replacements(pages) => format!("Replacements({})", pages.len()),
                 WarmOutcome::Superseded => "Superseded".to_owned(),
@@ -2538,6 +2635,13 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 continue;
             }
             shared.worker_busy.store(true, Ordering::Release);
+            shared.worker_building.store(
+                pending.full.is_some()
+                    || pending.warm.is_some()
+                    || pending.order.is_some()
+                    || pending.warm_stream.is_some(),
+                Ordering::Release,
+            );
             if std::mem::take(&mut pending.needs_full) {
                 awaiting_inventory = true;
                 shared.awaiting_inventory.store(true, Ordering::Release);
@@ -2550,7 +2654,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 if pending.warm.take().is_some() {
                     pending.warm_stream = None;
                     pending.warm_superseded = true;
-                    pending.warm_outcome = Some(WarmOutcome::Superseded);
+                    pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Superseded));
                 }
                 None
             } else {
@@ -2710,9 +2814,45 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     if !applied.stream_open
                         && (stream_closed || warm_clean || applied.unordered_replacements)
                     {
-                        let inventory = inventory.ok_or_else(|| {
+                        let mut inventory = inventory.ok_or_else(|| {
                             "the order turn ran without its queue inventory".to_owned()
                         })?;
+                        // GH #543: the order turn reconciles over pages the
+                        // projection HOLDS — `reconcile_query_page_order`
+                        // requires the supplied inventory to equal the stored
+                        // `pages` set exactly, and treats any mismatch as a
+                        // failed projection turn (`worker_failed`, readiness
+                        // revoked, a full rebuild demanded). The queue's map
+                        // can legitimately name a page that was never lowered:
+                        // a page the walk could not READ keeps whatever rows it
+                        // has (`PendingWarm::retained`) and is seeded into the
+                        // order, and a page whose bytes fail mid-stream is
+                        // skipped rather than deleted. On a cold or just-reset
+                        // index those pages have no rows at all, so naming them
+                        // here failed the whole graph's indexing over one
+                        // unreadable file. Drop them from THIS turn's inventory
+                        // only: the map keeps the path, and the next successful
+                        // read lowers it back into its place. The opposite
+                        // direction — a stored page the queue does not name —
+                        // is a real bookkeeping defect and still fails loudly.
+                        let stored = writer_slot
+                            .as_ref()
+                            .unwrap()
+                            .source_delta(&[])
+                            .map_err(|error| error.to_string())?
+                            .deletions
+                            .into_iter()
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let named = inventory.len();
+                        inventory.retain(|id| stored.contains(id));
+                        if inventory.len() != named {
+                            projection_diag(|| {
+                                format!(
+                                    "order turn: {} of {named} inventory pages hold no rows yet",
+                                    named - inventory.len()
+                                )
+                            });
+                        }
                         writer_slot
                             .as_mut()
                             .unwrap()
@@ -2842,13 +2982,14 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 {
                     let mut pending = shared.pending.lock().unwrap();
                     if had_warm {
-                        pending.warm_outcome = Some(WarmOutcome::Failed);
+                        pending.warm_outcome = Some((pending.warm_attempt, WarmOutcome::Failed));
                     }
                     if had_warm || stream_closed {
                         pending.warm_stream = None;
                         pending.order = None;
                     }
                 }
+                shared.worker_building.store(false, Ordering::Release);
                 shared.worker_busy.store(false, Ordering::Release);
                 shared.changed.notify_all();
                 if error.is_reportable_failure() {
@@ -2900,6 +3041,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             )
         });
         let mut pending = shared.pending.lock().unwrap();
+        shared.worker_building.store(false, Ordering::Release);
         shared.worker_busy.store(false, Ordering::Release);
         if had_warm {
             // A `Replacements` outcome keeps the stream open at its generation
@@ -2909,7 +3051,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 pending.warm_stream = None;
             }
             if pending.warm_outcome.is_none() && !pending.warm_superseded {
-                pending.warm_outcome = applied.warm_outcome.clone();
+                pending.warm_outcome = applied
+                    .warm_outcome
+                    .clone()
+                    .map(|outcome| (pending.warm_attempt, outcome));
             }
         }
         if stream_closed {

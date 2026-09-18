@@ -83,7 +83,17 @@ describe("native call error funnel", () => {
     expect(callStart).toBeGreaterThan(0);
     const callEnd = source.indexOf("\n  }\n", callStart);
     const call = source.slice(callStart, callEnd);
-    expect(call).toContain("throw classifyNativeCallError(error);");
+    expect(call).toContain("const classified = classifyNativeCallError(error);");
+    expect(call).toContain("throw classified;");
+    // GH #543 (re-audit A2-N3): the diagnostic is reported FROM the classified
+    // value. Reporting first recorded every native failure as `other`, because
+    // `invoke` rejects with the wire payload and `diagnosticFailureReason`
+    // recognises only error instances.
+    expect(call.indexOf("classifyNativeCallError(error)")).toBeLessThan(
+      call.indexOf("reportPhase(\"failed\"")
+    );
+    expect(call).toContain("diagnosticFailureReason(classified)");
+    expect(call).not.toContain("diagnosticFailureReason(error)");
 
     const production = source.slice(0, source.indexOf("export function classifyNativeCallError"));
     const rest = source.slice(callEnd);
@@ -114,6 +124,35 @@ describe("diagnostic failure reason", () => {
       diagnosticFailureReason(new QueryUnavailableError("worker-stopped", "gone"))
     ).toBe("unavailable:worker-stopped");
     expect(diagnosticFailureReason(new OperationCancelledError())).toBe("cancelled");
+  });
+
+  it("names the wire rejection a native call actually produces", () => {
+    // What `invoke` actually rejects with: `CommandError` serializes with
+    // `serialize_str`, so every tagged failure arrives as a JSON STRING, never
+    // as a frontend error instance. `diagnosticFailureReason` recognises only
+    // instances, so reporting before classifying recorded all of these as
+    // `other` — erasing the one distinction the record exists to draw.
+    const wire = (payload: Record<string, unknown>) => JSON.stringify(payload);
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ kind: "query-not-ready", reason_code: "indexing" }, "not-ready:indexing"],
+      [{ kind: "query-not-ready", reason_code: "recovering" }, "not-ready:recovering"],
+      [{ kind: "query-not-ready", reason_code: "pending_edits" }, "not-ready:pending_edits"],
+      [
+        {
+          kind: "query-unavailable",
+          reason_code: "projection_unavailable",
+          detail: { message: "The query index is unavailable." },
+        },
+        "unavailable:projection_unavailable",
+      ],
+      [{ kind: "operation-cancelled" }, "cancelled"],
+    ];
+    for (const [payload, expected] of cases) {
+      expect(diagnosticFailureReason(wire(payload))).toBe("other");
+      expect(diagnosticFailureReason(classifyNativeCallError(wire(payload)))).toBe(
+        expected
+      );
+    }
   });
 
   it("never reports a thrown value's own text", () => {

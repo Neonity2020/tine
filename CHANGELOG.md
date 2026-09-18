@@ -17,6 +17,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   flag nothing is recorded (GH #543).
 
 ### Fixed
+- Search can no longer stop indexing when two parts of the app read the graph
+  at the same time. The index kept one slot for "the answer to the check that
+  is running", with nothing recording WHICH check it belonged to, so a check
+  that was briefly descheduled could take an answer computed for a later one —
+  leaving that later check waiting for work that had already been done, and
+  holding the lock every subsequent index build queues behind. Each check now
+  only ever takes its own answer (GH #543).
+
+- A rebuild of the search index no longer discards a save made while it was
+  being prepared. A rebuild empties the index, so the copy of the graph it
+  carries has to be applied even when a save has landed since — but the pending
+  change was being thrown away with it, and the index then recorded the older
+  text as current, so nothing later noticed. Saved words could be missing from
+  search until that page was edited again; the file on disk was never affected
+  (GH #543).
+
+- A single unreadable file no longer fails indexing for the whole graph. Keeping
+  an unreadable page's existing results (fixed below) named it among the pages
+  the index holds — but on a first or freshly rebuilt index it holds nothing for
+  that page, and the mismatch was read as a failed build: search went
+  unavailable and a full rebuild was demanded (GH #543).
+
+- The debug report now records WHY a query was refused instead of "other".
+  Native refusals arrive as an encoded payload and were being written to the
+  report before being decoded, so every one of them — waiting for the index,
+  rebuilding, unavailable, cancelled — was filed as unclassified, which is
+  exactly the distinction the report exists to draw. The report still carries
+  only a short fixed code, never a message, path, or anything from your graph
+  (GH #543).
+
+- Indexing progress no longer disappears while the index is being written. The
+  count was read from the queue of work, which empties the moment the writer
+  picks the work up, so it went blank for the whole of the longest step;
+  surfaces that re-run their search when indexing finishes did so in the middle
+  of it (GH #543).
+
 - Search can no longer get stuck on "Indexing — waiting for search to be
   ready…" for the rest of a session. Several paths could leave the index owing
   a full re-read of the graph with nothing left running that would ever do it:
