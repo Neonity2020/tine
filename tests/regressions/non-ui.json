@@ -4364,6 +4364,45 @@
  "notes": "Blocking core operation, all platforms, worst on Windows: the open-path warm published nothing until it had read every page's bytes for its inventory (seconds on Linux, tens of seconds on Windows at 10,000 files), so a search landing in that window read the projection as idle and stale, took the repair route and ran a second warm on the query thread racing the open path's; the loser retried and fell to the whole-graph parse, whose snapshot then superseded the stream with one huge transaction. Windows run 35225823831 measured the 10k cold open at 587 s (150 s before packet 3), 35.7 GB written, switcher frozen at \"Indexing 240 of 10,000\". Fix: `warm_projection_cancellable` holds a `WarmInFlight` marker from before its first page read until it has enqueued; `progress_at` reports Working(Indexing) while any is held, so the query retries."
 },
 {
+ "id": "REG-QUERY-PROJECTION-MUTATION-PUBLISHES-543",
+ "title": "A page renamed, merged, rescued, trashed, migrated or written to a second file of the same journal day is findable as what it now is, instead of leaving search answering from what it was",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": [],
+  "internal": "convergence audits 3-6 on branch batch/gh543-convergence"
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "fixed-on-master",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_rename_converges_search_instead_of_answering_with_the_old_name",
+   "crates/tine-core/src/direct_projection_tests.rs::a_merge_and_a_rescue_tell_the_index_what_they_changed",
+   "crates/tine-core/src/direct_projection_tests.rs::a_page_set_mutation_publishes_through_one_front_door",
+   "crates/tine-core/src/direct_projection_tests.rs::a_resolved_duplicate_day_retires_the_stray_it_trashed",
+   "crates/tine-core/src/direct_projection_tests.rs::a_trashed_journal_file_leaves_search",
+   "crates/tine-core/src/direct_projection_tests.rs::a_journal_filename_migration_republishes_the_file_it_moved",
+   "crates/tine-core/src/direct_projection_tests.rs::a_path_pinned_save_reaches_search",
+   "crates/tine-core/src/direct_projection_tests.rs::a_merged_away_source_cannot_be_resurrected_by_a_repair",
+   "crates/tine-core/src/direct_projection_tests.rs::a_pinned_save_cannot_be_undone_by_another_producer",
+   "crates/tine-core/src/direct_projection_tests.rs::an_external_edit_to_a_duplicate_days_stray_reaches_search",
+   "crates/tine-core/src/direct_projection_tests.rs::a_migrated_legacy_highlight_page_leaves_search",
+   "crates/tine-core/src/direct_projection_tests.rs::a_moved_file_is_never_retired_by_a_lookup_that_can_come_back_empty",
+   "crates/tine-core/src/model_tests.rs::a_failed_merge_puts_the_source_back_in_the_index_too",
+   "crates/tine-core/src/model_tests.rs::a_failed_merge_that_cannot_restore_its_source_publishes_nothing",
+   "crates/tine-core/src/model_tests.rs::a_journal_filename_migration_serializes_against_other_writers"
+  ],
+  "scenario": "query.projection-build-cost",
+  "failBefore": "tine-agents/evidence/gh543-convergence/round6/necessity.log (each sixth-audit production fix reverted alone at abd0536f: A6-N1, A6-N2, A6-N3 with its class guard, A6-N4 and A6-N5 each red, the rest of the suite green). Rounds 3-5 were proved the same way per fix during implementation."
+ },
+ "notes": "Blocking core operation, all platforms: from v0.6.983 search answers from the SQLite projection rather than an in-memory walk, and a mutation that changed what the graph contains without publishing a producer left the index with a committed image nothing was converging. Partial admission then made the answer SUCCEED, and a successful answer never reaches the repair a refusal would start, so it never corrected itself: a rename kept offering the old name, a merge returned both pages with one of them in the trash, a rescued file was never findable, a trashed or filename-migrated journal answered twice, a path-pinned save and an externally delivered edit to a duplicate-day file reached the index never, and a migrated PDF highlight page answered from the trash. Fix: every mutation publishes through one front door - cache_upsert for a file this process rewrote, cache_remove_path for a file that left, direct_projection_publish_page_set for a multi-page set under one queue lock - the parsed whole-graph cache is treated as the authoritative producer it is (so a repair cannot republish a page a mutation removed), the journal filename migration holds the identity gate across its parse and publication, and a merge rollback compensates only when the restore actually put the file back. Class guard: a_moved_file_is_never_retired_by_a_lookup_that_can_come_back_empty fails on a retirement by name that hands over no entry."
+},
+{
  "id": "REG-FRIENDLY-BLOCK-CANDIDATE-BOUND-001",
  "title": "Searching a large graph reads only the blocks that can match the typed needle, instead of every block in the graph for every keystroke",
  "family": "waited-path-query-cost",
