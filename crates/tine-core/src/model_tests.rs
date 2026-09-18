@@ -15261,3 +15261,138 @@ fn a_failed_merge_puts_the_source_back_in_the_index_too() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A merge rolls back by moving its source file out of the trash and back —
+/// and that move is no-clobber, so it can refuse. Publishing the source's
+/// retained bytes regardless describes a file that is no longer at that path:
+/// search and cached reads then serve content that belongs to nothing on disk
+/// (GH #543, sixth audit A6-N5). The bytes verified before the write prove
+/// what was STAGED, not who owns the path afterwards.
+#[test]
+fn a_failed_merge_that_cannot_restore_its_source_publishes_nothing() {
+    let dir = scratch("merge-rollback-cannot-restore");
+    fs::write(dir.join("pages").join("source.md"), "- pangolin source\n").unwrap();
+    fs::write(
+        dir.join("pages").join("destination.md"),
+        "- destination body\n",
+    )
+    .unwrap();
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+    let cached = |graph: &Graph, token: &str| {
+        graph.with_pages(|pages| {
+            pages
+                .iter()
+                .any(|(_, doc)| doc::serialize(doc).contains(token))
+        })
+    };
+    assert!(cached(&graph, "pangolin"), "the source starts indexed");
+
+    // The destination changes under the merge, so its write is refused.
+    let dst = dir.join("pages").join("destination.md");
+    EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::write(&dst, "- destination body\n- typed elsewhere\n")
+        }));
+    });
+    // And something else takes the source path before the rollback can put the
+    // file back: the no-clobber restore refuses, and that path now belongs to a
+    // file this merge has never read.
+    let src = dir.join("pages").join("source.md");
+    GRAPH_TEXT_WRITE_DURING_ROLLBACK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&src, "- okapi occupant\n")));
+    });
+
+    let error = graph
+        .merge_pages("pages/source.md", "pages/destination.md")
+        .unwrap_err();
+    assert_eq!(
+        fs::read_to_string(dir.join("pages").join("source.md")).unwrap(),
+        "- okapi occupant\n",
+        "the fixture must leave the occupant owning the source path: {error}"
+    );
+    assert!(
+        !cached(&graph, "pangolin"),
+        "a failed merge published bytes it did not restore, so the index now \
+         describes a file that is not there: {error}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The journal filename migration reads the current generation when it
+/// publishes, but parses its replacement earlier. Without the graph identity
+/// gate every other page-set mutation takes, an ordinary save can land in
+/// between — and the migration then stamps that save's generation onto the
+/// bytes it parsed before it, and its batch replaces the newer rows
+/// (GH #543, sixth audit A6-N4).
+#[test]
+fn a_journal_filename_migration_serializes_against_other_writers() {
+    let dir = scratch("journal-migration-identity-gate");
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    fs::write(
+        dir.join("logseq").join("config.edn"),
+        "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("journals").join("Friday, 26-06-2026.md"),
+        "- okapi only here\n",
+    )
+    .unwrap();
+    let graph = Arc::new(Graph::open(&dir));
+    graph.warm_cache();
+
+    // Observe the gate from the FIRST graph-text admission of the migration —
+    // before it has moved anything. A prober thread asks for the gate there; if
+    // the migration is holding it, the prober registers as a waiter (the gate's
+    // test instrumentation counts them), and if it is not, the prober simply
+    // takes the gate and no waiter ever appears.
+    let probe_graph = Arc::clone(&graph);
+    let probe: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let probe_slot = Arc::clone(&probe);
+    GRAPH_TEXT_WRITE_AFTER_ADMISSION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let blocked = Arc::clone(&probe_graph);
+            *probe_slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                let _gate = blocked.lock_graph_text_identity_mutation().unwrap();
+            }));
+            let gate = &probe_graph
+                .graph_text_write_binding()
+                .expect("test graph has graph writer binding")
+                .gate;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut state = gate.identity_mutation.lock().unwrap();
+            while state.waiters == 0 {
+                let remaining = deadline.checked_duration_since(Instant::now()).expect(
+                    "the migration reached its first graph-text write without holding \
+                             the graph identity gate, so an ordinary save can land between its \
+                             parse and its publication and be replaced by the older bytes",
+                );
+                let (next, timeout) = gate
+                    .identity_mutation_changed
+                    .wait_timeout(state, remaining)
+                    .unwrap();
+                state = next;
+                assert!(
+                    !timeout.timed_out(),
+                    "the migration reached its first graph-text write without holding the \
+                     graph identity gate, so an ordinary save can land between its parse and \
+                     its publication and be replaced by the older bytes"
+                );
+            }
+            Ok(())
+        }));
+    });
+
+    assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
+    probe
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the migration never reached a graph-text write")
+        .join()
+        .unwrap();
+    assert!(dir.join("journals").join("2026_06_26.md").exists());
+    let _ = fs::remove_dir_all(&dir);
+}

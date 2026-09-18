@@ -152,6 +152,17 @@ impl Graph {
                     None => self.is_shadow_journal(path, date),
                 };
                 if shadow {
+                    // GH #543 (sixth audit A6-N2): "not in the `(kind,name)`
+                    // cache" had become "not in the INDEX either", the same
+                    // conflation the pinned save path carried (A5-N2/A6-N1). An
+                    // externally delivered edit to a shadow file — Syncthing,
+                    // Dropbox, an external editor — reached search never, with
+                    // the index idle, validated and ready, because nothing was
+                    // ever queued for it. Cache slots are keyed by PATH and the
+                    // by-name winner is chosen by `or_insert` in vector order,
+                    // so writing the shadow's own slot publishes its rows
+                    // without taking the day's name from the canonical file.
+                    self.cache_upsert(entry, newdoc, content_rev(content));
                     return Ok(None);
                 }
             }

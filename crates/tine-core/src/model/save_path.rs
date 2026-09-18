@@ -507,10 +507,12 @@ impl Graph {
         // already-cached page MUST NOT call cache_upsert: it bumps `cache_gen`,
         // which keys every memoized backlink/reference result — so an unchanged
         // re-save would force a whole-graph rescan on every open dashboard.
-        // A path-pinned save (`cache == false`, a duplicate-day stray, #21) NEVER
-        // touches the `(kind,name)` cache: that slot belongs to the canonical file,
-        // and folding the stray's content in would make name-resolution serve it.
-        // The stray is re-parsed from disk on its next path-addressed load.
+        // A path-pinned save (`cache == false`, a duplicate-day stray, #21) still
+        // owns its OWN path slot — what it must not do is take the `(kind,name)`
+        // slot away from the canonical file. Those are different questions, and
+        // the cache answers them in different places: slots are keyed by path,
+        // and the by-name winner is decided by `or_insert` in vector order, so
+        // writing the stray's own slot cannot repoint the name.
         let need_cache_update = cache
             && (changed || {
                 let guard = self.cache.read().unwrap();
@@ -525,10 +527,17 @@ impl Graph {
         // where the delta is published, so skipping it left this file indexed at
         // its pre-save text forever, with the index idle, validated and ready.
         // Nothing was queued and a successful answer never reaches the repair a
-        // refusal would start, so it never corrected itself. Publish the rows
-        // without touching the name cache.
-        let need_projection_publication = !cache && changed;
-        if need_cache_update || need_projection_publication {
+        // refusal would start, so it never corrected itself.
+        //
+        // (Sixth audit A6-N1: publishing the delta alone was still not enough.
+        // The parsed cache is an authoritative PRODUCER — a repair snapshots it
+        // and republishes it wholesale at the current generation — so a pinned
+        // save that left its own slot holding pre-save text had its rows undone
+        // by the next repair, and, publishing at an unchanged generation, could
+        // not outrank them either. A file this save rewrote goes through the
+        // same front door as every other rewritten file.)
+        let need_cache_update = need_cache_update || (!cache && changed);
+        if need_cache_update {
             // For a brand-new journal, derive its date_key from the name so it's
             // recognized as a dated journal by `journals_desc` (which reads this
             // cache) — otherwise today's freshly-created page would be missing.
@@ -564,18 +573,7 @@ impl Graph {
                 doc
             };
             let entry = effective_page_entry(&self.journal_format, &base_entry, &cache_doc);
-            if need_cache_update {
-                self.cache_upsert(entry, cache_doc, rev.clone());
-            } else {
-                // No generation bump: the parsed cache did not change, and the
-                // delta belongs to the generation the rest of it already has.
-                self.direct_projection_enqueue_replace(
-                    self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
-                    entry,
-                    std::sync::Arc::new(cache_doc),
-                    rev.clone(),
-                );
-            }
+            self.cache_upsert(entry, cache_doc, rev.clone());
         }
         // Drop the self-write marker now the write is published + cached (it only
         // had to cover the atomic-write → cache_upsert window; disk_revs now

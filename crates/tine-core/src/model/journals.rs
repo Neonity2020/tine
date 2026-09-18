@@ -124,6 +124,16 @@ impl Graph {
     }
 
     pub fn migrate_journal_filenames_checked(&self) -> io::Result<usize> {
+        // GH #543 (sixth audit A6-N4): every other page-set mutation holds the
+        // identity gate across its whole transaction; this one took it only
+        // inside each individual move primitive and released it again. So the
+        // window between the last move and the publication below was open: a
+        // save could land in it, publish its rows, and then be replaced by the
+        // bytes this function had already read — stale text carrying the newer
+        // generation. Hold the gate for the whole migration, as `merge_pages`,
+        // `rename_file_to_page` and the save path do. The gate is reentrant per
+        // thread, so the per-move acquisitions underneath still work.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let write = self.admit_graph_text_writer()?;
         let entries = self.configured_text_entries(&write, false)?;
         let mut n = 0;

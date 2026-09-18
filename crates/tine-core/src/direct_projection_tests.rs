@@ -7242,6 +7242,84 @@ fn a_reset_has_one_call_site_and_the_worker_owns_it() {
     );
 }
 
+/// A file that leaves the graph is retired BY PATH, with the entry the caller
+/// already holds. `cache_remove(name, kind, None)` retires only what it can
+/// find, and with a cold parsed cache and no current page-list memo it finds
+/// nothing — so it falls through to marking the index stale with no producer
+/// queued, and search goes on answering from a file that is now in the trash
+/// (sixth audit A6-N3, where the PDF highlight migration did exactly this).
+/// The rule is checkable, so it is checked here rather than written in a
+/// comment: a function that MOVES graph text may not retire by name without
+/// handing over the entry it moved. Blessed exemplars:
+/// `journals.rs::trash_journal_file` (`cache_remove_path`) and
+/// `page_rename.rs::delete_page_expected` (`cache_remove(.., removed)`).
+#[test]
+fn a_moved_file_is_never_retired_by_a_lookup_that_can_come_back_empty() {
+    fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model");
+    let mut files = Vec::new();
+    visit(&root, &mut files);
+    files.sort();
+
+    let mut offenders = Vec::new();
+    for path in files
+        .iter()
+        .filter(|path| !path.to_string_lossy().ends_with("_tests.rs"))
+    {
+        let source = std::fs::read_to_string(path).unwrap();
+        // Impl-level functions start at four spaces; that is enough structure to
+        // attribute a call to the function that makes it.
+        let starts: Vec<usize> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.starts_with("    fn ")
+                    || line.starts_with("    pub fn ")
+                    || line.starts_with("    pub(super) fn ")
+                    || line.starts_with("    pub(crate) fn ")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let lines: Vec<&str> = source.lines().collect();
+        for (position, start) in starts.iter().enumerate() {
+            let end = starts.get(position + 1).copied().unwrap_or(lines.len());
+            let body = lines[*start..end].join("\n");
+            if !body.contains("graph_text_move_") {
+                continue;
+            }
+            // The third argument is the entry the caller holds. Written out, a
+            // retirement that hands over nothing reads as `, None)`.
+            if body.contains("self.cache_remove(") && body.contains("None,\n") {
+                offenders.push(format!(
+                    "{}:{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    start + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a function that moves graph text retires the file it moved by PATH \
+         (`cache_remove_path`), or by name WITH the entry it holds — never \
+         `cache_remove(name, kind, None)`, which retires nothing when the \
+         parsed cache is cold and leaves search answering from a trashed file \
+         with no producer queued to correct it (GH #543, sixth audit A6-N3). \
+         Imitate `journals.rs::trash_journal_file`. Offenders: {offenders:?}"
+    );
+}
+
 /// A rename changes the page SET, so the committed image stops matching the
 /// inventory this session validated — and nothing queues a producer for it.
 /// Partial admission would then let search keep ANSWERING from that image,
@@ -7757,6 +7835,202 @@ fn a_merged_away_source_cannot_be_resurrected_by_a_repair() {
         names(&graph),
         vec!["destination".to_owned()],
         "search lost the merged text: {}",
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Publishing a pinned save's rows is not enough if nothing else agrees the
+/// save happened. The parsed whole-graph snapshot still held the file's old
+/// document at the SAME generation, so one query read error rebuilt the index
+/// from it and undid the save; and a warm stream that had already parsed the
+/// old bytes was still accepted, because the batch's generation had not been
+/// outrun (GH #543, sixth audit A6-N1).
+#[test]
+fn a_pinned_save_cannot_be_undone_by_another_producer() {
+    let _serial = serialize_projection_tests();
+    let root = duplicate_day_projection_graph("gh543-pinned-save-producers", "dugong");
+    let graph = attached_graph(&root);
+    // The optional parsed snapshot exists — it is one of the producers here.
+    graph.with_pages(|pages| assert_eq!(pages.len(), 2));
+    let before = graph.cache_generation();
+
+    let mut page = graph
+        .load_by_path("journals/Friday, 26-06-2026.md")
+        .unwrap()
+        .expect("the stray loads by path");
+    let baseline = page.rev.clone();
+    let edited = page
+        .blocks
+        .iter()
+        .position(|block| block.raw.contains("dugong"))
+        .expect("the token block");
+    page.blocks[edited].raw = "quokka only in stray".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    assert!(
+        settle_hits(&graph, "quokka", 1),
+        "the saved text never reached the index: {} block(s)",
+        hits(&graph, "quokka")
+    );
+    // Producers are admitted by generation. A publication that leaves the
+    // generation where it found it cannot outrank the batch a warm stream
+    // parsed before the save.
+    assert!(
+        graph.cache_generation() > before,
+        "a pinned save that changed bytes must advance the generation"
+    );
+
+    let projection = graph.direct_projection_test().unwrap();
+    graph.direct_projection_inject_read_failure_test();
+    for _ in 0..300 {
+        // A refusal (`usize::MAX`) is the index declining to answer while it
+        // repairs — designed behaviour, not a resurrection. What must never
+        // happen is the overwritten text coming back as an ANSWER.
+        let dugong = hits(&graph, "dugong");
+        assert!(
+            dugong == 0 || dugong == usize::MAX,
+            "a repair rebuilt the index from a snapshot that never heard about \
+             the save: {dugong} block(s), {}",
+            projection.debug_state_test()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        settle_hits(&graph, "quokka", 1),
+        "the repaired index lost the saved text: {} block(s), {}",
+        hits(&graph, "quokka"),
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// An external editor or a sync tool writing to one file of a duplicate
+/// journal day is reconciled — and was then dropped on the floor, by the same
+/// conflation the pinned save had: the file is deliberately kept out of the
+/// by-name cache, and the index was only ever told about changes from there
+/// (GH #543, sixth audit A6-N2).
+#[test]
+fn an_external_edit_to_a_duplicate_days_stray_reaches_search() {
+    let _serial = serialize_projection_tests();
+    let root = duplicate_day_projection_graph("gh543-external-shadow-edit", "caracal");
+    let graph = attached_graph(&root);
+    assert_eq!(hits(&graph, "caracal"), 1, "the stray starts indexed");
+
+    let stray = root.join("journals/Friday, 26-06-2026.md");
+    std::fs::write(&stray, "- shared line\n- axolotl only in stray\n").unwrap();
+    graph.sync_file_checked(&stray).unwrap();
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "axolotl", 1),
+        "the externally delivered edit never reached the index: {} block(s) — {}",
+        hits(&graph, "axolotl"),
+        projection.debug_state_test()
+    );
+    assert_eq!(
+        hits(&graph, "caracal"),
+        0,
+        "the index still answers with the text the file had before the edit: {}",
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn pdf_highlight(id: &str, page: i64, text: &str) -> crate::pdf::Highlight {
+    let rect = crate::pdf::Rect {
+        top: 1.0,
+        left: 2.0,
+        width: 3.0,
+        height: 4.0,
+        source_width: None,
+        source_height: None,
+    };
+    crate::pdf::Highlight {
+        id: id.into(),
+        page,
+        position: crate::pdf::Position {
+            page,
+            bounding: rect.clone(),
+            rects: vec![rect],
+        },
+        color: "yellow".into(),
+        text: Some(text.to_owned()),
+        image: None,
+    }
+}
+
+/// Migrating a legacy PDF highlight page to its OG-compatible key trashes the
+/// old page and calls the blessed by-NAME removal — which, with no parsed
+/// whole-graph cache to name the file from, removed nothing and queued
+/// nothing. Search answered from both pages, one of them already in the trash
+/// (GH #543, sixth audit A6-N3).
+#[test]
+fn a_migrated_legacy_highlight_page_leaves_search() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh543-pdf-legacy-migration");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    let pdf = "My Paper.pdf";
+    let legacy_key = crate::pdf::legacy_asset_key(pdf);
+    let highlight = pdf_highlight(
+        "11111111-1111-1111-1111-111111111111",
+        3,
+        "pangolin legacy text",
+    );
+    std::fs::write(
+        root.join("assets").join(format!("{legacy_key}.edn")),
+        crate::pdf::write_highlights(std::slice::from_ref(&highlight), ""),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages").join(format!("hls__{legacy_key}.md")),
+        crate::doc::serialize(&crate::pdf::hls_page_document(
+            pdf,
+            "My Paper",
+            std::slice::from_ref(&highlight),
+        )),
+    )
+    .unwrap();
+    // Deliberately NO parsed whole-graph cache: the ordinary projection warm is
+    // the only index, which is exactly the session the by-name removal cannot
+    // resolve a path in.
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    // A query with no parsed cache is what drives the projection's own warm.
+    for _ in 0..1500 {
+        if graph.direct_projection_ready_test() {
+            break;
+        }
+        let _ = graph.search("pangolin", 5);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_ready(&graph);
+    assert_eq!(
+        hits(&graph, "pangolin"),
+        1,
+        "the legacy page starts indexed"
+    );
+
+    graph
+        .write_highlights(pdf, "My Paper", std::slice::from_ref(&highlight), &[])
+        .unwrap();
+    assert!(
+        !root
+            .join("pages")
+            .join(format!("hls__{legacy_key}.md"))
+            .exists(),
+        "the fixture did not actually migrate the legacy page"
+    );
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "pangolin", 1),
+        "search answers from both the migrated page and the trashed one: {} \
+         block(s) — {}",
+        hits(&graph, "pangolin"),
         projection.debug_state_test()
     );
     let _ = std::fs::remove_dir_all(root);

@@ -144,17 +144,29 @@ impl Graph {
             dst_cacheable,
         ) {
             let _ = graph_text_write_during_rollback_hook();
-            let _ = self.graph_text_move_noreplace(&write, &staged, &src);
+            let restored = self
+                .graph_text_move_noreplace(&write, &staged, &src)
+                .is_ok();
             // The rollback puts the source file back, so its retirement has to
             // come back with it — otherwise a failed merge leaves the index
             // missing a page that exists, with nothing queued to notice.
             // Republished from the exact bytes verified on disk above, so this
             // compensation needs no read that could fail in turn.
-            if let Some(entry) = src_entry {
-                if let Ok((entry, document, revision)) =
-                    parse_exact_page(self, &entry, &src_content)
-                {
-                    self.cache_upsert(entry, document, revision);
+            //
+            // But ONLY when the file actually came back (sixth audit A6-N5).
+            // `move_noreplace` refuses when something else now owns that path,
+            // and that is exactly when republishing is worst: it would announce
+            // the source's old bytes under a path whose current occupant is a
+            // different file. The retirement is then the true state — the source
+            // really is gone from the graph — and leaving it standing is what
+            // keeps every published image one that existed on disk.
+            if restored {
+                if let Some(entry) = src_entry {
+                    if let Ok((entry, document, revision)) =
+                        parse_exact_page(self, &entry, &src_content)
+                    {
+                        self.cache_upsert(entry, document, revision);
+                    }
                 }
             }
             return Err(e);

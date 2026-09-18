@@ -39,11 +39,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   went on being findable. Migrating journal filenames to the graph's configured
   format had the same gap, and showed up as duplicate results after the next
   edit of a migrated day (GH #543).
-- Editing one file of a duplicate journal day now reaches search. The edit was
+- Editing one file of a duplicate journal day now reaches search, whether the
+  edit came from Tine or from an external editor or sync tool. The edit was
   written to disk correctly, but that file is deliberately kept out of the
   by-name page cache — and the index was being told about edits from there
   only, so search kept serving what the file said before the edit, for the rest
-  of the session (GH #543).
+  of the session. It also stayed edited: the edit is now recorded where the
+  index rebuilds itself from, so recovering from a read error no longer puts
+  the pre-edit text back (GH #543).
+- A PDF highlight page migrated to its current location no longer answers
+  twice. The old page was retired by name, which finds nothing when the graph
+  has not been read into memory yet, so the file went to the trash while its
+  entries stayed in search — and nothing was queued that would have noticed
+  (GH #543).
+- A merge that fails and cannot put the source page back no longer announces
+  that page as still present. The undo step restores the file unless something
+  else has taken its place, and search was told the page was back either way
+  (GH #543).
+- Renaming journal files to the graph's configured filename format now takes
+  the same lock every other whole-page operation takes, so a save made while it
+  runs cannot be overwritten in search by the text that file had beforehand
+  (GH #543).
 
 - Search can no longer stop indexing when two parts of the app read the graph
   at the same time. The index kept one slot for "the answer to the check that

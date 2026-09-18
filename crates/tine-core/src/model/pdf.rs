@@ -775,6 +775,10 @@ impl Graph {
         // recoverable trash rather than hard-deleted.
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
             if self.graph_text_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
+                // Retained before the move takes the path away (sixth audit
+                // A6-N3): the retirement below is by PATH, and the path is the
+                // only thing that identifies which file left the graph.
+                let retired = self.entry_for_path(path);
                 // Create the trash directory only when something is actually
                 // going into it. Unconditionally mkdir-ing it made every
                 // highlight save materialize `logseq/.tine-trash/conflict/` in a
@@ -795,11 +799,27 @@ impl Graph {
                             "legacy highlight page changed during migration cleanup",
                         ));
                     }
-                    self.cache_remove(
-                        &crate::pdf::hls_page_name(&legacy_key),
-                        PageKind::Page,
-                        None,
-                    );
+                    // GH #543 (sixth audit A6-N3): this retired the legacy page
+                    // BY NAME, and `cache_remove` can only retire what it can
+                    // find — with a cold parsed cache it matched nothing, so it
+                    // fell through to marking the index stale with no producer
+                    // queued to converge it, and search went on answering from
+                    // both the migrated page and the file now in the trash.
+                    // A physical page that disappeared is retired by path,
+                    // through the front door that also drops its disk_rev,
+                    // session ids and projection rows. When the inventory did
+                    // not know this file, its identity is still fully
+                    // determined by the path and the legacy key, so the
+                    // retirement is built rather than skipped: a file that left
+                    // the graph must never depend on a lookup to be retired.
+                    let retired = retired.unwrap_or_else(|| PageEntry {
+                        name: crate::pdf::hls_page_name(&legacy_key),
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: self.rel_path(path),
+                        path: path.clone(),
+                    });
+                    self.cache_remove_path(&retired);
                 }
             }
         }
