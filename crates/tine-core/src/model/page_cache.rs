@@ -428,6 +428,10 @@ impl Graph {
             if cancelled() {
                 return Outcome::Cancelled;
             }
+            #[cfg(test)]
+            self.page_build_test
+                .warm_inventory_file_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.graph_text_read_optional_text_with_identity(&permit, &entry.path) {
                 Ok(Some((content, _))) => {
                     let revision = content_rev(&content);
@@ -768,6 +772,16 @@ impl Graph {
     pub(crate) fn on_demand_parses_test(&self) -> usize {
         self.page_build_test
             .on_demand_parses
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// GH #543: page files the warm validation read to compute content
+    /// revisions. A drift retry re-reads the whole graph, so this grows with
+    /// retries while every parse counter stays at zero.
+    #[cfg(test)]
+    pub(crate) fn warm_inventory_file_reads_test(&self) -> usize {
+        self.page_build_test
+            .warm_inventory_file_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

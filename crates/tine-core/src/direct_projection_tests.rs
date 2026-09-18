@@ -4340,6 +4340,70 @@ fn a_parsed_snapshot_beside_an_open_stream_does_not_supersede_it() {
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
+/// GH #543: the retry a drift provokes must not re-read the whole graph.
+///
+/// `drift_during_the_stream_restarts_the_warm_without_parsing_the_graph`
+/// already pins that a retry does not re-PARSE the graph. It does not pin what
+/// the retry costs, and the answer was "one full pass over every file's bytes,
+/// per drift, up to `WARM_DRIFT_RETRIES`" — the validation re-reads every page
+/// to recompute a content revision it already stored. That read is the
+/// "seconds, tens on Windows" the warm announce comment cites, so an editing
+/// user on a large graph can pay it two dozen times before the warm gives up
+/// and falls to the whole-graph parse. Reported on GH #543 as indexing that
+/// never finishes while one core stays busy.
+#[test]
+#[ignore = "RED ON PURPOSE: pins the retry cost that is not fixed yet. A retry \
+skips no unchanged file because drift does not name the paths it changed, so the \
+fix threads a changed-path ledger through every cache_gen bump site including the \
+save path. Un-ignore with that change, not by loosening the bound."]
+fn a_drift_retry_does_not_re_read_the_whole_graph_inventory() {
+    let _serial = serialize_projection_tests();
+    let pages = 2 * WARM_STREAM_HIGH_WATER + 5;
+    let (root, database) = partial_admission_graph("stream-drift-inventory", pages);
+    reset_lowerings(&root);
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    // A bounded number of racing saves, so the assertion below is a hard bound
+    // and not a race against the retry budget.
+    const DRIFTS: usize = 3;
+    let drifts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let graph = Arc::clone(&graph);
+        let drifts = Arc::clone(&drifts);
+        *projection.shared.after_sql_commit.lock().unwrap() = Some(Box::new(move || {
+            if drifts.load(Ordering::Acquire) < DRIFTS {
+                graph.drift_generation_test();
+                drifts.fetch_add(1, Ordering::AcqRel);
+            }
+        }));
+    }
+    assert!(
+        graph.warm_cache_cancellable(|| false),
+        "the warm still owns readiness after the drifts"
+    );
+    let landed = drifts.load(Ordering::Acquire);
+    assert!(landed >= 1, "at least one drift landed");
+    wait_ready(&graph);
+    assert!(
+        !graph.has_parsed_cache_test(),
+        "the retries must not fall to the whole-graph parse: {}",
+        projection.debug_state_test()
+    );
+    // One pass over the graph is the honest cost of validating it. Anything
+    // proportional to the number of drifts means each retry paid for the whole
+    // graph again.
+    let reads = graph.warm_inventory_file_reads_test();
+    assert!(
+        reads < 2 * pages,
+        "a drift retry re-read the whole inventory: {reads} file reads for {pages} pages \
+         across {landed} drift(s) (one pass would be {pages})"
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
 /// GH #543: a save that races the stream drifts the generation and abandons
 /// it. The warm task then runs the validation again — resuming at the pages
 /// the old stream never reached — instead of parsing the whole graph and
