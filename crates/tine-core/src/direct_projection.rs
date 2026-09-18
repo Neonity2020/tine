@@ -1027,82 +1027,56 @@ impl DirectProjection {
         // A snapshot older than the queue is not a supersession, it is a
         // rollback. `install_built` validates the generation under the cache
         // write lock and then RELEASES that lock before enqueueing here, so a
-        // save can publish G+1 and queue its delta in the gap; this call would
-        // then clear that delta and drop `latest_generation` back to G, and the
-        // saved text would be absent from search until something else touched
-        // the page. The snapshot's own pages are stale by construction at that
-        // point — the delta is the newer truth (GH #543).
+        // save can publish G+1 and queue its delta in the gap; applying this
+        // snapshot would then answer search from text the user has already
+        // replaced, and `latest_generation` would say otherwise.
         //
-        // A requested rebuild is the exception, because it RESETS the database:
-        // refusing its payload would leave an empty index with nothing queued
-        // to fill it. So the snapshot is applied — but its own pages are still
-        // the older truth, and clearing the queue beside it erased saved text
-        // that had already committed (re-audit A2-N1). The deltas are kept and
-        // replay on top of the snapshot, and the generation is not lowered.
-        let stale = generation < pending.latest_generation;
-        if stale && !pending.rebuild {
+        // A pending rebuild is NOT an exception to that, though it was written
+        // as one. The fear was that refusing the payload leaves an emptied
+        // index with nothing queued to fill it — but `Database::reset` has a
+        // single call site, inside the worker turn that consumes the rebuild
+        // BESIDE this payload (`a_reset_has_one_call_site_and_the_worker_owns_it`).
+        // Nothing has been reset when the payload is refused, so the index the
+        // refusal keeps is the one the deltas have been maintaining all along.
+        //
+        // Keeping the payload and replaying the queued deltas on top of it is
+        // not enough either: the worker DRAINS a delta the instant it takes
+        // the turn, so a save that has already been applied is in neither the
+        // queue nor the snapshot, and the reset erased it while readiness was
+        // still published at the newer watermark — search then answered from
+        // the old text with no producer queued to correct it, and the file on
+        // disk disagreed with the index indefinitely (third audit A3-N1).
+        //
+        // So refuse, and withdraw the obligation with the payload it promised:
+        // a rebuild latched with nothing to ride in on refuses every later
+        // query for the lifetime of the graph (GH #543, B1). The next repair
+        // assembles a snapshot at the current generation and rides in on that.
+        if generation < pending.latest_generation {
+            let withdrawn = std::mem::take(&mut pending.rebuild);
             projection_diag(|| {
                 format!(
-                    "full refused: snapshot generation={generation} older than queue {}",
-                    pending.latest_generation
+                    "full refused: snapshot generation={generation} older than queue {}{}",
+                    pending.latest_generation,
+                    if withdrawn {
+                        "; rebuild request withdrawn with it"
+                    } else {
+                        ""
+                    }
                 )
             });
             return;
         }
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
-        if stale {
-            // The surviving deltas must stay in the order: a page that exists
-            // only in them is absent from this older snapshot, and the order
-            // turn requires the inventory to cover every page the projection
-            // ends up holding. Their positions are re-derived by that turn, so
-            // each one is re-marked unordered rather than carrying a position
-            // from the map this seed replaces.
-            let mut ordered = pages
-                .iter()
-                .map(|(entry, _)| entry.rel_path.clone())
-                .collect::<Vec<_>>();
-            let covered = ordered
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            ordered.extend(
-                pending
-                    .deltas
-                    .iter()
-                    .filter(|(path, (_, delta))| {
-                        matches!(delta, PageDelta::Replace { .. }) && !covered.contains(*path)
-                    })
-                    .map(|(path, _)| path.clone()),
-            );
-            pending.seed_page_order(ordered.iter().map(String::as_str));
-            for (_, delta) in pending.deltas.values_mut() {
-                if let PageDelta::Replace {
-                    query_page_order, ..
-                } = delta
-                {
-                    *query_page_order = None;
-                }
-            }
-            projection_diag(|| {
-                format!(
-                    "rebuild kept {} newer delta(s) over snapshot generation={generation} queue={}",
-                    pending.deltas.len(),
-                    pending.latest_generation
-                )
-            });
-        } else {
-            pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
-        }
+        pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
         pending.full = Some(PendingFull {
             pages,
             revisions,
             parse_config,
         });
-        if !stale {
-            pending.deltas.clear();
-            pending.latest_generation = generation;
-        }
+        pending.deltas.clear();
+        pending.latest_generation = generation;
+
         // R6: a complete parsed snapshot owns readiness from here. A warm
         // validation or stream still in flight must not lower beside it — its
         // deltas carry no order positions and would erase the snapshot's.

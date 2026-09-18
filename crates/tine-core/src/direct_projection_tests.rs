@@ -7115,10 +7115,48 @@ fn a_rebuild_does_not_discard_a_save_newer_than_its_snapshot() {
     let saved_generation = graph.cache_generation();
     assert!(saved_generation > stale_generation);
 
-    // A reset repair: the database is emptied, so this older payload IS
-    // applied — and the newer delta must survive on top of it.
+    // Drain the save BEFORE the stale snapshot arrives. This is the case the
+    // queue cannot repair by replaying its own deltas: the worker takes a
+    // delta the instant it starts its turn, so by now the save is in neither
+    // the snapshot nor the queue, and only refusing the snapshot keeps it
+    // (third audit A3-N1). Without this wait the interleaving was reached
+    // barely half the time and the test passed by luck.
+    let mut drained = false;
+    for _ in 0..600 {
+        let quiet = {
+            let pending = projection.shared.pending.lock().unwrap();
+            pending.deltas.is_empty() && pending.full.is_none()
+        };
+        if quiet
+            && !projection
+                .shared
+                .worker_busy
+                .load(std::sync::atomic::Ordering::Acquire)
+            && graph
+                .search("gh543 rebuild sentinel", 50)
+                .map(|groups| !groups.is_empty())
+                .unwrap_or(false)
+        {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        drained,
+        "the save never reached the index, so the drained case was never set up: {}",
+        projection.debug_state_test()
+    );
+
+    // A reset repair whose snapshot predates that save. The payload is
+    // refused, and the rebuild obligation must go with it rather than latch.
     projection.request_rebuild();
     projection.enqueue_full(stale_generation, pages, revisions, config);
+    assert!(
+        !projection.shared.pending.lock().unwrap().rebuild,
+        "the refused payload left the rebuild latched with nothing to ride in on: {}",
+        projection.debug_state_test()
+    );
     let latest = projection.shared.pending.lock().unwrap().latest_generation;
     assert!(
         latest >= saved_generation,
@@ -7142,5 +7180,64 @@ fn a_rebuild_does_not_discard_a_save_newer_than_its_snapshot() {
         found,
         "the save was erased by the rebuild's older snapshot: {}",
         projection.debug_state_test()
+    );
+}
+
+/// `enqueue_full` refuses a snapshot older than the queue even when a rebuild
+/// is pending, and the safety of that refusal rests on one fact about the rest
+/// of the crate: nothing has been emptied yet when the payload is refused,
+/// because the reset happens inside the worker turn that consumes the rebuild
+/// BESIDE its payload. That is an architectural claim, so it is pinned here
+/// rather than asserted in a comment (third audit A3-N1).
+#[test]
+fn a_reset_has_one_call_site_and_the_worker_owns_it() {
+    fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    visit(&root, &mut files);
+    files.sort();
+
+    let sites = files
+        .iter()
+        .filter(|path| !path.to_string_lossy().ends_with("_tests.rs"))
+        .flat_map(|path| {
+            let source = std::fs::read_to_string(path).unwrap();
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("database.reset("))
+                .map(|(index, _)| {
+                    format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        index + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sites.len(),
+        1,
+        "`database.reset()` must have exactly ONE call site, inside the worker \
+         turn that consumes `pending.rebuild` beside its payload. \
+         `enqueue_full` refuses a stale snapshot and withdraws the rebuild with \
+         it, which is only safe while no other path can have emptied the index \
+         first. Found: {sites:?}"
+    );
+    assert!(
+        sites[0].starts_with("direct_projection.rs:"),
+        "the reset moved out of the projection worker: {sites:?}"
     );
 }

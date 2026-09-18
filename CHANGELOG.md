@@ -26,12 +26,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   only ever takes its own answer (GH #543).
 
 - A rebuild of the search index no longer discards a save made while it was
-  being prepared. A rebuild empties the index, so the copy of the graph it
-  carries has to be applied even when a save has landed since — but the pending
-  change was being thrown away with it, and the index then recorded the older
-  text as current, so nothing later noticed. Saved words could be missing from
-  search until that page was edited again; the file on disk was never affected
-  (GH #543).
+  being prepared. A rebuild carries its own copy of the graph; if a save landed
+  after that copy was taken, applying it wrote the older text back while the
+  index went on recording itself as up to date, so nothing later noticed — and
+  a save already written to the index was lost the same way, not just one still
+  waiting. An out-of-date copy is now refused outright and the rebuild retried
+  against a current one. Saved words could be missing from search until that
+  page was edited again; the file on disk was never affected (GH #543).
 
 - A single unreadable file no longer fails indexing for the whole graph. Keeping
   an unreadable page's existing results (fixed below) named it among the pages
