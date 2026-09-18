@@ -6192,6 +6192,15 @@ fn warm_scale_probe_with_switcher_polling() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(600);
     let budget = Duration::from_secs(budget_secs);
+    // GH #543: the reporters' machines sustain ~2 refused queries per second
+    // (7,520 failed `run_query` in one 63-minute session), because
+    // `queryReadiness.ts` retries a refusal forever at up to 800 ms and every
+    // query block on the page does so independently. A 2 s cadence lands ONE
+    // query inside a 3 s build and cannot model that.
+    let poll_ms: u64 = std::env::var("TINE_WARM_SCALE_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2000);
     let io = || {
         std::fs::read_to_string("/proc/self/io")
             .ok()
@@ -6260,7 +6269,7 @@ fn warm_scale_probe_with_switcher_polling() {
                     "WARM-POLL SEARCH at={at:?} took={took:?} {outcome} progress={:?}",
                     graph.query_index_progress()
                 );
-                std::thread::sleep(Duration::from_millis(2000));
+                std::thread::sleep(Duration::from_millis(poll_ms));
             }
             (first_results, slowest, calls)
         })
