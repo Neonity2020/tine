@@ -4229,7 +4229,13 @@ fn a_query_is_admitted_over_the_partial_index_while_a_stream_is_open() {
     let (sources, text_bytes) = warm_sources(&graph);
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    assert!(projection.enqueue_warm(
+        generation,
+        sources,
+        Vec::new(),
+        Arc::clone(&config),
+        text_bytes
+    ));
     let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
         panic!("a cold projection names every page");
     };
@@ -4325,7 +4331,13 @@ fn a_drift_keeps_serving_the_rows_a_validated_session_already_holds() {
     // validated — the whole inventory has been compared to disk.
     let (sources, text_bytes) = warm_sources(&graph);
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    assert!(projection.enqueue_warm(
+        generation,
+        sources,
+        Vec::new(),
+        Arc::clone(&config),
+        text_bytes
+    ));
     let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
         panic!("a cold projection names every page");
     };
@@ -4349,7 +4361,13 @@ fn a_drift_keeps_serving_the_rows_a_validated_session_already_holds() {
     graph.drift_generation_test();
     let (sources, text_bytes) = warm_sources(&graph);
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    assert!(projection.enqueue_warm(
+        generation,
+        sources,
+        Vec::new(),
+        Arc::clone(&config),
+        text_bytes
+    ));
     let WarmOutcome::Replacements(_) = projection.wait_warm_outcome() else {
         panic!("the edited page is a replacement");
     };
@@ -4393,7 +4411,13 @@ fn a_parsed_snapshot_beside_an_open_stream_does_not_supersede_it() {
     let (sources, text_bytes) = warm_sources(&graph);
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    assert!(projection.enqueue_warm(
+        generation,
+        sources,
+        Vec::new(),
+        Arc::clone(&config),
+        text_bytes
+    ));
     let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
         panic!("a cold projection names every page");
     };
@@ -6433,7 +6457,7 @@ fn a_failed_read_during_a_stream_does_not_latch_rebuild_forever() {
     let (sources, bytes) = warm_sources(&graph);
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
-    assert!(projection.enqueue_warm(generation, sources, config.clone(), bytes));
+    assert!(projection.enqueue_warm(generation, sources, Vec::new(), config.clone(), bytes));
     let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
         panic!("expected replacements");
     };
@@ -6481,7 +6505,11 @@ fn a_failed_read_during_a_stream_does_not_latch_rebuild_forever() {
             Err(error) => panic!("unexpected error {error}: {state}"),
         }
     }
-    assert!(answered, "search never recovered: {}", projection.debug_state_test());
+    assert!(
+        answered,
+        "search never recovered: {}",
+        projection.debug_state_test()
+    );
 }
 
 /// GH #543: a repair resets the disposable database, then generation drift
@@ -6571,7 +6599,7 @@ fn a_parsed_cache_does_not_own_readiness_while_an_inventory_is_owed() {
     let config = Arc::new(graph.config.parse_config());
     let generation = graph.cache_generation();
     let (sources, bytes) = warm_sources(&graph);
-    assert!(projection.enqueue_warm(generation, sources, config.clone(), bytes));
+    assert!(projection.enqueue_warm(generation, sources, Vec::new(), config.clone(), bytes));
     let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
         panic!("expected replacements");
     };
@@ -6587,7 +6615,7 @@ fn a_parsed_cache_does_not_own_readiness_while_an_inventory_is_owed() {
     // beside it — the snapshot is dropped, the cache stays.
     std::fs::write(root.join("pages/a.md"), "- sentinel543 changed\n").unwrap();
     let (sources, bytes) = warm_sources(&graph);
-    assert!(projection.enqueue_warm(generation, sources, config, bytes));
+    assert!(projection.enqueue_warm(generation, sources, Vec::new(), config, bytes));
     let WarmOutcome::Replacements(_) = projection.wait_warm_outcome() else {
         panic!("expected replacements");
     };
@@ -6666,4 +6694,186 @@ fn a_torn_projection_header_is_recreated_rather_than_stopping_the_worker() {
         ProjectionProgress::Stopped
     ));
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(5)));
+}
+
+/// GH #543: `install_built` validates a parsed snapshot's generation under the
+/// cache write lock, then RELEASES that lock before enqueueing it. A save can
+/// publish the next generation and queue its delta in that gap — and the
+/// arriving snapshot used to clear every delta and set `latest_generation`
+/// back to its own, older, value. The saved text then simply was not in search
+/// until something else happened to touch the page. A snapshot older than the
+/// queue is not a supersession, it is a rollback.
+#[test]
+/// GH #543 (audit finding F1): `warm_outcome` is a single slot with no attempt
+/// key, so a warm that is descheduled before it reads the slot can find its
+/// outcome already taken by a second warm. Such a waiter must not block
+/// forever — it holds the process-wide warm mutex, so every later graph warm
+/// queues behind it and the app stops indexing altogether.
+#[test]
+fn a_warm_waiter_with_no_producer_does_not_block_forever() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-lost-outcome");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    // The state a loser of that race is left in: nothing queued, an idle
+    // worker, and an empty outcome slot.
+    {
+        let pending = projection.shared.pending.lock().unwrap();
+        assert!(pending.warm.is_none() && pending.warm_stream.is_none());
+        assert!(pending.warm_outcome.is_none());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = Arc::clone(&projection);
+    let joined = std::thread::spawn(move || {
+        let _ = tx.send(waiter.wait_warm_outcome());
+    });
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("wait_warm_outcome blocked with nothing left to produce an outcome");
+    joined.join().unwrap();
+    assert!(
+        matches!(outcome, WarmOutcome::Superseded),
+        "expected the waiter to be told another attempt owns readiness, got {outcome:?}"
+    );
+}
+
+/// GH #543 (audit finding F4): a page the walk cannot READ is not a page that
+/// is GONE. Such a page carries no revision, so it is absent from the warm's
+/// `sources` — and validation used to read that absence as a deletion and drop
+/// every row it had, while reporting `Clean`. A live page then vanished from
+/// search over a transient disk error or a sharing violation, and stayed gone
+/// until something else touched it.
+#[test]
+fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-retained");
+    std::fs::write(
+        root.join("pages/unreadable.md"),
+        "- gh543 retained sentinel\n",
+    )
+    .unwrap();
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    assert!(
+        !graph
+            .search("gh543 retained sentinel", 50)
+            .unwrap()
+            .is_empty(),
+        "the page was never indexed, so this test would prove nothing"
+    );
+    let projection = graph.direct_projection_test().unwrap();
+
+    // A second walk in which that one page's bytes could not be read: it is
+    // absent from `sources` for want of a revision, and named `retained`.
+    let (all, bytes) = warm_sources(&graph);
+    let (unreadable, sources): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|(entry, _)| entry.rel_path.ends_with("unreadable.md"));
+    let retained = unreadable
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1, "fixture did not contain the page");
+    let config = Arc::new(graph.config.parse_config());
+    let generation = graph.cache_generation();
+    assert!(projection.enqueue_warm(generation, sources, retained, config, bytes));
+    let outcome = projection.wait_warm_outcome();
+    wait_ready(&graph);
+
+    assert!(
+        !graph
+            .search("gh543 retained sentinel", 50)
+            .unwrap()
+            .is_empty(),
+        "an unreadable page's rows were deleted as if the page were gone \
+         (warm outcome {outcome:?}): {}",
+        projection.debug_state_test()
+    );
+}
+
+fn a_full_snapshot_older_than_the_queue_does_not_roll_it_back() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-stale-full");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    // A complete parsed snapshot of the graph as it is now.
+    let mut pages = Vec::new();
+    let mut revisions = HashMap::new();
+    for entry in graph.list_pages() {
+        revisions.insert(
+            entry.path.clone(),
+            graph.load_page(&entry).unwrap().rev.unwrap(),
+        );
+        let mut document = crate::doc::parse(&std::fs::read_to_string(&entry.path).unwrap());
+        crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+        pages.push((entry, Arc::new(document)));
+    }
+    let pages = Arc::new(pages);
+    let revisions = Arc::new(revisions);
+    let config = Arc::clone(
+        &projection
+            .shared
+            .committed_registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .config,
+    );
+    let stale_generation = graph.cache_generation();
+
+    // A save lands while that snapshot is in the caller's hands.
+    let entry = graph.list_pages().into_iter().next().unwrap();
+    let mut page = graph.load_page(&entry).unwrap();
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "gh543 stale full sentinel".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    let saved_generation = graph.cache_generation();
+    assert!(saved_generation > stale_generation);
+
+    // The delayed snapshot arrives, naming the generation it was built for.
+    projection.enqueue_full(stale_generation, pages, revisions, config);
+    // Read the queue OUT of the lock: a panic while holding it wedges the
+    // worker on the poisoned mutex and the failure shows up as a hang.
+    let latest = projection.shared.pending.lock().unwrap().latest_generation;
+    assert!(
+        latest >= saved_generation,
+        "the queue was rolled back from generation {saved_generation} to {latest}: {}",
+        projection.debug_state_test()
+    );
+
+    // And the user-visible consequence: the saved text is searchable.
+    let mut found = false;
+    for _ in 0..600 {
+        if graph
+            .search("gh543 stale full sentinel", 50)
+            .map(|groups| !groups.is_empty())
+            .unwrap_or(false)
+        {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        found,
+        "the save was lost to a stale snapshot: {}",
+        projection.debug_state_test()
+    );
 }

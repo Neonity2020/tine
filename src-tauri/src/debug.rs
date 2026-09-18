@@ -585,9 +585,12 @@ pub(crate) fn diagnostic_ipc_event(
             || reason
                 .strip_prefix("not-ready:")
                 .is_some_and(|code| matches!(code, "indexing" | "recovering" | "busy"))
-            || reason
-                .strip_prefix("unavailable:")
-                .is_some_and(|code| code.len() <= 32 && code.chars().all(|c| c.is_ascii_lowercase() || c == '-' || c == '_'))
+            || reason.strip_prefix("unavailable:").is_some_and(|code| {
+                code.len() <= 32
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_')
+            })
     }) {
         fields.insert("reason".into(), json!(reason));
     }

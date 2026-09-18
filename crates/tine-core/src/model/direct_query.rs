@@ -894,6 +894,20 @@ impl Graph {
             let Some(projection) = projection.as_ref() else {
                 return;
             };
+            if projection.warm_in_flight() {
+                // Another thread is already reading this graph's inventory —
+                // the open path's warm, or a warm this repair's own earlier
+                // pass started. `projection_recovery` serializes repairs but
+                // not that warm, so continuing here would run a second warm of
+                // the same graph concurrently: both read every page, both
+                // compete for the single `warm_outcome` slot, and the loser
+                // used to wait for a producer that no longer existed
+                // (GH #543). The warm in flight is the payload; let it finish.
+                crate::direct_projection::projection_diag(|| {
+                    "repair skipped: a warm is already in flight".to_owned()
+                });
+                return;
+            }
             let reset = reset || projection.worker_failed();
             if reset {
                 projection.request_rebuild();
@@ -926,6 +940,25 @@ impl Graph {
             return;
         };
         let revisions = self.disk_revs.read().unwrap().clone();
+        // The generation, the pages and the revisions were read under three
+        // separate locks, so a save landing between them pairs OLD documents
+        // with NEW source revisions — which stamps stale content with the hash
+        // of the current file and defeats the very comparison a later warm
+        // would use to notice it was stale. Re-read the generation: if it
+        // moved, this pair may straddle two of them and must not be published
+        // (GH #543). The obligation a `reset` created goes with it, or it would
+        // be latched with no payload behind it.
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            crate::direct_projection::projection_diag(|| {
+                "repair snapshot abandoned: generation moved while it was assembled".to_owned()
+            });
+            if reset {
+                if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+                    projection.withdraw_rebuild_request();
+                }
+            }
+            return;
+        }
         // A reset must be followed by a payload; see `direct_projection_enqueue_full`.
         self.direct_projection_enqueue_full(generation, pages, Arc::new(revisions), reset);
     }

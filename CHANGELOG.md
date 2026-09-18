@@ -17,6 +17,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   flag nothing is recorded (GH #543).
 
 ### Fixed
+- Search can no longer get stuck on "Indexing — waiting for search to be
+  ready…" for the rest of a session. Several paths could leave the index owing
+  a full re-read of the graph with nothing left running that would ever do it:
+  a failed read during a build asked for a rebuild that no later work could
+  discharge, a second search-thread build could start beside the one already
+  running and then wait for an answer the first had already taken, and a build
+  could hand ownership to a parsed copy of the graph that was not the thing
+  being waited for. Each of those now either finishes the work or withdraws the
+  request so the next attempt can do it, and the app reports indexing while it
+  happens (GH #543).
+
+- Search no longer answers from an index that was just emptied. Rebuilding
+  clears the index before refilling it, and the flag that says "this session
+  has checked the whole graph" survived that clearing, so searches run in the
+  gap could return no results rather than saying the index was not ready
+  (GH #543).
+
+- A search index file damaged badly enough that SQLite will not open it at all
+  is now deleted and rebuilt. Previously the repair only ran once a connection
+  had been made, so a torn file left search unavailable for that graph for as
+  long as the app ran. Nothing in the index is a source of truth; it is rebuilt
+  from your Markdown (GH #543).
+
+- A page whose file cannot be read while the index is being checked no longer
+  disappears from search. The check treated "could not read" the same as "no
+  longer there" and dropped everything it had indexed for that page, so a
+  transient disk error — or another program holding the file open, which is
+  common on Windows — silently removed a page from search until something else
+  changed it. Such a page now keeps what was indexed for it and is re-read on
+  the next check (GH #543).
+
+- A parsed copy of the graph that arrives late can no longer undo a save made
+  while it was being prepared. The stale copy replaced the newer text and
+  discarded the pending change, so the saved words were missing from search
+  until that page was edited again. Your file on disk was never affected
+  (GH #543).
+
 - Saving while the search index is being rebuilt no longer takes search away
   until the rebuild finishes. A save that lands mid-rebuild makes the index
   start its check over, and search went from answering to "waiting for search to

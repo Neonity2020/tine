@@ -972,10 +972,17 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "fs.create_dir_all",
             1,
         ),
+        // 2026-09-18: GH #543 — a projection file whose SQLite HEADER is torn
+        // never yields a connection, so the existing schema repair cannot run
+        // and the worker stopped for the graph's lifetime. The recreate path
+        // removes the file and its `-wal`/`-shm` companions (one call site,
+        // two occurrences) before reopening. The projection is a disposable
+        // cache and the caller holds the exclusive writer lease; no graph text
+        // is touched.
         (
             "crates/tine-core/src/direct_projection.rs",
             "fs.remove_file",
-            1,
+            2,
         ),
         (
             "crates/tine-core/src/direct_projection.rs",
@@ -1474,9 +1481,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // raw_name)` where it took a 4-tuple — but that is an argument change at an
     // existing call site, not a new or removed one, so no inventory row moved
     // and the digest below held (the same way the v0.20.2 bump did).
+    // 2026-09-18: GH #543 — the torn-header recreate path in
+    // `open_projection_database` reopens the recreated file and initializes
+    // and validates its schema, so `open_writable`, `initialize_schema` and
+    // `validate_schema` each gain one call site in direct_projection.rs. No
+    // write crossing moved (the rows asserted above are unchanged) and no new
+    // storage API entered the surface.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "8d3af88e280015a04f1ad1ebb0c133ac1c115349e0946b455aad60eed1d55721",
+        "d53d0f1b592fae8bb5a7397c814c3d562dd7b79f843092f2bf2f82b896b87dc1",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

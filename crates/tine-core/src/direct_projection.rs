@@ -149,6 +149,11 @@ struct PendingFull {
 /// alone, a changed one names the pages the warm thread must parse.
 struct PendingWarm {
     sources: Vec<(PageEntry, String)>,
+    /// Pages the walk could not READ (an I/O error, not an absence). They are
+    /// deliberately absent from `sources` because no revision could be taken
+    /// for them, but they still exist: validation must leave their existing
+    /// rows alone instead of reading their omission as a deletion (GH #543).
+    retained: Vec<PageEntry>,
     parse_config: Arc<ParseConfig>,
     /// Total bytes of the graph text the warm read for its revisions. A
     /// stream this warm opens sizes the writer's page cache from it
@@ -899,6 +904,14 @@ impl DirectProjection {
         WarmInFlight(Arc::clone(&self.shared))
     }
 
+    /// True while some thread has announced a warm and not yet finished it.
+    /// `projection_recovery` serializes repairs against each other but not
+    /// against the open path's warm, so a query arriving during a cold open
+    /// could start a SECOND warm of the same graph (GH #543).
+    pub(crate) fn warm_in_flight(&self) -> bool {
+        self.shared.warms_in_flight.load(Ordering::Acquire) > 0
+    }
+
     /// True while the last worker turn failed. The flag clears on the next
     /// successful turn, so it names a projection that owes a reset — not one
     /// that has merely never started.
@@ -994,6 +1007,27 @@ impl DirectProjection {
         if pending.warm_stream.is_some() && !pending.rebuild && !pending.warm_superseded {
             return;
         }
+        // A snapshot older than the queue is not a supersession, it is a
+        // rollback. `install_built` validates the generation under the cache
+        // write lock and then RELEASES that lock before enqueueing here, so a
+        // save can publish G+1 and queue its delta in the gap; this call would
+        // then clear that delta and drop `latest_generation` back to G, and the
+        // saved text would be absent from search until something else touched
+        // the page. The snapshot's own pages are stale by construction at that
+        // point — the delta is the newer truth (GH #543).
+        //
+        // A requested rebuild is the exception: it resets the database, so its
+        // payload must be applied even though the deltas are newer. They are
+        // re-derived from source by the inventory the rebuild carries.
+        if generation < pending.latest_generation && !pending.rebuild {
+            projection_diag(|| {
+                format!(
+                    "full refused: snapshot generation={generation} older than queue {}",
+                    pending.latest_generation
+                )
+            });
+            return;
+        }
         self.shared.ready.store(false, Ordering::Release);
         self.shared.worker_failed.store(false, Ordering::Release);
         pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
@@ -1027,6 +1061,7 @@ impl DirectProjection {
         &self,
         generation: u64,
         sources: Vec<(PageEntry, String)>,
+        retained: Vec<PageEntry>,
         parse_config: Arc<ParseConfig>,
         text_bytes: u64,
     ) -> bool {
@@ -1066,7 +1101,12 @@ impl DirectProjection {
             .store(sources.len() as u64, Ordering::Release);
         self.shared.stream_indexed.store(0, Ordering::Release);
         self.shared.ready.store(false, Ordering::Release);
-        pending.seed_page_order(sources.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        let ordered = sources
+            .iter()
+            .map(|(entry, _)| entry.rel_path.as_str())
+            .chain(retained.iter().map(|entry| entry.rel_path.as_str()))
+            .collect::<Vec<_>>();
+        pending.seed_page_order(ordered.into_iter());
         // Optimistically open the stream now so every delta recorded from here
         // until the outcome carries no order position; the worker closes it
         // again in the same turn when the outcome is `Clean`.
@@ -1075,6 +1115,7 @@ impl DirectProjection {
         pending.warm_superseded = false;
         pending.warm = Some(PendingWarm {
             sources,
+            retained,
             parse_config,
             text_bytes,
         });
@@ -1143,6 +1184,24 @@ impl DirectProjection {
             }
             if !self.shared.worker_available.load(Ordering::Acquire) || pending.stop {
                 return WarmOutcome::Failed;
+            }
+            // `warm_outcome` is ONE slot with no attempt key, so a second warm
+            // that started while this waiter was descheduled clears the slot
+            // and publishes its own outcome; both waiters then race for that
+            // one value and the loser would block here forever — while holding
+            // the process-wide warm mutex, so every later graph warm queues
+            // behind it (GH #543). Nothing queued and an idle worker means no
+            // outcome is coming for THIS waiter: say so instead of waiting.
+            // The caller checks `owes_inventory()` before reading Superseded
+            // as "another producer owns readiness".
+            if pending.warm.is_none()
+                && pending.warm_stream.is_none()
+                && !self.shared.worker_busy.load(Ordering::Acquire)
+            {
+                projection_diag(|| {
+                    "warm outcome taken by another attempt; nothing left to wait for".to_owned()
+                });
+                return WarmOutcome::Superseded;
             }
             pending = self.shared.changed.wait(pending).unwrap();
         }
@@ -3011,9 +3070,24 @@ fn validate_warm(
             revision: projection_source_revision(revision, config_digest),
         })
         .collect::<Vec<_>>();
-    let source_delta = database
+    let mut source_delta = database
         .source_delta(&sources)
         .map_err(|error| error.to_string())?;
+    if !warm.retained.is_empty() {
+        // A page whose bytes could not be read is absent from `sources`, so
+        // `source_delta` names it a deletion — and warm validation would drop
+        // the rows of a page that still exists (GH #543). An unreadable page
+        // keeps its previous rows AND its previous stored revision, so the
+        // next warm names it a replacement and re-reads it once the read
+        // succeeds. In-scope scenarios: a transient disk error, and a
+        // Windows/macOS sharing violation while another process holds the file.
+        let retained = warm
+            .retained
+            .iter()
+            .map(|entry| page_id(&entry.rel_path))
+            .collect::<std::collections::BTreeSet<_>>();
+        source_delta.deletions.retain(|id| !retained.contains(id));
+    }
     if !source_delta.deletions.is_empty() {
         applied
             .deleted

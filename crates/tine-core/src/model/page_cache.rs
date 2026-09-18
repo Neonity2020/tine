@@ -454,6 +454,7 @@ impl Graph {
             return Outcome::Unavailable;
         };
         let mut sources = Vec::with_capacity(entries.len());
+        let mut retained = Vec::new();
         let mut failures = Vec::new();
         let mut text_bytes = 0u64;
         for (i, entry) in entries.into_iter().enumerate() {
@@ -470,7 +471,18 @@ impl Graph {
                     text_bytes += content.len() as u64;
                     sources.push((entry, revision));
                 }
-                _ => failures.push(entry.rel_path),
+                // The file is genuinely gone: omitting it from `sources` is
+                // how the walk says "delete its rows".
+                Ok(None) => failures.push(entry.rel_path),
+                // The file EXISTS and could not be read. Omitting it would
+                // delete a live page's rows over a transient disk error or a
+                // Windows sharing violation (GH #543), so name it retained:
+                // validation keeps its rows and its old stored revision, and
+                // the next warm re-reads it.
+                Err(_) => {
+                    retained.push(entry.clone());
+                    failures.push(entry.rel_path);
+                }
             }
             if i % 24 == 23 {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -487,16 +499,22 @@ impl Graph {
         }
         crate::direct_projection::projection_diag(|| {
             format!(
-                "warm inventory read in {}ms pages={} failures={} text_mib={:.1}",
+                "warm inventory read in {}ms pages={} retained={} failures={} text_mib={:.1}",
                 warm_started.elapsed().as_millis(),
                 sources.len(),
+                retained.len(),
                 failures.len(),
                 text_bytes as f64 / (1024.0 * 1024.0),
             )
         });
         let parse_config = Arc::new(self.config.parse_config());
-        let enqueued =
-            projection.enqueue_warm(generation, sources, Arc::clone(&parse_config), text_bytes);
+        let enqueued = projection.enqueue_warm(
+            generation,
+            sources,
+            retained,
+            Arc::clone(&parse_config),
+            text_bytes,
+        );
         // From here the queue itself reports Indexing (or the refusal reason).
         drop(in_flight);
         if !enqueued {
@@ -529,7 +547,18 @@ impl Graph {
                 self.publish_page_index_failures(generation, failures);
                 Outcome::Owned
             }
-            crate::direct_projection::WarmOutcome::Superseded => Outcome::Owned,
+            crate::direct_projection::WarmOutcome::Superseded => {
+                // Superseded means SOMEONE ELSE owns readiness — a full
+                // snapshot, or the warm that took this one's outcome slot. If
+                // a complete inventory is still owed with nothing queued to
+                // produce it, that claim is false and returning Owned strands
+                // the projection (GH #543); warm again instead.
+                if projection.owes_inventory() {
+                    Outcome::Retry
+                } else {
+                    Outcome::Owned
+                }
+            }
             crate::direct_projection::WarmOutcome::Failed => Outcome::Unavailable,
             crate::direct_projection::WarmOutcome::Replacements(pages) => {
                 if self.stream_warm_replacements(
@@ -581,44 +610,58 @@ impl Graph {
                 return projection.abandon_warm_stream(generation);
             }
             let fallback = entry.clone();
-            let item = match self.graph_text_read_optional_text_with_identity(permit, &entry.path) {
-                Ok(Some((content, _))) => {
-                    #[cfg(test)]
-                    self.page_build_test
-                        .warm_stream_parses
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    match isolate_page_parse(entry, &self.journal_format, |entry| {
-                        Some(parse_page_content(entry, &content))
-                    }) {
-                        Ok(Some((effective, mut document, revision))) => {
-                            let identity = if self.restore_session_page_ids(
-                                &effective,
-                                &revision,
-                                &mut document,
-                            ) {
-                                crate::direct_projection::DeltaIdentity::Live
-                            } else {
-                                crate::direct_projection::DeltaIdentity::Structural
-                            };
-                            WarmStreamItem::Replace {
-                                entry: effective,
-                                document: Arc::new(document),
-                                revision,
-                                identity,
+            let item: Option<WarmStreamItem> =
+                match self.graph_text_read_optional_text_with_identity(permit, &entry.path) {
+                    Ok(Some((content, _))) => {
+                        #[cfg(test)]
+                        self.page_build_test
+                            .warm_stream_parses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match isolate_page_parse(entry, &self.journal_format, |entry| {
+                            Some(parse_page_content(entry, &content))
+                        }) {
+                            Ok(Some((effective, mut document, revision))) => {
+                                let identity = if self.restore_session_page_ids(
+                                    &effective,
+                                    &revision,
+                                    &mut document,
+                                ) {
+                                    crate::direct_projection::DeltaIdentity::Live
+                                } else {
+                                    crate::direct_projection::DeltaIdentity::Structural
+                                };
+                                Some(WarmStreamItem::Replace {
+                                    entry: effective,
+                                    document: Arc::new(document),
+                                    revision,
+                                    identity,
+                                })
+                            }
+                            Ok(None) | Err(_) => {
+                                failures.push(fallback.rel_path.clone());
+                                Some(WarmStreamItem::Delete { entry: fallback })
                             }
                         }
-                        Ok(None) | Err(_) => {
-                            failures.push(fallback.rel_path.clone());
-                            WarmStreamItem::Delete { entry: fallback }
-                        }
                     }
-                }
-                _ => {
-                    failures.push(fallback.rel_path.clone());
-                    WarmStreamItem::Delete { entry: fallback }
-                }
-            };
-            batch.push(item);
+                    // Gone from disk since the walk: delete is right.
+                    Ok(None) => {
+                        failures.push(fallback.rel_path.clone());
+                        Some(WarmStreamItem::Delete { entry: fallback })
+                    }
+                    // Unreadable, not absent. Queue NOTHING for it: the page keeps
+                    // the rows and the stored revision it already had, so the next
+                    // warm names it a replacement again and re-reads it. Deleting
+                    // it here erased a live page over a transient read error
+                    // (GH #543).
+                    Err(_) => {
+                        failures.push(fallback.rel_path.clone());
+                        None
+                    }
+                };
+            // `None` still falls through to the flush below: skipping it left
+            // a final partial batch unsent when the LAST page was the
+            // unreadable one.
+            batch.extend(item);
             if batch.len() == BATCH || i + 1 == total {
                 if (i / BATCH) % 32 == 0 || i + 1 == total {
                     crate::direct_projection::projection_diag(|| {
