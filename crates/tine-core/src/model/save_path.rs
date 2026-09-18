@@ -518,7 +518,17 @@ impl Graph {
                     .as_ref()
                     .is_some_and(|pages| self.cached_page_index_for_path(pages, &path).is_none())
             });
-        if need_cache_update {
+        // GH #543 (fifth audit A5-N2): the `(kind,name)` exclusion above had
+        // quietly become an exclusion from the INDEX too. The projection's rows
+        // are keyed by PATH, not by logical name, so a pinned file has its own
+        // rows and they are what search answers from — but `cache_upsert` is
+        // where the delta is published, so skipping it left this file indexed at
+        // its pre-save text forever, with the index idle, validated and ready.
+        // Nothing was queued and a successful answer never reaches the repair a
+        // refusal would start, so it never corrected itself. Publish the rows
+        // without touching the name cache.
+        let need_projection_publication = !cache && changed;
+        if need_cache_update || need_projection_publication {
             // For a brand-new journal, derive its date_key from the name so it's
             // recognized as a dated journal by `journals_desc` (which reads this
             // cache) — otherwise today's freshly-created page would be missing.
@@ -554,7 +564,18 @@ impl Graph {
                 doc
             };
             let entry = effective_page_entry(&self.journal_format, &base_entry, &cache_doc);
-            self.cache_upsert(entry, cache_doc, rev.clone());
+            if need_cache_update {
+                self.cache_upsert(entry, cache_doc, rev.clone());
+            } else {
+                // No generation bump: the parsed cache did not change, and the
+                // delta belongs to the generation the rest of it already has.
+                self.direct_projection_enqueue_replace(
+                    self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                    entry,
+                    std::sync::Arc::new(cache_doc),
+                    rev.clone(),
+                );
+            }
         }
         // Drop the self-write marker now the write is published + cached (it only
         // had to cover the atomic-write → cache_upsert window; disk_revs now

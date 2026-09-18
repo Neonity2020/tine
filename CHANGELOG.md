@@ -28,6 +28,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   changed, which it already holds, so no rebuild is needed — and hands them over
   in one step, because a half-told change let the index report itself complete
   while a page was missing from it (GH #543).
+- A merged-away page can no longer come back. Retiring its rows was not the
+  same as retiring the page: the merged page stayed in the in-memory snapshot
+  the index rebuilds itself from, so recovering from a read error put it back
+  into search, with the index reporting itself complete (GH #543).
+- Reconciling a duplicate journal day now reaches search. Folding one file into
+  the other, and trashing one of the day's files, both moved a real file out of
+  the graph and told the index nothing — so the folded-in line was found twice,
+  once from the live file and once from a file in the trash, and trashed text
+  went on being findable. Migrating journal filenames to the graph's configured
+  format had the same gap, and showed up as duplicate results after the next
+  edit of a migrated day (GH #543).
+- Editing one file of a duplicate journal day now reaches search. The edit was
+  written to disk correctly, but that file is deliberately kept out of the
+  by-name page cache — and the index was being told about edits from there
+  only, so search kept serving what the file said before the edit, for the rest
+  of the session (GH #543).
 
 - Search can no longer stop indexing when two parts of the app read the graph
   at the same time. The index kept one slot for "the answer to the check that

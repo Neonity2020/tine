@@ -1155,6 +1155,12 @@ impl Graph {
         let win_cacheable = self.graph_text_path_is_cacheable(&write, &win)?;
         // Stage-before-commit (L5): move the conflict copy out first, then write the
         // merged winner; roll the move back if the write fails.
+        // Retained for the projection before the move takes the path away. A
+        // provider conflict copy is not eligible graph text, so this is `None`
+        // for the ordinary sync-copy resolve and `Some` exactly when this
+        // shared implementation is reconciling a DUPLICATE JOURNAL DAY, whose
+        // stray is a real indexed page (GH #543, fifth audit A5-N1).
+        let retired = self.entry_for_path(&conf);
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
         self.graph_text_create_dir_all(&write, &trash)?;
         let conf_name = conf.file_name().and_then(|s| s.to_str()).unwrap_or("file");
@@ -1185,6 +1191,13 @@ impl Graph {
                 return Err(error);
             }
         };
+        // The stray is in the trash and its line has been folded into the
+        // winner. Nothing retired its rows, so the folded-in text was served
+        // TWICE — once from the live file and once from a file that no longer
+        // exists — with the index ready, nothing queued and no progress shown.
+        if let Some(entry) = retired {
+            self.cache_remove_path(&entry);
+        }
         // The conflict copy is resolved and trashed — its pinned base (if any)
         // has served its purpose; let the ledger forget it (best-effort).
         if let Some(ledger) = self.concord_ledger.get() {

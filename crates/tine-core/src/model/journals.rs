@@ -127,6 +127,7 @@ impl Graph {
         let write = self.admit_graph_text_writer()?;
         let entries = self.configured_text_entries(&write, false)?;
         let mut n = 0;
+        let mut moved: Vec<(Option<PageEntry>, PathBuf)> = Vec::new();
         for entry in entries
             .into_iter()
             .filter(|entry| entry.kind == PageKind::Journal)
@@ -136,10 +137,55 @@ impl Graph {
                 if self.graph_text_exists(&write, &target)? {
                     continue;
                 }
+                // Retained for the projection before the move takes the path away.
+                let retired = self.entry_for_path(&p);
                 if self.graph_text_move_noreplace(&write, &p, &target).is_ok() {
                     n += 1;
+                    moved.push((retired, target));
                 }
             }
+        }
+        if n > 0 {
+            // GH #543 (fifth audit A5-N1): this migration MOVES files and told
+            // nothing. The logical page and its text are unchanged, so search
+            // kept answering — from rows keyed to paths that no longer exist,
+            // with nothing queued to correct them. The next ordinary save of a
+            // migrated page then published its NEW path beside the retired
+            // one's surviving row, so one file answered twice.
+            self.invalidate_cache_after_tine_mutation();
+            let mut page_set = Vec::new();
+            for (retired, target) in moved {
+                if let Some(entry) = retired {
+                    page_set.push(crate::direct_projection::PageSetChange::Delete { entry });
+                }
+                let replacement = self
+                    .graph_text_read_to_string(&write, &target)
+                    .ok()
+                    .and_then(|content| {
+                        let provisional = self.graph_inventory_entry(&target).ok().flatten()?;
+                        parse_exact_page(self, &provisional, &content).ok()
+                    });
+                // Stale beats absent: without the replacement the retired rows
+                // are the only evidence this journal exists, so leave them and
+                // let a later warm reconcile (`rename_file_to_page` reasons the
+                // same way).
+                match replacement {
+                    Some((entry, document, revision)) => {
+                        page_set.push(crate::direct_projection::PageSetChange::Replace {
+                            entry,
+                            document: Arc::new(document),
+                            revision,
+                        })
+                    }
+                    None => {
+                        page_set.pop();
+                    }
+                }
+            }
+            self.direct_projection_publish_page_set(
+                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                page_set,
+            );
         }
         Ok(n)
     }
@@ -178,7 +224,18 @@ impl Graph {
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Journal);
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
+        // Retained for the projection before the move takes the path away.
+        let retired = self.entry_for_path(&src);
         self.graph_text_move_to_trash(&write, &src, &dest, &trash)?;
+        // GH #543 (fifth audit A5-N1): this published nothing at all — no cache
+        // removal, no generation advance, no delta — so search went on offering
+        // the trashed file's text from an index that called itself complete.
+        // `cache_remove_path` is the blessed one-page retirement: it drops the
+        // page from the parsed cache and every index derived from it, advances
+        // the generation, and queues the projection's delete.
+        if let Some(entry) = retired {
+            self.cache_remove_path(&entry);
+        }
         Ok(())
     }
 }

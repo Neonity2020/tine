@@ -118,6 +118,17 @@ impl Graph {
                 "source changed during merge",
             ));
         }
+        // Retire the source the moment its FILE leaves the graph, before the
+        // destination is rewritten — not after. Published the other way round,
+        // the destination's own `cache_upsert` can be drained on its own and the
+        // worker announces a complete, ready index that still contains a page
+        // whose file is already in the trash (fifth audit A5-N4). This order has
+        // no such state: every image published between these two points is one
+        // that actually existed on disk — the source gone, the destination not
+        // yet merged.
+        if let Some(entry) = src_entry.clone() {
+            self.cache_remove_path(&entry);
+        }
         // The page lock excludes other Tine writers, but not Logseq/Syncthing.
         // Recheck the baseline at commit so an external edit arriving after our
         // read is not silently overwritten.
@@ -134,6 +145,18 @@ impl Graph {
         ) {
             let _ = graph_text_write_during_rollback_hook();
             let _ = self.graph_text_move_noreplace(&write, &staged, &src);
+            // The rollback puts the source file back, so its retirement has to
+            // come back with it — otherwise a failed merge leaves the index
+            // missing a page that exists, with nothing queued to notice.
+            // Republished from the exact bytes verified on disk above, so this
+            // compensation needs no read that could fail in turn.
+            if let Some(entry) = src_entry {
+                if let Ok((entry, document, revision)) =
+                    parse_exact_page(self, &entry, &src_content)
+                {
+                    self.cache_upsert(entry, document, revision);
+                }
+            }
             return Err(e);
         }
         // GH #543: the merged destination publishes itself through `write_page`,
@@ -141,12 +164,19 @@ impl Graph {
         // with the index `ready` and claiming to be complete, while the source's
         // file sat in the trash. A successful answer never reaches the repair a
         // refusal would start, so the ghost never went away (fourth audit A4-N1).
-        if let Some(entry) = src_entry {
-            self.direct_projection_publish_page_set(
-                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
-                vec![PageSetChange::Delete { entry }],
-            );
-        }
+        //
+        // Deleting the source's ROWS is not enough, and the first fix here did
+        // only that (fifth audit A5-N3). Unlike every other page-set mutation in
+        // this file, a merge does NOT invalidate the parsed whole-graph cache —
+        // it publishes one destination through `cache_upsert` — so the source
+        // stayed in that cache. The parsed cache is an authoritative snapshot
+        // producer: a query read failure makes the repair path reset the index
+        // and republish it at the CURRENT generation, walking the merged-away
+        // page straight back into search, past the older-generation guard, which
+        // has nothing to object to. `cache_remove_path` is the blessed one-page
+        // retirement — parsed cache, revisions, every derived index, the session
+        // ids and the projection delete, in one generation. It runs above,
+        // before the destination write, for the reason A5-N4 gives there.
         Ok(())
     }
 

@@ -15217,3 +15217,47 @@ fn registry_build_timing_on_a_real_graph() {
         micros[micros.len() / 2]
     );
 }
+
+/// A merge retires the source the moment its file leaves the graph, before the
+/// destination is rewritten, so no index that calls itself complete ever
+/// contains a page whose file is already in the trash (GH #543, fifth audit
+/// A5-N4). When the destination write then fails, the rollback puts the source
+/// file back — and its retirement has to come back with it, or a failed merge
+/// leaves the graph missing a page that exists, with nothing queued to notice.
+#[test]
+fn a_failed_merge_puts_the_source_back_in_the_index_too() {
+    let dir = scratch("merge-rollback-republishes-source");
+    fs::write(dir.join("pages").join("source.md"), "- pangolin source\n").unwrap();
+    fs::write(
+        dir.join("pages").join("destination.md"),
+        "- destination body\n",
+    )
+    .unwrap();
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+    let indexed = |graph: &Graph| {
+        graph.with_pages(|pages| pages.iter().any(|(entry, _)| entry.name == "source"))
+    };
+    assert!(indexed(&graph), "the source starts indexed");
+
+    // An external writer lands between the merge's read of the destination and
+    // its commit recheck: the write is refused and the merge rolls back.
+    let dst = dir.join("pages").join("destination.md");
+    EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::write(&dst, "- destination body\n- typed elsewhere\n")
+        }));
+    });
+    let error = graph
+        .merge_pages("pages/source.md", "pages/destination.md")
+        .unwrap_err();
+    assert!(
+        dir.join("pages").join("source.md").exists(),
+        "the rollback must restore the source file: {error}"
+    );
+    assert!(
+        indexed(&graph),
+        "the failed merge left the index missing a page that is on disk: {error}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

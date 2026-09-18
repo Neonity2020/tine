@@ -7405,6 +7405,16 @@ fn a_merge_and_a_rescue_tell_the_index_what_they_changed() {
 /// rename's `Delete` drained on its own left the index `ready` over a graph
 /// missing the page entirely (fourth audit A4-N2). The one-page save and delete
 /// paths keep their own single-delta entry points; these three do not.
+///
+/// This scan proves the SPELLING inside the mutation file, not that the whole
+/// publication is atomic: it cannot see a publication these functions reach
+/// through `write_page -> cache_upsert`, which is exactly how a merge used to
+/// announce its destination while its source was still queued (fifth audit
+/// A5-N4). That property is behavioural, and lives in
+/// `a_merged_away_source_cannot_be_resurrected_by_a_repair` and
+/// `a_failed_merge_puts_the_source_back_in_the_index_too`, where a merge's
+/// retirement is published before the destination write and rolled back with
+/// it.
 #[test]
 fn a_page_set_mutation_publishes_through_one_front_door() {
     for file in ["model/page_rename.rs", "model/pages_merge.rs"] {
@@ -7432,4 +7442,322 @@ fn a_page_set_mutation_publishes_through_one_front_door() {
             );
         }
     }
+}
+
+/// A duplicate journal day: the canonical date-named file and a title-named
+/// stray for the same day, both indexed, with `token` present only in the stray.
+fn duplicate_day_projection_graph(tag: &str, token: &str) -> PathBuf {
+    let root = scratch(tag);
+    std::fs::create_dir_all(root.join("logseq")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("logseq/config.edn"),
+        "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("journals/2026_06_26.md"),
+        "- shared line\n- only in canonical\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("journals/Friday, 26-06-2026.md"),
+        format!("- shared line\n- {token} only in stray\n"),
+    )
+    .unwrap();
+    root
+}
+
+fn attached_graph(root: &Path) -> Graph {
+    let graph = Graph::open(root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    graph
+}
+
+/// How many indexed BLOCKS carry `token`. Counting groups is not enough for a
+/// duplicate journal day: the stray and the canonical file answer under the
+/// same journal title, so a ghost row hides inside one group.
+fn hits(graph: &Graph, token: &str) -> usize {
+    graph
+        .search(token, 50)
+        .map(|groups| groups.iter().map(|group| group.blocks.len()).sum())
+        .unwrap_or(usize::MAX)
+}
+
+fn settle_hits(graph: &Graph, token: &str, want: usize) -> bool {
+    for _ in 0..600 {
+        if hits(graph, token) == want {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// Folding a duplicate day's stray into the canonical file moves the stray to
+/// the trash. Nothing retired its rows, so the token the merge had just folded
+/// in was served TWICE — once from the live canonical file and once from a file
+/// that no longer exists — with the index `ready`, nothing queued and no
+/// progress shown. A successful answer never reaches the repair a refusal would
+/// start, so it never went away (GH #543, fifth audit A5-N1).
+#[test]
+fn a_resolved_duplicate_day_retires_the_stray_it_trashed() {
+    let _serial = serialize_projection_tests();
+    let root = duplicate_day_projection_graph("gh543-duplicate-day-resolve", "zebrafish");
+    let graph = attached_graph(&root);
+    assert_eq!(hits(&graph, "zebrafish"), 1, "the stray starts indexed");
+
+    let diff = graph
+        .duplicate_journal_diff("journals/2026_06_26.md", "journals/Friday, 26-06-2026.md")
+        .unwrap()
+        .expect("a same-format pair diffs");
+    fn keep_both(
+        rows: &[crate::sync_diff::DiffRow],
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        for row in rows {
+            if row.kind != crate::sync_diff::RowKind::Unchanged {
+                out.insert(row.id.clone(), "both".to_string());
+            }
+            keep_both(&row.children, out);
+        }
+    }
+    let mut decisions = std::collections::HashMap::new();
+    keep_both(&diff.rows, &mut decisions);
+    graph
+        .resolve_duplicate_journal_day(
+            "journals/2026_06_26.md",
+            "journals/Friday, 26-06-2026.md",
+            &decisions,
+            &diff.base_rev,
+            &diff.conflict_rev,
+            "union",
+        )
+        .unwrap();
+    assert!(
+        !root.join("journals/Friday, 26-06-2026.md").exists(),
+        "the fixture did not actually resolve the day"
+    );
+    // The fold is the precondition the ghost hides behind: without it the
+    // token would still exist exactly once and the count below would pass
+    // while the stray's rows survived.
+    assert!(
+        std::fs::read_to_string(root.join("journals/2026_06_26.md"))
+            .unwrap()
+            .contains("zebrafish"),
+        "the fixture did not fold the stray's line into the canonical file"
+    );
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "zebrafish", 1),
+        "the trashed stray is still answering beside the file it was folded \
+         into: {} block(s) — {}",
+        hits(&graph, "zebrafish"),
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Trashing one file of a duplicate day is the other half of the same
+/// affordance, and it published nothing at all: no generation advance, no
+/// delta, no invalidation. Search went on finding the trashed file's text.
+#[test]
+fn a_trashed_journal_file_leaves_search() {
+    let _serial = serialize_projection_tests();
+    let root = duplicate_day_projection_graph("gh543-journal-trash", "narwhal");
+    let graph = attached_graph(&root);
+    assert_eq!(hits(&graph, "narwhal"), 1, "the stray starts indexed");
+
+    graph.trash_journal_file("Friday, 26-06-2026.md").unwrap();
+    assert!(
+        !root.join("journals/Friday, 26-06-2026.md").exists(),
+        "the fixture did not actually trash the file"
+    );
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "narwhal", 0),
+        "search still answers from the trashed journal file: {} block(s) — {}",
+        hits(&graph, "narwhal"),
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Migrating a title-named journal to the graph's filename format MOVES the
+/// file. The logical page and its text are unchanged, so search still answers —
+/// but from rows keyed to a path that no longer exists, with nothing queued to
+/// correct them.
+#[test]
+fn a_journal_filename_migration_republishes_the_file_it_moved() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh543-journal-migration");
+    std::fs::create_dir_all(root.join("logseq")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("logseq/config.edn"),
+        "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("journals/Friday, 26-06-2026.md"),
+        "- okapi only here\n",
+    )
+    .unwrap();
+    let graph = attached_graph(&root);
+    assert_eq!(hits(&graph, "okapi"), 1, "the journal starts indexed");
+
+    assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
+    assert!(root.join("journals/2026_06_26.md").exists());
+    assert!(!root.join("journals/Friday, 26-06-2026.md").exists());
+
+    // The stale row is keyed by the retired PATH, and the logical page and its
+    // text are unchanged — so the migration alone shows nothing. It surfaces on
+    // the next ordinary edit: that save publishes the NEW path, the retired
+    // path's row keeps answering beside it, and the graph now has two rows for
+    // one file.
+    let mut page = graph
+        .load_by_path("journals/2026_06_26.md")
+        .unwrap()
+        .expect("the migrated journal loads at its new path");
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "tapir only here".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "tapir", 1),
+        "the saved text never reached the index: {} block(s) — {}",
+        hits(&graph, "tapir"),
+        projection.debug_state_test()
+    );
+    assert_eq!(
+        hits(&graph, "okapi"),
+        0,
+        "the index still answers from the migrated-away path: {}",
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A path-pinned save — a duplicate day's stray, which deliberately never
+/// enters the `(kind,name)` parsed cache — wrote its bytes and published
+/// nothing. The projection's rows are keyed by PATH, so that exclusion had
+/// silently become "this file's index is never updated again": search kept
+/// serving the pre-save text, with the index idle, validated and ready
+/// (GH #543, fifth audit A5-N2).
+#[test]
+fn a_path_pinned_save_reaches_search() {
+    let _serial = serialize_projection_tests();
+    let root = duplicate_day_projection_graph("gh543-pinned-save", "wombat");
+    let graph = attached_graph(&root);
+    assert_eq!(hits(&graph, "wombat"), 1, "the stray starts indexed");
+
+    let mut page = graph
+        .load_by_path("journals/Friday, 26-06-2026.md")
+        .unwrap()
+        .expect("the stray loads by path");
+    let baseline = page.rev.clone();
+    let edited = page
+        .blocks
+        .iter()
+        .position(|block| block.raw.contains("wombat"))
+        .expect("the token block");
+    page.blocks[edited].raw = "kiwifruit only in stray".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+    assert!(
+        std::fs::read_to_string(root.join("journals/Friday, 26-06-2026.md"))
+            .unwrap()
+            .contains("kiwifruit"),
+        "the fixture did not actually save"
+    );
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "kiwifruit", 1),
+        "the saved text never reached the index: {} block(s) — {}",
+        hits(&graph, "kiwifruit"),
+        projection.debug_state_test()
+    );
+    assert_eq!(
+        hits(&graph, "wombat"),
+        0,
+        "the index still serves the pre-save text of a file that was saved"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Deleting the merged-away source's ROWS is not the same as retiring the page.
+/// The parsed whole-graph cache is an authoritative snapshot producer: a query
+/// read failure makes it reset the index and republish that snapshot at the
+/// CURRENT generation, so a source left in the cache walks straight back into
+/// search — past the older-generation guard, which sees nothing wrong
+/// (GH #543, fifth audit A5-N3).
+#[test]
+fn a_merged_away_source_cannot_be_resurrected_by_a_repair() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh543-merge-repair-resurrection");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::write(root.join("pages/source.md"), "- pangolin source\n").unwrap();
+    std::fs::write(root.join("pages/destination.md"), "- destination body\n").unwrap();
+    let graph = attached_graph(&root);
+    // The optional parsed snapshot exists — this is the producer under test.
+    graph.with_pages(|pages| assert_eq!(pages.len(), 2));
+
+    graph
+        .merge_pages("pages/source.md", "pages/destination.md")
+        .unwrap();
+    let names = |graph: &Graph| {
+        graph
+            .search("pangolin", 20)
+            .map(|groups| {
+                let mut names = groups
+                    .iter()
+                    .map(|group| group.page.clone())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names.dedup();
+                names
+            })
+            .unwrap_or_default()
+    };
+    let settled = (0..600).any(|_| {
+        if names(&graph) == vec!["destination".to_owned()] {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        false
+    });
+    assert!(
+        settled,
+        "the merge itself did not converge: {:?}",
+        names(&graph)
+    );
+
+    graph.direct_projection_inject_read_failure_test();
+    let projection = graph.direct_projection_test().unwrap();
+    for _ in 0..300 {
+        assert_ne!(
+            names(&graph),
+            vec!["destination".to_owned(), "source".to_owned()],
+            "a repair republished the merged-away source from the parsed cache: {}",
+            projection.debug_state_test()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        names(&graph),
+        vec!["destination".to_owned()],
+        "search lost the merged text: {}",
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
