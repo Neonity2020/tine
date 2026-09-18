@@ -1107,10 +1107,21 @@ impl DirectProjection {
         // vanished for the whole of it while the search below still said
         // Indexing, and the frontend reads that disappearance as "the build
         // finished" and re-runs the query.
+        // Every shape of build in flight, because the caller's contract is
+        // that `None` means IDLE: the Quick Switcher reruns its search on the
+        // non-null -> null edge, so any build this omitted announced a false
+        // completion mid-build and issued another query into the most loaded
+        // moment of the build (GH #543). A pending full snapshot, an owed
+        // inventory, and a repair computing its payload are all builds.
         let in_flight = pending.warm.is_some()
             || pending.warm_stream.is_some()
             || pending.order.is_some()
-            || self.shared.warms_in_flight.load(Ordering::Acquire) > 0;
+            || pending.full.is_some()
+            || pending.rebuild
+            || pending.needs_full
+            || self.shared.awaiting_inventory.load(Ordering::Acquire)
+            || self.shared.warms_in_flight.load(Ordering::Acquire) > 0
+            || self.shared.repairs_in_flight.load(Ordering::Acquire) > 0;
         if !in_flight || pending.stop {
             return None;
         }
@@ -1207,7 +1218,9 @@ impl DirectProjection {
     /// Close the warm stream (R6): the worker reconciles `query_page_order`
     /// over the queue's inventory and then publishes readiness. `false` when
     /// the stream is no longer this thread's; a superseding snapshot owns
-    /// readiness in that case and nothing is owed.
+    /// readiness in that case and nothing is owed. Readiness is not a full
+    /// snapshot's exclusive privilege: a warm inventory publishes it too, which
+    /// is the whole point of streaming rather than rebuilding.
     pub(crate) fn finish_warm_stream(&self, generation: u64) -> bool {
         let mut pending = self.shared.pending.lock().unwrap();
         if pending.warm_superseded {
@@ -2903,7 +2916,39 @@ fn restore_build_settings(
 fn open_projection_database(
     path: &Path,
 ) -> Result<PhysicalGraphProjectionDatabase, tine_storage::sqlite::MaterializationError> {
-    let database = PhysicalGraphProjectionDatabase::open_writable(path)?;
+    let database = match PhysicalGraphProjectionDatabase::open_writable(path) {
+        Ok(database) => database,
+        Err(error) => {
+            // The schema repair and recreate below only run once SQLite has
+            // handed us a connection, and it will not do that for a damaged
+            // header: `open_writable` runs `PRAGMA journal_mode=WAL` first, so
+            // the failure lands HERE. The worker then stopped for the lifetime
+            // of this graph — a permanent "search unavailable" on a cache that
+            // is, by design, disposable and rebuilt from the source files
+            // (GH #543). In-scope scenario: crash or power loss tearing the
+            // projection, which relaxed build durability explicitly relies on
+            // next-open recovery to clean up.
+            //
+            // Deleting is safe here specifically because the caller already
+            // holds the exclusive writer lease, so no honest concurrent
+            // instance owns this file; and because nothing in it is a source
+            // of truth. It is NOT unconditional: a path that does not exist,
+            // or a removal that fails (permissions, a read-only volume), or a
+            // second open that fails, all surface the real environment error
+            // rather than being retried into a loop.
+            if !path.exists() {
+                return Err(error);
+            }
+            projection_diag(|| format!("projection unopenable ({error}); recreating"));
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+            let database = PhysicalGraphProjectionDatabase::open_writable(path)?;
+            database.initialize_schema()?;
+            database.validate_schema()?;
+            return Ok(database);
+        }
+    };
     if database.validate_schema().is_ok() && database.quick_check().is_ok() {
         return Ok(database);
     }
@@ -3605,17 +3650,22 @@ pub(crate) fn release_projection<G: crate::query::graph::QueryGraph>(graph: &G) 
 }
 
 #[cfg(test)]
-/// Drive projection recovery the way the app does: by retrying.
+/// Retry projection recovery until it converges.
 ///
 /// `direct_projection_recover_after_failed_read` is ONE attempt and is allowed
 /// to accomplish nothing -- `model.rs` says so itself where it turns "the
-/// repair did not take" into `Unavailable(ReadFailed)`. The mechanism is that
-/// recovery latches `pending.rebuild`, but the worker consumes that flag only
-/// together with a `full` or `warm` payload (`rebuild = (full|warm) &&
-/// take(rebuild)`). If the turn carrying that payload fails, the payload is
-/// gone and the rebuild stays latched with nothing left to ride in on, so the
-/// projection stays failed until something enqueues work again. In the running
-/// app that something is the user's next query, which calls recovery again.
+/// repair did not take" into `Unavailable(ReadFailed)`. If the turn carrying a
+/// rebuild's payload fails, the payload is gone and the attempt achieved
+/// nothing, so the projection stays failed until something enqueues work again.
+///
+/// This helper calls the recovery entry point DIRECTLY, which the running app
+/// does not do: the app issues ordinary queries and the dispatcher decides. So
+/// this cannot be the proof that public recovery converges, and it once hid the
+/// fact that it did not — a latched `rebuild` made every query retryable rather
+/// than repairing, and nothing called recovery again (GH #543). That property
+/// is proved separately, through public `search` calls only, by
+/// `a_failed_read_during_a_stream_does_not_latch_rebuild_forever`. Keep it that
+/// way: do not "fix" a convergence failure by reaching for this helper.
 ///
 /// A fixture that calls recovery once and then waits has assumed a convergence
 /// guarantee the contract does not make. It fails about one run in twenty on a

@@ -1,6 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { classifyNativeCallError, DirectSaveFailureError, SaveConflictError } from "./backend";
+import {
+  classifyNativeCallError,
+  diagnosticFailureReason,
+  DirectSaveFailureError,
+  OperationCancelledError,
+  QueryNotReadyError,
+  QueryUnavailableError,
+  SaveConflictError,
+} from "./backend";
 import { isRetryableSaveFailure, isSaveConflictFailure } from "./persistence";
 
 // Every native rejection is classified once at the frontend funnel. Direct
@@ -83,5 +91,35 @@ describe("native call error funnel", () => {
       expect(chunk).not.toContain("classifySaveConflictWire(");
       expect(chunk).not.toContain("classifyNativeCallError(");
     }
+  });
+});
+
+// GH #543: a reporter's diagnostic recorded 7,520 failed `run_query` calls
+// with no reason, so nobody could tell a retryable wait for the index from a
+// terminally unavailable projection. The classification must be a short fixed
+// code, and it must never be the thrown value's own text — an arbitrary
+// message can carry a path or graph content into a published report.
+describe("diagnostic failure reason", () => {
+  it("names which waiting state a refused query was in", () => {
+    expect(diagnosticFailureReason(new QueryNotReadyError("indexing"))).toBe(
+      "not-ready:indexing"
+    );
+    expect(diagnosticFailureReason(new QueryNotReadyError("recovering"))).toBe(
+      "not-ready:recovering"
+    );
+  });
+
+  it("separates a terminal failure and a cancellation from a wait", () => {
+    expect(
+      diagnosticFailureReason(new QueryUnavailableError("worker-stopped", "gone"))
+    ).toBe("unavailable:worker-stopped");
+    expect(diagnosticFailureReason(new OperationCancelledError())).toBe("cancelled");
+  });
+
+  it("never reports a thrown value's own text", () => {
+    const leaky = new Error("/home/someone/graph/pages/Private Page.md is missing");
+    expect(diagnosticFailureReason(leaky)).toBe("other");
+    expect(diagnosticFailureReason("/home/someone/graph")).toBe("other");
+    expect(diagnosticFailureReason({ message: "secret" })).toBe("other");
   });
 });

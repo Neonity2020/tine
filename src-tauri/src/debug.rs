@@ -549,7 +549,12 @@ pub(crate) fn record_watcher_latency(
 }
 
 #[tauri::command]
-pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u64) {
+pub(crate) fn diagnostic_ipc_event(
+    command: String,
+    phase: String,
+    elapsed_ms: u64,
+    reason: Option<String>,
+) {
     if !crate::command_surface::is_known_command(&command)
         || matches!(
             command.as_str(),
@@ -570,6 +575,22 @@ pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u
     fields.insert("command".into(), json!(command));
     fields.insert("phase".into(), json!(phase));
     fields.insert("elapsedMs".into(), json!(elapsed_ms));
+    // Fixed vocabulary only. The frontend assigns these codes itself
+    // (`diagnosticFailureReason`); anything else is dropped rather than
+    // written, so no message text, path or graph content can reach a report
+    // the user may publish. Without it a reporter's "7,520 failed run_query"
+    // says nothing about whether they were waiting or broken (GH #543).
+    if let Some(reason) = reason.filter(|reason| {
+        matches!(reason.as_str(), "cancelled" | "other")
+            || reason
+                .strip_prefix("not-ready:")
+                .is_some_and(|code| matches!(code, "indexing" | "recovering" | "busy"))
+            || reason
+                .strip_prefix("unavailable:")
+                .is_some_and(|code| code.len() <= 32 && code.chars().all(|c| c.is_ascii_lowercase() || c == '-' || c == '_'))
+    }) {
+        fields.insert("reason".into(), json!(reason));
+    }
     record_fixed_event("ipc.command", fields);
 }
 

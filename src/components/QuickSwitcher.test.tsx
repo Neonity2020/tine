@@ -84,6 +84,35 @@ describe("QuickSwitcher search syntax help", () => {
     dispose();
   });
 
+  it("does not read a failed progress poll as a finished build (GH #543)", async () => {
+    // `null` is the signal that the build FINISHED: the notice goes and the
+    // query is re-run. A poll that threw was being converted to that signal,
+    // so one dropped IPC call during a slow build told the user it was done
+    // and fired another query into the most loaded moment of the build.
+    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
+      hits: [],
+      diagnostics: [],
+      pageResultsTruncated: false,
+      blockResultsTruncated: false,
+    } as unknown as Awaited<ReturnType<ReturnType<typeof backend>["runGraphSearch"]>>);
+    const progress = vi.spyOn(backend(), "queryIndexProgress").mockResolvedValue([7, 99]);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    openSwitcher();
+    const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+    input.value = "Needle";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    await vi.waitFor(() => expect(root.textContent).toContain("Indexing 7 of 99 pages"));
+
+    progress.mockRejectedValue(new Error("ipc dropped"));
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+    // Still building, as far as anyone knows. The notice staying IS the
+    // property: its disappearance is the same edge that re-runs the query.
+    expect(root.textContent).toContain("Indexing 7 of 99 pages");
+    dispose();
+  });
+
   it("says it is indexing without a count before the build knows the page total (GH #543)", async () => {
     // The warm's inventory read is counting the graph — the longest phase of a
     // large cold build, and the one re-run from the top on every drift retry.

@@ -310,8 +310,23 @@ impl Graph {
         // transaction — the launch-time cost the issue reports. The warm is
         // simply run again: pages the old stream already lowered validate
         // clean, so each retry resumes where the last one stopped. The parse
-        // remains the fallback only when no projection can own readiness at
-        // all (none attached, lease held by another instance, worker gone).
+        // remains the fallback when no projection can own readiness at all
+        // (none attached, lease held by another instance, worker gone) — and
+        // also when the retry budget below is exhausted, which is a real path
+        // under sustained drift, not a theoretical one.
+        // Announce the warm for the WHOLE retry sequence, not just the
+        // inventory reads inside it. Between attempts this thread sleeps up to
+        // 2.4 s, and without a guard held across that sleep the projection
+        // looks idle: the switcher's progress goes to `None` and reads it as a
+        // finished build, and an arriving query sees nothing in flight and
+        // starts a competing warm of its own (GH #543). A warm that is going to
+        // try again is still in flight.
+        let _retrying = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|projection| projection.begin_warm());
         let mut retries = 0;
         let warmed = loop {
             match self.warm_projection_cancellable(&cancelled) {
@@ -363,11 +378,17 @@ impl Graph {
 
     /// R6 warm validation: publish Direct Files projection readiness from the
     /// walk inventory and each page's exact content revision, parsing nothing
-    /// unless the worker names replacements. `true` means the projection owns
-    /// readiness at the generation this warm observed (or a full snapshot
-    /// superseded it); `false` means the caller must fall back to the full
-    /// parse — no projection, a lease held elsewhere, a failed worker,
-    /// cancellation, or a mutation that raced the warm (generation drift).
+    /// unless the worker names replacements.
+    ///
+    /// `Owned` means the projection (or a full snapshot already queued to it)
+    /// owns readiness at the generation this warm observed. `Retry` means the
+    /// attempt accomplished nothing and MUST be run again — a mutation raced
+    /// it, or the queue was held by work that will drain shortly; the caller
+    /// owns that retry, and dropping the outcome is how an obligation ends up
+    /// with no producer (GH #543). `Unavailable` means no projection can own
+    /// readiness at all: none attached, the graph text scope unreadable, the
+    /// lease held by another instance, or the worker gone. `Cancelled` is the
+    /// binding being revoked under us.
     pub(super) fn warm_projection_cancellable(
         &self,
         cancelled: &impl Fn() -> bool,

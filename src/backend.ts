@@ -283,6 +283,20 @@ export class QueryNotReadyError extends BackendError {
   }
 }
 
+/** The short, fixed classification of a failed call for the diagnostic record.
+ *
+ * Only codes this frontend itself assigned, never a message from the backend or
+ * a thrown value's own text: an arbitrary error string could carry a path or
+ * graph content into a report the user is invited to publish. Anything
+ * unrecognised is reported as `"other"`, which is still the useful fact — it
+ * says the failure was not a readiness wait. */
+export function diagnosticFailureReason(error: unknown): string {
+  if (error instanceof QueryNotReadyError) return `not-ready:${error.reasonCode}`;
+  if (error instanceof QueryUnavailableError) return `unavailable:${error.reasonCode}`;
+  if (error instanceof OperationCancelledError) return "cancelled";
+  return "other";
+}
+
 export class QueryUnavailableError extends BackendError {
   constructor(readonly reasonCode: string, message: string) {
     super("query-unavailable", message);
@@ -1238,12 +1252,24 @@ class TauriBackend implements Backend {
     const started = performance.now();
     let slow = false;
     let slowTimer: ReturnType<typeof setTimeout> | undefined;
-    const reportPhase = (phase: "slow" | "completed" | "failed", elapsedMs: number) => {
+    // GH #543: a reporter's diagnostic showed 7,520 failed `run_query` calls
+    // and not one word about WHY. "failed" covers a retryable wait for the
+    // index, a terminal unavailable projection, and a cancelled job, and those
+    // three want three different answers from us — so the report that was
+    // supposed to end the guessing could not distinguish them. The reason is a
+    // short fixed code the backend already produced; it carries no query text,
+    // no page name and no path.
+    const reportPhase = (
+      phase: "slow" | "completed" | "failed",
+      elapsedMs: number,
+      reason?: string,
+    ) => {
       if (DIAGNOSTIC_COMMANDS.has(cmd)) return;
       void this.invoke<void>("diagnostic_ipc_event", {
         command: cmd,
         phase,
         elapsedMs: Math.max(0, Math.round(elapsedMs)),
+        reason,
       }).catch(() => {});
     };
     let slowTicket: number | undefined;
@@ -1269,7 +1295,7 @@ class TauriBackend implements Backend {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
       releaseSlowTicket();
       recordGraphOpenCommand(cmd, started, "failed");
-      reportPhase("failed", performance.now() - started);
+      reportPhase("failed", performance.now() - started, diagnosticFailureReason(error));
       // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
       // save_page and left the resolver recovery branch dead).
       throw classifyNativeCallError(error);

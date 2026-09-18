@@ -751,9 +751,16 @@ fn a_deferred_turn_is_silent_while_a_write_failure_is_reported() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(turn_consumed(), "the worker took the delta turn");
+    // The invariant is that readiness is never published while an inventory is
+    // still OWED — not that readiness never returns. This used to assert the
+    // latter, which held only because an owed inventory had no producer: the
+    // warm deferred to the parsed cache and enqueued nothing, so the withdrawal
+    // was permanent and the test read that as correct (GH #543). Now something
+    // does produce it, so pin the property rather than the symptom.
     assert!(
-        !graph.direct_projection_ready_test(),
-        "the deferred turn still withdraws readiness: only a complete inventory may publish it"
+        !(graph.direct_projection_ready_test() && projection.owes_inventory()),
+        "readiness was published while a complete inventory is still owed: {}",
+        projection.debug_state_test()
     );
     assert!(
         !projection.shared.worker_failed.load(Ordering::Acquire),
@@ -6619,4 +6626,44 @@ fn a_parsed_cache_does_not_own_readiness_while_an_inventory_is_owed() {
         "the edit never became searchable: {}",
         projection.debug_state_test()
     );
+}
+
+/// GH #543: the projection database is disposable — it is rebuilt from the
+/// source files. A torn header made `open_writable` fail before any of the
+/// schema repair or recreate logic could run, so the worker stopped for the
+/// lifetime of the graph and search was unavailable across reopens, for a file
+/// nothing depends on.
+#[test]
+fn a_torn_projection_header_is_recreated_rather_than_stopping_the_worker() {
+    let root = scratch("gh543-torn-header");
+    let path = root.join("private/projection.sqlite");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, vec![0x55; 4096]).unwrap();
+
+    let projection = DirectProjection::start(path.clone()).unwrap();
+    // The positive property: the torn file is REPLACED by a real database.
+    // "the worker has not failed yet" is not evidence — it starts available.
+    let recreated = |path: &std::path::Path| {
+        std::fs::read(path)
+            .map(|bytes| bytes.starts_with(b"SQLite format 3\0"))
+            .unwrap_or(false)
+    };
+    for _ in 0..400 {
+        if recreated(&path) || !projection.worker_available() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        recreated(&path),
+        "the torn cache was not recreated (worker_available={}): {}",
+        projection.worker_available(),
+        projection.debug_state_test()
+    );
+    assert!(projection.worker_available());
+    assert!(!matches!(
+        projection.progress_at(0),
+        ProjectionProgress::Stopped
+    ));
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(5)));
 }

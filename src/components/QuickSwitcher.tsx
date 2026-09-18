@@ -107,10 +107,23 @@ export function QuickSwitcher(): JSX.Element {
     if (!switcherOpen()) { setIndexProgress(null); return; }
     let live = true;
     let building = false;
+    // Two guards, because `null` here means "the build finished, re-run the
+    // query" and both of these turned something else into that claim (GH #543).
+    // A poll that THREW said the build had finished; and two polls in flight
+    // could land out of order, so an older answer could overwrite a newer one.
+    let issued = 0;
+    let answered = 0;
     const poll = async () => {
+      const ticket = ++issued;
       let progress: [number, number] | null = null;
-      try { progress = await backend().queryIndexProgress(); } catch { progress = null; }
-      if (!live) return;
+      try {
+        progress = await backend().queryIndexProgress();
+      } catch {
+        // Unknown, not finished. Leave the last known state alone.
+        return;
+      }
+      if (!live || ticket <= answered) return;
+      answered = ticket;
       if (progress) building = true;
       else if (building) { building = false; setSearchRetry((n) => n + 1); }
       setIndexProgress(progress);
