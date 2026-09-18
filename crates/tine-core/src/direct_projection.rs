@@ -358,6 +358,17 @@ struct ProjectionShared {
     /// Resources whose destruction must follow the writer connection and
     /// lease. None closes registration once worker teardown starts.
     worker_resources: Mutex<Option<Vec<Arc<dyn Send + Sync>>>>,
+    /// A complete inventory is owed before readiness may be published again,
+    /// as seen from OUTSIDE the worker.
+    ///
+    /// The worker keeps this obligation in its own `awaiting_inventory` local,
+    /// where nothing else can see it — so a caller asking "does anyone owe an
+    /// inventory?" got `false` while the worker was silently discarding every
+    /// delta turn it was handed. Mirroring it here is what lets a warm decide
+    /// that an existing parsed cache does NOT own readiness after all, and
+    /// lets a diagnostic say which of the two waiting states a stuck session
+    /// is actually in (GH #543).
+    awaiting_inventory: AtomicBool,
     /// R6: this session has validated the complete page inventory against
     /// the projection at least once (a full snapshot, or a warm validation's
     /// `Clean` or closing order turn). Until then a live delta keeps the file
@@ -833,6 +844,7 @@ impl DirectProjection {
             worker_busy: AtomicBool::new(false),
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
+            awaiting_inventory: AtomicBool::new(false),
             validated: AtomicBool::new(false),
             stream_indexed: AtomicU64::new(0),
             stream_total: AtomicU64::new(0),
@@ -914,6 +926,54 @@ impl DirectProjection {
         let mut pending = self.shared.pending.lock().unwrap();
         pending.rebuild = true;
         self.shared.ready.store(false, Ordering::Release);
+    }
+
+    /// Does a complete inventory remain owed, with nobody producing one?
+    ///
+    /// True means the projection cannot publish readiness until some caller
+    /// reads the inventory again, and no queued payload will do it. A parsed
+    /// cache does not discharge this: `enqueue_full` drops a snapshot that
+    /// arrives beside an open warm stream, so if that stream then abandons,
+    /// the cache is present, the snapshot is gone, and the next warm would
+    /// return `Owned` on the strength of the cache alone and enqueue nothing
+    /// (GH #543).
+    pub(crate) fn owes_inventory(&self) -> bool {
+        let pending = self.shared.pending.lock().unwrap();
+        (pending.needs_full || self.shared.awaiting_inventory.load(Ordering::Acquire))
+            && pending.full.is_none()
+            && pending.warm.is_none()
+            && pending.warm_stream.is_none()
+    }
+
+    /// Withdraw a rebuild request that found no payload to carry it.
+    ///
+    /// `rebuild` is an obligation, not a state: [`Self::request_rebuild`]
+    /// promises a full snapshot or a warm inventory will follow, because the
+    /// worker consumes the flag ONLY beside one of those two payloads, and
+    /// [`PendingProjection::has_work`] does not count it. A request nobody can
+    /// discharge is therefore permanent: the worker sleeps, every capture is
+    /// refused by [`query_capture_admissible`], and [`Self::progress_at`]
+    /// reports `Working(Recovering)` forever — the user watches "Rebuilding
+    /// the search index…" on an idle process (GH #543).
+    ///
+    /// That is reachable without any filesystem activity: a query read fails
+    /// while a warm stream is open, repair sets the flag, and `enqueue_warm`
+    /// refuses its inventory because `warm_stream.is_some()`. Withdrawing lets
+    /// the next query's repair try again once the stream has closed, which
+    /// converges; holding the flag does not.
+    ///
+    /// Returns whether the request was withdrawn. A payload that arrived in
+    /// the meantime owns the rebuild, so the flag stays.
+    pub(crate) fn withdraw_rebuild_request(&self) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.full.is_some() || pending.warm.is_some() {
+            return false;
+        }
+        let withdrawn = std::mem::take(&mut pending.rebuild);
+        if withdrawn {
+            projection_diag(|| "rebuild request withdrawn: no payload followed".to_owned());
+        }
+        withdrawn
     }
 
     pub(crate) fn enqueue_full(
@@ -2408,6 +2468,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             shared.worker_busy.store(true, Ordering::Release);
             if std::mem::take(&mut pending.needs_full) {
                 awaiting_inventory = true;
+                shared.awaiting_inventory.store(true, Ordering::Release);
             }
             let rebuild = (pending.full.is_some() || pending.warm.is_some())
                 && std::mem::take(&mut pending.rebuild);
@@ -2538,6 +2599,14 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         // Even repaired DDL leaves unchanged source stamps behind.
                         // Reset them so the complete inventory relowers every source page.
                         database.reset().map_err(|error| error.to_string())?;
+                        // The reset emptied the rows `validated` vouches for.
+                        // Leaving it set let `query_capture_admissible` keep
+                        // admitting queries against an empty index, so a search
+                        // SUCCEEDED and found nothing instead of reporting that
+                        // it was rebuilding — and, because a successful answer
+                        // never consults `progress_at`, nothing ever scheduled
+                        // the inventory that would refill it (GH #543).
+                        shared.validated.store(false, Ordering::Release);
                         writer_slot = Some(database);
                         build_relaxed = None;
                     }
@@ -2688,7 +2757,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     // committed image and its registry stand, readiness is
                     // withdrawn until an inventory arrives, and that inventory
                     // is applied without a reset.
-                    ProjectionRefusal::AwaitingFullInventory => awaiting_inventory = true,
+                    ProjectionRefusal::AwaitingFullInventory => {
+                        awaiting_inventory = true;
+                        shared.awaiting_inventory.store(true, Ordering::Release);
+                    }
                     ProjectionRefusal::Failed(_) => {
                         shared.committed_registry.lock().unwrap().take();
                         requires_full_rebuild = true;
@@ -2723,6 +2795,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         if had_full || had_warm {
             requires_full_rebuild = false;
             awaiting_inventory = false;
+            shared.awaiting_inventory.store(false, Ordering::Release);
         }
         // GH #543 partial admission: publish how far the stream has got.
         if let Some(WarmOutcome::Replacements(pages)) = &applied.warm_outcome {

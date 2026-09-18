@@ -5139,6 +5139,7 @@ fn empty_projection_shared() -> ProjectionShared {
         changed: Condvar::new(),
         ready: AtomicBool::new(false),
         ready_generation: AtomicU64::new(0),
+        awaiting_inventory: AtomicBool::new(false),
         commit_notification: AtomicU64::new(0),
         commit_waker: Mutex::new(None),
         reader: Mutex::new(None),
@@ -6401,4 +6402,221 @@ fn probe_copy_tree(source: &std::path::Path, target: &std::path::Path) {
             std::fs::copy(entry.path(), to).unwrap();
         }
     }
+}
+
+/// GH #543: `rebuild` is an obligation. Repair sets it before computing a
+/// payload, and the worker consumes it ONLY beside a full snapshot or a warm
+/// inventory — so a repair that fails to enqueue one leaves a flag nobody can
+/// discharge. `has_work` does not count it, so the worker sleeps; every capture
+/// is refused; `progress_at` says `Working(Recovering)` forever. The reporter
+/// sees "Rebuilding the search index…" on an idle process, with no filesystem
+/// activity needed to get there.
+#[test]
+fn a_failed_read_during_a_stream_does_not_latch_rebuild_forever() {
+    let root = scratch("gh543-rebuild-latch");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/a.md"), "- sentinel543 original\n").unwrap();
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+
+    // A warm has produced its replacements, so a stream owns the queue.
+    let (sources, bytes) = warm_sources(&graph);
+    let config = Arc::new(graph.config.parse_config());
+    let generation = graph.cache_generation();
+    assert!(projection.enqueue_warm(generation, sources, config.clone(), bytes));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+        panic!("expected replacements");
+    };
+
+    // A read fails under the open stream: repair requests a rebuild, then its
+    // own warm inventory is refused because the stream holds the queue.
+    projection.inject_next_statement_failure();
+    let _ = graph.search("sentinel543", 50);
+
+    // The stream finishes normally.
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        pages.into_iter().map(stream_item).collect(),
+        config
+    ));
+    assert!(projection.finish_warm_stream(generation));
+    for _ in 0..400 {
+        if !projection.shared.worker_busy.load(Ordering::Acquire)
+            && !projection.shared.pending.lock().unwrap().has_work()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let state = projection.debug_state_test();
+    {
+        let pending = projection.shared.pending.lock().unwrap();
+        assert!(
+            !(pending.rebuild && !pending.has_work()),
+            "rebuild is latched with nothing queued to discharge it: {state}"
+        );
+    }
+    // And the user-visible consequence: search is not stuck on Recovering.
+    let mut answered = false;
+    for _ in 0..400 {
+        match graph.search("sentinel543", 50) {
+            Ok(_) => {
+                answered = true;
+                break;
+            }
+            Err(crate::query::QueryExecutionError::NotReady(_)) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("unexpected error {error}: {state}"),
+        }
+    }
+    assert!(answered, "search never recovered: {}", projection.debug_state_test());
+}
+
+/// GH #543: a repair resets the disposable database, then generation drift
+/// abandons the replacement stream. `validated` used to survive that reset, so
+/// `query_capture_admissible` kept admitting queries against the EMPTY index —
+/// they succeeded and found nothing, and because a successful answer never
+/// consults `progress_at`, nothing scheduled the inventory that would refill
+/// it. Silent wrong answers, indefinitely.
+#[test]
+fn a_reset_projection_does_not_answer_from_the_rows_it_just_erased() {
+    let root = scratch("gh543-reset-validated");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/a.md"), "- sentinel543 original\n").unwrap();
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    graph.warm_cache();
+    assert!(graph.direct_projection_ready_test());
+    assert!(!graph.has_parsed_cache_test());
+
+    // Drift the generation as the recovery warm commits, so its replacement
+    // stream abandons: the reset has happened, the refill has not.
+    {
+        let graph = Arc::clone(&graph);
+        *projection.shared.after_sql_commit.lock().unwrap() =
+            Some(Box::new(move || graph.drift_generation_test()));
+    }
+    projection.inject_next_statement_failure();
+    let _ = graph.search("sentinel543", 50);
+    *projection.shared.after_sql_commit.lock().unwrap() = None;
+
+    // A real edit arrives through the real reconciliation path.
+    let path = graph.walk_entries_test()[0].path.clone();
+    std::fs::write(&path, "- newest543\n").unwrap();
+    assert!(graph.sync_file_checked(&path).unwrap().is_some());
+
+    // Either search reports that it is rebuilding, or it finds the new text.
+    // What it must never do is answer "no results" from an erased index.
+    let mut found = false;
+    for _ in 0..600 {
+        match graph.search("newest543", 50) {
+            Ok(groups) if !groups.is_empty() => {
+                found = true;
+                break;
+            }
+            Ok(_) => {
+                let state = projection.debug_state_test();
+                let owes = projection.owes_inventory();
+                assert!(
+                    !owes,
+                    "answered from an index that still owes its inventory: {state}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(crate::query::QueryExecutionError::NotReady(_)) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("unexpected error {error}"),
+        }
+    }
+    assert!(
+        found,
+        "the edit never became searchable: {}",
+        projection.debug_state_test()
+    );
+}
+
+/// GH #543: `enqueue_full` drops a parsed snapshot queued beside an open warm
+/// stream, because the stream is already lowering those pages. If the stream
+/// then abandons, the snapshot is gone but the parsed cache remains — and the
+/// next warm returned `Owned` on the strength of that cache alone, enqueueing
+/// nothing. The owed inventory had no producer, so every later edit was
+/// discarded by the worker and search kept answering from the stale rows.
+#[test]
+fn a_parsed_cache_does_not_own_readiness_while_an_inventory_is_owed() {
+    let root = scratch("gh543-cache-handoff");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages/a.md"), "- sentinel543 original\n").unwrap();
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+
+    let config = Arc::new(graph.config.parse_config());
+    let generation = graph.cache_generation();
+    let (sources, bytes) = warm_sources(&graph);
+    assert!(projection.enqueue_warm(generation, sources, config.clone(), bytes));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+        panic!("expected replacements");
+    };
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        pages.into_iter().map(stream_item).collect(),
+        config.clone()
+    ));
+    assert!(projection.finish_warm_stream(generation));
+    wait_ready(&graph);
+
+    // A second warm opens a stream, and a parsed build publishes its cache
+    // beside it — the snapshot is dropped, the cache stays.
+    std::fs::write(root.join("pages/a.md"), "- sentinel543 changed\n").unwrap();
+    let (sources, bytes) = warm_sources(&graph);
+    assert!(projection.enqueue_warm(generation, sources, config, bytes));
+    let WarmOutcome::Replacements(_) = projection.wait_warm_outcome() else {
+        panic!("expected replacements");
+    };
+    graph.with_pages(|pages| assert_eq!(pages.len(), 1));
+    assert!(graph.has_parsed_cache_test());
+    assert!(projection.shared.pending.lock().unwrap().full.is_none());
+
+    // Drift abandons that stream: an inventory is now owed.
+    graph.drift_generation_test();
+    assert!(!projection.abandon_warm_stream(generation));
+    assert!(
+        projection.owes_inventory(),
+        "expected an owed inventory: {}",
+        projection.debug_state_test()
+    );
+    let _ = graph.warm_cache_cancellable(|| false);
+
+    // A real edit must reach search.
+    let path = graph.walk_entries_test()[0].path.clone();
+    std::fs::write(&path, "- sentinel543 newest\n").unwrap();
+    assert!(graph.sync_file_checked(&path).unwrap().is_some());
+    let mut found = false;
+    for _ in 0..600 {
+        if graph
+            .search("newest", 50)
+            .map(|groups| !groups.is_empty())
+            .unwrap_or(false)
+        {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        found,
+        "the edit never became searchable: {}",
+        projection.debug_state_test()
+    );
 }

@@ -909,7 +909,20 @@ impl Graph {
             // validating this source inventory, then consumes bounded page
             // batches. Never call warm_cache here: its legacy fallback builds
             // the parsed graph when streaming cannot currently acquire ownership.
-            let _ = self.warm_projection_cancellable(&|| false);
+            let outcome = self.warm_projection_cancellable(&|| false);
+            // A `reset` above already set the rebuild obligation, and only a
+            // full snapshot or a warm inventory can discharge it. This warm is
+            // the payload that was promised, so anything other than ownership
+            // means nobody owes one: an open stream refuses the enqueue, drift
+            // abandons it, an unavailable projection never had one. Dropping
+            // the outcome here latched `rebuild` with no producer and refused
+            // every later query forever (GH #543). Withdraw instead: the
+            // frontend retries, the next repair runs once the stream closes.
+            if !matches!(outcome, super::page_cache::WarmProjectionOutcome::Owned) {
+                if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+                    projection.withdraw_rebuild_request();
+                }
+            }
             return;
         };
         let revisions = self.disk_revs.read().unwrap().clone();

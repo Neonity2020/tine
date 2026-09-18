@@ -376,10 +376,6 @@ impl Graph {
         if cancelled() {
             return Outcome::Cancelled;
         }
-        if self.cache.read().unwrap().is_some() {
-            // The full-snapshot path owns readiness while a parsed cache exists.
-            return Outcome::Owned;
-        }
         let Some(projection) = self
             .direct_projection
             .lock()
@@ -387,8 +383,23 @@ impl Graph {
             .as_ref()
             .map(Arc::clone)
         else {
-            return Outcome::Unavailable;
+            // No projection to own readiness; a parsed cache is all there is.
+            return if self.cache.read().unwrap().is_some() {
+                Outcome::Owned
+            } else {
+                Outcome::Unavailable
+            };
         };
+        if self.cache.read().unwrap().is_some() && !projection.owes_inventory() {
+            // The full-snapshot path owns readiness while a parsed cache exists
+            // — but only while that path still has a snapshot to publish.
+            // `enqueue_full` drops a snapshot queued beside an open warm
+            // stream; if the stream then abandons, the cache is still here and
+            // the snapshot is not, so returning `Owned` on the cache alone left
+            // the owed inventory with no producer and every later edit was
+            // silently discarded (GH #543).
+            return Outcome::Owned;
+        }
         // GH #543: announce this warm before the inventory read below. On a
         // 10k-page graph that read takes seconds (tens on Windows), and a
         // query landing inside it must see Indexing, not an idle projection
