@@ -660,10 +660,18 @@ export function QuickSwitcher(): JSX.Element {
                 {graphResults()!.diagnostics.map((diagnostic) => diagnostic.message).join(" · ")}
               </div>
             </Show>
-            <Show when={query().trim() && !commandsOnly() && indexProgress()}>
+            {/* The ternary, not `&&`: `&&` widens the accessor to `string | [number,
+                    number]`, so `progress()[1]` types as `string | number`. */}
+            <Show when={query().trim() && !commandsOnly() ? indexProgress() : null}>
               {(progress) => (
                 <div class="switcher-empty" role="status" data-testid="switcher-index-progress">
-                  {`Indexing ${progress()[0].toLocaleString()} of ${progress()[1].toLocaleString()} pages — results may be incomplete`}
+                  {/* A total of 0 means the build is still counting the graph
+                      (the warm's inventory read, the longest phase on a large
+                      graph). It is indexing, with no page count to give yet —
+                      saying "0 of 0" would read as a finished empty graph. */}
+                  {progress()[1] > 0
+                    ? `Indexing ${progress()[0].toLocaleString()} of ${progress()[1].toLocaleString()} pages — results may be incomplete`
+                    : "Indexing — results may be incomplete"}
                 </div>
               )}
             </Show>

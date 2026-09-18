@@ -5722,6 +5722,69 @@ fn a_query_during_the_warm_inventory_read_retries_instead_of_repairing() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// GH #543: the build's progress label must not go dark while the warm is
+/// still converging the graph.
+///
+/// Its sibling above pins that a QUERY landing in the warm's inventory read is
+/// told `Indexing`. `index_progress` answers the same question — is a warm
+/// converging this graph? — for the label beside that query, and answered it
+/// differently: it tested only the projection's pending QUEUE, and a warm that
+/// has announced itself queues nothing until the inventory read finishes.
+/// `progress_at` already counts `warms_in_flight` for exactly this reason
+/// (`Working(Reason::Indexing)`); `index_progress` did not, so the two
+/// disagreed for the whole of the build's most expensive phase — seconds on a
+/// 10k-page graph, tens on Windows, and re-run from the top on every drift
+/// retry.
+///
+/// The user-visible harm is not only the missing count. `QuickSwitcher.tsx`
+/// reads a non-null → null transition as "the build finished" and re-runs the
+/// query, so every drift retry fired a spurious search at a machine already
+/// saturated by the rebuild the user is waiting for, while the line above it
+/// still read "Indexing — waiting for search to be ready…".
+#[test]
+fn the_index_progress_label_survives_the_warm_inventory_read() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("progress-during-warm-read");
+    let graph = Arc::new(Graph::open(&root));
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let pause = graph.pause_next_warm_validation_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    // The warm has announced itself and is about to read the inventory.
+    pause.reached.wait();
+    let generation = graph.cache_generation();
+    assert!(
+        matches!(
+            projection.progress_at(generation),
+            ProjectionProgress::Working(crate::query::QueryReadinessReason::Indexing)
+        ),
+        "precondition: the readiness reason calls this window Indexing: {}",
+        projection.debug_state_test()
+    );
+    assert!(
+        projection.index_progress().is_some(),
+        "a warm that has announced itself and is reading the inventory is \
+         converging the graph, and the progress label must agree with the \
+         readiness reason and say so: {}",
+        projection.debug_state_test()
+    );
+    pause.release.wait();
+    warm.join().unwrap();
+    wait_ready(&graph);
+    assert_eq!(
+        projection.index_progress(),
+        None,
+        "a converged graph reports no build in progress"
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Manual read-latency probe for the bounded-reads packet: the same query
 /// surfaces, timed on ONE prebuilt graph, so a candidate bound can be compared
 /// against the scan it replaces on identical inputs. Martin's requirement for

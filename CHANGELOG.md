@@ -17,6 +17,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   flag nothing is recorded (GH #543).
 
 ### Fixed
+- While the search index is building, the progress line in Ctrl+K no longer
+  disappears for minutes at a time. Building the index starts by reading every
+  page in the graph to see what changed, which is the longest part of the work
+  on a large graph, and the progress line treated that phase as "not building" —
+  so the count vanished while the message underneath it still said the search
+  was waiting to be ready. Worse, the search took the count's disappearance to
+  mean the build had finished and re-ran the query, repeatedly, on a machine
+  already busy with the build. The progress line now stays for the whole build,
+  and says simply that it is indexing until it knows how many pages there
+  are (GH #543).
+
 - Typing a `[[` page link on a large graph no longer re-reads the whole
   reference index on every lookup. Offering page suggestions needs the set of
   page names the graph links to, and the index answered that by handing back

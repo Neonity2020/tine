@@ -84,6 +84,36 @@ describe("QuickSwitcher search syntax help", () => {
     dispose();
   });
 
+  it("says it is indexing without a count before the build knows the page total (GH #543)", async () => {
+    // The warm's inventory read is counting the graph — the longest phase of a
+    // large cold build, and the one re-run from the top on every drift retry.
+    // It is in flight with no total yet, which the backend reports as a total
+    // of 0. Rendering that arithmetically gives "Indexing 0 of 0 pages", which
+    // reads as a finished empty graph at exactly the moment the user is
+    // waiting hardest.
+    vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
+      hits: [],
+      diagnostics: [],
+      pageResultsTruncated: false,
+      blockResultsTruncated: false,
+    } as unknown as Awaited<ReturnType<ReturnType<typeof backend>["runGraphSearch"]>>);
+    vi.spyOn(backend(), "queryIndexProgress").mockResolvedValue([0, 0]);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    openSwitcher();
+    const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+    input.value = "Needle";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(root.querySelector('[data-testid="switcher-index-progress"]')?.textContent)
+        .toBe("Indexing — results may be incomplete"),
+    );
+    expect(root.textContent).not.toContain("0 of 0");
+    dispose();
+  });
+
   it.each([
     [true, true],
     [false, false],

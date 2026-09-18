@@ -1018,10 +1018,24 @@ impl DirectProjection {
     /// or warm stream is converging the projection, `None` otherwise. A
     /// surface that shows results over the partial index polls this to say
     /// so; readiness itself is `progress_at`.
+    ///
+    /// `total` is 0 while the inventory read is still counting the graph: a
+    /// build in flight whose size is not known yet. A caller renders that as
+    /// indexing WITHOUT a count, never as "0 of 0".
     pub(crate) fn index_progress(&self) -> Option<(u64, u64)> {
         let pending = self.shared.pending.lock().unwrap();
-        let in_flight =
-            pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some();
+        // The same question [`Self::progress_at`] answers as
+        // `Working(Reason::Indexing)`, and it must have the same answer. A
+        // warm that has announced itself queues nothing until its inventory
+        // read finishes, so testing the pending queue alone called the most
+        // expensive phase of the build "not building" — the switcher's count
+        // vanished for the whole of it while the search below still said
+        // Indexing, and the frontend reads that disappearance as "the build
+        // finished" and re-runs the query.
+        let in_flight = pending.warm.is_some()
+            || pending.warm_stream.is_some()
+            || pending.order.is_some()
+            || self.shared.warms_in_flight.load(Ordering::Acquire) > 0;
         if !in_flight || pending.stop {
             return None;
         }
