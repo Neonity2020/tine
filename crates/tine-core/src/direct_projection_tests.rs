@@ -7241,3 +7241,70 @@ fn a_reset_has_one_call_site_and_the_worker_owns_it() {
         "the reset moved out of the projection worker: {sites:?}"
     );
 }
+
+/// A rename changes the page SET, so the committed image stops matching the
+/// inventory this session validated — and nothing queues a producer for it.
+/// Partial admission would then let search keep ANSWERING from that image,
+/// with the renamed page's old name and path, indefinitely: a successful
+/// answer never reaches the repair that a refusal starts, so nothing ever
+/// converged it (third audit A3-F1). A delete has always published its own
+/// delta; a rename published none.
+#[test]
+fn a_rename_converges_search_instead_of_answering_with_the_old_name() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-rename-converges");
+    let graph = Graph::open(&root);
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_ready(&graph);
+    let projection = graph.direct_projection_test().unwrap();
+
+    let names = |graph: &Graph| {
+        graph.search("target", 20).map(|groups| {
+            let mut names = groups
+                .iter()
+                .map(|group| group.page.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            names
+        })
+    };
+    assert!(
+        names(&graph).unwrap().iter().any(|name| name == "target"),
+        "the fixture never indexed the page this test renames"
+    );
+
+    let before = projection.shared.pending.lock().unwrap().latest_generation;
+
+    // No `warm_cache` after this: the point is that the rename itself leaves a
+    // producer behind, so the projection converges on its own.
+    graph.rename_page("target", "renamed target").unwrap();
+
+    assert!(
+        projection.shared.pending.lock().unwrap().latest_generation > before,
+        "the rename queued nothing, so nothing will ever correct the index: {}",
+        projection.debug_state_test()
+    );
+
+    let mut converged = false;
+    for _ in 0..600 {
+        if names(&graph)
+            .map(|names| names.iter().any(|name| name == "renamed target"))
+            .unwrap_or(false)
+        {
+            converged = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        converged,
+        "search never learned the new page name: {}",
+        projection.debug_state_test()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}

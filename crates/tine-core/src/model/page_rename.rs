@@ -231,6 +231,10 @@ impl Graph {
             _new_reservation: RetainedContentReservation,
             base_rev: String,
             is_move: bool,
+            /// The page as it was BEFORE this edit. A move retires its old
+            /// `rel_path` from the projection, which is the only way the
+            /// index learns that the file it holds rows for is gone.
+            src_entry: PageEntry,
         }
         let _move_map_charge = content_budget.reserve(
             checked_mul_bytes(
@@ -355,7 +359,10 @@ impl Graph {
                                 owned_path_upper_bound(&entry.path)?,
                                 checked_add_bytes(
                                     owned_path_upper_bound(dst)?,
-                                    owned_string_upper_bound(&base_rev)?,
+                                    checked_add_bytes(
+                                        owned_string_upper_bound(&base_rev)?,
+                                        Self::retained_page_entry_bytes(&entry)?,
+                                    )?,
                                 )?,
                             )?,
                         )?,
@@ -370,6 +377,7 @@ impl Graph {
                         new_content: updated,
                         _new_reservation: updated_reservation,
                         is_move: true,
+                        src_entry: entry.clone(),
                     });
                 }
                 None if changed => {
@@ -378,7 +386,10 @@ impl Graph {
                             conservative_vec_entry_bytes::<Edit>()?,
                             checked_add_bytes(
                                 checked_mul_bytes(owned_path_upper_bound(&entry.path)?, 2)?,
-                                owned_string_upper_bound(&base_rev)?,
+                                checked_add_bytes(
+                                    owned_string_upper_bound(&base_rev)?,
+                                    Self::retained_page_entry_bytes(&entry)?,
+                                )?,
                             )?,
                         )?,
                         "graph rename edit vector",
@@ -392,6 +403,7 @@ impl Graph {
                         new_content: updated,
                         _new_reservation: updated_reservation,
                         is_move: false,
+                        src_entry: entry.clone(),
                     });
                 }
                 None => {
@@ -596,10 +608,63 @@ impl Graph {
         if let Some((inventory, failures)) = updated_page_inventory {
             self.publish_page_inventory_snapshot(inventory, failures);
         }
+        // GH #543: a rename is a PRODUCER, exactly as a delete is.
+        // `invalidate_cache_after_tine_mutation` only marks the projection
+        // stale, and a stale image with nothing queued behind it is still
+        // ADMITTED for queries — partial admission deliberately lets a search
+        // read a committed image while a producer converges it. With no
+        // producer there was nothing to converge and nothing to refuse, so
+        // search went on answering with the renamed page's OLD name and path
+        // indefinitely, offering a page that no longer existed; and because
+        // the query SUCCEEDED it never reached the repair a refusal starts
+        // (third audit A3-F1). `cache_remove` has always published its own
+        // delta for a delete; the rename published none.
+        //
+        // The transaction still holds every changed page's final bytes, so
+        // these deltas are exact and need no graph-wide reparse. A page whose
+        // replacement cannot be parsed keeps its existing rows rather than
+        // losing them: stale beats absent, and `page_index_failures` already
+        // names it (the same rule as an unreadable page in a warm).
+        let projection_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        for edit in &edits {
+            let replacement = self
+                .graph_inventory_entry(&edit.dst)
+                .ok()
+                .flatten()
+                .and_then(|entry| parse_exact_page(self, &entry, &edit.new_content).ok());
+            let Some((effective, document, revision)) = replacement else {
+                continue;
+            };
+            if edit.is_move && edit.dst != edit.src {
+                self.direct_projection_enqueue_delete(
+                    projection_generation,
+                    edit.src_entry.clone(),
+                );
+            }
+            self.direct_projection_enqueue_replace(
+                projection_generation,
+                effective,
+                Arc::new(document),
+                revision,
+            );
+        }
         self.finish_successful_rename_editor_lifecycle();
         Ok(RenameOutcome {
             skipped_conflicted_referrers,
         })
+    }
+
+    /// The owned bytes a retained [`PageEntry`] adds to the edit vector, so
+    /// carrying the pre-edit page through the transaction is charged like every
+    /// other retained string in it.
+    fn retained_page_entry_bytes(entry: &PageEntry) -> io::Result<u64> {
+        checked_add_bytes(
+            owned_string_upper_bound(&entry.name)?,
+            checked_add_bytes(
+                owned_string_upper_bound(&entry.rel_path)?,
+                owned_path_upper_bound(&entry.path)?,
+            )?,
+        )
     }
 
     /// An ordinary rename resets the frontend's entire working set because the
