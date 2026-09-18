@@ -4283,6 +4283,95 @@ fn a_query_is_admitted_over_the_partial_index_while_a_stream_is_open() {
     let _ = std::fs::remove_dir_all(database.parent().unwrap());
 }
 
+/// GH #543: a drift must not blackhole search on a graph this session has
+/// already validated completely.
+///
+/// `abandon_warm_stream` sets `needs_full`, and `query_capture_admissible`
+/// refused EVERY capture while it was set — so one save racing the warm took
+/// search from answering to `NotReady` and held it there for the whole retry,
+/// which re-reads the entire graph before a single row can be served again.
+///
+/// The flag never meant the rows were bad. `abandon_warm_stream`'s own
+/// contract is that "rows already validated or streamed are consistent" and
+/// only "the replacements not yet streamed are stale", and the worker turn
+/// calls the state it produces "NOT a failure and NOT a reset". Failure has
+/// its own signals in this predicate — `pending.rebuild` and `worker_failed` —
+/// and they are unchanged. What `needs_full` says is that a complete
+/// inventory is OWED before readiness can be published again, which is a
+/// statement about `ready_at`, not about whether the committed rows may be
+/// read.
+///
+/// `validated` is the precondition that makes this safe and is still
+/// required: it is set only by a full snapshot, a closed stream, or a `Clean`
+/// warm, so it means this session has compared the whole inventory to disk.
+/// A first cold build has not, and is still refused.
+#[test]
+fn a_drift_keeps_serving_the_rows_a_validated_session_already_holds() {
+    let _serial = serialize_projection_tests();
+    let (root, database) = partial_admission_graph("drift-keeps-serving", 8);
+    let graph = Graph::open(&root);
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let config = Arc::new(graph.config.parse_config());
+
+    // Round one: converge completely. That is what makes the session
+    // validated — the whole inventory has been compared to disk.
+    let (sources, text_bytes) = warm_sources(&graph);
+    let generation = graph.cache_generation();
+    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    let WarmOutcome::Replacements(pages) = projection.wait_warm_outcome() else {
+        panic!("a cold projection names every page");
+    };
+    assert!(projection.warm_stream_admit(generation, pages.len()));
+    assert!(projection.enqueue_warm_stream(
+        generation,
+        pages.iter().cloned().map(stream_item).collect(),
+        Arc::clone(&config),
+    ));
+    assert!(projection.finish_warm_stream(generation));
+    wait_ready(&graph);
+    assert_eq!(graph.search("sentinel543", 50).unwrap().len(), 8);
+
+    // Round two: a page changes, the warm names it as a replacement, and a
+    // save drifts the generation before the stream closes.
+    std::fs::write(
+        root.join("pages/p000.md"),
+        "- TODO task 0 sentinel543 edited\n",
+    )
+    .unwrap();
+    graph.drift_generation_test();
+    let (sources, text_bytes) = warm_sources(&graph);
+    let generation = graph.cache_generation();
+    assert!(projection.enqueue_warm(generation, sources, Arc::clone(&config), text_bytes));
+    let WarmOutcome::Replacements(_) = projection.wait_warm_outcome() else {
+        panic!("the edited page is a replacement");
+    };
+    assert!(
+        !projection.abandon_warm_stream(generation),
+        "no full snapshot superseded this stream"
+    );
+
+    let job = projection.open_current_query_job(RegistrySensitivity::Insensitive);
+    assert!(
+        matches!(job, QueryJobOpen::Job(_)),
+        "the rows a validated session already committed stay readable through \
+         a drift; only readiness waits for the complete inventory: {}",
+        projection.debug_state_test()
+    );
+    drop(job);
+    assert!(
+        !graph.search("sentinel543", 50).unwrap().is_empty(),
+        "search keeps answering over the rows already committed"
+    );
+    assert!(
+        !graph.direct_projection_ready_test(),
+        "readiness itself still waits for the complete inventory"
+    );
+    assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
 /// GH #543: a parsed snapshot that arrives while a stream is open (the
 /// page-inventory or reference-name parse flight of a not-yet-ready
 /// projection) is dropped, not applied over the stream. Applying it

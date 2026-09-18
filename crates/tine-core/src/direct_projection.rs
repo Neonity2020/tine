@@ -240,9 +240,14 @@ struct PendingProjection {
     /// R6: a full snapshot was queued after the warm; the stream must stop
     /// enqueueing (its deltas would drop the snapshot's order rows).
     warm_superseded: bool,
-    /// R6: an abandoned stream left stale rows behind; only a full snapshot may
-    /// publish readiness again (the worker turns this into
-    /// `requires_full_rebuild`).
+    /// R6: a complete inventory is owed before readiness may be published
+    /// again — the worker turns this into `awaiting_inventory`. It does NOT
+    /// mean the committed rows are stale: `abandon_warm_stream` sets it on
+    /// ordinary generation drift, where the rows already streamed are
+    /// consistent and only the replacements not yet streamed are missing, and
+    /// the next warm validation resumes from them. `requires_full_rebuild` is
+    /// the failure latch; this is not it, and `query_capture_admissible`
+    /// deliberately does not refuse on it.
     needs_full: bool,
 }
 
@@ -482,9 +487,19 @@ impl ProjectionShared {
 /// Readiness (`ready_at`) is unchanged and still waits for the complete
 /// inventory.
 fn query_capture_admissible(shared: &ProjectionShared, pending: &PendingProjection) -> bool {
+    // Deliberately NOT `!pending.needs_full`. That flag says a complete
+    // inventory is owed before READINESS may be published again — a statement
+    // about `ready_at`, not about whether the committed rows may be read.
+    // `abandon_warm_stream` sets it on ordinary generation drift, where its own
+    // contract is that the rows already streamed are consistent and only the
+    // replacements not yet streamed are missing; the worker turn calls the
+    // resulting state "NOT a failure and NOT a reset". Refusing here took
+    // search from answering to `NotReady` on one save racing the warm, and held
+    // it there for a retry that re-reads the whole graph (GH #543). Failure
+    // keeps its own signals below, and `validated` still means this session has
+    // compared the whole inventory to disk at least once.
     !pending.stop
         && !pending.rebuild
-        && !pending.needs_full
         && !shared.worker_failed.load(Ordering::Acquire)
         && (shared.validated.load(Ordering::Acquire)
             || pending.warm.is_some()

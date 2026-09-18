@@ -17,6 +17,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   flag nothing is recorded (GH #543).
 
 ### Fixed
+- Saving while the search index is being rebuilt no longer takes search away
+  until the rebuild finishes. A save that lands mid-rebuild makes the index
+  start its check over, and search went from answering to "waiting for search to
+  be ready" for the whole of that restart — on a large graph, minutes, and again
+  for each further save. The pages already indexed are still correct, so search
+  now keeps answering over them, saying that results may be incomplete, exactly
+  as it does during the first build. This applies once the graph has been
+  indexed completely at least once in the session; a first cold build still has
+  nothing to answer from (GH #543).
+
 - While the search index is building, the progress line in Ctrl+K no longer
   disappears for minutes at a time. Building the index starts by reading every
   page in the graph to see what changed, which is the longest part of the work
