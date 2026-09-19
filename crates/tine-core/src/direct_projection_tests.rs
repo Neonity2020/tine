@@ -7242,6 +7242,69 @@ fn a_reset_has_one_call_site_and_the_worker_owns_it() {
     );
 }
 
+/// Two publications deliberately write a file's own parsed-cache slot while
+/// leaving the day's NAME to the canonical file: the path-pinned save
+/// (`save_path.rs`) and the shadow branch of `sync_file_content`. Both are safe
+/// only because the page cache's `by_name` map is not how a page is found by
+/// name — `find_entry` builds its own index over `list_pages` and prefers the
+/// date-stem file (`lookup.rs`). That is an architectural claim those two
+/// comments rest on, so it is checked rather than asserted: `by_name` may be
+/// written, never read, outside this cache's own construction. (The seventh
+/// audit was right that an earlier version of those comments named the wrong
+/// mechanism — `or_insert` in vector order, which does not decide public
+/// lookup — and a wrong comment is what mistrains the next reader.)
+#[test]
+fn a_page_cache_by_name_map_is_not_a_lookup() {
+    fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    visit(&root, &mut files);
+    files.sort();
+
+    let mut sites = Vec::new();
+    for path in files
+        .iter()
+        .filter(|path| !path.to_string_lossy().ends_with("_tests.rs"))
+    {
+        let source = std::fs::read_to_string(path).unwrap();
+        for (index, line) in source.lines().enumerate() {
+            if !line.contains(".by_name") {
+                continue;
+            }
+            // Writing it is how the map is built; reading it would make the
+            // vector's order decide which file a name opens.
+            let writes = line.contains(".by_name.entry(") || line.contains(".by_name.insert(");
+            if !writes {
+                sites.push(format!(
+                    "{}:{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    index + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        sites.is_empty(),
+        "the page cache's `by_name` map is written, never read: a page is found \
+         by name through `find_entry`, which builds its own index and prefers \
+         the date-stem file, and that is what lets a duplicate day's stray be \
+         saved and reconciled into its own slot without taking the day from the \
+         canonical file (GH #543). Reading `by_name` would hand that decision \
+         to whatever order the cache vector happens to be in. Found: {sites:?}"
+    );
+}
+
 /// A file that leaves the graph is retired BY PATH, with the entry the caller
 /// already holds. `cache_remove(name, kind, None)` retires only what it can
 /// find, and with a cold parsed cache and no current page-list memo it finds
@@ -7725,6 +7788,70 @@ fn a_journal_filename_migration_republishes_the_file_it_moved() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// `graph_text_move_noreplace` renames FIRST and then does fallible durability
+/// work, so an `Err` from it does not mean the file stayed put. The migration
+/// filtered its moves on `.is_ok()`, so a rename that committed and then failed
+/// to flush its directory was recorded as not having happened: nothing was
+/// published, the retired path went on describing the file in search, and the
+/// call reported `Ok(0)` — "nothing migrated" — for a file that had moved
+/// (GH #543, seventh audit A7-N3).
+#[test]
+fn a_migration_publishes_a_move_whose_durability_step_failed() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh543-journal-migration-partial");
+    std::fs::create_dir_all(root.join("logseq")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("logseq/config.edn"),
+        "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("journals/Friday, 26-06-2026.md"),
+        "- okapi only here\n",
+    )
+    .unwrap();
+    let graph = attached_graph(&root);
+    assert_eq!(hits(&graph, "okapi"), 1, "the journal starts indexed");
+
+    crate::model::fail_next_projection_directory_sync();
+    let outcome = graph.migrate_journal_filenames_checked();
+    assert!(
+        root.join("journals/2026_06_26.md").is_file()
+            && !root.join("journals/Friday, 26-06-2026.md").exists(),
+        "the fixture must leave the file MOVED with the call having failed: \
+         outcome={outcome:?}"
+    );
+
+    // The retired path is the observable: nothing published means search keeps
+    // describing it, and the next ordinary edit of the day then publishes the
+    // new path beside the ghost, so one file answers twice.
+    let mut page = graph
+        .load_by_path("journals/2026_06_26.md")
+        .unwrap()
+        .expect("the migrated journal loads at its new path");
+    let baseline = page.rev.clone();
+    page.blocks[0].raw = "tapir only here".into();
+    graph.save_page(&page, baseline.as_deref()).unwrap();
+
+    let projection = graph.direct_projection_test().unwrap();
+    assert!(
+        settle_hits(&graph, "tapir", 1),
+        "the saved text never reached the index: {} block(s) — {}",
+        hits(&graph, "tapir"),
+        projection.debug_state_test()
+    );
+    assert_eq!(
+        hits(&graph, "okapi"),
+        0,
+        "the migration moved the file and published nothing, so search still \
+         answers from the path it moved away from: {}",
+        projection.debug_state_test()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A path-pinned save — a duplicate day's stray, which deliberately never
 /// enters the `(kind,name)` parsed cache — wrote its bytes and published
 /// nothing. The projection's rows are keyed by PATH, so that exclusion had
@@ -7931,6 +8058,30 @@ fn an_external_edit_to_a_duplicate_days_stray_reaches_search() {
         hits(&graph, "caracal"),
         0,
         "the index still answers with the text the file had before the edit: {}",
+        projection.debug_state_test()
+    );
+
+    // A redelivery of the SAME bytes publishes nothing (seventh audit A7-N2).
+    // Sync tools redeliver routinely and Tine's own save of this file echoes
+    // back through here; the ordinary path suppresses both by comparing the
+    // recorded disk revision, and the shadow branch returned before reaching
+    // that comparison. Every needless publication bumps the generation, which
+    // invalidates every memoized whole-graph result.
+    let settled = graph.cache_generation();
+    for _ in 0..5 {
+        graph.sync_file_checked(&stray).unwrap();
+    }
+    assert_eq!(
+        graph.cache_generation(),
+        settled,
+        "unchanged redeliveries of the stray each published a replacement and \
+         bumped the generation: {}",
+        projection.debug_state_test()
+    );
+    assert_eq!(
+        hits(&graph, "axolotl"),
+        1,
+        "the redeliveries disturbed the index: {}",
         projection.debug_state_test()
     );
     let _ = std::fs::remove_dir_all(root);

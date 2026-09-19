@@ -52,10 +52,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   has not been read into memory yet, so the file went to the trash while its
   entries stayed in search — and nothing was queued that would have noticed
   (GH #543).
-- A merge that fails and cannot put the source page back no longer announces
-  that page as still present. The undo step restores the file unless something
-  else has taken its place, and search was told the page was back either way
+- A merge that fails now describes whatever is at the source path afterwards,
+  rather than what it believed it had done. Its undo step restores the file
+  unless something else has taken that place, and it can also report failure
+  after the file is already back — so search could be told the page was present
+  when it was not, or absent when it was (GH #543).
+- Renaming journal files to the graph's configured filename format no longer
+  loses track of files it did move. A rename that completed and then failed to
+  flush was counted as not having happened, so the day stayed findable only at
+  the path it had left, and the operation reported that nothing had migrated;
+  a failure partway through skipped publishing the files already moved
   (GH #543).
+- An external editor or sync tool redelivering a duplicate journal day's file
+  unchanged no longer counts as an edit. Each redelivery re-indexed the file and
+  invalidated every cached whole-graph result, which the ordinary file path has
+  always suppressed by comparing what it last wrote (GH #543).
 - Renaming journal files to the graph's configured filename format now takes
   the same lock every other whole-page operation takes, so a save made while it
   runs cannot be overwritten in search by the text that file had beforehand

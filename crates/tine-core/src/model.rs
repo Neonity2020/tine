@@ -732,6 +732,15 @@ fn guide_twin_race_hook(_path: &Path) -> io::Result<()> {
 // test-only control surface to tine-storage.  Keying it by the deterministic
 // ambient return path keeps parallel runtime fixtures independent.
 
+/// Arm the one-shot directory-sync fault from a test outside this module.
+/// The fault itself stays at the narrow core `Result` boundary above; this only
+/// makes it reachable from the projection tests, which need a move that RENAMED
+/// and then failed (GH #543, seventh audit A7-N3).
+#[cfg(test)]
+pub(crate) fn fail_next_projection_directory_sync() {
+    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true));
+}
+
 #[cfg(test)]
 fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
     FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| {

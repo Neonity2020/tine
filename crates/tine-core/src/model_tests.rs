@@ -15316,6 +15316,15 @@ fn a_failed_merge_that_cannot_restore_its_source_publishes_nothing() {
         "a failed merge published bytes it did not restore, so the index now \
          describes a file that is not there: {error}"
     );
+    // And the file that DOES own that path is described (seventh audit A7-N1).
+    // Publishing nothing was safer than publishing the wrong bytes, but it is
+    // not right: the occupant is the honest current content of a live path, and
+    // nothing else is queued to notice it.
+    assert!(
+        cached(&graph, "okapi occupant"),
+        "the file that now owns the source path reached neither the cache nor \
+         the index, and the failed merge queued nothing that would: {error}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

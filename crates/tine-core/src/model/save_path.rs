@@ -508,11 +508,14 @@ impl Graph {
         // which keys every memoized backlink/reference result — so an unchanged
         // re-save would force a whole-graph rescan on every open dashboard.
         // A path-pinned save (`cache == false`, a duplicate-day stray, #21) still
-        // owns its OWN path slot — what it must not do is take the `(kind,name)`
-        // slot away from the canonical file. Those are different questions, and
-        // the cache answers them in different places: slots are keyed by path,
-        // and the by-name winner is decided by `or_insert` in vector order, so
-        // writing the stray's own slot cannot repoint the name.
+        // owns its OWN path slot — what it must not do is take the day away from
+        // the canonical file when someone opens it BY NAME. Those are different
+        // questions and different code: cache slots are keyed by path, while
+        // name resolution does not read this cache's `by_name` map at all.
+        // `find_entry` builds its own index over `list_pages` and explicitly
+        // prefers the date-stem file (`lookup.rs`), which is what makes opening
+        // the day deterministic. `a_page_cache_by_name_map_is_not_a_lookup`
+        // pins that, because it is the whole reason this save is safe.
         let need_cache_update = cache
             && (changed || {
                 let guard = self.cache.read().unwrap();

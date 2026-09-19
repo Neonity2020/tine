@@ -135,26 +135,45 @@ impl Graph {
         // thread, so the per-move acquisitions underneath still work.
         let _identity = self.lock_graph_text_identity_mutation()?;
         let write = self.admit_graph_text_writer()?;
-        let entries = self.configured_text_entries(&write, false)?;
-        let mut n = 0;
         let mut moved: Vec<(Option<PageEntry>, PathBuf)> = Vec::new();
-        for entry in entries
-            .into_iter()
-            .filter(|entry| entry.kind == PageKind::Journal)
-        {
-            let p = entry.path;
-            if let Some(target) = self.journal_filename_migration_target(&p) {
-                if self.graph_text_exists(&write, &target)? {
-                    continue;
-                }
-                // Retained for the projection before the move takes the path away.
-                let retired = self.entry_for_path(&p);
-                if self.graph_text_move_noreplace(&write, &p, &target).is_ok() {
-                    n += 1;
-                    moved.push((retired, target));
+        // GH #543 (seventh audit A7-N3): the enumeration and the moves are
+        // fallible, and every one of their error exits used to `?` straight
+        // past the publication below — leaving files this function had ALREADY
+        // moved described in the index at paths that no longer exist, with
+        // nothing queued. A committed filesystem move does not un-happen
+        // because a later file failed, so the outcome is captured here and the
+        // moves made before it are published either way.
+        let outcome = (|| -> io::Result<()> {
+            let entries = self.configured_text_entries(&write, false)?;
+            for entry in entries
+                .into_iter()
+                .filter(|entry| entry.kind == PageKind::Journal)
+            {
+                let p = entry.path;
+                if let Some(target) = self.journal_filename_migration_target(&p) {
+                    if self.graph_text_exists(&write, &target)? {
+                        continue;
+                    }
+                    // Retained for the projection before the move takes the path away.
+                    let retired = self.entry_for_path(&p);
+                    let attempt = self.graph_text_move_noreplace(&write, &p, &target);
+                    // Ask the filesystem what happened, not the Result: the
+                    // move renames FIRST and then does fallible durability and
+                    // identity work, so an `Err` here can mean "the file moved
+                    // and a later step failed" — which used to be reported as
+                    // nothing having migrated (A7-N3).
+                    let landed = attempt.is_ok()
+                        || (self.graph_text_exists(&write, &target).unwrap_or(false)
+                            && !self.graph_text_exists(&write, &p).unwrap_or(true));
+                    if landed {
+                        moved.push((retired, target));
+                    }
+                    attempt?;
                 }
             }
-        }
+            Ok(())
+        })();
+        let n = moved.len();
         if n > 0 {
             // GH #543 (fifth audit A5-N1): this migration MOVES files and told
             // nothing. The logical page and its text are unchanged, so search
@@ -197,6 +216,9 @@ impl Graph {
                 page_set,
             );
         }
+        // Reported only after the moves that DID happen are published, so a
+        // caller seeing the error still sees an index that matches the disk.
+        outcome?;
         Ok(n)
     }
 

@@ -158,11 +158,44 @@ impl Graph {
                     // externally delivered edit to a shadow file — Syncthing,
                     // Dropbox, an external editor — reached search never, with
                     // the index idle, validated and ready, because nothing was
-                    // ever queued for it. Cache slots are keyed by PATH and the
-                    // by-name winner is chosen by `or_insert` in vector order,
-                    // so writing the shadow's own slot publishes its rows
-                    // without taking the day's name from the canonical file.
-                    self.cache_upsert(entry, newdoc, content_rev(content));
+                    // ever queued for it. Cache slots are keyed by PATH, and name
+                    // resolution does not read this cache's `by_name` map at
+                    // all — `find_entry` builds its own index and prefers the
+                    // date-stem file (`lookup.rs`) — so writing the shadow's own
+                    // slot publishes its rows without taking the day from the
+                    // canonical file.
+                    //
+                    // An UNCHANGED delivery publishes nothing (seventh audit
+                    // A7-N2). Sync tools and watchers redeliver the same bytes
+                    // routinely, and Tine's own save of this file echoes back
+                    // through here; the ordinary path has the disk_rev and
+                    // self-write comparisons below for exactly that, and this
+                    // branch returns before reaching them. Each needless
+                    // publication bumps the generation, which invalidates every
+                    // memoized whole-graph result and can invalidate an
+                    // inventory read that was in flight.
+                    let disk_rev = content_rev(content);
+                    let parse_config = self.config.parse_config().digest();
+                    // `disk_revs` records a revision only once the parsed cache
+                    // is built; the session record is written by every
+                    // publication, warm or cold, so it is the one that answers
+                    // "have I already published exactly these bytes for this
+                    // path, under this parse configuration".
+                    let unchanged = self
+                        .session_page_ids
+                        .read()
+                        .unwrap()
+                        .get(path)
+                        .is_some_and(|ids| ids.revision == disk_rev && ids.config == parse_config)
+                        || self
+                            .disk_revs
+                            .read()
+                            .unwrap()
+                            .get(path)
+                            .is_some_and(|known| *known == disk_rev);
+                    if !unchanged {
+                        self.cache_upsert(entry, newdoc, disk_rev);
+                    }
                     return Ok(None);
                 }
             }
