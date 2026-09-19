@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { baselineFrom, evaluateBudget } from "../scripts/lib/projection-budget.mjs";
+import { baselineFrom, evaluateBudget, type BudgetRow } from "../scripts/lib/projection-budget.mjs";
 
 const repo = path.resolve(__dirname, "..");
 const policy = JSON.parse(fs.readFileSync(path.join(repo, "scripts/projection-budget-policy.json"), "utf8"));
@@ -42,23 +42,23 @@ describe("projection budget policy", () => {
     const ok = evaluateBudget(measurement(), base);
     expect(ok.breaches).toEqual([]);
     const overS1 = evaluateBudget(measurement({ s1_ratio: 7.01 }), base);
-    expect(overS1.breaches.map((row) => row.id)).toEqual(["S1"]);
+    expect(overS1.breaches.map((row: BudgetRow) => row.id)).toEqual(["S1"]);
     // 5% slower than the baseline is inside the 10% band; 12% slower is not.
     expect(evaluateBudget(measurement({ t1_build_ms: 735 }), base).breaches).toEqual([]);
-    expect(evaluateBudget(measurement({ t1_build_ms: 784 }), base).breaches.map((row) => row.id)).toEqual(["T1"]);
+    expect(evaluateBudget(measurement({ t1_build_ms: 784 }), base).breaches.map((row: BudgetRow) => row.id)).toEqual(["T1"]);
     // U1 is relative to the baseline too, band included.
     const overU1 = evaluateBudget(measurement({ u1: { one_block: { wchar: 331_000 }, sixty_block: { wchar: 989_000 } } }), base);
-    expect(overU1.breaches.map((row) => row.id)).toEqual(["U1/one_block"]);
+    expect(overU1.breaches.map((row: BudgetRow) => row.id)).toEqual(["U1/one_block"]);
     // S2 is absolute: no band.
-    expect(evaluateBudget(measurement({ s2_write_ratio: 2.51 }), base).breaches.map((row) => row.id)).toEqual(["S2"]);
+    expect(evaluateBudget(measurement({ s2_write_ratio: 2.51 }), base).breaches.map((row: BudgetRow) => row.id)).toEqual(["S2"]);
   });
 
   it("leaves relative rows unjudged until a baseline is recorded", () => {
     const noBaseline = { ...policy, corpora: { anon: { ...policy.corpora.anon, baseline: null } } };
     const { rows, breaches } = evaluateBudget(measurement({ t1_build_ms: 1e9 }), noBaseline);
     expect(breaches).toEqual([]);
-    expect(rows.find((row) => row.id === "T1")?.ok).toBeNull();
-    expect(rows.find((row) => row.id === "S1")?.ok).toBe(true);
+    expect(rows.find((row: BudgetRow) => row.id === "T1")?.ok).toBeNull();
+    expect(rows.find((row: BudgetRow) => row.id === "S1")?.ok).toBe(true);
   });
 });
 
