@@ -4433,6 +4433,31 @@
  "notes": "Blocking core operation, and the error-path half of REG-QUERY-PROJECTION-MUTATION-PUBLISHES-543. graph_text_move_noreplace performs the no-clobber rename FIRST and only then makes the chain durable and finishes identity, so an Err from it means the file HAS moved and a later step failed. Every caller that exited on that error skipped its ordinary publication: merge staging, file rescue, page deletion and journal trash each left the vanished source answering searches (rescue additionally kept returning the retired page name instead of the live one); a rename whose compensation preserved an external replacement at the destination left those real, readable bytes unindexed; and a failed duplicate-day resolution kept describing the stray text it could no longer remove. In each case the projection reported itself idle, ready and validated at generation 0 with nothing queued, so nothing was ever going to correct it - a successful search served from an image with no convergence work, which is the other half of GH #543's indexing-forever. Fix: the shared move primitive reconciles the actual eligible source and destination paths when its own post-rename work fails - readable bytes through parse_exact_page/cache_upsert, confirmed absence through cache_remove_path - and still returns the original error; rename_page and resolve_duplicate_journal_day reconcile their final edit paths after failed compensation. graph_text_move_to_trash needed no separate fix because it delegates to the same primitive. The second rename site, graph_text_move_editor_recovery_noreplace, has the same partial-commit shape but runs only inside recover_interrupted_editor_publications at graph open, before any index exists, so it cannot strand a stale image; it is deliberately not covered here."
 },
 {
+ "id": "REG-QUERY-PROJECTION-FAILED-SAVE-PUBLISHES-543",
+ "title": "A save that fails after it has already changed the file still leaves search finding the text that is really on disk",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [543],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/model_tests.rs::a_save_that_fails_after_editor_publication_still_indexes_the_live_text",
+   "crates/tine-core/src/model_tests.rs::a_save_that_fails_at_the_editor_final_read_still_indexes_the_live_text",
+   "crates/tine-core/src/model_tests.rs::a_save_that_loses_editor_publication_to_an_external_owner_still_indexes_the_live_text"
+  ],
+  "scenario": "query.failed-save-convergence",
+  "failBefore": "tine-agents/evidence/gh543-convergence/round10/necessity.log (the reconciliation disabled in commit_editor_write on the integrated head 2a77c84d: all three regressions fail at the live-text search assertion after their disk and error assertions pass; all three pass restored)"
+ },
+ "notes": "Blocking core operation, and the ordinary-save sibling of REG-QUERY-PROJECTION-FAILED-MUTATION-PUBLISHES-543 - reached far more often than a failed move, because it is the editor path every keystroke eventually takes. An editor write that changed the file and then failed propagated its error through write_page's `?` before cache_upsert, so nothing published: search went on serving the pre-save text and could not find the text now on disk, with the projection idle, ready and validated at generation 0 and nothing queued. Worse for the variant that fails after the inner commit returns: the leftover self-write marker made the FIRST checked watcher delivery a no-op (sync_file_checked returns Ok(None) because the marker matches the new bytes), and the native reconciler treats Ok(None) as success and advances its file stamp, so the one delivery that would have repaired it was consumed. Third variant: an external writer wins the path after publication, production raises conflict.replace_post_publication, and that real readable winner reached no producer either. Fix: commit_editor_write reconciles the final path through the same front door the failed-move fix uses (reconcile_failed_graph_text_paths) on every error from its commit/final-read body, clearing the marker and publishing the actual readable owner or confirmed absence, and returns the original error unchanged; the success path and the conflict/no-clobber protocol are untouched. The DTO is never published merely because its write was attempted - the external-winner regression pins that by rejecting the attempted editor text. Assertion change recorded: the two foreign_destination_* tests previously required a failed save to advance NO cache generation and to leave the stale cached document standing; that assertion was the defect written down, and they now require the surviving foreign winner's document, which still fails if the editor's own bytes are published."
+},
+{
  "id": "REG-FRIENDLY-BLOCK-CANDIDATE-BOUND-001",
  "title": "Searching a large graph reads only the blocks that can match the typed needle, instead of every block in the graph for every keystroke",
  "family": "waited-path-query-cost",

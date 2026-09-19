@@ -82,6 +82,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   reconciliation that could not put its file back went on describing text that
   was no longer there. The move itself now reconciles both paths with what is
   actually on disk before returning its error (GH #543).
+- A save that fails after it has already changed the file no longer leaves
+  search showing the old text. The error was reported before anything told the
+  index, so the file on disk said one thing and every search said another, with
+  no indexing work outstanding to correct it. One variant was worse: the record
+  that marks a file as "written by us" was left behind, so the next time the
+  file watcher looked at that file it recognised it as our own finished write
+  and skipped it — spending the one delivery that would have repaired it. This
+  also covers a save that loses its file to another program at the last moment:
+  that program's text is now indexed, and the text the save was trying to write
+  never is (GH #543).
 
 - Search can no longer stop indexing when two parts of the app read the graph
   at the same time. The index kept one slot for "the answer to the check that

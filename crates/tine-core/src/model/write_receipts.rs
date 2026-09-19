@@ -363,86 +363,92 @@ impl Graph {
         // creates and unpinned auxiliary writes.
         let commit_recheck = recheck && expected_identity.is_none();
         let create_parent = creation_proof.is_none();
-        let (rev, ()) = self.commit_write(
-            write,
-            path,
-            content,
-            baseline,
-            commit_recheck,
-            create_parent,
-            editor_episode,
-            || match (expected_identity, creation_proof) {
-                (Some(identity), _) => self.graph_text_atomic_replace_bound(
-                    write,
-                    path,
-                    content.as_bytes(),
-                    identity,
-                    recheck.then_some(baseline).flatten().map(str::as_bytes),
-                    editor_episode,
-                    turn_short_id,
-                ),
-                (None, Some(creation_proof)) if baseline.is_none() => self
-                    .graph_text_atomic_create_with_proof(
+        let result = (|| {
+            let (rev, ()) = self.commit_write(
+                write,
+                path,
+                content,
+                baseline,
+                commit_recheck,
+                create_parent,
+                editor_episode,
+                || match (expected_identity, creation_proof) {
+                    (Some(identity), _) => self.graph_text_atomic_replace_bound(
                         write,
                         path,
                         content.as_bytes(),
-                        creation_proof,
+                        identity,
+                        recheck.then_some(baseline).flatten().map(str::as_bytes),
+                        editor_episode,
+                        turn_short_id,
+                    ),
+                    (None, Some(creation_proof)) if baseline.is_none() => self
+                        .graph_text_atomic_create_with_proof(
+                            write,
+                            path,
+                            content.as_bytes(),
+                            creation_proof,
+                            editor_episode,
+                        ),
+                    (None, _) => self.graph_text_atomic_write_with_conflict(
+                        write,
+                        path,
+                        content.as_bytes(),
+                        baseline.is_none(),
                         editor_episode,
                     ),
-                (None, _) => self.graph_text_atomic_write_with_conflict(
-                    write,
-                    path,
-                    content.as_bytes(),
-                    baseline.is_none(),
-                    editor_episode,
-                ),
-            },
-        )?;
-        editor_commit_before_final_reread_hook()?;
-        let reread = match self.graph_text_read_optional_editor_conflict_snapshot(write, path) {
-            Ok(reread) => reread,
-            Err(error) if editor_episode.is_some() => {
-                return Err(Self::observation_failure_or_hard_refusal(
-                    EditorConflictSite::FinalRereadPresent,
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let Some((reread, identity)) = reread else {
-            self.validate_editor_conflict_portable_path(write, path)?;
-            return Err(self.conflict_error_from_snapshot(
-                path,
-                editor_episode,
-                EditorConflictSite::FinalRereadAbsent,
-                ConflictSnapshot::Absent,
-                None,
-            ));
-        };
-        if reread != content || content_rev(&reread) != rev {
-            if editor_episode.is_some() {
+                },
+            )?;
+            editor_commit_before_final_reread_hook()?;
+            let reread = match self.graph_text_read_optional_editor_conflict_snapshot(write, path) {
+                Ok(reread) => reread,
+                Err(error) if editor_episode.is_some() => {
+                    return Err(Self::observation_failure_or_hard_refusal(
+                        EditorConflictSite::FinalRereadPresent,
+                        error,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            let Some((reread, identity)) = reread else {
                 self.validate_editor_conflict_portable_path(write, path)?;
                 return Err(self.conflict_error_from_snapshot(
                     path,
                     editor_episode,
-                    EditorConflictSite::FinalRereadPresent,
-                    ConflictSnapshot::Present {
-                        revision: content_rev(&reread),
-                        resource_identity: identity,
-                    },
-                    Some(reread),
+                    EditorConflictSite::FinalRereadAbsent,
+                    ConflictSnapshot::Absent,
+                    None,
+                ));
+            };
+            if reread != content || content_rev(&reread) != rev {
+                if editor_episode.is_some() {
+                    self.validate_editor_conflict_portable_path(write, path)?;
+                    return Err(self.conflict_error_from_snapshot(
+                        path,
+                        editor_episode,
+                        EditorConflictSite::FinalRereadPresent,
+                        ConflictSnapshot::Present {
+                            revision: content_rev(&reread),
+                            resource_identity: identity,
+                        },
+                        Some(reread),
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "graph text final reread does not match published bytes",
                 ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph text final reread does not match published bytes",
-            ));
+            self.loaded_file_identities
+                .write()
+                .unwrap()
+                .insert(path.to_path_buf(), (rev.clone(), identity));
+            self.remember_exact_graph_text_state(path, rev.clone(), identity);
+            Ok(rev)
+        })();
+        if result.is_err() {
+            self.reconcile_failed_graph_text_paths(write, std::iter::once(path));
         }
-        self.loaded_file_identities
-            .write()
-            .unwrap()
-            .insert(path.to_path_buf(), (rev.clone(), identity));
-        self.remember_exact_graph_text_state(path, rev.clone(), identity);
-        Ok(rev)
+        result
     }
 }

@@ -1427,7 +1427,7 @@ fn assert_post_retirement_foreign_destination(restoration_branch: bool) {
         .get(&path)
         .cloned()
         .unwrap();
-    let cached_revisions = graph.disk_revs.read().unwrap().clone();
+    let mut cached_revisions = graph.disk_revs.read().unwrap().clone();
     let cache_generation = graph.cache_gen.load(std::sync::atomic::Ordering::Acquire);
     page.blocks[0].raw = format!("user staged {branch} bytes");
     let staged_bytes = format!("- user staged {branch} bytes\n").into_bytes();
@@ -1514,22 +1514,25 @@ fn assert_post_retirement_foreign_destination(restoration_branch: bool) {
         Some(baseline),
         "{branch} failure must not advance the loaded identity baseline"
     );
+    cached_revisions.insert(
+        path.clone(),
+        content_rev(std::str::from_utf8(&foreign_bytes).unwrap()),
+    );
     assert_eq!(
         *graph.disk_revs.read().unwrap(),
         cached_revisions,
-        "{branch} failure must not advance cached disk revisions"
+        "{branch} failure must publish the surviving owner's disk revision"
     );
-    assert_eq!(
-        graph.cache_gen.load(std::sync::atomic::Ordering::Acquire),
-        cache_generation,
-        "{branch} failure must not advance cache generation"
+    assert!(
+        graph.cache_gen.load(std::sync::atomic::Ordering::Acquire) > cache_generation,
+        "{branch} failure must publish the surviving owner"
     );
     graph.with_pages(|pages| {
         let (_, document) = pages
             .iter()
             .find(|(entry, _)| entry.rel_path == "external/Exact.md")
             .unwrap();
-        assert_eq!(document.roots[0].raw, "loaded baseline");
+        assert_eq!(document.roots[0].raw, format!("foreign {branch} winner"));
     });
     let _ = fs::remove_dir_all(&dir);
 }
@@ -3580,6 +3583,108 @@ fn rename_rolls_back_destination_when_source_remove_fails() {
         ref_original
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(any(unix, windows))]
+fn assert_failed_editor_publication_is_searchable(ending: &str) {
+    let dir = scratch(ending);
+    let path = dir.join("pages/Alpha.md");
+    fs::write(&path, "- numbat original\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    graph.with_pages(|_| ());
+    let projection = graph.direct_projection_test().unwrap();
+    let wait = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(projection
+            .wait_until_ready_at(graph.cache_generation(), &|| { Instant::now() >= deadline }));
+    };
+    wait();
+    assert_eq!(graph.search("numbat", 20).unwrap().len(), 1);
+    let mut page = graph.load_by_path("pages/Alpha.md").unwrap().unwrap();
+    page.blocks[0].raw = "quokka edited".to_string();
+    let injected_error = || Err(io::Error::other("editor publication probe"));
+    match ending {
+        "editor-post-publication-error" => JOURNAL_PROJECTION_AFTER_PUBLISH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(injected_error));
+        }),
+        "editor-final-read-error" => EDITOR_COMMIT_BEFORE_FINAL_REREAD.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(injected_error));
+        }),
+        "editor-external-winner" => JOURNAL_PROJECTION_AFTER_PUBLISH.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let replacement = path.with_file_name(".external-winner");
+                fs::write(&replacement, "- quokka external\n")?;
+                gh254_replace(&path, &replacement)
+            }));
+        }),
+        _ => unreachable!(),
+    }
+    let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+    let external = ending == "editor-external-winner";
+    if external {
+        assert_eq!(gh254_code(&error), "conflict.replace_post_publication");
+    } else {
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "editor publication probe");
+    }
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        if external {
+            "- quokka external\n"
+        } else {
+            "- quokka edited\n"
+        }
+    );
+    let assert_search = || {
+        wait();
+        for _ in 0..5 {
+            let groups = graph.search("quokka", 20).unwrap();
+            assert_eq!(
+                groups
+                    .iter()
+                    .map(|group| group.page.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Alpha"]
+            );
+            assert!(graph.search("numbat", 20).unwrap().is_empty());
+            assert_eq!(
+                graph
+                    .search(if external { "external" } else { "edited" }, 20)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            if external {
+                assert!(graph.search("edited", 20).unwrap().is_empty());
+            }
+        }
+    };
+    assert_search();
+    graph.sync_file_checked(&path).unwrap();
+    assert_search();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_save_that_fails_after_editor_publication_still_indexes_the_live_text() {
+    assert_failed_editor_publication_is_searchable("editor-post-publication-error");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_save_that_fails_at_the_editor_final_read_still_indexes_the_live_text() {
+    assert_failed_editor_publication_is_searchable("editor-final-read-error");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_save_that_loses_editor_publication_to_an_external_owner_still_indexes_the_live_text() {
+    assert_failed_editor_publication_is_searchable("editor-external-winner");
 }
 
 #[test]
