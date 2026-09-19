@@ -1437,7 +1437,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.25.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.26.0\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1500,6 +1500,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // lines) and leaves the Direct Files durability and SQLite projection
     // surface. tine-core imported nothing from the deleted half, so the pin
     // string above moved v0.24.0 → v0.25.0 and the digest is unchanged.
+    // 2026-09-19: compact-projection P1 pinned v0.26.0, which trims the
+    // crate's public surface to the methods Tine's Direct Files path calls
+    // (35 public methods on exported types deleted). Nothing Tine imports or
+    // calls moved, so the pin string above moved v0.25.0 → v0.26.0 and the
+    // digest is unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "a5a486d6bb83e5f7f3dcfaed306afccd3a21b7ffccc2f54b5dc690ccfcc53fb4",

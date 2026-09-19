@@ -10,12 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
-- Internal: Tine now pins tine-storage v0.25.0, which deletes the Managed
+- Internal: Tine now pins tine-storage v0.26.0. v0.25.0 deletes the Managed
   Storage half of the crate (durable batches, local journals, sealed digests,
   the oplog frontier and the managed layout — 32,640 → 11,863 source lines).
   The crate is the Direct Files durability and SQLite projection crate; nothing
   Tine used moved, and the projection schema is unchanged at version 29, so no
-  rebuild is triggered (compact-projection campaign P1; no user-visible change).
+  rebuild is triggered. v0.26.0 then trims the crate's public surface to the
+  methods Tine's Direct Files path calls (compact-projection campaign P1; no
+  user-visible change).
 - Internal: `scripts/measure-projection.mjs` runs `graph_scale_bench --root <graph>` on a real corpus and reports the compact-projection budget rows (S1 file/Markdown, S2 build write amplification, T1 build time, M1 peak RSS, U1 bytes per single-block edit, T2 Ctrl+K p95, T3 `{{query}}` p95) against `scripts/projection-budget-policy.json`; `src/projectionBudget.test.ts` runs it only when `TINE_PROJECTION_CORPUS` names a corpus. Anon baseline recorded 2026-09-19 (compact-projection P0a).
 - Internal: every SQL statement tine-core sends to the search/query projection
   now passes through one door (`query/projection_sql.rs`), a blessed statement
