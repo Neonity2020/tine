@@ -7,29 +7,23 @@ import { fileURLToPath } from "node:url";
 import { coverageReferenceProblem } from "./lib/coverage-reference.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const uiCheck = spawnSync(process.execPath, [path.join(root, "scripts/check-ui-regression-catalog.mjs")], {
-  cwd: root,
-  encoding: "utf8",
-});
-process.stdout.write(uiCheck.stdout);
-process.stderr.write(uiCheck.stderr);
-if (uiCheck.status !== 0) process.exit(uiCheck.status ?? 1);
-
-const taoTitlebarCheck = spawnSync(process.execPath, [path.join(root, "scripts/check-tao-native-titlebar.mjs")], {
-  cwd: root,
-  encoding: "utf8",
-});
-process.stdout.write(taoTitlebarCheck.stdout);
-process.stderr.write(taoTitlebarCheck.stderr);
-if (taoTitlebarCheck.status !== 0) process.exit(taoTitlebarCheck.status ?? 1);
-
-const linuxIdentityCheck = spawnSync(process.execPath, [path.join(root, "scripts/check-linux-window-identity.mjs")], {
-  cwd: root,
-  encoding: "utf8",
-});
-process.stdout.write(linuxIdentityCheck.stdout);
-process.stderr.write(linuxIdentityCheck.stderr);
-if (linuxIdentityCheck.status !== 0) process.exit(linuxIdentityCheck.status ?? 1);
+// Every sub-check runs, and the exit code is decided once at the end. Until
+// 2026-09-19 each one exited immediately, so the FIRST failure hid every later
+// problem: one missing E2E contract entry masked three unresolvable coverage
+// references and an invalid status for as long as it stood. A checker that
+// stops at the first thing it finds teaches its readers the queue is one deep.
+const subChecks = [
+  "scripts/check-ui-regression-catalog.mjs",
+  "scripts/check-tao-native-titlebar.mjs",
+  "scripts/check-linux-window-identity.mjs",
+];
+let subCheckStatus = 0;
+for (const subCheck of subChecks) {
+  const result = spawnSync(process.execPath, [path.join(root, subCheck)], { cwd: root, encoding: "utf8" });
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  if (result.status !== 0) subCheckStatus ||= result.status ?? 1;
+}
 
 const index = JSON.parse(fs.readFileSync(path.join(root, "tests/regressions/catalog.json"), "utf8"));
 const problems = [];
@@ -101,3 +95,6 @@ if (problems.length) {
   process.exit(1);
 }
 console.log(`Regression catalog index OK: ${index.inventories.length} inventories.`);
+// A sub-check that failed above still fails the gate; its own output already
+// said what and why, so there is nothing to reprint here.
+if (subCheckStatus !== 0) process.exit(subCheckStatus);

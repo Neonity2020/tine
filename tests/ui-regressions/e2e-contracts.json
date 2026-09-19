@@ -340,6 +340,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-machine-probe.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A journey that failed while waiting says whether the machine itself was answering, so a starved disk or saturated CPU is named as the cause instead of being read as a product regression, and a healthy machine hands the failure back to the product.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The sample count, the thresholds that separate a starved machine from a healthy one, and the wording of the verdict."
+   ],
+   "nonRequirements": [
+    "Any product behaviour; any absolute latency figure, which is machine-specific by construction."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-main-window.test.mjs": {
    "contracts": [
     {
