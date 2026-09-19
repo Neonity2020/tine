@@ -6,16 +6,15 @@ export const STORAGE_REPOSITORY = "https://github.com/martinkoutecky/tine-storag
 export const STORAGE_PIN_METADATA = "docs/dependency-receipts/tine-storage.json";
 export const STORAGE_REQUIRED_JOBS =
   "linux-complete,windows-complete,android-compile,macos-compile,ios-compile,api-semver";
-// The complete manifest hash pins every persistent format. These v0.2 journal
-// values are also explicit so a superficially valid non-v2 receipt fails with a
-// useful diagnostic before Tine starts consuming the frontier protocol.
-export const STORAGE_REQUIRED_V2_FORMATS = new Map([
-  ["LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION", "2"],
-  ["LOCAL_JOURNAL_SEGMENT_V2_MAGIC", "TINEJNL2"],
-  ["LOCAL_JOURNAL_FRONTIER_V2_MAGIC", "TINEFRT2"],
-  ["LOCAL_JOURNAL_SEGMENT_HEADER_BYTES", "136"],
-  ["LOCAL_JOURNAL_FRONTIER_BYTES", "240"],
-  ["LOCAL_JOURNAL_FRONTIER_SUFFIX", ".frontier-v2"],
+// The complete manifest hash pins every persistent format. Since tine-storage
+// 0.25.0 (Direct Files only) the crate owns exactly one on-disk artifact, the
+// SQLite projection, and its identity is also pinned explicitly so a receipt
+// from a pre-0.25.0 Managed-era crate, or from a projection with another
+// application id, fails with a useful diagnostic instead of a bare hash
+// mismatch. The schema version is required to be present, not to hold a
+// particular value: it moves with the projection schema, not with the pin.
+export const STORAGE_REQUIRED_FORMATS = new Map([
+  ["SQLITE_APPLICATION_ID", "1414090309"],
 ]);
 
 function sha256(bytes) {
@@ -161,16 +160,10 @@ export function storagePinProblems(root) {
     problems.push("certification receipt has no persistent-format manifest");
   } else {
     if (sha256(manifest) !== metadata.formatManifestSha256) problems.push("persistent-format manifest SHA-256 does not match pin metadata");
-    for (const required of [
-      "OPLOG_PROTOCOL_VERSION",
-      "OBJECT_ENVELOPE_SCHEMA_VERSION",
-      "MANIFEST_ENCODING_VERSION",
-      "LOCAL_JOURNAL_FRAME_SCHEMA_VERSION",
-      "SQLITE_SCHEMA_VERSION",
-    ]) {
+    for (const required of ["SQLITE_APPLICATION_ID", "SQLITE_SCHEMA_VERSION"]) {
       if (!new RegExp(`^${required}\\t`, "m").test(manifest)) problems.push(`persistent-format receipt omits ${required}`);
     }
-    for (const [required, expected] of STORAGE_REQUIRED_V2_FORMATS) {
+    for (const [required, expected] of STORAGE_REQUIRED_FORMATS) {
       const actual = formatValue(manifest, required);
       if (actual === undefined) {
         problems.push(`persistent-format receipt omits ${required}`);

@@ -11,17 +11,8 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-storage-pin-"));
 const commit = "a".repeat(40);
 const run = "https://github.com/martinkoutecky/tine-storage/actions/runs/123";
 const manifest = [
-  "OPLOG_PROTOCOL_VERSION\tidentity\toplog\t2",
-  "OBJECT_ENVELOPE_SCHEMA_VERSION\tidentity\tenvelope\t2",
-  "MANIFEST_ENCODING_VERSION\tidentity\tmanifest\t4",
-  "LOCAL_JOURNAL_FRAME_SCHEMA_VERSION\tidentity\tjournal\t1",
-  "LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION\tidentity\tjournal v2\t2",
-  "LOCAL_JOURNAL_SEGMENT_V2_MAGIC\tidentity\tjournal v2 header\tTINEJNL2",
-  "LOCAL_JOURNAL_FRONTIER_V2_MAGIC\tidentity\tjournal v2 frontier\tTINEFRT2",
-  "SQLITE_SCHEMA_VERSION\tidentity\tsqlite\t15",
-  "LOCAL_JOURNAL_SEGMENT_HEADER_BYTES\tlayout\tjournal v2 header\t136",
-  "LOCAL_JOURNAL_FRONTIER_BYTES\tlayout\tjournal v2 frontier\t240",
-  "LOCAL_JOURNAL_FRONTIER_SUFFIX\tlayout\tjournal v2 frontier\t.frontier-v2",
+  "SQLITE_APPLICATION_ID\tidentity\tsqlite\t1414090309",
+  "SQLITE_SCHEMA_VERSION\tidentity\tsqlite\t29",
 ].join("\n") + "\n";
 const receipt = [
   "tine-storage certification receipt",
@@ -111,14 +102,26 @@ incompleteMetadata.receiptSha256 = digest(incompleteReceipt);
 write("docs/dependency-receipts/tine-storage.json", `${JSON.stringify(incompleteMetadata, null, 2)}\n`);
 assert.ok(storagePinProblems(root).some((problem) => problem.includes("complete required storage matrix")));
 
-const v2Receipt = receipt.replace("LOCAL_JOURNAL_FRONTIER_V2_MAGIC\tidentity\tjournal v2 frontier\tTINEFRT2\n", "");
-write("docs/dependency-receipts/tine-storage-v0.3.0.txt", v2Receipt);
-const v2Metadata = JSON.parse(fs.readFileSync(path.join(root, "docs/dependency-receipts/tine-storage.json"), "utf8"));
-const v2Manifest = v2Receipt.match(/^format_manifest_begin\n([\s\S]+?)^format_manifest_end$/m)?.[1];
-v2Metadata.receiptSha256 = digest(v2Receipt);
-v2Metadata.formatManifestSha256 = digest(v2Manifest);
-write("docs/dependency-receipts/tine-storage.json", `${JSON.stringify(v2Metadata, null, 2)}\n`);
-assert.ok(storagePinProblems(root).some((problem) => problem.includes("LOCAL_JOURNAL_FRONTIER_V2_MAGIC")));
+const foreignIdReceipt = receipt.replace(
+  "SQLITE_APPLICATION_ID\tidentity\tsqlite\t1414090309\n",
+  "SQLITE_APPLICATION_ID\tidentity\tsqlite\t1414090310\n",
+);
+write("docs/dependency-receipts/tine-storage-v0.3.0.txt", foreignIdReceipt);
+const foreignIdMetadata = JSON.parse(fs.readFileSync(path.join(root, "docs/dependency-receipts/tine-storage.json"), "utf8"));
+const foreignIdManifest = foreignIdReceipt.match(/^format_manifest_begin\n([\s\S]+?)^format_manifest_end$/m)?.[1];
+foreignIdMetadata.receiptSha256 = digest(foreignIdReceipt);
+foreignIdMetadata.formatManifestSha256 = digest(foreignIdManifest);
+write("docs/dependency-receipts/tine-storage.json", `${JSON.stringify(foreignIdMetadata, null, 2)}\n`);
+assert.ok(storagePinProblems(root).some((problem) => problem.includes("SQLITE_APPLICATION_ID=1414090310")));
+
+const schemalessReceipt = receipt.replace("SQLITE_SCHEMA_VERSION\tidentity\tsqlite\t29\n", "");
+write("docs/dependency-receipts/tine-storage-v0.3.0.txt", schemalessReceipt);
+const schemalessMetadata = JSON.parse(fs.readFileSync(path.join(root, "docs/dependency-receipts/tine-storage.json"), "utf8"));
+const schemalessManifest = schemalessReceipt.match(/^format_manifest_begin\n([\s\S]+?)^format_manifest_end$/m)?.[1];
+schemalessMetadata.receiptSha256 = digest(schemalessReceipt);
+schemalessMetadata.formatManifestSha256 = digest(schemalessManifest);
+write("docs/dependency-receipts/tine-storage.json", `${JSON.stringify(schemalessMetadata, null, 2)}\n`);
+assert.ok(storagePinProblems(root).some((problem) => problem.includes("omits SQLITE_SCHEMA_VERSION")));
 
 fs.rmSync(root, { recursive: true, force: true });
 console.log("tine-storage pin contract fixtures OK");
