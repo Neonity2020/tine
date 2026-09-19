@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "spec": "tine-agents/specs/campaigns/2026-09-compact-projection/SPEC.md §3",
+  "noiseBandFraction": 0.1,
+  "corpora": {
+    "anon": {
+      "description": "Martin's anonymized graph (~/research/logseq-anonymized); opt in with TINE_PROJECTION_CORPUS.",
+      "ceilings": {
+        "s1": 7,
+        "s2": 2.5,
+        "t1_multiplier": 1,
+        "t2_multiplier": 1.5,
+        "t3_multiplier": 1.5,
+        "m1_multiplier": 1,
+        "u1_multiplier": 1
+      },
+      "baseline": {
+        "recorded": "2026-09-19",
+        "t1_build_ms": 1030.733571,
+        "m1_peak_rss_delta_kb": 53152,
+        "u1": {
+          "one_block": {
+            "wchar": 360401
+          },
+          "sixty_block": {
+            "wchar": 1646683
+          }
+        },
+        "t2_search": [
+          {
+            "chars": 3,
+            "p95_ms": 17.20901
+          },
+          {
+            "chars": 4,
+            "p95_ms": 16.957233
+          },
+          {
+            "chars": 10,
+            "p95_ms": 3.861494
+          }
+        ],
+        "t3_queries": [
+          {
+            "query": "(task TODO)",
+            "p95_ms": 4.687948
+          },
+          {
+            "query": "(task DONE)",
+            "p95_ms": 31.232087
+          },
+          {
+            "query": "(between -3650d today)",
+            "p95_ms": 1.432198
+          },
+          {
+            "query": "(all-page-tags)",
+            "p95_ms": 1.475889
+          },
+          {
+            "query": "(and (task TODO) (between -3650d today))",
+            "p95_ms": 1.328896
+          }
+        ],
+        "s1_ratio": 26.44435662321566,
+        "s2_write_ratio": 4.7435850647924855
+      }
+    },
+    "brikas": {
+      "description": "The GH #295 corpus (page-heavy, 55k blocks).",
+      "ceilings": {
+        "s1": 8,
+        "s2": 2.5,
+        "t1_multiplier": 1,
+        "t2_multiplier": 1.5,
+        "t3_multiplier": 1.5,
+        "m1_multiplier": 1,
+        "u1_multiplier": 1
+      },
+      "baseline": null
+    },
+    "synthetic10k": {
+      "description": "The 10k-page synthetic graph graph_scale_bench generates (49 MB).",
+      "ceilings": {
+        "s1": 9,
+        "s2": 2.5,
+        "t1_multiplier": 1,
+        "t2_multiplier": 1.5,
+        "t2_absolute_ms": 150,
+        "t3_multiplier": 1.5,
+        "m1_multiplier": 1,
+        "u1_multiplier": 1
+      },
+      "baseline": null
+    }
+  }
+}

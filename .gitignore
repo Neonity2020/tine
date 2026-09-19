@@ -57,3 +57,6 @@ reddit-backup/
 # A sandboxed lane cannot write the default npm cache directory, so it makes one
 # here. It is a build artifact, not source.
 /.npm-cache/
+
+# compact-projection budget measurement output (scripts/measure-projection.mjs)
+/projection-budget.json

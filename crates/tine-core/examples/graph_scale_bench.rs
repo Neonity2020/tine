@@ -32,6 +32,21 @@ const WORDS: &[&str] = &[
 ];
 
 fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Some(at) = args.iter().position(|arg| arg == "--root") {
+        let root = args.get(at + 1).map(PathBuf::from).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "--root needs a graph path")
+        })?;
+        let flag = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .and_then(|at| args.get(at + 1))
+                .cloned()
+        };
+        let corpus = flag("--corpus").unwrap_or_else(|| "anon".to_owned());
+        let json = flag("--json").map(PathBuf::from);
+        return measure::run(&root, &corpus, json.as_deref());
+    }
     let scales = parse_scales()?;
     println!("Graph scale benchmark");
     println!("primary_query={PRIMARY_QUERY}");
@@ -575,5 +590,451 @@ fn print_table(rows: &[BenchRow]) {
             row.publish_ms,
             row.publish_pages
         );
+    }
+}
+
+/// Real-graph measurement mode (compact-projection campaign P0a): copies the
+/// graph at `--root` into a scratch directory, builds the Direct Files
+/// projection there, and reports the §3 budget instruments as JSON:
+/// S1 (projection bytes / Markdown bytes after a TRUNCATE checkpoint),
+/// S2 (bytes handed to `write()` during the build / final projection bytes),
+/// T1 (build wall time), M1 (peak RSS delta), U1 (bytes written per
+/// single-block edit on a 1-block and a 60-block page), T2 (Ctrl+K p95
+/// through `Graph::run_graph_search_latest`) and T3 (`{{query}}` p95 over a
+/// fixed query set). Linux-only: it reads `/proc/self/io` and
+/// `/proc/self/status`, which are process-wide, so this process does nothing
+/// but the measured work while measuring.
+mod measure {
+    use super::*;
+    use std::collections::HashMap;
+
+    const SEARCH_RUNS: usize = 20;
+    const QUERY_RUNS: usize = 20;
+    const EDIT_RUNS: usize = 10;
+    const SIXTY: usize = 60;
+    /// One text per operator family the query census counts, over facts every
+    /// graph has (tasks, dates, page tags); property and reference names are
+    /// corpus-specific and are not fixed here.
+    const QUERIES: &[&str] = &[
+        "(task TODO)",
+        "(task DONE)",
+        "(between -3650d today)",
+        "(all-page-tags)",
+        "(and (task TODO) (between -3650d today))",
+    ];
+
+    #[derive(Clone, Copy, Default)]
+    struct Io {
+        wchar: u64,
+        write_bytes: u64,
+        cancelled_write_bytes: u64,
+    }
+
+    fn io() -> Io {
+        let text = fs::read_to_string("/proc/self/io").expect("Linux /proc/self/io");
+        let mut out = Io::default();
+        for line in text.lines() {
+            let mut parts = line.split(':');
+            let key = parts.next().unwrap_or("").trim();
+            let value = parts
+                .next()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            match key {
+                "wchar" => out.wchar = value,
+                "write_bytes" => out.write_bytes = value,
+                "cancelled_write_bytes" => out.cancelled_write_bytes = value,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn status_kb(key: &str) -> u64 {
+        let text = fs::read_to_string("/proc/self/status").expect("Linux /proc/self/status");
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_start_matches(':')
+                    .trim()
+                    .split_whitespace()
+                    .next()
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    fn file_len(path: &Path) -> u64 {
+        fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    /// Copy the graph, skipping version control and Logseq's own backup dirs.
+    /// Returns (files copied, Markdown/Org bytes under pages/ and journals/).
+    fn copy_graph(from: &Path, to: &Path) -> io::Result<(usize, u64)> {
+        fn walk(
+            from: &Path,
+            to: &Path,
+            rel: &Path,
+            files: &mut usize,
+            bytes: &mut u64,
+        ) -> io::Result<()> {
+            fs::create_dir_all(to.join(rel))?;
+            for entry in fs::read_dir(from.join(rel))? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let child = rel.join(&name);
+                if entry.file_type()?.is_dir() {
+                    if name_str == ".git" || name_str == "bak" || name_str == ".recycle" {
+                        continue;
+                    }
+                    walk(from, to, &child, files, bytes)?;
+                } else {
+                    fs::copy(from.join(&child), to.join(&child))?;
+                    *files += 1;
+                    let top = child
+                        .components()
+                        .next()
+                        .map(|c| c.as_os_str().to_string_lossy().to_string());
+                    let is_text = child
+                        .extension()
+                        .is_some_and(|ext| ext == "md" || ext == "org");
+                    if is_text && matches!(top.as_deref(), Some("pages") | Some("journals")) {
+                        *bytes += entry.metadata()?.len();
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut files = 0;
+        let mut bytes = 0;
+        walk(from, to, Path::new(""), &mut files, &mut bytes)?;
+        Ok((files, bytes))
+    }
+
+    /// The most frequent alphabetic tokens of the corpus text: the top token
+    /// of at least 4 chars and the top token of at least 8 chars, so the
+    /// Ctrl+K needles are representative of this graph and not of a word
+    /// list; the 3-char needle is the prefix of the first.
+    fn top_tokens(root: &Path) -> Vec<String> {
+        let mut freq: HashMap<String, usize> = HashMap::new();
+        for dir in ["pages", "journals"] {
+            let Ok(entries) = fs::read_dir(root.join(dir)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(text) = fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                for token in text
+                    .split(|c: char| !c.is_alphabetic())
+                    .filter(|token| token.chars().count() >= 4)
+                {
+                    *freq.entry(token.to_lowercase()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<(String, usize)> = freq.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut tokens = Vec::new();
+        if let Some((top, _)) = ranked.first() {
+            tokens.push(top.clone());
+        }
+        if let Some((long, _)) = ranked.iter().find(|(token, _)| token.chars().count() >= 8) {
+            if !tokens.contains(long) {
+                tokens.push(long.clone());
+            }
+        }
+        tokens
+    }
+
+    fn p95(durations: &mut [Duration]) -> f64 {
+        durations.sort();
+        let at = ((durations.len() as f64) * 0.95).ceil() as usize;
+        ms(durations[at.saturating_sub(1).min(durations.len() - 1)])
+    }
+
+    /// Wait until the projection has no build in flight, `needle` is
+    /// searchable (so a queued live delta has been applied), and the process
+    /// has stopped writing for 300 ms (a checkpoint after the delta counts).
+    fn settle(graph: &Graph, needle: &str) -> io::Result<()> {
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > Duration::from_secs(60) {
+                return Err(io::Error::other(format!(
+                    "projection did not settle for {needle}"
+                )));
+            }
+            if graph.query_index_progress().is_some() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let found = graph
+                .run_graph_search_latest("measure", needle, 4, 4, false)
+                .map(|execution| !execution.hits.is_empty())
+                .unwrap_or(false);
+            if !found {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let mut last = io().wchar;
+            let mut stable = 0;
+            while stable < 3 {
+                std::thread::sleep(Duration::from_millis(100));
+                let now = io().wchar;
+                if now == last {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                    last = now;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    fn bench_page(name: &str, blocks: usize, token: &str) -> tine_core::model::PageDto {
+        tine_core::model::PageDto {
+            name: name.to_owned(),
+            kind: PageKind::Page,
+            title: name.to_owned(),
+            pre_block: None,
+            blocks: (0..blocks)
+                .map(|at| tine_core::model::BlockDto {
+                    raw: format!("{token} block {at} of {name}"),
+                    ..Default::default()
+                })
+                .collect(),
+            rev: None,
+            format: Default::default(),
+            read_only: false,
+            path: String::new(),
+            activation: None,
+            guide: false,
+        }
+    }
+
+    /// U1 for one page: median bytes written by a single-block edit.
+    /// TRUNCATE-checkpoint the projection from a second connection so the WAL
+    /// is empty at the start of a measured series and fully accounted at its
+    /// end; without the bracket, whether SQLite's autocheckpoint lands inside
+    /// the series moves a 10-edit mean by 3x between identical runs.
+    fn checkpoint(projection: &Path) -> io::Result<()> {
+        let database =
+            tine_storage::sqlite::PhysicalGraphProjectionDatabase::open_writable(projection)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        database
+            .checkpoint_truncate()
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    /// Bytes written per single-block edit of `name`: `EDIT_RUNS` edits, each
+    /// settled (projection idle, the new text searchable), bracketed by two
+    /// checkpoints, divided by the count — the amortized cost a user pays per
+    /// edit, WAL append and checkpoint share included.
+    fn edit_cost(graph: &Graph, projection: &Path, name: &str) -> io::Result<(u64, u64, f64)> {
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| io::Error::other(format!("bench page {name} missing")))?;
+        checkpoint(projection)?;
+        let before = io();
+        let mut elapsed = Vec::new();
+        for round in 0..EDIT_RUNS {
+            let mut page = graph.load_page(&entry)?;
+            let baseline = page.rev.clone();
+            let token = format!("benchedit{round}x{}", name.len());
+            page.blocks[0].raw = format!("{token} edited block of {name}");
+            let started = Instant::now();
+            let round_before = io().wchar;
+            graph.save_page(&page, baseline.as_deref())?;
+            settle(graph, &token)?;
+            elapsed.push(started.elapsed());
+            if std::env::var_os("TINE_MEASURE_TRACE").is_some() {
+                eprintln!(
+                    "measure: edit {round} of {name}: {} B",
+                    io().wchar - round_before
+                );
+            }
+        }
+        let series = io().wchar;
+        checkpoint(projection)?;
+        let after = io();
+        if std::env::var_os("TINE_MEASURE_TRACE").is_some() {
+            eprintln!(
+                "measure: final checkpoint of {name}: {} B",
+                after.wchar - series
+            );
+        }
+        let runs = EDIT_RUNS as u64;
+        Ok((
+            (after.wchar - before.wchar) / runs,
+            (after.write_bytes - before.write_bytes) / runs,
+            ms(median(&elapsed)),
+        ))
+    }
+
+    pub fn run(root: &Path, corpus: &str, json: Option<&Path>) -> io::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let graph_root = scratch.path().join("graph");
+        let (files, markdown_bytes) = copy_graph(root, &graph_root)?;
+        let projection = scratch.path().join("projection.sqlite");
+        eprintln!("measure: {files} files, {markdown_bytes} Markdown/Org bytes, corpus={corpus}");
+
+        // T1, S2, M1: the build, with nothing else running in this process.
+        let rss_before_kb = status_kb("VmRSS");
+        let io_before = io();
+        let started = Instant::now();
+        let graph = Graph::open(&graph_root);
+        graph.attach_direct_projection(projection.clone())?;
+        graph.warm_cache();
+        while graph.query_index_progress().is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let build_ms = ms(started.elapsed());
+        let io_build = io();
+        let hwm_after_kb = status_kb("VmHWM");
+        let pages = graph.with_pages(|pages| pages.len());
+        let projection_bytes_after_build =
+            file_len(&projection) + file_len(&projection.with_extension("sqlite-wal"));
+        eprintln!("measure: built in {build_ms:.0} ms, {pages} pages, file+wal {projection_bytes_after_build} bytes");
+
+        // T2: Ctrl+K needles from this corpus.
+        let tokens = top_tokens(&graph_root);
+        let mut needles = Vec::new();
+        if let Some(top) = tokens.first() {
+            needles.push(top.chars().take(3).collect::<String>());
+        }
+        needles.extend(tokens.iter().cloned());
+        let mut search = Vec::new();
+        for needle in &needles {
+            let mut durations = Vec::with_capacity(SEARCH_RUNS);
+            let mut hits = 0usize;
+            for _ in 0..SEARCH_RUNS {
+                let started = Instant::now();
+                let execution = graph
+                    .run_graph_search_latest("measure", needle, 12, 12, false)
+                    .map_err(|error| io::Error::other(format!("search {needle}: {error:?}")))?;
+                durations.push(started.elapsed());
+                hits = execution.hits.len();
+            }
+            search.push(serde_json::json!({
+                "needle": needle,
+                "chars": needle.chars().count(),
+                "p95_ms": p95(&mut durations),
+                "median_ms": ms(median(&durations)),
+                "hits": hits,
+            }));
+        }
+
+        // T3: the fixed query set.
+        let mut queries = Vec::new();
+        for query in QUERIES {
+            let mut durations = Vec::with_capacity(QUERY_RUNS);
+            let mut groups_len = 0usize;
+            for _ in 0..QUERY_RUNS {
+                let started = Instant::now();
+                let groups = graph
+                    .run_query(query)
+                    .map_err(|error| io::Error::other(format!("query {query}: {error:?}")))?;
+                durations.push(started.elapsed());
+                groups_len = groups.len();
+            }
+            queries.push(serde_json::json!({
+                "query": query,
+                "p95_ms": p95(&mut durations),
+                "median_ms": ms(median(&durations)),
+                "groups": groups_len,
+            }));
+        }
+
+        // U1: bytes written per single-block edit, 1-block and 60-block pages.
+        graph.save_page(&bench_page("Bench One Block", 1, "benchseedone"), None)?;
+        graph.save_page(
+            &bench_page("Bench Sixty Blocks", SIXTY, "benchseedsixty"),
+            None,
+        )?;
+        settle(&graph, "benchseedone")?;
+        settle(&graph, "benchseedsixty")?;
+        let (one_wchar, one_write_bytes, one_ms) =
+            edit_cost(&graph, &projection, "Bench One Block")?;
+        let (sixty_wchar, sixty_write_bytes, sixty_ms) =
+            edit_cost(&graph, &projection, "Bench Sixty Blocks")?;
+
+        // S1: file bytes after detach, TRUNCATE checkpoint and close.
+        if !graph.detach_direct_projection(Duration::from_secs(60)) {
+            return Err(io::Error::other("projection did not detach"));
+        }
+        drop(graph);
+        let block_count = {
+            let database =
+                tine_storage::sqlite::PhysicalGraphProjectionDatabase::open_writable(&projection)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            database
+                .checkpoint_truncate()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            drop(database);
+            let mut snapshot = tine_storage::sqlite::PhysicalProjectionQuerySnapshot::open_direct(
+                &projection,
+                || Ok(()),
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            let rows = snapshot
+                .run_projection_query("SELECT COUNT(*) FROM blocks", &[])
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            match rows.first().and_then(|row| row.first()) {
+                Some(tine_storage::sqlite::PhysicalQueryValue::Integer(count)) => *count as u64,
+                _ => 0,
+            }
+        };
+        let projection_bytes = file_len(&projection);
+        let wal_bytes = file_len(&projection.with_extension("sqlite-wal"));
+        let build_wchar = io_build.wchar - io_before.wchar;
+        let build_write_bytes = (io_build.write_bytes - io_before.write_bytes)
+            .saturating_sub(io_build.cancelled_write_bytes - io_before.cancelled_write_bytes);
+
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "corpus": corpus,
+            "root": root.display().to_string(),
+            "files": files,
+            "pages": pages,
+            "blocks": block_count,
+            "markdown_bytes": markdown_bytes,
+            "projection_bytes": projection_bytes,
+            "wal_bytes_after_checkpoint": wal_bytes,
+            "projection_bytes_after_build_with_wal": projection_bytes_after_build,
+            "s1_ratio": projection_bytes as f64 / markdown_bytes.max(1) as f64,
+            "build_wchar": build_wchar,
+            "build_write_bytes_net": build_write_bytes,
+            "s2_write_ratio": build_wchar as f64 / projection_bytes.max(1) as f64,
+            "t1_build_ms": build_ms,
+            "m1_peak_rss_delta_kb": hwm_after_kb.saturating_sub(rss_before_kb),
+            "vm_hwm_kb": hwm_after_kb,
+            "u1": {
+                "one_block": { "wchar": one_wchar, "write_bytes": one_write_bytes, "settle_ms": one_ms },
+                "sixty_block": { "wchar": sixty_wchar, "write_bytes": sixty_write_bytes, "settle_ms": sixty_ms },
+                "edits_per_page": EDIT_RUNS,
+            },
+            "t2_search": search,
+            "t3_queries": queries,
+        });
+        let text = serde_json::to_string_pretty(&report)?;
+        match json {
+            Some(path) => fs::write(path, format!("{text}\n"))?,
+            None => println!("{text}"),
+        }
+        eprintln!(
+            "measure: S1 {:.2}x  S2 {:.2}x  T1 {:.0} ms  M1 {} kB  U1 {}/{} B",
+            report["s1_ratio"].as_f64().unwrap_or(0.0),
+            report["s2_write_ratio"].as_f64().unwrap_or(0.0),
+            build_ms,
+            report["m1_peak_rss_delta_kb"],
+            one_wchar,
+            sixty_wchar
+        );
+        Ok(())
     }
 }

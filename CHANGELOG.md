@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- Internal: `scripts/measure-projection.mjs` runs `graph_scale_bench --root <graph>` on a real corpus and reports the compact-projection budget rows (S1 file/Markdown, S2 build write amplification, T1 build time, M1 peak RSS, U1 bytes per single-block edit, T2 Ctrl+K p95, T3 `{{query}}` p95) against `scripts/projection-budget-policy.json`; `src/projectionBudget.test.ts` runs it only when `TINE_PROJECTION_CORPUS` names a corpus. Anon baseline recorded 2026-09-19 (compact-projection P0a).
 - Internal: every SQL statement tine-core sends to the search/query projection
   now passes through one door (`query/projection_sql.rs`), a blessed statement
   census exercises every shape against the pinned projection schema, and the
