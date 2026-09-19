@@ -267,6 +267,38 @@ fn attribute_end(source: &str, start: usize) -> usize {
     source.len()
 }
 
+/// Byte offset just past the item that a `#[cfg(test)]` attribute ending at
+/// `after` gates. Angle brackets are tracked so a comma inside generics does
+/// not end a field early; `->` and comparisons saturate at depth zero.
+fn gated_item_end(source: &str, after: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 0_usize;
+    let mut cursor = after;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'(' | b'[' | b'<' => depth += 1,
+            b')' | b']' | b'>' => depth = depth.saturating_sub(1),
+            b';' | b',' if depth == 0 => return cursor + 1,
+            b'{' => {
+                let mut body = 1_usize;
+                cursor += 1;
+                while cursor < bytes.len() && body > 0 {
+                    match bytes[cursor] {
+                        b'{' => body += 1,
+                        b'}' => body -= 1,
+                        _ => {}
+                    }
+                    cursor += 1;
+                }
+                return cursor;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    source.len()
+}
+
 pub fn erase_cfg_test_regions(mut source: String) -> String {
     // `#[cfg(test)]` and `#[cfg(all(test, ..))]` are both compiled ONLY under
     // `cfg(test)`; `#[cfg(any(test, ..))]` and `#[cfg(not(test))]` are not, and
@@ -279,27 +311,15 @@ pub fn erase_cfg_test_regions(mut source: String) -> String {
     while let Some(found) = marker.find(&source[search_from..]) {
         let start = search_from + found.start();
         let after = attribute_end(&source, start);
-        let next_brace = source[after..].find('{').map(|offset| after + offset);
-        let next_semicolon = source[after..].find(';').map(|offset| after + offset);
-        let end = match (next_brace, next_semicolon) {
-            (Some(brace), Some(semicolon)) if semicolon < brace => semicolon + 1,
-            (None, Some(semicolon)) => semicolon + 1,
-            (Some(brace), _) => {
-                let bytes = source.as_bytes();
-                let mut depth = 1_usize;
-                let mut cursor = brace + 1;
-                while cursor < bytes.len() && depth > 0 {
-                    match bytes[cursor] {
-                        b'{' => depth += 1,
-                        b'}' => depth -= 1,
-                        _ => {}
-                    }
-                    cursor += 1;
-                }
-                cursor
-            }
-            (None, None) => source.len(),
-        };
+        // The gated item ends at the first `;` or `,` outside every bracket
+        // (a statement, a `use`, a struct field, a struct-literal field or a
+        // match arm), or at the matching `}` of its body. A field attribute
+        // has neither `;` nor `{` of its own: stopping at the comma is what
+        // keeps the NEXT item -- typically the `impl` block right after a
+        // struct -- in production source. Before this, one `#[cfg(test)]`
+        // field on `DirectQueryJob` erased the whole `impl DirectQueryJob`
+        // from every census built on this walker.
+        let end = gated_item_end(&source, after);
         let replacement = source.as_bytes()[start..end]
             .iter()
             .map(|byte| if *byte == b'\n' { b'\n' } else { b' ' })

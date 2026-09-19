@@ -367,8 +367,7 @@ fn read_root_page_paths(
             .collect::<Vec<_>>();
         #[cfg(test)]
         note(|census| census.page_statements += 1);
-        let rows = snapshot
-            .run_projection_query(&sql, &params)
+        let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         for row in &rows {
             let decoded = (|| {
@@ -426,8 +425,7 @@ fn read_root_preorders(
             .collect::<Vec<_>>();
         #[cfg(test)]
         note(|census| census.root_statements += 1);
-        let rows = snapshot
-            .run_projection_query(&sql, &params)
+        let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         let owned: HashMap<[u8; 16], [u8; 16]> = batch.iter().copied().collect();
         for row in &rows {
@@ -534,8 +532,7 @@ fn read_subtree_topology(
         ];
         #[cfg(test)]
         note(|census| census.topology_statements += 1);
-        let rows = snapshot
-            .run_projection_query(sql, &params)
+        let rows = crate::query::projection_sql::run(snapshot, sql, &params)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         let complete = rows.len() == TOPOLOGY_BATCH;
         #[cfg(test)]
@@ -646,8 +643,7 @@ fn verify_subtree_completeness(
             census.completeness_statements += 1;
             census.completeness_parents += batch.len();
         });
-        let rows = snapshot
-            .run_projection_query(&sql, &params)
+        let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         for row in rows {
             let parent =
@@ -694,15 +690,15 @@ fn verify_boundary_parent(
     }
     #[cfg(test)]
     note(|census| census.boundary_statements += 1);
-    let rows = snapshot
-        .run_projection_query(
-            "SELECT preorder FROM query_block_results WHERE block_id = ?1 AND page_id = ?2",
-            &[
-                PhysicalQueryValue::Blob(parent.to_vec()),
-                PhysicalQueryValue::Blob(page_id.to_vec()),
-            ],
-        )
-        .map_err(|error| sql_or_cancelled(snapshot, error))?;
+    let rows = crate::query::projection_sql::run(
+        snapshot,
+        "SELECT preorder FROM query_block_results WHERE block_id = ?1 AND page_id = ?2",
+        &[
+            PhysicalQueryValue::Blob(parent.to_vec()),
+            PhysicalQueryValue::Blob(page_id.to_vec()),
+        ],
+    )
+    .map_err(|error| sql_or_cancelled(snapshot, error))?;
     let Some(row) = rows.first() else {
         return Err(ResultReadError::Corrupt(
             "a block's parent is not a block of its own page".to_string(),

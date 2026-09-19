@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: every SQL statement tine-core sends to the search/query projection
+  now passes through one door (`query/projection_sql.rs`), a blessed statement
+  census exercises every shape against the pinned projection schema, and the
+  storage contract lists the projection's tables as its schema of record
+  (compact-projection campaign P0; no user-visible change).
+
 ### Added
 
 - Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's

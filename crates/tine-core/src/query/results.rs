@@ -215,7 +215,7 @@ pub(crate) const FTS_READY_PROBE_SQL: &str =
 pub(crate) fn probe_fts_ready(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
 ) -> Result<bool, ResultReadError> {
-    match snapshot.run_projection_query(FTS_READY_PROBE_SQL, &[]) {
+    match crate::query::projection_sql::run(snapshot, FTS_READY_PROBE_SQL, &[]) {
         Ok(rows) => Ok(matches!(
             rows.first().and_then(|row| row.first()),
             Some(PhysicalQueryValue::Integer(1))
@@ -435,8 +435,11 @@ pub(crate) fn read_page_results(
     let mut damage: Option<String> = None;
     let mut failure = None;
     let mut ordinal = 0usize;
-    let visit =
-        snapshot.visit_projection_query(&statement.query.sql, &statement.query.params, |row| {
+    let visit = crate::query::projection_sql::visit(
+        snapshot,
+        &statement.query.sql,
+        &statement.query.params,
+        |row| {
             if cancellation.is_cancelled() {
                 failure = Some(ResultReadError::Cancelled);
                 return Ok(std::ops::ControlFlow::Break(()));
@@ -500,7 +503,8 @@ pub(crate) fn read_page_results(
                 return Ok(std::ops::ControlFlow::Break(()));
             }
             Ok(std::ops::ControlFlow::Continue(()))
-        });
+        },
+    );
     if let Err(error) = visit {
         return Err(sql_or_cancelled(snapshot, error));
     }
@@ -627,8 +631,7 @@ pub(crate) fn hydrate_page_rows(
         );
         #[cfg(test)]
         note(|census| census.page_payload_statements += 1);
-        let rows = snapshot
-            .run_projection_query(&sql, &ids)
+        let rows = crate::query::projection_sql::run(snapshot, &sql, &ids)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         let admitted = batch.iter().map(|row| row.page_id).collect::<HashSet<_>>();
         let mut properties: HashMap<[u8; 16], Vec<(usize, String, String)>> = HashMap::new();
@@ -924,53 +927,54 @@ fn read_descriptors<C: ResultCarrier>(
     let mut failure = None;
     let mut ordinal = 0usize;
     let cancellation = snapshot.cancellation();
-    let visit = snapshot.visit_projection_query(&statement.sql, &statement.params, |row| {
-        if cancellation.is_cancelled() {
-            failure = Some(ResultReadError::Cancelled);
-            return Ok(std::ops::ControlFlow::Break(()));
-        }
-        #[cfg(test)]
-        note(|census| census.descriptor_rows += 1);
-        if let Some((view, _)) = ordered {
-            match count(row, 14, "complete block count") {
-                Ok(total) => *matched_total = Some(total),
+    let visit =
+        crate::query::projection_sql::visit(snapshot, &statement.sql, &statement.params, |row| {
+            if cancellation.is_cancelled() {
+                failure = Some(ResultReadError::Cancelled);
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            #[cfg(test)]
+            note(|census| census.descriptor_rows += 1);
+            if let Some((view, _)) = ordered {
+                match count(row, 14, "complete block count") {
+                    Ok(total) => *matched_total = Some(total),
+                    Err(what) => {
+                        damage = Some(what);
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                }
+                if view.sample.is_some_and(|sample| ordinal >= sample as usize) {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            ordinal += 1;
+            let descriptor = if ordered.is_some() {
+                row.get(..14).unwrap_or(row)
+            } else {
+                row
+            };
+            let (page, decoded) = match decode_descriptor(descriptor, inputs) {
+                Ok(decoded) => decoded,
                 Err(what) => {
                     damage = Some(what);
                     return Ok(std::ops::ControlFlow::Break(()));
                 }
+            };
+            if let Some(fold) = statistics {
+                if let Err(error) = fold_statistics_row(fold, row, 15) {
+                    failure = Some(error);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
             }
-            if view.sample.is_some_and(|sample| ordinal >= sample as usize) {
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        }
-        ordinal += 1;
-        let descriptor = if ordered.is_some() {
-            row.get(..14).unwrap_or(row)
-        } else {
-            row
-        };
-        let (page, decoded) = match decode_descriptor(descriptor, inputs) {
-            Ok(decoded) => decoded,
-            Err(what) => {
-                damage = Some(what);
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        };
-        if let Some(fold) = statistics {
-            if let Err(error) = fold_statistics_row(fold, row, 15) {
-                failure = Some(error);
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        }
-        Ok(admit_decoded(
-            &page,
-            decoded,
-            inputs,
-            pages,
-            budget,
-            &mut admitted,
-        ))
-    });
+            Ok(admit_decoded(
+                &page,
+                decoded,
+                inputs,
+                pages,
+                budget,
+                &mut admitted,
+            ))
+        });
     if let Err(error) = visit {
         return Err(sql_or_cancelled(snapshot, error));
     }
@@ -1376,8 +1380,7 @@ fn read_block_facets(
     note(|census| *payload_statements(census, channel) += 1);
     #[cfg(not(test))]
     let _ = channel;
-    let rows = snapshot
-        .run_projection_query(&sql, ids)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     let mut facets = HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -1452,8 +1455,7 @@ fn read_owner_strings<T>(
     note(|census| *payload_statements(census, channel) += 1);
     #[cfg(not(test))]
     let _ = (list, channel);
-    let rows = snapshot
-        .run_projection_query(&sql, ids)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     let mut owners: HashMap<[u8; 16], Vec<T>> = HashMap::new();
     for row in &rows {

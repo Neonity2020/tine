@@ -535,7 +535,7 @@ fn visit(
 ) -> Result<(), QueryExecutionError> {
     #[cfg(test)]
     STATEMENTS.with(|count| count.set(count.get() + 1));
-    let outcome = snapshot.visit_projection_query(sql, parameters, |values| {
+    let outcome = crate::query::projection_sql::visit(snapshot, sql, parameters, |values| {
         row(values)
             .map(|()| ControlFlow::Continue(()))
             .map_err(MaterializationError::Corrupt)

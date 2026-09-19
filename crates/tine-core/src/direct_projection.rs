@@ -697,7 +697,8 @@ impl DirectQueryJob {
         let mut at = 0;
         let mut matches = true;
         let mut malformed = false;
-        let read = self.snapshot.visit_projection_query(
+        let read = crate::query::projection_sql::visit(
+            &mut self.snapshot,
             "SELECT p.page_id, s.revision FROM pages p \
              LEFT JOIN direct_source_revisions s ON s.page_id = p.page_id \
              ORDER BY p.page_id",

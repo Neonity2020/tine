@@ -90,6 +90,36 @@ writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transa
 transaction commits are not authority or individual durability barriers, because
 the file is a disposable cache (§3 invariant 3).
 
+**Tables of the projection (schema 29).** This list is the schema of record:
+`crates/tine-core/tests/contract_docs.rs` asserts it equals `sqlite_master`
+of a freshly initialized projection, so a table cannot appear or disappear
+without this contract saying so. FTS5 shadow tables are listed with their
+virtual table.
+
+- `pages` — page identity and routing (`page_id`, name, path, `text_kind`, `journal_day`).
+- `page_text` — page preamble and search text, keyed by `page_id`.
+- `blocks` — block structure, metadata and the folded query text (`query_visible_folded`).
+- `block_text` — a block's source content, query-visible text and search text.
+- `block_planning` — `[#A]`, `SCHEDULED:` and `DEADLINE:` facets, never conditioned on a task marker.
+- `tasks` — the task marker of every block that has one.
+- `properties` — property rows per owner (page or block), by ordinal.
+- `property_atoms` — each property element flattened, de-duplicated by `atom_key`.
+- `tags` — tag rows per owner, keyed by `refs::page_key(tag)`.
+- `block_own_refs` — a block's own normalized reference names.
+- `block_path_refs` — a block's reference closure: own refs, every ancestor's, and the page's name.
+- `reference_postings` — normalized-name postings that back navigation names and referrers.
+- `reference_alias_declarations` — `alias::` declarations per source page.
+- `query_block_results` — public result identity, tree preorder, construction estimate and tag/property counts per block.
+- `query_page_results` — construction estimate and property count per page.
+- `query_page_order` — Direct session page positions for cross-page result order.
+- `query_projection_state` — the image revision a query snapshot validates (`query_revision`).
+- `direct_source_revisions` — the source revision each page's rows were lowered from, plus the query-metadata schema marker.
+- `search_fts`, `search_fts_config`, `search_fts_content`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the token FTS5 table and its shadow tables.
+- `search_substring_fts`, `search_substring_fts_config`, `search_substring_fts_content`, `search_substring_fts_data`, `search_substring_fts_docsize`, `search_substring_fts_idx` — the trigram FTS5 table and its shadow tables.
+- `search_fts_owners` — FTS rowid to owner (page or block) map.
+- `search_fts_build` — the FTS build phase singleton (`phase` is 1 in every Direct file).
+- `block_home_claims`, `logseq_uuid_introductions`, `page_name_identity_records`, `page_portable_path_claims`, `portable_path_identity_records`, `reference_alias_bindings`, `search_fts_outbox`, `refs` — Managed Storage residue: created by the shared DDL, never written in Direct, always empty. Their removal is packet P2 of the compact-projection campaign (`tine-agents/specs/campaigns/2026-09-compact-projection/SPEC.md`).
+
 **Path refs and property atoms are one producer, not two.** `block_path_refs`
 holds each block's reference closure — its own normalized refs, every
 ancestor's, and the page's own normalized name — and `property_atoms` holds each

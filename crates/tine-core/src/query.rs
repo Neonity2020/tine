@@ -42,6 +42,7 @@ pub(crate) mod sort;
 // guard shares recognises a `*_tests.rs` file included by a SIBLING under
 // `#[cfg(test)]`, and only then does it stop counting the gates' `eprintln!`
 // receipts as production print sites (I-5).
+pub(crate) mod projection_sql;
 pub(crate) mod rank;
 pub(crate) mod read_execute;
 pub(crate) mod results;

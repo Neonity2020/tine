@@ -672,8 +672,7 @@ fn read_pages(
          FROM candidates c{payload_join} ORDER BY {order}{limit}",
         ctes.join(", ")
     );
-    let rows = snapshot
-        .run_projection_query(&sql, &params)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     #[cfg(test)]
     note_friendly(|census| census.page_descriptors += rows.len());
@@ -950,8 +949,7 @@ fn candidate_count_within_cap(
         PhysicalQueryValue::Text(literal.to_owned()),
         PhysicalQueryValue::Integer(BLOCK_CANDIDATE_CAP as i64 + 1),
     ];
-    let rows = snapshot
-        .run_projection_query(&sql, &params)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     Ok(match rows.first().and_then(|row| row.first()) {
         Some(PhysicalQueryValue::Integer(count)) => {
@@ -1098,8 +1096,7 @@ fn read_blocks(
          FROM ranked r WHERE r.missing_text = 1 OR r.rank_key IS NOT NULL \
          ORDER BY r.missing_text DESC, {order}{limit}"
     );
-    let rows = snapshot
-        .run_projection_query(&sql, &params)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     #[cfg(test)]
     note_friendly(|census| census.block_descriptors += rows.len());
@@ -1299,8 +1296,7 @@ fn read_breadcrumbs(
                  WHERE b.block_id IN ({})",
                 crate::query::results::placeholders(params.len())
             );
-            let rows = snapshot
-                .run_projection_query(&sql, &params)
+            let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
                 .map_err(|error| sql_or_cancelled(snapshot, error))?;
             #[cfg(test)]
             note_friendly(|census| {
