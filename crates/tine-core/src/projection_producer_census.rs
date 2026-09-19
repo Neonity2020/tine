@@ -1487,9 +1487,16 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // `validate_schema` each gain one call site in direct_projection.rs. No
     // write crossing moved (the rows asserted above are unchanged) and no new
     // storage API entered the surface.
+    // 2026-09-19: compact-projection P0b routed every projection SQL statement
+    // through `query/projection_sql.rs`, which imports
+    // `PhysicalProjectionQuerySnapshot`, `PhysicalQueryValue` and
+    // `MaterializationError` from tine-storage: one new import row for the
+    // door file. The 17 call sites keep their snapshot imports and call the
+    // door instead of the storage methods (method calls are not inventory
+    // rows), so no other row moved and no write crossing changed.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "d53d0f1b592fae8bb5a7397c814c3d562dd7b79f843092f2bf2f82b896b87dc1",
+        "a5a486d6bb83e5f7f3dcfaed306afccd3a21b7ffccc2f54b5dc690ccfcc53fb4",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
