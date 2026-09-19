@@ -2,6 +2,128 @@
   "schemaVersion": 1,
   "spec": "tine-agents/specs/campaigns/2026-09-compact-projection/SPEC.md §3",
   "noiseBandFraction": 0.1,
+  "searchScaling": {
+    "schema": "tine.search_scaling_budget.v1",
+    "description": "Section 7 current-production-backend paired search scaling. Ratios are 600k / 60k combined-search p95; diagnostic exceptions have no ceiling.",
+    "corpora": {
+      "small": "dense60k",
+      "large": "dense600k",
+      "pages": "brikas",
+      "sentinel": "page-sentinel"
+    },
+    "rows": {
+      "T2-nohit": {
+        "sourceLabel": "nohit_indexable_zqx1",
+        "surface": "combined",
+        "ratioCeiling": null,
+        "exception": "indexable zero-hit postings are read to exhaustion"
+      },
+      "T2-broad": {
+        "sourceLabel": "broad_2char_synthetic",
+        "surface": "combined",
+        "ratioCeiling": 1.5
+      },
+      "T2-sparse": {
+        "sourceLabel": "T2-sparse",
+        "surface": "combined",
+        "ratioCeiling": 1.5
+      },
+      "T2-fp": {
+        "sourceLabel": "T2-fp",
+        "surface": "combined",
+        "ratioCeiling": null,
+        "exception": "high false-positive amplification consumes candidates beyond verified matches"
+      },
+      "T2-pages": {
+        "sourceLabel": "nohit_indexable_zqx1",
+        "surface": "quick_switch_100",
+        "ratioCeiling": null,
+        "exception": "page-name fuzzy search scans the page-name owner-row inventory"
+      }
+    },
+    "baseline": {
+      "recorded": "2026-09-19",
+      "source_identity": {
+        "public_base_sha": "47148fe81f4175c93645acea03ae95c629f58857",
+        "production_source_hash": {
+          "kind": "git_tree_oid",
+          "value": "d3c5b5c6e33124854e7dd36f1e4064d9f8bce36e"
+        },
+        "production_source_scope": "crates/tine-core/src at repository_head",
+        "probe_source_sha256_by_role": {
+          "small": "8902a4e031c227fb9d44882c661a95002743aeb59c9e259bc1caf0e468c34c51",
+          "large": "8902a4e031c227fb9d44882c661a95002743aeb59c9e259bc1caf0e468c34c51",
+          "pages": "541f407ff485de616890455cccfa625f845c87f60f0cd1edd81e7ba7dc2c460b",
+          "sentinel": "541f407ff485de616890455cccfa625f845c87f60f0cd1edd81e7ba7dc2c460b"
+        }
+      },
+      "counts": {
+        "small": {
+          "original_pages": 1000,
+          "original_blocks": 60000,
+          "navigation_owner_rows": 1010
+        },
+        "large": {
+          "original_pages": 10000,
+          "original_blocks": 600000,
+          "navigation_owner_rows": 10010
+        },
+        "pages": {
+          "original_pages": 1046,
+          "original_blocks": 55481,
+          "navigation_owner_rows": 5965
+        }
+      },
+      "queries": {
+        "T2-nohit": "zqx1",
+        "T2-broad": "你好",
+        "T2-sparse": "s7sparseanchor543",
+        "T2-fp": "\"page 11 block 11\"",
+        "T2-pages": "zqx1"
+      },
+      "limits": {
+        "block_only": {
+          "block": 100,
+          "page": 0
+        },
+        "combined": {
+          "block": 100,
+          "page": 100
+        },
+        "page_only": {
+          "block": 0,
+          "page": 100
+        },
+        "quick_switch": 100
+      },
+      "augmentation_sha256": "21d10fca6c7e04a9aea597fd2f3f199eab315ed30cf08df5aae433d48f683cd5",
+      "rows": {
+        "T2-nohit": {
+          "small_p95_ms": 59.216391,
+          "large_p95_ms": 722.753598,
+          "ratio": 12.205296300478697
+        },
+        "T2-broad": {
+          "small_p95_ms": 220.072961,
+          "large_p95_ms": 3652.470477,
+          "ratio": 16.596634408894968
+        },
+        "T2-sparse": {
+          "small_p95_ms": 61.435168,
+          "large_p95_ms": 707.693378,
+          "ratio": 11.519352856656957
+        },
+        "T2-fp": {
+          "small_p95_ms": 210.40261,
+          "large_p95_ms": 3467.596823,
+          "ratio": 16.480769050345906
+        },
+        "T2-pages": {
+          "page_p95_ms": 5.046887
+        }
+      }
+    }
+  },
   "corpora": {
     "anon": {
       "description": "Martin's anonymized graph (~/research/logseq-anonymized); opt in with TINE_PROJECTION_CORPUS.",

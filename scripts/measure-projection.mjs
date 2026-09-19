@@ -6,6 +6,8 @@
 //   TINE_PROJECTION_CORPUS=~/research/logseq-anonymized node scripts/measure-projection.mjs
 //   node scripts/measure-projection.mjs --root <graph> --corpus brikas
 //   node scripts/measure-projection.mjs --record-baseline   # today's numbers become the policy baseline
+//   node scripts/measure-projection.mjs --paired-search <wrapper.json>
+//   node scripts/measure-projection.mjs --paired-search <wrapper.json> --record-baseline
 //
 // Linux-only (the harness reads /proc/self/io and /proc/self/status). Exit code 1
 // on a breached ceiling. Never run it on Martin's live graph: the harness copies
@@ -15,7 +17,14 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { baselineFrom, evaluateBudget, formatRows } from "./lib/projection-budget.mjs";
+import {
+  baselineFrom,
+  baselineFromSearchScaling,
+  evaluateBudget,
+  evaluateSearchScaling,
+  formatRows,
+  formatSearchScalingRows,
+} from "./lib/projection-budget.mjs";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -23,6 +32,33 @@ const flag = (name) => {
   const at = args.indexOf(name);
   return at >= 0 ? args[at + 1] : undefined;
 };
+const pairedSearch = flag("--paired-search");
+if (args.includes("--paired-search") && !pairedSearch) {
+  console.error("measure-projection: --paired-search needs a JSON path");
+  process.exit(2);
+}
+const policyPath = path.join(repo, "scripts/projection-budget-policy.json");
+const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+
+if (pairedSearch) {
+  const reportPath = path.resolve(pairedSearch);
+  const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+  if (args.includes("--record-baseline")) {
+    policy.searchScaling.baseline = baselineFromSearchScaling(report, policy);
+    fs.writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
+    console.log(`recorded today's paired search-scaling baseline into ${path.relative(repo, policyPath)}`);
+  }
+  const { rows, breaches } = evaluateSearchScaling(report, policy);
+  console.log(`projection search-scaling budget, report=${path.relative(repo, reportPath)}`);
+  console.log(formatSearchScalingRows(rows));
+  if (breaches.length) {
+    console.error(`projection search-scaling budget: ${breaches.length} ceiling(s) breached: ${breaches.map((row) => row.id).join(", ")}`);
+    process.exit(1);
+  }
+  console.log("projection search-scaling budget OK (diagnostic rows remain unjudged)");
+  process.exit(0);
+}
+
 const root = flag("--root") ?? process.env.TINE_PROJECTION_CORPUS;
 if (!root) {
   console.error("measure-projection: pass --root <graph> or set TINE_PROJECTION_CORPUS");
@@ -30,8 +66,6 @@ if (!root) {
 }
 const corpus = flag("--corpus") ?? "anon";
 const out = path.resolve(flag("--out") ?? path.join(repo, "projection-budget.json"));
-const policyPath = path.join(repo, "scripts/projection-budget-policy.json");
-const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
 
 if (!args.includes("--reuse")) {
   execFileSync(
