@@ -1188,6 +1188,7 @@ impl Graph {
             Err(error) => {
                 let _ = graph_text_write_during_rollback_hook();
                 let _ = self.graph_text_move_noreplace(&write, &staged, &conf);
+                self.reconcile_failed_graph_text_paths(&write, [conf.as_path(), win.as_path()]);
                 return Err(error);
             }
         };

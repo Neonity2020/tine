@@ -4405,6 +4405,34 @@
  "notes": "Blocking core operation, all platforms: from v0.6.983 search answers from the SQLite projection rather than an in-memory walk, and a mutation that changed what the graph contains without publishing a producer left the index with a committed image nothing was converging. Partial admission then made the answer SUCCEED, and a successful answer never reaches the repair a refusal would start, so it never corrected itself: a rename kept offering the old name, a merge returned both pages with one of them in the trash, a rescued file was never findable, a trashed or filename-migrated journal answered twice, a path-pinned save and an externally delivered edit to a duplicate-day file reached the index never, and a migrated PDF highlight page answered from the trash. Fix: every mutation publishes through one front door - cache_upsert for a file this process rewrote, cache_remove_path for a file that left, direct_projection_publish_page_set for a multi-page set under one queue lock - the parsed whole-graph cache is treated as the authoritative producer it is (so a repair cannot republish a page a mutation removed), the journal filename migration holds the identity gate across its parse and publication, and a merge rollback compensates only when the restore actually put the file back. Class guard: a_moved_file_is_never_retired_by_a_lookup_that_can_come_back_empty fails on a retirement by name that hands over no entry. Seventh audit: `graph_text_move_noreplace` renames BEFORE its fallible durability and identity work, so an Err from it does not mean the file stayed put - the merge rollback now publishes whatever the source path actually holds afterwards, and the journal migration asks the filesystem whether each move landed, publishes the moves that did happen on every exit, and no longer reports Ok(0) for a file it moved. An unchanged redelivery of a duplicate-day file publishes nothing, matching the suppression the ordinary file path has always had."
 },
 {
+ "id": "REG-QUERY-PROJECTION-FAILED-MUTATION-PUBLISHES-543",
+ "title": "An operation that fails AFTER its file move already committed still leaves search describing the files that are actually on disk",
+ "family": "query-readiness",
+ "sources": {
+  "issues": [543],
+  "commits": [],
+  "internal": ""
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::a_merge_whose_durability_fails_after_the_move_stops_serving_the_source",
+   "crates/tine-core/src/direct_projection_tests.rs::a_rescue_whose_durability_fails_after_the_move_answers_at_the_new_name",
+   "crates/tine-core/src/direct_projection_tests.rs::a_delete_whose_durability_fails_after_the_move_stops_serving_the_page",
+   "crates/tine-core/src/direct_projection_tests.rs::a_journal_trash_whose_durability_fails_after_the_move_stops_serving_the_file",
+   "crates/tine-core/src/model_tests.rs::a_failed_rename_publishes_the_destination_that_survived_it",
+   "crates/tine-core/src/model_tests.rs::a_failed_duplicate_resolution_publishes_the_occupant_it_could_not_remove"
+  ],
+  "scenario": "query.failed-mutation-convergence",
+  "failBefore": "tine-agents/evidence/gh543-convergence/round8/necessity.log (each fix disabled in turn on the round-7 head 93dd3c14: the four move regressions fail on \"retired source still searchable\" / \"search must describe the live paths\", the rename regression expects [\"Beta\"] and observes [], the conflict regression finds no producer for the surviving occupant; all six pass with the fixes restored)"
+ },
+ "notes": "Blocking core operation, and the error-path half of REG-QUERY-PROJECTION-MUTATION-PUBLISHES-543. graph_text_move_noreplace performs the no-clobber rename FIRST and only then makes the chain durable and finishes identity, so an Err from it means the file HAS moved and a later step failed. Every caller that exited on that error skipped its ordinary publication: merge staging, file rescue, page deletion and journal trash each left the vanished source answering searches (rescue additionally kept returning the retired page name instead of the live one); a rename whose compensation preserved an external replacement at the destination left those real, readable bytes unindexed; and a failed duplicate-day resolution kept describing the stray text it could no longer remove. In each case the projection reported itself idle, ready and validated at generation 0 with nothing queued, so nothing was ever going to correct it - a successful search served from an image with no convergence work, which is the other half of GH #543's indexing-forever. Fix: the shared move primitive reconciles the actual eligible source and destination paths when its own post-rename work fails - readable bytes through parse_exact_page/cache_upsert, confirmed absence through cache_remove_path - and still returns the original error; rename_page and resolve_duplicate_journal_day reconcile their final edit paths after failed compensation. graph_text_move_to_trash needed no separate fix because it delegates to the same primitive. The second rename site, graph_text_move_editor_recovery_noreplace, has the same partial-commit shape but runs only inside recover_interrupted_editor_publications at graph open, before any index exists, so it cannot strand a stale image; it is deliberately not covered here."
+},
+{
  "id": "REG-FRIENDLY-BLOCK-CANDIDATE-BOUND-001",
  "title": "Searching a large graph reads only the blocks that can match the typed needle, instead of every block in the graph for every keystroke",
  "family": "waited-path-query-cost",

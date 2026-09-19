@@ -7640,6 +7640,96 @@ fn settle_hits(graph: &Graph, token: &str, want: usize) -> bool {
     false
 }
 
+fn a_move_whose_durability_fails_after_the_rename_still_converges(operation: &str) {
+    let _serial = serialize_projection_tests();
+    let root = duplicate_day_projection_graph(&format!("move-durability-{operation}"), "quokka");
+    std::fs::write(root.join("pages/source.md"), "- numbat source\n").unwrap();
+    std::fs::write(root.join("pages/destination.md"), "- destination body\n").unwrap();
+    let graph = attached_graph(&root);
+    graph.with_pages(|_| ());
+    wait_ready(&graph);
+    crate::model::fail_graph_text_directory_sync_after_mutation();
+    let outcome = match operation {
+        "merge" => graph.merge_pages("pages/source.md", "pages/destination.md"),
+        "rescue" => graph.rename_file_to_page("pages/source.md", "rescued"),
+        "delete" => graph.delete_page("source", PageKind::Page),
+        "journal-trash" => graph.trash_journal_file("Friday, 26-06-2026.md"),
+        _ => unreachable!(),
+    };
+    assert!(outcome.is_err(), "durability failure must reach the caller");
+    let retired = if operation == "journal-trash" {
+        "journals/Friday, 26-06-2026.md"
+    } else {
+        "pages/source.md"
+    };
+    assert!(
+        !root.join(retired).exists(),
+        "the rename must have landed: {outcome:?}"
+    );
+    let token = if operation == "journal-trash" {
+        "quokka"
+    } else {
+        "numbat"
+    };
+    if operation == "rescue" {
+        assert!(root.join("pages/rescued.md").is_file());
+        for _ in 0..600 {
+            if graph
+                .search(token, 20)
+                .unwrap()
+                .iter()
+                .any(|g| g.page == "rescued")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        assert!(
+            settle_hits(&graph, token, 0),
+            "{operation}: retired source still searchable: {}",
+            graph.direct_projection_test().unwrap().debug_state_test()
+        );
+    }
+    wait_ready(&graph);
+    for _ in 0..5 {
+        let groups = graph.search(token, 20).unwrap();
+        let names: Vec<_> = groups.iter().map(|g| g.page.as_str()).collect();
+        assert_eq!(
+            names,
+            if operation == "rescue" {
+                vec!["rescued"]
+            } else {
+                vec![]
+            },
+            "{operation}: search must describe the live paths"
+        );
+    }
+    graph.with_pages(|pages| {
+        assert!(
+            !pages.iter().any(|(entry, _)| entry.rel_path == retired),
+            "parsed cache must not resurrect the retired source"
+        )
+    });
+}
+
+#[test]
+fn a_merge_whose_durability_fails_after_the_move_stops_serving_the_source() {
+    a_move_whose_durability_fails_after_the_rename_still_converges("merge");
+}
+#[test]
+fn a_rescue_whose_durability_fails_after_the_move_answers_at_the_new_name() {
+    a_move_whose_durability_fails_after_the_rename_still_converges("rescue");
+}
+#[test]
+fn a_delete_whose_durability_fails_after_the_move_stops_serving_the_page() {
+    a_move_whose_durability_fails_after_the_rename_still_converges("delete");
+}
+#[test]
+fn a_journal_trash_whose_durability_fails_after_the_move_stops_serving_the_file() {
+    a_move_whose_durability_fails_after_the_rename_still_converges("journal-trash");
+}
+
 /// Folding a duplicate day's stray into the canonical file moves the stray to
 /// the trash. Nothing retired its rows, so the token the merge had just folded
 /// in was served TWICE — once from the live canonical file and once from a file

@@ -71,6 +71,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   the same lock every other whole-page operation takes, so a save made while it
   runs cannot be overwritten in search by the text that file had beforehand
   (GH #543).
+- An operation that fails part-way now leaves search describing the files that
+  are really there. Moving a file into place succeeds before the step that makes
+  the move durable, so when that step failed the file had already moved — and
+  every operation built on it gave up without telling the index: a failed merge,
+  rescue, page delete or journal trash left the vanished file still answering
+  searches, and a rescued page kept answering under the name it had left. A
+  rename that could not finish, but whose destination had meanwhile been written
+  by something else, left those real bytes unfindable; a duplicate-day
+  reconciliation that could not put its file back went on describing text that
+  was no longer there. The move itself now reconciles both paths with what is
+  actually on disk before returning its error (GH #543).
 
 - Search can no longer stop indexing when two parts of the app read the graph
   at the same time. The index kept one slot for "the answer to the check that

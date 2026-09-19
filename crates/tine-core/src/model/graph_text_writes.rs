@@ -4,6 +4,36 @@
 use super::*;
 
 impl Graph {
+    /// Reconcile readable final owners after a mutation or its compensation
+    /// failed. The caller retains its identity mutation permit throughout.
+    pub(super) fn reconcile_failed_graph_text_paths<'a>(
+        &self,
+        permit: &GraphTextWritePermit,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            if !seen.insert(path) {
+                continue;
+            }
+            let Some(entry) = self.entry_for_path(path) else {
+                continue;
+            };
+            self.recent_writes.lock().unwrap().remove(path);
+            match self.graph_text_read_optional_text(permit, path) {
+                Ok(Some(content)) => {
+                    if let Ok((entry, document, revision)) =
+                        parse_exact_page(self, &entry, &content)
+                    {
+                        self.cache_upsert(entry, document, revision);
+                    }
+                }
+                Ok(None) => self.cache_remove_path(&entry),
+                Err(_) => {}
+            }
+        }
+    }
+
     fn validate_direct_creation_proof_before_mutation(
         &self,
         permit: &GraphTextWritePermit,
@@ -689,12 +719,24 @@ impl Graph {
             destination.parent(),
             &destination.filename,
         )?;
-        sync_projection_chain_required(&source.chain)?;
-        sync_projection_chain_required(&destination.chain)?;
-        self.finish_tine_owned_graph_text_identity_paths([
-            source_path.as_path(),
-            destination_path.as_path(),
-        ])
+        let result = (|| {
+            sync_projection_chain_required(&source.chain)?;
+            sync_projection_chain_required(&destination.chain)?;
+            self.finish_tine_owned_graph_text_identity_paths([
+                source_path.as_path(),
+                destination_path.as_path(),
+            ])
+        })();
+        // The rename has already committed. Preserve its durability/identity
+        // error, but publish the filesystem state even when the caller exits
+        // before its ordinary successful-mutation publication.
+        if result.is_err() {
+            self.reconcile_failed_graph_text_paths(
+                permit,
+                [source_path.as_path(), destination_path.as_path()],
+            );
+        }
+        result
     }
 
     pub(super) fn graph_text_move_to_trash(

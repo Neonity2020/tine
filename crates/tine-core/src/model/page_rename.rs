@@ -574,6 +574,12 @@ impl Graph {
                 }
             }
             self.invalidate_cache_after_tine_mutation();
+            self.reconcile_failed_graph_text_paths(
+                &write,
+                edits
+                    .iter()
+                    .flat_map(|edit| [edit.src.as_path(), edit.dst.as_path()]),
+            );
             return Err(err);
         }
         // The rename transaction already retains every changed document's final

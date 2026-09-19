@@ -3583,6 +3583,139 @@ fn rename_rolls_back_destination_when_source_remove_fails() {
 }
 
 #[test]
+fn a_failed_rename_publishes_the_destination_that_survived_it() {
+    let dir = scratch("failed-rename-compensation");
+    fs::write(dir.join("pages/Alpha.md"), "- numbat original\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    graph.with_pages(|_| ());
+    let projection = graph.direct_projection_test().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(
+        projection.wait_until_ready_at(graph.cache_generation(), &|| Instant::now() >= deadline)
+    );
+    FAIL_NEXT_RENAME_SOURCE_REMOVE.with(|flag| flag.set(true));
+    WITHDRAW_RACE_REPLACEMENT.with(|replacement| {
+        *replacement.borrow_mut() = Some(b"- quokka occupant\n".to_vec());
+    });
+    assert!(graph.rename_page("Alpha", "Beta").is_err());
+    assert_eq!(
+        fs::read_to_string(dir.join("pages/Beta.md")).unwrap(),
+        "- quokka occupant\n"
+    );
+    for _ in 0..600 {
+        if graph
+            .search("quokka", 20)
+            .unwrap()
+            .iter()
+            .any(|g| g.page == "Beta")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for _ in 0..5 {
+        let groups = graph.search("quokka", 20).unwrap();
+        assert_eq!(
+            groups.iter().map(|g| g.page.as_str()).collect::<Vec<_>>(),
+            vec!["Beta"],
+            "failed rename left surviving bytes unindexed: {}",
+            projection.debug_state_test()
+        );
+    }
+}
+
+#[test]
+fn a_failed_duplicate_resolution_publishes_the_occupant_it_could_not_remove() {
+    let dir = scratch("failed-conflict-compensation");
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    fs::write(
+        dir.join("logseq/config.edn"),
+        "{:journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+    )
+    .unwrap();
+    let winner = "journals/2026_06_26.md";
+    let stray = "journals/Friday, 26-06-2026.md";
+    fs::write(dir.join(winner), "- shared\n").unwrap();
+    fs::write(dir.join(stray), "- shared\n- numbat old\n").unwrap();
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    graph.with_pages(|_| ());
+    let projection = graph.direct_projection_test().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(
+        projection.wait_until_ready_at(graph.cache_generation(), &|| Instant::now() >= deadline)
+    );
+    let diff = graph
+        .duplicate_journal_diff(winner, stray)
+        .unwrap()
+        .unwrap();
+    fn decisions(
+        rows: &[crate::sync_diff::DiffRow],
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        for row in rows {
+            if row.kind != crate::sync_diff::RowKind::Unchanged {
+                out.insert(row.id.clone(), "both".into());
+            }
+            decisions(&row.children, out);
+        }
+    }
+    let mut choices = std::collections::HashMap::new();
+    decisions(&diff.rows, &mut choices);
+    let dst = dir.join(winner);
+    EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&dst, "- winner changed\n")));
+    });
+    let src = dir.join(stray);
+    GRAPH_TEXT_WRITE_DURING_ROLLBACK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || fs::write(&src, "- quokka occupant\n")));
+    });
+    assert!(graph
+        .resolve_duplicate_journal_day(
+            winner,
+            stray,
+            &choices,
+            &diff.base_rev,
+            &diff.conflict_rev,
+            "union"
+        )
+        .is_err());
+    assert_eq!(
+        fs::read_to_string(dir.join(stray)).unwrap(),
+        "- quokka occupant\n"
+    );
+    for _ in 0..600 {
+        if !graph.search("quokka", 20).unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for _ in 0..5 {
+        assert!(
+            !graph.search("quokka", 20).unwrap().is_empty(),
+            "current occupant absent: {}",
+            projection.debug_state_test()
+        );
+        assert!(
+            graph.search("numbat", 20).unwrap().is_empty(),
+            "historical stray still searchable"
+        );
+    }
+    graph.with_pages(|pages| {
+        assert!(pages
+            .iter()
+            .any(|(_, document)| doc::serialize(document).contains("quokka")))
+    });
+}
+
+#[test]
 fn rename_namespace_rewrites_all_descendant_refs_in_one_pass() {
     // A namespace rename (`Project` -> `Archive`) moves the primary page AND
     // every file-backed descendant, and rewrites every reference to ANY of

@@ -742,6 +742,16 @@ pub(crate) fn fail_next_projection_directory_sync() {
 }
 
 #[cfg(test)]
+pub(crate) fn fail_graph_text_directory_sync_after_mutation() {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|| {
+            fail_next_projection_directory_sync();
+            Ok(())
+        }));
+    });
+}
+
+#[cfg(test)]
 fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
     FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| {
         if fail.replace(false) {
