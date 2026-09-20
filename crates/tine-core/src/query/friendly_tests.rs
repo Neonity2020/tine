@@ -1122,6 +1122,118 @@ fn broad_scan_and_index_cursors_stop_at_w_verified_rows_in_descending_membership
     }
 }
 
+#[derive(Debug)]
+struct IndexedCursorWork {
+    rows: usize,
+    vm_steps: i32,
+    fullscan_steps: i32,
+    sorts: i32,
+    plan: Vec<String>,
+}
+
+fn indexed_cursor_work(blocks: usize) -> IndexedCursorWork {
+    use rusqlite::{Connection, OpenFlags, StatementStatus};
+
+    let root = scratch(&format!("friendly-indexed-cursor-{blocks}"));
+    write_many_blocks(&root, blocks);
+    let corpus = Corpus::open(root, true);
+    let writer = Connection::open(corpus.projection_path()).expect("projection opens for ANALYZE");
+    writer
+        .execute_batch("ANALYZE")
+        .expect("fixture is analyzed");
+    let statistics: i64 = writer
+        .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |row| row.get(0))
+        .expect("sqlite_stat1 remains populated");
+    assert!(statistics > 0, "the cost fixture needs planner statistics");
+    drop(writer);
+
+    let plan = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+    let branch = plan
+        .branches
+        .iter()
+        .find(|branch| branch.target == QueryTarget::Blocks)
+        .expect("interactive plan has a block branch");
+    let (sql, params) = interactive_block_cursor_statement(&plan, branch);
+    let mut snapshot = corpus.snapshot();
+    let plan = snapshot
+        .explain_query_plan(&sql, &params)
+        .expect("the production statement seam explains the cursor");
+    snapshot.finish();
+    let connection =
+        Connection::open_with_flags(corpus.projection_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("the projection opens read-only");
+    let bound = params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect::<Vec<_>>();
+    let mut statement = connection.prepare(&sql).expect("cursor prepares");
+    let mut rows = statement.query(bound.as_slice()).expect("cursor executes");
+    let mut seen = Vec::new();
+    while seen.len() < crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW {
+        let Some(row) = rows.next().expect("cursor advances") else {
+            break;
+        };
+        seen.push(row.get::<_, i64>(0).expect("block id"));
+    }
+    drop(rows);
+    let work = IndexedCursorWork {
+        rows: seen.len(),
+        vm_steps: statement.get_status(StatementStatus::VmStep),
+        fullscan_steps: statement.get_status(StatementStatus::FullscanStep),
+        sorts: statement.get_status(StatementStatus::Sort),
+        plan,
+    };
+    assert!(
+        seen.windows(2).all(|pair| pair[0] > pair[1]),
+        "cursor rows remain newest first"
+    );
+    work
+}
+
+#[test]
+fn common_indexed_cursor_streams_the_verified_window_without_sorting_the_posting() {
+    let _serial = serialize();
+    let small = indexed_cursor_work(1_200);
+    let large = indexed_cursor_work(9_000);
+    eprintln!("small indexed cursor work: {small:#?}");
+    eprintln!("large indexed cursor work: {large:#?}");
+
+    for work in [&small, &large] {
+        assert_eq!(
+            work.rows,
+            crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW
+        );
+        assert!(
+            work.plan
+                .iter()
+                .any(|step| step.contains("search_fts") && step.contains("M1")),
+            "the production cursor must use the FTS match plan: {work:#?}"
+        );
+        assert_eq!(work.sorts, 0, "the common posting must stream: {work:#?}");
+        assert!(
+            work.plan
+                .iter()
+                .all(|step| !step.contains("TEMP B-TREE FOR ORDER BY")),
+            "the production cursor must not sort the whole posting: {work:#?}"
+        );
+    }
+    assert!(
+        large.vm_steps <= small.vm_steps * 2,
+        "VM work to reach W must be posting-size independent: small={small:#?}, large={large:#?}"
+    );
+    assert!(
+        large.fullscan_steps <= small.fullscan_steps * 2,
+        "row work to reach W must be posting-size independent: small={small:#?}, large={large:#?}"
+    );
+}
+
 #[test]
 fn sparse_false_positive_candidates_stream_to_exhaustion_before_the_old_match() {
     let _serial = serialize();

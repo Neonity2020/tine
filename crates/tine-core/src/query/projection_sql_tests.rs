@@ -362,7 +362,7 @@ fn every_projection_statement_shape_is_blessed() {
         &[
             "SELECT b.block_id, bt.content, p.path",
             "WHERE p.path = ?",
-            "ORDER BY b.block_id DESC",
+            "ORDER BY c.block_id DESC",
         ],
         &[],
     );

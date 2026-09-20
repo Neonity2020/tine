@@ -665,7 +665,7 @@ fn read_pages(
     let content_block_source = match content {
         Some((content_branch, _)) => match interactive_content_ids.as_deref() {
             Some(ids) => verified_id_block_source(&mut params, ids),
-            None => indexed_block_source(&mut params, &content_branch.predicate),
+            None => indexed_block_source(&mut params, &content_branch.predicate).sql,
         },
         None => "blocks b".to_string(),
     };
@@ -1009,20 +1009,33 @@ struct BlockDescriptor {
 /// The difference between driving and filtering is the whole point: as a
 /// `WHERE` clause the index only skips the rank call, so SQLite still walks
 /// every row; as the driving table it reads the candidates and nothing else.
+struct BlockCandidateSource {
+    sql: String,
+    // Name the driving coordinate: ordering by the equal joined PK makes
+    // SQLite sort the complete FTS posting before the Rust cursor can stop.
+    recency: &'static str,
+}
+
 fn indexed_block_source(
     params: &mut Vec<PhysicalQueryValue>,
     predicate: &crate::query_plan::QueryExpr,
-) -> String {
+) -> BlockCandidateSource {
     match expression_plan(predicate) {
-        CandidatePlan::Scan => "blocks b".to_string(),
+        CandidatePlan::Scan => BlockCandidateSource {
+            sql: "blocks b".to_string(),
+            recency: "b.block_id",
+        },
         CandidatePlan::Index { match_expression } => {
             params.push(PhysicalQueryValue::Text(match_expression));
-            format!(
-                "(SELECT rowid AS block_id FROM search_fts \
-                   WHERE search_fts MATCH ?{} ORDER BY rowid DESC) c \
-                 JOIN blocks b ON b.block_id = c.block_id",
-                params.len()
-            )
+            BlockCandidateSource {
+                sql: format!(
+                    "(SELECT rowid AS block_id FROM search_fts \
+                       WHERE search_fts MATCH ?{} ORDER BY rowid DESC) c \
+                     JOIN blocks b ON b.block_id = c.block_id",
+                    params.len()
+                ),
+                recency: "c.block_id",
+            }
         }
     }
 }
@@ -1073,19 +1086,15 @@ fn block_scope_conditions(params: &mut Vec<PhysicalQueryValue>, plan: &QueryPlan
     conditions
 }
 
-/// Consume rowid-descending candidates until `window` exact matches survive.
-/// This is deliberately a Rust cursor: putting the exact callback in a
-/// materialized SQL CTE evaluates the complete candidate set before LIMIT and
-/// turns a verified-match window back into graph-sized work.
-fn interactive_verified_block_ids(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
+fn interactive_block_cursor_statement(
     plan: &QueryPlan,
     branch: &QueryBranch,
-    window: usize,
-    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> Result<Vec<i64>, ResultReadError> {
+) -> (String, Vec<PhysicalQueryValue>) {
     let mut params = Vec::new();
-    let source = indexed_block_source(&mut params, &branch.predicate);
+    let BlockCandidateSource {
+        sql: source,
+        recency,
+    } = indexed_block_source(&mut params, &branch.predicate);
     let conditions = block_scope_conditions(&mut params, plan);
     let scope_sql = if conditions.is_empty() {
         String::new()
@@ -1098,8 +1107,23 @@ fn interactive_verified_block_ids(
          LEFT JOIN block_text bt ON bt.block_id = b.block_id \
          LEFT JOIN pages p ON p.page_id = b.page_id \
          LEFT JOIN names p_name ON p_name.name_id = p.name_id{scope_sql} \
-         ORDER BY b.block_id DESC"
+         ORDER BY {recency} DESC"
     );
+    (sql, params)
+}
+
+/// Consume rowid-descending candidates until `window` exact matches survive.
+/// This is deliberately a Rust cursor: putting the exact callback in a
+/// materialized SQL CTE evaluates the complete candidate set before LIMIT and
+/// turns a verified-match window back into graph-sized work.
+fn interactive_verified_block_ids(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    window: usize,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<Vec<i64>, ResultReadError> {
+    let (sql, params) = interactive_block_cursor_statement(plan, branch);
     let mut ids = Vec::with_capacity(window);
     let mut damage = None;
     let cancellation = snapshot.cancellation();
@@ -1190,7 +1214,7 @@ fn read_blocks(
     // counts W; this ranked statement likewise keeps its LEFT joins and orders
     // `missing_text` first so descriptor decoding fails the whole read.
     let block_source = match plan.candidate_mode() {
-        CandidateMode::Exhaustive => indexed_block_source(&mut params, &branch.predicate),
+        CandidateMode::Exhaustive => indexed_block_source(&mut params, &branch.predicate).sql,
         CandidateMode::Interactive { window } => {
             let ids = interactive_verified_block_ids(snapshot, plan, branch, window, lane)?;
             verified_id_block_source(&mut params, &ids)

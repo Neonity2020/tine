@@ -2672,10 +2672,20 @@ fn interactive_indexed_plain_reference_keeps_exact_callback_work_bounded() {
 
     let graph = Graph::open(&root);
     graph.warm_cache();
+    let projection_path = root.join("private/projection.sqlite");
     graph
-        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .attach_direct_projection(projection_path.clone())
         .unwrap();
     wait_ready(&graph);
+    let analyzer = rusqlite::Connection::open(&projection_path).expect("projection opens");
+    analyzer
+        .execute_batch("ANALYZE")
+        .expect("indexed unlinked fixture is analyzed");
+    let statistics: i64 = analyzer
+        .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |row| row.get(0))
+        .expect("sqlite_stat1 remains populated");
+    assert!(statistics > 0, "the plan fixture needs planner statistics");
+    drop(analyzer);
 
     reset_plain_reference_query_instrumentation();
     graph
@@ -2689,6 +2699,20 @@ fn interactive_indexed_plain_reference_keeps_exact_callback_work_bounded() {
     assert_eq!(
         callbacks, window,
         "the indexed candidate cursor must stop exact work at W; plans={plans:?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .flatten()
+            .any(|step| step.contains("search_fts") && step.contains("M1")),
+        "the indexed unlinked cursor must actually use the FTS match plan: {plans:?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .flatten()
+            .all(|step| !step.contains("USE TEMP B-TREE FOR ORDER BY")),
+        "the indexed candidate cursor must stream FTS rowids before LIMIT: {plans:?}"
     );
 
     let _ = std::fs::remove_dir_all(root);
