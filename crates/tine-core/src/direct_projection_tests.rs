@@ -5781,6 +5781,8 @@ fn a_query_during_the_warm_inventory_read_retries_instead_of_repairing() {
     );
     let projection = graph.direct_projection_test().unwrap();
     assert!(projection.close_and_wait_for_worker(Duration::from_secs(3)));
+    drop(projection);
+    drop(graph);
     std::fs::remove_dir_all(root).unwrap();
 }
 
