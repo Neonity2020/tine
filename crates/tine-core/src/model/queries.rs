@@ -163,9 +163,7 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> Result<DerivedEntry, E>,
     ) -> Result<DerivedEntry, E> {
-        self.derived_memo_entry_fallible_if_eligible(key, || {
-            compute().map(|result| (result, true))
-        })
+        self.derived_memo_entry_fallible_if_eligible(key, || compute().map(|result| (result, true)))
     }
 
     /// The existing memo boundary with result-derived admission. A successful

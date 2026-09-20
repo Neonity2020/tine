@@ -8820,8 +8820,7 @@ fn bounded_unlinked_reference_memo_keeps_interactive_and_exhaustive_membership_d
             .collect::<std::collections::BTreeSet<_>>()
     };
 
-    let exhaustive_expected =
-        crate::query::unlinked_refs_bounded(&g, "Target", limits.0, limits.1);
+    let exhaustive_expected = crate::query::unlinked_refs_bounded(&g, "Target", limits.0, limits.1);
     let interactive_expected =
         crate::query::unlinked_refs_bounded_indexed(&g, "Target", limits.0, limits.1)
             .expect("the ready interactive reference route answers");
@@ -8978,7 +8977,7 @@ impl crate::query::graph::QueryGraph for ExhaustiveReferenceCandidateGraph<'_> {
     }
 
     fn direct_projection_recover_after_failed_read(&self) {
-        self.0.direct_projection_recover_after_failed_read();
+        crate::direct_projection::recover_until_ready(self.0);
     }
 
     fn cache_generation(&self) -> u64 {
@@ -9001,11 +9000,7 @@ impl crate::query::graph::QueryGraph for ExhaustiveReferenceCandidateGraph<'_> {
 #[test]
 fn indexed_exhaustive_fallback_is_not_eligible_for_interactive_memo() {
     let dir = scratch("bounded-unlinked-memo-exhaustive-fallback");
-    fs::write(
-        dir.join("pages").join("Source.md"),
-        "- target occurrence\n",
-    )
-    .unwrap();
+    fs::write(dir.join("pages").join("Source.md"), "- target occurrence\n").unwrap();
     fs::write(dir.join("pages").join("Target.md"), "- owner\n").unwrap();
     let graph = ready_graph(&dir);
 
