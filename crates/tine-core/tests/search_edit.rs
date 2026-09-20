@@ -271,8 +271,9 @@ fn search_reflects_toggle_on_named_page() {
     let mut dto = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DOING");
     g.save_page(&dto, dto.rev.as_deref()).expect("save");
-    assert!(
-        !ready_query::when_ready(|| g.search("DOING", 20)).is_empty(),
+    assert_eq!(
+        ready_query::when_search_hits(&g, "DOING", 1),
+        1,
         "named: DOING found after save"
     );
     assert!(
@@ -296,8 +297,9 @@ fn search_reflects_toggle_on_journal_page() {
     let mut dto = g.load_named(&title, PageKind::Journal).unwrap().unwrap();
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DOING");
     g.save_page(&dto, dto.rev.as_deref()).expect("journal save");
-    assert!(
-        !ready_query::when_ready(|| g.search("DOING", 20)).is_empty(),
+    assert_eq!(
+        ready_query::when_search_hits(&g, "DOING", 1),
+        1,
         "journal: DOING found after save"
     );
     assert!(
