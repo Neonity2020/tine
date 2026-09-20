@@ -691,7 +691,8 @@ fn current_snapshot_write_failure_recovers_from_authoritative_source() {
     page.blocks[0].raw = "TODO acknowledged source survives failed projection".into();
     graph.save_page(&page, baseline.as_deref()).unwrap();
     let started = Instant::now();
-    while !projection.shared.worker_failed.load(Ordering::Acquire)
+    while (!projection.shared.worker_failed.load(Ordering::Acquire)
+        || reported_projection_failures_test() <= reported_before)
         && started.elapsed() < Duration::from_secs(3)
     {
         std::thread::sleep(Duration::from_millis(1));
