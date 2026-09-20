@@ -1,12 +1,11 @@
-// Shared parser for the Ctrl-K quick-search query dialect (GH #44).
+// Frontend parser for the Ctrl-K quick-search query dialect (GH #44).
 //
-// MIRRORS `crates/tine-core/src/search_query.rs` — the grammar, the `is_simple`
-// rule, and the match semantics MUST agree with the Rust side, or a query would
-// filter the page list (checked here) differently from the block list (checked
-// in Rust). See that file's doc comment for the grammar.
+// This module owns syntax only. Terms retain the user's exact spelling so the
+// production UI can forward them to the native engine without folding twice.
+// Native search owns authoritative normalization and matching.
 
 export interface Term {
-  // Lowercase-plus-NFC needle for `.includes(..)`.
+  // Exact term spelling from the friendly source.
   text: string;
   negated: boolean;
   // Came from a `"quoted phrase"` — an explicit grammar opt-in, so even a single
@@ -28,13 +27,6 @@ export const SEARCH_SYNTAX = [
   { example: '"exact phrase"', description: "matches adjacent words", match: "an exact phrase here", miss: "exact other phrase" },
   { example: "/[A-Z]{3}/", description: "case-sensitive regular expression", match: "ABC", miss: "abc" },
 ] as const;
-
-/** Locale-independent comparison form for non-regex search. NFC handles only
- * canonical equivalence: it deliberately does not perform compatibility or
- * accent folding. */
-export function canonicalFold(value: string): string {
-  return value.toLowerCase().normalize("NFC");
-}
 
 // The exact cross-runtime whitespace contract. ECMAScript and Rust's Unicode
 // helpers disagree on U+FEFF and U+0085, so using either runtime's broad helper
@@ -92,59 +84,6 @@ function commonRegexPattern(pattern: string): boolean {
   return true;
 }
 
-interface SourceSpan { start: number; end: number }
-
-const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-/** Fold text while retaining original UTF-16 provenance. Each normalized
- * scalar maps to its complete contributing extended grapheme, so composition,
- * mark reordering, Hangul Jamo, and lowercase expansion cannot leave a partial
- * highlight behind. */
-function foldedWithMap(original: string): { scalars: string[]; spans: SourceSpan[] } {
-  const lowered = original.toLowerCase();
-  const loweredSources: SourceSpan[] = [];
-  let originalUtf16 = 0;
-  for (const scalar of original) {
-    const start = originalUtf16;
-    originalUtf16 += scalar.length;
-    for (const _ of scalar.toLowerCase()) loweredSources.push({ start, end: originalUtf16 });
-  }
-
-  const scalars: string[] = [];
-  const spans: SourceSpan[] = [];
-  let sourceAt = 0;
-  for (const part of graphemeSegmenter.segment(lowered)) {
-    const count = Array.from(part.segment).length;
-    const contributors = loweredSources.slice(sourceAt, sourceAt + count);
-    sourceAt += count;
-    const source = {
-      start: contributors[0]?.start ?? 0,
-      end: contributors.at(-1)?.end ?? 0,
-    };
-    for (const scalar of part.segment.normalize("NFC")) {
-      scalars.push(scalar);
-      spans.push(source);
-    }
-  }
-  return { scalars, spans };
-}
-
-function canonicalSubstringSpans(text: string, needle: string, limit: number): SourceSpan[] {
-  const hay = foldedWithMap(text);
-  const wanted = Array.from(canonicalFold(needle));
-  if (!wanted.length || wanted.length > hay.scalars.length) return [];
-  const out: SourceSpan[] = [];
-  for (let at = 0; at <= hay.scalars.length - wanted.length && out.length < limit; at += 1) {
-    if (!wanted.every((scalar, index) => hay.scalars[at + index] === scalar)) continue;
-    const span = {
-      start: hay.spans[at].start,
-      end: hay.spans[at + wanted.length - 1].end,
-    };
-    if (!out.some((existing) => existing.start === span.start && existing.end === span.end)) out.push(span);
-  }
-  return out;
-}
-
 export function parseSearchQuery(query: string): SearchMatcher {
   const q = trimSearchWhitespace(query);
   if (!q) return { kind: "empty" };
@@ -168,74 +107,11 @@ export function parseSearchQuery(query: string): SearchMatcher {
   return { kind: "boolean", groups };
 }
 
-// Does `orig` (original text) / `lower` (pre-folded lowercase-plus-NFC) match?
-export function matcherMatches(m: SearchMatcher, lower: string, orig: string): boolean {
-  switch (m.kind) {
-    case "regex":
-      return m.re.test(orig);
-    case "boolean":
-      return m.groups.some((g) => groupMatches(g, lower));
-    default:
-      return false; // empty | invalid
-  }
-}
-
 // The single positive bare term when this is a one-term query, else null.
 export function simpleTerm(m: SearchMatcher): string | null {
   if (m.kind !== "boolean" || m.groups.length !== 1 || m.groups[0].length !== 1) return null;
   const t = m.groups[0][0];
   return !t.negated && !t.quoted ? t.text : null;
-}
-
-// The first match range in `text`, for the snippet highlight: the earliest
-// positive-term occurrence (boolean) or the first regex match. null if none.
-export function matchHighlight(m: SearchMatcher, text: string): { start: number; len: number } | null {
-  if (m.kind === "regex") {
-    // exec without a global flag returns the first match with its index.
-    const hit = m.re.exec(text);
-    return hit ? { start: hit.index, len: hit[0].length } : null;
-  }
-  if (m.kind === "boolean") {
-    let best: { start: number; len: number } | null = null;
-    for (const g of m.groups) {
-      for (const t of g) {
-        if (t.negated || !t.text) continue;
-        const span = canonicalSubstringSpans(text, t.text, 1)[0];
-        if (span && (!best || span.start < best.start)) {
-          best = { start: span.start, len: span.end - span.start };
-        }
-      }
-    }
-    return best;
-  }
-  return null;
-}
-
-/** All positive match ranges for dev/mock presentation only. Production search
- * receives authoritative UTF-16 evidence from Rust's QueryPlan evaluator. */
-export function matchHighlights(m: SearchMatcher, text: string, limit = 24): { start: number; end: number }[] {
-  if (m.kind === "regex") {
-    const flags = m.re.flags.includes("g") ? m.re.flags : `${m.re.flags}g`;
-    const re = new RegExp(m.re.source, flags);
-    const out: { start: number; end: number }[] = [];
-    for (const hit of text.matchAll(re)) {
-      const start = hit.index ?? 0;
-      const end = start + hit[0].length;
-      if (end > start) out.push({ start, end });
-      if (out.length >= limit) break;
-    }
-    return out;
-  }
-  if (m.kind !== "boolean") return [];
-  const lower = canonicalFold(text);
-  const group = m.groups.find((candidate) => groupMatches(candidate, lower));
-  if (!group) return [];
-  const out: { start: number; end: number }[] = [];
-  for (const term of group) {
-    if (term.negated || !term.text) continue;
-    out.push(...canonicalSubstringSpans(text, term.text, limit - out.length));
-  }
-  return out.sort((a, b) => a.start - b.start || a.end - b.end);
 }
 
 function quoteDsl(value: string): string {
@@ -288,13 +164,6 @@ export function savedDslToFriendlySearch(dsl: string): string | null {
   return out;
 }
 
-function groupMatches(group: Term[], lower: string): boolean {
-  return group.every((t) => {
-    const present = t.text !== "" && lower.includes(t.text);
-    return present !== t.negated;
-  });
-}
-
 function parseBoolean(q: string): Term[][] {
   const tokens = tokenize(q);
   const groups: Term[][] = [];
@@ -306,7 +175,7 @@ function parseBoolean(q: string): Term[][] {
       continue;
     }
     if (!tok.text) continue;
-    cur.push({ text: canonicalFold(tok.text), negated: tok.negated, quoted: tok.quoted });
+    cur.push({ text: tok.text, negated: tok.negated, quoted: tok.quoted });
   }
   groups.push(cur);
   return groups.filter((g) => g.length > 0);

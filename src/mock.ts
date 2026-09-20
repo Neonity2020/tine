@@ -23,7 +23,13 @@ import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { leadingMarker } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
-import { canonicalFold, matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
+import { parseSearchQuery } from "./editor/searchQuery";
+import {
+  mockSearchFold,
+  mockSearchHighlights,
+  mockSearchMatches,
+  mockSearchSimpleTerm,
+} from "./mockSearchQuery";
 import { parseJournalWith } from "./journal";
 
 /** The dev preview's stand-in for `query_print`'s refusal (§7.1, I-9): the same
@@ -1063,7 +1069,7 @@ export function mockBackend(): Backend {
             ...target,
             facets: [...facets.values()],
             text_matches: matcher.kind === "empty" || matcher.kind === "invalid"
-              || matcherMatches(matcher, canonicalFold(original), original),
+              || mockSearchMatches(matcher, original),
           });
         }
         block.children.forEach((child) => visit(page, child));
@@ -1457,10 +1463,10 @@ export function mockBackend(): Backend {
       return [...map.entries()].map(([k, vs]) => [k, [...vs].sort()] as [string, string[]]);
     },
     async search(query: string, limit: number): Promise<RefGroup[]> {
-      const q = canonicalFold(query.trim());
+      const q = mockSearchFold(query.trim());
       if (!q) return [];
       let n = limit;
-      const groups = collect((b) => canonicalFold(b.raw).includes(q));
+      const groups = collect((b) => mockSearchFold(b.raw).includes(q));
       for (const g of groups) {
         if (g.blocks.length > n) g.blocks = g.blocks.slice(0, n);
         n -= g.blocks.length;
@@ -1479,10 +1485,10 @@ export function mockBackend(): Backend {
           cancelled: false,
         };
       }
-      const bare = simpleTerm(matcher);
+      const bare = mockSearchSimpleTerm(matcher);
       const pageMatches = scope ? [] : all
-        .map((page) => ({ page, score: bare ? fuzzyScore(bare, canonicalFold(page.name)) : 0 }))
-        .filter(({ page, score }) => bare ? score > 0 : matcherMatches(matcher, canonicalFold(page.name), page.name))
+        .map((page) => ({ page, score: bare ? fuzzyScore(bare, mockSearchFold(page.name)) : 0 }))
+        .filter(({ page, score }) => bare ? score > 0 : mockSearchMatches(matcher, page.name))
         .sort((a, b) => b.score - a.score);
       const pages = pageMatches
         .slice(0, pageLimit)
@@ -1494,32 +1500,32 @@ export function mockBackend(): Backend {
             clause_id: 1,
             field: "page_name" as const,
             mode: bare ? "fuzzy" as const : matcher.kind === "regex" ? "regex" as const : "contains" as const,
-            spans: matchHighlights(matcher, page.name),
+            spans: mockSearchHighlights(matcher, page.name),
             score,
           }],
           score,
           match_class: bare
-            ? canonicalFold(page.name) === bare ? "exact" as const
-              : canonicalFold(page.name).startsWith(bare) ? "prefix" as const
-              : canonicalFold(page.name).includes(bare) ? "substring" as const
+            ? mockSearchFold(page.name) === bare ? "exact" as const
+              : mockSearchFold(page.name).startsWith(bare) ? "prefix" as const
+              : mockSearchFold(page.name).includes(bare) ? "substring" as const
               : "fuzzy" as const
             : undefined,
         }));
       const inScope = (group: RefGroup) => {
         if (!scope) return true;
-        const page = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
+        const page = all.find((candidate) => candidate.kind === group.kind && mockSearchFold(candidate.name) === mockSearchFold(group.page));
         if (!page) return false;
         return scope.path
           ? mockPagePath(page) === scope.path
-          : page.kind === scope.pageKind && canonicalFold(page.name) === canonicalFold(scope.name);
+          : page.kind === scope.pageKind && mockSearchFold(page.name) === mockSearchFold(scope.name);
       };
-      const blockMatches = collect((block) => matcherMatches(matcher, canonicalFold(block.raw), block.raw))
+      const blockMatches = collect((block) => mockSearchMatches(matcher, block.raw))
         .filter(inScope)
         .flatMap((group) => group.blocks.map((block) => ({ group, block })));
       const blocks = blockMatches
         .slice(0, Math.max(0, blockLimit))
         .map(({ group, block }) => {
-          const owner = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
+          const owner = all.find((candidate) => candidate.kind === group.kind && mockSearchFold(candidate.name) === mockSearchFold(group.page));
           return {
             entity: "block" as const,
             page: group.page,
@@ -1531,7 +1537,7 @@ export function mockBackend(): Backend {
               clause_id: 1,
               field: "visible_content" as const,
               mode: matcher.kind === "regex" ? "regex" as const : "contains" as const,
-              spans: matchHighlights(matcher, block.raw),
+              spans: mockSearchHighlights(matcher, block.raw),
             }],
           };
         });
@@ -1566,9 +1572,9 @@ export function mockBackend(): Backend {
       ];
     },
     async quickSwitch(query: string, limit: number): Promise<PageEntry[]> {
-      const q = canonicalFold(query.trim());
+      const q = mockSearchFold(query.trim());
       return all
-        .filter((p) => canonicalFold(p.name).includes(q))
+        .filter((p) => mockSearchFold(p.name).includes(q))
         .slice(0, limit)
         .map(mockPageEntry);
     },

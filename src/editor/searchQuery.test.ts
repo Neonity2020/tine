@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { SEARCH_SYNTAX, canonicalFold, parseSearchQuery, matcherMatches, simpleTerm, matchHighlight, matchHighlights, friendlySearchToDsl, friendlySearchToSavedDsl, savedDslToFriendlySearch } from "./searchQuery";
+import { SEARCH_SYNTAX, parseSearchQuery, simpleTerm, friendlySearchToDsl, friendlySearchToSavedDsl, savedDslToFriendlySearch } from "./searchQuery";
+import { mockSearchMatchHighlight, mockSearchHighlights, mockSearchMatches } from "../mockSearchQuery";
 
-// Mirrors crates/tine-core/src/search_query.rs tests — keep the two in sync.
+// Grammar cases mirror Rust; match/highlight assertions exercise only the
+// explicitly non-authoritative browser-preview adapter.
 const hit = (q: string, text: string) =>
-  matcherMatches(parseSearchQuery(q), canonicalFold(text), text);
+  mockSearchMatches(parseSearchQuery(q), text);
 
 describe("searchQuery parser (#44)", () => {
   it("executes every example displayed by Ctrl K syntax help", () => {
@@ -75,38 +77,38 @@ describe("searchQuery parser (#44)", () => {
   });
 
   it("highlight picks the earliest positive term / regex match", () => {
-    expect(matchHighlight(parseSearchQuery("bar"), "foo bar baz")).toEqual({ start: 4, len: 3 });
+    expect(mockSearchMatchHighlight(parseSearchQuery("bar"), "foo bar baz")).toEqual({ start: 4, len: 3 });
     // earliest of two AND terms
-    expect(matchHighlight(parseSearchQuery("baz foo"), "foo bar baz")).toEqual({ start: 0, len: 3 });
-    expect(matchHighlight(parseSearchQuery("/b.z/"), "foo bar baz")).toEqual({ start: 8, len: 3 });
+    expect(mockSearchMatchHighlight(parseSearchQuery("baz foo"), "foo bar baz")).toEqual({ start: 0, len: 3 });
+    expect(mockSearchMatchHighlight(parseSearchQuery("/b.z/"), "foo bar baz")).toEqual({ start: 8, len: 3 });
     // negated terms are never highlighted
-    expect(matchHighlight(parseSearchQuery("foo -bar"), "foo bar")).toEqual({ start: 0, len: 3 });
+    expect(mockSearchMatchHighlight(parseSearchQuery("foo -bar"), "foo bar")).toEqual({ start: 0, len: 3 });
   });
 
   it("mock presentation evidence includes every positive term and repeated regex hit", () => {
-    expect(matchHighlights(parseSearchQuery("alpha beta -draft"), "beta alpha alpha")).toEqual([
+    expect(mockSearchHighlights(parseSearchQuery("alpha beta -draft"), "beta alpha alpha")).toEqual([
       { start: 0, end: 4 },
       { start: 5, end: 10 },
       { start: 11, end: 16 },
     ]);
-    expect(matchHighlights(parseSearchQuery("/a./"), "ab ac")).toEqual([
+    expect(mockSearchHighlights(parseSearchQuery("/a./"), "ab ac")).toEqual([
       { start: 0, end: 2 },
       { start: 3, end: 5 },
     ]);
   });
 
-  it("matches canonical Unicode forms and maps highlights to original UTF-16 spans", () => {
+  it("keeps the mock's legacy canonical matching and mapped highlights", () => {
     expect(hit("Café", "Cafe\u0301")).toBe(true);
     expect(hit("Cafe\u0301", "Café")).toBe(true);
     expect(hit("가", "\u1100\u1161")).toBe(true);
     expect(hit("i\u0307", "İ")).toBe(true);
     expect(hit("cafe", "café")).toBe(false);
     expect(hit("/Café/", "Cafe\u0301")).toBe(false);
-    expect(matchHighlight(parseSearchQuery("Résumé"), "\u{1F9E0} Re\u0301sume\u0301"))
+    expect(mockSearchMatchHighlight(parseSearchQuery("Résumé"), "\u{1F9E0} Re\u0301sume\u0301"))
       .toEqual({ start: 3, len: 8 });
-    expect(matchHighlights(parseSearchQuery("è\u0315"), "e\u0315\u0300"))
+    expect(mockSearchHighlights(parseSearchQuery("è\u0315"), "e\u0315\u0300"))
       .toEqual([{ start: 0, end: 3 }]);
-    expect(matchHighlights(parseSearchQuery("i\u0307"), "İ"))
+    expect(mockSearchHighlights(parseSearchQuery("i\u0307"), "İ"))
       .toEqual([{ start: 0, end: 1 }]);
   });
 
@@ -121,6 +123,19 @@ describe("searchQuery parser (#44)", () => {
     });
     expect(friendlySearchToSavedDsl('foo "bar"')).toBe('(search "foo \\"bar\\"")');
     expect(savedDslToFriendlySearch('(search "foo \\"bar\\"")')).toBe('foo "bar"');
+    expect(friendlySearchToSavedDsl('Café \\path "quoted"')).toBe('(search "Café \\\\path \\"quoted\\"")');
+    expect(savedDslToFriendlySearch('(search "Café \\\\path \\"quoted\\"")')).toBe('Café \\path "quoted"');
     expect(savedDslToFriendlySearch('(and "foo" "bar")')).toBeNull();
+  });
+
+  it("preserves search term spelling when compiling friendly input", () => {
+    expect(friendlySearchToDsl('TODO 𝐀 Café "Exact Phrase" Path\\Name')).toEqual({
+      dsl: '(and "TODO" "𝐀" "Café" "Exact Phrase" "Path\\\\Name")',
+      error: null,
+    });
+    expect(friendlySearchToDsl("/[A-Z]\\p{L}+/")).toEqual({
+      dsl: '(content-regex "[A-Z]\\\\p{L}+")',
+      error: null,
+    });
   });
 });

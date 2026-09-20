@@ -924,8 +924,8 @@ describe("QueryWorkspace", () => {
     expect(root.querySelector('[role="dialog"]')).not.toBeNull();
     expect((document.activeElement as HTMLInputElement)?.value).toBe("");
     const fields = root.querySelectorAll<HTMLInputElement>(".query-friendly-fields input");
-    expect(fields[1].value).toBe("alpha beta");
-    expect(fields[3].value).toBe("draft");
+    expect(fields[1].value).toBe("Alpha Beta");
+    expect(fields[3].value).toBe("Draft");
 
     const apply = [...root.querySelectorAll<HTMLButtonElement>(".query-advanced-actions button")]
       .find((button) => button.textContent === "Apply")!;
