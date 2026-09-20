@@ -1,15 +1,9 @@
-// DUP-8: the shared search-grammar conformance corpus, TypeScript side.
+// DUP-8: shared search-grammar conformance corpus, TypeScript syntax side.
 //
-// The Ctrl-K query dialect is implemented twice: here for the page list, and in
-// `crates/tine-core/src/search_query.rs` for the block list. Until this corpus
-// existed, the only thing keeping them in step was the "MIRRORS … MUST agree"
-// note at the top of both files. A user typing one query gets both engines at
-// once, so a drift shows up as the two lists disagreeing about the same query.
-//
-// `tests/fixtures/search-query-corpus.json` is asserted case for case by this
-// file and by `search_query::corpus` on the Rust side. It pins CURRENT
-// behavior. Every row has one shared answer; runtime-specific expectations are
-// forbidden because users get both engines in the same search surface.
+// Rust owns normalization and matching, so the fixture's verdict term text is
+// the native folded needle. The frontend asserts shared tokens and verdict
+// structure here, then separately pins that its syntax terms remain raw. This
+// prevents the native A6 expectation from becoming a second frontend fold.
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -50,15 +44,47 @@ function verdictOf(m: SearchMatcher): unknown {
   }
 }
 
+function grammarShape(verdict: unknown): unknown {
+  const value = verdict as {
+    kind: string;
+    pattern?: string;
+    groups?: { text: string; negated: boolean; quoted: boolean }[][];
+    simpleTerm?: string | null;
+  };
+  if (value.kind !== "boolean") return value;
+  return {
+    kind: value.kind,
+    groups: value.groups?.map((group) =>
+      group.map((term) => ({ negated: term.negated, quoted: term.quoted })),
+    ),
+    simpleTerm: value.simpleTerm === null ? null : "<term>",
+  };
+}
+
 describe("search-grammar conformance corpus (DUP-8)", () => {
   it("has cases", () => {
     expect(corpus.cases.length).toBeGreaterThan(0);
   });
 
+  it("keeps frontend syntax terms raw independently of native fold expectations", () => {
+    const matcher = parseSearchQuery('TODO Café cafe\u0301 𝐀 "Exact Phrase"');
+    expect(matcher.kind).toBe("boolean");
+    if (matcher.kind !== "boolean") return;
+    expect(matcher.groups[0].map((term) => term.text)).toEqual([
+      "TODO",
+      "Café",
+      "cafe\u0301",
+      "𝐀",
+      "Exact Phrase",
+    ]);
+    expect(simpleTerm(parseSearchQuery("Abc"))).toBe("Abc");
+  });
+
   for (const testCase of corpus.cases) {
     it(testCase.name, () => {
       expect(tokenize(testCase.query)).toEqual(testCase.tokens);
-      expect(verdictOf(parseSearchQuery(testCase.query))).toEqual(testCase.verdict);
+      expect(grammarShape(verdictOf(parseSearchQuery(testCase.query))))
+        .toEqual(grammarShape(testCase.verdict));
     });
   }
 });

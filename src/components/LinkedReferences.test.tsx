@@ -6,7 +6,8 @@ import type { BacklinkFilterContext, BacklinkFilterEntry, BlockDto, RefGroup } f
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
 import { setGraphMeta } from "../ui";
-import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
+import { parseSearchQuery } from "../editor/searchQuery";
+import { mockSearchMatches } from "../mockSearchQuery";
 
 vi.mock("./LiveRefGroup", () => ({
   LiveRefGroup: (props: { blocks: BlockDto[]; showBreadcrumb?: boolean }) => (
@@ -57,7 +58,7 @@ function mockBacklinkFilterContext(
         entries: entries.map(({ text, ...entry }) => ({
           ...entry,
           text_matches: matcher.kind === "empty" || matcher.kind === "invalid"
-            || matcherMatches(matcher, canonicalFold(text), text),
+            || mockSearchMatches(matcher, text),
         })),
       };
     }
