@@ -132,6 +132,9 @@ function rawSearchReport(role: SearchRole, p95: Record<string, number>) {
     navigation_name_inventory: {
       method: "quick_switch",
       count: settings.names,
+      reported_count_scope: "original_corpus_before_scratch_augmentation",
+      augmentation_added_owner_rows: settings.augmented ? 2 : 0,
+      actual_count_after_augmentation: settings.names + (settings.augmented ? 2 : 0),
       count_unit: "navigable owner rows; aliases participate but do not add duplicate owner rows",
     },
     runs: 3,
@@ -161,13 +164,15 @@ function pairedSearchFixture(overrides: {
   bothBroadMs?: number;
   bothSparseMs?: number;
   namesNormalized?: number;
+  namesTimeRatio?: number;
 } = {}) {
   const blockBroadRatio = overrides.blockBroadRatio ?? 1.5;
   const blockSparseRatio = overrides.blockSparseRatio ?? 1.5;
   const bothBroadMs = overrides.bothBroadMs ?? 49.28;
   const bothSparseMs = overrides.bothSparseMs ?? 41.69;
   const namesNormalized = overrides.namesNormalized ?? 1.0;
-  const ownerCountRatio = 10_010 / 1_010;
+  const ownerCountRatio = 10_012 / 1_012;
+  const namesTimeRatio = overrides.namesTimeRatio ?? ownerCountRatio * namesNormalized;
   return {
     schema: "tine.search_scaling.v2",
     small: rawSearchReport("small", { nohit: 0.125, broad: 0.25, sparse: 2, fp: 4 }),
@@ -178,8 +183,8 @@ function pairedSearchFixture(overrides: {
       fp: 20,
     }),
     namesLarge: rawSearchReport("namesLarge", {
-      nohit: 0.125 * ownerCountRatio * namesNormalized,
-      broad: 0.25 * ownerCountRatio * namesNormalized,
+      nohit: 0.125 * namesTimeRatio,
+      broad: 0.25 * namesTimeRatio,
       sparse: 3,
       fp: 20,
     }),
@@ -281,16 +286,16 @@ describe("paired search-scaling budget", () => {
   it("gates the worst no-hit/broad name timing normalized by measured owner-count growth at 1.10", () => {
     const atCeiling = evaluateSearchScaling(pairedSearchFixture({ namesNormalized: 1.1 }), policy);
     const names = atCeiling.rows.find((row: SearchScalingRow) => row.id === "T2-names")!;
-    expect(names.nameGrowth?.smallOwnerCount).toBe(1_010);
-    expect(names.nameGrowth?.namesLargeOwnerCount).toBe(10_010);
-    expect(names.nameGrowth?.ownerCountRatio).toBeCloseTo(10_010 / 1_010);
+    expect(names.nameGrowth?.smallOwnerCount).toBe(1_012);
+    expect(names.nameGrowth?.namesLargeOwnerCount).toBe(10_012);
+    expect(names.nameGrowth?.ownerCountRatio).toBeCloseTo(10_012 / 1_012);
     expect(names.nameGrowth).toMatchObject({
       smallPhysicalPageCount: 1_000,
       namesLargePhysicalPageCount: 10_000,
       smallFixedOwnerCount: 10,
       namesLargeFixedOwnerCount: 10,
-      smallAugmentationPageCount: 2,
-      namesLargeAugmentationPageCount: 2,
+      smallAugmentationOwnerCount: 2,
+      namesLargeAugmentationOwnerCount: 2,
     });
     expect(names.nameGrowth?.maxNormalizedLinearity).toBeCloseTo(1.1);
     expect(names.ok).toBe(true);
@@ -301,6 +306,17 @@ describe("paired search-scaling budget", () => {
     const cappedPolicy = structuredClone(policy);
     cappedPolicy.searchScaling.rows["T2-names"].executor = "capped candidate window";
     expect(() => evaluateSearchScaling(pairedSearchFixture(), cappedPolicy)).toThrow(/exhaustive navigation owner inventory/);
+  });
+
+  it("uses the timed owner inventory when the original-only ratio would hide a breach", () => {
+    const timeRatio = 10.89;
+    expect(timeRatio / (10_010 / 1_010)).toBeLessThan(1.1);
+
+    const result = evaluateSearchScaling(pairedSearchFixture({ namesTimeRatio: timeRatio }), policy);
+    const names = result.rows.find((row: SearchScalingRow) => row.id === "T2-names")!;
+    expect(names.ratio).toBeCloseTo(timeRatio / (10_012 / 1_012));
+    expect(names.ratio).toBeGreaterThan(1.1);
+    expect(result.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-names"]);
   });
 
   it("keeps no-hit, false-positive, and page-search exceptions unjudged", () => {
@@ -319,7 +335,7 @@ describe("paired search-scaling budget", () => {
     expect(rendered).toContain("0.125 ms");
     expect(rendered).toContain("both-growing HARD ≤49.28 ms");
     expect(rendered).toContain("fixed-name block ratio 1.5x; both-growing ratio 197.12x");
-    expect(rendered).toContain("1010→10010 owner rows (9.910891x): 1000→10000 physical pages + 10→10 fixed owner rows; separate scratch augmentation +2→+2 pages");
+    expect(rendered).toContain("1000→10000 physical pages + 10→10 fixed owner rows + 2→2 scratch-augmentation owner rows = 1012→10012 timed owner rows (9.893281x)");
     expect(rendered).toContain("max normalized time/name growth");
     expect(rendered).toContain("(no baseline)");
   });
@@ -340,6 +356,9 @@ describe("paired search-scaling budget", () => {
     ["non-finite p95", (report: any) => { report.large.queries[1].surfaces[2].p95_ms = Infinity; }, /positive finite/],
     ["missing required row", (report: any) => { report.small.queries = report.small.queries.filter((query: any) => query.label !== "T2-sparse"); }, /query workload must match/],
     ["wrong raw run length", (report: any) => { report.large.queries[0].surfaces[2].raw_ns.pop(); }, /does not match runs/],
+    ["missing actual owner count", (report: any) => { delete report.small.navigation_name_inventory.actual_count_after_augmentation; }, /actual_count_after_augmentation must be a positive integer/],
+    ["inconsistent actual owner count", (report: any) => { report.small.navigation_name_inventory.actual_count_after_augmentation += 1; }, /actual count must equal original count plus augmentation owner rows/],
+    ["wrong owner-count scope", (report: any) => { report.small.navigation_name_inventory.reported_count_scope = "all rows"; }, /reported_count_scope must identify the original corpus/],
   ] as Array<[string, (report: any) => void, RegExp]>)("rejects malformed input: %s", (_label, mutate, message) => {
     const report = pairedSearchFixture();
     mutate(report);
@@ -382,15 +401,24 @@ describe("paired search-scaling budget", () => {
     ["blocksLarge pages", (report: any) => { report.blocksLarge.page_count = report.blocksLarge.corpus_counts.original_page_count = 1_001; }, /blocksLarge original_page_count must be 1000/],
     ["namesLarge blocks", (report: any) => { report.namesLarge.block_count = report.namesLarge.corpus_counts.original_block_count = 60_001; }, /namesLarge original_block_count must be 60000/],
     ["large pages", (report: any) => { report.large.page_count = report.large.corpus_counts.original_page_count = 9_999; }, /large original_page_count must be 10000/],
-    ["fixed low-name inventory", (report: any) => { report.blocksLarge.navigation_name_inventory.count += 1; }, /small and blocksLarge navigation owner inventory counts must match/],
-    ["fixed high-name inventory", (report: any) => { report.large.navigation_name_inventory.count += 1; }, /namesLarge and large navigation owner inventory counts must match/],
+    ["fixed low-name inventory", (report: any) => {
+      report.blocksLarge.navigation_name_inventory.count += 1;
+      report.blocksLarge.navigation_name_inventory.actual_count_after_augmentation += 1;
+    }, /small and blocksLarge navigation owner inventory counts must match/],
+    ["fixed high-name inventory", (report: any) => {
+      report.large.navigation_name_inventory.count += 1;
+      report.large.navigation_name_inventory.actual_count_after_augmentation += 1;
+    }, /namesLarge and large navigation owner inventory counts must match/],
     ["inventory method", (report: any) => { report.namesLarge.navigation_name_inventory.method = "other"; }, /navigation_name_inventory\.method must match small/],
     ["non-growing inventory", (report: any) => {
       report.namesLarge.navigation_name_inventory.count = report.large.navigation_name_inventory.count = 1_010;
+      report.namesLarge.navigation_name_inventory.actual_count_after_augmentation = report.large.navigation_name_inventory.actual_count_after_augmentation = 1_012;
     }, /namesLarge navigation owner inventory count minus small must equal 9000/],
     ["extra owner growth", (report: any) => {
       report.namesLarge.navigation_name_inventory.count += 1;
       report.large.navigation_name_inventory.count += 1;
+      report.namesLarge.navigation_name_inventory.actual_count_after_augmentation += 1;
+      report.large.navigation_name_inventory.actual_count_after_augmentation += 1;
     }, /namesLarge navigation owner inventory count minus small must equal 9000/],
   ] as Array<[string, (report: any) => void, RegExp]>)("rejects a mismatched or non-growing axis: %s", (_label, mutate, message) => {
     const report = pairedSearchFixture();
@@ -418,6 +446,20 @@ describe("paired search-scaling budget", () => {
     extra.label = "other";
     extraSentinelWork.sentinel.queries.push(extra);
     expect(() => evaluateSearchScaling(extraSentinelWork, policy)).toThrow(/sentinel query workload must contain only exact_old_page/);
+  });
+
+  it("requires owner-row augmentation counts to match each fixture", () => {
+    const augmented = pairedSearchFixture() as any;
+    for (const role of ["small", "blocksLarge", "namesLarge", "large"] as const) {
+      augmented[role].navigation_name_inventory.augmentation_added_owner_rows = 3;
+      augmented[role].navigation_name_inventory.actual_count_after_augmentation += 1;
+    }
+    expect(() => evaluateSearchScaling(augmented, policy)).toThrow(/must report 2 scratch-augmentation owner rows/);
+
+    const unaugmented = pairedSearchFixture() as any;
+    unaugmented.pages.navigation_name_inventory.augmentation_added_owner_rows = 1;
+    unaugmented.pages.navigation_name_inventory.actual_count_after_augmentation += 1;
+    expect(() => evaluateSearchScaling(unaugmented, policy)).toThrow(/must report no scratch-augmentation owner rows/);
   });
 
   it("requires one production/backend identity across every role", () => {
@@ -500,6 +542,11 @@ describe("paired search-scaling budget", () => {
     expect(baseline.counts.small).toEqual({ original_pages: 1_000, original_blocks: 60_000, navigation_owner_rows: 1_010 });
     expect(baseline.counts.blocksLarge).toEqual({ original_pages: 1_000, original_blocks: 600_000, navigation_owner_rows: 1_010 });
     expect(baseline.counts.namesLarge).toEqual({ original_pages: 10_000, original_blocks: 60_000, navigation_owner_rows: 10_010 });
+    expect(baseline.rows["T2-names"]).toMatchObject({
+      small_owner_count: 1_012,
+      names_large_owner_count: 10_012,
+      owner_count_ratio: 10_012 / 1_012,
+    });
     expect(baseline.counts.large.original_blocks).toBe(600_000);
     expect(baseline.augmentation_sha256).toBe("a".repeat(64));
     expect(baseline.queries["T2-sparse"]).toBe("s7sparseanchor543");

@@ -33,8 +33,8 @@ export type SearchScalingRow = {
     namesLargePhysicalPageCount: number;
     smallFixedOwnerCount: number;
     namesLargeFixedOwnerCount: number;
-    smallAugmentationPageCount: number;
-    namesLargeAugmentationPageCount: number;
+    smallAugmentationOwnerCount: number;
+    namesLargeAugmentationOwnerCount: number;
     cases: Array<{
       sourceLabel: string;
       smallP95Ms: number;

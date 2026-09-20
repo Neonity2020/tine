@@ -224,6 +224,14 @@ function validateRawReport(report, role, expectedCorpus) {
   const inventory = requireObject(report.navigation_name_inventory, `${path}.navigation_name_inventory`);
   requireString(inventory.method, `${path}.navigation_name_inventory.method`);
   requirePositiveInteger(inventory.count, `${path}.navigation_name_inventory.count`);
+  if (inventory.reported_count_scope !== "original_corpus_before_scratch_augmentation") {
+    searchInvalid(`${path}.navigation_name_inventory.reported_count_scope must identify the original corpus before scratch augmentation`);
+  }
+  requireNonNegativeInteger(inventory.augmentation_added_owner_rows, `${path}.navigation_name_inventory.augmentation_added_owner_rows`);
+  requirePositiveInteger(inventory.actual_count_after_augmentation, `${path}.navigation_name_inventory.actual_count_after_augmentation`);
+  if (inventory.count + inventory.augmentation_added_owner_rows !== inventory.actual_count_after_augmentation) {
+    searchInvalid(`${path}.navigation_name_inventory actual count must equal original count plus augmentation owner rows`);
+  }
   if (typeof inventory.count_unit !== "string" || !inventory.count_unit.includes("owner rows")) {
     searchInvalid(`${path}.navigation_name_inventory.count_unit must identify navigable owner rows`);
   }
@@ -341,6 +349,9 @@ function validateAugmentation(report, role) {
       || report.corpus_counts.actual_block_count_after_augmentation !== report.block_count + 1208) {
     searchInvalid(`${role}.corpus_counts post-augmentation totals do not derive from the original counts`);
   }
+  if (report.navigation_name_inventory.augmentation_added_owner_rows !== 2) {
+    searchInvalid(`${role}.navigation_name_inventory must report 2 scratch-augmentation owner rows`);
+  }
   return augmentation;
 }
 
@@ -354,6 +365,9 @@ function validateNoAugmentation(report, role) {
   if (counts.actual_page_count_after_augmentation !== report.page_count
       || counts.actual_block_count_after_augmentation !== report.block_count) {
     searchInvalid(`${role}.corpus_counts totals must equal the unaugmented original counts`);
+  }
+  if (report.navigation_name_inventory.augmentation_added_owner_rows !== 0) {
+    searchInvalid(`${role}.navigation_name_inventory must report no scratch-augmentation owner rows`);
   }
 }
 
@@ -402,11 +416,23 @@ function searchScalingSummary(input, policy) {
   if (reports.small.navigation_name_inventory.count !== reports.blocksLarge.navigation_name_inventory.count) {
     searchInvalid("small and blocksLarge navigation owner inventory counts must match for fixed-name block growth");
   }
+  if (reports.small.navigation_name_inventory.actual_count_after_augmentation
+      !== reports.blocksLarge.navigation_name_inventory.actual_count_after_augmentation) {
+    searchInvalid("small and blocksLarge actual navigation owner inventory counts must match for fixed-name block growth");
+  }
   if (reports.namesLarge.navigation_name_inventory.count !== reports.large.navigation_name_inventory.count) {
     searchInvalid("namesLarge and large navigation owner inventory counts must match for fixed-name block growth");
   }
+  if (reports.namesLarge.navigation_name_inventory.actual_count_after_augmentation
+      !== reports.large.navigation_name_inventory.actual_count_after_augmentation) {
+    searchInvalid("namesLarge and large actual navigation owner inventory counts must match for fixed-name block growth");
+  }
   if (reports.namesLarge.navigation_name_inventory.count - reports.small.navigation_name_inventory.count !== 9_000) {
     searchInvalid("namesLarge navigation owner inventory count minus small must equal 9000 added physical pages");
+  }
+  if (reports.namesLarge.navigation_name_inventory.actual_count_after_augmentation
+      - reports.small.navigation_name_inventory.actual_count_after_augmentation !== 9_000) {
+    searchInvalid("namesLarge actual navigation owner inventory count minus small must equal 9000 added physical pages");
   }
   for (const role of AXIS_ROLES.slice(1)) {
     for (const field of ["method", "count_unit"]) {
@@ -472,16 +498,18 @@ function searchScalingSummary(input, policy) {
     searchInvalid(`policy.searchScaling.rows.T2-names.executor must be ${JSON.stringify(EXHAUSTIVE_NAME_EXECUTOR)}`);
   }
   const nameCounts = {
-    small: reports.small.navigation_name_inventory.count,
-    namesLarge: reports.namesLarge.navigation_name_inventory.count,
+    small: reports.small.navigation_name_inventory.actual_count_after_augmentation,
+    namesLarge: reports.namesLarge.navigation_name_inventory.actual_count_after_augmentation,
+    smallOriginal: reports.small.navigation_name_inventory.count,
+    namesLargeOriginal: reports.namesLarge.navigation_name_inventory.count,
     smallPhysicalPages: reports.small.corpus_counts.original_page_count,
     namesLargePhysicalPages: reports.namesLarge.corpus_counts.original_page_count,
-    smallAugmentationPages: reports.small.corpus_counts.augmentation_added_page_count,
-    namesLargeAugmentationPages: reports.namesLarge.corpus_counts.augmentation_added_page_count,
+    smallAugmentationOwners: reports.small.navigation_name_inventory.augmentation_added_owner_rows,
+    namesLargeAugmentationOwners: reports.namesLarge.navigation_name_inventory.augmentation_added_owner_rows,
   };
   nameCounts.ratio = nameCounts.namesLarge / nameCounts.small;
-  nameCounts.smallFixedOwners = nameCounts.small - nameCounts.smallPhysicalPages;
-  nameCounts.namesLargeFixedOwners = nameCounts.namesLarge - nameCounts.namesLargePhysicalPages;
+  nameCounts.smallFixedOwners = nameCounts.smallOriginal - nameCounts.smallPhysicalPages;
+  nameCounts.namesLargeFixedOwners = nameCounts.namesLargeOriginal - nameCounts.namesLargePhysicalPages;
   const nameCases = namesConfig.sourceLabels.map((sourceLabel, index) => {
     requireString(sourceLabel, `policy.searchScaling.rows.T2-names.sourceLabels[${index}]`);
     const smallSurface = findSurface(findQuery(reports.small, sourceLabel, "small"), namesSurfaceName, "small");
@@ -642,8 +670,8 @@ export function evaluateSearchScaling(input, policy) {
       namesLargePhysicalPageCount: summary.nameCounts.namesLargePhysicalPages,
       smallFixedOwnerCount: summary.nameCounts.smallFixedOwners,
       namesLargeFixedOwnerCount: summary.nameCounts.namesLargeFixedOwners,
-      smallAugmentationPageCount: summary.nameCounts.smallAugmentationPages,
-      namesLargeAugmentationPageCount: summary.nameCounts.namesLargeAugmentationPages,
+      smallAugmentationOwnerCount: summary.nameCounts.smallAugmentationOwners,
+      namesLargeAugmentationOwnerCount: summary.nameCounts.namesLargeAugmentationOwners,
       cases: summary.nameCases,
       maxNormalizedLinearity,
     },
@@ -742,7 +770,7 @@ export function formatSearchScalingRows(rows) {
     let budget;
     if (row.nameGrowth) {
       const cases = row.nameGrowth.cases.map((entry) => `${entry.sourceLabel}: ${formatSearchNumber(entry.smallP95Ms)}→${formatSearchNumber(entry.namesLargeP95Ms)} ms (${formatSearchNumber(entry.timeRatio)}x time, ${formatSearchNumber(entry.normalizedLinearity)}x normalized)`).join("; ");
-      const inventory = `${row.nameGrowth.smallOwnerCount}→${row.nameGrowth.namesLargeOwnerCount} owner rows (${formatSearchNumber(row.nameGrowth.ownerCountRatio)}x): ${row.nameGrowth.smallPhysicalPageCount}→${row.nameGrowth.namesLargePhysicalPageCount} physical pages + ${row.nameGrowth.smallFixedOwnerCount}→${row.nameGrowth.namesLargeFixedOwnerCount} fixed owner rows; separate scratch augmentation +${row.nameGrowth.smallAugmentationPageCount}→+${row.nameGrowth.namesLargeAugmentationPageCount} pages`;
+      const inventory = `${row.nameGrowth.smallPhysicalPageCount}→${row.nameGrowth.namesLargePhysicalPageCount} physical pages + ${row.nameGrowth.smallFixedOwnerCount}→${row.nameGrowth.namesLargeFixedOwnerCount} fixed owner rows + ${row.nameGrowth.smallAugmentationOwnerCount}→${row.nameGrowth.namesLargeAugmentationOwnerCount} scratch-augmentation owner rows = ${row.nameGrowth.smallOwnerCount}→${row.nameGrowth.namesLargeOwnerCount} timed owner rows (${formatSearchNumber(row.nameGrowth.ownerCountRatio)}x)`;
       measurements = `${row.nameGrowth.executor}; ${inventory}; ${cases}`;
       metric = `max normalized time/name growth ${formatSearchNumber(row.nameGrowth.maxNormalizedLinearity)}x`;
       budget = `normalized ≤${formatSearchNumber(row.ceiling)}x`;
