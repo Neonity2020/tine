@@ -347,6 +347,23 @@ bytes itself. The unpublished connection alone uses journal and synchronous
 mode OFF; the serving writer is reopened WAL/NORMAL with the resting page-cache
 budget.
 
+The bounded batches stream through one storage-owned fresh-build transaction.
+Its ordinary secondary indexes are absent for every base chunk; the fresh-only
+append invariant admits disjoint new pages and reuses the same name interning,
+integer-coordinate allocation, row/FTS insertion, reference and alias
+machinery as ordinary apply without running replacement cleanup or name
+reclamation against an unindexed accumulated graph. Storage creates the
+secondary indexes exactly once, then applies the captured tail delta and final
+inventory with those indexes live before the single build commit. Final
+optimize completes inside that transaction and integrity checking completes
+before the connection closes. Only
+the resulting closed finalized-stage token can invoke publication through the
+directory capability bound to the stage's exact regular-file identity at
+construction; callers cannot substitute a same-basename second directory. An
+append error, repeated page/block identity, cancellation, failed finish, or abandoned
+token removes the OFF-mode stage. Active WAL/NORMAL applies retain their
+existing per-apply atomic rollback behavior.
+
 Cancellation is checked between build batches and immediately before the
 storage publication boundary. A stop or failure before that boundary discards
 the exact owned stage and leaves the old image intact. Once the storage name

@@ -3092,14 +3092,11 @@ fn build_and_publish_fresh_projection(
         if fresh_build_stopped(shared) {
             return Err(FreshBuildError::Stopped);
         }
-        let mut database = PhysicalGraphProjectionDatabase::create_fresh_build(&stage_path)
+        let stage_publication = tine_storage::DurableDirectoryPublication::open(&directory)
             .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-        database
-            .initialize_schema()
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-        database
-            .validate_schema()
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+        let mut database =
+            PhysicalGraphProjectionDatabase::create_fresh_build(&stage_path, stage_publication)
+                .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
 
         let PendingFull {
             pages,
@@ -3149,7 +3146,7 @@ fn build_and_publish_fresh_projection(
                 ))
                 .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
             database
-                .apply_with_source_revisions_and_aliases(
+                .append_with_source_revisions_and_aliases(
                     &PhysicalGraphProjectionChange {
                         replacements,
                         deletions: Vec::new(),
@@ -3168,35 +3165,19 @@ fn build_and_publish_fresh_projection(
             }
         }
 
-        let delta_applied = apply_deltas(&mut database, deltas).map_err(FreshBuildError::Failed)?;
-        applied.pages.lowered.extend(delta_applied.pages.lowered);
-        applied.pages.deleted.extend(delta_applied.pages.deleted);
-        database
-            .apply_with_source_revisions_aliases_and_page_order(
-                &PhysicalGraphProjectionChange {
-                    replacements: Vec::new(),
-                    deletions: Vec::new(),
-                    reference_postings: Vec::new(),
-                },
-                &[],
-                &[],
-                inventory,
-            )
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
+        let delta = lower_deltas(deltas).map_err(FreshBuildError::Failed)?;
+        applied.pages.lowered.extend(delta.applied.pages.lowered);
+        applied.pages.deleted.extend(delta.applied.pages.deleted);
         if fresh_build_stopped(shared) {
             return Err(FreshBuildError::Stopped);
         }
-        database
-            .optimize()
+        let finalized = database
+            .finish(&delta.change, &delta.revisions, &delta.aliases, inventory)
             .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-        database
-            .quick_check()
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-        drop(database);
-        Ok((applied, text_bytes))
+        Ok((finalized, applied, text_bytes))
     })();
 
-    let (applied, text_bytes) = match build {
+    let (finalized, applied, text_bytes) = match build {
         Ok(built) => built,
         Err(error) => {
             let _ = cleanup_projection_stage_artifacts(&directory, &stage_name);
@@ -3248,10 +3229,8 @@ fn build_and_publish_fresh_projection(
             return Err(FreshBuildError::Stopped);
         }
 
-        let publication = tine_storage::DurableDirectoryPublication::open(&directory)
-            .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
-        publication
-            .replace_from_staged_regular_single_writer(&stage_name, &destination_name)
+        finalized
+            .publish_replace_single_writer(&destination_name)
             .map_err(|error| FreshBuildError::Failed(error.to_string()))?;
 
         #[cfg(test)]
@@ -3361,10 +3340,29 @@ fn apply_deltas(
     database: &mut PhysicalGraphProjectionDatabase,
     deltas: BTreeMap<String, (u64, PageDelta)>,
 ) -> Result<AppliedTurn, String> {
-    let mut turn = AppliedTurn::default();
     if deltas.is_empty() {
-        return Ok(turn);
+        return Ok(AppliedTurn::default());
     }
+    let lowered = lower_deltas(deltas)?;
+    database
+        .apply_with_source_revisions_and_aliases(
+            &lowered.change,
+            &lowered.revisions,
+            &lowered.aliases,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(lowered.applied)
+}
+
+struct LoweredDeltas {
+    applied: AppliedTurn,
+    change: PhysicalGraphProjectionChange,
+    revisions: Vec<PhysicalGraphProjectionSourceRevision>,
+    aliases: Vec<PhysicalAliasDeclaration>,
+}
+
+fn lower_deltas(deltas: BTreeMap<String, (u64, PageDelta)>) -> Result<LoweredDeltas, String> {
+    let mut turn = AppliedTurn::default();
     let mut replacements = Vec::new();
     let mut reference_postings = Vec::new();
     let mut aliases = Vec::new();
@@ -3398,18 +3396,16 @@ fn apply_deltas(
             }
         }
     }
-    database
-        .apply_with_source_revisions_and_aliases(
-            &PhysicalGraphProjectionChange {
-                replacements,
-                deletions,
-                reference_postings,
-            },
-            &replacement_sources,
-            &aliases,
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(turn)
+    Ok(LoweredDeltas {
+        applied: turn,
+        change: PhysicalGraphProjectionChange {
+            replacements,
+            deletions,
+            reference_postings,
+        },
+        revisions: replacement_sources,
+        aliases,
+    })
 }
 
 /// The revision Direct Files compares to decide whether a page's rows are still

@@ -3532,6 +3532,18 @@ fn storage_contract_names_the_generation_bound_cutover() {
         contract,
         "app-private graph-fact projection contains no authority state"
     ));
+    assert!(contains_words(
+        contract,
+        "bounded batches stream through one storage-owned fresh-build transaction"
+    ));
+    assert!(contains_words(
+        contract,
+        "creates the secondary indexes exactly once, then applies the captured tail delta"
+    ));
+    assert!(contains_words(
+        contract,
+        "Only the resulting closed finalized-stage token can invoke publication"
+    ));
     assert!(contains_words(contract, "clean\nreopen lowers none"));
     assert!(contains_words(
         contract,
@@ -6715,7 +6727,7 @@ fn a_fresh_build_has_one_atomic_publication_and_no_active_reset() {
             source
                 .lines()
                 .enumerate()
-                .filter(|(_, line)| line.contains("replace_from_staged_regular_single_writer"))
+                .filter(|(_, line)| line.contains(".publish_replace_single_writer("))
                 .map(|(index, _)| {
                     format!(
                         "{}:{}",
@@ -6732,6 +6744,30 @@ fn a_fresh_build_has_one_atomic_publication_and_no_active_reset() {
         "publication sites: {publication_sites:?}"
     );
     assert!(publication_sites[0].starts_with("direct_projection.rs:"));
+
+    let raw_publication_sites = files
+        .iter()
+        .filter(|path| !path.to_string_lossy().ends_with("_tests.rs"))
+        .flat_map(|path| {
+            let source = std::fs::read_to_string(path).unwrap();
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("replace_from_staged_regular_single_writer"))
+                .map(|(index, _)| {
+                    format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        index + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        raw_publication_sites.is_empty(),
+        "core bypasses the finalized fresh-stage token: {raw_publication_sites:?}"
+    );
 }
 
 #[test]
