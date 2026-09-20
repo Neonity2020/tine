@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // Focused Windows diagnostic for GH #266 and the GH #543 readiness regression.
-// Fixture construction happens before Tine starts; the load ceiling still
-// covers only the frontend load_graph call.
+// Fixture construction happens before Tine starts; the load ceiling covers the
+// conservative full interval from application launch through journal render.
 import { spawn, spawnSync } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -131,6 +131,7 @@ async function waitForMarkerResult(browser, observePending) {
   return result;
 }
 
+const appStartStartedAt = performance.now();
 const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
 const driverLog = fs.openSync(path.join(artifacts, "tauri-driver.log"), "w");
 const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT), {
@@ -160,6 +161,7 @@ try {
     timeout: 90_000,
     timeoutMsg: "large Direct Files graph did not render its journal",
   });
+  const appStartToJournalRenderMs = Math.ceil(performance.now() - appStartStartedAt);
 
   const readyAtFirstSearchStart = projectionReadyEvidence();
   const firstSearchStartedAt = Date.now();
@@ -205,30 +207,22 @@ try {
   await browser.keys(["Escape"]);
   await browser.$(".switcher-input").waitForExist({ reverse: true, timeout: 30_000 });
 
-  await browser.waitUntil(() => fs.existsSync(debugLog) && fs.readFileSync(debugLog, "utf8").includes("[ui] graph load call returned"), {
-    timeout: 30_000,
-    timeoutMsg: "debug trace did not record completion of the graph-load call",
-  });
-
   const log = fs.readFileSync(debugLog, "utf8");
-  const loading = log.match(/^\[\+\s*(\d+)ms\] \[ui\] loading graph:/m);
-  const returned = log.match(/^\[\+\s*(\d+)ms\] \[ui\] graph load call returned/m);
-  if (!loading || !returned) throw new Error("debug trace omitted graph-load boundary timestamps");
-  const loadCallMs = Number(returned[1]) - Number(loading[1]);
-  const phases = log
+  const backendGraphLoadPhases = log
     .split(/\r?\n/)
     .filter((line) => line.includes("graph load phase:"));
   const receipt = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     scenario: "windows-direct-large-open",
     pageCount: PAGE_COUNT,
     assetCount: ASSET_COUNT,
     assetBytes: ASSET_COUNT * assetBytes.length,
     nestedDirectoryCount: 281,
     unicodePaths: true,
-    loadCallMs,
-    maxLoadMs: MAX_LOAD_MS,
-    phases,
+    appStartToJournalRenderMs,
+    maxAppStartToJournalRenderMs: MAX_LOAD_MS,
+    appStartMeasurement: "wall clock from immediately before application launch to first observed rendered journal marker",
+    backendGraphLoadPhases,
     ctrlK: {
       query: marker,
       input: "literal WebDriver Control+K and character keys",
@@ -253,8 +247,8 @@ try {
     },
   };
   fs.writeFileSync(path.join(artifacts, "windows-direct-large-open-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-  if (loadCallMs > MAX_LOAD_MS) {
-    throw new Error(`Direct Files load_graph took ${loadCallMs} ms, above severe-regression ceiling ${MAX_LOAD_MS} ms; phases=${JSON.stringify(phases)}`);
+  if (appStartToJournalRenderMs > MAX_LOAD_MS) {
+    throw new Error(`Direct Files app start to rendered journal marker took ${appStartToJournalRenderMs} ms, above severe-regression ceiling ${MAX_LOAD_MS} ms; backendPhases=${JSON.stringify(backendGraphLoadPhases)}`);
   }
   console.log(`PASS: Windows Direct Files reporter-scale open: ${JSON.stringify(receipt)}`);
 } catch (error) {
