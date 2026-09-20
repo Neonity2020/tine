@@ -1155,8 +1155,7 @@ fn interactive_page_scope_is_applied_before_the_verified_window() {
     let _serial = serialize();
     let root = scratch("friendly-scoped-window");
     std::fs::create_dir_all(root.join("pages")).expect("pages");
-    std::fs::write(root.join("pages/A-InScope.md"), "- needle old scoped\n")
-        .expect("scoped page");
+    std::fs::write(root.join("pages/A-InScope.md"), "- needle old scoped\n").expect("scoped page");
     let outside = (0..650)
         .map(|at| format!("- needle newer outside {at}\n"))
         .collect::<String>();
@@ -1176,8 +1175,8 @@ fn interactive_page_scope_is_applied_before_the_verified_window() {
     );
 
     reset_friendly_read_census();
-    let answer = read(&corpus, &plan, &ResultIdentity::session_owned())
-        .expect("scoped interactive read");
+    let answer =
+        read(&corpus, &plan, &ResultIdentity::session_owned()).expect("scoped interactive read");
     let census = friendly_read_census();
     assert!(matches!(
         answer.hits.first(),
@@ -1246,7 +1245,9 @@ mod virtual_name_candidate_cost_tests {
         connection: &Connection,
         sql: &str,
     ) -> (Vec<(String, String)>, i32, i32, i32) {
-        let mut statement = connection.prepare(sql).expect("candidate statement prepares");
+        let mut statement = connection
+            .prepare(sql)
+            .expect("candidate statement prepares");
         let candidates = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .expect("candidate rows execute")
@@ -1261,11 +1262,9 @@ mod virtual_name_candidate_cost_tests {
     }
 
     fn measure_candidate_work(corpus: &Corpus) -> CandidateWork {
-        let connection = Connection::open_with_flags(
-            corpus.projection_path(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("the projection opens read-only");
+        let connection =
+            Connection::open_with_flags(corpus.projection_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("the projection opens read-only");
         let names = connection
             .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
             .expect("names count");
@@ -1279,8 +1278,7 @@ mod virtual_name_candidate_cost_tests {
             .expect("eligible postings count");
         let sql = candidate_statement();
         let (candidates, vm_steps, fullscan_steps, sorts) = statement_work(&connection, &sql);
-        let (_, legacy_vm_steps, _, _) =
-            statement_work(&connection, legacy_occurrence_statement());
+        let (_, legacy_vm_steps, _, _) = statement_work(&connection, legacy_occurrence_statement());
         let mut explain = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("candidate explain prepares");
@@ -1341,9 +1339,8 @@ mod virtual_name_candidate_cost_tests {
              {sparse:?} vs {repeated:?}"
         );
         assert!(
-            repeated.plan.iter().any(|step| step.contains(
-                "SEARCH r USING COVERING INDEX reference_postings_navigation_names_idx"
-            )),
+            repeated.plan.iter().any(|step| step
+                .contains("SEARCH r USING COVERING INDEX reference_postings_navigation_names_idx")),
             "eligible membership must use the covering target-name index: {:?}",
             repeated.plan
         );
@@ -1379,7 +1376,10 @@ mod virtual_name_candidate_cost_tests {
         let work = measure_candidate_work(&corpus);
         assert_eq!(
             work.candidates,
-            vec![("GHOST NAME".to_string(), crate::refs::page_key("ghost name"))],
+            vec![(
+                "GHOST NAME".to_string(),
+                crate::refs::page_key("ghost name")
+            )],
             "one lexicographically chosen raw spelling survives; repeated references, \
              property names, physical titles and aliases do not add virtual rows"
         );
@@ -1421,6 +1421,9 @@ mod virtual_name_candidate_cost_tests {
             &ResultIdentity::session_owned(),
         )
         .expect("property-name read");
-        assert!(property.hits.is_empty(), "a property name is not a virtual page");
+        assert!(
+            property.hits.is_empty(),
+            "a property name is not a virtual page"
+        );
     }
 }

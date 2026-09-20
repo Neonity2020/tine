@@ -237,10 +237,10 @@ pub(crate) fn read_friendly_results(
                         &projection.visible_lower,
                     )
                     .map(|rank| {
-                            let mut key = rank.order_key().to_vec();
-                            key.extend_from_slice(projection.visible.as_bytes());
-                            key
-                        }))
+                        let mut key = rank.order_key().to_vec();
+                        key.extend_from_slice(projection.visible.as_bytes());
+                        key
+                    }))
                 });
                 branches.push(BoundBranch::Blocks {
                     branch: branch.clone(),
@@ -515,8 +515,7 @@ struct PageDescriptor {
     payload: Option<(usize, usize)>,
 }
 
-const VIRTUAL_REFERENCE_CHOICES_CTE: &str =
-    "reference_choices AS (\
+const VIRTUAL_REFERENCE_CHOICES_CTE: &str = "reference_choices AS (\
          SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
              PARTITION BY n.key ORDER BY n.raw, n.key, n.name_id\
          ) AS name_choice \
@@ -809,9 +808,7 @@ fn read_pages(
                 )
             })?;
             let matched_text_lower = descriptor.matched_text_lower.as_deref().ok_or_else(|| {
-                ResultReadError::Corrupt(
-                    "a selected content page has no folded block text".into(),
-                )
+                ResultReadError::Corrupt("a selected content page has no folded block text".into())
             })?;
             let rank = rank_block_text_folded(
                 plan,
@@ -820,10 +817,10 @@ fn read_pages(
                 matched_text_lower,
             )
             .ok_or_else(|| {
-                    ResultReadError::Corrupt(
-                        "a selected page's block no longer satisfies its rank program".into(),
-                    )
-                })?;
+                ResultReadError::Corrupt(
+                    "a selected page's block no longer satisfies its rank program".into(),
+                )
+            })?;
             if descriptor.rank_key != rank.order_key() {
                 return Err(ResultReadError::Corrupt(
                     "a selected content page rank disagrees with its compiled plan".into(),
@@ -1045,10 +1042,7 @@ fn verified_id_block_source(params: &mut Vec<PhysicalQueryValue>, ids: &[i64]) -
 /// candidate statement. The interactive cursor must apply it before counting
 /// verified matches; applying it only to the later ranked winners lets newer
 /// out-of-scope rows consume the whole window.
-fn block_scope_conditions(
-    params: &mut Vec<PhysicalQueryValue>,
-    plan: &QueryPlan,
-) -> Vec<String> {
+fn block_scope_conditions(params: &mut Vec<PhysicalQueryValue>, plan: &QueryPlan) -> Vec<String> {
     let mut conditions = Vec::new();
     match plan.page_scope() {
         Some(scope) if scope.path.is_some() => {
@@ -1141,13 +1135,8 @@ fn interactive_verified_block_ids(
         #[cfg(test)]
         note_friendly(|census| census.block_candidate_verifications += 1);
         let projection = crate::query::text::visible_projection_from_raw_path(raw, path);
-        if rank_block_text_folded(
-            plan,
-            branch,
-            &projection.visible,
-            &projection.visible_lower,
-        )
-        .is_some()
+        if rank_block_text_folded(plan, branch, &projection.visible, &projection.visible_lower)
+            .is_some()
         {
             ids.push(block_id);
             if ids.len() == window {
@@ -1268,15 +1257,13 @@ fn read_blocks(
                 "one physical block appears twice in Friendly results".into(),
             ));
         }
-        let expected = rank_block_text_folded(
-            plan,
-            branch,
-            &descriptor.visible,
-            &descriptor.visible_lower,
-        )
-        .ok_or_else(|| {
-            ResultReadError::Corrupt("a selected block no longer satisfies its rank program".into())
-        })?;
+        let expected =
+            rank_block_text_folded(plan, branch, &descriptor.visible, &descriptor.visible_lower)
+                .ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "a selected block no longer satisfies its rank program".into(),
+                    )
+                })?;
         if descriptor.rank_key != expected.order_key() {
             return Err(ResultReadError::Corrupt(
                 "a selected block rank disagrees with its compiled plan".into(),
@@ -1319,17 +1306,13 @@ fn read_blocks(
             ResultReadError::Corrupt("an admitted Friendly block has no payload".into())
         })?;
         block.breadcrumb = breadcrumb;
-        let rank = rank_block_text_folded(
-            plan,
-            branch,
-            &descriptor.visible,
-            &descriptor.visible_lower,
-        )
-        .ok_or_else(|| {
-            ResultReadError::Corrupt(
-                "an admitted block no longer satisfies its rank program".into(),
-            )
-        })?;
+        let rank =
+            rank_block_text_folded(plan, branch, &descriptor.visible, &descriptor.visible_lower)
+                .ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "an admitted block no longer satisfies its rank program".into(),
+                    )
+                })?;
         let evidence =
             admitted_block_evidence(plan, branch, &descriptor.visible).ok_or_else(|| {
                 ResultReadError::Corrupt(

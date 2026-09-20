@@ -13,10 +13,7 @@ pub(crate) struct VisibleTextProjection {
     pub(crate) visible_lower: String,
 }
 
-pub(crate) fn visible_projection_from_raw_path(
-    raw: &str,
-    path: &str,
-) -> VisibleTextProjection {
+pub(crate) fn visible_projection_from_raw_path(raw: &str, path: &str) -> VisibleTextProjection {
     let is_org = Format::from_path(Path::new(path)) == Format::Org;
     let block = DocBlock::preamble(raw, is_org);
     let projection = block.projection();
