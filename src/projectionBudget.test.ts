@@ -18,6 +18,7 @@ import {
 
 const repo = path.resolve(__dirname, "..");
 const policy = JSON.parse(fs.readFileSync(path.join(repo, "scripts/projection-budget-policy.json"), "utf8"));
+const searchScalingContract = fs.readFileSync(path.join(repo, "docs/contracts/search-scaling.md"), "utf8");
 
 function measurement(overrides: Record<string, unknown> = {}) {
   return {
@@ -62,9 +63,13 @@ function searchQuery(label: string, needle: string, p95: number, hits: { pages: 
   };
 }
 
-function rawSearchReport(role: "small" | "large" | "pages" | "sentinel", p95: Record<string, number>) {
+type SearchRole = "small" | "blocksLarge" | "namesLarge" | "large" | "pages" | "sentinel";
+
+function rawSearchReport(role: SearchRole, p95: Record<string, number>) {
   const settings = {
     small: { corpus: "dense60k", pages: 1_000, blocks: 60_000, names: 1_010, augmented: true },
+    blocksLarge: { corpus: "dense600k-fixed-names", pages: 1_000, blocks: 600_000, names: 1_010, augmented: true },
+    namesLarge: { corpus: "dense60k-10k-pages", pages: 10_000, blocks: 60_000, names: 10_010, augmented: true },
     large: { corpus: "dense600k", pages: 10_000, blocks: 600_000, names: 10_010, augmented: true },
     pages: { corpus: "brikas", pages: 30_000, blocks: 55_000, names: 31_000, augmented: false },
     sentinel: { corpus: "page-sentinel", pages: 1_002, blocks: 1_002, names: 1_002, augmented: false },
@@ -150,11 +155,35 @@ function rawSearchReport(role: "small" | "large" | "pages" | "sentinel", p95: Re
   };
 }
 
-function pairedSearchFixture(broadRatio = 1.5) {
+function pairedSearchFixture(overrides: {
+  blockBroadRatio?: number;
+  blockSparseRatio?: number;
+  bothBroadMs?: number;
+  bothSparseMs?: number;
+  namesNormalized?: number;
+} = {}) {
+  const blockBroadRatio = overrides.blockBroadRatio ?? 1.5;
+  const blockSparseRatio = overrides.blockSparseRatio ?? 1.5;
+  const bothBroadMs = overrides.bothBroadMs ?? 49.28;
+  const bothSparseMs = overrides.bothSparseMs ?? 41.69;
+  const namesNormalized = overrides.namesNormalized ?? 1.0;
+  const ownerCountRatio = 10_010 / 1_010;
   return {
-    schema: "tine.search_scaling.v1",
+    schema: "tine.search_scaling.v2",
     small: rawSearchReport("small", { nohit: 0.125, broad: 0.25, sparse: 2, fp: 4 }),
-    large: rawSearchReport("large", { nohit: 1.25, broad: 0.25 * broadRatio, sparse: 3, fp: 20 }),
+    blocksLarge: rawSearchReport("blocksLarge", {
+      nohit: 1.25,
+      broad: 0.25 * blockBroadRatio,
+      sparse: 2 * blockSparseRatio,
+      fp: 20,
+    }),
+    namesLarge: rawSearchReport("namesLarge", {
+      nohit: 0.125 * ownerCountRatio * namesNormalized,
+      broad: 0.25 * ownerCountRatio * namesNormalized,
+      sparse: 3,
+      fp: 20,
+    }),
+    large: rawSearchReport("large", { nohit: 1.25, broad: bothBroadMs, sparse: bothSparseMs, fp: 20 }),
     pages: rawSearchReport("pages", { pages: 0.0625 }),
     sentinel: rawSearchReport("sentinel", { sentinel: 0.5 }),
   };
@@ -205,6 +234,18 @@ describe("projection budget policy", () => {
 });
 
 describe("paired search-scaling budget", () => {
+  it("keeps the approved contract values aligned with the executable policy", () => {
+    expect(searchScalingContract).toMatch(/Block growth:[\s\S]{0,200}60,000 to 600,000 blocks[\s\S]{0,300}1\.5×/);
+    expect(searchScalingContract).toMatch(/Both growing:[\s\S]{0,200}600,000-block, 10,000-page[\s\S]{0,300}49\.28 ms[\s\S]{0,100}41\.69 ms/);
+    expect(searchScalingContract).toMatch(/Name growth:[\s\S]{0,200}blocks at 60,000[\s\S]{0,100}pages grow from 1,000 to 10,000[\s\S]{0,300}1\.10/);
+
+    expect(policy.searchScaling.rows["T2-broad"]).toMatchObject({ ratioCeiling: 1.5, bothGrowingHardCeilingMs: 49.28 });
+    expect(policy.searchScaling.rows["T2-sparse"]).toMatchObject({ ratioCeiling: 1.5, bothGrowingHardCeilingMs: 41.69 });
+    expect(policy.searchScaling.rows["T2-names"].normalizedLinearityCeiling).toBe(1.1);
+
+    expect(() => evaluateSearchScaling(pairedSearchFixture(), policy)).not.toThrow();
+  });
+
   it("uses the literal probe labels", () => {
     expect(policy.searchScaling.rows["T2-nohit"].sourceLabel).toBe("nohit_indexable_zqx1");
     expect(policy.searchScaling.rows["T2-broad"].sourceLabel).toBe("broad_2char_synthetic");
@@ -212,14 +253,43 @@ describe("paired search-scaling budget", () => {
     expect(policy.searchScaling.rows["T2-fp"].sourceLabel).toBe("T2-fp");
   });
 
-  it("passes exactly 1.5 and fails 1.5001 without the legacy 10% noise band", () => {
-    const atCeiling = evaluateSearchScaling(pairedSearchFixture(1.5), policy);
+  it("passes exactly 1.5 and fails 1.5001 for fixed-name block growth", () => {
+    const atCeiling = evaluateSearchScaling(pairedSearchFixture({ blockBroadRatio: 1.5 }), policy);
     expect(atCeiling.rows.find((row: SearchScalingRow) => row.id === "T2-broad")?.ok).toBe(true);
     expect(atCeiling.breaches).toEqual([]);
 
-    const over = evaluateSearchScaling(pairedSearchFixture(1.5001), policy);
+    const over = evaluateSearchScaling(pairedSearchFixture({ blockBroadRatio: 1.5001 }), policy);
     expect(policy.noiseBandFraction).toBe(0.1);
     expect(over.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-broad"]);
+
+    const sparseOver = evaluateSearchScaling(pairedSearchFixture({ blockSparseRatio: 1.5001 }), policy);
+    expect(sparseOver.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-sparse"]);
+  });
+
+  it("treats 49.28/41.69 ms as literal both-growing hard caps with no second margin", () => {
+    expect(evaluateSearchScaling(pairedSearchFixture({ bothBroadMs: 49.28, bothSparseMs: 41.69 }), policy).breaches).toEqual([]);
+
+    const broadOver = evaluateSearchScaling(pairedSearchFixture({ bothBroadMs: 49.280001 }), policy);
+    expect(broadOver.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-broad"]);
+    const sparseOver = evaluateSearchScaling(pairedSearchFixture({ bothSparseMs: 41.690001 }), policy);
+    expect(sparseOver.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-sparse"]);
+  });
+
+  it("gates the worst no-hit/broad name timing normalized by measured owner-count growth at 1.10", () => {
+    const atCeiling = evaluateSearchScaling(pairedSearchFixture({ namesNormalized: 1.1 }), policy);
+    const names = atCeiling.rows.find((row: SearchScalingRow) => row.id === "T2-names")!;
+    expect(names.nameGrowth?.smallOwnerCount).toBe(1_010);
+    expect(names.nameGrowth?.namesLargeOwnerCount).toBe(10_010);
+    expect(names.nameGrowth?.ownerCountRatio).toBeCloseTo(10_010 / 1_010);
+    expect(names.nameGrowth?.maxNormalizedLinearity).toBeCloseTo(1.1);
+    expect(names.ok).toBe(true);
+
+    const over = evaluateSearchScaling(pairedSearchFixture({ namesNormalized: 1.1001 }), policy);
+    expect(over.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-names"]);
+
+    const cappedPolicy = structuredClone(policy);
+    cappedPolicy.searchScaling.rows["T2-names"].executor = "capped candidate window";
+    expect(() => evaluateSearchScaling(pairedSearchFixture(), cappedPolicy)).toThrow(/exhaustive navigation owner inventory/);
   });
 
   it("keeps no-hit, false-positive, and page-search exceptions unjudged", () => {
@@ -236,6 +306,9 @@ describe("paired search-scaling budget", () => {
     }
     const rendered = formatSearchScalingRows(rows);
     expect(rendered).toContain("0.125 ms");
+    expect(rendered).toContain("both-growing HARD ≤49.28 ms");
+    expect(rendered).toContain("1010→10010 owner rows");
+    expect(rendered).toContain("max normalized time/name growth");
     expect(rendered).toContain("(no baseline)");
   });
 
@@ -244,7 +317,8 @@ describe("paired search-scaling budget", () => {
     const withBaseline = structuredClone(policy);
     withBaseline.searchScaling.baseline = baselineFromSearchScaling(report, policy);
     const rows = evaluateSearchScaling(report, withBaseline).rows;
-    expect(rows.every((row: SearchScalingRow) => row.baselineComparison !== null)).toBe(true);
+    expect(rows.filter((row: SearchScalingRow) => row.id !== "T2-names").every((row: SearchScalingRow) => row.baselineComparison !== null)).toBe(true);
+    expect(rows.find((row: SearchScalingRow) => row.id === "T2-names")?.baselineComparison).toBeNull();
     expect(formatSearchScalingRows(rows)).toContain("small 1x; large 1x; ratio 1x baseline");
     expect(formatSearchScalingRows(rows)).toContain("page 1x baseline");
   });
@@ -252,7 +326,7 @@ describe("paired search-scaling budget", () => {
   it.each([
     ["zero p95", (report: any) => { report.small.queries[0].surfaces[2].p95_ms = 0; }, /positive finite/],
     ["non-finite p95", (report: any) => { report.large.queries[1].surfaces[2].p95_ms = Infinity; }, /positive finite/],
-    ["missing required row", (report: any) => { report.small.queries = report.small.queries.filter((query: any) => query.label !== "T2-sparse"); }, /missing required label "T2-sparse"/],
+    ["missing required row", (report: any) => { report.small.queries = report.small.queries.filter((query: any) => query.label !== "T2-sparse"); }, /query workload must match/],
     ["wrong raw run length", (report: any) => { report.large.queries[0].surfaces[2].raw_ns.pop(); }, /does not match runs/],
   ] as Array<[string, (report: any) => void, RegExp]>)("rejects malformed input: %s", (_label, mutate, message) => {
     const report = pairedSearchFixture();
@@ -261,51 +335,113 @@ describe("paired search-scaling budget", () => {
   });
 
   it.each([
-    ["needle", (report: any) => { report.large.queries[1].needle = "世界"; }, /needles must match/],
+    ["needle", (report: any) => { report.large.queries[1].needle = "世界"; }, /query workload must match/],
     ["limits", (report: any) => { report.large.limits.combined.block = 99; }, /must be 100/],
     ["production tree", (report: any) => { report.large.current_backend_provenance.production_source_hash.value = "b".repeat(40); }, /identity does not match/],
-    ["augmentation hash", (report: any) => { report.large.scratch_augmentation.manifest_sha256 = "b".repeat(64); }, /SHA-256 values must match/],
+    ["augmentation hash", (report: any) => { report.large.scratch_augmentation.manifest_sha256 = "b".repeat(64); }, /scratch augmentation must match/],
     ["original block count", (report: any) => { report.large.block_count = report.large.corpus_counts.original_block_count = 599_999; }, /must be 600000/],
     ["measurement runs", (report: any) => {
       report.large.runs = 4;
       report.large.queries.forEach((query: any) => query.surfaces.forEach((surface: any) => surface.raw_ns.push(130)));
-    }, /small and large runs must match/],
-    ["warmup settings", (report: any) => { report.large.warmups_per_surface = 2; }, /small and large warmups_per_surface must match/],
+    }, /large runs must match small/],
+    ["warmup settings", (report: any) => { report.large.warmups_per_surface = 2; }, /large warmups_per_surface must match small/],
   ] as Array<[string, (report: any) => void, RegExp]>)("rejects a mismatched pair: %s", (_label, mutate, message) => {
     const report = pairedSearchFixture();
     mutate(report);
     expect(() => evaluateSearchScaling(report, policy)).toThrow(message);
   });
 
-  it("requires one production/backend identity across every role", () => {
-    for (const role of ["small", "large", "pages", "sentinel"] as const) {
+  it("rejects legacy wrappers and either missing scaling axis", () => {
+    const legacy = pairedSearchFixture() as any;
+    legacy.schema = "tine.search_scaling.v1";
+    delete legacy.blocksLarge;
+    delete legacy.namesLarge;
+    expect(() => evaluateSearchScaling(legacy, policy)).toThrow(/wrapper\.schema must be tine\.search_scaling\.v2/);
+
+    for (const role of ["blocksLarge", "namesLarge"] as const) {
       const report = pairedSearchFixture() as any;
-      report[role].backend_under_test = `other-${role}`;
-      expect(() => evaluateSearchScaling(report, policy), role).toThrow(/production\/backend identity does not match/);
+      delete report[role];
+      expect(() => evaluateSearchScaling(report, policy), role).toThrow(new RegExp(`${role} must be an object`));
     }
   });
 
-  it("requires matching probe harnesses within each measurement pair only", () => {
-    const mismatchedPerformancePair = pairedSearchFixture() as any;
-    mismatchedPerformancePair.large.current_backend_provenance.probe_source_sha256 = "b".repeat(64);
-    expect(() => evaluateSearchScaling(mismatchedPerformancePair, policy)).toThrow(
-      /small and large probe harness SHA-256 values must match/,
-    );
+  it.each([
+    ["small pages", (report: any) => { report.small.page_count = report.small.corpus_counts.original_page_count = 999; }, /small original_page_count must be 1000/],
+    ["blocksLarge pages", (report: any) => { report.blocksLarge.page_count = report.blocksLarge.corpus_counts.original_page_count = 1_001; }, /blocksLarge original_page_count must be 1000/],
+    ["namesLarge blocks", (report: any) => { report.namesLarge.block_count = report.namesLarge.corpus_counts.original_block_count = 60_001; }, /namesLarge original_block_count must be 60000/],
+    ["large pages", (report: any) => { report.large.page_count = report.large.corpus_counts.original_page_count = 9_999; }, /large original_page_count must be 10000/],
+    ["fixed low-name inventory", (report: any) => { report.blocksLarge.navigation_name_inventory.count += 1; }, /small and blocksLarge navigation owner inventory counts must match/],
+    ["fixed high-name inventory", (report: any) => { report.large.navigation_name_inventory.count += 1; }, /namesLarge and large navigation owner inventory counts must match/],
+    ["inventory method", (report: any) => { report.namesLarge.navigation_name_inventory.method = "other"; }, /navigation_name_inventory\.method must match small/],
+    ["non-growing inventory", (report: any) => {
+      report.namesLarge.navigation_name_inventory.count = report.large.navigation_name_inventory.count = 1_010;
+    }, /namesLarge navigation owner inventory count minus small must equal 9000/],
+    ["extra owner growth", (report: any) => {
+      report.namesLarge.navigation_name_inventory.count += 1;
+      report.large.navigation_name_inventory.count += 1;
+    }, /namesLarge navigation owner inventory count minus small must equal 9000/],
+  ] as Array<[string, (report: any) => void, RegExp]>)("rejects a mismatched or non-growing axis: %s", (_label, mutate, message) => {
+    const report = pairedSearchFixture();
+    mutate(report);
+    expect(() => evaluateSearchScaling(report, policy)).toThrow(message);
+  });
 
-    const mismatchedCorrectnessPair = pairedSearchFixture() as any;
-    mismatchedCorrectnessPair.sentinel.current_backend_provenance.probe_source_sha256 = "b".repeat(64);
-    expect(() => evaluateSearchScaling(mismatchedCorrectnessPair, policy)).toThrow(
-      /pages and sentinel probe harness SHA-256 values must match/,
-    );
+  it("requires the four scaling-axis reports to share workload and augmentation", () => {
+    const workload = pairedSearchFixture() as any;
+    workload.namesLarge.queries.reverse();
+    expect(() => evaluateSearchScaling(workload, policy)).toThrow(/namesLarge query workload must match small/);
 
-    const legitimatePairRevisions = pairedSearchFixture() as any;
-    legitimatePairRevisions.pages.current_backend_provenance.probe_source_sha256 = "b".repeat(64);
-    legitimatePairRevisions.sentinel.current_backend_provenance.probe_source_sha256 = "b".repeat(64);
-    expect(() => evaluateSearchScaling(legitimatePairRevisions, policy)).not.toThrow();
+    const augmentation = pairedSearchFixture() as any;
+    augmentation.blocksLarge.scratch_augmentation.sparse_query = "different";
+    expect(() => evaluateSearchScaling(augmentation, policy)).toThrow(/blocksLarge scratch augmentation must match small/);
+  });
+
+  it("requires the page and sentinel role-specific workloads to remain unaugmented", () => {
+    const augmentedPages = pairedSearchFixture() as any;
+    augmentedPages.pages.scratch_augmentation.provided = true;
+    expect(() => evaluateSearchScaling(augmentedPages, policy)).toThrow(/pages\.scratch_augmentation\.provided must be false/);
+
+    const extraSentinelWork = pairedSearchFixture() as any;
+    const extra = structuredClone(extraSentinelWork.sentinel.queries[0]);
+    extra.label = "other";
+    extraSentinelWork.sentinel.queries.push(extra);
+    expect(() => evaluateSearchScaling(extraSentinelWork, policy)).toThrow(/sentinel query workload must contain only exact_old_page/);
+  });
+
+  it("requires one production/backend identity across every role", () => {
+    for (const role of ["small", "blocksLarge", "namesLarge", "large", "pages", "sentinel"] as const) {
+      const report = pairedSearchFixture() as any;
+      report[role].backend_under_test = `other-${role}`;
+      expect(() => evaluateSearchScaling(report, policy), role).toThrow(/production\/backend\/probe identity does not match/);
+    }
+  });
+
+  it("requires paired storage provenance to match whenever any report supplies it", () => {
+    const mismatched = pairedSearchFixture() as any;
+    for (const role of ["small", "blocksLarge", "namesLarge", "large", "pages", "sentinel"] as const) {
+      mismatched[role].current_backend_provenance.paired_storage_commit = "a".repeat(40);
+    }
+    mismatched.large.current_backend_provenance.paired_storage_commit = "b".repeat(40);
+    expect(() => evaluateSearchScaling(mismatched, policy)).toThrow(/production\/backend\/probe identity does not match/);
+
+    const missing = pairedSearchFixture() as any;
+    for (const role of ["small", "blocksLarge", "namesLarge", "large", "pages", "sentinel"] as const) {
+      missing[role].current_backend_provenance.paired_storage_commit = "a".repeat(40);
+    }
+    delete missing.large.current_backend_provenance.paired_storage_commit;
+    expect(() => evaluateSearchScaling(missing, policy)).toThrow(/production\/backend\/probe identity does not match/);
+  });
+
+  it("requires one probe harness across all six reports", () => {
+    for (const role of ["blocksLarge", "namesLarge", "large", "pages", "sentinel"] as const) {
+      const report = pairedSearchFixture() as any;
+      report[role].current_backend_provenance.probe_source_sha256 = "b".repeat(64);
+      expect(() => evaluateSearchScaling(report, policy), role).toThrow(/production\/backend\/probe identity does not match/);
+    }
   });
 
   it("requires copied-corpus fixtures, the sentinel fixture, and excluded warmups", () => {
-    for (const role of ["small", "large", "pages", "sentinel"] as const) {
+    for (const role of ["small", "blocksLarge", "namesLarge", "large", "pages", "sentinel"] as const) {
       const wrongFixture = pairedSearchFixture() as any;
       wrongFixture[role].fixture_mode = "wrong";
       expect(() => evaluateSearchScaling(wrongFixture, policy), role).toThrow(/fixture_mode must be/);
@@ -350,12 +486,16 @@ describe("paired search-scaling budget", () => {
   it("records only scalar summaries and reproducibility identities", () => {
     const baseline = baselineFromSearchScaling(pairedSearchFixture(), policy) as any;
     expect(baseline.counts.small).toEqual({ original_pages: 1_000, original_blocks: 60_000, navigation_owner_rows: 1_010 });
+    expect(baseline.counts.blocksLarge).toEqual({ original_pages: 1_000, original_blocks: 600_000, navigation_owner_rows: 1_010 });
+    expect(baseline.counts.namesLarge).toEqual({ original_pages: 10_000, original_blocks: 60_000, navigation_owner_rows: 10_010 });
     expect(baseline.counts.large.original_blocks).toBe(600_000);
     expect(baseline.augmentation_sha256).toBe("a".repeat(64));
     expect(baseline.queries["T2-sparse"]).toBe("s7sparseanchor543");
     expect(baseline.queries["T2-pages"]).toBe("zqx1");
     expect(baseline.source_identity.probe_source_sha256_by_role).toEqual({
       small: "c".repeat(64),
+      blocksLarge: "c".repeat(64),
+      namesLarge: "c".repeat(64),
       large: "c".repeat(64),
       pages: "c".repeat(64),
       sentinel: "c".repeat(64),

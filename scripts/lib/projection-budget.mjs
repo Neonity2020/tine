@@ -94,9 +94,13 @@ export function baselineFrom(measurement) {
   };
 }
 
-const SEARCH_REPORT_SCHEMA = "tine.search_scaling.v1";
+const SEARCH_REPORT_SCHEMA = "tine.search_scaling.v2";
+const SEARCH_POLICY_SCHEMA = "tine.search_scaling_budget.v2";
 const RAW_SEARCH_REPORT_SCHEMA = "tine.s7_page_search_probe.v1";
-const SEARCH_ROW_IDS = ["T2-nohit", "T2-broad", "T2-sparse", "T2-fp", "T2-pages"];
+const EXHAUSTIVE_NAME_EXECUTOR = "exhaustive navigation owner inventory (no candidate cap)";
+const SEARCH_ROLES = ["small", "blocksLarge", "namesLarge", "large", "pages", "sentinel"];
+const AXIS_ROLES = ["small", "blocksLarge", "namesLarge", "large"];
+const SEARCH_ROW_IDS = ["T2-nohit", "T2-broad", "T2-sparse", "T2-fp", "T2-names", "T2-pages"];
 const CROSS_SCALE_ROW_IDS = SEARCH_ROW_IDS.slice(0, 4);
 
 const searchInvalid = (message) => {
@@ -218,6 +222,7 @@ function validateRawReport(report, role, expectedCorpus) {
     searchInvalid(`${path} top-level page_count/block_count must equal the original corpus counts`);
   }
   const inventory = requireObject(report.navigation_name_inventory, `${path}.navigation_name_inventory`);
+  requireString(inventory.method, `${path}.navigation_name_inventory.method`);
   requirePositiveInteger(inventory.count, `${path}.navigation_name_inventory.count`);
   if (typeof inventory.count_unit !== "string" || !inventory.count_unit.includes("owner rows")) {
     searchInvalid(`${path}.navigation_name_inventory.count_unit must identify navigable owner rows`);
@@ -259,7 +264,7 @@ function findSurface(query, surface, role) {
   return result;
 }
 
-function validateSameSource(reports) {
+function validateSameSourceAndProbe(reports) {
   const [firstRole, first] = reports[0];
   const comparable = (report) => ({
     measurement_kind: report.measurement_kind,
@@ -268,17 +273,50 @@ function validateSameSource(reports) {
     public_base_sha: report.current_backend_provenance.public_base_sha,
     production_source_hash: report.current_backend_provenance.production_source_hash,
     production_source_scope: report.current_backend_provenance.production_source_scope,
+    probe_source_sha256: report.current_backend_provenance.probe_source_sha256,
+    paired_storage_commit: report.current_backend_provenance.paired_storage_commit,
   });
   for (const [role, report] of reports.slice(1)) {
     if (!sameValue(comparable(first), comparable(report))) {
-      searchInvalid(`${role} production/backend identity does not match ${firstRole}`);
+      searchInvalid(`${role} production/backend/probe identity does not match ${firstRole}`);
     }
   }
 }
 
-function validateSameProbeHarness(leftRole, left, rightRole, right) {
-  if (left.current_backend_provenance.probe_source_sha256 !== right.current_backend_provenance.probe_source_sha256) {
-    searchInvalid(`${leftRole} and ${rightRole} probe harness SHA-256 values must match`);
+function validateSameRunConfiguration(reports) {
+  const [firstRole, first] = reports[0];
+  for (const [role, report] of reports.slice(1)) {
+    if (!sameValue(first.limits, report.limits)) {
+      searchInvalid(`${role} limits must match ${firstRole}`);
+    }
+    if (report.runs !== first.runs) {
+      searchInvalid(`${role} runs must match ${firstRole}`);
+    }
+    if (report.warmups_per_surface !== first.warmups_per_surface) {
+      searchInvalid(`${role} warmups_per_surface must match ${firstRole}`);
+    }
+  }
+}
+
+function workloadIdentity(report) {
+  return report.queries.map((query) => ({
+    label: query.label,
+    needle: query.needle,
+    surfaces: query.surfaces.map((surface) => ({
+      surface: surface.surface,
+      page_limit: surface.page_limit,
+      block_limit: surface.block_limit,
+    })),
+  }));
+}
+
+function validateSameAxisWorkload(reports) {
+  const [firstRole, first] = reports[0];
+  const firstWorkload = workloadIdentity(first);
+  for (const [role, report] of reports.slice(1)) {
+    if (!sameValue(workloadIdentity(report), firstWorkload)) {
+      searchInvalid(`${role} query workload must match ${firstRole}`);
+    }
   }
 }
 
@@ -306,6 +344,19 @@ function validateAugmentation(report, role) {
   return augmentation;
 }
 
+function validateNoAugmentation(report, role) {
+  const augmentation = requireObject(report.scratch_augmentation, `${role}.scratch_augmentation`);
+  if (augmentation.provided !== false) searchInvalid(`${role}.scratch_augmentation.provided must be false`);
+  const counts = report.corpus_counts;
+  if (counts.augmentation_added_page_count !== 0 || counts.augmentation_added_block_count !== 0) {
+    searchInvalid(`${role}.corpus_counts must report no scratch augmentation`);
+  }
+  if (counts.actual_page_count_after_augmentation !== report.page_count
+      || counts.actual_block_count_after_augmentation !== report.block_count) {
+    searchInvalid(`${role}.corpus_counts totals must equal the unaugmented original counts`);
+  }
+}
+
 function assertHits(surface, expected, path) {
   for (const [field, value] of Object.entries(expected)) {
     if (surface.actual_hits[field] !== value) searchInvalid(`${path}.actual_hits.${field} must be ${value}`);
@@ -316,73 +367,146 @@ function searchScalingSummary(input, policy) {
   requireObject(input, "wrapper");
   if (input.schema !== SEARCH_REPORT_SCHEMA) searchInvalid(`wrapper.schema must be ${SEARCH_REPORT_SCHEMA}`);
   const searchPolicy = requireObject(policy?.searchScaling, "policy.searchScaling");
+  if (searchPolicy.schema !== SEARCH_POLICY_SCHEMA) {
+    searchInvalid(`policy.searchScaling.schema must be ${SEARCH_POLICY_SCHEMA}`);
+  }
   const corpora = requireObject(searchPolicy.corpora, "policy.searchScaling.corpora");
   const rowPolicy = requireObject(searchPolicy.rows, "policy.searchScaling.rows");
   for (const id of SEARCH_ROW_IDS) requireObject(rowPolicy[id], `policy.searchScaling.rows.${id}`);
 
-  const small = validateRawReport(input.small, "small", corpora.small);
-  const large = validateRawReport(input.large, "large", corpora.large);
-  const pages = validateRawReport(input.pages, "pages", corpora.pages);
-  const sentinel = validateRawReport(input.sentinel, "sentinel", corpora.sentinel);
-  validateSameSource([["small", small], ["large", large], ["pages", pages], ["sentinel", sentinel]]);
-  validateSameProbeHarness("small", small, "large", large);
-  validateSameProbeHarness("pages", pages, "sentinel", sentinel);
-  if (small.corpus_counts.original_block_count !== 60_000) searchInvalid("small original_block_count must be 60000");
-  if (large.corpus_counts.original_block_count !== 600_000) searchInvalid("large original_block_count must be 600000");
-  if (!sameValue(small.limits, large.limits)) searchInvalid("small and large limits must match");
-  if (small.runs !== large.runs) searchInvalid("small and large runs must match");
-  if (small.warmups_per_surface !== large.warmups_per_surface) {
-    searchInvalid("small and large warmups_per_surface must match");
+  const reports = Object.fromEntries(SEARCH_ROLES.map((role) => {
+    const expectedCorpus = requireString(corpora[role], `policy.searchScaling.corpora.${role}`);
+    return [role, validateRawReport(input[role], role, expectedCorpus)];
+  }));
+  const reportEntries = SEARCH_ROLES.map((role) => [role, reports[role]]);
+  const axisEntries = AXIS_ROLES.map((role) => [role, reports[role]]);
+  validateSameSourceAndProbe(reportEntries);
+  validateSameRunConfiguration(reportEntries);
+  validateSameAxisWorkload(axisEntries);
+
+  const expectedAxisCounts = {
+    small: { pages: 1_000, blocks: 60_000 },
+    blocksLarge: { pages: 1_000, blocks: 600_000 },
+    namesLarge: { pages: 10_000, blocks: 60_000 },
+    large: { pages: 10_000, blocks: 600_000 },
+  };
+  for (const [role, expected] of Object.entries(expectedAxisCounts)) {
+    const counts = reports[role].corpus_counts;
+    if (counts.original_page_count !== expected.pages) {
+      searchInvalid(`${role} original_page_count must be ${expected.pages}`);
+    }
+    if (counts.original_block_count !== expected.blocks) {
+      searchInvalid(`${role} original_block_count must be ${expected.blocks}`);
+    }
+  }
+  if (reports.small.navigation_name_inventory.count !== reports.blocksLarge.navigation_name_inventory.count) {
+    searchInvalid("small and blocksLarge navigation owner inventory counts must match for fixed-name block growth");
+  }
+  if (reports.namesLarge.navigation_name_inventory.count !== reports.large.navigation_name_inventory.count) {
+    searchInvalid("namesLarge and large navigation owner inventory counts must match for fixed-name block growth");
+  }
+  if (reports.namesLarge.navigation_name_inventory.count - reports.small.navigation_name_inventory.count !== 9_000) {
+    searchInvalid("namesLarge navigation owner inventory count minus small must equal 9000 added physical pages");
+  }
+  for (const role of AXIS_ROLES.slice(1)) {
+    for (const field of ["method", "count_unit"]) {
+      if (reports[role].navigation_name_inventory[field] !== reports.small.navigation_name_inventory[field]) {
+        searchInvalid(`${role} navigation_name_inventory.${field} must match small`);
+      }
+    }
   }
 
-  const smallAugmentation = validateAugmentation(small, "small");
-  const largeAugmentation = validateAugmentation(large, "large");
-  if (smallAugmentation.manifest_sha256 !== largeAugmentation.manifest_sha256) {
-    searchInvalid("small and large augmentation manifest SHA-256 values must match");
+  const augmentations = Object.fromEntries(axisEntries.map(([role, report]) => [role, validateAugmentation(report, role)]));
+  for (const role of AXIS_ROLES.slice(1)) {
+    if (!sameValue(augmentations[role], augmentations.small)) {
+      searchInvalid(`${role} scratch augmentation must match small`);
+    }
   }
+  validateNoAugmentation(reports.pages, "pages");
+  validateNoAugmentation(reports.sentinel, "sentinel");
 
   const rows = {};
   for (const id of CROSS_SCALE_ROW_IDS) {
     const config = rowPolicy[id];
-    const smallQuery = findQuery(small, requireString(config.sourceLabel, `policy.searchScaling.rows.${id}.sourceLabel`), "small");
-    const largeQuery = findQuery(large, config.sourceLabel, "large");
-    if (smallQuery.needle !== largeQuery.needle) searchInvalid(`${id} small and large needles must match`);
-    const smallSurface = findSurface(smallQuery, config.surface, "small");
-    const largeSurface = findSurface(largeQuery, config.surface, "large");
+    const sourceLabel = requireString(config.sourceLabel, `policy.searchScaling.rows.${id}.sourceLabel`);
+    const surfaceName = requireString(config.surface, `policy.searchScaling.rows.${id}.surface`);
+    const queries = Object.fromEntries(AXIS_ROLES.map((role) => [role, findQuery(reports[role], sourceLabel, role)]));
+    const surfaces = Object.fromEntries(AXIS_ROLES.map((role) => [role, findSurface(queries[role], surfaceName, role)]));
     rows[id] = {
-      needle: smallQuery.needle,
-      smallP95Ms: smallSurface.p95_ms,
-      largeP95Ms: largeSurface.p95_ms,
-      ratio: largeSurface.p95_ms / smallSurface.p95_ms,
-      smallSurface,
-      largeSurface,
+      needle: queries.small.needle,
+      smallP95Ms: surfaces.small.p95_ms,
+      blocksLargeP95Ms: surfaces.blocksLarge.p95_ms,
+      namesLargeP95Ms: surfaces.namesLarge.p95_ms,
+      largeP95Ms: surfaces.large.p95_ms,
+      blockRatio: surfaces.blocksLarge.p95_ms / surfaces.small.p95_ms,
+      bothGrowingRatio: surfaces.large.p95_ms / surfaces.small.p95_ms,
+      surfaces,
     };
   }
 
   if ([...rows["T2-nohit"].needle].length < 3) searchInvalid("T2-nohit needle must contain at least three Unicode scalars");
-  for (const [role, report] of [["small", small], ["large", large]]) {
+  for (const role of AXIS_ROLES) {
+    const report = reports[role];
     const nohit = findQuery(report, rowPolicy["T2-nohit"].sourceLabel, role);
     for (const surface of nohit.surfaces) assertHits(surface, { total: 0 }, `${role}.T2-nohit.${surface.surface}`);
   }
   if ([...rows["T2-broad"].needle].length !== 2) searchInvalid("T2-broad needle must contain exactly two Unicode scalars");
-  for (const role of ["small", "large"]) {
-    const surface = rows["T2-broad"][`${role}Surface`];
-    assertHits(surface, { blocks: 100 }, `${role}.T2-broad.combined`);
+  for (const role of AXIS_ROLES) {
+    assertHits(rows["T2-broad"].surfaces[role], { blocks: 100 }, `${role}.T2-broad.combined`);
+    assertHits(rows["T2-sparse"].surfaces[role], { total: 7, pages: 0, blocks: 7 }, `${role}.T2-sparse.combined`);
+    assertHits(rows["T2-fp"].surfaces[role], { total: 1, pages: 0, blocks: 1 }, `${role}.T2-fp.combined`);
   }
-  for (const role of ["small", "large"]) {
-    assertHits(rows["T2-sparse"][`${role}Surface`], { total: 7, pages: 0, blocks: 7 }, `${role}.T2-sparse.combined`);
-    assertHits(rows["T2-fp"][`${role}Surface`], { total: 1, pages: 0, blocks: 1 }, `${role}.T2-fp.combined`);
-  }
-  if (rows["T2-sparse"].needle !== smallAugmentation.sparse_query || rows["T2-sparse"].needle !== largeAugmentation.sparse_query) {
-    searchInvalid("T2-sparse needle must match both augmentation sparse_query values");
+  for (const role of AXIS_ROLES) {
+    if (rows["T2-sparse"].needle !== augmentations[role].sparse_query) {
+      searchInvalid(`T2-sparse needle must match ${role} augmentation sparse_query`);
+    }
   }
 
-  const pagesQuery = findQuery(pages, rowPolicy["T2-pages"].sourceLabel, "pages");
+  const namesConfig = rowPolicy["T2-names"];
+  if (!Array.isArray(namesConfig.sourceLabels) || namesConfig.sourceLabels.length !== 2) {
+    searchInvalid("policy.searchScaling.rows.T2-names.sourceLabels must contain no-hit and broad labels");
+  }
+  const namesSurfaceName = requireString(namesConfig.surface, "policy.searchScaling.rows.T2-names.surface");
+  if (namesSurfaceName !== "page_only") searchInvalid("policy.searchScaling.rows.T2-names.surface must be page_only");
+  if (namesConfig.executor !== EXHAUSTIVE_NAME_EXECUTOR) {
+    searchInvalid(`policy.searchScaling.rows.T2-names.executor must be ${JSON.stringify(EXHAUSTIVE_NAME_EXECUTOR)}`);
+  }
+  const nameCounts = {
+    small: reports.small.navigation_name_inventory.count,
+    namesLarge: reports.namesLarge.navigation_name_inventory.count,
+  };
+  nameCounts.ratio = nameCounts.namesLarge / nameCounts.small;
+  const nameCases = namesConfig.sourceLabels.map((sourceLabel, index) => {
+    requireString(sourceLabel, `policy.searchScaling.rows.T2-names.sourceLabels[${index}]`);
+    const smallSurface = findSurface(findQuery(reports.small, sourceLabel, "small"), namesSurfaceName, "small");
+    const namesLargeSurface = findSurface(findQuery(reports.namesLarge, sourceLabel, "namesLarge"), namesSurfaceName, "namesLarge");
+    const timeRatio = namesLargeSurface.p95_ms / smallSurface.p95_ms;
+    return {
+      sourceLabel,
+      smallP95Ms: smallSurface.p95_ms,
+      namesLargeP95Ms: namesLargeSurface.p95_ms,
+      timeRatio,
+      normalizedLinearity: timeRatio / nameCounts.ratio,
+    };
+  });
+  const expectedNameLabels = [rowPolicy["T2-nohit"].sourceLabel, rowPolicy["T2-broad"].sourceLabel];
+  if (!sameValue(namesConfig.sourceLabels, expectedNameLabels)) {
+    searchInvalid("policy.searchScaling.rows.T2-names.sourceLabels must be the no-hit and broad labels in that order");
+  }
+  assertHits(findSurface(findQuery(reports.namesLarge, rowPolicy["T2-nohit"].sourceLabel, "namesLarge"), "page_only", "namesLarge"), { total: 0 }, "namesLarge.T2-nohit.page_only");
+  assertHits(findSurface(findQuery(reports.small, rowPolicy["T2-broad"].sourceLabel, "small"), "page_only", "small"), { pages: 100, blocks: 0 }, "small.T2-broad.page_only");
+  assertHits(findSurface(findQuery(reports.namesLarge, rowPolicy["T2-broad"].sourceLabel, "namesLarge"), "page_only", "namesLarge"), { pages: 100, blocks: 0 }, "namesLarge.T2-broad.page_only");
+
+  const pagesQuery = findQuery(reports.pages, rowPolicy["T2-pages"].sourceLabel, "pages");
+  if (reports.pages.queries.length !== 1) searchInvalid("pages query workload must contain only the page-search no-hit probe");
   if (pagesQuery.needle !== rows["T2-nohit"].needle) searchInvalid("T2-pages no-hit needle must match the paired T2-nohit needle");
   const pagesSurface = findSurface(pagesQuery, rowPolicy["T2-pages"].surface, "pages");
   assertHits(pagesSurface, { total: 0, pages: 0, blocks: 0 }, "pages.T2-pages.quick_switch_100");
 
-  const checks = requireObject(sentinel.sentinel_checks, "sentinel.sentinel_checks");
+  const checks = requireObject(reports.sentinel.sentinel_checks, "sentinel.sentinel_checks");
+  if (reports.sentinel.queries.length !== 1 || reports.sentinel.queries[0].label !== "exact_old_page") {
+    searchInvalid("sentinel query workload must contain only exact_old_page");
+  }
   for (const field of ["sentinel_created_before_later_pages", "quick_switch_returned_exact", "page_only_returned_exact", "passed"]) {
     if (checks[field] !== true) searchInvalid(`sentinel.sentinel_checks.${field} must be true`);
   }
@@ -405,14 +529,13 @@ function searchScalingSummary(input, policy) {
   }
 
   return {
-    small,
-    large,
-    pages,
-    sentinel,
+    ...reports,
     rows,
+    nameCounts,
+    nameCases,
     pagesNeedle: pagesQuery.needle,
     pagesP95Ms: pagesSurface.p95_ms,
-    augmentationHash: smallAugmentation.manifest_sha256,
+    augmentationHash: augmentations.small.manifest_sha256,
   };
 }
 
@@ -438,41 +561,98 @@ function baselineComparison(id, current, baseline) {
 }
 
 // Evaluate the manager-provided wrapper without building or rerunning a probe.
-// T2-broad and T2-sparse use their hard ratio ceilings directly: the legacy
-// policy noise band deliberately does not apply. The other rows are named,
-// unjudged diagnostics.
+// All three scaling gates are literal: neither the legacy policy noise band nor
+// any second margin applies to the strict ratio, hard-ms, or normalized gates.
 export function evaluateSearchScaling(input, policy) {
   const summary = searchScalingSummary(input, policy);
   const searchPolicy = policy.searchScaling;
   const rows = CROSS_SCALE_ROW_IDS.map((id) => {
     const current = summary.rows[id];
     const config = searchPolicy.rows[id];
+    const gated = id === "T2-broad" || id === "T2-sparse";
     const ceiling = config.ratioCeiling;
-    if (ceiling !== null) requirePositiveFinite(ceiling, `policy.searchScaling.rows.${id}.ratioCeiling`);
-    const ok = ceiling == null ? null : current.ratio <= ceiling;
+    if (gated) requirePositiveFinite(ceiling, `policy.searchScaling.rows.${id}.ratioCeiling`);
+    else if (ceiling !== null) searchInvalid(`policy.searchScaling.rows.${id}.ratioCeiling must be null`);
+    const hardCeilingMs = gated
+      ? requirePositiveFinite(config.bothGrowingHardCeilingMs, `policy.searchScaling.rows.${id}.bothGrowingHardCeilingMs`)
+      : null;
+    const ratio = gated ? current.blockRatio : current.bothGrowingRatio;
+    const ratioOk = gated ? ratio <= ceiling : null;
+    const hardCeilingOk = gated ? current.largeP95Ms <= hardCeilingMs : null;
+    const ok = gated ? ratioOk && hardCeilingOk : null;
+    const historicalCurrent = {
+      smallP95Ms: current.smallP95Ms,
+      largeP95Ms: current.largeP95Ms,
+      ratio: current.bothGrowingRatio,
+    };
     return {
       id,
       label: id,
       smallP95Ms: current.smallP95Ms,
+      blocksLargeP95Ms: current.blocksLargeP95Ms,
+      namesLargeP95Ms: current.namesLargeP95Ms,
       largeP95Ms: current.largeP95Ms,
       pageP95Ms: null,
-      ratio: current.ratio,
+      ratio,
       ceiling,
+      ratioOk,
+      hardCeilingMs,
+      hardCeilingOk,
+      nameGrowth: null,
       ok,
       status: ok == null ? "DIAGNOSTIC" : ok ? "PASS" : "BREACH",
       exception: config.exception ?? null,
-      baselineComparison: baselineComparison(id, current, searchPolicy.baseline),
+      baselineComparison: baselineComparison(id, historicalCurrent, searchPolicy.baseline),
     };
+  });
+  const namesConfig = searchPolicy.rows["T2-names"];
+  const namesCeiling = requirePositiveFinite(
+    namesConfig.normalizedLinearityCeiling,
+    "policy.searchScaling.rows.T2-names.normalizedLinearityCeiling",
+  );
+  const maxNormalizedLinearity = Math.max(...summary.nameCases.map((entry) => entry.normalizedLinearity));
+  const namesOk = maxNormalizedLinearity <= namesCeiling;
+  rows.push({
+    id: "T2-names",
+    label: "T2-names",
+    smallP95Ms: null,
+    blocksLargeP95Ms: null,
+    namesLargeP95Ms: null,
+    largeP95Ms: null,
+    pageP95Ms: null,
+    ratio: maxNormalizedLinearity,
+    ceiling: namesCeiling,
+    ratioOk: namesOk,
+    hardCeilingMs: null,
+    hardCeilingOk: null,
+    nameGrowth: {
+      executor: namesConfig.executor,
+      smallOwnerCount: summary.nameCounts.small,
+      namesLargeOwnerCount: summary.nameCounts.namesLarge,
+      ownerCountRatio: summary.nameCounts.ratio,
+      cases: summary.nameCases,
+      maxNormalizedLinearity,
+    },
+    ok: namesOk,
+    status: namesOk ? "PASS" : "BREACH",
+    exception: null,
+    baselineComparison: null,
   });
   const pageCurrent = { pageP95Ms: summary.pagesP95Ms };
   rows.push({
     id: "T2-pages",
     label: "T2-pages",
     smallP95Ms: null,
+    blocksLargeP95Ms: null,
+    namesLargeP95Ms: null,
     largeP95Ms: null,
     pageP95Ms: summary.pagesP95Ms,
     ratio: null,
     ceiling: null,
+    ratioOk: null,
+    hardCeilingMs: null,
+    hardCeilingOk: null,
+    nameGrowth: null,
     ok: null,
     status: "DIAGNOSTIC",
     exception: searchPolicy.rows["T2-pages"].exception ?? null,
@@ -492,29 +672,17 @@ export function baselineFromSearchScaling(input, policy) {
       production_source_hash: summary.small.current_backend_provenance.production_source_hash,
       production_source_scope: summary.small.current_backend_provenance.production_source_scope,
       probe_source_sha256_by_role: Object.fromEntries(
-        ["small", "large", "pages", "sentinel"].map((role) => [
+        SEARCH_ROLES.map((role) => [
           role,
           summary[role].current_backend_provenance.probe_source_sha256,
         ]),
       ),
     },
-    counts: {
-      small: {
-        original_pages: summary.small.corpus_counts.original_page_count,
-        original_blocks: summary.small.corpus_counts.original_block_count,
-        navigation_owner_rows: summary.small.navigation_name_inventory.count,
-      },
-      large: {
-        original_pages: summary.large.corpus_counts.original_page_count,
-        original_blocks: summary.large.corpus_counts.original_block_count,
-        navigation_owner_rows: summary.large.navigation_name_inventory.count,
-      },
-      pages: {
-        original_pages: summary.pages.corpus_counts.original_page_count,
-        original_blocks: summary.pages.corpus_counts.original_block_count,
-        navigation_owner_rows: summary.pages.navigation_name_inventory.count,
-      },
-    },
+    counts: Object.fromEntries(SEARCH_ROLES.filter((role) => role !== "sentinel").map((role) => [role, {
+      original_pages: summary[role].corpus_counts.original_page_count,
+      original_blocks: summary[role].corpus_counts.original_block_count,
+      navigation_owner_rows: summary[role].navigation_name_inventory.count,
+    }])),
     queries: {
       ...Object.fromEntries(CROSS_SCALE_ROW_IDS.map((id) => [id, summary.rows[id].needle])),
       "T2-pages": summary.pagesNeedle,
@@ -525,8 +693,22 @@ export function baselineFromSearchScaling(input, policy) {
       ...Object.fromEntries(CROSS_SCALE_ROW_IDS.map((id) => [id, {
         small_p95_ms: summary.rows[id].smallP95Ms,
         large_p95_ms: summary.rows[id].largeP95Ms,
-        ratio: summary.rows[id].ratio,
+        ratio: summary.rows[id].bothGrowingRatio,
+        blocks_large_p95_ms: summary.rows[id].blocksLargeP95Ms,
+        block_ratio: summary.rows[id].blockRatio,
       }])),
+      "T2-names": {
+        small_owner_count: summary.nameCounts.small,
+        names_large_owner_count: summary.nameCounts.namesLarge,
+        owner_count_ratio: summary.nameCounts.ratio,
+        cases: summary.nameCases.map((entry) => ({
+          source_label: entry.sourceLabel,
+          small_p95_ms: entry.smallP95Ms,
+          names_large_p95_ms: entry.namesLargeP95Ms,
+          time_ratio: entry.timeRatio,
+          normalized_linearity: entry.normalizedLinearity,
+        })),
+      },
       "T2-pages": { page_p95_ms: summary.pagesP95Ms },
     },
   };
@@ -536,16 +718,31 @@ const formatSearchNumber = (value, digits = 6) => Number(value).toFixed(digits).
 
 export function formatSearchScalingRows(rows) {
   const lines = [
-    "| row | small p95 | large / page p95 | ratio | ceiling | status | baseline comparison |",
-    "|---|---:|---:|---:|---:|:-:|---|",
+    "| row | measurements | scaling metric | budget | status | historical baseline |",
+    "|---|---|---|---|:-:|---|",
   ];
   for (const row of rows) {
-    const small = row.smallP95Ms == null ? "–" : `${formatSearchNumber(row.smallP95Ms)} ms`;
-    const large = row.pageP95Ms != null
-      ? `${formatSearchNumber(row.pageP95Ms)} ms (page corpus)`
-      : `${formatSearchNumber(row.largeP95Ms)} ms`;
-    const ratio = row.ratio == null ? "–" : `${formatSearchNumber(row.ratio)}x`;
-    const ceiling = row.ceiling == null ? "diagnostic" : `${formatSearchNumber(row.ceiling)}x`;
+    let measurements;
+    let metric;
+    let budget;
+    if (row.nameGrowth) {
+      const cases = row.nameGrowth.cases.map((entry) => `${entry.sourceLabel}: ${formatSearchNumber(entry.smallP95Ms)}→${formatSearchNumber(entry.namesLargeP95Ms)} ms (${formatSearchNumber(entry.timeRatio)}x time, ${formatSearchNumber(entry.normalizedLinearity)}x normalized)`).join("; ");
+      measurements = `${row.nameGrowth.executor}; ${row.nameGrowth.smallOwnerCount}→${row.nameGrowth.namesLargeOwnerCount} owner rows (${formatSearchNumber(row.nameGrowth.ownerCountRatio)}x); ${cases}`;
+      metric = `max normalized time/name growth ${formatSearchNumber(row.nameGrowth.maxNormalizedLinearity)}x`;
+      budget = `normalized ≤${formatSearchNumber(row.ceiling)}x`;
+    } else if (row.hardCeilingMs != null) {
+      measurements = `small ${formatSearchNumber(row.smallP95Ms)} ms; blocksLarge ${formatSearchNumber(row.blocksLargeP95Ms)} ms; both-growing ${formatSearchNumber(row.largeP95Ms)} ms`;
+      metric = `fixed-name block ratio ${formatSearchNumber(row.ratio)}x`;
+      budget = `ratio ≤${formatSearchNumber(row.ceiling)}x; both-growing HARD ≤${formatSearchNumber(row.hardCeilingMs)} ms`;
+    } else if (row.pageP95Ms != null) {
+      measurements = `${formatSearchNumber(row.pageP95Ms)} ms (page corpus)`;
+      metric = "–";
+      budget = "diagnostic";
+    } else {
+      measurements = `small ${formatSearchNumber(row.smallP95Ms)} ms; both-growing ${formatSearchNumber(row.largeP95Ms)} ms`;
+      metric = `${formatSearchNumber(row.ratio)}x`;
+      budget = "diagnostic";
+    }
     let comparison = "(no baseline)";
     if (row.baselineComparison?.currentToBaseline != null) {
       comparison = `page ${formatSearchNumber(row.baselineComparison.currentToBaseline)}x baseline`;
@@ -553,7 +750,7 @@ export function formatSearchScalingRows(rows) {
       comparison = `small ${formatSearchNumber(row.baselineComparison.smallCurrentToBaseline)}x; large ${formatSearchNumber(row.baselineComparison.largeCurrentToBaseline)}x; ratio ${formatSearchNumber(row.baselineComparison.ratioCurrentToBaseline)}x baseline`;
     }
     const status = row.exception ? `${row.status}: ${row.exception}` : row.status;
-    lines.push(`| ${row.id} | ${small} | ${large} | ${ratio} | ${ceiling} | ${status} | ${comparison} |`);
+    lines.push(`| ${row.id} | ${measurements} | ${metric} | ${budget} | ${status} | ${comparison} |`);
   }
   return lines.join("\n");
 }

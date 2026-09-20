@@ -14,10 +14,29 @@ export type SearchScalingRow = {
   id: string;
   label: string;
   smallP95Ms: number | null;
+  blocksLargeP95Ms: number | null;
+  namesLargeP95Ms: number | null;
   largeP95Ms: number | null;
   pageP95Ms: number | null;
   ratio: number | null;
   ceiling: number | null;
+  ratioOk: boolean | null;
+  hardCeilingMs: number | null;
+  hardCeilingOk: boolean | null;
+  nameGrowth: {
+    executor: string;
+    smallOwnerCount: number;
+    namesLargeOwnerCount: number;
+    ownerCountRatio: number;
+    cases: Array<{
+      sourceLabel: string;
+      smallP95Ms: number;
+      namesLargeP95Ms: number;
+      timeRatio: number;
+      normalizedLinearity: number;
+    }>;
+    maxNormalizedLinearity: number;
+  } | null;
   ok: boolean | null;
   status: "PASS" | "BREACH" | "DIAGNOSTIC";
   exception: string | null;

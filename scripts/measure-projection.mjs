@@ -6,8 +6,8 @@
 //   TINE_PROJECTION_CORPUS=~/research/logseq-anonymized node scripts/measure-projection.mjs
 //   node scripts/measure-projection.mjs --root <graph> --corpus brikas
 //   node scripts/measure-projection.mjs --record-baseline   # today's numbers become the policy baseline
-//   node scripts/measure-projection.mjs --paired-search <wrapper.json>
-//   node scripts/measure-projection.mjs --paired-search <wrapper.json> --record-baseline
+//   node scripts/measure-projection.mjs --paired-search <six-report-wrapper.json>
+//   node scripts/measure-projection.mjs --paired-search <six-report-wrapper.json> --record-baseline
 //
 // Linux-only (the harness reads /proc/self/io and /proc/self/status). Exit code 1
 // on a breached ceiling. Never run it on Martin's live graph: the harness copies
@@ -46,7 +46,7 @@ if (pairedSearch) {
   if (args.includes("--record-baseline")) {
     policy.searchScaling.baseline = baselineFromSearchScaling(report, policy);
     fs.writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
-    console.log(`recorded today's paired search-scaling baseline into ${path.relative(repo, policyPath)}`);
+    console.log(`recorded today's paired search-scaling evidence into ${path.relative(repo, policyPath)} (hard caps unchanged)`);
   }
   const { rows, breaches } = evaluateSearchScaling(report, policy);
   console.log(`projection search-scaling budget, report=${path.relative(repo, reportPath)}`);
@@ -55,7 +55,7 @@ if (pairedSearch) {
     console.error(`projection search-scaling budget: ${breaches.length} ceiling(s) breached: ${breaches.map((row) => row.id).join(", ")}`);
     process.exit(1);
   }
-  console.log("projection search-scaling budget OK (diagnostic rows remain unjudged)");
+  console.log("projection search-scaling budget OK (strict ratio, hard-ms, and normalized-linearity gates passed; diagnostic rows remain unjudged)");
   process.exit(0);
 }
 

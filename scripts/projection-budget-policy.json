@@ -3,10 +3,12 @@
   "spec": "tine-agents/specs/campaigns/2026-09-compact-projection/SPEC.md §3",
   "noiseBandFraction": 0.1,
   "searchScaling": {
-    "schema": "tine.search_scaling_budget.v1",
-    "description": "Section 7 current-production-backend paired search scaling. Ratios are 600k / 60k combined-search p95; diagnostic exceptions have no ceiling.",
+    "schema": "tine.search_scaling_budget.v2",
+    "description": "Current-production-backend search scaling. Block-only growth uses strict ratios, both-growing broad/sparse uses hard millisecond caps, and name-only growth uses count-normalized linearity. Diagnostic exceptions have no ceiling.",
     "corpora": {
       "small": "dense60k",
+      "blocksLarge": "dense600k-fixed-names",
+      "namesLarge": "dense60k-10k-pages",
       "large": "dense600k",
       "pages": "brikas",
       "sentinel": "page-sentinel"
@@ -21,12 +23,14 @@
       "T2-broad": {
         "sourceLabel": "broad_2char_synthetic",
         "surface": "combined",
-        "ratioCeiling": 1.5
+        "ratioCeiling": 1.5,
+        "bothGrowingHardCeilingMs": 49.28
       },
       "T2-sparse": {
         "sourceLabel": "T2-sparse",
         "surface": "combined",
-        "ratioCeiling": 1.5
+        "ratioCeiling": 1.5,
+        "bothGrowingHardCeilingMs": 41.69
       },
       "T2-fp": {
         "sourceLabel": "T2-fp",
@@ -39,6 +43,15 @@
         "surface": "quick_switch_100",
         "ratioCeiling": null,
         "exception": "page-name fuzzy search scans the page-name owner-row inventory"
+      },
+      "T2-names": {
+        "sourceLabels": [
+          "nohit_indexable_zqx1",
+          "broad_2char_synthetic"
+        ],
+        "surface": "page_only",
+        "normalizedLinearityCeiling": 1.1,
+        "executor": "exhaustive navigation owner inventory (no candidate cap)"
       }
     },
     "baseline": {
