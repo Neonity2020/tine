@@ -222,54 +222,13 @@ impl Graph {
         let Some(pages) = guard.as_ref() else {
             return Vec::new(); // cache not warm — don't force a parse
         };
-        fn add(seen: &mut std::collections::HashMap<String, String>, name: String) {
-            if !name.is_empty() {
-                seen.entry(crate::refs::page_key(&name)).or_insert(name);
-            }
-        }
-        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for (_, doc) in pages.iter() {
-            if let Some(pre) = &doc.pre_block {
-                for name in crate::doc::property_reference_page_names(pre) {
-                    add(&mut seen, name);
-                }
-            }
-            let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_BLOCK_DEPTH] =
-                std::array::from_fn(|_| None);
-            let mut len = usize::from(!doc.roots.is_empty());
-            if len != 0 {
-                frames[0] = Some(doc.roots.iter());
-            }
-            while len != 0 {
-                let mut frame = frames[len - 1]
-                    .take()
-                    .expect("active cached-reference frame");
-                let Some(block) = frame.next() else {
-                    len -= 1;
-                    continue;
-                };
-                frames[len - 1] = Some(frame);
-                // Read the memoized projection's original-case page refs instead of a
-                // fresh `block_refs` parse. This whole-graph path runs on reference
-                // autocomplete after each cache generation change.
-                for name in &block.projection().refs_page {
-                    add(&mut seen, name.clone());
-                }
-                for name in crate::doc::property_reference_page_names(&block.raw) {
-                    add(&mut seen, name);
-                }
-                if !block.children.is_empty() {
-                    if len == MAX_BLOCK_DEPTH {
-                        // Cache documents normally pass the checked parser/admission
-                        // boundary. Contain any forged or stale over-depth value:
-                        // publish no partial result.
-                        return Vec::new();
-                    }
-                    frames[len] = Some(block.children.iter());
-                    len += 1;
-                }
-            }
-        }
-        seen.into_values().collect()
+        referenced_page_names_from_snapshot(pages)
     }
+}
+
+pub(super) fn referenced_page_names_from_snapshot(
+    pages: &[(PageEntry, Arc<Document>)],
+) -> Vec<String> {
+    crate::query::referenced_page_names_from_snapshot_cancellable(pages, &|| false)
+        .unwrap_or_default()
 }

@@ -154,16 +154,9 @@ pub(super) struct PageBuildTestState {
     pub(super) parses: std::sync::atomic::AtomicUsize,
     pub(super) installs: std::sync::atomic::AtomicUsize,
     pub(super) censuses: std::sync::atomic::AtomicUsize,
-    /// R6: pages parsed by the warm STREAM (replacements only).
-    pub(super) warm_stream_parses: std::sync::atomic::AtomicUsize,
     /// R6: pages parsed on demand for reference/fuzzy hydration without a
     /// parsed cache.
     pub(super) on_demand_parses: std::sync::atomic::AtomicUsize,
-    /// GH #543: page files whose bytes the warm VALIDATION read to compute a
-    /// content revision. Every drift retry re-runs that read over the whole
-    /// graph, so this counts the cost a retry actually pays — the parse
-    /// counters above stay at zero while it climbs.
-    pub(super) warm_inventory_file_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]

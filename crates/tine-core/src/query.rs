@@ -757,24 +757,91 @@ pub fn page_aliases<G: QueryGraph>(graph: &G) -> Vec<(String, String)> {
 }
 
 pub(crate) fn page_aliases_with_owners<G: QueryGraph>(graph: &G) -> Vec<(String, String, String)> {
-    graph.with_pages(|pages| {
-        let mut owned = Vec::new();
-        for (entry, doc) in pages {
-            for (alias, _) in document_alias_spellings(doc) {
-                owned.push((
-                    entry.path.clone(),
-                    alias,
-                    entry.name.clone(),
-                    entry.rel_path.clone(),
-                ));
+    graph.with_pages(page_aliases_with_owners_from_pages)
+}
+
+pub(crate) fn page_aliases_with_owners_from_pages(
+    pages: &[(PageEntry, std::sync::Arc<Document>)],
+) -> Vec<(String, String, String)> {
+    let mut owned = Vec::new();
+    for (entry, doc) in pages {
+        for (alias, _) in document_alias_spellings(doc) {
+            owned.push((
+                entry.path.clone(),
+                alias,
+                entry.name.clone(),
+                entry.rel_path.clone(),
+            ));
+        }
+    }
+    owned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    owned
+        .into_iter()
+        .map(|(_, alias, owner, owner_rel_path)| (alias, owner, owner_rel_path))
+        .collect()
+}
+
+pub(crate) fn referenced_page_names_from_snapshot_cancellable(
+    pages: &[(PageEntry, std::sync::Arc<Document>)],
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<String>> {
+    fn add(seen: &mut std::collections::HashSet<String>, names: &mut Vec<String>, name: String) {
+        if !name.is_empty() && seen.insert(crate::refs::page_key(&name)) {
+            names.push(name);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for (_, doc) in pages {
+        if cancelled() {
+            return None;
+        }
+        if let Some(pre) = &doc.pre_block {
+            for name in crate::doc::property_reference_page_names(pre) {
+                if cancelled() {
+                    return None;
+                }
+                add(&mut seen, &mut names, name);
             }
         }
-        owned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        owned
-            .into_iter()
-            .map(|(_, alias, owner, owner_rel_path)| (alias, owner, owner_rel_path))
-            .collect()
-    })
+        let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; crate::vocab::MAX_BLOCK_DEPTH] =
+            std::array::from_fn(|_| None);
+        let mut len = usize::from(!doc.roots.is_empty());
+        if len != 0 {
+            frames[0] = Some(doc.roots.iter());
+        }
+        while len != 0 {
+            if cancelled() {
+                return None;
+            }
+            let mut frame = frames[len - 1]
+                .take()
+                .expect("active cached-reference frame");
+            let Some(block) = frame.next() else {
+                len -= 1;
+                continue;
+            };
+            frames[len - 1] = Some(frame);
+            for name in &block.projection().refs_page {
+                add(&mut seen, &mut names, name.clone());
+            }
+            for name in crate::doc::property_reference_page_names(&block.raw) {
+                if cancelled() {
+                    return None;
+                }
+                add(&mut seen, &mut names, name);
+            }
+            if !block.children.is_empty() {
+                if len == crate::vocab::MAX_BLOCK_DEPTH {
+                    return Some(Vec::new());
+                }
+                frames[len] = Some(block.children.iter());
+                len += 1;
+            }
+        }
+    }
+    Some(names)
 }
 
 pub(crate) type RealPageNames = std::collections::HashMap<String, (std::path::PathBuf, String)>;

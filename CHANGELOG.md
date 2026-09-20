@@ -29,9 +29,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's
   lifecycle: when a validation starts reading the graph, how long that read
-  took, how many pages it queued, each worker turn's duration and rows, how far
-  a partial build has streamed, and when the index becomes ready. Without the
-  flag nothing is recorded (GH #543).
+  took, how many pages it queued, each worker turn's duration and rows, and when
+  a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
 - Renaming, merging or rescuing a page no longer leaves search answering from
@@ -184,15 +183,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   until that page was edited again. Your file on disk was never affected
   (GH #543).
 
-- Saving while the search index is being rebuilt no longer takes search away
-  until the rebuild finishes. A save that lands mid-rebuild makes the index
-  start its check over, and search went from answering to "waiting for search to
-  be ready" for the whole of that restart — on a large graph, minutes, and again
-  for each further save. The pages already indexed are still correct, so search
-  now keeps answering over them, saying that results may be incomplete, exactly
-  as it does during the first build. This applies once the graph has been
-  indexed completely at least once in the session; a first cold build still has
-  nothing to answer from (GH #543).
+- Saving while a complete search index is being reconciled no longer takes its
+  coherent committed answers away. Ordinary pending edits may briefly leave
+  those answers one committed revision behind, then the queued delta advances
+  them. A cold, stale, damaged, or configuration-changed image is rebuilt in an
+  unpublished file and appears only when the complete replacement is ready
+  (GH #543).
 
 - While the search index is building, the progress line in Ctrl+K no longer
   disappears for minutes at a time. Building the index starts by reading every
@@ -266,18 +262,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   every platform, also on a reopen with a finished index. tine-storage
   v0.20.2 pages both navigation readers on an existing index instead (full
   drain of that graph: 65 s → 1.3 s). Unit cost: unchanged; no schema change.
-- Search answers while the query index is still being built (GH #543). On a
-  cold or changed graph, Ctrl+K and the `((` picker return the pages indexed
-  so far and the switcher says "Indexing N of M pages — results may be
-  incomplete", re-running the query once the build completes; before, every
-  search waited for the whole graph to be indexed (minutes on a large graph
-  on Windows). The build itself no longer restarts: a parsed snapshot that
-  arrives beside the running index stream is dropped instead of superseding
-  it with one huge transaction, an edit during the build restarts only the
-  validation (resuming where it stopped) instead of parsing the whole graph,
-  and the streaming writer runs with the same page-cache budget as a
-  one-transaction build and without per-batch fsyncs (tine-storage v0.20.3).
-  Unit cost: unchanged per edit; single-page saves keep their durability.
+- Ctrl+K and the `((` picker remain useful while the query index is unavailable
+  (GH #543). They search one already-loaded parsed snapshot in document order,
+  never a partly built SQLite image, and rerun against ranked SQL results when
+  the complete index becomes ready. Structured and inline queries continue to
+  wait for the complete index. Cold and replacement builds use bounded batches
+  in an unpublished SQLite file; cancellation or failure before publication
+  leaves the old image intact, and single-page saves keep their durability
+  (compact-projection P4).
 
 ## [0.6.984] - 2026-09-16
 

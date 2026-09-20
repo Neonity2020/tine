@@ -38,9 +38,155 @@ fn fixture() -> (PathBuf, Graph) {
         "- [[Virtual Opdf]]\n",
     )
     .unwrap();
+    fs::write(
+        dir.join("pages").join("Étude.org"),
+        "#+TITLE: Étude\n* Žluťoučký unicode fallback\n",
+    )
+    .unwrap();
     let graph = Graph::open(&dir);
     graph.warm_cache();
     (dir, graph)
+}
+
+#[test]
+fn pre_ready_fallback_is_limited_to_ctrl_k_and_block_picker_routes() {
+    let (dir, graph) = fixture();
+
+    let picker = graph.search("foo ready", 10).unwrap();
+    assert!(picker
+        .iter()
+        .flat_map(|group| &group.blocks)
+        .any(|block| { block.raw.contains("foo ready") }));
+    assert!(graph
+        .search("Žluťoučký", 10)
+        .unwrap()
+        .iter()
+        .flat_map(|group| &group.blocks)
+        .any(|block| block.raw.contains("Žluťoučký")));
+
+    let ctrl_k = graph
+        .run_graph_search_displayed_for(
+            "Research Hub",
+            10,
+            10,
+            None,
+            false,
+            FriendlyDisplayOptions::default(),
+            FriendlyConsumer::CtrlK,
+        )
+        .unwrap();
+    assert!(ctrl_k.hits.iter().any(|hit| matches!(
+        hit,
+        QueryHit::Page { matched_alias: Some(alias), .. } if alias == "Research Hub"
+    )));
+
+    assert!(matches!(
+        graph.run_graph_search("foo ready", 10, 10, false),
+        Err(crate::query::QueryExecutionError::Unavailable(
+            crate::query::QueryUnavailableReason::ProjectionUnavailable
+        ))
+    ));
+    crate::test_support::remove_dir_all(dir);
+}
+
+#[test]
+fn pre_ready_ctrl_k_keeps_current_page_scope_and_cancellation_atomic() {
+    let (dir, graph) = fixture();
+    let scoped = graph
+        .run_graph_search_displayed_for(
+            "ready",
+            10,
+            10,
+            Some(QueryPageScope {
+                name: "Opinion Diffusion".into(),
+                page_kind: PageKind::Page,
+                path: Some("pages/Opinion Diffusion.md".into()),
+            }),
+            false,
+            FriendlyDisplayOptions::default(),
+            FriendlyConsumer::CtrlK,
+        )
+        .unwrap();
+    assert!(scoped.hits.iter().any(|hit| matches!(
+        hit,
+        QueryHit::Block { block, .. } if block.raw.contains("ready")
+    )));
+    assert!(scoped.hits.iter().all(|hit| match hit {
+        QueryHit::Page { .. } => true,
+        QueryHit::Block { path, .. } => path == "pages/Opinion Diffusion.md",
+    }));
+
+    let plan = QueryPlan::block_search_literal("ready", 10);
+    let cancelled =
+        graph.with_pages(|pages| pre_ready_interactive_snapshot(&plan, pages, false, &|| true));
+    assert!(cancelled.cancelled);
+    assert!(cancelled.hits.is_empty());
+    crate::test_support::remove_dir_all(dir);
+}
+
+#[test]
+fn pre_ready_ctrl_k_ranks_all_page_names_and_aliases_before_limiting() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tine-query-plan-pre-ready-pages-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    for index in 0..1001 {
+        fs::write(
+            dir.join("pages").join(format!("a-{index:04}.md")),
+            format!(
+                "title:: Target filler {index:04}\n\
+                 alias:: Needle Alias filler {index:04}\n\n\
+                 - unrelated\n"
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        dir.join("pages/z-exact.md"),
+        "title:: Target\nalias:: Needle Alias\n\n- unrelated\n",
+    )
+    .unwrap();
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+
+    for (query, expected_alias) in [("Target", None), ("Needle Alias", Some("Needle Alias"))] {
+        let plan = friendly_search_plan_for(
+            query,
+            100,
+            0,
+            None,
+            FriendlyDisplayOptions::default(),
+            FriendlyConsumer::CtrlK,
+        );
+        let answer = graph
+            .with_pages(|pages| pre_ready_interactive_snapshot(&plan, pages, false, &|| false));
+        assert_eq!(
+            answer
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit, QueryHit::Page { .. }))
+                .count(),
+            100
+        );
+        assert!(answer.has_more.pages);
+        assert!(
+            answer.hits.iter().any(|hit| matches!(
+                hit,
+                QueryHit::Page { page, matched_alias, .. }
+                    if page.name == "Target"
+                        && matched_alias.as_deref() == expected_alias
+            )),
+            "the exact {query:?} owner beyond 1,000 earlier matches was capped before ranking"
+        );
+    }
+    crate::test_support::remove_dir_all(dir);
 }
 
 /// The block evaluator produces evidence and result DTOs once per WINNER

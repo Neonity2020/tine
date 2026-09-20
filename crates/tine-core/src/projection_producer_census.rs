@@ -967,22 +967,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "fs.rename",
             1,
         ),
+        // 2026-09-20: P4 removes exact owned unpublished stage files and their
+        // known SQLite sidecars through the directory capability. Prefix-only
+        // matches are preserved, and storage owns destination publication.
+        (
+            "crates/tine-core/src/direct_projection.rs",
+            "cap.remove_file",
+            3,
+        ),
         (
             "crates/tine-core/src/direct_projection.rs",
             "fs.create_dir_all",
             1,
-        ),
-        // 2026-09-18: GH #543 — a projection file whose SQLite HEADER is torn
-        // never yields a connection, so the existing schema repair cannot run
-        // and the worker stopped for the graph's lifetime. The recreate path
-        // removes the file and its `-wal`/`-shm` companions (one call site,
-        // two occurrences) before reopening. The projection is a disposable
-        // cache and the caller holds the exclusive writer lease; no graph text
-        // is touched.
-        (
-            "crates/tine-core/src/direct_projection.rs",
-            "fs.remove_file",
-            2,
         ),
         (
             "crates/tine-core/src/direct_projection.rs",
@@ -1410,6 +1406,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ],
     );
     let expected = [
+        (
+            "crates/tine-core/src/direct_projection.rs",
+            "durable_directory.open",
+            1,
+        ),
         // GH #466: the three Direct Files graph-text sites (create, validated
         // write, bounded replace) left this boundary — its Android arm is a
         // hard link that shared storage refuses — for the graph tree's own
@@ -1465,8 +1466,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // the `set_page_cache_budget`/`shrink_page_cache_budget` calls in
     // direct_projection.rs, and v0.20.2 changed no call site.
     // 2026-09-17: GH #543 partial admission pinned v0.20.3 and added the
-    // `set_build_durability` calls (the stream's relaxed durability, and its
-    // restore in `restore_build_settings`) in direct_projection.rs.
+    // relaxed-WAL build calls that P4 later retired with partial serving.
     // 2026-09-17: the bounded-reads packet drove BOTH Friendly block reads from
     // the trigram index instead of filtering a full scan with it, which binds a
     // candidate literal and a candidate cap per read: query/friendly.rs gains
@@ -1481,12 +1481,8 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // raw_name)` where it took a 4-tuple — but that is an argument change at an
     // existing call site, not a new or removed one, so no inventory row moved
     // and the digest below held (the same way the v0.20.2 bump did).
-    // 2026-09-18: GH #543 — the torn-header recreate path in
-    // `open_projection_database` reopens the recreated file and initializes
-    // and validates its schema, so `open_writable`, `initialize_schema` and
-    // `validate_schema` each gain one call site in direct_projection.rs. No
-    // write crossing moved (the rows asserted above are unchanged) and no new
-    // storage API entered the surface.
+    // 2026-09-18: GH #543 — the torn-header recreate path added storage open,
+    // schema initialization and validation calls that P4 later replaced.
     // 2026-09-19: compact-projection P0b routed every projection SQL statement
     // through `query/projection_sql.rs`, which imports
     // `PhysicalProjectionQuerySnapshot`, `PhysicalQueryValue` and
@@ -1526,9 +1522,18 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-20: one-pass page ranking removes one read-only Integer bind;
     // the byte-length/text callback frame adds two InvalidQuery error sites.
     // No write crossing or dependency pin changes.
+    // 2026-09-20: compact-projection P4 replaces partial relaxed-WAL builds
+    // with a fresh unpublished OFF image and a storage-owned directory
+    // publication. direct_projection.rs gains one DurableDirectoryPublication
+    // write crossing plus the fresh/open/validation calls, and removes the
+    // retired build-durability calls.
+    // 2026-09-20: the P4 final reader-drain correction routes every pooled
+    // projection read, including alias ownership, through one mutex-held
+    // admission helper. This changes only the counted receiver-call shape;
+    // it adds no storage import or authority crossing.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "03f575d87919a1decf7bf559f56440eedc3c4d4f652e05cca6883d2133c65e63",
+        "33416e871cfdb1ca0a68655052b8c42f37d01333cedb0846745d5e3fa017c856",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

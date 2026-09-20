@@ -25,6 +25,7 @@ impl Graph {
                 snapshot,
                 revisions,
                 Arc::new(self.config.parse_config()),
+                self.page_index_failures.read().unwrap().is_empty(),
             );
         }
         Ok(())
@@ -165,6 +166,7 @@ impl Graph {
         pages: Arc<Vec<(PageEntry, Arc<Document>)>>,
         revisions: Arc<std::collections::HashMap<PathBuf, String>>,
         force: bool,
+        source_complete: bool,
     ) {
         if let Some(projection) = self
             .direct_projection
@@ -184,6 +186,7 @@ impl Graph {
                 pages,
                 revisions,
                 Arc::new(self.config.parse_config()),
+                source_complete,
             );
         }
     }

@@ -1814,7 +1814,11 @@ mod tests {
             .markdown;
         for phrase in [
             "still being built",
-            "results may be incomplete",
+            "one complete snapshot",
+            "document order",
+            "never show a partly built index",
+            "block picker",
+            "structured queries keep waiting",
             "says it is searching",
             "Retry",
             "nothing matched",

@@ -8,13 +8,11 @@
 
 #![cfg_attr(test, allow(private_bounds))]
 
-#[cfg(test)]
 use crate::doc::DocBlock;
 #[cfg(test)]
 use crate::model::Graph;
 #[cfg(test)]
 use crate::query::graph::QueryGraph;
-#[cfg(test)]
 use crate::refs;
 use crate::search_query::{canonical_fold, canonical_fold_with_map, Matcher, Term};
 use crate::vocab::{BlockDto, PageEntry, PageKind};
@@ -733,7 +731,6 @@ impl QueryPlan {
     }
 }
 
-#[cfg(test)]
 fn cancelled_execution(plan: &QueryPlan, explanation: QueryExplanation) -> QueryExecution {
     QueryExecution {
         hits: Vec::new(),
@@ -1832,14 +1829,14 @@ fn execute_pages<G: QueryGraph>(
     let file_pages = graph.list_pages();
     let aliases = graph.page_aliases_with_owners();
     let referenced = graph.referenced_page_names();
-    execute_page_candidates(plan, file_pages, aliases, referenced, branch, cancelled)
+    execute_page_candidates(plan, &file_pages, &aliases, &referenced, branch, cancelled)
 }
 
 fn execute_page_candidates(
     plan: &QueryPlan,
-    file_pages: Vec<PageEntry>,
-    aliases: Vec<(String, String, String)>,
-    referenced: Vec<String>,
+    file_pages: &[PageEntry],
+    aliases: &[(String, String, String)],
+    referenced: &[String],
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
 ) -> Option<(Vec<QueryHit>, bool)> {
@@ -1849,9 +1846,9 @@ fn execute_page_candidates(
     let mut aliases_by_owner: HashMap<String, Vec<String>> = HashMap::new();
     for (alias, _, owner_rel_path) in aliases {
         aliases_by_owner
-            .entry(owner_rel_path)
+            .entry(owner_rel_path.clone())
             .or_default()
-            .push(alias);
+            .push(alias.clone());
     }
     let mut heap = BinaryHeap::new();
     let mut has_more = false;
@@ -1942,7 +1939,7 @@ fn execute_page_candidates(
                     matched_alias,
                     tie_key: crate::refs::page_key(&name),
                     candidate: PageCandidate::Referenced(PageEntry {
-                        name,
+                        name: name.clone(),
                         kind: PageKind::Page,
                         date_key: None,
                         rel_path: String::new(),
@@ -1999,12 +1996,11 @@ pub(crate) fn pre_ready_page_search_entries(
     let Some(branch) = plan.branches.first() else {
         return Vec::new();
     };
-    execute_page_candidates(&plan, file_pages, aliases, referenced, branch, &|| false)
+    execute_page_candidates(&plan, &file_pages, &aliases, &referenced, branch, &|| false)
         .map(|(hits, _)| page_hits_to_entries(hits))
         .unwrap_or_default()
 }
 
-#[cfg(test)]
 fn walk_blocks<'a>(
     blocks: &'a [DocBlock],
     ancestors: &mut Vec<&'a DocBlock>,
@@ -2022,6 +2018,164 @@ fn walk_blocks<'a>(
         }
     }
     true
+}
+
+/// The explicitly allowed pre-ready producer for Ctrl-K text and `((`.
+/// Membership and evidence come from the same compiled plan as indexed search;
+/// only ordering differs: one captured parsed snapshot is emitted in document
+/// order, under the plan's existing per-branch presentation limits.
+pub(crate) fn pre_ready_interactive_snapshot(
+    plan: &QueryPlan,
+    pages: &[(PageEntry, std::sync::Arc<crate::doc::Document>)],
+    explain: bool,
+    cancelled: &impl Fn() -> bool,
+) -> QueryExecution {
+    let explanation = if explain {
+        plan.explanation()
+    } else {
+        QueryExplanation {
+            branches: Vec::new(),
+        }
+    };
+    if !plan.diagnostics.is_empty() {
+        return QueryExecution {
+            hits: Vec::new(),
+            diagnostics: plan.diagnostics.clone(),
+            explanation,
+            has_more: QueryHasMore::default(),
+            cancelled: false,
+        };
+    }
+
+    let needs_page_inventory = plan
+        .branches
+        .iter()
+        .any(|branch| branch.target == QueryTarget::Pages && branch.limit > 0);
+    let mut file_pages = Vec::new();
+    let mut aliases = Vec::new();
+    let referenced = if needs_page_inventory {
+        for (entry, document) in pages {
+            if cancelled() {
+                return cancelled_execution(plan, explanation);
+            }
+            file_pages.push(entry.clone());
+            let owner_aliases = crate::query::document_alias_spellings(document)
+                .into_iter()
+                .map(|(alias, _)| alias)
+                .collect::<Vec<_>>();
+            for alias in &owner_aliases {
+                if cancelled() {
+                    return cancelled_execution(plan, explanation);
+                }
+                aliases.push((alias.clone(), entry.name.clone(), entry.rel_path.clone()));
+            }
+        }
+        let Some(referenced) =
+            crate::query::referenced_page_names_from_snapshot_cancellable(pages, cancelled)
+        else {
+            return cancelled_execution(plan, explanation);
+        };
+        referenced
+    } else {
+        Vec::new()
+    };
+    let mut hits = Vec::new();
+    let mut has_more = QueryHasMore::default();
+    for branch in &plan.branches {
+        if cancelled() {
+            return cancelled_execution(plan, explanation);
+        }
+        match branch.target {
+            QueryTarget::Pages => {
+                let Some((page_hits, page_has_more)) = execute_page_candidates(
+                    plan,
+                    &file_pages,
+                    &aliases,
+                    &referenced,
+                    branch,
+                    cancelled,
+                ) else {
+                    return cancelled_execution(plan, explanation);
+                };
+                hits.extend(page_hits);
+                has_more.pages |= page_has_more;
+            }
+            QueryTarget::Blocks => {
+                if branch.limit == 0 {
+                    continue;
+                }
+                let mut admitted = 0usize;
+                'pages: for (entry, document) in pages {
+                    if cancelled() {
+                        return cancelled_execution(plan, explanation);
+                    }
+                    if let Some(scope) = plan.page_scope() {
+                        let selected = match scope.path.as_deref() {
+                            Some(path) => entry.rel_path == path,
+                            None => {
+                                entry.kind == scope.page_kind
+                                    && refs::same_page(&entry.name, &scope.name)
+                            }
+                        };
+                        if !selected {
+                            continue;
+                        }
+                    }
+                    let mut ancestors = Vec::new();
+                    let complete =
+                        walk_blocks(&document.roots, &mut ancestors, &mut |block, path| {
+                            if cancelled() {
+                                return false;
+                            }
+                            let projection = block.projection();
+                            let Some(rank) = rank_block_text(plan, branch, &projection.visible)
+                            else {
+                                return true;
+                            };
+                            if admitted == branch.limit {
+                                has_more.blocks = true;
+                                return false;
+                            }
+                            let mut dto = crate::vocab::block_to_shallow_dto(block);
+                            dto.breadcrumb = path
+                                .iter()
+                                .map(|ancestor| crate::doc::crumb_line(ancestor))
+                                .collect();
+                            hits.push(QueryHit::Block {
+                                page: entry.name.clone(),
+                                kind: entry.kind,
+                                path: entry.rel_path.clone(),
+                                block: dto,
+                                display_text: projection.visible.clone(),
+                                evidence: admitted_block_evidence(
+                                    plan,
+                                    branch,
+                                    &projection.visible,
+                                )
+                                .unwrap_or_default(),
+                                score: rank.score(),
+                                match_class: rank.match_class(),
+                            });
+                            admitted += 1;
+                            true
+                        });
+                    if !complete {
+                        if cancelled() {
+                            return cancelled_execution(plan, explanation);
+                        }
+                        break 'pages;
+                    }
+                }
+            }
+        }
+    }
+    QueryExecution {
+        hits,
+        diagnostics: plan.diagnostics.clone(),
+        explanation,
+        has_more,
+        cancelled: false,
+    }
 }
 
 /// The block-branch evaluator.

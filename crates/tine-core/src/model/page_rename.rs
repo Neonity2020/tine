@@ -617,10 +617,9 @@ impl Graph {
         }
         // GH #543: a rename is a PRODUCER, exactly as a delete is.
         // `invalidate_cache_after_tine_mutation` only marks the projection
-        // stale, and a stale image with nothing queued behind it is still
-        // ADMITTED for queries — partial admission deliberately lets a search
-        // read a committed image while a producer converges it. With no
-        // producer there was nothing to converge and nothing to refuse, so
+        // stale, and an existing complete committed image may still answer
+        // while an ordinary queued delta converges it. With no producer there
+        // was nothing to converge and nothing to refuse, so
         // search went on answering with the renamed page's OLD name and path
         // indefinitely, offering a page that no longer existed; and because
         // the query SUCCEEDED it never reached the repair a refusal starts

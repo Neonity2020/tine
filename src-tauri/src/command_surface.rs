@@ -112,7 +112,6 @@ const KNOWN_COMMANDS: &[&str] = &[
     "publish_query_plan",
     "query_explain_empty",
     "query_facets",
-    "query_index_progress",
     "query_og_expressible",
     "query_parse",
     "query_print",

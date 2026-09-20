@@ -163,11 +163,12 @@ and reconciles only `pages.position`. Identical order performs no order
 writes. Live page deltas capture retained/append/remove positions before queue
 coalescing. The shared runtime-ID helper reproduces fresh-session IDs from page
 path and structural order; live identity mappings and metadata-backed result
-consumption are subsequent packets. Removing
-global parsing from warm startup, streaming cold initialization, and result
-consumption remain subsequent work; DB reuse alone does not claim fast end-to-end
-startup. Older projection readers reject the schema-30 disposable cache and
-rebuild it.
+consumption are subsequent packets. Removing global parsing from warm startup
+and result consumption remains separate from cold reconstruction: a cold,
+stale, damaged or config-changed image is built from one captured parsed
+snapshot in an unpublished stage. DB reuse alone does not claim fast
+end-to-end startup. Older projection readers reject the schema-30 disposable
+cache and rebuild it.
 
 `pages` holds identity and routing;
 `page_text` owns preamble and search text. `blocks` holds structure, metadata
@@ -239,7 +240,7 @@ one read transaction pinned for the job's whole descriptor-and-payload read so
 every row it returns describes one projection state. The projection admits at
 most `DEFAULT_QUERY_JOB_CAPACITY` jobs at once and **capacity is acquired before
 the snapshot**, so a waiting job pins no WAL pages; the snapshot is validated
-against the exact graph cache generation before and after SQLite establishes
+against the exact current graph cache generation before and after SQLite establishes
 the transaction, and a job whose generation moved is `NotReady`, never a stale
 answer. Every admitted job registers its interrupt handle with the owner, and
 **the worker drains every job before a rebuild touches the file**: it cancels
@@ -252,30 +253,27 @@ a typed dispatch answer, not a failed read: it schedules no recovery or retry.
 **Result identity follows who lowered the row.** `blocks.result_id`
 is the runtime id the lowering process assigned. The projection tracks
 `session_pages` — exactly the pages whose stored ids are LIVE in this process:
-a full snapshot's replacements and each live save's page add to the set; a
-structural relowering (a warm-stream replacement parsed in isolation) and a
-deletion remove the page; dropping the parsed cache clears the set, because
-the ids it held are no longer reachable. The set is captured with each
-snapshot. A row on a session page answers with its stored id; every other row
-(a warm reopen lowers none of them) answers with the structural runtime id the
-shared helper reproduces from page path and structural order, which is the id
-a fresh parse assigns it.
+a captured full snapshot's replacements and each live save's page add to the
+set; a deletion removes the page. Parsed-cache eviction does not erase the
+session identity owner. The set is captured with each snapshot. A row on a
+session page answers with its stored id; every other row (a clean reopen lowers
+none of them) answers with the structural runtime id the shared helper
+reproduces from page path and structural order, which is the id a fresh parse
+assigns it.
 
 **Warm validation from bytes, never from a parsed graph.** Opening a Direct
 Files graph validates the projection against the walk inventory and each
 page's exact content revision computed from file bytes, parsing nothing. An
 unchanged graph is READY with no parsed cache and nothing retained. A changed,
-missing, damaged or config-mismatched projection names its replacement pages
-and the caller streams them through a bounded high-water queue, parsing each
-page in isolation and retaining none. Live saves and deletions enqueue their
-delta whether or not a parsed cache exists, but readiness is published only
-after this session has validated the complete inventory once (a full
-snapshot, a clean warm, or a closed stream) — a delta alone never publishes an
-inventory this process has not compared to disk. `pages.position`
-is reconciled by the worker from the queue's own page order whenever a stream
-closes or a delta arrives without a position. In-scope scenario: an external
-edit between two sessions, followed by a save of a different page before the
-warm completes.
+missing, damaged or config-mismatched projection is rebuilt from one captured
+parsed snapshot in an unpublished same-directory stage, in bounded batches.
+Live saves and deletions enqueue their delta whether or not a parsed cache
+exists, but readiness is published only after this session has validated the
+complete inventory once (a full snapshot or a clean warm) — a delta alone
+never publishes an inventory this process has not compared to disk.
+`pages.position` is reconciled from the captured order or the delta's retained,
+appended or removed position. In-scope scenario: an external edit between two
+sessions, followed by a save of a different page before the warm completes.
 
 **One parse config, or a re-lowering.** Six graph-config facts decide those
 derived rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,
@@ -335,37 +333,41 @@ and mints a conflict from the retained snapshot. There is no separate
 pre-retirement full-file reread; creates and unpinned auxiliary writes keep
 their independent recheck rules.
 
-One background SQLite owner accepts either an already-resident
-`PageEntry + Arc<Document>` snapshot or the bounded warm stream. The database
-retains each page's exact caller-owned content revision together with the Direct
-fact-extractor version as disposable adapter metadata. Bumping that extractor
-version forces one background re-lowering when unchanged source bytes acquire
-new physical facts. Warm validation compares the complete byte-derived source
-inventory, parses only changed or missing pages in bounded batches and retains
-no parsed graph; a clean reopen lowers none. One-page cache upserts and deletes
-enqueue coalesced page deltas. The editor, watcher, and save paths never wait
-for SQL. Indexed reads are admitted over the committed image once this
-session's worker has validated the complete inventory, and — partial
-admission, GH #543 — while a warm validation or warm stream is still
-converging it: the answer is over the rows committed so far, and the surface
-labels it with the build's `(indexed, total)` progress (`query_index_progress`).
-Readiness itself is still published only when the worker has validated the
-complete inventory at the exact current graph cache generation. What
-stays refused is an image nobody is converging: a rebuild or inventory still
-owed, a failed write, or an idle projection this session has never validated
-(its rows may be stale from an earlier session); the query's bounded repair
-starts the warm there. A warm validation announces itself before it reads
-the first page byte, so a query landing during that read reports
-`NotReady(Indexing)` and retries; it never reads the projection as idle and
-never starts a second warm on the query thread (GH #543). Under `TINE_DEBUG=1` (or `--debug`) the projection records its lifecycle on the runtime diagnostic channel: the warm announcing itself, its inventory read, the pages queued, each worker turn's duration, applied rows and stream state, how far the stream has parsed, the build page-cache switch, a deferred or failed turn, a requested repair, and the generation at which readiness is published. Without the flag none of it is emitted, which the `projection_lifecycle_diagnostics_follow_the_debug_flag` regression pins: these lines name page counts and timings of the user's own graph. A warm stream is never superseded by a parsed snapshot
-that arrives beside it, and generation drift restarts the warm validation
-(resuming at the pages the abandoned stream had not reached) rather than
-falling back to a whole-graph parse; a turn deferred for want of an
-inventory is not a failure and forces no reset. During a stream the writer
-runs with the build's page-cache budget and `synchronous=OFF`, restored when
-the stream closes (crash mid-stream: WAL keeps the file consistent and each
-batch's source revisions are committed, so the next open resumes; a torn
-file after power loss fails `quick_check` and is rebuilt). One app-private sidecar lease permits
+One background SQLite owner accepts captured `PageEntry + Arc<Document>`
+snapshots and ordinary coalesced page deltas. The database retains each page's
+exact caller-owned content revision together with the Direct fact-extractor
+version as disposable adapter metadata. A clean warm inventory validates those
+revisions without parsing or lowering anything. A cold, stale, damaged or
+config-mismatched image is reconstructed from one captured parsed snapshot in
+a newly created, unpublished same-directory SQLite file. The worker lowers the
+snapshot in bounded batches, finalizes and checks it, drains old reader jobs and
+the active writer, checkpoints the old WAL, and asks `tine-storage` to
+atomically replace the destination. Core never renames or copies the database
+bytes itself. The unpublished connection alone uses journal and synchronous
+mode OFF; the serving writer is reopened WAL/NORMAL with the resting page-cache
+budget.
+
+Cancellation is checked between build batches and immediately before the
+storage publication boundary. A stop or failure before that boundary discards
+the exact owned stage and leaves the old image intact. Once the storage name
+operation begins, its result owns the outcome: a complete newly installed
+destination is never deleted by a later open, durability or injected failure,
+and a stopped owner publishes no readiness. The next owned open/build removes
+only exact stage names (UUID plus known SQLite sidecars), never unrelated
+prefix matches. A source capture missing an unreadable live page cannot replace
+a healthy complete image; the old coherent image remains until reconstruction
+from a complete capture succeeds.
+
+One-page cache upserts and deletes still enqueue coalesced WAL transactions.
+The editor, watcher, and save paths never wait for SQL. Ordinary pending deltas
+may serve the older complete committed image; readiness at the exact current
+graph generation waits for reconciliation. Replacement construction admits no
+partial staged image. A clean same-config full capture reuses the healthy image
+without draining pinned readers, including when `with_pages` installs a parsed
+cache after a SQL-only warm reopen. A rebuild, failed write, or idle image this
+session has never validated stays unavailable until repair. Under
+`TINE_DEBUG=1` (or `--debug`) the projection records bounded lifecycle facts on
+the runtime diagnostic channel; without the flag none are emitted. One app-private sidecar lease permits
 only one graph instance to publish into a projection database at a time, which
 prevents an older instance from replacing facts behind another instance's
 locally-ready generation watermark. A public query against a missing, stale,
@@ -373,6 +375,16 @@ corrupt, incompatible, leased or unwritable projection follows the typed
 dispatch and bounded repair rules below; the remaining parser-owned navigation
 and search consumers may use their existing fallback. Neither case blocks
 graph open, save or external file observation.
+
+Before projection readiness, only Ctrl-K text search and the `((` picker may
+answer from one already-captured parsed snapshot. They use the shared
+membership, folding, matcher and evidence logic, preserve current-page scope,
+and emit block-text matches in unranked document order under the existing
+limits. Ctrl-K page names and aliases retain the existing exhaustive evaluator,
+ranking and exact-name retention over that same snapshot. They never cold-parse
+from a query callback. Inline Friendly, saved/structured queries and other
+projection-only surfaces keep their typed Indexing response; reference panels
+retain their separate established fallback contract.
 
 The switched read families are literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
@@ -586,11 +598,10 @@ from the current graph generation. Because the projection is disposable,
 owned snapshot have dropped, then retries the SQL route once. The worker drains
 all old query jobs before it resets the file. If a complete parsed snapshot is
 already resident, recovery may enqueue it; otherwise recovery validates a
-complete source inventory from bytes and streams bounded per-page replacements,
-without constructing or retaining a whole parsed graph. Clearing readiness
-alone would strand the projection until another edit. Cancellation is excluded
-from repair because the drain or close deliberately removed the snapshot's
-subject.
+complete source inventory from bytes and then captures one parsed snapshot for
+an unpublished bounded-batch reconstruction. Clearing readiness alone would
+strand the projection until another edit. Cancellation is excluded from repair
+because the drain or close deliberately removed the snapshot's subject.
 
 Production queries construct no candidate-page plan and apply no
 selectivity cutoff. A simple query is parsed once; invalid input returns its

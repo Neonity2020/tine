@@ -227,18 +227,6 @@ impl Graph {
         }
     }
 
-    /// GH #543 partial admission: `(indexed, total)` pages while the attached
-    /// projection's warm validation or stream is converging, `None` when no
-    /// build is in flight (or no projection is attached). A search surface
-    /// shows results over the partial index and polls this to say so.
-    pub fn query_index_progress(&self) -> Option<(u64, u64)> {
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|projection| projection.index_progress())
-    }
-
     /// The readiness lifecycle of the attached projection, or `None` when no
     /// projection is attached at all.
     pub(super) fn direct_projection_progress(
@@ -873,9 +861,9 @@ impl Graph {
     /// §5.9/M9: schedule the recovery a FAILED projection read owes.
     ///
     /// `mark_stale` alone would strand the projection until another edit. Repair
-    /// uses a complete source inventory and bounded page batches when there is
-    /// no parsed cache, or reuses an already-owned parsed snapshot. It never
-    /// builds a parsed graph solely to reconstruct the disposable database.
+    /// validates a complete source inventory, then captures one parsed snapshot
+    /// for a bounded staged build when there is no parsed cache, or reuses an
+    /// already-owned parsed snapshot.
     pub(crate) fn direct_projection_recover_after_failed_read(&self) {
         self.direct_projection_repair(true);
     }
@@ -950,20 +938,24 @@ impl Graph {
             .as_ref()
             .map(|pages| (Arc::clone(pages), self.disk_revs.read().unwrap().clone()));
         let Some((pages, revisions)) = snapshot else {
-            // The existing worker resets the disposable projection before
-            // validating this source inventory, then consumes bounded page
-            // batches. Never call warm_cache here: its legacy fallback builds
-            // the parsed graph when streaming cannot currently acquire ownership.
-            let outcome = self.warm_projection_cancellable(&|| false);
-            // A `reset` above already set the rebuild obligation, and only a
-            // full snapshot or a warm inventory can discharge it. This warm is
-            // the payload that was promised, so anything other than ownership
-            // means nobody owes one: an open stream refuses the enqueue, drift
-            // abandons it, an unavailable projection never had one. Dropping
-            // the outcome here latched `rebuild` with no producer and refused
-            // every later query forever (GH #543). Withdraw instead: the
-            // frontend retries, the next repair runs once the stream closes.
-            if !matches!(outcome, super::page_cache::WarmProjectionOutcome::Owned) {
+            // A failed read cannot validate the damaged image. Capture one
+            // parsed source snapshot and hand it to the unpublished fresh
+            // builder. An ordinary not-yet-started image still gets the cheap
+            // revision-only validation first and parses only when that says a
+            // cold/stale build is required.
+            let owned = if reset {
+                self.warm_page_cache_cancellable(&|| false)
+            } else {
+                match self.warm_projection_cancellable(&|| false) {
+                    super::page_cache::WarmProjectionOutcome::Owned => true,
+                    super::page_cache::WarmProjectionOutcome::Retry => {
+                        self.warm_page_cache_cancellable(&|| false)
+                    }
+                    super::page_cache::WarmProjectionOutcome::Cancelled
+                    | super::page_cache::WarmProjectionOutcome::Unavailable => false,
+                }
+            };
+            if !owned {
                 if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
                     projection.withdraw_rebuild_request();
                 }
@@ -987,7 +979,14 @@ impl Graph {
             return;
         }
         // A reset must be followed by a payload; see `direct_projection_enqueue_full`.
-        self.direct_projection_enqueue_full(generation, pages, Arc::new(revisions), reset);
+        let source_complete = self.page_index_failures.read().unwrap().is_empty();
+        self.direct_projection_enqueue_full(
+            generation,
+            pages,
+            Arc::new(revisions),
+            reset,
+            source_complete,
+        );
     }
 
     pub(super) fn direct_projection_note_fallback_read(&self) {

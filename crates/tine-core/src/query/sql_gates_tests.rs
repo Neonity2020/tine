@@ -637,6 +637,36 @@ pub(crate) fn write_fast_corpus(root: &Path) {
         .expect("odd journal");
 }
 
+/// Ordinary nonmatching rows used only by plan-shape gates. The shared semantic
+/// corpus stays tiny and unchanged, while these gates retain the same optimized
+/// statistics production uses and make every named positive anchor selective.
+fn write_selective_plan_background(root: &Path) {
+    for page in 0..256 {
+        let mut body = String::new();
+        for block in 0..8 {
+            body.push_str(&format!(
+                "- neutral qzxv background {page:03} row {block:02}\n"
+            ));
+        }
+        std::fs::write(
+            root.join("pages").join(format!("neutral-{page:03}.md")),
+            body,
+        )
+        .expect("selective plan background page");
+    }
+}
+
+fn assert_selective_plan_background(corpus: &Corpus) {
+    assert!(
+        corpus.graph.list_pages().len() >= 256,
+        "the optimized plan fixture must contain the nonmatching page background"
+    );
+    assert!(
+        corpus.trigram_fts_rows() >= 2_048,
+        "the optimized plan fixture must contain the nonmatching block background"
+    );
+}
+
 /// The focused page-`blocks` corpus. It separates root/deep matches, Markdown
 /// and Org, empty-relation quantifiers, duplicate display names, page and block
 /// properties, exact visible-text operators, and the two reference contexts a
@@ -1774,7 +1804,9 @@ fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
     let _serial = serialize();
     let root = scratch("relation-plan");
     write_fast_corpus(&root);
+    write_selective_plan_background(&root);
     let corpus = Corpus::open(root, true);
+    assert_selective_plan_background(&corpus);
     let source = "(and [[Project]] (not (task DONE)))";
     let plan_for = |rule| {
         let (_anchor, statement) = corpus.lower_as(source, QueryDialect::Og, RESULT_SET_RULE, rule);
@@ -2196,7 +2228,9 @@ fn a_positively_bounded_query_searches_its_anchor_and_indexes_its_subqueries() {
     let _serial = serialize();
     let root = scratch("plan");
     write_fast_corpus(&root);
+    write_selective_plan_background(&root);
     let corpus = Corpus::open(root, true);
+    assert_selective_plan_background(&corpus);
     let (failures, vacuous) = measure_plans(&corpus);
     assert!(
         failures.is_empty(),

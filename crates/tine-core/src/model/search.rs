@@ -14,6 +14,7 @@ impl Graph {
             &crate::query_plan::QueryPlan::block_search_literal(query, limit),
             false,
             None,
+            true,
         )
         .map(|answer| crate::query_plan::block_hits_to_groups(answer.hits))
     }
@@ -91,7 +92,12 @@ impl Graph {
             display,
             consumer,
         );
-        self.read_friendly_plan(&plan, explain, None)
+        self.read_friendly_plan(
+            &plan,
+            explain,
+            None,
+            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
+        )
     }
 
     /// Interactive search lane: a newer request in the same lane cooperatively
@@ -118,6 +124,7 @@ impl Graph {
             &crate::query_plan::QueryPlan::block_search_literal(query, limit),
             false,
             Some(cancelled),
+            true,
         )
         .map(|answer| crate::query_plan::block_hits_to_groups(answer.hits))
     }
@@ -212,6 +219,7 @@ impl Graph {
             &plan,
             explain,
             Some(Arc::new(move || epoch.load(Ordering::Acquire) != mine)),
+            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
         )
     }
 
@@ -220,6 +228,7 @@ impl Graph {
         plan: &crate::query_plan::QueryPlan,
         explain: bool,
         lane: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        pre_ready_interactive: bool,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         use crate::query::friendly::{
             friendly_without_read, read_friendly_results, FriendlyReadInputs,
@@ -253,13 +262,33 @@ impl Graph {
         if lane.as_ref().is_some_and(|cancelled| cancelled()) {
             return Ok(friendly_without_read(plan, explain, &lane).unwrap());
         }
-        answer
+        match answer {
+            Ok(answer) => Ok(answer),
+            Err(crate::query::QueryExecutionError::Cancelled) => {
+                Err(crate::query::QueryExecutionError::Cancelled)
+            }
+            Err(error) if !pre_ready_interactive => Err(error),
+            Err(
+                error @ (crate::query::QueryExecutionError::NotReady(_)
+                | crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::ProjectionUnavailable
+                    | crate::query::QueryUnavailableReason::ReadFailed,
+                )),
+            ) => self
+                .with_captured_pages(|pages| {
+                    crate::query_plan::pre_ready_interactive_snapshot(plan, pages, explain, &|| {
+                        lane.as_ref().is_some_and(|cancelled| cancelled())
+                    })
+                })
+                .ok_or(error),
+            Err(error) => Err(error),
+        }
     }
 
     /// Fuzzy page-name matches for the quick switcher.
     pub fn quick_switch(&self, query: &str, limit: usize) -> Vec<PageEntry> {
         let plan = crate::query_plan::QueryPlan::page_name_fuzzy(query, limit);
-        self.read_friendly_plan(&plan, false, None)
+        self.read_friendly_plan(&plan, false, None, false)
             .map(|answer| crate::query_plan::page_hits_to_entries(answer.hits))
             .unwrap_or_else(|_| {
                 crate::query_plan::pre_ready_page_search_entries(
