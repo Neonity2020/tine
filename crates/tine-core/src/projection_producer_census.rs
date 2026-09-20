@@ -1438,7 +1438,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.26.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.27.0\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1537,6 +1537,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // token publication. Schema initialization and one pre-publication schema
     // validation moved inside storage; the ordinary apply call remains. No
     // authority crossing or dependency pin changed.
+    // 2026-09-20: final compact-projection delivery pins tine-storage v0.27.0.
+    // The production import and direct-call inventory is unchanged, so the
+    // digest below holds.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "9e53e9b52a57fb8df5174cc77fed32859109168ed79e554a3bd451eac91aba53",

@@ -43,6 +43,13 @@ const NONCANONICAL_DUPLICATE_BODY = "NONCANONICAL-STORAGE-OWNER-642";
 const NONCANONICAL_BLOCK_QUERY = "NONCANONICAL-BLOCK-OWNER-643";
 const NONCANONICAL_BLOCK_ID = "64364364-3643-4643-8643-643643643643";
 const NONCANONICAL_EDIT = "Edited exact noncanonical owner 644";
+const INTERACTIVE_VERIFIED_WINDOW = 300;
+const WINDOW_QUERY = "RECENCY-WINDOW-NEEDLE-927";
+const OLDEST_WINDOW_PAGE = "000 Search Window Oldest";
+const OLDEST_WINDOW_BLOCK_ID = "92792792-7927-4927-8927-927927927927";
+const OLD_EXACT_PAGE = "000 Exact Page Outside Search Window";
+const NEWER_WINDOW_OWNERS = INTERACTIVE_VERIFIED_WINDOW + 1;
+const EXPECTED_INLINE_WINDOW_BLOCKS = NEWER_WINDOW_OWNERS + 1;
 const CANONICAL_DUPLICATE_FILE = path.join(GRAPH, `pages/${DUPLICATE_PAGE}.md`);
 const NONCANONICAL_DUPLICATE_FILE = path.join(GRAPH, `pages/duplicates/${DUPLICATE_PAGE}.md`);
 
@@ -56,6 +63,24 @@ for (const dir of ["data", "config", "cache"]) {
 }
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 fs.writeFileSync(path.join(GRAPH, "logseq/config.edn"), "{}\n");
+// Fresh projection rows follow the path-sorted inventory. The exact/best-ranked
+// block is deliberately first, while more than W longer matches have `zz-`
+// paths and therefore newer row coordinates. If the exact block reached the
+// interactive candidate window it would be the first displayed result; its
+// absence cannot be explained by the switcher's 50-row presentation chunk.
+fs.writeFileSync(path.join(GRAPH, `pages/${OLDEST_WINDOW_PAGE}.md`), [
+  `- ${WINDOW_QUERY}`,
+  `  id:: ${OLDEST_WINDOW_BLOCK_ID}`,
+  "",
+].join("\n"));
+fs.writeFileSync(path.join(GRAPH, `pages/${OLD_EXACT_PAGE}.md`), "- old exact page-name witness\n");
+for (let index = 0; index < NEWER_WINDOW_OWNERS; index += 1) {
+  const suffix = String(index).padStart(3, "0");
+  fs.writeFileSync(
+    path.join(GRAPH, `pages/zz-window-${suffix}.md`),
+    `- newer owner ${suffix} contains ${WINDOW_QUERY} with deliberately longer ranking context\n`,
+  );
+}
 fs.writeFileSync(path.join(GRAPH, `pages/${MAIN_PAGE}.md`), [
   "- Collapsed search owner",
   "  collapsed:: true",
@@ -63,6 +88,8 @@ fs.writeFileSync(path.join(GRAPH, `pages/${MAIN_PAGE}.md`), [
   `    id:: ${CURRENT_BLOCK_ID}`,
   `- ${DECOMPOSED_BLOCK}`,
   "  id:: 50505050-5050-4050-8050-505050505050",
+  `- {{query (search "${WINDOW_QUERY}")}}`,
+  "  tine.view:: search",
   "",
 ].join("\n"));
 fs.writeFileSync(path.join(GRAPH, "pages/Search Parity Other.md"), [
@@ -413,18 +440,74 @@ try {
   receipt.observations.unicodeBlock = unicodeBlock;
   await closeSwitcher(browser);
 
-  // 5c. Canonical equivalence is not accent folding. Wait for an ordinary
-  // backend page hit as the settlement witness, then prove the accent-bearing
-  // block is absent and Create remains available (no false exact page match).
+  // 5c. Search folding strips accents, while page identity remains narrower.
+  // The ASCII query must therefore find the accent-bearing block and must
+  // still retain Create because it is not an exact page-identity match.
   await openSwitcher(browser, ["Control", "k"], "Jump to page, search, or run a command…");
   await typeKeys(browser, "cafe");
-  const accentNegative = await waitFor(browser, (state) => state.rows.some((row) => row.kind === "page" && row.name === "Cafe Plain Control")
+  const accentFold = await waitFor(browser, (state) => state.rows.some((row) => row.kind === "page" && row.name === "Cafe Plain Control")
+    && state.rows.some((row) => row.kind === "block" && row.excerpt.includes(DECOMPOSED_BLOCK))
     && state.rows.some((row) => row.kind === "new"),
-  "ASCII negative control did not reach a settled backend result");
-  if (accentNegative.rows.some((row) => row.kind === "block" && row.excerpt.includes(DECOMPOSED_BLOCK))) {
-    throw new Error(`ASCII cafe accent-folded into the decomposed block: ${JSON.stringify(accentNegative)}`);
+  "ASCII query did not accent-fold block search while preserving Create");
+  receipt.observations.accentFold = accentFold;
+  await closeSwitcher(browser);
+
+  // 6. The same >W needle has deliberately different consumer semantics. The
+  // exact oldest block wins ranking if admitted, but Ctrl-K's W newest verified
+  // owners exclude it. The rendered inline Friendly macro remains exhaustive
+  // and therefore includes that exact old block. Page-name navigation is also
+  // exhaustive and independently returns an old exact name.
+  await expectMainRoute(browser, MAIN_PAGE, "window proof lost the inline-query host route");
+  // Inline Friendly has no pre-ready parsed-snapshot fallback. Its completed
+  // rendered answer is therefore also the readiness barrier before Ctrl-K.
+  await browser.waitUntil(() => browser.execute((query, oldestPage) => {
+    const rows = [...document.querySelectorAll(".query-search-results .query-search-hit")];
+    return rows.some((row) => {
+      const context = row.querySelector(".search-result-context")?.textContent?.trim() ?? "";
+      const excerpt = row.querySelector(".search-result-excerpt")?.textContent?.trim() ?? "";
+      return context.includes(oldestPage) && excerpt === query;
+    });
+  }, WINDOW_QUERY, OLDEST_WINDOW_PAGE), {
+    timeout: 60_000,
+    timeoutMsg: "rendered inline Friendly search did not include the oldest exact block beyond W",
+  });
+  const inlineWindow = await browser.execute((query) => {
+    const rows = [...document.querySelectorAll(".query-search-results .query-search-hit")];
+    return {
+      count: document.querySelector(".query-block .query-count")?.textContent?.trim() ?? "",
+      renderedBlocks: rows.length,
+      exactOldest: rows.filter((row) => (
+        row.querySelector(".search-result-excerpt")?.textContent?.trim() ?? ""
+      ) === query).length,
+    };
+  }, WINDOW_QUERY);
+  if (inlineWindow.exactOldest !== 1 || Number(inlineWindow.count) !== EXPECTED_INLINE_WINDOW_BLOCKS) {
+    throw new Error(`inline Friendly search was not exhaustive beyond W: ${JSON.stringify(inlineWindow)}`);
   }
-  receipt.observations.accentNegative = accentNegative;
+  receipt.observations.inlineFriendlyWindow = inlineWindow;
+
+  await openSwitcher(browser, ["Control", "k"], "Jump to page, search, or run a command…");
+  await typeKeys(browser, WINDOW_QUERY);
+  const interactiveWindow = await waitFor(browser, (state) => state.rows.some((row) => row.kind === "block"
+    && row.excerpt.includes("newer owner") && row.excerpt.includes(WINDOW_QUERY))
+    && !state.rows.some((row) => row.kind === "block" && row.excerpt.trim() === WINDOW_QUERY),
+  "Ctrl-K did not settle on the recent verified window", 60_000);
+  receipt.observations.interactiveWindow = {
+    query: WINDOW_QUERY,
+    configuredWindow: INTERACTIVE_VERIFIED_WINDOW,
+    newerMatchingOwners: NEWER_WINDOW_OWNERS,
+    oldestExactBlockId: OLDEST_WINDOW_BLOCK_ID,
+    oldestExactVisible: false,
+    displayedRows: interactiveWindow.rows.filter((row) => row.kind === "block").length,
+  };
+  await closeSwitcher(browser);
+
+  await openSwitcher(browser, ["Control", "k"], "Jump to page, search, or run a command…");
+  await typeKeys(browser, OLD_EXACT_PAGE);
+  const exhaustiveOldPageName = await waitFor(browser, (state) => state.rows.some((row) => row.kind === "page" && row.name === OLD_EXACT_PAGE)
+    && !state.rows.some((row) => row.kind === "new"),
+  "old exact page name outside the block window was not returned");
+  receipt.observations.exhaustiveOldPageName = exhaustiveOldPageName;
   await closeSwitcher(browser);
 
   // 4. A route without a single page uses the ordinary global provider set.
@@ -447,7 +530,7 @@ try {
   await closeSwitcher(browser);
 
   fs.writeFileSync(path.join(ARTIFACTS, "receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-  console.log("PASS: literal search gestures preserve exact storage owners, routes, scope blocks, and canonical Unicode without accent folding");
+  console.log("PASS: literal search gestures preserve storage identity, routing, folded text, exhaustive Friendly search, and recent-window Ctrl-K semantics");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try {

@@ -10,14 +10,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
-- Internal: Tine now pins tine-storage v0.26.0. v0.25.0 deletes the Managed
+- Internal: compact-projection P1 moved tine-storage through v0.25.0 and
+  v0.26.0. v0.25.0 deletes the Managed
   Storage half of the crate (durable batches, local journals, sealed digests,
   the oplog frontier and the managed layout — 32,640 → 11,863 source lines).
-  The crate is the Direct Files durability and SQLite projection crate; nothing
-  Tine used moved, and the projection schema is unchanged at version 29, so no
-  rebuild is triggered. v0.26.0 then trims the crate's public surface to the
-  methods Tine's Direct Files path calls (compact-projection campaign P1; no
-  user-visible change).
+  The crate became the Direct Files durability and SQLite projection crate;
+  nothing Tine used moved. At that stage, the projection schema was unchanged
+  at version 29, so no rebuild was triggered. v0.26.0 then trims the crate's
+  public surface to the methods Tine's Direct Files path calls (no user-visible
+  change).
+- Internal: Tine now pins tine-storage v0.27.0 and projection schema 30. The
+  compact schema removes redundant cache data and uses one integer coordinate
+  space for pages and blocks; an existing schema-29 projection is rebuilt once
+  from the Markdown/Org graph, without changing graph files.
+- Ctrl+K, the `((` picker and unlinked-reference search use a bounded recent-
+  result window. Inline Friendly search shares their index, canonical folding
+  and exact matcher, but remains exhaustive up to its 5,000-result limit and
+  preserves display order.
+- A cold, stale, damaged or configuration-changed search index is built and
+  checked in an unpublished file, then atomically becomes ready only as a
+  complete image. Before the first ready image, Ctrl+K and the `((` picker use
+  the loaded graph snapshot while structured queries keep waiting; failure or
+  cancellation preserves the previous coherent committed image.
 - Internal: `scripts/measure-projection.mjs` runs `graph_scale_bench --root <graph>` on a real corpus and reports the compact-projection budget rows (S1 file/Markdown, S2 build write amplification, T1 build time, M1 peak RSS, U1 bytes per single-block edit, T2 Ctrl+K p95, T3 `{{query}}` p95) against `scripts/projection-budget-policy.json`; `src/projectionBudget.test.ts` runs it only when `TINE_PROJECTION_CORPUS` names a corpus. Anon baseline recorded 2026-09-19 (compact-projection P0a).
 - Internal: every SQL statement tine-core sends to the search/query projection
   now passes through one door (`query/projection_sql.rs`), a blessed statement

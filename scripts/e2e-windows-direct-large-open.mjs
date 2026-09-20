@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-// Focused Windows diagnostic for GH #266. Fixture construction happens before
-// Tine starts; the asserted interval is only the frontend load_graph call.
+// Focused Windows diagnostic for GH #266 and the GH #543 readiness regression.
+// Fixture construction happens before Tine starts; the load ceiling still
+// covers only the frontend load_graph call.
 import { spawn, spawnSync } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -34,6 +35,7 @@ const root = path.join(os.tmpdir(), `tine-windows-direct-large-${process.pid}`);
 const graph = path.join(root, "L-Logseq-笔记");
 const artifacts = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "artifacts"));
 const debugLog = path.join(artifacts, "tine-debug.log");
+const applicationStderrLog = path.join(artifacts, "application-stderr.log");
 const marker = "WINDOWS_DIRECT_LARGE_OPEN_MARKER";
 const now = new Date();
 const journalStem = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
@@ -62,9 +64,73 @@ const env = {
   TINE_GRAPH: graph,
   TINE_DEBUG: "1",
   TINE_DEBUG_LOG: debugLog,
+  TINE_E2E_APPLICATION_STDERR_LOG: applicationStderrLog,
   APPDATA: path.join(root, "appdata"),
   LOCALAPPDATA: path.join(root, "localappdata"),
 };
+
+function projectionReadyEvidence() {
+  if (!fs.existsSync(applicationStderrLog)) return null;
+  const lines = fs.readFileSync(applicationStderrLog, "utf8").split(/\r?\n/);
+  for (const line of lines.reverse()) {
+    const match = line.match(/\[tine\] projection \+(\d+)ms ready at generation=(\d+)/);
+    if (match) {
+      return {
+        line,
+        projectionElapsedMs: Number(match[1]),
+        generation: Number(match[2]),
+      };
+    }
+  }
+  return null;
+}
+
+async function openGlobalSwitcher(browser) {
+  await browser.keys(["Control", "k"]);
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 30_000 });
+  await browser.waitUntil(() => input.isFocused(), {
+    timeout: 30_000,
+    timeoutMsg: "Ctrl+K did not focus the global switcher input",
+  });
+  const placeholder = await input.getAttribute("placeholder");
+  if (placeholder !== "Jump to page, search, or run a command…") {
+    throw new Error(`Ctrl+K opened an unexpected switcher mode: ${JSON.stringify(placeholder)}`);
+  }
+  return input;
+}
+
+async function typeLiteralKeys(browser, text) {
+  for (const key of text) await browser.keys([key]);
+}
+
+async function switcherSearchSnapshot(browser) {
+  return browser.execute(() => ({
+    pending: document.querySelector('.switcher-empty[role="status"]')?.textContent?.trim() ?? null,
+    rows: [...document.querySelectorAll(".switcher-row.block-result")].map((row) => ({
+      context: row.querySelector(".search-result-context")?.textContent?.trim() ?? "",
+      excerpt: row.querySelector(".search-result-excerpt")?.textContent?.trim() ?? "",
+    })),
+  }));
+}
+
+async function waitForMarkerResult(browser, observePending) {
+  let result = null;
+  await browser.waitUntil(async () => {
+    const snapshot = await switcherSearchSnapshot(browser);
+    observePending(snapshot.pending);
+    const row = snapshot.rows.find((candidate) => candidate.excerpt.includes(marker));
+    if (!row || snapshot.pending) return false;
+    result = row;
+    return true;
+  }, {
+    timeout: 90_000,
+    interval: 100,
+    timeoutMsg: `Ctrl+K did not return the fixture block for ${marker}`,
+  });
+  return result;
+}
+
 const webviewTarget = await startWebdriverApplication(APP, env, NATIVE_PORT);
 const driverLog = fs.openSync(path.join(artifacts, "tauri-driver.log"), "w");
 const driver = spawn(TD, webdriverServerArgs(DRIVER_PORT), {
@@ -94,6 +160,51 @@ try {
     timeout: 90_000,
     timeoutMsg: "large Direct Files graph did not render its journal",
   });
+
+  const readyAtFirstSearchStart = projectionReadyEvidence();
+  const firstSearchStartedAt = Date.now();
+  const firstInput = await openGlobalSwitcher(browser);
+  await typeLiteralKeys(browser, marker);
+  await browser.waitUntil(async () => (await firstInput.getValue()) === marker, {
+    timeout: 30_000,
+    timeoutMsg: "literal WebDriver keys did not reach the Ctrl+K input",
+  });
+  const pendingMessages = new Set();
+  const firstResult = await waitForMarkerResult(browser, (pending) => {
+    if (pending) pendingMessages.add(pending);
+  });
+  const firstResultElapsedMs = Date.now() - firstSearchStartedAt;
+  const readyAtFirstResult = projectionReadyEvidence();
+  const firstResultPhase = readyAtFirstSearchStart
+    ? "ready-at-search-start"
+    : readyAtFirstResult
+      ? "ready-before-result-observation"
+      : "pre-ready-cache-result";
+
+  await browser.waitUntil(() => projectionReadyEvidence() !== null, {
+    timeout: 90_000,
+    interval: 100,
+    timeoutMsg: "projection lifecycle trace did not reach ready after the Ctrl+K search",
+  });
+  const projectionReady = projectionReadyEvidence();
+  await browser.keys(["Escape"]);
+  await browser.$(".switcher-input").waitForExist({ reverse: true, timeout: 30_000 });
+
+  const postReadySearchStartedAt = Date.now();
+  const postReadyInput = await openGlobalSwitcher(browser);
+  await typeLiteralKeys(browser, marker);
+  await browser.waitUntil(async () => (await postReadyInput.getValue()) === marker, {
+    timeout: 30_000,
+    timeoutMsg: "literal WebDriver keys did not reach the post-ready Ctrl+K input",
+  });
+  const postReadyPendingMessages = new Set();
+  const postReadyResult = await waitForMarkerResult(browser, (pending) => {
+    if (pending) postReadyPendingMessages.add(pending);
+  });
+  const postReadyResultElapsedMs = Date.now() - postReadySearchStartedAt;
+  await browser.keys(["Escape"]);
+  await browser.$(".switcher-input").waitForExist({ reverse: true, timeout: 30_000 });
+
   await browser.waitUntil(() => fs.existsSync(debugLog) && fs.readFileSync(debugLog, "utf8").includes("[ui] graph load call returned"), {
     timeout: 30_000,
     timeoutMsg: "debug trace did not record completion of the graph-load call",
@@ -108,7 +219,7 @@ try {
     .split(/\r?\n/)
     .filter((line) => line.includes("graph load phase:"));
   const receipt = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     scenario: "windows-direct-large-open",
     pageCount: PAGE_COUNT,
     assetCount: ASSET_COUNT,
@@ -118,6 +229,28 @@ try {
     loadCallMs,
     maxLoadMs: MAX_LOAD_MS,
     phases,
+    ctrlK: {
+      query: marker,
+      input: "literal WebDriver Control+K and character keys",
+      firstSearch: {
+        elapsedMs: firstResultElapsedMs,
+        resultPhase: firstResultPhase,
+        indexingObserved: [...pendingMessages].some((message) => /indexing/i.test(message)),
+        pendingMessages: [...pendingMessages],
+        result: firstResult,
+      },
+      projectionReady: {
+        source: path.basename(applicationStderrLog),
+        observed: true,
+        ...projectionReady,
+      },
+      postReadySearch: {
+        elapsedMs: postReadyResultElapsedMs,
+        indexingObserved: [...postReadyPendingMessages].some((message) => /indexing/i.test(message)),
+        pendingMessages: [...postReadyPendingMessages],
+        result: postReadyResult,
+      },
+    },
   };
   fs.writeFileSync(path.join(artifacts, "windows-direct-large-open-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
   if (loadCallMs > MAX_LOAD_MS) {
