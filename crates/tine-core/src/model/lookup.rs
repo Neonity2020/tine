@@ -230,12 +230,14 @@ impl Graph {
         self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        if let Some((pages, blocks, page_owners)) = self.direct_projection_reference_candidate_pages(
-            names_norm,
-            self_page,
-            kind,
-            crate::query::candidate::CandidateMode::Exhaustive,
-        ) {
+        if let Some((pages, blocks, page_owners)) = self
+            .direct_projection_reference_candidate_pages(
+                names_norm,
+                self_page,
+                kind,
+                crate::query::candidate::CandidateMode::Exhaustive,
+            )
+        {
             // R6: the inventory is the projection's (memoized), never a reason
             // to build the whole parsed graph.
             let full_page_count = self.list_pages().len();
@@ -287,16 +289,18 @@ impl Graph {
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
-        if let Some((pages, blocks, page_owners)) = self.direct_projection_reference_candidate_pages(
-            names_norm,
-            self_page,
-            kind,
-            if kind == ReferenceKind::Plain {
-                crate::query::candidate::CandidateMode::interactive()
-            } else {
-                crate::query::candidate::CandidateMode::Exhaustive
-            },
-        ) {
+        if let Some((pages, blocks, page_owners)) = self
+            .direct_projection_reference_candidate_pages(
+                names_norm,
+                self_page,
+                kind,
+                if kind == ReferenceKind::Plain {
+                    crate::query::candidate::CandidateMode::interactive()
+                } else {
+                    crate::query::candidate::CandidateMode::Exhaustive
+                },
+            )
+        {
             let full_page_count = self.list_pages().len();
             return Ok(ReferenceCandidatePages {
                 pages,

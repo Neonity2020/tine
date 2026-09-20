@@ -38,7 +38,8 @@ fn write_census_corpus(root: &Path) {
          \t- alpha sibling after the exported subtree\n\
          - DONE alpha done task\n\
          - census:: one\n\
-         - a plain block mentioning beta\n",
+         - a plain block mentioning beta\n\
+         - plain mentions go and ox\n",
     )
     .unwrap();
     std::fs::write(
@@ -46,6 +47,7 @@ fn write_census_corpus(root: &Path) {
         "alias:: bee\n\n- beta block referencing [[Alpha Book]]\n- another #fiction alpha\n",
     )
     .unwrap();
+    std::fs::write(root.join("pages/Go.md"), "alias:: ox\n\n- short target\n").unwrap();
     std::fs::write(root.join("pages/Gamma.md"), "- gamma alpha\n").unwrap();
     std::fs::write(root.join("pages/Alpha%2FChild.md"), "- namespaced alpha\n").unwrap();
     std::fs::write(
@@ -120,6 +122,32 @@ fn exercise_every_surface(graph: &Graph) {
             crate::query_plan::FriendlyConsumer::CtrlK,
         )
         .expect("interactive page-by-content");
+    let scoped = graph
+        .run_graph_search_displayed_for(
+            "alpha",
+            12,
+            12,
+            Some(crate::query_plan::QueryPageScope {
+                name: "Alpha Book".into(),
+                page_kind: crate::model::PageKind::Page,
+                path: Some("pages/Alpha Book.md".into()),
+            }),
+            false,
+            FriendlyDisplayOptions::default(),
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        )
+        .expect("scoped interactive Ctrl-K");
+    assert!(
+        !scoped.hits.is_empty(),
+        "scoped interactive Ctrl-K answered nothing"
+    );
+    let alias_suggestions = graph.quick_switch("b", 12);
+    assert!(
+        alias_suggestions
+            .iter()
+            .any(|entry| entry.name == "bee" && entry.rel_path == "pages/Beta.md"),
+        "ready quick-switch must execute the authored-alias suggestion route: {alias_suggestions:?}"
+    );
     // Macro queries, one per lowering family the compiler emits, hydrated
     // through the results reader (descriptor + payload batches).
     for query in [
@@ -181,13 +209,31 @@ fn exercise_every_surface(graph: &Graph) {
         .expect("backlink filter context");
     crate::query::backlink_filter_context(graph, "2026-09-18", &[], "")
         .expect("journal backlink filter context");
-    graph
+    let interactive_indexed = graph
         .unlinked_refs_bounded_indexed("Beta", 100, 1 << 20)
         .expect("windowed unlinked narrowing");
-    let exhaustive_unlinked = graph.unlinked_refs_bounded("Beta", 100, 1 << 20);
     assert!(
-        exhaustive_unlinked.total > 0,
-        "exhaustive unlinked narrowing answered nothing"
+        interactive_indexed.total > 0,
+        "interactive indexed unlinked narrowing answered nothing"
+    );
+    // These equivalent spellings deliberately use distinct memo keys: each
+    // public route must execute rather than borrowing another route's result.
+    let exhaustive_indexed = graph.unlinked_refs_bounded("bee", 100, 1 << 20);
+    assert!(
+        exhaustive_indexed.total > 0,
+        "exhaustive indexed unlinked narrowing answered nothing"
+    );
+    let interactive_scan = graph
+        .unlinked_refs_bounded_indexed("Go", 100, 1 << 20)
+        .expect("windowed short-scan unlinked narrowing");
+    assert!(
+        interactive_scan.total > 0,
+        "interactive short-scan unlinked narrowing answered nothing"
+    );
+    let exhaustive_scan = graph.unlinked_refs_bounded("ox", 100, 1 << 20);
+    assert!(
+        exhaustive_scan.total > 0,
+        "exhaustive short-scan unlinked narrowing answered nothing"
     );
     // Live export: a top-level root and a nested root (the nested one runs the
     // boundary-parent check).
@@ -258,6 +304,68 @@ fn every_projection_statement_shape_is_blessed() {
     exercise_every_surface(&graph);
 
     let recorded: BTreeSet<String> = census::recorded().into_keys().collect();
+    let assert_shape = |label: &str, required: &[&str], forbidden: &[&str]| {
+        assert!(
+            recorded.iter().any(|sql| {
+                required.iter().all(|part| sql.contains(part))
+                    && forbidden.iter().all(|part| !sql.contains(part))
+            }),
+            "statement census did not execute {label}"
+        );
+    };
+    let indexed_unlinked = [
+        "SELECT path, result_id, entity_id, entity_type",
+        "FROM (SELECT rowid FROM search_fts WHERE search_fts MATCH ? ORDER BY rowid DESC) c",
+    ];
+    assert_shape(
+        "interactive indexed unlinked SQL",
+        &[
+            indexed_unlinked[0],
+            indexed_unlinked[1],
+            "tine_query_rank(entity_type",
+            "LIMIT ?",
+        ],
+        &[],
+    );
+    assert_shape(
+        "exhaustive indexed unlinked SQL",
+        &indexed_unlinked,
+        &["tine_query_rank(entity_type", "LIMIT ?"],
+    );
+    let scan_unlinked = [
+        "SELECT p.path AS path, NULL AS result_id",
+        "UNION ALL SELECT p.path, b.result_id",
+    ];
+    assert_shape(
+        "interactive short-scan unlinked SQL",
+        &[
+            scan_unlinked[0],
+            scan_unlinked[1],
+            "tine_query_rank(0",
+            "tine_query_rank(1",
+            "LIMIT ?",
+        ],
+        &[],
+    );
+    assert_shape(
+        "exhaustive short-scan unlinked SQL",
+        &scan_unlinked,
+        &["tine_query_rank(", "LIMIT ?"],
+    );
+    assert_shape(
+        "authored-alias page-name suggestions SQL",
+        &["PARTITION BY r.page_id, r.matched_text"],
+        &[],
+    );
+    assert_shape(
+        "scoped interactive block cursor SQL",
+        &[
+            "SELECT b.block_id, bt.content, p.path",
+            "WHERE p.path = ?",
+            "ORDER BY b.block_id DESC",
+        ],
+        &[],
+    );
     let path = blessed_path();
     if std::env::var_os(BLESS_ENV).is_some() {
         let mut text = recorded.iter().cloned().collect::<Vec<_>>().join("\n");

@@ -1517,9 +1517,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // integer private coordinates, moved SQL bind sites from blobs to
     // integers, and removed the retired blob decoder. The read/write call
     // ownership and the write crossings asserted above are unchanged.
+    // 2026-09-20: P3b correction A classifies malformed streamed candidates
+    // directly as ResultReadError::Corrupt instead of constructing three
+    // storage InvalidQuery errors. Correction B binds source exclusions and
+    // decodes the page/block entity discriminator in the shared unlinked
+    // candidate read. These alter read-only value/error inventory rows; no
+    // storage write crossing or public storage dependency pin changed.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "05b9d361cc3643470e43e4b46f1d595c8bc249a4963c6497389cfa8d99e4b02d",
+        "1ba3e4144d2cc21a391cb8489b6ae8011240da2ecb9210f45daf127b1af51bbd",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

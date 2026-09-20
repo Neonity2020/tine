@@ -861,6 +861,19 @@ pub(crate) fn plain_reference_query_instrumentation() -> (usize, Vec<Vec<String>
     (callbacks, plans)
 }
 
+#[cfg(test)]
+fn capture_plain_reference_query_plan(
+    path: &Path,
+    sql: &str,
+    params: &[PhysicalQueryValue],
+) -> Option<()> {
+    let plan_reader = tine_storage::sqlite::PhysicalProjectionQueryReader::open(path).ok()?;
+    plan_reader.set_query_rank_function(|_, _| Ok(None)).ok()?;
+    let plan = plan_reader.explain_query_plan(sql, params).ok()?;
+    PLAIN_REFERENCE_QUERY_PLANS.with(|plans| plans.borrow_mut().push(plan));
+    Some(())
+}
+
 /// Direct Files' disposable parser-fact projection.
 ///
 /// The foreground only publishes already-parsed `Arc<Document>` snapshots into
@@ -2288,9 +2301,8 @@ impl DirectProjection {
                                 page_conditions.push_str(" AND ");
                                 block_conditions.push_str(" AND ");
                             }
-                            page_conditions.push_str(&format!(
-                                "tine_query_rank(0, {page_frame}) IS NOT NULL"
-                            ));
+                            page_conditions
+                                .push_str(&format!("tine_query_rank(0, {page_frame}) IS NOT NULL"));
                             block_conditions.push_str(&format!(
                                 "tine_query_rank(1, {block_frame}) IS NOT NULL"
                             ));
@@ -2319,16 +2331,7 @@ impl DirectProjection {
                         mode,
                         crate::query::candidate::CandidateMode::Interactive { .. }
                     ) {
-                        let plan_reader =
-                            tine_storage::sqlite::PhysicalProjectionQueryReader::open(
-                                &self.shared.path,
-                            )
-                            .ok()?;
-                        plan_reader
-                            .set_query_rank_function(|_, _| Ok(None))
-                            .ok()?;
-                        let plan = plan_reader.explain_query_plan(&sql, &params).ok()?;
-                        PLAIN_REFERENCE_QUERY_PLANS.with(|plans| plans.borrow_mut().push(plan));
+                        capture_plain_reference_query_plan(&self.shared.path, &sql, &params)?;
                     }
                     crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
                         let Some(PhysicalQueryValue::Text(path)) = row.first() else {

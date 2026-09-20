@@ -2396,12 +2396,11 @@ fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
     let reader = Arc::clone(&graph);
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let candidates = reader
-            .reference_candidate_pages(
-                &[crate::refs::page_key("target")],
-                "target",
-                ReferenceKind::Plain,
-            );
+        let candidates = reader.reference_candidate_pages(
+            &[crate::refs::page_key("target")],
+            "target",
+            ReferenceKind::Plain,
+        );
         result_tx.send(candidates.indexed).unwrap();
     });
 
@@ -2654,11 +2653,7 @@ fn interactive_plain_reference_window_counts_verified_page_and_block_owners_toge
     for ordinal in 0..block_matches {
         block_source.push_str(&format!("- target block {ordinal}\n"));
     }
-    std::fs::write(
-        root.join("pages/zz-block-target-source.md"),
-        block_source,
-    )
-    .unwrap();
+    std::fs::write(root.join("pages/zz-block-target-source.md"), block_source).unwrap();
 
     let graph = Graph::open(&root);
     graph.warm_cache();
@@ -2689,7 +2684,10 @@ fn interactive_plain_reference_window_counts_verified_page_and_block_owners_toge
         .iter()
         .all(|(entry, _)| !entry.name.starts_with("zz-false-")));
     assert_eq!(
-        candidates.blocks.as_ref().map(std::collections::HashSet::len),
+        candidates
+            .blocks
+            .as_ref()
+            .map(std::collections::HashSet::len),
         Some(block_matches)
     );
     assert_eq!(
@@ -2756,7 +2754,10 @@ fn interactive_short_plain_reference_scan_bounds_exact_callback_work() {
         "a >2W qualifying scan must do exactly W plus one merge-lookahead callback; plans={plans:?}"
     );
     assert!(
-        plans.iter().flatten().any(|step| step.contains("MERGE (UNION ALL)")),
+        plans
+            .iter()
+            .flatten()
+            .any(|step| step.contains("MERGE (UNION ALL)")),
         "the production scan statement must be a mergeable top-level compound: {plans:?}"
     );
     assert!(
@@ -2870,7 +2871,11 @@ fn interactive_plain_reference_excludes_self_before_window_admission() {
         .unlinked_refs_bounded_indexed("target", 100, 4 * 1024 * 1024)
         .expect("self-excluded interactive reference read")
         .groups;
-    assert_eq!(groups.len(), 1, "the self page must not consume W: {groups:?}");
+    assert_eq!(
+        groups.len(),
+        1,
+        "the self page must not consume W: {groups:?}"
+    );
     assert_eq!(groups[0].page, "aaa-other");
     assert_eq!(groups[0].blocks.len(), 1);
 
@@ -6013,12 +6018,11 @@ fn real_corpus_reference_family_matches_parser_oracle() {
             signature(&indexed_unlinked),
             signature(oracle_unlinked.as_deref().unwrap())
         );
-        let candidates = graph
-            .reference_candidate_pages(
-                &[crate::refs::page_key(target)],
-                target,
-                ReferenceKind::Explicit,
-            );
+        let candidates = graph.reference_candidate_pages(
+            &[crate::refs::page_key(target)],
+            target,
+            ReferenceKind::Explicit,
+        );
         assert!(candidates.indexed);
         eprintln!(
                 "real-corpus-reference explicit_candidates={} full_pages={} parser_unlinked_us={} indexed_unlinked_us={}",

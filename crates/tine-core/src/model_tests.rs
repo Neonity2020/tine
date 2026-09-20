@@ -1033,8 +1033,7 @@ fn quick_switch_offers_each_matching_authored_alias_before_and_after_readiness()
         for spelling in ["Welcome to Tine", "Welcome-To-Tine"] {
             assert!(
                 w.iter().any(|entry| {
-                    entry.name == spelling
-                        && entry.rel_path == "pages/Welcome to Tine.md"
+                    entry.name == spelling && entry.rel_path == "pages/Welcome to Tine.md"
                 }),
                 "{phase}: W must offer {spelling:?} on its real owner: {w:?}"
             );
@@ -1042,8 +1041,7 @@ fn quick_switch_offers_each_matching_authored_alias_before_and_after_readiness()
         let t = graph.quick_switch("T", 20);
         assert!(
             t.iter().any(|entry| {
-                entry.name == "Tine greet"
-                    && entry.rel_path == "pages/Welcome to Tine.md"
+                entry.name == "Tine greet" && entry.rel_path == "pages/Welcome to Tine.md"
             }),
             "{phase}: T must offer the authored alias: {t:?}"
         );
@@ -13276,12 +13274,11 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
         ],
     );
     let target_names = vec![crate::refs::page_key("Deep target")];
-    let accepted_candidates =
-        accepted_snapshot.reference_candidate_pages(
-            &target_names,
-            "Deep target",
-            ReferenceKind::Explicit,
-        );
+    let accepted_candidates = accepted_snapshot.reference_candidate_pages(
+        &target_names,
+        "Deep target",
+        ReferenceKind::Explicit,
+    );
     assert!(!accepted_candidates.indexed);
     assert_eq!(
             candidate_paths(&accepted_candidates),
@@ -13326,12 +13323,11 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
         ],
     );
     for _ in 0..2 {
-        let candidates =
-            rejected_snapshot.reference_candidate_pages(
-                &target_names,
-                "Deep target",
-                ReferenceKind::Explicit,
-            );
+        let candidates = rejected_snapshot.reference_candidate_pages(
+            &target_names,
+            "Deep target",
+            ReferenceKind::Explicit,
+        );
         assert!(!candidates.indexed);
         assert_eq!(candidates.pages.len(), candidates.full_page_count);
         assert!(

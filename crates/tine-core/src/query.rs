@@ -1325,12 +1325,11 @@ pub fn backlinks_bounded_indexed<G: QueryGraph>(
 ) -> Result<BoundedGroups, QueryExecutionError> {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
-    let candidate_pages =
-        graph.reference_candidate_pages_indexed(
-            &names_norm,
-            &self_page,
-            ReferenceKind::Explicit,
-        )?;
+    let candidate_pages = graph.reference_candidate_pages_indexed(
+        &names_norm,
+        &self_page,
+        ReferenceKind::Explicit,
+    )?;
     Ok(collect_reference_occurrences_in(
         graph,
         &canonical,

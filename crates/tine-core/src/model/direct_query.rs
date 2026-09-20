@@ -1331,15 +1331,14 @@ impl Graph {
         if !projection.wait_for_reference_generation(generation) {
             return None;
         }
-        let candidates =
-            projection.reference_candidates(
-                generation,
-                names_norm,
-                self_page,
-                kind,
-                mode,
-                &self.config,
-            )?;
+        let candidates = projection.reference_candidates(
+            generation,
+            names_norm,
+            self_page,
+            kind,
+            mode,
+            &self.config,
+        )?;
         let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
         Some((pages, candidates.blocks, candidates.page_owners))
     }
