@@ -14,8 +14,30 @@
 
 import { createSignal } from "solid-js";
 import init, { parse_block_json, lsdoc_tag, __tineReinstantiate } from "./wasm/lsdoc_wasm.js";
+import * as lsdocWasm from "./wasm/lsdoc_wasm.js";
 import { WASM_B64, LSDOC_TAG } from "./wasm/lsdoc_wasm_bytes";
 import type { Block } from "./ast";
+
+export interface SearchFoldSource {
+  start: number;
+  end: number;
+}
+
+export interface SearchFoldMap {
+  text: string;
+  sources: SearchFoldSource[];
+}
+
+export interface SearchMatchBatch {
+  matches: boolean[];
+  search_error: string | null;
+}
+
+interface SearchWasmExports {
+  search_fold(text: string): string;
+  search_fold_map_json(text: string): string;
+  search_match_batch_json(query: string, textsJson: string): string;
+}
 
 // `ready` is a Solid signal so components (AstBody) reactively render once the
 // parser is loaded. In the normal flow init is awaited before mount, so it's
@@ -77,6 +99,37 @@ export function parserInitError(): unknown {
  *  "renderer failed" banner so a failure isn't a silently degraded app. */
 export function parserFailed(): boolean {
   return failed();
+}
+
+function searchWasm(): SearchWasmExports {
+  if (!ready()) throw new Error("search Wasm called before initParser() resolved");
+  const exports = lsdocWasm as unknown as Partial<SearchWasmExports>;
+  if (
+    typeof exports.search_fold !== "function"
+    || typeof exports.search_fold_map_json !== "function"
+    || typeof exports.search_match_batch_json !== "function"
+  ) {
+    throw new Error("lsdoc-wasm search exports are unavailable");
+  }
+  return exports as SearchWasmExports;
+}
+
+/** Apply the shared native search fold exactly once. Page/reference identity
+ *  deliberately does not use this fold. */
+export function searchFold(text: string): string {
+  return searchWasm().search_fold(text);
+}
+
+/** Fold text while retaining one original UTF-16 source range for each output
+ *  Unicode scalar. Used for evidence only; ordinary membership needs no map. */
+export function searchFoldMap(text: string): SearchFoldMap {
+  return JSON.parse(searchWasm().search_fold_map_json(text)) as SearchFoldMap;
+}
+
+/** Compile one shared Rust Matcher and apply it to the supplied original-text
+ *  corpus. Empty/invalid policy and regex semantics remain native-owned. */
+export function searchMatchBatch(query: string, texts: string[]): SearchMatchBatch {
+  return JSON.parse(searchWasm().search_match_batch_json(query, JSON.stringify(texts))) as SearchMatchBatch;
 }
 
 // Pure parse cache: text+format fully determine the AST (independent of graph
