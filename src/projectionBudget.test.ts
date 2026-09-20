@@ -267,7 +267,10 @@ describe("paired search-scaling budget", () => {
   });
 
   it("treats 49.28/41.69 ms as literal both-growing hard caps with no second margin", () => {
-    expect(evaluateSearchScaling(pairedSearchFixture({ bothBroadMs: 49.28, bothSparseMs: 41.69 }), policy).breaches).toEqual([]);
+    const atCeiling = evaluateSearchScaling(pairedSearchFixture({ bothBroadMs: 49.28, bothSparseMs: 41.69 }), policy);
+    expect(atCeiling.breaches).toEqual([]);
+    expect(atCeiling.rows.find((row: SearchScalingRow) => row.id === "T2-broad")?.bothGrowingRatio).toBeCloseTo(49.28 / 0.25);
+    expect(atCeiling.rows.find((row: SearchScalingRow) => row.id === "T2-sparse")?.bothGrowingRatio).toBeCloseTo(41.69 / 2);
 
     const broadOver = evaluateSearchScaling(pairedSearchFixture({ bothBroadMs: 49.280001 }), policy);
     expect(broadOver.breaches.map((row: SearchScalingRow) => row.id)).toEqual(["T2-broad"]);
@@ -281,6 +284,14 @@ describe("paired search-scaling budget", () => {
     expect(names.nameGrowth?.smallOwnerCount).toBe(1_010);
     expect(names.nameGrowth?.namesLargeOwnerCount).toBe(10_010);
     expect(names.nameGrowth?.ownerCountRatio).toBeCloseTo(10_010 / 1_010);
+    expect(names.nameGrowth).toMatchObject({
+      smallPhysicalPageCount: 1_000,
+      namesLargePhysicalPageCount: 10_000,
+      smallFixedOwnerCount: 10,
+      namesLargeFixedOwnerCount: 10,
+      smallAugmentationPageCount: 2,
+      namesLargeAugmentationPageCount: 2,
+    });
     expect(names.nameGrowth?.maxNormalizedLinearity).toBeCloseTo(1.1);
     expect(names.ok).toBe(true);
 
@@ -307,7 +318,8 @@ describe("paired search-scaling budget", () => {
     const rendered = formatSearchScalingRows(rows);
     expect(rendered).toContain("0.125 ms");
     expect(rendered).toContain("both-growing HARD ≤49.28 ms");
-    expect(rendered).toContain("1010→10010 owner rows");
+    expect(rendered).toContain("fixed-name block ratio 1.5x; both-growing ratio 197.12x");
+    expect(rendered).toContain("1010→10010 owner rows (9.910891x): 1000→10000 physical pages + 10→10 fixed owner rows; separate scratch augmentation +2→+2 pages");
     expect(rendered).toContain("max normalized time/name growth");
     expect(rendered).toContain("(no baseline)");
   });

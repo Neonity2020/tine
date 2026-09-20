@@ -19,6 +19,7 @@ export type SearchScalingRow = {
   largeP95Ms: number | null;
   pageP95Ms: number | null;
   ratio: number | null;
+  bothGrowingRatio: number | null;
   ceiling: number | null;
   ratioOk: boolean | null;
   hardCeilingMs: number | null;
@@ -28,6 +29,12 @@ export type SearchScalingRow = {
     smallOwnerCount: number;
     namesLargeOwnerCount: number;
     ownerCountRatio: number;
+    smallPhysicalPageCount: number;
+    namesLargePhysicalPageCount: number;
+    smallFixedOwnerCount: number;
+    namesLargeFixedOwnerCount: number;
+    smallAugmentationPageCount: number;
+    namesLargeAugmentationPageCount: number;
     cases: Array<{
       sourceLabel: string;
       smallP95Ms: number;

@@ -474,8 +474,14 @@ function searchScalingSummary(input, policy) {
   const nameCounts = {
     small: reports.small.navigation_name_inventory.count,
     namesLarge: reports.namesLarge.navigation_name_inventory.count,
+    smallPhysicalPages: reports.small.corpus_counts.original_page_count,
+    namesLargePhysicalPages: reports.namesLarge.corpus_counts.original_page_count,
+    smallAugmentationPages: reports.small.corpus_counts.augmentation_added_page_count,
+    namesLargeAugmentationPages: reports.namesLarge.corpus_counts.augmentation_added_page_count,
   };
   nameCounts.ratio = nameCounts.namesLarge / nameCounts.small;
+  nameCounts.smallFixedOwners = nameCounts.small - nameCounts.smallPhysicalPages;
+  nameCounts.namesLargeFixedOwners = nameCounts.namesLarge - nameCounts.namesLargePhysicalPages;
   const nameCases = namesConfig.sourceLabels.map((sourceLabel, index) => {
     requireString(sourceLabel, `policy.searchScaling.rows.T2-names.sourceLabels[${index}]`);
     const smallSurface = findSurface(findQuery(reports.small, sourceLabel, "small"), namesSurfaceName, "small");
@@ -594,6 +600,7 @@ export function evaluateSearchScaling(input, policy) {
       largeP95Ms: current.largeP95Ms,
       pageP95Ms: null,
       ratio,
+      bothGrowingRatio: current.bothGrowingRatio,
       ceiling,
       ratioOk,
       hardCeilingMs,
@@ -621,6 +628,7 @@ export function evaluateSearchScaling(input, policy) {
     largeP95Ms: null,
     pageP95Ms: null,
     ratio: maxNormalizedLinearity,
+    bothGrowingRatio: null,
     ceiling: namesCeiling,
     ratioOk: namesOk,
     hardCeilingMs: null,
@@ -630,6 +638,12 @@ export function evaluateSearchScaling(input, policy) {
       smallOwnerCount: summary.nameCounts.small,
       namesLargeOwnerCount: summary.nameCounts.namesLarge,
       ownerCountRatio: summary.nameCounts.ratio,
+      smallPhysicalPageCount: summary.nameCounts.smallPhysicalPages,
+      namesLargePhysicalPageCount: summary.nameCounts.namesLargePhysicalPages,
+      smallFixedOwnerCount: summary.nameCounts.smallFixedOwners,
+      namesLargeFixedOwnerCount: summary.nameCounts.namesLargeFixedOwners,
+      smallAugmentationPageCount: summary.nameCounts.smallAugmentationPages,
+      namesLargeAugmentationPageCount: summary.nameCounts.namesLargeAugmentationPages,
       cases: summary.nameCases,
       maxNormalizedLinearity,
     },
@@ -648,6 +662,7 @@ export function evaluateSearchScaling(input, policy) {
     largeP95Ms: null,
     pageP95Ms: summary.pagesP95Ms,
     ratio: null,
+    bothGrowingRatio: null,
     ceiling: null,
     ratioOk: null,
     hardCeilingMs: null,
@@ -727,12 +742,13 @@ export function formatSearchScalingRows(rows) {
     let budget;
     if (row.nameGrowth) {
       const cases = row.nameGrowth.cases.map((entry) => `${entry.sourceLabel}: ${formatSearchNumber(entry.smallP95Ms)}→${formatSearchNumber(entry.namesLargeP95Ms)} ms (${formatSearchNumber(entry.timeRatio)}x time, ${formatSearchNumber(entry.normalizedLinearity)}x normalized)`).join("; ");
-      measurements = `${row.nameGrowth.executor}; ${row.nameGrowth.smallOwnerCount}→${row.nameGrowth.namesLargeOwnerCount} owner rows (${formatSearchNumber(row.nameGrowth.ownerCountRatio)}x); ${cases}`;
+      const inventory = `${row.nameGrowth.smallOwnerCount}→${row.nameGrowth.namesLargeOwnerCount} owner rows (${formatSearchNumber(row.nameGrowth.ownerCountRatio)}x): ${row.nameGrowth.smallPhysicalPageCount}→${row.nameGrowth.namesLargePhysicalPageCount} physical pages + ${row.nameGrowth.smallFixedOwnerCount}→${row.nameGrowth.namesLargeFixedOwnerCount} fixed owner rows; separate scratch augmentation +${row.nameGrowth.smallAugmentationPageCount}→+${row.nameGrowth.namesLargeAugmentationPageCount} pages`;
+      measurements = `${row.nameGrowth.executor}; ${inventory}; ${cases}`;
       metric = `max normalized time/name growth ${formatSearchNumber(row.nameGrowth.maxNormalizedLinearity)}x`;
       budget = `normalized ≤${formatSearchNumber(row.ceiling)}x`;
     } else if (row.hardCeilingMs != null) {
       measurements = `small ${formatSearchNumber(row.smallP95Ms)} ms; blocksLarge ${formatSearchNumber(row.blocksLargeP95Ms)} ms; both-growing ${formatSearchNumber(row.largeP95Ms)} ms`;
-      metric = `fixed-name block ratio ${formatSearchNumber(row.ratio)}x`;
+      metric = `fixed-name block ratio ${formatSearchNumber(row.ratio)}x; both-growing ratio ${formatSearchNumber(row.bothGrowingRatio)}x`;
       budget = `ratio ≤${formatSearchNumber(row.ceiling)}x; both-growing HARD ≤${formatSearchNumber(row.hardCeilingMs)} ms`;
     } else if (row.pageP95Ms != null) {
       measurements = `${formatSearchNumber(row.pageP95Ms)} ms (page corpus)`;
