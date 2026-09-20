@@ -47,6 +47,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- A graph inside a Cryptomator or VeraCrypt vault (and any other user-space
+  volume) can be created and opened again. Windows asks the volume driver to
+  resolve a path to its final name, and these drivers are allowed to answer
+  "this volume has no recognized file system" — which Tine treated as a broken
+  path and refused, after it had already created the graph folders. Tine now
+  falls back to the plain absolute path when the driver cannot answer; the
+  no-follow open that actually protects the graph tree is unchanged. Saving on
+  such a volume was affected by the same call and is fixed with it (GH #561).
 - A query whose results are pages — `{{query (page-property tags x)}}` and any
   other page query — now shows those pages in every display view. Table and
   Board said "No results" and Search reported a count of 0, because those three

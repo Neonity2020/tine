@@ -361,9 +361,12 @@ impl<'r, 'de: 'r, R: Runtime> CommandArg<'de, R> for GraphContext<'r, R> {
 }
 
 pub(crate) fn canonical_graph_root(path: &str) -> Result<PathBuf, CommandError> {
-    let root = std::fs::canonicalize(path).map_err(|error| {
-        CommandError::coded("couldn't resolve graph path", format!("{path}: {error}"))
-    })?;
+    // Not `fs::canonicalize` directly: an encrypted-volume driver may refuse to
+    // answer it at all, which used to make every graph on that drive
+    // unopenable (GH #561).
+    let root = tine_core::directory_identity::canonical_existing_path(Path::new(path)).map_err(
+        |error| CommandError::coded("couldn't resolve graph path", format!("{path}: {error}")),
+    )?;
     if !root.is_dir() {
         return Err(CommandError::prose(format!(
             "graph path is not a folder: {}",

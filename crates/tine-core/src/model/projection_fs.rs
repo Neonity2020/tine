@@ -52,7 +52,10 @@ pub(super) fn open_projection_root_nofollow(root: &Path) -> io::Result<Dir> {
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let parent = fs::canonicalize(parent)?;
+    // An encrypted or otherwise user-space volume may refuse to canonicalize
+    // (GH #561); an absolute spelling of a directory that exists opens the same
+    // place, and the no-follow open below is what actually enforces safety.
+    let parent = crate::directory_identity::canonical_existing_path(parent)?;
     let parent = Dir::open_ambient_dir(parent, ambient_authority())?;
     open_projection_dir_nofollow(&parent, name)
 }
