@@ -24,6 +24,7 @@ import { ReferenceExportChooser } from "./ReferenceExportChooser";
 import { createLongPress } from "../render/longPress";
 import { readOr } from "../resourceRead";
 import { runQueryWhenCurrent } from "../queryReadiness";
+import { backlinkFilterFacets } from "../lib/backlinkFilterFacets";
 
 // One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
 // old private `norm` (trim+toLowerCase) split NFC/NFD and boundary-slash
@@ -64,17 +65,7 @@ type FilterEntry = Pick<BacklinkFilterEntry, "facets" | "text_matches">;
  *  uses only DTO-owned semantic facets (never a raw reference regex); the native
  *  context replaces it with parser-owned descendant refs as soon as it arrives. */
 function fallbackFilterEntry(block: BlockDto): FilterEntry {
-  const facets = new Map<string, string>();
-  const visit = (current: BlockDto) => {
-    for (const tag of current.tags ?? []) if (!facets.has(norm(tag))) facets.set(norm(tag), tag);
-    if (current.marker) {
-      const key = norm(current.marker);
-      if (!facets.has(key)) facets.set(key, current.marker);
-    }
-    for (const child of current.children) visit(child);
-  };
-  visit(block);
-  return { facets: [...facets.values()], text_matches: true };
+  return { facets: backlinkFilterFacets(block), text_matches: true };
 }
 
 interface BacklinkRootInventory {

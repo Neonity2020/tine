@@ -14,7 +14,9 @@
  */
 import type { Backend, LoadGraphResult } from "./backend";
 import type { ExecutionContext, ParsedQuery, Query, QueryResult, QueryTextDialect, ViewSettings } from "./editor/queryIr";
-import type { BlockDto, BlockPreview, MatchEvidence, PageDto, PageEntry, QueryExecution, QueryHit, QueryPageScope, RefGroup } from "./types";
+import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, MatchEvidence, PageDto, PageEntry, QueryExecution, QueryHit, QueryPageScope, RefGroup } from "./types";
+import { backlinkFilterFacets } from "./lib/backlinkFilterFacets";
+import { searchFold, searchFoldMap, searchMatchBatch } from "./render/parse";
 
 /** `<meta name="tine-published" content="snapshot.json">` in the exported shell. */
 export const PUBLISHED_META_NAME = "tine-published";
@@ -148,8 +150,35 @@ function propertiesEqual(a: [string, string][], b: [string, string][]): boolean 
   return left.every((entry, index) => entry === right[index]);
 }
 
-function fold(name: string): string {
+function identityFold(name: string): string {
   return name.trim().toLowerCase();
+}
+
+function literalNeedle(query: string): { empty: boolean; folded: string } {
+  const raw = query.trim();
+  return { empty: raw === "", folded: raw === "" ? "" : searchFold(raw) };
+}
+
+function includesFolded(text: string, needle: string): boolean {
+  return searchFold(text).includes(needle);
+}
+
+function firstMappedSpan(text: string, needle: string): { start: number; end: number } | null {
+  if (!needle) return null;
+  const mapped = searchFoldMap(text);
+  const startCodeUnit = mapped.text.indexOf(needle);
+  if (startCodeUnit < 0) return null;
+  const startScalar = Array.from(mapped.text.slice(0, startCodeUnit)).length;
+  const endScalar = startScalar + Array.from(needle).length;
+  const sources = mapped.sources.slice(startScalar, endScalar);
+  if (sources.length === 0) return null;
+  return sources.reduce(
+    (span, source) => ({
+      start: Math.min(span.start, source.start),
+      end: Math.max(span.end, source.end),
+    }),
+    { start: sources[0].start, end: sources[0].end },
+  );
 }
 
 // ---- the backend --------------------------------------------------------------
@@ -176,11 +205,11 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
   const unsubscribed = async () => () => {};
 
   const pageByName = (snapshot: PublishedSnapshot, name: string): PageDto | null => {
-    const wanted = fold(name);
-    const direct = snapshot.pages.find((page) => fold(page.name) === wanted);
+    const wanted = identityFold(name);
+    const direct = snapshot.pages.find((page) => identityFold(page.name) === wanted);
     if (direct) return direct;
-    const alias = snapshot.aliases.find(([from]) => fold(from) === wanted);
-    return alias ? snapshot.pages.find((page) => fold(page.name) === fold(alias[1])) ?? null : null;
+    const alias = snapshot.aliases.find(([from]) => identityFold(from) === wanted);
+    return alias ? snapshot.pages.find((page) => identityFold(page.name) === identityFold(alias[1])) ?? null : null;
   };
   const emptyReadOnlyPage = (name: string, kind: "journal" | "page"): PageDto => ({
     name,
@@ -246,11 +275,35 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
   };
   const quickSwitch = async (query: string, limit: number): Promise<PageEntry[]> => {
     const snapshot = await load();
-    const wanted = fold(query);
+    const wanted = literalNeedle(query);
+    if (!wanted.empty && !wanted.folded) return [];
     return snapshot.entries
-      .filter((entry) => fold(entry.name).includes(wanted))
+      .filter((entry) => wanted.empty || includesFolded(entry.name.trim(), wanted.folded))
       .slice(0, limit)
       .map((entry) => structuredClone(entry));
+  };
+  const backlinkGroups = (snapshot: PublishedSnapshot, name: string): RefGroup[] => {
+    const exact = snapshot.backlinks[name];
+    if (exact) return exact;
+    const wanted = identityFold(name);
+    const key = Object.keys(snapshot.backlinks).find((candidate) => identityFold(candidate) === wanted);
+    return key ? snapshot.backlinks[key] : [];
+  };
+  const backlinkRoot = (groups: RefGroup[], target: BacklinkFilterTarget): { group: RefGroup; block: BlockDto } | null => {
+    for (const group of groups) {
+      if (group.kind !== target.kind || identityFold(group.page) !== identityFold(target.page)) continue;
+      let found: BlockDto | null = null;
+      walk(group.blocks, (block) => {
+        if (!found && block.id === target.block_id) found = block;
+      });
+      if (found) return { group, block: found };
+    }
+    return null;
+  };
+  const backlinkText = (root: BlockDto): string => {
+    const lines: string[] = [];
+    walk([root], (block) => lines.push(block.raw));
+    return lines.join("\n");
   };
   /** `../assets/<name>` — or null when the authored name would leave the
    *  export's own `assets/` folder. The rule is the static exporter's
@@ -378,15 +431,35 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     // ---- references ----
     async getBacklinks(name: string) {
       const snapshot = await load();
-      const exact = snapshot.backlinks[name];
-      if (exact) return structuredClone(exact);
-      const wanted = fold(name);
-      const key = Object.keys(snapshot.backlinks).find((candidate) => fold(candidate) === wanted);
-      return key ? structuredClone(snapshot.backlinks[key]) : [];
+      return structuredClone(backlinkGroups(snapshot, name));
     },
-    async getBacklinkFilterContext() {
-      await load();
-      return { entries: [], truncated: false };
+    async getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string): Promise<BacklinkFilterContext> {
+      const snapshot = await load();
+      const groups = backlinkGroups(snapshot, name);
+      const roots: { group: RefGroup; block: BlockDto; text: string }[] = [];
+      const requested = new Set<string>();
+      for (const target of targets) {
+        const key = `${target.kind}\0${identityFold(target.page)}\0${target.block_id}`;
+        if (requested.has(key)) continue;
+        requested.add(key);
+        const root = backlinkRoot(groups, target);
+        if (root) roots.push({ ...root, text: backlinkText(root.block) });
+      }
+      const matched = searchMatchBatch(search, roots.map((root) => root.text));
+      if (matched.matches.length !== roots.length) {
+        throw new Error(`lsdoc-wasm search batch returned ${matched.matches.length} matches for ${roots.length} texts`);
+      }
+      return {
+        entries: roots.map((root, index) => ({
+          page: root.group.page,
+          kind: root.group.kind,
+          block_id: root.block.id,
+          facets: backlinkFilterFacets(root.block),
+          text_matches: matched.matches[index],
+        })),
+        ...(matched.search_error === null ? {} : { search_error: matched.search_error }),
+        truncated: roots.length < requested.size,
+      };
     },
     async getUnlinkedRefs() {
       await load();
@@ -430,9 +503,9 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     // ---- search ----
     async search(query: string, limit: number) {
       const snapshot = await load();
-      const wanted = fold(query);
-      if (!wanted) return [];
-      return collect(snapshot, (block) => block.raw.toLowerCase().includes(wanted), limit);
+      const wanted = literalNeedle(query);
+      if (wanted.empty || !wanted.folded) return [];
+      return collect(snapshot, (block) => includesFolded(block.raw, wanted.folded), limit);
     },
     quickSwitch,
     async captureQuickSwitch(query: string, limit: number): Promise<PageEntry[]> {
@@ -480,21 +553,23 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
     async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane?: string, _explain?: boolean, scope?: QueryPageScope): Promise<QueryExecution> {
       const snapshot = await load();
       if (!lane?.startsWith("quick-switch")) throw await staticQueryRefusal();
-      const wanted = fold(source);
+      const wanted = literalNeedle(source);
       const hits: QueryHit[] = [];
       const empty = { hits, diagnostics: [], explanation: { branches: [] }, has_more: { pages: false, blocks: false }, cancelled: false };
-      if (!wanted) return empty;
+      if (wanted.empty || !wanted.folded) return empty;
       const evidence = (field: "page_name" | "visible_content", text: string): MatchEvidence[] => {
-        const start = text.toLowerCase().indexOf(wanted);
-        return start < 0 ? [] : [{ clause_id: 0, field, mode: "contains", spans: [{ start, end: start + wanted.length }] }];
+        const span = firstMappedSpan(text, wanted.folded);
+        return span === null ? [] : [{ clause_id: 0, field, mode: "contains", spans: [span] }];
       };
       const pageHits: QueryHit[] = [];
       if (!scope) {
         for (const entry of snapshot.entries) {
-          const alias = snapshot.aliases.find(([from, to]) => fold(to) === fold(entry.name) && fold(from).includes(wanted))?.[0];
-          const name = fold(entry.name);
-          if (!name.includes(wanted) && !alias) continue;
-          const match_class = name === wanted ? "exact" : name.startsWith(wanted) ? "prefix" : "substring";
+          const alias = snapshot.aliases.find(([from, to]) =>
+            identityFold(to) === identityFold(entry.name) && includesFolded(from.trim(), wanted.folded)
+          )?.[0];
+          const name = searchFold(entry.name.trim());
+          if (!name.includes(wanted.folded) && !alias) continue;
+          const match_class = name === wanted.folded ? "exact" : name.startsWith(wanted.folded) ? "prefix" : "substring";
           const score = match_class === "exact" ? 3 : match_class === "prefix" ? 2 : 1;
           pageHits.push({ entity: "page", page: structuredClone(entry), display_text: entry.name, evidence: evidence("page_name", entry.name), score, match_class, ...(alias ? { matched_alias: alias } : {}) });
         }
@@ -502,10 +577,10 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
       }
       const blockHits: QueryHit[] = [];
       for (const page of snapshot.pages) {
-        if (scope && (scope.path ? page.path !== scope.path : fold(page.name) !== fold(scope.name))) continue;
+        if (scope && (scope.path ? page.path !== scope.path : identityFold(page.name) !== identityFold(scope.name))) continue;
         walk(page.blocks, (block) => {
           const text = block.raw.split("\n")[0] ?? "";
-          if (!block.raw.toLowerCase().includes(wanted)) return;
+          if (!includesFolded(block.raw, wanted.folded)) return;
           blockHits.push({ entity: "block", page: page.name, kind: page.kind, path: page.path, block: { ...structuredClone(block), children: [] }, display_text: text, evidence: evidence("visible_content", text), score: 1, match_class: "substring" });
         });
       }
