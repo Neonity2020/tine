@@ -58,7 +58,7 @@ function extraBlocksText(page, dimensions) {
   for (let block = first; block < end; block += 1) {
     // This keeps the broad 你好 match while introducing no page reference,
     // tag, property, sparse needle, or false-positive needle.
-    text += `- outline sentinel543 你好世界 page ${page} block ${block}\n`;
+    text += `- outline sentinel543 你好世界 page ${page} extra block ${block}\n`;
   }
   return text;
 }

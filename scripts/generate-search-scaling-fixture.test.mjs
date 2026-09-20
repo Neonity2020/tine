@@ -17,27 +17,34 @@ const DIMENSIONS = Object.freeze({
   extraNamePages: 4,
 });
 
+const PREFIX_TRAP_DIMENSIONS = Object.freeze({
+  sourcePages: 12,
+  sourceBlocksPerPage: 60,
+  extraBlocksPerPage: 60,
+  extraNamePages: 0,
+});
+
 async function workspace(t) {
   const root = await mkdtemp(join(tmpdir(), "tine-search-scaling-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
 }
 
-function sourcePageText(page) {
-  const next = (page + 1) % DIMENSIONS.sourcePages;
+function sourcePageText(page, dimensions = DIMENSIONS) {
+  const next = (page + 1) % dimensions.sourcePages;
   let text = `title:: Topic ${page} 你好\n\n`;
-  for (let block = 0; block < DIMENSIONS.sourceBlocksPerPage; block += 1) {
+  for (let block = 0; block < dimensions.sourceBlocksPerPage; block += 1) {
     text += `- outline sentinel543 你好世界 page ${page} block ${block} [[Topic ${next} 你好]] #tag${block % 10}\n`;
   }
   return text;
 }
 
-async function writeSource(root) {
+async function writeSource(root, dimensions = DIMENSIONS) {
   const source = join(root, "source");
   await mkdir(join(source, "pages"), { recursive: true });
-  for (let page = 0; page < DIMENSIONS.sourcePages; page += 1) {
+  for (let page = 0; page < dimensions.sourcePages; page += 1) {
     const name = `主题-${String(page).padStart(5, "0")}.md`;
-    await writeFile(join(source, "pages", name), sourcePageText(page));
+    await writeFile(join(source, "pages", name), sourcePageText(page, dimensions));
   }
   return source;
 }
@@ -78,11 +85,39 @@ test("blocksLarge fixes pages and names while growing only ordinary broad-match 
     assert.equal(rootBlockCount(text), 5);
     assert.equal(rootBlockCount(appended), 3);
     assert.equal(appended, [2, 3, 4]
-      .map((block) => `- outline sentinel543 你好世界 page ${page} block ${block}\n`)
+      .map((block) => `- outline sentinel543 你好世界 page ${page} extra block ${block}\n`)
       .join(""));
     assert.match(appended, /你好/);
     assert.doesNotMatch(appended, /\[\[|#tag|::|s7sparseanchor543|match/);
   }
+});
+
+test("blocksLarge extra block namespace cannot prefix-match an original exact needle", async (t) => {
+  const root = await workspace(t);
+  const source = await writeSource(root, PREFIX_TRAP_DIMENSIONS);
+  const output = join(root, "blocks-large-prefix-trap");
+  const original = sourcePageText(11, PREFIX_TRAP_DIMENSIONS);
+  const falsePositiveNeedle = "page 11 block 11";
+  const sparseNeedle = "s7sparseanchor543";
+
+  await generateSearchScalingFixture({
+    source,
+    output,
+    variant: "blocksLarge",
+    dimensions: PREFIX_TRAP_DIMENSIONS,
+  });
+
+  const generated = await readFile(join(output, "pages", "主题-00011.md"), "utf8");
+  const appended = generated.slice(original.length);
+  assert.equal(generated.slice(0, original.length), original);
+  assert.equal(original.split(falsePositiveNeedle).length - 1, 1);
+  assert.equal(generated.split(falsePositiveNeedle).length - 1, 1);
+  assert.doesNotMatch(appended, /page 11 block 11/);
+  assert.doesNotMatch(appended, new RegExp(sparseNeedle));
+  assert.equal(appended.match(/你好/g)?.length, PREFIX_TRAP_DIMENSIONS.extraBlocksPerPage);
+  assert.equal(appended.split("\n").filter(Boolean).at(-1),
+    "- outline sentinel543 你好世界 page 11 extra block 119");
+  assert.doesNotMatch(appended, /\[\[|#tag|::/);
 });
 
 test("namesLarge preserves source blocks and adds only deterministic title-only physical pages", async (t) => {
