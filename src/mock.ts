@@ -1031,8 +1031,12 @@ export function mockBackend(): Backend {
       const n = name.toLowerCase();
       return collect((b) => pageRefs(b.raw).some((r) => r.toLowerCase() === n), name);
     },
-    async getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]): Promise<BacklinkFilterContext> {
+    async getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string): Promise<BacklinkFilterContext> {
       const excluded = name.trim().toLowerCase();
+      // Browser preview only: production matching is native. This adapter keeps
+      // mirroring the shared TypeScript search grammar until the preview can
+      // call Rust directly.
+      const matcher = parseSearchQuery(search);
       const wanted = new Map(targets.map((item) => [
         `${item.kind}\0${item.page.toLowerCase()}\0${item.block_id}`,
         item,
@@ -1054,12 +1058,22 @@ export function mockBackend(): Backend {
             node.children.forEach(subtree);
           };
           subtree(block);
-          entries.push({ ...target, text: text.join("\n"), facets: [...facets.values()] });
+          const original = text.join("\n");
+          entries.push({
+            ...target,
+            facets: [...facets.values()],
+            text_matches: matcher.kind === "empty" || matcher.kind === "invalid"
+              || matcherMatches(matcher, canonicalFold(original), original),
+          });
         }
         block.children.forEach((child) => visit(page, child));
       };
       for (const page of all) page.blocks.forEach((block) => visit(page, block));
-      return { entries, truncated: entries.length < wanted.size };
+      return {
+        entries,
+        search_error: matcher.kind === "invalid" ? matcher.error : undefined,
+        truncated: entries.length < wanted.size,
+      };
     },
     async getUnlinkedRefs(name: string): Promise<RefGroup[]> {
       const n = name.toLowerCase();

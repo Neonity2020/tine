@@ -84,8 +84,12 @@ pub struct BacklinkFilterEntry {
     pub page: String,
     pub kind: PageKind,
     pub block_id: String,
-    pub text: String,
     pub facets: Vec<String>,
+    /// Whether this root's bounded visible subtree satisfies the raw search
+    /// supplied with the context request. Empty and invalid searches leave all
+    /// roots visible; `BacklinkFilterContext::search_error` distinguishes the
+    /// invalid case for presentation.
+    pub text_matches: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
@@ -93,6 +97,8 @@ pub struct BacklinkFilterEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BacklinkFilterContext {
     pub entries: Vec<BacklinkFilterEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_error: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }

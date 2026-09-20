@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::doc::Document;
-use crate::vocab::{PageEntry, RefGroup, ReferenceCandidatePages, ReferenceKind};
+use crate::vocab::{PageEntry, PageKind, RefGroup, ReferenceCandidatePages, ReferenceKind};
 
 #[allow(dead_code)]
 pub(crate) trait QueryGraph {
@@ -21,6 +21,11 @@ pub(crate) trait QueryGraph {
         names_norm: &[String],
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, super::QueryExecutionError>;
+    fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<super::BacklinkFilterScope, super::QueryExecutionError>;
     fn direct_projection_block_referrer_candidate_pages(
         &self,
         uuid: &str,
@@ -86,6 +91,14 @@ impl<G: QueryGraph> QueryGraph for Arc<G> {
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, super::QueryExecutionError> {
         (**self).reference_candidate_pages_indexed(names_norm, kind)
+    }
+
+    fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<super::BacklinkFilterScope, super::QueryExecutionError> {
+        (**self).backlink_filter_scope(target, requested_pages)
     }
 
     fn direct_projection_block_referrer_candidate_pages(

@@ -421,13 +421,14 @@ export interface BacklinkFilterTarget {
 }
 
 export interface BacklinkFilterEntry extends BacklinkFilterTarget {
-  text: string;
   facets: string[];
+  text_matches: boolean;
   truncated?: boolean;
 }
 
 export interface BacklinkFilterContext {
   entries: BacklinkFilterEntry[];
+  search_error?: string;
   truncated?: boolean;
 }
 

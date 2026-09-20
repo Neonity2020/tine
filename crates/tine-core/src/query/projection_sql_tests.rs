@@ -8,7 +8,7 @@
 use super::census;
 use crate::model::Graph;
 use crate::query::ir::FriendlyPageMatchScope;
-use crate::query::QueryExportSpec;
+use crate::query::{BacklinkFilterTarget, QueryExportSpec};
 use crate::query_plan::FriendlyDisplayOptions;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -137,6 +137,21 @@ fn exercise_every_surface(graph: &Graph) {
             "census IR query {source} answered nothing; the fixture no longer exercises it"
         );
     }
+    let filter_targets = graph
+        .backlinks("Beta")
+        .iter()
+        .flat_map(|group| {
+            group.blocks.iter().map(|block| BacklinkFilterTarget {
+                page: group.page.clone(),
+                kind: group.kind,
+                block_id: block.id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    crate::query::backlink_filter_context(graph, "Beta", &filter_targets, "alpha")
+        .expect("backlink filter context");
+    crate::query::backlink_filter_context(graph, "2026-09-18", &[], "")
+        .expect("journal backlink filter context");
     // Live export: a top-level root and a nested root (the nested one runs the
     // boundary-parent check).
     let export = graph

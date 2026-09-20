@@ -561,9 +561,9 @@ export interface Backend {
   /** Persist the graph-local one-time Guide announcement flag. */
   setGuideAnnounced(announced: boolean): Promise<void>;
   getBacklinks(name: string): Promise<RefGroup[]>;
-  /** Parser-owned visible-subtree/facet index for only the roots in an open
-   *  Linked References filter. Ordinary backlink DTOs stay shallow. */
-  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]): Promise<BacklinkFilterContext>;
+  /** Parser-owned visible-subtree facets and native text-match decisions for
+   *  only the roots in an open Linked References filter. */
+  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string): Promise<BacklinkFilterContext>;
   getUnlinkedRefs(name: string): Promise<RefGroup[]>;
   /** True once the background whole-graph warm has built derived graph-open caches. */
   warmDone(): Promise<boolean>;
@@ -1474,8 +1474,8 @@ class TauriBackend implements Backend {
   getBacklinks(name: string) {
     return this.call<RefGroup[]>("get_backlinks", { name });
   }
-  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]) {
-    return this.call<BacklinkFilterContext>("get_backlink_filter_context", { name, targets });
+  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string) {
+    return this.call<BacklinkFilterContext>("get_backlink_filter_context", { name, targets, search });
   }
   getUnlinkedRefs(name: string) {
     return this.call<RefGroup[]>("get_unlinked_refs", { name });

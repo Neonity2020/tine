@@ -74,6 +74,7 @@ use crate::doc::{property_key_norm, DocBlock, Document};
 #[cfg(test)]
 use crate::model::Graph;
 use crate::refs;
+use crate::search_query::{canonical_fold, Matcher};
 use crate::vocab::{
     block_to_shallow_dto, BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget,
     BlockDto, BlockPreview, Format, PageEntry, PageKind, RefGroup, ReferenceBlockEvidence,
@@ -755,6 +756,11 @@ pub(crate) fn page_aliases_with_owners<G: QueryGraph>(graph: &G) -> Vec<(String,
 
 pub(crate) type RealPageNames = std::collections::HashMap<String, (std::path::PathBuf, String)>;
 
+pub(crate) struct BacklinkFilterScope {
+    pub(crate) names_norm: Vec<String>,
+    pub(crate) pages: Vec<(PageEntry, std::sync::Arc<Document>)>,
+}
+
 pub(crate) fn real_page_names<G: QueryGraph>(graph: &G) -> RealPageNames {
     if let Some(indexed) = graph.reference_real_page_names() {
         return indexed;
@@ -858,8 +864,18 @@ fn graph_equivalent_page_names<G: QueryGraph>(
         return resolved;
     };
 
+    apply_journal_page_equivalence(&mut resolved, &format, target_day, &journal.name);
+    resolved
+}
+
+pub(crate) fn apply_journal_page_equivalence(
+    resolved: &mut (String, Vec<String>, String),
+    format: &JournalFormat,
+    target_day: JournalDate,
+    journal_name: &str,
+) {
     let accepted_spellings = [
-        journal.name.as_str().to_string(),
+        journal_name.to_string(),
         format.title(target_day),
         format.file_stem(target_day),
         target_day.title(),
@@ -876,9 +892,8 @@ fn graph_equivalent_page_names<G: QueryGraph>(
         }
     }
     resolved.1.sort();
-    resolved.0 = journal.name.clone();
-    resolved.2 = journal.name;
-    resolved
+    resolved.0 = journal_name.to_string();
+    resolved.2 = journal_name.to_string();
 }
 
 fn org_property_line(line: &str) -> bool {
@@ -1328,7 +1343,8 @@ pub(crate) fn backlink_filter_entry(
     block: &DocBlock,
     excluded_refs: &std::collections::HashSet<String>,
     remaining_bytes: usize,
-) -> BacklinkFilterEntry {
+    matcher: &Matcher,
+) -> (BacklinkFilterEntry, usize) {
     let max_text = BACKLINK_FILTER_MAX_TEXT_BYTES.min(remaining_bytes);
     let mut text = String::new();
     let mut facets = Vec::new();
@@ -1404,22 +1420,25 @@ pub(crate) fn backlink_filter_entry(
         &mut add_facet,
         &mut text_truncated,
     );
-    BacklinkFilterEntry {
+    let text_matches = match matcher {
+        Matcher::Empty | Matcher::InvalidRegex(_) => true,
+        Matcher::Regex(_) => matcher.matches("", &text),
+        Matcher::Boolean(_) => matcher.matches(&canonical_fold(&text), &text),
+    };
+    let entry = BacklinkFilterEntry {
         page: page.to_string(),
         kind,
         block_id: block.uuid.clone(),
-        text,
         facets,
+        text_matches,
         truncated: text_truncated || facets_truncated,
-    }
-}
-
-pub(crate) fn backlink_filter_entry_estimated_bytes(entry: &BacklinkFilterEntry) -> usize {
-    entry.text.len()
+    };
+    let estimated = text.len()
         + entry.facets.iter().map(String::len).sum::<usize>()
         + entry.page.len()
         + entry.block_id.len()
-        + 128
+        + 128;
+    (entry, estimated)
 }
 
 /// Build search/facet metadata only for the shallow backlink roots already in
@@ -1430,12 +1449,13 @@ pub fn backlink_filter_context<G: QueryGraph>(
     graph: &G,
     target: &str,
     targets: &[BacklinkFilterTarget],
-) -> BacklinkFilterContext {
-    let aliases = graph.page_aliases();
-    let (_, names_norm, _) = graph_equivalent_page_names(graph, &aliases, target);
-    let excluded_refs = names_norm
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
+    search: &str,
+) -> Result<BacklinkFilterContext, QueryExecutionError> {
+    let matcher = Matcher::parse(search);
+    let search_error = match &matcher {
+        Matcher::InvalidRegex(error) => Some(error.clone()),
+        _ => None,
+    };
     let mut requested =
         std::collections::HashMap::<(PageKind, String), std::collections::HashSet<String>>::new();
     for item in targets {
@@ -1444,86 +1464,94 @@ pub fn backlink_filter_context<G: QueryGraph>(
             .or_default()
             .insert(item.block_id.clone());
     }
+    let requested_pages = requested.keys().cloned().collect::<Vec<_>>();
+    let scope = graph.backlink_filter_scope(target, &requested_pages)?;
+    let excluded_refs = scope
+        .names_norm
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     let requested_unique = requested
         .values()
         .map(std::collections::HashSet::len)
         .sum::<usize>();
 
-    let mut context = BacklinkFilterContext::default();
+    let mut context = BacklinkFilterContext {
+        search_error,
+        ..BacklinkFilterContext::default()
+    };
     let mut bytes = 0usize;
-    graph.with_pages(|pages| {
-        for (page, document) in pages {
-            let Some(ids) = requested.get(&(page.kind, refs::normalize(&page.name))) else {
-                continue;
-            };
-            if let Some(pre) = document.pre_block.as_deref() {
-                if let Some(block) = page_property_block(page, pre) {
-                    if ids.contains(&block.uuid) {
-                        let entry = backlink_filter_entry(
-                            &page.name,
-                            page.kind,
-                            &block,
-                            &excluded_refs,
-                            BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
-                        );
-                        let estimated = backlink_filter_entry_estimated_bytes(&entry);
-                        if bytes.saturating_add(estimated) > BACKLINK_FILTER_MAX_BYTES {
-                            context.truncated = true;
-                        } else {
-                            bytes += estimated;
-                            // Same flag propagation as the ordinary-root loop
-                            // below: an entry truncated at its own text/facet
-                            // budget must mark the context (DUP-6).
-                            context.truncated |= entry.truncated;
-                            context.entries.push(entry);
-                        }
+    for (page, document) in &scope.pages {
+        let Some(ids) = requested.get(&(page.kind, refs::normalize(&page.name))) else {
+            continue;
+        };
+        if let Some(pre) = document.pre_block.as_deref() {
+            if let Some(block) = page_property_block(page, pre) {
+                if ids.contains(&block.uuid) {
+                    let (entry, estimated) = backlink_filter_entry(
+                        &page.name,
+                        page.kind,
+                        &block,
+                        &excluded_refs,
+                        BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
+                        &matcher,
+                    );
+                    if bytes.saturating_add(estimated) > BACKLINK_FILTER_MAX_BYTES {
+                        context.truncated = true;
+                    } else {
+                        bytes += estimated;
+                        // Same flag propagation as the ordinary-root loop
+                        // below: an entry truncated at its own text/facet
+                        // budget must mark the context (DUP-6).
+                        context.truncated |= entry.truncated;
+                        context.entries.push(entry);
                     }
                 }
-            }
-            fn collect<'a>(
-                blocks: &'a [DocBlock],
-                ids: &std::collections::HashSet<String>,
-                out: &mut Vec<&'a DocBlock>,
-            ) {
-                for block in blocks {
-                    if ids.contains(&block.uuid) {
-                        out.push(block);
-                    }
-                    collect(&block.children, ids, out);
-                }
-            }
-            let mut blocks = Vec::new();
-            collect(&document.roots, ids, &mut blocks);
-            for block in blocks {
-                if bytes >= BACKLINK_FILTER_MAX_BYTES {
-                    context.truncated = true;
-                    break;
-                }
-                let entry = backlink_filter_entry(
-                    &page.name,
-                    page.kind,
-                    block,
-                    &excluded_refs,
-                    BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
-                );
-                let estimated = backlink_filter_entry_estimated_bytes(&entry);
-                if bytes.saturating_add(estimated) > BACKLINK_FILTER_MAX_BYTES {
-                    context.truncated = true;
-                    break;
-                }
-                bytes += estimated;
-                context.truncated |= entry.truncated;
-                context.entries.push(entry);
             }
         }
-    });
+        fn collect<'a>(
+            blocks: &'a [DocBlock],
+            ids: &std::collections::HashSet<String>,
+            out: &mut Vec<&'a DocBlock>,
+        ) {
+            for block in blocks {
+                if ids.contains(&block.uuid) {
+                    out.push(block);
+                }
+                collect(&block.children, ids, out);
+            }
+        }
+        let mut blocks = Vec::new();
+        collect(&document.roots, ids, &mut blocks);
+        for block in blocks {
+            if bytes >= BACKLINK_FILTER_MAX_BYTES {
+                context.truncated = true;
+                break;
+            }
+            let (entry, estimated) = backlink_filter_entry(
+                &page.name,
+                page.kind,
+                block,
+                &excluded_refs,
+                BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
+                &matcher,
+            );
+            if bytes.saturating_add(estimated) > BACKLINK_FILTER_MAX_BYTES {
+                context.truncated = true;
+                break;
+            }
+            bytes += estimated;
+            context.truncated |= entry.truncated;
+            context.entries.push(entry);
+        }
+    }
     if context.entries.len() < requested_unique {
-        // Missing IDs can be stale results after an external edit; the frontend
-        // can still search each root's shallow raw text but must not claim the
-        // descendant index is complete.
+        // Missing IDs can be stale results after an external edit. They remain
+        // visible in the frontend, which must not turn an incomplete bounded
+        // native answer into a false negative.
         context.truncated = true;
     }
-    context
+    Ok(context)
 }
 
 /// Block-level referrers: every block across the graph that references the block

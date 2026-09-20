@@ -27,6 +27,15 @@ describe("Linked References filter contract matches the source", () => {
     expect(source).toContain("Indexing {totalCount()} references… the filter applies when this finishes");
   });
 
+  it("keeps production text parsing and matching behind the native boundary", () => {
+    expect(contract).toContain("Rust's shared `search_query::Matcher`");
+    expect(source).not.toContain('from "../editor/searchQuery"');
+    expect(source).toContain("void runQueryWhenCurrent(");
+    expect(source).toContain("getBacklinkFilterContext(");
+    expect(source).toContain("() => version === nativeRequestVersion");
+    expect(source).toContain("rootEntry(group, block).text_matches");
+  });
+
   it("keeps the chip list independent of the filter selections", () => {
     // §3: coRefs() must not read filters(); the orphan pass is a separate memo.
     const coRefs = source.slice(source.indexOf("const coRefs = createMemo"));

@@ -32,6 +32,14 @@ impl QueryGraph for Graph {
         Graph::reference_candidate_pages_indexed(self, names_norm, kind)
     }
 
+    fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<crate::query::BacklinkFilterScope, crate::query::QueryExecutionError> {
+        Graph::backlink_filter_scope(self, target, requested_pages)
+    }
+
     fn direct_projection_block_referrer_candidate_pages(
         &self,
         uuid: &str,

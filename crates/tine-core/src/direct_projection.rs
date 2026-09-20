@@ -3471,7 +3471,7 @@ fn apply_pending(
 /// current. Folding the parse-config digest in is what makes a config edit a
 /// full re-lowering (§5.8 J7): reconciliation compares only source revisions,
 /// so without it an unchanged file would keep rows built under the old config.
-fn projection_source_revision(
+pub(crate) fn projection_source_revision(
     content_revision: &str,
     parse_config_digest: tine_storage::ContentDigest,
 ) -> String {

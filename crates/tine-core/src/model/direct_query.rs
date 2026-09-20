@@ -5,6 +5,47 @@
 
 use super::*;
 
+const BACKLINK_FILTER_EQUIVALENCE_SQL: &str = "WITH RECURSIVE component(name_key) AS (
+    SELECT ?1
+    UNION
+    SELECT declaration.normalized_alias
+    FROM component
+    JOIN pages AS owner INDEXED BY pages_name_key_idx
+      ON owner.name_key = component.name_key
+    JOIN reference_alias_declarations AS declaration
+      INDEXED BY reference_alias_declarations_source_idx
+      ON declaration.source_page_id = owner.page_id
+    UNION
+    SELECT owner.name_key
+    FROM component
+    JOIN reference_postings AS posting
+      INDEXED BY reference_postings_normalized_name_idx
+      ON posting.normalized_name = component.name_key
+     AND posting.target_type = 0
+    JOIN reference_alias_declarations AS declaration
+      INDEXED BY reference_alias_declarations_source_idx
+      ON declaration.source_page_id = posting.source_page_id
+     AND declaration.normalized_alias = component.name_key
+    JOIN pages AS owner ON owner.page_id = declaration.source_page_id
+)
+SELECT component.name_key, page.path, page.name, declaration.normalized_alias
+FROM component
+LEFT JOIN pages AS page INDEXED BY pages_name_key_idx
+  ON page.name_key = component.name_key
+LEFT JOIN reference_alias_declarations AS declaration
+  INDEXED BY reference_alias_declarations_source_idx
+  ON declaration.source_page_id = page.page_id
+ORDER BY component.name_key, page.path, declaration.normalized_alias";
+
+const BACKLINK_FILTER_JOURNAL_SQL: &str = "SELECT page.name
+FROM pages AS page INDEXED BY pages_name_key_idx
+JOIN query_page_order AS inventory ON inventory.page_id = page.page_id
+WHERE page.name_key = ?1 AND page.text_kind = 1
+ORDER BY inventory.position
+LIMIT 1";
+
+const BACKLINK_FILTER_SOURCE_BATCH: usize = 256;
+
 impl Graph {
     /// **SPEC §5.9's Direct Files dispatch, in ONE place.**
     ///
@@ -1010,6 +1051,229 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
+    fn direct_projection_pages_for_sources(
+        &self,
+        generation: u64,
+        sources: Vec<(PathBuf, String)>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let cache = self.cache.read().unwrap();
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        let Some(snapshot) = cache.as_ref().map(Arc::clone) else {
+            drop(cache);
+            return self.parse_pages_on_demand_with_revisions(generation, sources);
+        };
+        let revisions = self.disk_revs.read().unwrap();
+        let config_digest = self.config.parse_config().digest();
+        let mut pages = Vec::with_capacity(sources.len());
+        for (relative, projected_revision) in sources {
+            let path = self.root.join(&relative);
+            let source_revision = revisions.get(&path)?;
+            if crate::direct_projection::projection_source_revision(source_revision, config_digest)
+                != projected_revision
+            {
+                return None;
+            }
+            let slot = self.cached_page_index_for_path(&snapshot, &path)?;
+            let page = snapshot.get(slot)?;
+            if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
+                return None;
+            }
+            pages.push(page.clone());
+        }
+        drop(revisions);
+        drop(cache);
+        #[cfg(test)]
+        DIRECT_HYDRATED_PAGES.with(|recorded| {
+            recorded.borrow_mut().extend(
+                pages
+                    .iter()
+                    .map(|(entry, _)| PathBuf::from(&entry.rel_path)),
+            );
+        });
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
+    pub(crate) fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<crate::query::BacklinkFilterScope, crate::query::QueryExecutionError> {
+        use tine_storage::sqlite::PhysicalQueryValue;
+
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_read_job(
+                request,
+                crate::direct_projection::RegistrySensitivity::Insensitive,
+                |job| {
+                    let rows = crate::query::projection_sql::run(
+                        &mut job.snapshot,
+                        BACKLINK_FILTER_EQUIVALENCE_SQL,
+                        &[PhysicalQueryValue::Text(crate::refs::page_key(target))],
+                    )
+                    .map_err(|error| -> crate::query::QueryExecutionError {
+                        crate::query::results::sql_or_cancelled(&job.snapshot, error).into()
+                    })?;
+                    let mut real_pages = crate::query::RealPageNames::new();
+                    let mut aliases = Vec::new();
+                    for row in rows {
+                        let [PhysicalQueryValue::Text(_), path, name, alias] = row.as_slice()
+                        else {
+                            return Err(crate::query::QueryExecutionError::Unavailable(
+                                crate::query::QueryUnavailableReason::InvalidSnapshot,
+                            ));
+                        };
+                        match (path, name, alias) {
+                            (
+                                PhysicalQueryValue::Text(path),
+                                PhysicalQueryValue::Text(name),
+                                PhysicalQueryValue::Text(alias),
+                            ) => {
+                                let key = crate::refs::page_key(name);
+                                let path = PathBuf::from(path);
+                                match real_pages.get_mut(&key) {
+                                    Some((winner_path, winner_name)) if path < *winner_path => {
+                                        *winner_path = path;
+                                        *winner_name = name.clone();
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        real_pages.insert(key, (path, name.clone()));
+                                    }
+                                }
+                                aliases.push((alias.clone(), name.clone()));
+                            }
+                            (
+                                PhysicalQueryValue::Text(path),
+                                PhysicalQueryValue::Text(name),
+                                PhysicalQueryValue::Null,
+                            ) => {
+                                let key = crate::refs::page_key(name);
+                                let path = PathBuf::from(path);
+                                match real_pages.get_mut(&key) {
+                                    Some((winner_path, winner_name)) if path < *winner_path => {
+                                        *winner_path = path;
+                                        *winner_name = name.clone();
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        real_pages.insert(key, (path, name.clone()));
+                                    }
+                                }
+                            }
+                            (
+                                PhysicalQueryValue::Null,
+                                PhysicalQueryValue::Null,
+                                PhysicalQueryValue::Null,
+                            ) => {}
+                            _ => {
+                                return Err(crate::query::QueryExecutionError::Unavailable(
+                                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                                ));
+                            }
+                        }
+                    }
+                    let mut resolved = crate::query::equivalent_page_names(
+                        &real_pages,
+                        &aliases,
+                        target,
+                    );
+                    let format = crate::date::JournalFormat::new(
+                        self.config.journal_file_name_format.as_deref(),
+                        self.config.journal_page_title_format.as_deref(),
+                    );
+                    if let Some(target_day) = format.parse(target) {
+                        let rows = crate::query::projection_sql::run(
+                            &mut job.snapshot,
+                            BACKLINK_FILTER_JOURNAL_SQL,
+                            &[PhysicalQueryValue::Text(crate::refs::page_key(
+                                &format.title(target_day),
+                            ))],
+                        )
+                        .map_err(|error| -> crate::query::QueryExecutionError {
+                            crate::query::results::sql_or_cancelled(&job.snapshot, error).into()
+                        })?;
+                        if let Some(row) = rows.first() {
+                            let [PhysicalQueryValue::Text(journal_name)] = row.as_slice() else {
+                                return Err(crate::query::QueryExecutionError::Unavailable(
+                                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                                ));
+                            };
+                            crate::query::apply_journal_page_equivalence(
+                                &mut resolved,
+                                &format,
+                                target_day,
+                                journal_name,
+                            );
+                        }
+                    }
+
+                    let mut sources = std::collections::BTreeMap::<PathBuf, String>::new();
+                    for chunk in requested_pages.chunks(BACKLINK_FILTER_SOURCE_BATCH) {
+                        let values = (0..chunk.len())
+                            .map(|index| {
+                                let first = index * 2 + 1;
+                                format!("(?{first}, ?{})", first + 1)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "WITH requested(text_kind, name_key) AS (VALUES {values}) \
+                             SELECT page.path, revision.revision \
+                             FROM requested \
+                             JOIN pages AS page INDEXED BY pages_name_key_idx \
+                               ON page.name_key = requested.name_key \
+                              AND page.text_kind = requested.text_kind \
+                             LEFT JOIN direct_source_revisions AS revision \
+                               ON revision.page_id = page.page_id \
+                             ORDER BY page.path"
+                        );
+                        let mut parameters = Vec::with_capacity(chunk.len() * 2);
+                        for (kind, name) in chunk {
+                            parameters.push(PhysicalQueryValue::Integer(match kind {
+                                PageKind::Page => 0,
+                                PageKind::Journal => 1,
+                            }));
+                            parameters.push(PhysicalQueryValue::Text(name.clone()));
+                        }
+                        let rows = crate::query::projection_sql::run(
+                            &mut job.snapshot,
+                            &sql,
+                            &parameters,
+                        )
+                        .map_err(|error| -> crate::query::QueryExecutionError {
+                            crate::query::results::sql_or_cancelled(&job.snapshot, error).into()
+                        })?;
+                        for row in rows {
+                            let [PhysicalQueryValue::Text(path), PhysicalQueryValue::Text(revision)] =
+                                row.as_slice()
+                            else {
+                                return Err(crate::query::QueryExecutionError::Unavailable(
+                                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                                ));
+                            };
+                            sources.insert(PathBuf::from(path), revision.clone());
+                        }
+                    }
+                    let pages = self
+                        .direct_projection_pages_for_sources(
+                            generation,
+                            sources.into_iter().collect(),
+                        )
+                        .ok_or(crate::query::QueryExecutionError::NotReady(
+                            crate::query::QueryReadinessReason::PendingEdits,
+                        ))?;
+                    Ok(crate::query::BacklinkFilterScope {
+                        names_norm: resolved.1,
+                        pages,
+                    })
+                },
+            )
+        })
+    }
+
     pub(super) fn direct_projection_page_aliases_with_owners(
         &self,
     ) -> Option<Vec<(String, String, String)>> {
@@ -1196,6 +1460,18 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_hydrated_pages_test(&self) -> Vec<std::path::PathBuf> {
         DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow().clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_set_source_revision_test(
+        &self,
+        path: &std::path::Path,
+        revision: &str,
+    ) {
+        self.disk_revs
+            .write()
+            .unwrap()
+            .insert(path.to_path_buf(), revision.to_string());
     }
 
     /// §5.9: make the NEXT read through the statement seam fail, as a torn or

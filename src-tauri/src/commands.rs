@@ -538,6 +538,7 @@ pub(crate) async fn get_backlinks(
 pub(crate) async fn get_backlink_filter_context(
     name: String,
     targets: Vec<BacklinkFilterTarget>,
+    search: String,
     state: GraphContext<'_>,
 ) -> Result<BacklinkFilterContext, CommandError> {
     if targets.len() > RESULT_BRIDGE_MAX_ROWS {
@@ -552,9 +553,8 @@ pub(crate) async fn get_backlink_filter_context(
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         {
             let graph = slot.graph();
-            Ok(tine_core::query::backlink_filter_context(
-                &graph, &name, &targets,
-            ))
+            tine_core::query::backlink_filter_context(&graph, &name, &targets, &search)
+                .map_err(CommandError::from)
         }
     })
     .await

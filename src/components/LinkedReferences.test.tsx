@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
-import { backend } from "../backend";
-import type { BacklinkFilterContext, BlockDto, RefGroup } from "../types";
+import { backend, QueryNotReadyError } from "../backend";
+import type { BacklinkFilterContext, BacklinkFilterEntry, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
 import { resetReferenceSectionState } from "../referenceSectionState";
 import { setGraphMeta } from "../ui";
+import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 
 vi.mock("./LiveRefGroup", () => ({
   LiveRefGroup: (props: { blocks: BlockDto[]; showBreadcrumb?: boolean }) => (
@@ -28,6 +30,38 @@ function tick(): Promise<void> {
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+type MockFilterEntry = Omit<BacklinkFilterEntry, "text_matches"> & { text: string };
+
+function mockBacklinkFilterContext(
+  entries: MockFilterEntry[],
+  options: Pick<BacklinkFilterContext, "truncated"> = {}
+) {
+  return vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(
+    async (_name, _targets, search) => {
+      const matcher = parseSearchQuery(search);
+      return {
+        ...options,
+        search_error: matcher.kind === "invalid" ? matcher.error : undefined,
+        entries: entries.map(({ text, ...entry }) => ({
+          ...entry,
+          text_matches: matcher.kind === "empty" || matcher.kind === "invalid"
+            || matcherMatches(matcher, canonicalFold(text), text),
+        })),
+      };
+    }
+  );
 }
 
 afterEach(() => {
@@ -156,7 +190,7 @@ describe("Linked References filters", () => {
     dispose();
   });
 
-  it("normalizes each native search corpus once instead of once per search evaluation", async () => {
+  it("never normalizes or matches the native search corpus in the frontend", async () => {
     const groups: RefGroup[] = [
       {
         page: "Journal",
@@ -172,11 +206,11 @@ describe("Linked References filters", () => {
       return originalToLowerCase.call(this);
     });
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups);
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue({
+    vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(async () => ({
       entries: [
-        { page: "Journal", kind: "journal", block_id: "root", text: indexedText, facets: [] },
+        { page: "Journal", kind: "journal", block_id: "root", facets: [], text_matches: true },
       ],
-    });
+    }));
     const root = document.createElement("div");
     document.body.appendChild(root);
     const dispose = render(() => <LinkedReferences name="My Project" />, root);
@@ -186,7 +220,7 @@ describe("Linked References filters", () => {
     root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
     await tick();
     await tick();
-    expect(corpusNormalizations).toBe(1);
+    expect(corpusNormalizations).toBe(0);
 
     const input = root.querySelector<HTMLInputElement>(".reference-filter-search")!;
     for (const query of ["unique", "indexed", "search corpus"]) {
@@ -195,7 +229,7 @@ describe("Linked References filters", () => {
       await wait(150);
       expect(root.querySelector(".references-count")?.textContent).toBe("1");
     }
-    expect(corpusNormalizations).toBe(1);
+    expect(corpusNormalizations).toBe(0);
 
     dispose();
   });
@@ -212,12 +246,10 @@ describe("Linked References filters", () => {
       },
     ];
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups);
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue({
-      entries: [
-        { page: "Journal", kind: "journal", block_id: "matching-root", text: "Planning\nA descendant carries the exact needle", facets: [] },
-        { page: "Journal", kind: "journal", block_id: "other-root", text: "Another reference\nUnrelated descendant", facets: [] },
-      ],
-    });
+    mockBacklinkFilterContext([
+      { page: "Journal", kind: "journal", block_id: "matching-root", text: "Planning\nA descendant carries the exact needle", facets: [] },
+      { page: "Journal", kind: "journal", block_id: "other-root", text: "Another reference\nUnrelated descendant", facets: [] },
+    ]);
     const root = document.createElement("div");
     document.body.appendChild(root);
     const dispose = render(() => <LinkedReferences name="My Project" />, root);
@@ -271,14 +303,12 @@ describe("Linked References filters", () => {
       },
     ];
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups);
-    const context: BacklinkFilterContext = {
-      entries: [
+    const context: MockFilterEntry[] = [
         { page: "Jul 10th, 2026", kind: "journal", block_id: "planning", text: "Planning", facets: ["fun", "pin", "TODO"] },
         { page: "Jul 9th, 2026", kind: "journal", block_id: "sync", text: "Sync", facets: ["fun", "pin"] },
         { page: "Jul 9th, 2026", kind: "journal", block_id: "direct-todo", text: "TODO should be detected", facets: ["TODO"] },
-      ],
-    };
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue(context);
+    ];
+    mockBacklinkFilterContext(context);
     const root = document.createElement("div");
     document.body.appendChild(root);
     const dispose = render(() => <LinkedReferences name="My Project" />, root);
@@ -311,12 +341,10 @@ describe("Linked References filters", () => {
       },
     ];
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups);
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue({
-      entries: [
-        { page: "Journal", kind: "journal", block_id: "with-task", text: "Planning\nTODO nested task", facets: ["work", "TODO"] },
-        { page: "Journal", kind: "journal", block_id: "without-task", text: "Notes", facets: ["notes"] },
-      ],
-    });
+    mockBacklinkFilterContext([
+      { page: "Journal", kind: "journal", block_id: "with-task", text: "Planning\nTODO nested task", facets: ["work", "TODO"] },
+      { page: "Journal", kind: "journal", block_id: "without-task", text: "Notes", facets: ["notes"] },
+    ]);
     const root = document.createElement("div");
     document.body.appendChild(root);
     const dispose = render(() => <LinkedReferences name="My Project" />, root);
@@ -353,15 +381,13 @@ describe("Linked References include chips OR (GH #273)", () => {
         blocks: entries.map((entry) => block(entry.id, `${entry.text} [[My Project]]`)),
       },
     ]);
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue({
-      entries: entries.map((entry) => ({
+    mockBacklinkFilterContext(entries.map((entry) => ({
         page,
-        kind: "journal",
+        kind: "journal" as const,
         block_id: entry.id,
         text: entry.text,
         facets: entry.facets,
-      })),
-    });
+      })));
   };
 
   async function mountFiltered(entries: { id: string; text: string; facets: string[] }[]) {
@@ -487,12 +513,10 @@ describe("Linked References facet chips follow the text query (GH #173)", () => 
       blocks: [block("alpha-root", "Planning [[My Project]]"), block("beta-root", "Other [[My Project]]")],
     },
   ];
-  const facetedContext = (): BacklinkFilterContext => ({
-    entries: [
+  const facetedContext = (): MockFilterEntry[] => [
       { page: "Journal", kind: "journal", block_id: "alpha-root", text: "Planning the needle", facets: ["Alpha"] },
       { page: "Journal", kind: "journal", block_id: "beta-root", text: "Other unrelated", facets: ["Beta"] },
-    ],
-  });
+  ];
 
   const openFilter = async (root: HTMLElement) => {
     root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
@@ -515,7 +539,7 @@ describe("Linked References facet chips follow the text query (GH #173)", () => 
 
   it("drops facets whose only backlinks no longer match the typed text", async () => {
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue(twoFacetedRoots());
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue(facetedContext());
+    mockBacklinkFilterContext(facetedContext());
     const root = document.createElement("div");
     document.body.appendChild(root);
     const dispose = render(() => <LinkedReferences name="My Project" />, root);
@@ -539,7 +563,7 @@ describe("Linked References facet chips follow the text query (GH #173)", () => 
   // regression the fix could introduce, not a repro of the reported defect.
   it("keeps an already-selected facet visible so it can still be cleared", async () => {
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue(twoFacetedRoots());
-    vi.spyOn(backend(), "getBacklinkFilterContext").mockResolvedValue(facetedContext());
+    mockBacklinkFilterContext(facetedContext());
     const root = document.createElement("div");
     document.body.appendChild(root);
     const dispose = render(() => <LinkedReferences name="My Project" />, root);
@@ -599,6 +623,224 @@ describe("Linked References filter summary is honest while indexing (GH #173)", 
     const summary = root.querySelector(".reference-filter-summary")!.textContent!;
     expect(summary).toContain("Indexing");
     expect(summary).not.toContain("2 of 2");
+    dispose();
+  });
+});
+
+describe("Linked References native filter request identity", () => {
+  const groups = (page: string, ids: string[]): RefGroup[] => [{
+    page,
+    kind: "page",
+    blocks: ids.map((id) => block(id, `${id} [[Target]]`)),
+  }];
+  const context = (
+    page: string,
+    matches: Record<string, boolean>,
+    extra: Partial<BacklinkFilterContext> = {}
+  ): BacklinkFilterContext => ({
+    entries: Object.entries(matches).map(([block_id, text_matches]) => ({
+      page,
+      kind: "page",
+      block_id,
+      facets: [block_id],
+      text_matches,
+    })),
+    ...extra,
+  });
+  const type = async (root: HTMLElement, search: string) => {
+    const input = root.querySelector<HTMLInputElement>(".reference-filter-search")!;
+    input.value = search;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    await wait(150);
+  };
+
+  it("keeps the settled list stable while a newer native match is pending", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups("Source", ["one", "two"]));
+    const second = deferred<BacklinkFilterContext>();
+    vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(
+      async (_name, _targets, search) => {
+        if (search === "one") return context("Source", { one: true, two: false });
+        if (search === "two") return second.promise;
+        return context("Source", { one: true, two: true });
+      }
+    );
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+    await tick();
+
+    await type(root, "one");
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+
+    await type(root, "two");
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+    expect(root.querySelector(".reference-filter-summary")?.textContent).toContain("Indexing");
+
+    second.resolve(context("Source", { one: false, two: true }));
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("two");
+    dispose();
+  });
+
+  it("retries typed native readiness and publishes only the current request", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups("Source", ["one", "two"]));
+    const getContext = vi.spyOn(backend(), "getBacklinkFilterContext")
+      .mockRejectedValueOnce(new QueryNotReadyError("indexing"))
+      .mockResolvedValue(context("Source", { one: true, two: false }));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+
+    await vi.waitFor(() => expect(getContext).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => {
+      expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+    });
+    expect(root.querySelector(".reference-filter-error")).toBeNull();
+    dispose();
+  });
+
+  it("keeps a text-only filter applied across close, Escape, and reopen", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups("Source", ["one", "two"]));
+    const getContext = vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(
+      async (_name, _targets, search) => search === "one"
+        ? context("Source", { one: true, two: false })
+        : context("Source", { one: true, two: true })
+    );
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    const toggle = root.querySelector<HTMLButtonElement>(
+      'button[aria-label="Filter linked references"]'
+    )!;
+    toggle.click();
+    await tick();
+    await type(root, "one");
+    await vi.waitFor(() => {
+      expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+    });
+    const settledCalls = getContext.mock.calls.length;
+
+    root.querySelector<HTMLInputElement>(".reference-filter-search")!
+      .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await tick();
+    expect(root.querySelector(".reference-filter-panel")).toBeNull();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+    expect(getContext).toHaveBeenCalledTimes(settledCalls);
+
+    toggle.click();
+    await tick();
+    expect(root.querySelector<HTMLInputElement>(".reference-filter-search")?.value).toBe("one");
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+    expect(getContext).toHaveBeenCalledTimes(settledCalls);
+
+    toggle.click();
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one");
+    expect(getContext).toHaveBeenCalledTimes(settledCalls);
+    dispose();
+  });
+
+  it("discards a late query reply after a newer query has settled", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups("Source", ["one", "two"]));
+    const old = deferred<BacklinkFilterContext>();
+    vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(
+      async (_name, _targets, search) => {
+        if (search === "old") return old.promise;
+        if (search === "new") return context("Source", { one: false, two: true });
+        return context("Source", { one: true, two: true });
+      }
+    );
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+    await tick();
+
+    await type(root, "old");
+    await type(root, "new");
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("two");
+
+    old.resolve(context("Source", { one: true, two: false }));
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("two");
+    dispose();
+  });
+
+  it("does not land a late page/root reply on the replacement inventory", async () => {
+    const first = deferred<BacklinkFilterContext>();
+    vi.spyOn(backend(), "getBacklinks").mockImplementation(async (name) =>
+      name === "First" ? groups("Old source", ["old-root"]) : groups("New source", ["new-root"])
+    );
+    vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(
+      async (name) => name === "First"
+        ? first.promise
+        : context("New source", { "new-root": true })
+    );
+    const [name, setName] = createSignal("First");
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name={name()} />, root);
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+    await tick();
+
+    setName("Second");
+    await tick();
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("new-root");
+
+    first.resolve(context("Old source", { "old-root": false }));
+    await tick();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("new-root");
+    dispose();
+  });
+
+  it("renders native invalid, error, and truncation states without hiding roots", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(groups("Source", ["one", "two"]));
+    vi.spyOn(backend(), "getBacklinkFilterContext").mockImplementation(
+      async (_name, _targets, search) => {
+        if (search === "fail") throw new Error("native failed");
+        if (search === "/[/") {
+          return context("Source", { one: true, two: true }, { search_error: "invalid regex" });
+        }
+        return context("Source", { one: true, two: true }, { truncated: search === "large" });
+      }
+    );
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    root.querySelector<HTMLButtonElement>('button[aria-label="Filter linked references"]')!.click();
+    await tick();
+
+    await type(root, "/[/");
+    await tick();
+    expect(root.querySelector(".reference-filter-error")?.textContent).toContain("Invalid search");
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one,two");
+
+    await type(root, "large");
+    await tick();
+    expect(root.querySelector(".reference-filter-warning")?.textContent).toContain("searched partially");
+
+    await type(root, "fail");
+    await tick();
+    expect(root.querySelector(".reference-filter-error")?.textContent).toContain("showing all references");
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one,two");
+
+    await type(root, "");
+    await tick();
+    expect(root.querySelector(".reference-filter-error")).toBeNull();
+    expect(root.querySelector(".test-ref-group")?.textContent).toBe("one,two");
     dispose();
   });
 });

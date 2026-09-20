@@ -316,9 +316,35 @@ impl Graph {
         generation: u64,
         paths: Vec<PathBuf>,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        self.parse_pages_on_demand_inner(
+            generation,
+            paths.into_iter().map(|path| (path, None)).collect(),
+        )
+    }
+
+    pub(super) fn parse_pages_on_demand_with_revisions(
+        &self,
+        generation: u64,
+        sources: Vec<(PathBuf, String)>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        self.parse_pages_on_demand_inner(
+            generation,
+            sources
+                .into_iter()
+                .map(|(path, revision)| (path, Some(revision)))
+                .collect(),
+        )
+    }
+
+    fn parse_pages_on_demand_inner(
+        &self,
+        generation: u64,
+        sources: Vec<(PathBuf, Option<String>)>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
         let permit = self.admit_retained_graph_text_writer().ok()?;
-        let mut pages = Vec::with_capacity(paths.len());
-        for relative in paths {
+        let mut pages = Vec::with_capacity(sources.len());
+        let config_digest = self.config.parse_config().digest();
+        for (relative, projected_revision) in sources {
             let absolute = self.root.join(&relative);
             let entry = self.graph_inventory_entry(&absolute).ok()??;
             if entry.rel_path != relative.to_string_lossy() {
@@ -327,6 +353,14 @@ impl Graph {
             let (content, _) = self
                 .graph_text_read_optional_text_with_identity(&permit, &entry.path)
                 .ok()??;
+            if projected_revision.is_some_and(|expected| {
+                crate::direct_projection::projection_source_revision(
+                    &content_rev(&content),
+                    config_digest,
+                ) != expected
+            }) {
+                return None;
+            }
             #[cfg(test)]
             self.page_build_test
                 .on_demand_parses
