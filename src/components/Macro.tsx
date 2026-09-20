@@ -1382,11 +1382,18 @@ export function QueryMacro(props: {
     score: 0,
     row,
   })));
-  const total = () => friendlySearch() !== null
-    ? searchPresentationHits().length
-    : currentView() === "search"
+  /** **One answer, counted once — whatever face it is wearing** (GH #547).
+   *
+   *  The count is a property of the RESULT, not of the presentation, so the
+   *  row family is chosen by what the run returned and never by `currentView()`.
+   *  A page-anchored answer counts its pages in every view: keying the Search
+   *  face off `searchPresentationHits()` counted blocks a page-anchored run
+   *  never produces, so the header read 0 beside a summary group reading 7. */
+  const total = () => pageRows()
+    ? (matchedTotal() ?? pageRows()!.length)
+    : friendlySearch() !== null || currentView() === "search"
       ? searchPresentationHits().length
-      : (pageRows() ? (matchedTotal() ?? pageRows()!.length) : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
+      : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
   // **Why empty? (Q14, N19; B1).** `query_explain_empty` was decoded and never
   // rendered, so a query that matched nothing said only "No results" — which is
   // the one moment a user most needs to know WHICH conjunct emptied it. Asked
@@ -2251,42 +2258,54 @@ export function QueryMacro(props: {
                 when={friendlySearch() !== null}
                 fallback={
                   <Show
-                    when={sheetFace()}
+                    when={pageRows()}
                     fallback={
-                      <>
-                        <Show when={currentView() === "search"}>{blockSearchRows()}</Show>
-                        <Show when={currentView() !== "search"}>
-                          {/* `@page`-anchored results are pages, not blocks (K16):
-                              they carry their physical owner and need no document
-                              load, so they render through the Pages renderer —
-                              under the PAGE settings, which is the only reason a
-                              page-anchored query's columns and grouping can show
-                              at all. */}
-                          <Show when={pageRows()}>
-                            <QueryPageResults
-                              hits={pageRowHits}
-                              view={pageResultView}
-                              onOpen={openPageHit}
-                              linkAttrs={pageHitLinkAttrs}
-                              linkClass="query-page-row"
-                            />
-                          </Show>
-                          <Show
-                            when={groups() && groups()!.length > 0}
-                            fallback={<Show when={!pageRows()?.length}>{emptyResultPanel()}</Show>}
-                          >
-                            {blockGroupRows()}
-                          </Show>
+                      <Show
+                        when={sheetFace()}
+                        fallback={
+                          <>
+                            <Show when={currentView() === "search"}>{blockSearchRows()}</Show>
+                            <Show when={currentView() !== "search"}>
+                              <Show
+                                when={groups() && groups()!.length > 0}
+                                fallback={emptyResultPanel()}
+                              >
+                                {blockGroupRows()}
+                              </Show>
+                            </Show>
+                          </>
+                        }
+                      >
+                        <Show
+                          when={groups() && groups()!.length > 0}
+                          fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
+                        >
+                          {blockSheetRows()}
                         </Show>
-                      </>
+                      </Show>
                     }
                   >
-                    <Show
-                      when={groups() && groups()!.length > 0}
-                      fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
-                    >
-                      {blockSheetRows()}
-                    </Show>
+                    {/* `@page`-anchored results are pages, not blocks (K16): they
+                        carry their physical owner and need no document load, so
+                        they render through the Pages renderer — under the PAGE
+                        settings, which is the only reason a page-anchored query's
+                        columns and grouping can show at all.
+
+                        **All four faces, from the one renderer** (GH #547). The
+                        page renderer already draws search, list, table and board;
+                        routing only List to it sent Table and Board to the BLOCK
+                        sheet, which a page-anchored run leaves empty by
+                        construction, so a query with seven matching pages said
+                        "No results" the moment its face changed. Presentation
+                        never changes membership. */}
+                    <QueryPageResults
+                      hits={pageRowHits}
+                      view={pageResultView}
+                      onOpen={openPageHit}
+                      linkAttrs={pageHitLinkAttrs}
+                      linkClass="query-page-row"
+                    />
+                    <Show when={!pageRows()!.length}>{emptyResultPanel()}</Show>
                   </Show>
                 }
               >

@@ -123,6 +123,45 @@ describe("B1: a TQL block executes through query_run", () => {
     }
   });
 
+  /** **A page-anchored answer is the SAME seven pages in every view** (GH #547).
+   *
+   *  `{{query (page-property tags gptpro)}}` answers with pages. List rendered
+   *  them; Table and Board asked `groups()` — which a page-anchored run leaves
+   *  empty by construction — and printed "No results", and Search counted
+   *  `searchPresentationHits()`, which was built from those same absent blocks,
+   *  so the header said 0 beside a summary group that said 7. Presentation never
+   *  changes membership: the ONE page renderer already draws all four faces. */
+  for (const view of ["table", "board", "search"] as const) {
+    it(`renders the page rows a page-anchored query matched under tine.view:: ${view}`, async () => {
+      load(`{{tine-query @page and journal = false}}\ntine.view:: ${view}`);
+      const answer: QueryResult = {
+        anchor: "page",
+        pages: [
+          { path: "pages/Twin.md", name: "Twin", kind: "page", properties: [["tags", "gptpro"]] },
+          { path: "pages/Other.md", name: "Other", kind: "page", properties: [["tags", "gptpro"]] },
+        ],
+        diagnostics: [],
+        report: { ran: ["journal"], ignored: [], supported: true },
+        total: 2,
+        matched_total: 2,
+        exceeded: false,
+      };
+      vi.spyOn(backend(), "queryRun").mockResolvedValue(answer);
+
+      const { root, dispose } = mount(() => <Block id="query" />);
+      try {
+        await vi.waitFor(() => expect(root.querySelectorAll(".query-page-row")).toHaveLength(2));
+        expect(root.textContent).toContain("Twin");
+        expect(root.textContent).toContain("Other");
+        // The count the header shows is the count of the rows it is showing.
+        expect(root.querySelector(".query-count")?.textContent).toBe("2");
+        expect(root.querySelector(".query-empty")).toBeNull();
+      } finally {
+        dispose();
+      }
+    });
+  }
+
   it("automatically retries indexing without reporting an empty query", async () => {
     load(TQL_MACRO);
     let finish!: (value: ReturnType<typeof blockRunResult>) => void;

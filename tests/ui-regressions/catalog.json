@@ -11837,6 +11837,30 @@
         "failBefore": "proven"
       },
       "notes": "The other half of UI-REGION-FAILURE-BOUNDARY-001. The boundary catches the throw; this row is about the throw happening at all. Reading a Solid resource is how this app throws into render: read() (solid-js 1.9.13, dist/solid.js:318-322) does `if (err !== undefined && !pr) throw err`, and the `latest` getter (:390-397) does the same - so `hljs()`, `katex()`, `preview()`, `contentDays()`, `icons()` on a rejected fetch threw, and runUpdates discarded every effect batched with it. The finding that shaped the fix: nearly every one of these sites had ALREADY written what to do without a value - escaped plain text for un-highlighted code, the raw TeX for an un-typeset formula, `?? {}`, `?? []` - and not one of those branches could ever run, because the read threw first. So the fix is behaviour-preserving on the happy path: readOr/readLatestOr (src/resourceRead.ts) consult resource.error, which never throws, and hand back the fallback the site already had; 42 reads across 21 files. What this row covers: a failed background fetch costs only the value it was fetching, and a panel whose emptiness would MISINFORM says so instead - ResourceFailure (src/components/ResourceFailure.tsx) keeps the panel's heading and controls and shows 'Couldn't load <what>' with a Retry where refetching is possible, in the sidebar page list and in Block References. Linked and Unlinked References are NOT in that set and do not need to be: createReferenceFetcher (src/lib/referenceFetch.ts) catches its own failures into loadError and already renders a role=alert row, so those resources never reject. Deliberately NOT a boundary per panel: a boundary costs the panel's whole subtree and its state, and a panel that knows its own resource failed can keep its place. Fail-before PROVEN by a control arm kept permanently in src/resourceRead.test.tsx: a settled-rejected resource throws on both `resource()` and `resource.latest`, and the bare render leaves its healthy sibling unmounted where the readOr render shows both. Recurrence is prevented by shape plus a ratchet: src/resourceReads.guard.test.ts walks the TSX AST of every non-test file in src/, scopes each binding to its own function (Page.tsx has a resource named `groups` AND a parameter named `groups`), and fails on any call of a resource binding or any read of a non-safe property - `.latest` is explicitly not safe. It carries two self-checks because an earlier version parsed the file twice and compared scope nodes by identity, which silently made the whole scan vacuous. Evidence layer: render/unit. Not driven at the native observation boundary - a failing backend fetch is not reproducible in a stable E2E journey - so the claim is that the fallback path is reachable and correct, not that a specific field failure is cured."
+    },
+    {
+      "id": "UI-QUERY-PAGE-ANCHORED-VIEWS-547",
+      "title": "A query that matched pages shows the same pages in every display view, and the header counts them",
+      "family": "query-results",
+      "sources": {
+        "issues": [
+          547
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.ir.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Reported for {{query (page-property tags gptpro)}}: List showed seven pages and the count 7, Table said \"No results\", and Search showed a summary group \"(none) 7\" beside a header count of 0. One answer, three producers. A page-anchored run returns `pages` and leaves `groups` EMPTY by construction (Macro.tsx fetchQueryOperation, the anchor === page branch), but only the List branch consulted pageRows(): the Table/Board branch rendered the BLOCK sheet from groups() and fell back to \"No results\", and the Search branch rendered blockSearchRows() over searchPresentationHits(), which is also built from groups(). The header count was a fourth derivation keyed on currentView(), which is why it read 0 in Search while the backend's own statistics fold (crates/tine-core/src/query/statistics.rs), the source of the summary panel, correctly reported 7 - every page row has no `state`, so all of them land in the null-key \"(none)\" group. Fix: a page-anchored answer routes to the ONE page renderer (QueryPageResults) in all four presentations - it already implemented search/list/table/board and was simply never reached - and total() chooses its row family from what the run RETURNED rather than from the presentation, so hide-when-empty and 'why empty?' stop misreading a non-empty page answer too. Evidence layer: render/unit; the backend answer is mocked, so this proves the view routing, not the engine's page-property matching. Fail-before PROVEN: the three new tests (tine.view:: table, board and search over a page-anchored answer) each rendered 0 page rows on the pre-fix tree."
     }
   ]
 }

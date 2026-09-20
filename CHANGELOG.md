@@ -47,6 +47,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- A query whose results are pages — `{{query (page-property tags x)}}` and any
+  other page query — now shows those pages in every display view. Table and
+  Board said "No results" and Search reported a count of 0, because those three
+  views read the block results a page query never produces, while List read the
+  pages. The page results were always there: the summary panel went on counting
+  them correctly beside the header's 0. Changing the view now changes only how
+  the same matches are drawn, and the count is the count of what is on screen
+  (GH #547).
 - Renaming, merging or rescuing a page no longer leaves search answering from
   the page it used to be. A delete has always told the index what changed;
   these three only told it that something had, and the index is allowed to keep
