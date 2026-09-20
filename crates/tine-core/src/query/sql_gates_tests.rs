@@ -226,10 +226,11 @@ impl Corpus {
         let rows = self
             .reader
             .run_projection_query(
-                "SELECT b.block_id FROM blocks b \
+                "SELECT b.result_id FROM blocks b \
                  JOIN pages p ON p.page_id = b.page_id \
+                 JOIN names pn ON pn.name_id = p.name_id \
                  JOIN block_text t ON t.block_id = b.block_id \
-                 WHERE p.name = ?1 AND instr(t.content, ?2) > 0",
+                 WHERE pn.raw = ?1 AND instr(t.content, ?2) > 0",
                 &[
                     PhysicalQueryValue::Text(page.to_string()),
                     PhysicalQueryValue::Text(needle.to_string()),
@@ -242,9 +243,7 @@ impl Corpus {
             "{page}/{needle:?} must name exactly one fixture block"
         );
         match rows[0].first() {
-            Some(PhysicalQueryValue::Blob(id)) => Uuid::from_slice(id)
-                .expect("a 16-byte block id")
-                .to_string(),
+            Some(PhysicalQueryValue::Text(id)) => id.clone(),
             other => panic!("a block row selects its id, got {other:?}"),
         }
     }
@@ -254,16 +253,14 @@ impl Corpus {
         let rows = self
             .reader
             .run_projection_query(
-                "SELECT b.block_id FROM blocks b JOIN pages p ON p.page_id = b.page_id \
-                 WHERE p.name = ?1",
+                "SELECT b.result_id FROM blocks b JOIN pages p ON p.page_id = b.page_id \
+                 JOIN names pn ON pn.name_id = p.name_id WHERE pn.raw = ?1",
                 &[PhysicalQueryValue::Text(name.to_string())],
             )
             .expect("the page's blocks are readable through the seam");
         rows.into_iter()
             .map(|row| match row.first() {
-                Some(PhysicalQueryValue::Blob(id)) => Uuid::from_slice(id)
-                    .expect("a 16-byte block id")
-                    .to_string(),
+                Some(PhysicalQueryValue::Text(id)) => id.clone(),
                 other => panic!("a block row selects its id, got {other:?}"),
             })
             .collect()
@@ -379,9 +376,16 @@ impl Corpus {
             });
         rows.into_iter()
             .map(|row| match (anchor, row.first()) {
-                (Anchor::Block, Some(PhysicalQueryValue::Blob(id))) => Uuid::from_slice(id)
-                    .expect("a 16-byte block id")
-                    .to_string(),
+                (Anchor::Block, Some(PhysicalQueryValue::Integer(id))) => {
+                    let resolved = self.reader.run_projection_query(
+                        "SELECT result_id FROM blocks WHERE block_id = ?1",
+                        &[PhysicalQueryValue::Integer(*id)],
+                    ).expect("a selected private block coordinate resolves");
+                    match resolved.first().and_then(|row| row.first()) {
+                        Some(PhysicalQueryValue::Text(id)) => id.clone(),
+                        other => panic!("a private block coordinate resolves to its public result id, got {other:?}"),
+                    }
+                }
                 (Anchor::Page, _) => match row.get(1) {
                     Some(PhysicalQueryValue::Text(name)) => crate::refs::page_key(name),
                     other => panic!("a page row selects its name, got {other:?}"),
@@ -1817,9 +1821,10 @@ fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
     // the driver produced, which is the whole cost claim. The index's NAME is
     // SQLite's business; `(block_id=?)` is the claim.
     assert!(
-        probes
-            .iter()
-            .any(|step| step.starts_with("SEARCH t") && step.contains("(block_id=?)")),
+        probes.iter().any(|step| {
+            step.starts_with("SEARCH t")
+                && (step.contains("(block_id=?)") || step.contains("(rowid=?)"))
+        }),
         "the correlated probe must seek the task facet by block id: {}",
         probes.join(" | ")
     );
@@ -3145,15 +3150,17 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
             assert_eq!(row.len(), 3, "{source}: {row:?}");
             match (&row[0], &row[1], &row[2]) {
                 (
-                    PhysicalQueryValue::Blob(block_id),
-                    PhysicalQueryValue::Blob(page_id),
+                    PhysicalQueryValue::Integer(block_id),
+                    PhysicalQueryValue::Integer(page_id),
                     PhysicalQueryValue::Text(path),
                 ) => {
-                    assert_eq!(block_id.len(), 16, "{source}");
-                    assert_eq!(page_id.len(), 16, "{source}");
+                    assert!(*block_id > 0, "{source}");
+                    assert!(*page_id > 0, "{source}");
                     assert!(path.ends_with(".md"), "{source}");
                 }
-                other => panic!("{source}: the row contract is (blob, blob, text): {other:?}"),
+                other => {
+                    panic!("{source}: the row contract is (integer, integer, text): {other:?}")
+                }
             }
         }
     }
@@ -3180,13 +3187,14 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
         probe.sql
     );
 
-    // `@page` output is untouched by this packet: four columns, name and kind
-    // included, because the page result construction reads them.
+    // `@page` keeps its four public columns; the name now comes through the
+    // dictionary join used by every other page-name reader.
     let (anchor, page) = corpus.lower("@page and journal = true", QueryDialect::Tql);
     assert_eq!(anchor, Anchor::Page);
     assert!(
-        page.sql
-            .starts_with("SELECT p.page_id, p.name, p.text_kind, p.journal_day FROM pages p "),
+        page.sql.starts_with(
+            "SELECT p.page_id, pn.raw, p.text_kind, p.journal_day FROM pages p JOIN names pn "
+        ),
         "{}",
         page.sql
     );
@@ -3246,11 +3254,12 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
     // The NAME is read only to run the panel query; it is never printed.
     let ranked = snapshot
         .run_projection_query(
-            "SELECT normalized_name, COUNT(DISTINCT source_page_id) AS pages
-             FROM reference_postings
-             WHERE target_type = 0 AND reference_kind <= 4
-             GROUP BY normalized_name
-             ORDER BY pages DESC, normalized_name
+            "SELECT n.key, COUNT(DISTINCT r.source_page_id) AS pages
+             FROM reference_postings r
+             JOIN names n ON n.name_id = r.target_name_id
+             WHERE r.target_type = 0 AND r.reference_kind <= 4
+             GROUP BY n.key
+             ORDER BY pages DESC, n.key
              LIMIT 8",
             &[],
         )
@@ -3266,9 +3275,10 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
         };
         let referring_blocks = snapshot
             .run_projection_query(
-                "SELECT COUNT(DISTINCT source_entity_id) FROM reference_postings
-                 WHERE target_type = 0 AND reference_kind <= 4
-                   AND normalized_name = ?1 AND source_entity_type = 1",
+                "SELECT COUNT(DISTINCT r.source_entity_id) FROM reference_postings r
+                 JOIN names n ON n.name_id = r.target_name_id
+                 WHERE r.target_type = 0 AND r.reference_kind <= 4
+                   AND n.key = ?1 AND r.source_entity_type = 1",
                 &[PhysicalQueryValue::Text(name.clone())],
             )
             .expect("the block count runs")
@@ -3281,9 +3291,10 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
         let blocks_in_candidates = snapshot
             .run_projection_query(
                 "SELECT COUNT(*) FROM blocks WHERE page_id IN (
-                     SELECT DISTINCT source_page_id FROM reference_postings
-                     WHERE target_type = 0 AND reference_kind <= 4
-                       AND normalized_name = ?1)",
+                     SELECT DISTINCT r.source_page_id FROM reference_postings r
+                     JOIN names n ON n.name_id = r.target_name_id
+                     WHERE r.target_type = 0 AND r.reference_kind <= 4
+                       AND n.key = ?1)",
                 &[PhysicalQueryValue::Text(name.clone())],
             )
             .expect("the candidate block count runs")

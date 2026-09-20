@@ -17,7 +17,7 @@
 //!   exactly that block on exactly that snapshot.
 //! * **A subtree is not a page.** Loading a whole document to answer "the four
 //!   blocks under this one" is the same N+1 R3 removed from result reads. Here
-//!   the subtree is a contiguous run of `query_block_results.preorder` inside
+//!   the subtree is a contiguous run of `blocks.preorder` inside
 //!   one page, read in batches of [`TOPOLOGY_BATCH`], and OUTPUT PAYLOAD is
 //!   read only for the nodes the budget actually admitted.
 //!
@@ -44,9 +44,9 @@ use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
 use crate::query::ir::ViewSettings;
 use crate::query::results::{
-    blob16, count, integer, placeholders, read_admitted_payload, resolve_identity,
-    sql_or_cancelled, text, LocatedPreViewGroups, PayloadChannel, PayloadFacts, ResultIdentity,
-    ResultLocator, ResultReadError,
+    count, integer, placeholders, read_admitted_payload, resolve_identity, sql_or_cancelled, text,
+    LocatedPreViewGroups, PayloadChannel, PayloadFacts, ResultIdentity, ResultLocator,
+    ResultReadError,
 };
 use crate::query::{
     finish_result_view_groups, select_export_queries_over, ExportSelectionAnswer,
@@ -247,7 +247,7 @@ pub(crate) fn hydrate_located_queries(
     // Re-reading their identical topology would be pure waste, so it is cached
     // — a cache that cannot move an admission or an omission count, because it
     // returns the same rows the second read would have.
-    let mut topologies: HashMap<[u8; 16], Subtree> = HashMap::new();
+    let mut topologies: HashMap<i64, Subtree> = HashMap::new();
 
     for query in selected {
         let mut roots = Vec::with_capacity(query.roots.len());
@@ -343,7 +343,7 @@ fn allocation_error(error: std::collections::TryReserveError) -> ResultReadError
 fn read_root_page_paths(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     selected: &[LocatedExportQuery],
-) -> Result<HashMap<[u8; 16], String>, ResultReadError> {
+) -> Result<HashMap<i64, String>, ResultReadError> {
     let mut wanted = HashSet::new();
     for query in selected {
         for root in &query.roots {
@@ -351,7 +351,7 @@ fn read_root_page_paths(
         }
     }
     let mut paths = HashMap::new();
-    let mut ids: Vec<[u8; 16]> = wanted.into_iter().collect();
+    let mut ids: Vec<i64> = wanted.into_iter().collect();
     ids.sort_unstable();
     for batch in ids.chunks(TOPOLOGY_BATCH) {
         if snapshot.cancellation().is_cancelled() {
@@ -363,7 +363,7 @@ fn read_root_page_paths(
         );
         let params = batch
             .iter()
-            .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
+            .map(|id| PhysicalQueryValue::Integer(*id))
             .collect::<Vec<_>>();
         #[cfg(test)]
         note(|census| census.page_statements += 1);
@@ -372,7 +372,7 @@ fn read_root_page_paths(
         for row in &rows {
             let decoded = (|| {
                 Ok::<_, String>((
-                    blob16(row, 0, "pages.page_id")?,
+                    integer(row, 0, "pages.page_id")?,
                     text(row, 1, "pages.path")?,
                 ))
             })()
@@ -393,14 +393,14 @@ fn read_root_page_paths(
 /// Every root's preorder, batched — and the ownership check that
 /// makes duplicate public ids and equal display names harmless.
 ///
-/// `query_block_results.page_id` must be the page the locator names. That is
+/// `blocks.page_id` must be the page the locator names. That is
 /// the whole of "root physical ownership survives duplicate exposed ids": the
 /// row is found by its physical block id, and the page it claims has to be the
 /// one the selection admitted it under.
 fn read_root_preorders(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     selected: &[LocatedExportQuery],
-) -> Result<HashMap<[u8; 16], i64>, ResultReadError> {
+) -> Result<HashMap<i64, i64>, ResultReadError> {
     let mut wanted = HashMap::new();
     for query in selected {
         for root in &query.roots {
@@ -408,32 +408,32 @@ fn read_root_preorders(
         }
     }
     let mut preorders = HashMap::new();
-    let mut ordered: Vec<([u8; 16], [u8; 16])> = wanted.into_iter().collect();
+    let mut ordered: Vec<(i64, i64)> = wanted.into_iter().collect();
     ordered.sort_unstable();
     for batch in ordered.chunks(TOPOLOGY_BATCH) {
         if snapshot.cancellation().is_cancelled() {
             return Err(ResultReadError::Cancelled);
         }
         let sql = format!(
-            "SELECT block_id, page_id, preorder FROM query_block_results \
+            "SELECT block_id, page_id, preorder FROM blocks \
              WHERE block_id IN ({})",
             placeholders(batch.len())
         );
         let params = batch
             .iter()
-            .map(|(id, _)| PhysicalQueryValue::Blob(id.to_vec()))
+            .map(|(id, _)| PhysicalQueryValue::Integer(*id))
             .collect::<Vec<_>>();
         #[cfg(test)]
         note(|census| census.root_statements += 1);
         let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
-        let owned: HashMap<[u8; 16], [u8; 16]> = batch.iter().copied().collect();
+        let owned: HashMap<i64, i64> = batch.iter().copied().collect();
         for row in &rows {
             let decoded = (|| {
                 Ok::<_, String>((
-                    blob16(row, 0, "query_block_results.block_id")?,
-                    blob16(row, 1, "query_block_results.page_id")?,
-                    integer(row, 2, "query_block_results.preorder")?,
+                    integer(row, 0, "blocks.block_id")?,
+                    integer(row, 1, "blocks.page_id")?,
+                    integer(row, 2, "blocks.preorder")?,
                 ))
             })()
             .map_err(ResultReadError::Corrupt)?;
@@ -444,7 +444,7 @@ fn read_root_preorders(
             }
             if decoded.2 < 0 {
                 return Err(ResultReadError::Corrupt(
-                    "query_block_results.preorder is negative".to_string(),
+                    "blocks.preorder is negative".to_string(),
                 ));
             }
             preorders.insert(decoded.0, decoded.2);
@@ -474,7 +474,7 @@ struct Subtree {
 }
 
 struct TopologyNode {
-    block_id: [u8; 16],
+    block_id: i64,
     /// The node index of this node's parent — never `NO_PARENT`, because a
     /// descendant that is not under the root is where the scan stops.
     parent: usize,
@@ -489,7 +489,7 @@ struct TopologyNode {
 
 /// Read one root's whole requested subtree, in batches of [`TOPOLOGY_BATCH`].
 ///
-/// `query_block_results` is
+/// `blocks` is
 /// written once per page from the producer's own DFS, so a page's `preorder`
 /// values are dense `0..n-1` and a subtree is a CONTIGUOUS run of them. The
 /// unique `(page_id, preorder)` index therefore answers "the next 128 rows
@@ -511,22 +511,21 @@ fn read_subtree_topology(
     identity: &ResultIdentity,
 ) -> Result<Subtree, ResultReadError> {
     let mut nodes: Vec<TopologyNode> = Vec::new();
-    let mut index_of: HashMap<[u8; 16], usize> = HashMap::from([(locator.block_id, 0usize)]);
+    let mut index_of: HashMap<i64, usize> = HashMap::from([(locator.block_id, 0usize)]);
     let mut cursor = root_preorder;
-    let mut boundary_parent: Option<[u8; 16]> = None;
+    let mut boundary_parent: Option<i64> = None;
 
     'scan: loop {
         if snapshot.cancellation().is_cancelled() {
             return Err(ResultReadError::Cancelled);
         }
         let sql = "SELECT b.block_id, b.parent_block_id, b.page_id, b.order_key, \
-                   q.preorder, q.result_id, q.estimated_bytes, q.tag_count, q.property_count \
-                   FROM query_block_results q \
-                   LEFT JOIN blocks b ON b.block_id = q.block_id \
-                   WHERE q.page_id = ?1 AND q.preorder > ?2 \
-                   ORDER BY q.preorder LIMIT ?3";
+                   b.preorder, b.result_id, b.estimated_bytes, b.tag_count, b.property_count \
+                   FROM blocks b \
+                   WHERE b.page_id = ?1 AND b.preorder > ?2 \
+                   ORDER BY b.preorder LIMIT ?3";
         let params = [
-            PhysicalQueryValue::Blob(locator.page_id.to_vec()),
+            PhysicalQueryValue::Integer(locator.page_id),
             PhysicalQueryValue::Integer(cursor),
             PhysicalQueryValue::Integer(TOPOLOGY_BATCH as i64),
         ];
@@ -551,7 +550,7 @@ fn read_subtree_topology(
             // walking is not the subtree it claims to be.
             if decoded.preorder != cursor + 1 {
                 return Err(ResultReadError::Corrupt(
-                    "query_block_results.preorder is not dense inside a page".to_string(),
+                    "blocks.preorder is not dense inside a page".to_string(),
                 ));
             }
             cursor = decoded.preorder;
@@ -635,7 +634,7 @@ fn verify_subtree_completeness(
         );
         let params: Vec<_> = batch
             .iter()
-            .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
+            .map(|id| PhysicalQueryValue::Integer(*id))
             .collect();
         let mut actual = HashMap::new();
         #[cfg(test)]
@@ -647,8 +646,8 @@ fn verify_subtree_completeness(
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         for row in rows {
             let parent =
-                blob16(&row, 0, "blocks.parent_block_id").map_err(ResultReadError::Corrupt)?;
-            let page = blob16(&row, 1, "blocks.page_id").map_err(ResultReadError::Corrupt)?;
+                integer(&row, 0, "blocks.parent_block_id").map_err(ResultReadError::Corrupt)?;
+            let page = integer(&row, 1, "blocks.page_id").map_err(ResultReadError::Corrupt)?;
             let total = count(&row, 2, "child count").map_err(ResultReadError::Corrupt)?;
             if page != locator.page_id
                 || !batch.contains(&parent)
@@ -681,8 +680,8 @@ fn verify_subtree_completeness(
 /// return the shorter subtree the damage would otherwise produce.
 fn verify_boundary_parent(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
-    page_id: [u8; 16],
-    parent: [u8; 16],
+    page_id: i64,
+    parent: i64,
     root_preorder: i64,
 ) -> Result<(), ResultReadError> {
     if snapshot.cancellation().is_cancelled() {
@@ -692,10 +691,10 @@ fn verify_boundary_parent(
     note(|census| census.boundary_statements += 1);
     let rows = crate::query::projection_sql::run(
         snapshot,
-        "SELECT preorder FROM query_block_results WHERE block_id = ?1 AND page_id = ?2",
+        "SELECT preorder FROM blocks WHERE block_id = ?1 AND page_id = ?2",
         &[
-            PhysicalQueryValue::Blob(parent.to_vec()),
-            PhysicalQueryValue::Blob(page_id.to_vec()),
+            PhysicalQueryValue::Integer(parent),
+            PhysicalQueryValue::Integer(page_id),
         ],
     )
     .map_err(|error| sql_or_cancelled(snapshot, error))?;
@@ -704,8 +703,7 @@ fn verify_boundary_parent(
             "a block's parent is not a block of its own page".to_string(),
         ));
     };
-    let preorder =
-        integer(row, 0, "query_block_results.preorder").map_err(ResultReadError::Corrupt)?;
+    let preorder = integer(row, 0, "blocks.preorder").map_err(ResultReadError::Corrupt)?;
     if preorder >= root_preorder {
         return Err(ResultReadError::Corrupt(
             "a requested subtree's parent chain is malformed".to_string(),
@@ -718,9 +716,9 @@ fn verify_boundary_parent(
 /// membership are the caller's checks; this one only refuses a row that is not
 /// a row.
 struct TopologyRow {
-    block_id: [u8; 16],
-    parent: Option<[u8; 16]>,
-    page_id: [u8; 16],
+    block_id: i64,
+    parent: Option<i64>,
+    page_id: i64,
     order_key: String,
     preorder: i64,
     result_id: String,
@@ -738,17 +736,17 @@ fn decode_topology_row(row: &[PhysicalQueryValue]) -> Result<TopologyRow, String
     }
     // The join is LEFT precisely so that a result row whose block is gone is
     // VISIBLE here rather than silently absent from the answer (D-3).
-    let block_id = blob16(row, 0, "blocks.block_id")?;
+    let block_id = integer(row, 0, "blocks.block_id")?;
     let parent = match row.get(1) {
         Some(PhysicalQueryValue::Null) => None,
-        _ => Some(blob16(row, 1, "blocks.parent_block_id")?),
+        _ => Some(integer(row, 1, "blocks.parent_block_id")?),
     };
-    let page_id = blob16(row, 2, "blocks.page_id")?;
+    let page_id = integer(row, 2, "blocks.page_id")?;
     let order_key = text(row, 3, "blocks.order_key")?;
-    let preorder = integer(row, 4, "query_block_results.preorder")?;
-    let result_id = text(row, 5, "query_block_results.result_id")?;
+    let preorder = integer(row, 4, "blocks.preorder")?;
+    let result_id = text(row, 5, "blocks.result_id")?;
     if result_id.is_empty() {
-        return Err("query_block_results.result_id is empty".to_string());
+        return Err("blocks.result_id is empty".to_string());
     }
     Ok(TopologyRow {
         block_id,
@@ -757,9 +755,9 @@ fn decode_topology_row(row: &[PhysicalQueryValue]) -> Result<TopologyRow, String
         order_key,
         preorder,
         result_id,
-        estimated_bytes: count(row, 6, "query_block_results.estimated_bytes")?,
-        tag_count: count(row, 7, "query_block_results.tag_count")?,
-        property_count: count(row, 8, "query_block_results.property_count")?,
+        estimated_bytes: count(row, 6, "blocks.estimated_bytes")?,
+        tag_count: count(row, 7, "blocks.tag_count")?,
+        property_count: count(row, 8, "blocks.property_count")?,
     })
 }
 
@@ -854,8 +852,8 @@ fn admit_subtree_policy(
 
 /// One node the budget admitted, and where its DTO comes from.
 struct EmittedNode {
-    page_id: [u8; 16],
-    block_id: [u8; 16],
+    page_id: i64,
+    block_id: i64,
     payload: NodePayload,
     /// Index in `emitted` of this node's parent, or [`NO_PARENT`].
     parent: usize,
@@ -954,8 +952,8 @@ fn read_output_payload(
 /// One admitted descendant's stored facts, as the shared payload reader wants
 /// them.
 struct WantedPayload {
-    block_id: [u8; 16],
-    page_id: [u8; 16],
+    block_id: i64,
+    page_id: i64,
     result_id: String,
     estimated_bytes: usize,
     tag_count: usize,

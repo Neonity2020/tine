@@ -8,40 +8,43 @@ use super::*;
 const BACKLINK_FILTER_EQUIVALENCE_SQL: &str = "WITH RECURSIVE component(name_key) AS (
     SELECT ?1
     UNION
-    SELECT declaration.normalized_alias
+    SELECT alias_name.key
     FROM component
-    JOIN pages AS owner INDEXED BY pages_name_key_idx
-      ON owner.name_key = component.name_key
+    JOIN names AS owner_name ON owner_name.key = component.name_key
+    JOIN pages AS owner INDEXED BY pages_name_idx
+      ON owner.name_id = owner_name.name_id
     JOIN reference_alias_declarations AS declaration
       INDEXED BY reference_alias_declarations_source_idx
       ON declaration.source_page_id = owner.page_id
+    JOIN names AS alias_name ON alias_name.name_id = declaration.alias_name_id
     UNION
-    SELECT owner.name_key
+    SELECT owner_name.key
     FROM component
-    JOIN reference_postings AS posting
-      INDEXED BY reference_postings_normalized_name_idx
-      ON posting.normalized_name = component.name_key
-     AND posting.target_type = 0
+    JOIN names AS alias_name ON alias_name.key = component.name_key
     JOIN reference_alias_declarations AS declaration
-      INDEXED BY reference_alias_declarations_source_idx
-      ON declaration.source_page_id = posting.source_page_id
-     AND declaration.normalized_alias = component.name_key
+      INDEXED BY reference_alias_declarations_name_idx
+      ON declaration.alias_name_id = alias_name.name_id
     JOIN pages AS owner ON owner.page_id = declaration.source_page_id
+    JOIN names AS owner_name ON owner_name.name_id = owner.name_id
 )
-SELECT component.name_key, page.path, page.name, declaration.normalized_alias
+SELECT component.name_key, page.path,
+       CASE WHEN page.page_id IS NULL THEN NULL ELSE page_name.raw END,
+       alias_name.key
 FROM component
-LEFT JOIN pages AS page INDEXED BY pages_name_key_idx
-  ON page.name_key = component.name_key
+LEFT JOIN names AS page_name ON page_name.key = component.name_key
+LEFT JOIN pages AS page INDEXED BY pages_name_idx
+  ON page.name_id = page_name.name_id
 LEFT JOIN reference_alias_declarations AS declaration
   INDEXED BY reference_alias_declarations_source_idx
   ON declaration.source_page_id = page.page_id
-ORDER BY component.name_key, page.path, declaration.normalized_alias";
+LEFT JOIN names AS alias_name ON alias_name.name_id = declaration.alias_name_id
+ORDER BY component.name_key, page.path, alias_name.key";
 
-const BACKLINK_FILTER_JOURNAL_SQL: &str = "SELECT page.name
-FROM pages AS page INDEXED BY pages_name_key_idx
-JOIN query_page_order AS inventory ON inventory.page_id = page.page_id
-WHERE page.name_key = ?1 AND page.text_kind = 1
-ORDER BY inventory.position
+const BACKLINK_FILTER_JOURNAL_SQL: &str = "SELECT page_name.raw
+FROM names AS page_name
+JOIN pages AS page INDEXED BY pages_name_idx ON page.name_id = page_name.name_id
+WHERE page_name.key = ?1 AND page.text_kind = 1
+ORDER BY page.position
 LIMIT 1";
 
 const BACKLINK_FILTER_SOURCE_BATCH: usize = 256;
@@ -1223,11 +1226,12 @@ impl Graph {
                             "WITH requested(text_kind, name_key) AS (VALUES {values}) \
                              SELECT page.path, revision.revision \
                              FROM requested \
-                             JOIN pages AS page INDEXED BY pages_name_key_idx \
-                               ON page.name_key = requested.name_key \
+                             JOIN names AS page_name ON page_name.key = requested.name_key \
+                             JOIN pages AS page INDEXED BY pages_name_idx \
+                               ON page.name_id = page_name.name_id \
                               AND page.text_kind = requested.text_kind \
                              LEFT JOIN direct_source_revisions AS revision \
-                               ON revision.page_id = page.page_id \
+                               ON revision.path = page.path \
                              ORDER BY page.path"
                         );
                         let mut parameters = Vec::with_capacity(chunk.len() * 2);
@@ -1312,7 +1316,7 @@ impl Graph {
         kind: ReferenceKind,
     ) -> Option<(
         Vec<(PageEntry, Arc<Document>)>,
-        Option<std::collections::HashSet<[u8; 16]>>,
+        Option<std::collections::HashSet<String>>,
     )> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let projection = self

@@ -96,24 +96,21 @@ of a freshly initialized projection, so a table cannot appear or disappear
 without this contract saying so. FTS5 shadow tables are listed with their
 virtual table.
 
-- `pages` — page identity and routing (`page_id`, name, path, `text_kind`, `journal_day`).
+- `names` — dictionary spelling/key pairs shared by named graph facts.
+- `pages` — page identity, routing, session position and page-result metadata.
 - `page_text` — page preamble and search text, keyed by `page_id`.
-- `blocks` — block structure, metadata and the folded query text (`query_visible_folded`).
+- `blocks` — block structure, public result identity, ordering/result metadata and folded query text.
 - `block_text` — a block's source content, query-visible text and search text.
 - `block_planning` — `[#A]`, `SCHEDULED:` and `DEADLINE:` facets, never conditioned on a task marker.
 - `tasks` — the task marker of every block that has one.
 - `properties` — property rows per owner (page or block), by ordinal.
 - `property_atoms` — each property element flattened, de-duplicated by `atom_key`.
 - `tags` — tag rows per owner, keyed by `refs::page_key(tag)`.
-- `block_own_refs` — a block's own normalized reference names.
 - `block_path_refs` — a block's reference closure: own refs, every ancestor's, and the page's name.
-- `reference_postings` — normalized-name postings that back navigation names and referrers.
+- `reference_postings` — dictionary-keyed postings that back navigation names, referrers and own-reference probes.
 - `reference_alias_declarations` — `alias::` declarations per source page.
-- `query_block_results` — public result identity, tree preorder, construction estimate and tag/property counts per block.
-- `query_page_results` — construction estimate and property count per page.
-- `query_page_order` — Direct session page positions for cross-page result order.
 - `query_projection_state` — the image revision a query snapshot validates (`query_revision`).
-- `direct_source_revisions` — the source revision each page's rows were lowered from, plus the query-metadata schema marker.
+- `direct_source_revisions` — the source revision keyed by the public path each page's rows were lowered from.
 - `search_fts`, `search_fts_config`, `search_fts_content`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the token FTS5 table and its shadow tables.
 - `search_substring_fts`, `search_substring_fts_config`, `search_substring_fts_content`, `search_substring_fts_data`, `search_substring_fts_docsize`, `search_substring_fts_idx` — the trigram FTS5 table and its shadow tables.
 - `search_fts_owners` — FTS rowid to owner (page or block) map.
@@ -153,21 +150,22 @@ consumers and are not a substitute: a phrase query has to be able to tell `a  b`
 from `a b`. Both columns are populated at WRITE time by the producer, never by
 parsing or hydrating rows during a query.
 
-**Query rows stay narrow (schema 26).** `query_block_results`
-stores public result identity, tree preorder, construction estimate and tag/
-property counts without duplicating raw payload. `block_own_refs` stores own
-normalized reference names; `query_page_order` stores Direct session positions.
-All are rebuildable facts in the page transaction with explicit FK-off cleanup.
+**Query metadata stays on its physical owner (schema 30).** `blocks` stores
+public result identity, tree preorder, construction estimate and tag/property
+counts without duplicating raw payload. `pages` stores the corresponding page
+estimate, property count and Direct session position. A posting's `own` bit
+answers a block-own-reference probe without a second relation. These are
+rebuildable facts in the page transaction with explicit FK-off cleanup.
 Direct full reconciliation reuses projected facts for unchanged source revisions
-and reconciles only the inventory-order table. Identical order performs no order
+and reconciles only `pages.position`. Identical order performs no order
 writes. Live page deltas capture retained/append/remove positions before queue
 coalescing. The shared runtime-ID helper reproduces fresh-session IDs from page
 path and structural order; live identity mappings and metadata-backed result
 consumption are subsequent packets. Removing
 global parsing from warm startup, streaming cold initialization, and result
 consumption remain subsequent work; DB reuse alone does not claim fast end-to-end
-startup. Direct source-revision table shape includes the schema26 marker so
-older projection readers reject the newer disposable cache and rebuild it.
+startup. Older projection readers reject the schema-30 disposable cache and
+rebuild it.
 
 `pages` holds identity and routing;
 `page_text` owns preamble and search text. `blocks` holds structure, metadata
@@ -180,14 +178,14 @@ Projection-only filtering does not load these payload tables.
 **The result read is a descriptor read plus payload batches, and a damaged one
 fails.** One ready query's public result is constructed from ONE owned read
 snapshot, in two stages. The DESCRIPTOR read wraps the compiler's selected-id
-relation and adds only ordering and result metadata — `query_block_results`,
-the page's display fields, `blocks.order_key`, and `query_page_order.position`
+relation and adds only ordering and result metadata — the selected `blocks`
+row, the page's display fields, `blocks.order_key`, and `pages.position`
 — with no raw text, tag or property payload; every join in it is
-LEFT, so a missing `query_block_results`, `blocks` or `pages` row, a Direct
-result page with no `query_page_order` position, a `query_block_results.page_id`
-that does not own its block's page, or a `pages.text_kind` outside the two
+LEFT, so a missing `blocks` or `pages` row, a Direct
+result page with no `pages.position`, a selected block whose `blocks.page_id`
+does not match its result page, or a `pages.text_kind` outside the two
 written values FAILS the read rather than dropping a selected descriptor. Cross-
-page order is `query_page_order.position`, then `query_block_results.preorder`
+page order is `pages.position`, then `blocks.preorder`
 within a page. The PAYLOAD read then runs for ADMITTED ids only, in batches of
 128 bound ids and exactly three statements per batch — block/text/task/planning
 facets, then `tags` by owner and ordinal, then `properties` by owner and ordinal
@@ -198,11 +196,11 @@ actually built; any violation abandons the WHOLE result with no partially
 substituted rows. A read that fails this way is a rebuild request, never a
 shorter answer (D-3).
 
-**A tag key is a page key.** `tags.tag_key` is `refs::page_key(tag)` — the same
-key page identity uses — because `#x` is OG's `[[x]]`; `tags_lookup_idx` leads
-with it. `pages.journal_day` is the journal page's `yyyymmdd`, derived from the
-page's own file stem under the graph's `:file/name-format` and journal formats,
-and NULL for every other page.
+**A tag key is a page key.** `tags.name_id` points to the `names.key` produced by
+`refs::page_key(tag)` — the same key page identity uses — because `#x` is OG's
+`[[x]]`; `tags_lookup_idx` leads with `name_id`. `pages.journal_day` is the
+journal page's `yyyymmdd`, derived from the page's own file stem under the
+graph's `:file/name-format` and journal formats, and NULL for every other page.
 
 **The projection has a statement seam; nothing else does.**
 `PhysicalProjectionQueryReader` runs caller-supplied SQL against the graph
@@ -249,7 +247,7 @@ to be reset or replaced (in-scope: a torn projection rebuilt under a live
 reader). Closing the projection refuses every later admission. Cancellation is
 a typed dispatch answer, not a failed read: it schedules no recovery or retry.
 
-**Result identity follows who lowered the row.** `query_block_results.result_id`
+**Result identity follows who lowered the row.** `blocks.result_id`
 is the runtime id the lowering process assigned. The projection tracks
 `session_pages` — exactly the pages whose stored ids are LIVE in this process:
 a full snapshot's replacements and each live save's page add to the set; a
@@ -271,7 +269,7 @@ page in isolation and retaining none. Live saves and deletions enqueue their
 delta whether or not a parsed cache exists, but readiness is published only
 after this session has validated the complete inventory once (a full
 snapshot, a clean warm, or a closed stream) — a delta alone never publishes an
-inventory this process has not compared to disk. The `query_page_order` table
+inventory this process has not compared to disk. `pages.position`
 is reconciled by the worker from the queue's own page order whenever a stream
 closes or a delta arrives without a position. In-scope scenario: an external
 edit between two sessions, followed by a save of a different page before the
@@ -546,8 +544,8 @@ the anonymized corpus, with controls recorded in `RECEIPT-db1.md` (under 1% for 
 `(page_id, name, text_kind, journal_day, path)`. A row that does not have its
 required shape is a failed read, never an empty answer. The lowered selection
 statement itself has no ordering metadata. Its descriptor wrapper does: Direct
-block answers carry `query_page_order.position` and
-`query_block_results.preorder` and end with `ORDER BY` on those columns; the
+block answers carry `pages.position` and
+`blocks.preorder` and end with `ORDER BY` on those columns; the
 page wrapper carries the same page position. Missing Direct order metadata
 fails the read, because silently moving a page would change which rows survive
 a bounded budget.
@@ -558,7 +556,7 @@ the complete saved sort and `COUNT(*) OVER()` before its row limit. Unicode
 text sorting reuses Rust lowercase through operation-owned rank callbacks;
 numeric-looking property values remain lexical. Explicit sort ties use physical
 path, while unsorted reads retain Direct inventory order.
-`query_page_results` supplies raw construction estimates and property counts;
+`pages` supplies raw construction estimates and property counts;
 only admitted owners receive property payload reads, in batches of 128, with
 ownership, ordinal, count and estimate validation. Both row and byte limits
 apply. `total` counts admitted pages before sampling; optional `matched_total`

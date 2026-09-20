@@ -991,9 +991,13 @@ fn equal_display_names_do_not_merge_two_physical_subtrees() {
     let path = copy_projection(&corpus, "equal-names");
     {
         let writer = rusqlite::Connection::open(&path).expect("the copy opens writable");
+        writer
+            .execute("INSERT INTO names(key, raw) VALUES ('same', 'Same')", [])
+            .expect("the replacement display name is interned");
         let changed = writer
             .execute(
-                "UPDATE pages SET name = 'Same' WHERE name IN ('Alpha', 'Nested')",
+                "UPDATE pages SET name_id = (SELECT name_id FROM names WHERE key = 'same') \
+                 WHERE name_id IN (SELECT name_id FROM names WHERE raw IN ('Alpha', 'Nested'))",
                 [],
             )
             .expect("the rename applies");
@@ -1065,8 +1069,8 @@ fn located_selection_keeps_two_identically_named_roots_apart() {
         ..BlockDto::default()
     };
     let locator = |page: u8, id: u8| ResultLocator {
-        page_id: [page; 16],
-        block_id: [id; 16],
+        page_id: i64::from(page),
+        block_id: i64::from(id),
     };
     let answer = ExportSelectionAnswer {
         groups: vec![crate::query::ResultViewGroup {
@@ -1197,7 +1201,7 @@ fn export_damaged(
 
 /// The block id of one fixture block, named by a substring of its own source
 /// line. Only ever called with this file's own fixture text.
-fn block_id_of(corpus: &Corpus, needle: &str) -> Vec<u8> {
+fn block_id_of(corpus: &Corpus, needle: &str) -> i64 {
     let reader = rusqlite::Connection::open_with_flags(
         corpus.projection_path(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1209,8 +1213,8 @@ fn block_id_of(corpus: &Corpus, needle: &str) -> Vec<u8> {
              WHERE instr(t.content, ?1) > 0",
         )
         .expect("the fixture lookup prepares");
-    let ids: Vec<Vec<u8>> = statement
-        .query_map(rusqlite::params![needle], |row| row.get::<_, Vec<u8>>(0))
+    let ids: Vec<i64> = statement
+        .query_map(rusqlite::params![needle], |row| row.get::<_, i64>(0))
         .expect("the fixture lookup runs")
         .collect::<Result<Vec<_>, _>>()
         .expect("the fixture lookup runs");
@@ -1263,7 +1267,11 @@ fn a_damaged_projection_fails_the_export_instead_of_shortening_it() {
         ),
         (
             "wrong-ownership",
-            "UPDATE blocks SET page_id = (SELECT page_id FROM pages WHERE name = 'Beta') \
+            "UPDATE blocks SET \
+             page_id = (SELECT p.page_id FROM pages p JOIN names n ON n.name_id = p.name_id WHERE n.raw = 'Beta'), \
+             preorder = (SELECT COALESCE(MAX(b2.preorder), -1) + 1 FROM blocks b2 \
+                         JOIN pages p2 ON p2.page_id = b2.page_id \
+                         JOIN names n2 ON n2.name_id = p2.name_id WHERE n2.raw = 'Beta') \
              WHERE block_id = ?1",
             vec![&child],
         ),
@@ -1274,7 +1282,7 @@ fn a_damaged_projection_fails_the_export_instead_of_shortening_it() {
         ),
         (
             "missing-result-row",
-            "DELETE FROM query_block_results WHERE block_id = ?1",
+            "DELETE FROM block_text WHERE block_id = ?1",
             vec![&child],
         ),
     ];
@@ -1316,7 +1324,7 @@ fn a_missing_final_descendant_result_row_fails_instead_of_shortening_export() {
     let damaged = export_damaged(
         &corpus,
         "missing-tail",
-        "DELETE FROM query_block_results WHERE block_id = ?1",
+        "DELETE FROM block_text WHERE block_id = ?1",
         &[&child],
     );
     assert!(
@@ -1345,7 +1353,7 @@ fn multiple_missing_tail_result_rows_fail_instead_of_shortening_export() {
     let damaged = export_damaged(
         &corpus,
         "multiple-missing-tail",
-        "DELETE FROM query_block_results WHERE block_id IN (?1, ?2)",
+        "DELETE FROM block_text WHERE block_id IN (?1, ?2)",
         &[&first, &second],
     );
     assert!(
@@ -1374,7 +1382,7 @@ fn an_entire_missing_tail_branch_fails_instead_of_shortening_export() {
     let damaged = export_damaged(
         &corpus,
         "missing-tail-branch",
-        "DELETE FROM query_block_results WHERE block_id IN (?1, ?2)",
+        "DELETE FROM block_text WHERE block_id IN (?1, ?2)",
         &[&branch, &leaf],
     );
     assert!(
@@ -1402,7 +1410,7 @@ fn a_missing_tail_outside_the_selected_subtree_does_not_poison_export() {
     let read = export_damaged(
         &corpus,
         "unrelated-missing-tail",
-        "DELETE FROM query_block_results WHERE block_id = ?1",
+        "DELETE FROM block_text WHERE block_id = ?1",
         &[&unrelated],
     )
     .expect("damage outside the selected subtree is irrelevant to this export");

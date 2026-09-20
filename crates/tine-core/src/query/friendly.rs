@@ -16,9 +16,9 @@ use crate::direct_projection::page_kind_from_sql;
 use crate::query::ir::FriendlyPageMatchScope;
 use crate::query::rank::QueryRankPrograms;
 use crate::query::results::{
-    blob16, count, hydrate_page_rows, integer, read_admitted_payload, resolve_identity,
-    sql_or_cancelled, text, PageResultDescriptor, PayloadChannel, PayloadFacts, ResultIdentity,
-    ResultReadError, PAYLOAD_BATCH,
+    count, hydrate_page_rows, integer, read_admitted_payload, resolve_identity, sql_or_cancelled,
+    text, PageResultDescriptor, PayloadChannel, PayloadFacts, ResultIdentity, ResultReadError,
+    PAYLOAD_BATCH,
 };
 use crate::query::sql::{block_sort_expression, page_sort_expression, SortBinder};
 use crate::query_plan::{
@@ -448,7 +448,7 @@ struct PageDescriptor {
     /// different branches, so the row says which it is rather than leaving the
     /// reader to infer it from a rank blob.
     from_content: bool,
-    page_id: Option<[u8; 16]>,
+    page_id: Option<i64>,
     name: String,
     kind: PageKind,
     journal_day: Option<i64>,
@@ -523,15 +523,17 @@ fn read_pages(
         format!(
             "page_text_candidates(page_id, name, text_kind, journal_day, path, \
                   matched_text, source_kind, source_ordinal) AS (\
-             SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path, \
-                    p.name, 0, -1 FROM pages p \
+             SELECT p.page_id, pn.raw, p.text_kind, p.journal_day, p.path, \
+                    pn.raw, 0, -1 FROM pages p JOIN names pn ON pn.name_id = p.name_id \
              UNION ALL \
-             SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path, \
-                    a.normalized_alias, 1, MIN(a.ordinal) \
+             SELECT p.page_id, pn.raw, p.text_kind, p.journal_day, p.path, \
+                    an.key, 1, MIN(a.ordinal) \
              FROM reference_alias_declarations a \
              JOIN pages p ON p.page_id = a.source_page_id \
+             JOIN names pn ON pn.name_id = p.name_id \
+             JOIN names an ON an.name_id = a.alias_name_id \
              WHERE a.source_entity_type = 0 AND a.source_entity_id = a.source_page_id \
-             GROUP BY p.page_id, a.normalized_alias\
+             GROUP BY p.page_id, a.alias_name_id\
          ), ranked AS MATERIALIZED (\
              SELECT c.*, tine_query_rank(?1, c.matched_text) AS owner_key \
              FROM page_text_candidates c\
@@ -547,18 +549,19 @@ fn read_pages(
                     tine_query_rank(?2, {framed_physical}) AS global_key, w.path AS tie_key \
              FROM choices w WHERE w.owner_choice = 1\
          ), real_identities(name_key) AS (\
-             SELECT name_key FROM pages \
-             UNION SELECT normalized_alias FROM reference_alias_declarations\
+             SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
+             UNION SELECT n.key FROM reference_alias_declarations a \
+             JOIN names n ON n.name_id = a.alias_name_id\
          ), reference_choices AS (\
-             SELECT r.raw_name, r.normalized_name, ROW_NUMBER() OVER (\
-                 PARTITION BY r.normalized_name \
-                 ORDER BY r.raw_name, r.normalized_name, r.source_page_id\
+             SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
+                 PARTITION BY n.key \
+                 ORDER BY n.raw, n.key, r.source_page_id\
              ) AS name_choice \
              FROM reference_postings r \
-             JOIN pages p ON p.page_id = r.source_page_id \
+             JOIN names n ON n.name_id = r.target_name_id \
              WHERE r.target_type = 0 AND r.reference_kind <= 4 \
                AND NOT EXISTS (SELECT 1 FROM real_identities i \
-                               WHERE i.name_key = r.normalized_name)\
+                               WHERE i.name_key = n.key)\
          ), virtual AS MATERIALIZED (\
              SELECT 0 AS match_source, 1 AS candidate_kind, NULL AS page_id, v.raw_name AS name, \
                     0 AS text_kind, NULL AS journal_day, '' AS path, \
@@ -614,10 +617,11 @@ fn read_pages(
                  ) AS content_choice \
                  FROM content_ranked k WHERE k.content_key IS NOT NULL{dedupe}\
              ), content AS MATERIALIZED (\
-                 SELECT 1 AS match_source, 0 AS candidate_kind, p.page_id, p.name, p.text_kind, \
+                 SELECT 1 AS match_source, 0 AS candidate_kind, p.page_id, pn.raw AS name, p.text_kind, \
                         p.journal_day, p.path, k.matched_text, 0 AS source_kind, \
                         k.content_key AS global_key, p.path AS tie_key \
                  FROM content_choices k JOIN pages p ON p.page_id = k.page_id \
+                 JOIN names pn ON pn.name_id = p.name_id \
                  WHERE k.content_choice = 1\
              )"
         )
@@ -658,8 +662,8 @@ fn read_pages(
     };
     let (payload_columns, payload_join) = if hydrate {
         (
-            ", q.estimated_bytes, q.property_count",
-            " LEFT JOIN query_page_results q ON q.page_id = c.page_id",
+            ", stored.estimated_bytes, stored.property_count",
+            " LEFT JOIN pages stored ON stored.page_id = c.page_id",
         )
     } else {
         ("", "")
@@ -686,7 +690,7 @@ fn read_pages(
     // Hydrate only ADMITTED stored pages, through the shared page hydrator, and
     // only once the descriptors are final. A virtual suggestion names no stored
     // page, so it is not in this batch and gains no fabricated properties.
-    let mut hydrated: HashMap<[u8; 16], crate::query::ir::PageRow> = HashMap::new();
+    let mut hydrated: HashMap<i64, crate::query::ir::PageRow> = HashMap::new();
     if hydrate {
         let admitted = descriptors
             .iter()
@@ -820,7 +824,7 @@ fn decode_page_descriptor(
     };
     let candidate_kind = integer(row, 1, "Friendly page candidate kind")?;
     let page_id = match (candidate_kind, row.get(2)) {
-        (0, _) => Some(blob16(row, 2, "Friendly physical page_id")?),
+        (0, _) => Some(integer(row, 2, "Friendly physical page_id")?),
         (1, Some(PhysicalQueryValue::Null)) => None,
         (1, _) => return Err("Friendly virtual page has a physical page_id".into()),
         _ => return Err("Friendly page candidate kind is not 0 or 1".into()),
@@ -857,8 +861,8 @@ fn decode_page_descriptor(
         match (row.get(10), row.get(11)) {
             (Some(PhysicalQueryValue::Null), _) | (_, Some(PhysicalQueryValue::Null)) => None,
             _ => Some((
-                count(row, 10, "query_page_results.estimated_bytes")?,
-                count(row, 11, "query_page_results.property_count")?,
+                count(row, 10, "pages.estimated_bytes")?,
+                count(row, 11, "pages.property_count")?,
             )),
         }
     } else {
@@ -879,9 +883,9 @@ fn decode_page_descriptor(
 }
 
 struct BlockDescriptor {
-    block_id: [u8; 16],
-    page_id: [u8; 16],
-    parent_id: Option<[u8; 16]>,
+    block_id: i64,
+    page_id: i64,
+    parent_id: Option<i64>,
     page: String,
     kind: PageKind,
     path: String,
@@ -1023,7 +1027,7 @@ fn read_blocks(
             let kind = params.len();
             params.push(PhysicalQueryValue::Text(crate::refs::page_key(&scope.name)));
             conditions.push(format!(
-                "p.text_kind = ?{kind} AND p.name_key = ?{}",
+                "p.text_kind = ?{kind} AND p_name.key = ?{}",
                 params.len()
             ));
         }
@@ -1076,16 +1080,16 @@ fn read_blocks(
     let sql = format!(
         "WITH ranked AS MATERIALIZED (\
              SELECT b.block_id, b.page_id, b.parent_block_id, b.order_key, \
-                    bt.query_visible, p.name, p.text_kind, p.path, \
-                    q.page_id AS result_page_id, q.preorder, q.result_id, q.estimated_bytes, q.tag_count, \
-                    q.property_count, \
+                    bt.query_visible, p_name.raw AS name, p.text_kind, p.path, \
+                    b.page_id AS result_page_id, b.preorder, b.result_id, b.estimated_bytes, b.tag_count, \
+                    b.property_count, \
                     CASE WHEN bt.block_id IS NULL THEN zeroblob(1) \
                          ELSE tine_query_rank(?1, {framed_block_text}) END AS rank_key, \
                     CASE WHEN bt.block_id IS NULL THEN 1 ELSE 0 END AS missing_text \
              FROM {block_source} \
              LEFT JOIN block_text bt ON bt.block_id = b.block_id \
              LEFT JOIN pages p ON p.page_id = b.page_id \
-             LEFT JOIN query_block_results q ON q.block_id = b.block_id{scope_sql}\
+             LEFT JOIN names p_name ON p_name.name_id = p.name_id{scope_sql}\
          ) \
          SELECT r.block_id, r.page_id, r.parent_block_id, r.order_key, r.query_visible, \
                 r.name, r.text_kind, r.path, r.result_page_id, r.preorder, r.result_id, \
@@ -1193,9 +1197,9 @@ fn decode_block_descriptor(
             row.len()
         ));
     }
-    let block_id = blob16(row, 0, "blocks.block_id")?;
-    let page_id = blob16(row, 1, "blocks.page_id")?;
-    let parent_id = optional_blob16(row, 2, "blocks.parent_block_id")?;
+    let block_id = integer(row, 0, "blocks.block_id")?;
+    let page_id = integer(row, 1, "blocks.page_id")?;
+    let parent_id = optional_integer(row, 2, "blocks.parent_block_id")?;
     let order_key = text(row, 3, "blocks.order_key")?;
     let visible = text(row, 4, "block_text.query_visible")?;
     let page = text(row, 5, "pages.name")?;
@@ -1203,19 +1207,19 @@ fn decode_block_descriptor(
     let kind = page_kind_from_sql(kind_value)
         .ok_or_else(|| format!("pages.text_kind {kind_value} is not a page kind"))?;
     let path = text(row, 7, "pages.path")?;
-    let result_page = blob16(row, 8, "query_block_results.page_id")?;
+    let result_page = integer(row, 8, "blocks.page_id")?;
     if result_page != page_id {
-        return Err("query_block_results.page_id does not own its block's page".into());
+        return Err("blocks.page_id does not own its block's page".into());
     }
-    let preorder = integer(row, 9, "query_block_results.preorder")?;
+    let preorder = integer(row, 9, "blocks.preorder")?;
     if preorder < 0 {
-        return Err("query_block_results.preorder is negative".into());
+        return Err("blocks.preorder is negative".into());
     }
-    let stored_id = text(row, 10, "query_block_results.result_id")?;
+    let stored_id = text(row, 10, "blocks.result_id")?;
     if stored_id.is_empty() {
-        return Err("query_block_results.result_id is empty".into());
+        return Err("blocks.result_id is empty".into());
     }
-    let stored_estimate = count(row, 11, "query_block_results.estimated_bytes")?;
+    let stored_estimate = count(row, 11, "blocks.estimated_bytes")?;
     let (result_id, estimated_bytes) = resolve_identity(
         identity,
         page_id,
@@ -1238,28 +1242,28 @@ fn decode_block_descriptor(
         visible,
         result_id,
         estimated_bytes,
-        tag_count: count(row, 12, "query_block_results.tag_count")?,
-        property_count: count(row, 13, "query_block_results.property_count")?,
+        tag_count: count(row, 12, "blocks.tag_count")?,
+        property_count: count(row, 13, "blocks.property_count")?,
         rank_key,
     })
 }
 
-fn optional_blob16(
+fn optional_integer(
     row: &[PhysicalQueryValue],
     at: usize,
     what: &str,
-) -> Result<Option<[u8; 16]>, String> {
+) -> Result<Option<i64>, String> {
     match row.get(at) {
         Some(PhysicalQueryValue::Null) => Ok(None),
-        Some(PhysicalQueryValue::Blob(_)) => blob16(row, at, what).map(Some),
-        _ => Err(format!("{what} is not a blob or null")),
+        Some(PhysicalQueryValue::Integer(value)) => Ok(Some(*value)),
+        _ => Err(format!("{what} is not an integer or null")),
     }
 }
 
 #[derive(Clone)]
 struct Ancestor {
-    page_id: [u8; 16],
-    parent_id: Option<[u8; 16]>,
+    page_id: i64,
+    parent_id: Option<i64>,
     visible: String,
 }
 
@@ -1285,7 +1289,7 @@ fn read_breadcrumbs(
             check_lane(snapshot, lane)?;
             let params = batch
                 .iter()
-                .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
+                .map(|id| PhysicalQueryValue::Integer(*id))
                 .collect::<Vec<_>>();
             let sql = format!(
                 "SELECT b.block_id, b.page_id, b.parent_block_id, bt.query_visible \
@@ -1307,17 +1311,17 @@ fn read_breadcrumbs(
                         row.len()
                     )));
                 }
-                let id =
-                    blob16(row, 0, "ancestor blocks.block_id").map_err(ResultReadError::Corrupt)?;
+                let id = integer(row, 0, "ancestor blocks.block_id")
+                    .map_err(ResultReadError::Corrupt)?;
                 if !requested.contains(&id) {
                     return Err(ResultReadError::Corrupt(
                         "an ancestor row belongs to no admitted chain".into(),
                     ));
                 }
                 let ancestor = Ancestor {
-                    page_id: blob16(row, 1, "ancestor blocks.page_id")
+                    page_id: integer(row, 1, "ancestor blocks.page_id")
                         .map_err(ResultReadError::Corrupt)?,
-                    parent_id: optional_blob16(row, 2, "ancestor blocks.parent_block_id")
+                    parent_id: optional_integer(row, 2, "ancestor blocks.parent_block_id")
                         .map_err(ResultReadError::Corrupt)?,
                     visible: text(row, 3, "ancestor block_text.query_visible")
                         .map_err(ResultReadError::Corrupt)?,

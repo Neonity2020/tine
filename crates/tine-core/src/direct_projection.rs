@@ -9,14 +9,14 @@ use crate::query_jobs::{
 };
 use crate::vocab::{Format, PageEntry, PageKind, ReferenceKind};
 use fs2::FileExt as _;
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
-    PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
-    PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
+    PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityCoordinate, PhysicalEntityId,
+    PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase,
+    PhysicalGraphProjectionSourceRevision, PhysicalName, PhysicalPage,
     PhysicalProjectionQuerySnapshot, PhysicalProperty, PhysicalQueryValue,
     PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
@@ -98,9 +98,9 @@ enum PageDelta {
         parse_config: Arc<ParseConfig>,
         /// `None` while a warm stream is open (R6): the rows carry no order
         /// position until the stream's closing order turn reconciles the
-        /// whole `query_page_order` table, because a position written mid-stream
+        /// whole `pages.position` roster, because a position written mid-stream
         /// could collide with a retained page's previous-session position.
-        query_page_order: Option<u64>,
+        page_position: Option<u64>,
         identity: DeltaIdentity,
     },
     Delete {
@@ -259,9 +259,9 @@ struct PendingProjection {
     warm_attempt: u64,
     /// R6: a warm stream is open at this generation. Readiness never publishes
     /// while it is `Some`, and deltas recorded meanwhile carry no order
-    /// position (see `PageDelta::Replace::query_page_order`).
+    /// position (see `PageDelta::Replace::page_position`).
     warm_stream: Option<u64>,
-    /// R6: the stream's closing turn — reconcile `query_page_order` over the
+    /// R6: the stream's closing turn — reconcile `pages.position` over the
     /// queue's own inventory and then publish readiness.
     order: Option<u64>,
     /// R6: a full snapshot was queued after the warm; the stream must stop
@@ -282,9 +282,7 @@ impl PendingProjection {
     fn record_delta(&mut self, generation: u64, mut delta: PageDelta) {
         let key = delta.entry().rel_path.clone();
         match &mut delta {
-            PageDelta::Replace {
-                query_page_order, ..
-            } => {
+            PageDelta::Replace { page_position, .. } => {
                 let position = if let Some(position) = self.page_order.get(&key) {
                     *position
                 } else {
@@ -293,7 +291,7 @@ impl PendingProjection {
                     self.page_order.insert(key.clone(), position);
                     position
                 };
-                *query_page_order = self.warm_stream.is_none().then_some(position);
+                *page_position = self.warm_stream.is_none().then_some(position);
             }
             PageDelta::Delete { .. } => {
                 self.page_order.remove(&key);
@@ -324,11 +322,11 @@ impl PendingProjection {
     /// The queue's own page inventory in position order: the R6 order turn's
     /// authority. After a warm seed the map tracks every applied replacement
     /// and deletion, so it names exactly the pages the projection holds.
-    fn ordered_inventory(&self) -> Vec<[u8; 16]> {
+    fn ordered_inventory(&self) -> Vec<String> {
         let mut ordered = self
             .page_order
             .iter()
-            .map(|(rel_path, position)| (*position, page_id(rel_path)))
+            .map(|(rel_path, position)| (*position, rel_path.clone()))
             .collect::<Vec<_>>();
         ordered.sort_unstable_by_key(|(position, _)| *position);
         ordered.into_iter().map(|(_, id)| id).collect()
@@ -360,7 +358,7 @@ struct ProjectionShared {
     query_jobs: Arc<QueryJobOwner>,
     /// R3 identity policy (WARM-IDENTITY-ORDER-CONTRACT.md §"Chosen strategy"
     /// 2–3): the pages whose rows THIS process lowered. Their stored
-    /// `query_block_results.result_id` is the live runtime id the parsed
+    /// `blocks.result_id` is the live runtime id the parsed
     /// document carried when the row was written. Every other page's rows
     /// survived from an earlier session, and a fresh parse of an unchanged
     /// page assigns STRUCTURAL runtime ids, so their public id is derived from
@@ -368,7 +366,7 @@ struct ProjectionShared {
     /// Copy-on-write: the worker swaps a new `Arc` after each successful
     /// apply, and a job clones the `Arc` at snapshot acquisition — never a
     /// live lookup during output.
-    session_pages: Mutex<Arc<HashSet<[u8; 16]>>>,
+    session_pages: Mutex<Arc<HashSet<String>>>,
     committed_registry: SharedCommittedRegistry,
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
@@ -507,8 +505,8 @@ impl ProjectionShared {
             return;
         }
         let mut current = self.session_pages.lock().unwrap();
-        let mut next: HashSet<[u8; 16]> = (**current).clone();
-        next.extend(applied.lowered.iter().copied());
+        let mut next: HashSet<String> = (**current).clone();
+        next.extend(applied.lowered.iter().cloned());
         for page in applied
             .deleted
             .iter()
@@ -658,7 +656,7 @@ pub(crate) struct DirectQueryJob {
     _slot: crate::query_jobs::OwnedJobSlot,
     /// The pages whose rows this process lowered (see
     /// `ProjectionShared::session_pages`), as of the snapshot.
-    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    pub(crate) session_pages: Arc<HashSet<String>>,
     pub(crate) config: Arc<ParseConfig>,
     /// Actual acquired SQL image, distinct from the admission target.
     #[cfg(test)]
@@ -682,7 +680,7 @@ impl DirectQueryJob {
             .iter()
             .map(|(entry, revision)| {
                 (
-                    page_id(&entry.rel_path),
+                    entry.rel_path.clone(),
                     projection_source_revision(revision, config_digest),
                 )
             })
@@ -698,23 +696,20 @@ impl DirectQueryJob {
         let mut malformed = false;
         let read = crate::query::projection_sql::visit(
             &mut self.snapshot,
-            "SELECT p.page_id, s.revision FROM pages p \
-             LEFT JOIN direct_source_revisions s ON s.page_id = p.page_id \
-             ORDER BY p.page_id",
+            "SELECT p.path, s.revision FROM pages p \
+             LEFT JOIN direct_source_revisions s ON s.path = p.path \
+             ORDER BY p.path",
             &[],
             |row| {
-                let [PhysicalQueryValue::Blob(id), PhysicalQueryValue::Text(revision)] = row else {
+                let [PhysicalQueryValue::Text(path), PhysicalQueryValue::Text(revision)] = row
+                else {
                     malformed = true;
                     return Ok(std::ops::ControlFlow::Break(()));
                 };
-                if id.len() != 16 {
-                    malformed = true;
-                    return Ok(std::ops::ControlFlow::Break(()));
-                }
                 if !expected
                     .get(at)
-                    .is_some_and(|(wanted_id, wanted_revision)| {
-                        wanted_id.as_slice() == id.as_slice() && wanted_revision == revision
+                    .is_some_and(|(wanted_path, wanted_revision)| {
+                        wanted_path == path && wanted_revision == revision
                     })
                 {
                     matches = false;
@@ -840,7 +835,7 @@ pub(crate) fn reference_narrowing_supported(names_norm: &[String], kind: Referen
 /// existed, so a partial index can never silently drop a row.
 pub(crate) struct ReferenceCandidateIndex {
     pub paths: std::collections::BTreeSet<PathBuf>,
-    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
+    pub blocks: Option<std::collections::HashSet<String>>,
 }
 
 /// Direct Files' disposable parser-fact projection.
@@ -1343,7 +1338,7 @@ impl DirectProjection {
                     document,
                     revision,
                     parse_config: Arc::clone(&parse_config),
-                    query_page_order: None,
+                    page_position: None,
                     identity,
                 },
                 WarmStreamItem::Delete { entry } => PageDelta::Delete { entry },
@@ -1356,7 +1351,7 @@ impl DirectProjection {
         true
     }
 
-    /// Close the warm stream (R6): the worker reconciles `query_page_order`
+    /// Close the warm stream (R6): the worker reconciles stored page positions
     /// over the queue's inventory and then publishes readiness. `false` when
     /// the stream is no longer this thread's; a superseding snapshot owns
     /// readiness in that case and nothing is owed. Readiness is not a full
@@ -1421,10 +1416,10 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let mut rows = Vec::new();
         drain_after(
-            |cursor: Option<([u8; 16], String)>, batch| {
+            |cursor: Option<(i64, String)>, batch| {
                 read.navigation_pages_after_with_header_validation(
                     cursor.as_ref().map(|(_, path)| path.as_str()),
-                    cursor.as_ref().map(|(id, _)| id),
+                    cursor.as_ref().map(|(id, _)| *id),
                     batch,
                     |_, kind| match kind {
                         0 | 1 => Ok(()),
@@ -1434,7 +1429,7 @@ impl DirectProjection {
                     },
                 )
             },
-            |row| (row.page_id, row.path.clone()),
+            |row| (row.cursor, row.path.clone()),
             |row| {
                 rows.push((row.name, row.path, row.text_kind));
                 Ok(())
@@ -1514,7 +1509,7 @@ impl DirectProjection {
                 document,
                 revision,
                 parse_config,
-                query_page_order: None, // Filled under the queue lock, before coalescing.
+                page_position: None, // Filled under the queue lock, before coalescing.
                 identity: DeltaIdentity::Live,
             },
         );
@@ -1559,7 +1554,7 @@ impl DirectProjection {
                     document,
                     revision,
                     parse_config: Arc::clone(&parse_config),
-                    query_page_order: None, // Filled under this lock, before coalescing.
+                    page_position: None, // Filled under this lock, before coalescing.
                     identity: DeltaIdentity::Live,
                 },
                 PageSetChange::Delete { entry } => PageDelta::Delete { entry },
@@ -1649,7 +1644,13 @@ impl DirectProjection {
         };
         drain_after(
             |cursor, batch| read.property_facet_rows_after(!autocomplete, cursor, batch),
-            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
+                let owner = match row.owner {
+                    PhysicalEntityId::Page(_) => PhysicalEntityCoordinate::Page(row.owner_cursor),
+                    PhysicalEntityId::Block(_) => PhysicalEntityCoordinate::Block(row.owner_cursor),
+                };
+                (owner, row.name_cursor, row.ordinal)
+            },
             |row| {
                 accumulator.offer(&row.normalized_name, &row.value);
                 Ok(())
@@ -1713,11 +1714,12 @@ impl DirectProjection {
         // snapshot-consistency defect and fails the build (§6.2), never a
         // silent fallback to Markdown.
         let mut pages: HashMap<String, PageMeta> = HashMap::new();
+        let mut page_ids = HashMap::new();
         drain_after(
-            |cursor: Option<([u8; 16], String)>, batch| {
+            |cursor: Option<(i64, String)>, batch| {
                 read.navigation_pages_after_with_header_validation(
                     cursor.as_ref().map(|(_, path)| path.as_str()),
-                    cursor.as_ref().map(|(id, _)| id),
+                    cursor.as_ref().map(|(id, _)| *id),
                     batch,
                     |_, kind| match kind {
                         0 | 1 => Ok(()),
@@ -1727,10 +1729,11 @@ impl DirectProjection {
                     },
                 )
             },
-            |row| (row.page_id, row.path.clone()),
+            |row| (row.cursor, row.path.clone()),
             |row| {
+                page_ids.insert(row.path.clone(), row.cursor);
                 pages.insert(
-                    crate::query::registry_sql::page_key(row.page_id),
+                    crate::query::registry_sql::page_key(row.cursor),
                     PageMeta {
                         // §6.2 E4: `Format::from_path`, case-insensitive —
                         // never `reference_source_is_org`.
@@ -1753,22 +1756,31 @@ impl DirectProjection {
         let mut rows: Vec<OwnerRow> = Vec::new();
         drain_after(
             |cursor, batch| read.property_facet_rows_after(false, cursor, batch),
-            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
+                let owner = match row.owner {
+                    PhysicalEntityId::Page(_) => PhysicalEntityCoordinate::Page(row.owner_cursor),
+                    PhysicalEntityId::Block(_) => PhysicalEntityCoordinate::Block(row.owner_cursor),
+                };
+                (owner, row.name_cursor, row.ordinal)
+            },
             |row| {
                 let (owner_type, owner_id) = match row.owner {
-                    PhysicalEntityId::Page(id) => (
-                        OwnerType::Page,
-                        format!("p:{}", crate::query::registry_sql::hex16(id)),
-                    ),
-                    PhysicalEntityId::Block(id) => (
-                        OwnerType::Block,
-                        format!("b:{}", crate::query::registry_sql::hex16(id)),
-                    ),
+                    PhysicalEntityId::Page(_) => {
+                        (OwnerType::Page, format!("p:{}", row.owner_cursor))
+                    }
+                    PhysicalEntityId::Block(_) => {
+                        (OwnerType::Block, format!("b:{}", row.owner_cursor))
+                    }
                 };
+                let page_id = page_ids.get(&row.page_path).ok_or_else(|| {
+                    tine_storage::sqlite::MaterializationError::Corrupt(
+                        "registry property names an absent page path".into(),
+                    )
+                })?;
                 rows.push(OwnerRow {
                     owner_type,
                     owner_id,
-                    page_id: crate::query::registry_sql::page_key(row.page_id),
+                    page_id: crate::query::registry_sql::page_key(*page_id),
                     source_name: row.source_name,
                     normalized_name: row.normalized_name,
                     ordinal: row.ordinal,
@@ -1907,7 +1919,7 @@ impl DirectProjection {
     }
 
     #[cfg(test)]
-    pub(crate) fn session_pages_test(&self) -> Arc<HashSet<[u8; 16]>> {
+    pub(crate) fn session_pages_test(&self) -> Arc<HashSet<String>> {
         Arc::clone(&self.shared.session_pages.lock().unwrap())
     }
 
@@ -1976,21 +1988,8 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let mut aliases = Vec::new();
         drain_after(
-            |after: Option<(String, String, [u8; 16])>, batch| {
-                read.navigation_aliases_after(
-                    after
-                        .as_ref()
-                        .map(|(path, alias, id)| (path.as_str(), alias.as_str(), id)),
-                    batch,
-                )
-            },
-            |row| {
-                (
-                    row.owner_path.clone(),
-                    row.normalized_alias.clone(),
-                    row.source_page_id,
-                )
-            },
+            |after: Option<(i64, i64)>, batch| read.navigation_aliases_after(after, batch),
+            |row| (row.cursor, row.name_cursor),
             |row| {
                 aliases.push((row.normalized_alias, row.owner_name, row.owner_path));
                 Ok(())
@@ -2015,15 +2014,15 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let mut names = crate::query::RealPageNames::new();
         drain_after(
-            |after: Option<(String, [u8; 16])>, batch| {
+            |after: Option<(String, i64)>, batch| {
                 read.navigation_pages_after_with_header_validation(
                     after.as_ref().map(|(path, _)| path.as_str()),
-                    after.as_ref().map(|(_, id)| id),
+                    after.as_ref().map(|(_, id)| *id),
                     batch,
                     |_, _| Ok(()),
                 )
             },
-            |row| (row.path.clone(), row.page_id),
+            |row| (row.path.clone(), row.cursor),
             |row| {
                 let path = PathBuf::from(&row.path);
                 match names.get_mut(&row.name_key) {
@@ -2077,7 +2076,7 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut page_ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
         let mut blocks = std::collections::HashSet::new();
         let mut blocks_are_complete = true;
         for name in names_norm {
@@ -2085,9 +2084,19 @@ impl DirectProjection {
                 ReferenceKind::Explicit => {
                     drain_after(
                         |after, batch| read.page_referrer_candidates_after(name, after, batch),
-                        |row| (row.source_page_id, row.source),
                         |row| {
-                            page_ids.insert(row.source_page_id);
+                            let entity = match row.source {
+                                PhysicalEntityId::Page(_) => {
+                                    PhysicalEntityCoordinate::Page(row.entity_cursor)
+                                }
+                                PhysicalEntityId::Block(_) => {
+                                    PhysicalEntityCoordinate::Block(row.entity_cursor)
+                                }
+                            };
+                            (row.page_cursor, entity)
+                        },
+                        |row| {
+                            paths.insert(PathBuf::from(row.source_page_path));
                             match row.source {
                                 PhysicalEntityId::Block(block_id) => {
                                     blocks.insert(block_id);
@@ -2113,9 +2122,9 @@ impl DirectProjection {
                     blocks_are_complete = false;
                     drain_after(
                         |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
-                        |row| row.page_id,
+                        |row| row.cursor,
                         |row| {
-                            page_ids.insert(row.page_id);
+                            paths.insert(PathBuf::from(row.page_path));
                             Ok(())
                         },
                         |_, _| None,
@@ -2123,13 +2132,6 @@ impl DirectProjection {
                     .ok()?;
                 }
             }
-        }
-        let mut paths = std::collections::BTreeSet::new();
-        for page_id in page_ids {
-            let page = read
-                .page_with_header_validation(page_id, |_, _| Ok(()))
-                .ok()??;
-            paths.insert(PathBuf::from(page.path));
         }
         self.ready_at(cache_generation)
             .then_some(ReferenceCandidateIndex {
@@ -2148,7 +2150,7 @@ impl DirectProjection {
         if !self.ready_at(cache_generation) {
             return None;
         }
-        let uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
+        let parsed_uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
         let mut reader = self.shared.reader.lock().unwrap();
         if reader.is_none() {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
@@ -2156,13 +2158,14 @@ impl DirectProjection {
         let read = reader.as_ref()?.read();
         let block = match read.block(uuid).ok()? {
             Some(block) => crate::query::logseq_uuid_owner([block], false),
-            None => {
-                crate::query::logseq_uuid_owner(read.blocks_by_logseq_uuid(uuid, 2).ok()?, false)
-            }
+            None => crate::query::logseq_uuid_owner(
+                read.blocks_by_logseq_uuid(parsed_uuid, 2).ok()?,
+                false,
+            ),
         };
         let page = match block {
             Some(block) => read
-                .page_with_header_validation(block.page_id, |_, _| Ok(()))
+                .page_with_header_validation(&block.page_path, |_, _| Ok(()))
                 .ok()?
                 .map(|page| page.name),
             None => None,
@@ -2215,24 +2218,17 @@ impl DirectProjection {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
         let read = reader.as_ref()?.read();
-        let mut page_ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
         drain_after(
             |after, batch| read.block_referrer_candidates_after(uuid, after, batch),
-            |row| (row.source_page_id, row.source_block_id),
+            |row| (row.page_cursor, row.block_cursor),
             |row| {
-                page_ids.insert(row.source_page_id);
+                paths.insert(PathBuf::from(row.source_page_path));
                 Ok(())
             },
             |_, _| None,
         )
         .ok()?;
-        let mut paths = std::collections::BTreeSet::new();
-        for page_id in page_ids {
-            let page = read
-                .page_with_header_validation(page_id, |_, _| Ok(()))
-                .ok()??;
-            paths.insert(PathBuf::from(page.path));
-        }
         self.ready_at(cache_generation).then_some(paths)
     }
 
@@ -2700,7 +2696,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 matches!(
                     delta,
                     PageDelta::Replace {
-                        query_page_order: None,
+                        page_position: None,
                         ..
                     }
                 )
@@ -2764,7 +2760,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         });
         let touched_pages = deltas
             .values()
-            .map(|(_, delta)| page_id(&delta.entry().rel_path))
+            .map(|(_, delta)| delta.entry().rel_path.clone())
             .collect::<std::collections::BTreeSet<_>>();
         #[cfg(test)]
         run_before_apply_pending_hook();
@@ -2852,7 +2848,7 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                             "the order turn ran without its queue inventory".to_owned()
                         })?;
                         // GH #543: the order turn reconciles over pages the
-                        // projection HOLDS — `reconcile_query_page_order`
+                        // projection HOLDS — the storage order reconciler
                         // requires the supplied inventory to equal the stored
                         // `pages` set exactly, and treats any mismatch as a
                         // failed projection turn (`worker_failed`, readiness
@@ -2943,14 +2939,25 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     }
                     // All SQL writes, including the separate ordering transaction,
                     // have completed. No maintenance transaction survives a write.
-                    let revision = {
+                    let (revision, registry_after) = {
                         let mut snapshot =
                             PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
                                 .map_err(|error| error.to_string())?;
-                        snapshot
+                        let revision = snapshot
                             .query_revision()
-                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())?;
+                        let registry_after = if !registry_reset
+                            && !touched_pages.is_empty()
+                            && shared.committed_registry.lock().unwrap().is_some()
+                        {
+                            registry_sql::read_page_registry_metadata(&mut snapshot, &touched_pages)
+                                .map_err(|error| error.to_string())?
+                        } else {
+                            PageRegistryMetadata::new()
+                        };
+                        (revision, registry_after)
                     };
+                    applied.registry_pages = registry_after;
                     #[cfg(test)]
                     if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
                         hook();
@@ -3128,7 +3135,7 @@ struct WorkerTurn {
     order: Option<u64>,
     /// The queue's inventory captured with the deltas, so the order turn
     /// reconciles exactly the pages this turn leaves projected.
-    inventory: Option<Vec<[u8; 16]>>,
+    inventory: Option<Vec<String>>,
     /// Whether a warm stream was open when the turn was taken.
     stream_open: bool,
     latest_generation: u64,
@@ -3213,10 +3220,10 @@ fn open_projection_database(
 /// lowered" — only the source delta's replacements were.
 #[derive(Default)]
 struct AppliedPages {
-    lowered: Vec<[u8; 16]>,
-    deleted: Vec<[u8; 16]>,
+    lowered: Vec<String>,
+    deleted: Vec<String>,
     /// R6: pages relowered from a fresh parse; they leave the session set.
-    relowered_structurally: Vec<[u8; 16]>,
+    relowered_structurally: Vec<String>,
 }
 
 #[derive(Default)]
@@ -3245,7 +3252,7 @@ fn validate_warm(
         .sources
         .iter()
         .map(|(entry, revision)| PhysicalGraphProjectionSourceRevision {
-            page_id: page_id(&entry.rel_path),
+            path: entry.rel_path.clone(),
             revision: projection_source_revision(revision, config_digest),
         })
         .collect::<Vec<_>>();
@@ -3263,14 +3270,14 @@ fn validate_warm(
         let retained = warm
             .retained
             .iter()
-            .map(|entry| page_id(&entry.rel_path))
+            .map(|entry| entry.rel_path.clone())
             .collect::<std::collections::BTreeSet<_>>();
         source_delta.deletions.retain(|id| !retained.contains(id));
     }
     if !source_delta.deletions.is_empty() {
         applied
             .deleted
-            .extend(source_delta.deletions.iter().copied());
+            .extend(source_delta.deletions.iter().cloned());
         database
             .apply_with_source_revisions_and_aliases(
                 &PhysicalGraphProjectionChange {
@@ -3289,12 +3296,12 @@ fn validate_warm(
     let needed = source_delta
         .replacements
         .iter()
-        .copied()
+        .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     Ok(WarmOutcome::Replacements(
         warm.sources
             .iter()
-            .filter(|(entry, _)| needed.contains(&page_id(&entry.rel_path)))
+            .filter(|(entry, _)| needed.contains(&entry.rel_path))
             .map(|(entry, _)| entry.clone())
             .collect(),
     ))
@@ -3320,7 +3327,7 @@ fn apply_pending(
             .iter()
             .map(|(entry, _)| {
                 Ok(PhysicalGraphProjectionSourceRevision {
-                    page_id: page_id(&entry.rel_path),
+                    path: entry.rel_path.clone(),
                     revision: projection_source_revision(
                         revisions.get(&entry.path).ok_or_else(|| {
                             format!(
@@ -3339,19 +3346,19 @@ fn apply_pending(
         let replacements_needed = source_delta
             .replacements
             .iter()
-            .copied()
+            .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let inventory = sources
             .iter()
-            .map(|source| source.page_id)
+            .map(|source| source.path.clone())
             .collect::<Vec<_>>();
         let lowered = pages
             .iter()
             .enumerate()
-            .filter(|(_, (entry, _))| replacements_needed.contains(&page_id(&entry.rel_path)))
+            .filter(|(_, (entry, _))| replacements_needed.contains(&entry.rel_path))
             .map(|(position, (entry, document))| {
                 let (mut page, postings, aliases) = physical_page(entry, document, parse_config)?;
-                page.query_page_order = Some(position as u64);
+                page.position = Some(position as u64);
                 Ok::<_, String>((page, postings, aliases))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3365,12 +3372,12 @@ fn apply_pending(
         }
         let replacement_sources = sources
             .into_iter()
-            .filter(|source| replacements_needed.contains(&source.page_id))
+            .filter(|source| replacements_needed.contains(&source.path))
             .collect::<Vec<_>>();
-        applied.lowered.extend(replacements_needed.iter().copied());
+        applied.lowered.extend(replacements_needed.iter().cloned());
         applied
             .deleted
-            .extend(source_delta.deletions.iter().copied());
+            .extend(source_delta.deletions.iter().cloned());
         // GH #543: size the writer's page cache to this build and hand the
         // memory back once it commits (`projection_budget`).
         let text_bytes = projected_text_bytes(&replacements);
@@ -3417,36 +3424,32 @@ fn apply_pending(
                     document,
                     revision,
                     parse_config,
-                    query_page_order,
+                    page_position,
                     identity,
                 } => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
-                        page_id: page_id(&entry.rel_path),
+                        path: entry.rel_path.clone(),
                         revision: projection_source_revision(&revision, parse_config.digest()),
                     });
                     let (mut page, mut postings, mut page_aliases) =
                         physical_page(&entry, &document, &parse_config)?;
-                    page.query_page_order = query_page_order;
-                    if query_page_order.is_none() {
+                    page.position = page_position;
+                    if page_position.is_none() {
                         turn.unordered_replacements = true;
                     }
                     match identity {
-                        DeltaIdentity::Live => applied.lowered.push(page.page_id),
+                        DeltaIdentity::Live => applied.lowered.push(page.path.clone()),
                         DeltaIdentity::Structural => {
-                            applied.relowered_structurally.push(page.page_id)
+                            applied.relowered_structurally.push(page.path.clone())
                         }
                     }
-                    turn.registry_pages.insert(
-                        page.page_id,
-                        registry_sql::registry_metadata_from_physical_page(&page)?,
-                    );
                     replacements.push(page);
                     reference_postings.append(&mut postings);
                     aliases.append(&mut page_aliases);
                 }
                 PageDelta::Delete { entry } => {
-                    let id = page_id(&entry.rel_path);
-                    applied.deleted.push(id);
+                    let id = entry.rel_path;
+                    applied.deleted.push(id.clone());
                     deletions.push(id);
                 }
             }
@@ -3538,7 +3541,7 @@ fn physical_page(
             receipt.1 += 1;
         }
     }
-    let id = page_id(&entry.rel_path);
+    let path = entry.rel_path.as_str();
     let format = Format::from_path(Path::new(&entry.rel_path));
     let is_org = format == Format::Org;
     // `Format::from_path` and never `reference_source_is_org`: the latter is a
@@ -3557,26 +3560,26 @@ fn physical_page(
     };
     let mut blocks = Vec::new();
     let mut reference_postings = Vec::new();
-    let aliases = crate::query::document_aliases(document)
+    let aliases = crate::query::document_alias_spellings(document)
         .into_iter()
         .enumerate()
-        .map(|(ordinal, alias)| {
+        .map(|(ordinal, (raw_alias, normalized_alias))| {
             Ok(PhysicalAliasDeclaration {
-                source_page_id: id,
-                source_entity: PhysicalEntityId::Page(id),
+                source_page_path: path.to_owned(),
+                source_entity: PhysicalEntityId::Page(path.to_owned()),
                 source_locator: b"page-alias".to_vec(),
                 ordinal: u32::try_from(ordinal)
                     .map_err(|_| "one page exceeds u32::MAX aliases".to_string())?,
-                raw_alias: alias.clone(),
-                normalized_alias: alias,
+                raw_alias,
+                normalized_alias,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     if let Some(preamble) = document.pre_block.as_deref() {
         append_reference_postings(
             &mut reference_postings,
-            id,
-            PhysicalEntityId::Page(id),
+            path,
+            PhysicalEntityId::Page(path.to_owned()),
             b"preamble",
             std::iter::empty(),
             crate::doc::property_reference_page_names(preamble).into_iter(),
@@ -3585,7 +3588,7 @@ fn physical_page(
     let mut block_refs_norm: Vec<Vec<String>> = Vec::new();
     lower_blocks(
         &document.roots,
-        id,
+        path,
         None,
         &mut Vec::new(),
         &mut blocks,
@@ -3596,18 +3599,37 @@ fn physical_page(
     )?;
     // The two derived tables come from the ONE tine-core computation (§5.8):
     // this side only hands it the block's own `refs_norm` and its parent.
+    let block_indices = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.result_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
     let flat = blocks
         .iter()
+        .enumerate()
         .zip(block_refs_norm.iter())
-        .map(|(block, refs)| crate::query::path_refs::PathRefBlock {
-            id: block.block_id,
-            parent: block.parent,
-            refs: refs.as_slice(),
-        })
+        .map(
+            |((index, block), refs)| crate::query::path_refs::PathRefBlock {
+                id: index,
+                parent: block
+                    .parent
+                    .as_deref()
+                    .and_then(|parent| block_indices.get(parent).copied()),
+                refs: refs.as_slice(),
+            },
+        )
         .collect::<Vec<_>>();
     let mut path_refs = crate::query::derived::path_ref_rows(&entry.name, &flat);
-    for block in &mut blocks {
-        block.path_refs = path_refs.remove(&block.block_id).unwrap_or_default();
+    for (index, block) in blocks.iter_mut().enumerate() {
+        block.path_refs = path_refs
+            .remove(&index)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key| PhysicalName {
+                raw: key.clone(),
+                key,
+            })
+            .collect();
     }
     let journal_days = crate::query::derived::JournalDays::new(parse_config);
     let page_property_atoms = crate::query::derived::property_atom_rows(
@@ -3620,9 +3642,7 @@ fn physical_page(
     );
     Ok((
         PhysicalPage {
-            page_id: id,
-            query_page_order: None,
-            home_document_id: id,
+            position: None,
             name: entry.name.clone(),
             name_key: crate::refs::page_key(&entry.name),
             path: entry.rel_path.clone(),
@@ -3641,32 +3661,11 @@ fn physical_page(
     ))
 }
 
-/// The 16-byte key a block's rows are stored under.
-///
-/// A parsed page carries structural UUIDs. A page saved from the editor keeps
-/// the FRONTEND's live ids (`src/store.ts` `freshId()`: `b<base36 time>-<n>`),
-/// which `cache_upsert_inner` deliberately preserves so the editor can keep
-/// addressing the block; the public identity of a row is `query_result_id`,
-/// the id STRING, so a non-UUID live id only needs a deterministic key here.
-/// This used to be a refusal, and a refusal scoped to the whole page: one
-/// block created in the editor failed the page's delta, the failed turn
-/// latched a full rebuild, and every rebuild re-lowered the same live document
-/// and failed the same way — so after one such save every query in the app
-/// answered "Rebuilding the query index…" until restart (2026-09-11,
-/// master d61cfb3d). `a_block_created_in_the_editor_keeps_queries_answering`
-/// (`tests/search_edit.rs`) pins the user outcome.
-fn block_projection_key(runtime_id: &str) -> [u8; 16] {
-    match Uuid::parse_str(runtime_id) {
-        Ok(uuid) => uuid.into_bytes(),
-        Err(_) => crate::vocab::live_runtime_id_key(runtime_id).into_bytes(),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn lower_blocks(
     source: &[DocBlock],
-    page_id: [u8; 16],
-    parent: Option<[u8; 16]>,
+    page_path: &str,
+    parent: Option<&str>,
     structural_path: &mut Vec<u32>,
     out: &mut Vec<PhysicalBlock>,
     reference_postings: &mut Vec<PhysicalReferencePosting>,
@@ -3678,7 +3677,6 @@ fn lower_blocks(
         let position = u32::try_from(position)
             .map_err(|_| "page has more than u32::MAX sibling blocks".to_string())?;
         structural_path.push(position);
-        let block_id = block_projection_key(&block.uuid);
         let projection = block.projection();
         let order = structural_path
             .iter()
@@ -3687,8 +3685,8 @@ fn lower_blocks(
             .join("/");
         append_reference_postings(
             reference_postings,
-            page_id,
-            PhysicalEntityId::Block(block_id),
+            page_path,
+            PhysicalEntityId::Block(block.uuid.clone()),
             order.as_bytes(),
             projection.refs_page.iter().cloned(),
             crate::doc::property_reference_page_names(&block.raw).into_iter(),
@@ -3698,15 +3696,14 @@ fn lower_blocks(
                 continue;
             };
             reference_postings.push(PhysicalReferencePosting {
-                source_page_id: page_id,
-                source_entity: PhysicalEntityId::Block(block_id),
+                source_page_path: page_path.to_owned(),
+                source_entity: PhysicalEntityId::Block(block.uuid.clone()),
                 source_locator: order.as_bytes().to_vec(),
                 ordinal: u32::try_from(reference_postings.len())
                     .map_err(|_| "one page exceeds u32::MAX reference postings".to_string())?,
                 kind: 6,
                 target: PhysicalReferenceTarget::ExternalUuid {
                     raw_claim: raw_claim.into_bytes(),
-                    resolved_block_id: None,
                 },
             });
         }
@@ -3740,11 +3737,16 @@ fn lower_blocks(
             .and_then(|value| Uuid::parse_str(value.trim()).ok())
             .map(Uuid::into_bytes);
         out.push(PhysicalBlock {
-            block_id,
-            query_result_id: block.uuid.clone(),
-            own_refs: projection.refs_norm.clone(),
-            home_document_id: page_id,
-            parent,
+            result_id: block.uuid.clone(),
+            own_refs: projection
+                .refs_norm
+                .iter()
+                .map(|key| PhysicalName {
+                    raw: key.clone(),
+                    key: key.clone(),
+                })
+                .collect(),
+            parent: parent.map(str::to_owned),
             order,
             content: block.raw.clone(),
             normalized_searchable_text: crate::search_query::canonical_fold(&searchable_text),
@@ -3776,8 +3778,8 @@ fn lower_blocks(
         });
         lower_blocks(
             &block.children,
-            page_id,
-            Some(block_id),
+            page_path,
+            Some(block.uuid.as_str()),
             structural_path,
             out,
             reference_postings,
@@ -3792,7 +3794,7 @@ fn lower_blocks(
 
 fn append_reference_postings(
     out: &mut Vec<PhysicalReferencePosting>,
-    page_id: [u8; 16],
+    page_path: &str,
     source: PhysicalEntityId,
     source_locator: &[u8],
     inline_names: impl IntoIterator<Item = String>,
@@ -3805,15 +3807,14 @@ fn append_reference_postings(
     ] {
         for raw_name in names {
             out.push(PhysicalReferencePosting {
-                source_page_id: page_id,
-                source_entity: source,
+                source_page_path: page_path.to_owned(),
+                source_entity: source.clone(),
                 source_locator: source_locator.to_vec(),
                 ordinal,
                 kind,
                 target: PhysicalReferenceTarget::PageName {
                     normalized_name: crate::refs::page_key(&raw_name),
                     raw_name,
-                    resolved_page_id: None,
                 },
             });
             ordinal = ordinal
@@ -3842,16 +3843,6 @@ fn facets(raw: &str, is_org: bool) -> (String, Vec<PhysicalProperty>, Vec<String
         })
         .collect();
     (searchable, properties, block.projection().tags.clone())
-}
-
-pub(crate) fn page_id(relative_path: &str) -> [u8; 16] {
-    let mut digest = Sha256::new();
-    digest.update(b"tine-direct-page-v1\0");
-    digest.update(relative_path.as_bytes());
-    let bytes = digest.finalize();
-    let mut id = [0; 16];
-    id.copy_from_slice(&bytes[..16]);
-    id
 }
 
 fn page_kind_to_sql(kind: PageKind) -> i64 {

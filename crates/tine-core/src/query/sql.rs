@@ -60,9 +60,9 @@
 //! **`walk == SQL` is the contract (I-19, I-12).** Every comparison below is
 //! written against the walk's own code in [`crate::query::eval`], and the
 //! normalization applied to a literal is the SAME function the projection
-//! producer applied to the column (`refs::page_key` for `pages.name_key` and
-//! `tags.tag_key`, `refs::normalize` for `block_path_refs.normalized_name`,
-//! `doc::property_key_norm` for `normalized_name`, `atom::atom_key` for
+//! producer applied to the dictionary key (`refs::page_key` for page/tag
+//! names, `refs::normalize` for path-reference names,
+//! `doc::property_key_norm` for property names, `atom::atom_key` for
 //! `atom_key`, `search_query::canonical_fold` for `query_visible_folded`) —
 //! never a second normalizer that agrees by inspection.
 //!
@@ -413,13 +413,13 @@ const MATCH_SET_IDS: &str = "SELECT m.block_id, m.page_id FROM m";
 ///
 /// [`page_statement`] wraps exactly this relation for the same reason
 /// [`descriptor_view_statement`] wraps the block one. The `_IDS` twin adds `p.path`:
-/// the page read re-joins `query_page_order` on it (LEFT), so the order key
+/// the page read re-joins `pages` on it (LEFT), so the order key
 /// has to survive into the wrapper's CTE. `p` is the anchor alias and can never collide with a
 /// nested relation's, because [`Compiler::alias`] always appends a number.
-const PAGE_ANCHOR_SELECT: &str = "SELECT p.page_id, p.name, p.text_kind, p.journal_day";
-const PAGE_ANCHOR_FROM: &str = "FROM pages p";
+const PAGE_ANCHOR_SELECT: &str = "SELECT p.page_id, pn.raw, p.text_kind, p.journal_day";
+const PAGE_ANCHOR_FROM: &str = "FROM pages p JOIN names pn ON pn.name_id = p.name_id";
 const PAGE_ANCHOR_IDS: &str =
-    "SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path FROM pages p";
+    "SELECT p.page_id, pn.raw, p.text_kind, p.journal_day, p.path FROM pages p JOIN names pn ON pn.name_id = p.name_id";
 
 /// Lower one resolved query (SPEC §5.1–§5.7).
 ///
@@ -447,7 +447,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         // §5.3's block row is `(block_id, page_id, path)` and nothing else.
         // `block_id` is the answer, `page_id` is the page's routing identity,
         // and `path` is the order key the descriptor read (`query/results.rs`) joins
-        // `query_page_order` on. `pages.name` and `pages.text_kind` were
+        // stored page position on. Page name and text kind were
         // decoration: no consumer of these rows ever decoded either, and the
         // descriptor read takes both from the page row of the ANSWER only.
         Anchor::Block => (
@@ -592,15 +592,15 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
 /// the compiler a second "projection mode" — would be exactly the walk/SQL fork
 /// this campaign exists to prevent (I-12, D-14).
 ///
-/// **Every join is LEFT on purpose (D-3).** A missing `query_block_results`,
-/// `blocks` or `pages` row, a `query_page_order` row Direct Files requires, or
+/// **Every join is LEFT on purpose (D-3).** A missing `blocks` or `pages` row,
+/// a required page position, or
 /// a `text_kind` outside [`crate::direct_projection::page_kind_from_sql`] must
 /// FAIL the read. An inner join would answer the same question with fewer rows,
 /// which is the one thing a damaged disposable cache may never do.
 ///
 /// **Ordering** is the order the walk CHARGES its budget in:
-/// `query_page_order.position` (the projection's copy of the inventory order
-/// `GraphQueryPages::for_each_page` enumerates). Within a page it is always `query_block_results.preorder`.
+/// `pages.position` (the projection's copy of the inventory order
+/// `GraphQueryPages::for_each_page` enumerates). Within a page it is always `blocks.preorder`.
 ///
 /// `Anchor::Page` statements have no block descriptor and are rejected here:
 /// their rows are consumed exactly as they are today.
@@ -629,7 +629,7 @@ pub(crate) fn descriptor_view_statement(
         "" => "WITH".to_string(),
         ctes => format!("{ctes},"),
     };
-    let base = "o.position";
+    let base = "p.position";
     let mut params = statement.params.clone();
     let mut ranks = QueryRankPrograms::default();
     let mut terms = Vec::new();
@@ -672,26 +672,21 @@ pub(crate) fn descriptor_view_statement(
         );
     }
     terms.push(format!("{base} ASC"));
-    terms.push("q.preorder ASC".into());
-    let page_cte = recency_expression.map(|expression| format!(", qe_order_pages AS MATERIALIZED (SELECT p.page_id, p.name, p.text_kind, p.journal_day, p.path, {expression} AS qe_recency FROM pages p WHERE p.page_id IN (SELECT page_id FROM r))"));
-    let page_source = if page_cte.is_some() {
-        "qe_order_pages"
-    } else {
-        "pages"
+    terms.push("b.preorder ASC".into());
+    let page_cte = match recency_expression {
+        Some(expression) => format!(", qe_order_pages AS MATERIALIZED (SELECT p.page_id, n.raw AS name, p.text_kind, p.journal_day, p.path, p.position, {expression} AS qe_recency FROM pages p JOIN names n ON n.name_id = p.name_id WHERE p.page_id IN (SELECT page_id FROM r))"),
+        None => ", qe_order_pages AS MATERIALIZED (SELECT p.page_id, n.raw AS name, p.text_kind, p.journal_day, p.path, p.position FROM pages p JOIN names n ON n.name_id = p.name_id WHERE p.page_id IN (SELECT page_id FROM r))".to_owned(),
     };
-    let page_cte = page_cte.unwrap_or_default();
     Ok(RankedPageStatement {
         query: SqlQuery {
             sql: format!(
                 "{with} r(block_id, page_id) AS ({body}){page_cte} \
              SELECT r.block_id, r.page_id, p.name, p.text_kind, p.journal_day, p.path, \
-             q.page_id, q.preorder, q.result_id, q.estimated_bytes, q.tag_count, \
-             q.property_count, b.order_key, o.position{extra} \
+             b.page_id, b.preorder, b.result_id, b.estimated_bytes, b.tag_count, \
+             b.property_count, b.order_key, p.position{extra} \
              FROM r \
-             LEFT JOIN query_block_results q ON q.block_id = r.block_id \
              LEFT JOIN blocks b ON b.block_id = r.block_id \
-             LEFT JOIN {page_source} p ON p.page_id = r.page_id \
-             LEFT JOIN query_page_order o ON o.page_id = r.page_id \
+             LEFT JOIN qe_order_pages p ON p.page_id = r.page_id \
              ORDER BY {}",
                 terms.join(", ")
             ),
@@ -805,11 +800,12 @@ pub(crate) fn page_sort_expression(
             Some(format!(
                 "tine_query_rank({lowercase}, COALESCE(\
                    (SELECT property.value FROM properties property \
+                    JOIN names property_name ON property_name.name_id = property.name_id \
                     WHERE property.owner_type = {OWNER_PAGE} \
                       AND property.owner_id = {alias}.page_id \
                       AND property.page_id = {alias}.page_id \
-                      AND property.normalized_name = {key_param} \
-                    ORDER BY property.ordinal, property.name LIMIT 1), \
+                      AND property_name.key = {key_param} \
+                    ORDER BY property.ordinal, property.name_id LIMIT 1), \
                    {alias}.name))"
             ))
         }
@@ -852,7 +848,7 @@ pub(crate) fn block_sort_expression(
         _ => {
             let lowercase = binder.lowercase();
             let key = binder.property_key(property_key_norm(field));
-            Some(format!("tine_query_rank({lowercase}, COALESCE((SELECT value FROM properties WHERE owner_type=1 AND owner_id={block_alias}.block_id AND page_id={block_alias}.page_id AND normalized_name={key} ORDER BY ordinal, name LIMIT 1), (SELECT CASE WHEN instr(query_visible, char(10))=0 THEN query_visible ELSE substr(query_visible, 1, instr(query_visible, char(10))-1) END FROM block_text WHERE block_id={block_alias}.block_id)))"))
+            Some(format!("tine_query_rank({lowercase}, COALESCE((SELECT property.value FROM properties property JOIN names property_name ON property_name.name_id=property.name_id WHERE property.owner_type=1 AND property.owner_id={block_alias}.block_id AND property.page_id={block_alias}.page_id AND property_name.key={key} ORDER BY property.ordinal, property.name_id LIMIT 1), (SELECT CASE WHEN instr(query_visible, char(10))=0 THEN query_visible ELSE substr(query_visible, 1, instr(query_visible, char(10))-1) END FROM block_text WHERE block_id={block_alias}.block_id)))"))
         }
     }
 }
@@ -894,8 +890,8 @@ fn statistics_columns(
     let owner = if page { 0 } else { 1 };
     let id = if page { "r.page_id" } else { "r.block_id" };
     let property = |key: &str, params: &mut Vec<PhysicalQueryValue>| {
-        let key = bind_page_param(params, PhysicalQueryValue::Text(key.into()));
-        format!("(SELECT value FROM properties WHERE owner_type={owner} AND owner_id={id} AND page_id=r.page_id AND name={key} ORDER BY ordinal LIMIT 1)")
+        let key = bind_page_param(params, PhysicalQueryValue::Text(property_key_norm(key)));
+        format!("(SELECT property.value FROM properties property JOIN names property_name ON property_name.name_id=property.name_id WHERE property.owner_type={owner} AND property.owner_id={id} AND property.page_id=r.page_id AND property_name.key={key} ORDER BY property.ordinal LIMIT 1)")
     };
     let mut columns: Vec<String> = view
         .aggregates
@@ -912,7 +908,7 @@ fn statistics_columns(
     let keys = match group {
         None => "json_array()".into(),
         Some(field) if field.starts_with("formula:") => "json_array()".into(),
-        Some("tags") => format!("COALESCE((SELECT json_group_array(tag) FROM (SELECT tag FROM tags WHERE owner_type={owner} AND owner_id={id} AND page_id=r.page_id ORDER BY ordinal)), json_array())"),
+        Some("tags") => format!("COALESCE((SELECT json_group_array(raw) FROM (SELECT tag_name.raw FROM tags tag JOIN names tag_name ON tag_name.name_id=tag.name_id WHERE tag.owner_type={owner} AND tag.owner_id={id} AND tag.page_id=r.page_id ORDER BY tag.ordinal)), json_array())"),
         Some("page" | "name") => format!("json_array({}.name)", if page { "r" } else { "p" }),
         Some("path") if page => "json_array(r.path)".into(),
         Some("kind") if page => "json_array(CASE r.text_kind WHEN 1 THEN 'journal' ELSE 'page' END)".into(),
@@ -936,7 +932,7 @@ fn statistics_columns(
 /// statement is rejected because its rows belong to the block descriptor read.
 ///
 /// **The join is LEFT on purpose (D-3).** The page order IS
-/// `query_page_order.position`; a missing row must FAIL the read rather than
+/// `pages.position`; a missing value must FAIL the read rather than
 /// sort a page silently to one end of a truncated answer.
 pub(crate) struct RankedPageStatement {
     pub(crate) query: SqlQuery,
@@ -961,7 +957,7 @@ pub(crate) fn page_statement(
         "" => "WITH".to_string(),
         ctes => format!("{ctes},"),
     };
-    let base = "o.position";
+    let base = "stored.position";
     let mut params = statement.params.clone();
     let mut ranks = QueryRankPrograms::default();
     let mut lowercase = None;
@@ -1017,11 +1013,10 @@ pub(crate) fn page_statement(
         query: SqlQuery {
             sql: format!(
                 "{with} r(page_id, name, text_kind, journal_day, path) AS ({body}) \
-                 SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, o.position, \
-                        q.estimated_bytes, q.property_count, COUNT(*) OVER (){statistics} \
+                 SELECT r.page_id, r.name, r.text_kind, r.journal_day, r.path, stored.position, \
+                        stored.estimated_bytes, stored.property_count, COUNT(*) OVER (){statistics} \
                  FROM r \
-                 LEFT JOIN query_page_order o ON o.page_id = r.page_id \
-                 LEFT JOIN query_page_results q ON q.page_id = r.page_id \
+                 LEFT JOIN pages stored ON stored.page_id = r.page_id \
                  ORDER BY {}{limit}",
                 order_terms.join(", ")
             ),
@@ -1867,11 +1862,11 @@ impl Compiler<'_> {
     ///
     /// | Term | Source | Why it is exactly right |
     /// |---|---|---|
-    /// | `own(nested)` | `block_own_refs` | R1's explicit own-reference facts — `BlockProjection::refs_norm`, the walk's own `own` |
+    /// | `own(nested)` | `reference_postings(own=1)` | R1's explicit own-reference facts — `BlockProjection::refs_norm`, the walk's own `own` |
     /// | `ancestors(anchor)` ∪ `{page}` | `block_path_refs(anchor.parent_block_id)` | the parent's closure IS `ancestors(anchor)` ∪ `{page}` by §5.8's definition, so the ancestor context needs no new table and no subtraction |
-    /// | `{page}` | `pages.name_key` of the anchor's page | the anchor may be a ROOT block, where the middle term is empty and the page is still in the closure |
+    /// | `{page}` | `names.key` of the anchor's page | the anchor may be a ROOT block, where the middle term is empty and the page is still in the closure |
     ///
-    /// `pages.name_key` is `refs::page_key`, which IS `refs::normalize` — the
+    /// the page's `names.key` is `refs::page_key`, which IS `refs::normalize` — the
     /// same fold `eval_refs` applies to `ctx.page_name` — and the empty guard
     /// reproduces `closure_names`' own `!name.is_empty()` filter, so a page whose
     /// name normalizes away contributes nothing on either engine.
@@ -1890,13 +1885,16 @@ impl Compiler<'_> {
         };
         if scope.is_anchor() {
             let alias = self.alias("r");
+            let name = self.alias("rn");
             let owner = format!("{}.block_id", scope.alias);
             return self.quantified(&owner, quant, |compiler, invert| {
-                let column = format!("{alias}.normalized_name");
+                let column = format!("{name}.key");
                 let predicate = compiler.name_element(pred, &column, refs::normalize);
                 compiler.exists_subquery(
                     &format!("{alias}.block_id"),
-                    &format!("block_path_refs {alias}"),
+                    &format!(
+                        "block_path_refs {alias} JOIN names {name} ON {name}.name_id = {alias}.name_id"
+                    ),
                     &[],
                     predicate,
                     invert,
@@ -1913,13 +1911,19 @@ impl Compiler<'_> {
             // `own(nested)` — R1's explicit own-reference facts, seeked on the
             // `(block_id, normalized_name)` primary key.
             let own = compiler.alias("or");
+            let own_name = compiler.alias("orn");
             let owner = format!("{}.block_id", scope.alias);
             let predicate =
-                compiler.name_element(pred, &format!("{own}.normalized_name"), refs::normalize);
+                compiler.name_element(pred, &format!("{own_name}.key"), refs::normalize);
             if let Some(sub) = compiler.exists_subquery(
-                &format!("{own}.block_id"),
-                &format!("block_own_refs {own}"),
-                &[format!("{own}.block_id = {owner}")],
+                &format!("{own}.source_entity_id"),
+                &format!("reference_postings {own} JOIN names {own_name} ON {own_name}.name_id = {own}.target_name_id"),
+                &[
+                    format!("{own}.source_entity_id = {owner}"),
+                    format!("{own}.source_entity_type = 1"),
+                    format!("{own}.target_type = 0"),
+                    format!("{own}.own = 1"),
+                ],
                 predicate,
                 invert,
             ) {
@@ -1930,15 +1934,13 @@ impl Compiler<'_> {
             // no ancestor context at all, so the guard is what keeps this arm
             // two-valued under `NOT`.
             let ancestors = compiler.alias("ar");
+            let ancestor_name = compiler.alias("arn");
             let parent = format!("{}.parent_block_id", scope.anchor);
-            let predicate = compiler.name_element(
-                pred,
-                &format!("{ancestors}.normalized_name"),
-                refs::normalize,
-            );
+            let predicate =
+                compiler.name_element(pred, &format!("{ancestor_name}.key"), refs::normalize);
             if let Some(sub) = compiler.exists_subquery(
                 &format!("{ancestors}.block_id"),
-                &format!("block_path_refs {ancestors}"),
+                &format!("block_path_refs {ancestors} JOIN names {ancestor_name} ON {ancestor_name}.name_id = {ancestors}.name_id"),
                 &[format!("{ancestors}.block_id = {parent}")],
                 predicate,
                 invert,
@@ -1951,15 +1953,18 @@ impl Compiler<'_> {
             // empty-name filter, which the two ref tables get from their column
             // CHECK constraints and `pages` does not.
             let page = compiler.alias("pr");
+            let page_name = compiler.alias("prn");
             let page_owner = format!("{}.page_id", scope.anchor);
             let predicate =
-                compiler.name_element(pred, &format!("{page}.name_key"), refs::normalize);
+                compiler.name_element(pred, &format!("{page_name}.key"), refs::normalize);
             if let Some(sub) = compiler.exists_subquery(
                 &format!("{page}.page_id"),
-                &format!("pages {page}"),
+                &format!(
+                    "pages {page} JOIN names {page_name} ON {page_name}.name_id = {page}.name_id"
+                ),
                 &[
                     format!("{page}.page_id = {page_owner}"),
-                    format!("{page}.name_key <> ''"),
+                    format!("{page_name}.key <> ''"),
                 ],
                 predicate,
                 invert,
@@ -1980,6 +1985,7 @@ impl Compiler<'_> {
     /// (§3.2 K18), which is the same fold `eval_name_element` applies.
     fn tags(&mut self, quant: Quant, pred: &Filter, owner_alias: &str, owner_type: i64) -> String {
         let alias = self.alias("tg");
+        let name = self.alias("tgn");
         let owner_column = if owner_type == OWNER_BLOCK {
             format!("{owner_alias}.block_id")
         } else {
@@ -1987,11 +1993,11 @@ impl Compiler<'_> {
         };
         let owner_type_literal = self.bind(PhysicalQueryValue::Integer(owner_type));
         self.quantified(&owner_column, quant, |compiler, invert| {
-            let column = format!("{alias}.tag_key");
+            let column = format!("{name}.key");
             let predicate = compiler.name_element(pred, &column, refs::page_key);
             compiler.exists_subquery(
                 &format!("{alias}.owner_id"),
-                &format!("tags {alias}"),
+                &format!("tags {alias} JOIN names {name} ON {name}.name_id = {alias}.name_id"),
                 &[format!("{alias}.owner_type = {owner_type_literal}")],
                 predicate,
                 invert,
@@ -2129,18 +2135,22 @@ impl Compiler<'_> {
         }
     }
 
-    /// `pages.name_key` is `refs::page_key(name)` — the same page-identity fold
-    /// `eval_page_name` applies to both sides of its comparison.
+    /// `names.key` is `refs::page_key(name)` — the same page-identity fold
+    /// `eval_page_name` applies to both sides of its comparison. Membership is
+    /// expressed through `pages.name_id` so SQLite can drive the page anchor
+    /// from the dictionary key and `pages_name_idx` instead of scalar-looking
+    /// up the key once for every page.
     fn page_name(&mut self, op: CmpOp, value: &Value, p: &str) -> String {
-        let column = format!("{p}.name_key");
         match op {
             CmpOp::Eq | CmpOp::NotEq => {
                 let Some(text) = value.as_text() else {
                     return "0".to_string();
                 };
                 let literal = self.bind(PhysicalQueryValue::Text(refs::page_key(text)));
-                let comparison = if op == CmpOp::Eq { "=" } else { "<>" };
-                format!("{column} {comparison} {literal}")
+                let membership = if op == CmpOp::Eq { "IN" } else { "NOT IN" };
+                format!(
+                    "{p}.name_id {membership} (SELECT name_id FROM names WHERE key = {literal})"
+                )
             }
             CmpOp::StartsWith => {
                 let Some(text) = value.as_text() else {
@@ -2149,7 +2159,8 @@ impl Compiler<'_> {
                 // A range on the key column, which is what makes `(namespace X)`
                 // and `page.name starts_with` seek `pages_name_key_idx` (§5.7).
                 let prefix = page_prefix_key(text);
-                self.prefix_range(&column, &prefix)
+                let range = self.prefix_range("key", &prefix);
+                format!("{p}.name_id IN (SELECT name_id FROM names WHERE {range})")
             }
             CmpOp::Like => {
                 let Some(text) = value.as_text() else {
@@ -2157,7 +2168,9 @@ impl Compiler<'_> {
                 };
                 let pattern =
                     self.bind(PhysicalQueryValue::Text(refs::page_identity_pattern(text)));
-                format!("{column} LIKE {pattern} ESCAPE '\\'")
+                format!(
+                    "{p}.name_id IN (SELECT name_id FROM names WHERE key LIKE {pattern} ESCAPE '\\')"
+                )
             }
             CmpOp::In | CmpOp::NotIn => {
                 let Some(items) = value.as_list() else {
@@ -2166,7 +2179,9 @@ impl Compiler<'_> {
                 let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
                 // No text operand: `in` is false and `not in` true, as in the walk.
                 match self.text_list(items, |text| refs::page_key(text)) {
-                    Some(list) => format!("{column} {membership} ({list})"),
+                    Some(list) => format!(
+                        "{p}.name_id {membership} (SELECT name_id FROM names WHERE key IN ({list}))"
+                    ),
                     None if op == CmpOp::In => "0".to_string(),
                     None => "1".to_string(),
                 }
@@ -2204,7 +2219,7 @@ impl Compiler<'_> {
     /// `name_key` range measured sufficient for the bounded `starts_with` form,
     /// and this unbounded form is the one §5.7's table already marks `no`.
     fn page_namespace(&mut self, op: CmpOp, value: &Value, p: &str) -> String {
-        let column = format!("{p}.name_key");
+        let column = format!("(SELECT key FROM names WHERE name_id = {p}.name_id)");
         let has_parent = format!("instr({column}, '/') > 0");
         // `name_key` is already fully lowercased, so the walk's ASCII-insensitive
         // comparison is equality against the ASCII-lowercased operand.
@@ -2315,11 +2330,14 @@ impl Compiler<'_> {
         let key_literal = self.bind(PhysicalQueryValue::Text(key_norm.clone()));
         let presence = {
             let alias = self.alias("pr");
+            let name = self.alias("prn");
             let sub = Membership {
                 select: format!("{alias}.owner_id"),
-                from: format!("properties {alias}"),
+                from: format!(
+                    "properties {alias} JOIN names {name} ON {name}.name_id = {alias}.name_id"
+                ),
                 where_: format!(
-                    "({alias}.normalized_name = {key_literal} \
+                    "({name}.key = {key_literal} \
                      AND {alias}.owner_type = {owner_type_literal})"
                 ),
             };
@@ -2353,12 +2371,15 @@ impl Compiler<'_> {
             .unwrap_or(ObservedType::Text);
         let atom_subquery = |compiler: &mut Self, invert: bool| -> Option<Membership> {
             let alias = compiler.alias("a");
+            let name = compiler.alias("an");
             let predicate = compiler.atom_test(&test, &alias, effective);
             compiler.exists_subquery(
                 &format!("{alias}.owner_id"),
-                &format!("property_atoms {alias}"),
+                &format!(
+                    "property_atoms {alias} JOIN names {name} ON {name}.name_id = {alias}.name_id"
+                ),
                 &[
-                    format!("{alias}.normalized_name = {key_literal}"),
+                    format!("{name}.key = {key_literal}"),
                     format!("{alias}.owner_type = {owner_type_literal}"),
                 ],
                 predicate,
@@ -2425,15 +2446,16 @@ impl Compiler<'_> {
             | CmpOp::IsBlank => return None,
         };
         let alias = self.alias("ac");
+        let name = self.alias("acn");
         let bound = self.bind(PhysicalQueryValue::Real(*number));
         // A correlated COUNT rather than a quantifier: cardinality is a property
         // of the whole atom list, and the `(owner_type, owner_id,
         // normalized_name)` primary-key prefix makes it a seek.
         Some(format!(
-            "(SELECT COUNT(*) FROM property_atoms {alias} \
+            "(SELECT COUNT(*) FROM property_atoms {alias} JOIN names {name} ON {name}.name_id = {alias}.name_id \
              WHERE {alias}.owner_type = {owner_type_literal} \
              AND {alias}.owner_id = {owner} \
-             AND {alias}.normalized_name = {key_literal}) {comparison} {bound}"
+             AND {name}.key = {key_literal}) {comparison} {bound}"
         ))
     }
 

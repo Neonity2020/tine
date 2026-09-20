@@ -328,13 +328,13 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
     for (tag, damage) in [
         (
             "missing",
-            "DELETE FROM query_block_results WHERE block_id = (\
+            "DELETE FROM block_text WHERE block_id = (\
                 SELECT b.block_id FROM blocks b JOIN block_text t USING (block_id) \
                 WHERE instr(t.query_visible, 'alpha') > 0 LIMIT 1)",
         ),
         (
             "cross-owner",
-            "UPDATE query_block_results SET page_id = (\
+            "UPDATE blocks SET page_id = (\
                 SELECT page_id FROM pages WHERE path = 'pages/Other.md'), preorder = 999999 \
              WHERE block_id = (SELECT b.block_id FROM blocks b \
                 JOIN pages p USING (page_id) JOIN block_text t USING (block_id) \

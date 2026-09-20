@@ -4,8 +4,8 @@
 //! execution and the browser Wasm bridge cannot drift. Core-specific source
 //! guards remain here because they describe native planner and identity rules.
 
-pub use tine_search::{canonical_fold, AndGroup, Matcher, Term, SEARCH_SYNTAX_EXAMPLES};
 pub(crate) use tine_search::canonical_fold_with_map;
+pub use tine_search::{canonical_fold, AndGroup, Matcher, Term, SEARCH_SYNTAX_EXAMPLES};
 
 #[cfg(test)]
 mod tests {

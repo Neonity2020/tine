@@ -576,7 +576,7 @@ fn the_database_result_equals_the_walk_over_a_real_corpus() {
 // ===== ordering =====
 
 /// Direct Files' cross-page base order IS the order the walk enumerates pages
-/// in. The projection materializes it in `query_page_order`; if the two ever
+/// in. The projection materializes it in `pages.position`; if the two ever
 /// drifted, a truncated budget would keep different rows on the two paths.
 fn page_order_differences(corpus: &Corpus) -> Vec<String> {
     let mut walk_order: Vec<String> = Vec::new();
@@ -587,8 +587,8 @@ fn page_order_differences(corpus: &Corpus) -> Vec<String> {
     let mut snapshot = corpus.snapshot();
     let rows = snapshot
         .run_projection_query(
-            "SELECT p.name FROM query_page_order o JOIN pages p ON p.page_id = o.page_id \
-             ORDER BY o.position",
+            "SELECT n.raw FROM pages p JOIN names n ON n.name_id = p.name_id \
+             ORDER BY p.position",
             &[],
         )
         .expect("the page order is readable through the snapshot");
@@ -626,7 +626,7 @@ fn the_stored_page_order_is_the_walks_page_order() {
     let differences = page_order_differences(&corpus);
     assert!(
         differences.is_empty(),
-        "query_page_order is not the walk's enumeration order:\n{}",
+        "pages.position is not the walk's enumeration order:\n{}",
         differences.join("\n")
     );
 }
@@ -647,7 +647,7 @@ fn the_stored_page_order_is_the_walks_page_order_over_a_real_corpus() {
     );
     assert!(
         differences.is_empty(),
-        "query_page_order is not the walk's enumeration order on a real graph:\n{}",
+        "pages.position is not the walk's enumeration order on a real graph:\n{}",
         differences.join("\n")
     );
 }
@@ -836,7 +836,12 @@ fn q4_formula_grouping_reports_unsupported_preserves_visual_groups() {
     // The projection stores raw authored keys. Exercise a literal colon key
     // without asking the Markdown property grammar to create that wire case.
     let writer = rusqlite::Connection::open(corpus.projection_path()).unwrap();
-    writer.execute("UPDATE properties SET name='formula:cost', normalized_name='formula:cost' WHERE name='formula-cost'", []).unwrap();
+    writer
+        .execute(
+            "UPDATE names SET raw='formula:cost', key='formula:cost' WHERE key='formula-cost'",
+            [],
+        )
+        .unwrap();
     let mut view = q4_statistics_view();
     view.group_by = Some(Field::new("formula:cost"));
     view.aggregates[1].0 = Field::new("formula:cost");
@@ -1153,7 +1158,7 @@ fn q4_statistics_failure_and_cancellation_return_no_partial_answer() {
     snapshot.finish();
     for (label, sql) in [
         ("sql", "DROP TABLE properties"),
-        ("corruption", "DELETE FROM query_block_results"),
+        ("corruption", "DELETE FROM block_text"),
     ] {
         let path = copy_projection(&corpus, &format!("q4-failure-{label}"));
         rusqlite::Connection::open(&path)
@@ -1215,7 +1220,7 @@ fn q4_commit_between_rows_and_statistics_uses_one_snapshot() {
     let hook_path = path.clone();
     set_before_payload_batch_hook(Some(Box::new(move |_| {
         let writer = rusqlite::Connection::open(&hook_path).unwrap();
-        writer.execute_batch("BEGIN; UPDATE properties SET value = '9' WHERE name = 'cost'; UPDATE properties SET value = 'alt' WHERE name = 'group' AND value = 'old'; UPDATE tags SET tag = 'alt' WHERE tag = 'old'; UPDATE tasks SET marker = 'TODO' WHERE marker = 'DONE'; COMMIT;").unwrap();
+        writer.execute_batch("BEGIN; UPDATE properties SET value = '9' WHERE name_id IN (SELECT name_id FROM names WHERE key = 'cost'); UPDATE properties SET value = 'alt' WHERE name_id IN (SELECT name_id FROM names WHERE key = 'group') AND value = 'old'; INSERT OR IGNORE INTO names(key, raw) VALUES ('alt', 'alt'); UPDATE tags SET name_id = (SELECT name_id FROM names WHERE key = 'alt' ORDER BY name_id LIMIT 1) WHERE name_id IN (SELECT name_id FROM names WHERE key = 'old'); UPDATE tasks SET marker = 'TODO' WHERE marker = 'DONE'; COMMIT;").unwrap();
     })));
     let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
     let result = q4_snapshot_query(
@@ -1296,8 +1301,7 @@ fn page_results_sort_the_complete_set_before_limit_and_keep_exact_counts() {
     let mut snapshot = corpus.snapshot();
     let position = snapshot
         .run_projection_query(
-            "SELECT o.position FROM query_page_order o JOIN pages p ON p.page_id = o.page_id \
-             WHERE p.path = ?1",
+            "SELECT p.position FROM pages p WHERE p.path = ?1",
             &[PhysicalQueryValue::Text("pages/Page044.md".into())],
         )
         .expect("the stored inventory position is readable");
@@ -1967,19 +1971,12 @@ fn inconsistent_page_result_metadata_fails_instead_of_shrinking_the_answer() {
     let page = "pages/Page000.md";
     let damages = [
         (
-            "missing-result",
-            "DELETE FROM query_page_results WHERE page_id = \
-             (SELECT page_id FROM pages WHERE path = ?1)",
-        ),
-        (
             "missing-order",
-            "DELETE FROM query_page_order WHERE page_id = \
-             (SELECT page_id FROM pages WHERE path = ?1)",
+            "UPDATE pages SET position = NULL WHERE path = ?1",
         ),
         (
             "count",
-            "UPDATE query_page_results SET property_count = property_count + 1 WHERE page_id = \
-             (SELECT page_id FROM pages WHERE path = ?1)",
+            "UPDATE pages SET property_count = property_count + 1 WHERE path = ?1",
         ),
         (
             "ordinal",
@@ -1988,13 +1985,12 @@ fn inconsistent_page_result_metadata_fails_instead_of_shrinking_the_answer() {
         ),
         (
             "owner",
-            "UPDATE properties SET page_id = zeroblob(16) WHERE owner_type = 0 AND ordinal = 0 \
+            "UPDATE properties SET page_id = -999 WHERE owner_type = 0 AND ordinal = 0 \
              AND owner_id = (SELECT page_id FROM pages WHERE path = ?1)",
         ),
         (
             "estimate",
-            "UPDATE query_page_results SET estimated_bytes = estimated_bytes + 1 WHERE page_id = \
-             (SELECT page_id FROM pages WHERE path = ?1)",
+            "UPDATE pages SET estimated_bytes = estimated_bytes + 1 WHERE path = ?1",
         ),
     ];
     for (tag, damage) in damages {
@@ -2017,8 +2013,8 @@ fn every_missing_required_row_fails_the_read_rather_than_shortening_it() {
     let corpus = Corpus::open(root, true);
 
     // The shape is the fast corpus's TAGGED root block, so one query reaches a
-    // block that has a `query_block_results` row, a `block_text` row, a `tags`
-    // row and a page with a `query_page_order` row.
+    // block that has compact owner metadata, a `block_text` row, a `tags`
+    // row and a page with a stored position.
     let source = "#inline-tag";
     let dialect = QueryDialect::Og;
     let healthy = read_answer(
@@ -2037,20 +2033,20 @@ fn every_missing_required_row_fails_the_read_rather_than_shortening_it() {
         .flat_map(|group| group.blocks.iter())
         .collect();
     assert_eq!(admitted.len(), 1, "the damage fixture admits one block");
-    let block_id = uuid::Uuid::parse_str(&admitted[0].id)
-        .expect("an admitted id is a uuid")
-        .into_bytes()
-        .to_vec();
+    let block_id: i64 = rusqlite::Connection::open(corpus.projection_path())
+        .unwrap()
+        .query_row(
+            "SELECT block_id FROM blocks WHERE result_id = ?1",
+            rusqlite::params![&admitted[0].id],
+            |row| row.get(0),
+        )
+        .expect("the public result id resolves to its private coordinate");
     assert!(
         !admitted[0].tags.is_empty(),
         "the damaged block must carry a tag"
     );
 
-    let damages: [(&str, &str); 4] = [
-        (
-            "result",
-            "DELETE FROM query_block_results WHERE block_id = ?1",
-        ),
+    let damages: [(&str, &str); 3] = [
         ("text", "DELETE FROM block_text WHERE block_id = ?1"),
         (
             "tag",
@@ -2058,7 +2054,7 @@ fn every_missing_required_row_fails_the_read_rather_than_shortening_it() {
         ),
         (
             "order",
-            "DELETE FROM query_page_order WHERE page_id = \
+            "UPDATE pages SET position = NULL WHERE page_id = \
              (SELECT page_id FROM blocks WHERE block_id = ?1)",
         ),
     ];
@@ -2105,7 +2101,7 @@ fn a_missing_page_row_fails_the_read() {
         QueryDialect::Og,
         "page",
         false,
-        "DELETE FROM pages WHERE name = ?1",
+        "DELETE FROM pages WHERE name_id IN (SELECT name_id FROM names WHERE raw = ?1)",
         rusqlite::params!["refs"],
     ) {
         Err(ResultReadError::Corrupt(_)) => {}
@@ -2127,17 +2123,17 @@ fn a_missing_page_row_fails_the_read() {
 /// STRONGER than a live edit for the arithmetic under test: a live edit
 /// preserves a 36-byte canonical UUID, so it could not distinguish a correct
 /// identity-term adjustment from one that assumed 36 everywhere.
-fn preserve_ids_on_one_page(path: &Path, page: &str) -> ([u8; 16], usize) {
+fn preserve_ids_on_one_page(path: &Path, page: &str) -> (String, usize) {
     let writer = rusqlite::Connection::open(path).expect("the copy opens writable");
-    let page_id: Vec<u8> = writer
+    let (page_id, page_path): (i64, String) = writer
         .query_row(
-            "SELECT page_id FROM pages WHERE name = ?1",
+            "SELECT p.page_id, p.path FROM pages p JOIN names n ON n.name_id = p.name_id WHERE n.raw = ?1",
             rusqlite::params![page],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("the fixture page exists");
-    let rows: Vec<(Vec<u8>, String, i64)> = writer
-        .prepare("SELECT block_id, result_id, estimated_bytes FROM query_block_results WHERE page_id = ?1")
+    let rows: Vec<(i64, String, i64)> = writer
+        .prepare("SELECT block_id, result_id, estimated_bytes FROM blocks WHERE page_id = ?1")
         .expect("the metadata is readable")
         .query_map(rusqlite::params![page_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -2153,16 +2149,13 @@ fn preserve_ids_on_one_page(path: &Path, page: &str) -> ([u8; 16], usize) {
         let adjusted = estimated - result_id.len() as i64 + preserved.len() as i64;
         writer
             .execute(
-                "UPDATE query_block_results SET result_id = ?1, estimated_bytes = ?2 \
+                "UPDATE blocks SET result_id = ?1, estimated_bytes = ?2 \
                  WHERE block_id = ?3",
                 rusqlite::params![preserved, adjusted, block_id],
             )
             .expect("the preserved identity writes");
     }
-    (
-        page_id.as_slice().try_into().expect("a 16-byte page id"),
-        count,
-    )
+    (page_path, count)
 }
 
 #[test]
@@ -2314,7 +2307,7 @@ fn an_impossible_stored_estimate_fails_the_read() {
     {
         let writer = rusqlite::Connection::open(&path).expect("the copy opens writable");
         writer
-            .execute("UPDATE query_block_results SET estimated_bytes = 0", [])
+            .execute("UPDATE blocks SET estimated_bytes = 0", [])
             .expect("the damage applies");
     }
     let (_query, statement) =
@@ -2477,7 +2470,7 @@ fn the_descriptor_statement_wraps_every_lowered_shape() {
         assert!(
             descriptor
                 .sql
-                .contains("LEFT JOIN pages p ON p.page_id = r.page_id"),
+                .contains("LEFT JOIN qe_order_pages p ON p.page_id = r.page_id"),
             "{source}: the descriptor read re-joins pages itself, LEFT"
         );
         snapshot

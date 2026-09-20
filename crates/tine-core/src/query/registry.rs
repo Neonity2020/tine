@@ -41,7 +41,8 @@ pub enum OwnerType {
 
 /// One property row, with the ids widened to opaque snapshot-scoped strings so
 /// ONE producer serves both sources: the Direct Files projection identifies
-/// owners by `[u8; 16]`, and the cold document walk has no stored id at all.
+/// owners by opaque integer coordinates, and the cold document walk has no
+/// stored coordinate at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerRow {
     pub owner_type: OwnerType,
@@ -412,7 +413,7 @@ pub fn owner_property_atoms(
     properties: &[(String, String)],
     format: AtomFormat,
     config: &ParseConfig,
-) -> Vec<(String, Vec<Atom>)> {
+) -> Vec<(String, String, Vec<Atom>)> {
     let mut groups: BTreeMap<String, (String, Vec<(u32, &str)>)> = BTreeMap::new();
     for (at, (name, value)) in properties.iter().enumerate() {
         let normalized = property_key_norm(name);
@@ -428,7 +429,7 @@ pub fn owner_property_atoms(
         .into_iter()
         .map(|(normalized, (source_name, rows))| {
             let atoms = flatten_property_atoms(&source_name, &rows, format, config);
-            (normalized, atoms)
+            (source_name, normalized, atoms)
         })
         .collect()
 }

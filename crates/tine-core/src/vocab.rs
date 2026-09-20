@@ -188,7 +188,7 @@ pub(crate) struct ReferenceCandidatePages {
     /// every block of every candidate page", which is what every caller did
     /// before this field existed, so the walk is the behaviour a partial or
     /// absent index falls back to rather than a lossy shortcut.
-    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
+    pub blocks: Option<std::collections::HashSet<String>>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub indexed: bool,
     #[cfg_attr(not(test), allow(dead_code))]

@@ -347,7 +347,7 @@ fn backlink_filter_context_scopes_alias_cycles_collisions_and_hydration() {
     fs::write(dir.join("pages/Z.md"), "alias:: B\n\n- Z\n").unwrap();
     fs::write(
         dir.join("pages/SourceOne.md"),
-        "- exact needle [[A]] [[B]] [[Outside]]\n",
+        "- exact needle [[A]] [[B]] [[b]] [[Outside]]\n",
     )
     .unwrap();
     fs::write(
@@ -382,7 +382,9 @@ fn backlink_filter_context_scopes_alias_cycles_collisions_and_hydration() {
     wait_for_backlink_filter_projection(&graph);
     graph.reset_direct_projection_candidate_probe_test();
 
-    let context = backlink_filter_context(&graph, "B", &targets, "exact needle").unwrap();
+    let context = backlink_filter_context(&graph, "B", &targets, "exact needle").expect(
+        "a differently cased dictionary spelling must not produce a null-path/text-name row",
+    );
     assert_eq!(context.entries.len(), 2);
     assert!(context.entries.iter().all(|entry| entry.text_matches));
     let facets = context
@@ -636,10 +638,10 @@ fn backlink_filter_context_source_keeps_projection_setup_scoped() {
 
     let direct_source = include_str!("model/direct_query.rs");
     for required in [
-        "INDEXED BY pages_name_key_idx",
-        "WHERE page.name_key = ?1 AND page.text_kind = 1",
-        "INDEXED BY reference_postings_normalized_name_idx",
+        "INDEXED BY pages_name_idx",
+        "WHERE page_name.key = ?1 AND page.text_kind = 1",
         "INDEXED BY reference_alias_declarations_source_idx",
+        "INDEXED BY reference_alias_declarations_name_idx",
         "WITH requested(text_kind, name_key) AS (VALUES",
         "direct_projection_pages_for_sources",
     ] {

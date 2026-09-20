@@ -670,7 +670,7 @@ fn is_properties_only(raw: &str) -> bool {
 /// page-property rules as [`page_aliases`]. Keeping this extraction shared also
 /// lets cache invalidation compare the old and new semantic alias sets instead
 /// of treating the mere presence of an unchanged `alias::` line as a change.
-pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
+pub(crate) fn document_alias_spellings(doc: &Document) -> Vec<(String, String)> {
     let alias_text: Option<&str> = match &doc.pre_block {
         Some(pre) => Some(pre.as_str()),
         // No pre-block: a properties-only FIRST block is the page-properties
@@ -696,7 +696,7 @@ pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
                 for alias in v.split([',', '，']) {
                     let alias = strip_ref(alias.trim());
                     if !alias.is_empty() {
-                        aliases.push(refs::page_key(&alias));
+                        aliases.push((alias.clone(), refs::page_key(&alias)));
                     }
                 }
             }
@@ -704,6 +704,16 @@ pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
     }
     // Ordering and duplicate spelling do not alter alias resolution. Comparing
     // the semantic set avoids graph-wide invalidation for harmless formatting.
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases
+}
+
+pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
+    let mut aliases = document_alias_spellings(doc)
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect::<Vec<_>>();
     aliases.sort_unstable();
     aliases.dedup();
     aliases
@@ -1054,15 +1064,12 @@ fn collect_reference_occurrences_bounded<G: QueryGraph>(
 /// it), so it cannot be in the set, and dropping it here would lose a row the
 /// walk would have found.
 fn candidate_blocks_admit(
-    blocks: Option<&std::collections::HashSet<[u8; 16]>>,
+    blocks: Option<&std::collections::HashSet<String>>,
     block: &DocBlock,
 ) -> bool {
     let admitted = match blocks {
         None => true,
-        Some(blocks) => match uuid::Uuid::parse_str(&block.uuid) {
-            Ok(uuid) => blocks.contains(uuid.as_bytes()),
-            Err(_) => true,
-        },
+        Some(blocks) => blocks.contains(&block.uuid),
     };
     #[cfg(test)]
     if admitted {

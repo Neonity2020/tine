@@ -32,8 +32,9 @@ pub fn property_atom_rows(
 ) -> Vec<PhysicalPropertyAtom> {
     owner_property_atoms(properties, format, config)
         .into_iter()
-        .flat_map(|(normalized_name, atoms)| {
+        .flat_map(|(name, normalized_name, atoms)| {
             atoms.into_iter().map(move |atom| PhysicalPropertyAtom {
+                name: name.clone(),
                 normalized_name: normalized_name.clone(),
                 ordinal: atom.ordinal,
                 atom: atom.text,

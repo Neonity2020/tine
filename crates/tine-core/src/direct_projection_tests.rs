@@ -1195,7 +1195,7 @@ fn a_rebuild_drains_a_live_query_job_before_touching_the_file() {
     // R6: the cold open streamed a fresh parse (structural ids), so the
     // page holds no live-id claim; only a live save adds one.
     assert!(
-        !job.session_pages.contains(&page_id("pages/source.md")),
+        !job.session_pages.contains("pages/source.md"),
         "a streamed structural lowering claims no live ids"
     );
     let mut rows = 0usize;
@@ -1291,12 +1291,12 @@ fn session_pages_name_exactly_the_pages_this_process_lowered() {
     std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
     std::fs::write(root.join("pages/two.md"), "- DONE two\n").unwrap();
     let database = scratch("session-pages-db").join("projection.sqlite");
-    let ids = |graph: &Graph, names: &[&str]| -> HashSet<[u8; 16]> {
+    let ids = |graph: &Graph, names: &[&str]| -> HashSet<String> {
         graph
             .list_pages()
             .into_iter()
             .filter(|entry| names.contains(&entry.name.as_str()))
-            .map(|entry| page_id(&entry.rel_path))
+            .map(|entry| entry.rel_path)
             .collect()
     };
 
@@ -2800,16 +2800,16 @@ fn coalesced_edits_keep_first_insertion_page_order_and_readds_append() {
         document: Arc::new(crate::doc::parse("- text")),
         revision: "exact-revision".into(),
         parse_config: Arc::new(ParseConfig::default()),
-        query_page_order: None,
+        page_position: None,
         identity: DeltaIdentity::Live,
     };
     let position = |pending: &PendingProjection, name: &str| match &pending.deltas
         [&format!("pages/{name}.md")]
         .1
     {
-        PageDelta::Replace {
-            query_page_order, ..
-        } => query_page_order.expect("a delta outside a warm stream carries its position"),
+        PageDelta::Replace { page_position, .. } => {
+            page_position.expect("a delta outside a warm stream carries its position")
+        }
         _ => panic!("replacement expected"),
     };
     let mut pending = PendingProjection::default();
@@ -3124,7 +3124,7 @@ fn a_full_build_sizes_the_writer_cache_and_hands_it_back() {
                 document: Arc::new(document),
                 revision: "sha256:alpha.md:2".to_owned(),
                 parse_config: Arc::new(ParseConfig::default()),
-                query_page_order: Some(0),
+                page_position: Some(0),
                 identity: DeltaIdentity::Live,
             },
         ),
@@ -3175,7 +3175,7 @@ fn each_queued_page_lowers_under_the_config_it_was_queued_with() {
                     }),
                     revision: format!("sha256:{rel_path}"),
                     parse_config: Arc::clone(parse_config),
-                    query_page_order: Some(u64::from(rel_path == "beta.md")),
+                    page_position: Some(u64::from(rel_path == "beta.md")),
                     identity: DeltaIdentity::Live,
                 },
             ),
@@ -3191,11 +3191,11 @@ fn each_queued_page_lowers_under_the_config_it_was_queued_with() {
         database
             .source_delta(&[
                 PhysicalGraphProjectionSourceRevision {
-                    page_id: page_id("alpha.md"),
+                    path: "alpha.md".into(),
                     revision: projection_source_revision("sha256:alpha.md", alpha.digest()),
                 },
                 PhysicalGraphProjectionSourceRevision {
-                    page_id: page_id("beta.md"),
+                    path: "beta.md".into(),
                     revision: projection_source_revision("sha256:beta.md", beta.digest()),
                 },
             ])
@@ -3321,7 +3321,7 @@ fn storage_contract_names_the_generation_bound_cutover() {
             "Older coherent reads cannot overwrite newer publications or clear newer dirty keys",
             "Ready query selection\nand result construction load NO `Document`, read NO source text and consult no\nparsed graph.",
             "Recovery source-inventory work is counted separately.",
-            "Its descriptor wrapper does: Direct\nblock answers carry `query_page_order.position` and\n`query_block_results.preorder` and end with `ORDER BY` on those columns",
+            "Its descriptor wrapper does: Direct\nblock answers carry `pages.position` and\n`blocks.preorder` and end with `ORDER BY` on those columns",
             "Missing Direct order metadata\nfails the read",
             "Page results carry physical graph-relative `path`",
             "the complete saved sort and `COUNT(*) OVER()` before its row limit",
@@ -3940,13 +3940,14 @@ fn query_registry_snapshot_rejects_orphaned_property_owners() {
     damage.execute("DELETE FROM blocks", []).unwrap();
     drop(damage);
     let projection = graph.direct_projection_test().unwrap();
-    // The old row adapter accepted this impossible owner: pin the failure
-    // scenario independently of the new visitor's implementation.
-    assert!(!projection
-        .property_owner_rows(graph.cache_generation())
-        .unwrap()
-        .0
-        .is_empty());
+    // The typed physical cursor rejects the impossible owner before the
+    // registry adapter can publish a partial row stream.
+    assert!(
+        projection
+            .property_owner_rows(graph.cache_generation())
+            .is_none(),
+        "an orphaned integer owner must fail the physical registry read"
+    );
     let QueryJobOpen::Job(mut job) = projection.open_query_job(graph.cache_generation()) else {
         panic!("the schema still opens before corrupt ownership is inspected");
     };
@@ -5103,7 +5104,7 @@ fn session_identity_survives_parsed_page_eviction() {
         .into_iter()
         .find(|entry| entry.name == "one")
         .unwrap();
-    let one = page_id(&entry.rel_path);
+    let one = entry.rel_path.clone();
     let mut page = graph.load_page(&entry).unwrap();
     let baseline = page.rev.clone();
     let kept = page.blocks[0].clone();
@@ -5135,8 +5136,8 @@ fn session_identity_survives_parsed_page_eviction() {
     assert_eq!(
         writer
             .execute(
-                "DELETE FROM direct_source_revisions WHERE page_id = ?1",
-                rusqlite::params![one.as_slice()]
+                "DELETE FROM direct_source_revisions WHERE path = ?1",
+                rusqlite::params![one]
             )
             .unwrap(),
         1
@@ -5293,7 +5294,7 @@ fn query_job_capture_waits_for_post_commit_identity_publication() {
     let (commit_wake, commits) = std::sync::mpsc::channel();
     projection.observe_commits(commit_wake);
     let entry = graph.list_pages().into_iter().next().unwrap();
-    let id = page_id(&entry.rel_path);
+    let id = entry.rel_path.clone();
     assert!(!projection.session_pages_test().contains(&id));
     // Build the edit fixture without enqueueing load_page's ordinary
     // watcher delta on the producer whose first identity transition this
@@ -5418,15 +5419,15 @@ fn query_job_snapshot_is_captured_on_the_projection_worker() {
 #[test]
 fn a_structural_relower_drops_the_session_identity() {
     let shared = empty_projection_shared();
-    let a = page_id("pages/a.md");
-    let b = page_id("pages/b.md");
+    let a = "pages/a.md".to_owned();
+    let b = "pages/b.md".to_owned();
     shared.record_session_pages(&AppliedPages {
-        lowered: vec![a, b],
+        lowered: vec![a.clone(), b.clone()],
         ..AppliedPages::default()
     });
     assert_eq!(
         **shared.session_pages.lock().unwrap(),
-        HashSet::from([a, b])
+        HashSet::from([a.clone(), b.clone()])
     );
     shared.record_session_pages(&AppliedPages {
         relowered_structurally: vec![a],
@@ -6924,7 +6925,7 @@ fn a_page_the_walk_could_not_read_keeps_the_rows_it_already_had() {
 
 /// GH #543 (re-audit A2-N2): `retained` keeps an unreadable page's EXISTING
 /// rows — but on a COLD or just-reset index that page has no rows at all, and
-/// naming it in the order inventory broke `reconcile_query_page_order`'s
+/// naming it in the order inventory broke the storage order reconciler's
 /// exact-cover requirement. The worker read that bookkeeping mismatch as a
 /// failed projection turn: `worker_failed`, readiness revoked, a full rebuild
 /// demanded. One unreadable file failed indexing for the whole graph.

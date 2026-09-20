@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 
 use tine_storage::sqlite::{
-    MaterializationError, PhysicalPage, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
+    MaterializationError, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
 };
 
 use crate::config::ParseConfig;
@@ -21,39 +21,42 @@ use crate::query::registry::{
 };
 use crate::query::{QueryExecutionError, QueryUnavailableReason};
 
-const FULL_PAGES_SQL: &str = "SELECT page_id, path, name, text_kind FROM pages";
+const FULL_PAGES_SQL: &str =
+    "SELECT p.page_id, p.path, n.raw, p.text_kind FROM pages p JOIN names n ON n.name_id = p.name_id";
 
-const FULL_PROPERTIES_SQL: &str =
-    "SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
+const FULL_PROPERTIES_SQL: &str = "SELECT o.owner_type, o.owner_id, o.page_id, n.raw, n.key, \
      o.value, o.ordinal, b.page_id FROM properties o \
+     JOIN names n ON n.name_id = o.name_id \
      LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id \
-     ORDER BY o.owner_type, o.owner_id, o.name, o.ordinal";
+     ORDER BY o.owner_type, o.owner_id, o.name_id, o.ordinal";
 
-const PATCH_ROWS_SQL: &str =
-    "SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
-     o.value, o.ordinal, b.page_id, p.path, p.name, p.text_kind \
+const PATCH_ROWS_SQL: &str = "SELECT o.owner_type, o.owner_id, o.page_id, n.raw, n.key, \
+     o.value, o.ordinal, b.page_id, p.path, pn.raw, p.text_kind \
      FROM properties o \
+     JOIN names n ON n.name_id = o.name_id \
      LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id \
      LEFT JOIN pages p ON p.page_id = o.page_id \
-     WHERE o.normalized_name = ?1 \
-     ORDER BY o.owner_type, o.owner_id, o.name, o.ordinal";
+     LEFT JOIN names pn ON pn.name_id = p.name_id \
+     WHERE n.key = ?1 \
+     ORDER BY o.owner_type, o.owner_id, o.name_id, o.ordinal";
 
-const PATCH_DECLARATIONS_SQL: &str =
-    "SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
-     o.value, o.ordinal, b.page_id, p.path, p.name, p.text_kind \
+const PATCH_DECLARATIONS_SQL: &str = "SELECT o.owner_type, o.owner_id, o.page_id, n.raw, n.key, \
+     o.value, o.ordinal, b.page_id, p.path, pn.raw, p.text_kind \
      FROM properties o \
+     JOIN names n ON n.name_id = o.name_id \
      LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id \
      LEFT JOIN pages p ON p.page_id = o.page_id \
-     WHERE o.normalized_name = ?1 AND o.owner_type = 0 \
-     ORDER BY o.owner_type, o.owner_id, o.name, o.ordinal";
+     LEFT JOIN names pn ON pn.name_id = p.name_id \
+     WHERE n.key = ?1 AND o.owner_type = 0 \
+     ORDER BY o.owner_type, o.owner_id, o.name_id, o.ordinal";
 
 const PAGE_METADATA_BATCH_SIZE: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RegistryPropertyMetadata {
     pub(crate) owner_type: OwnerType,
-    pub(crate) owner_id: [u8; 16],
-    pub(crate) page_id: [u8; 16],
+    pub(crate) owner_id: i64,
+    pub(crate) page_id: i64,
     pub(crate) source_name: String,
     pub(crate) normalized_name: String,
     pub(crate) value: String,
@@ -62,12 +65,12 @@ pub(crate) struct RegistryPropertyMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryPageMetadata {
-    pub(crate) page_id: [u8; 16],
+    pub(crate) page_id: i64,
     pub(crate) page: PageMeta,
     pub(crate) properties: Vec<RegistryPropertyMetadata>,
 }
 
-pub(crate) type PageRegistryMetadata = BTreeMap<[u8; 16], RegistryPageMetadata>;
+pub(crate) type PageRegistryMetadata = BTreeMap<String, RegistryPageMetadata>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RegistryChanges {
@@ -103,7 +106,7 @@ pub(crate) fn read_registry(
     check_cancelled(snapshot)?;
     let mut pages = HashMap::new();
     visit(snapshot, FULL_PAGES_SQL, &[], |row| {
-        let id = page_key(blob16(row, 0, "pages.page_id")?);
+        let id = page_key(integer(row, 0, "pages.page_id")?);
         let meta = decode_page_meta(row, 1, 2, 3)?;
         if pages.insert(id, meta).is_some() {
             return Err("duplicate registry page".into());
@@ -186,20 +189,20 @@ pub(crate) fn patch_registry_from_snapshot(
 /// orphan property instead of silently treating it as a missing page.
 pub(crate) fn read_page_registry_metadata(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
-    ids: &BTreeSet<[u8; 16]>,
+    paths: &BTreeSet<String>,
 ) -> Result<PageRegistryMetadata, QueryExecutionError> {
     check_cancelled(snapshot)?;
-    if ids.is_empty() {
+    if paths.is_empty() {
         return Ok(BTreeMap::new());
     }
 
     let mut pages = BTreeMap::new();
-    let ids = ids.iter().copied().collect::<Vec<_>>();
-    for batch in ids.chunks(PAGE_METADATA_BATCH_SIZE) {
+    let paths = paths.iter().collect::<Vec<_>>();
+    for batch in paths.chunks(PAGE_METADATA_BATCH_SIZE) {
         let sql = page_metadata_sql(batch.len());
         let parameters = batch
             .iter()
-            .map(|id| PhysicalQueryValue::Blob(id.to_vec()))
+            .map(|path| PhysicalQueryValue::Text((*path).clone()))
             .collect::<Vec<_>>();
         visit(snapshot, &sql, &parameters, |row| {
             collect_page_metadata_row(row, &mut pages)
@@ -212,41 +215,6 @@ pub(crate) fn read_page_registry_metadata(
     Ok(pages)
 }
 
-/// Produce the same registry metadata that inserting `page` writes to the
-/// physical projection. Property ordinals come from owner-local vector order,
-/// exactly as tine-storage's insertion loop assigns them.
-pub(crate) fn registry_metadata_from_physical_page(
-    page: &PhysicalPage,
-) -> Result<RegistryPageMetadata, String> {
-    let page_meta = PageMeta {
-        format: crate::vocab::Format::from_path(Path::new(&page.path)).into(),
-        name: page.name.clone(),
-    };
-    let mut properties = Vec::new();
-    append_physical_properties(
-        &mut properties,
-        OwnerType::Page,
-        page.page_id,
-        page.page_id,
-        &page.properties,
-    )?;
-    for block in &page.blocks {
-        append_physical_properties(
-            &mut properties,
-            OwnerType::Block,
-            block.block_id,
-            page.page_id,
-            &block.properties,
-        )?;
-    }
-    properties.sort();
-    Ok(RegistryPageMetadata {
-        page_id: page.page_id,
-        page: page_meta,
-        properties,
-    })
-}
-
 /// Compare exact before/after page metadata and return the smallest registry
 /// inputs whose aggregate rows or declaration binding can have changed.
 pub(crate) fn registry_changes(
@@ -257,7 +225,7 @@ pub(crate) fn registry_changes(
     let page_ids = before
         .keys()
         .chain(after.keys())
-        .copied()
+        .cloned()
         .collect::<BTreeSet<_>>();
     for page_id in page_ids {
         let old = before.get(&page_id);
@@ -312,13 +280,15 @@ fn page_metadata_sql(count: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "WITH requested(page_id) AS (VALUES {values}) \
-         SELECT o.owner_type, o.owner_id, o.page_id, o.name, o.normalized_name, \
-         o.value, o.ordinal, b.page_id, p.path, p.name, p.text_kind, \
-         requested.page_id, p.page_id \
+        "WITH requested(path) AS (VALUES {values}) \
+         SELECT o.owner_type, o.owner_id, o.page_id, n.raw, n.key, \
+         o.value, o.ordinal, b.page_id, p.path, pn.raw, p.text_kind, \
+         requested.path, p.page_id \
          FROM requested \
-         LEFT JOIN pages p ON p.page_id = requested.page_id \
-         LEFT JOIN properties o ON o.page_id = requested.page_id \
+         LEFT JOIN pages p ON p.path = requested.path \
+         LEFT JOIN names pn ON pn.name_id = p.name_id \
+         LEFT JOIN properties o ON o.page_id = p.page_id \
+         LEFT JOIN names n ON n.name_id = o.name_id \
          LEFT JOIN blocks b ON o.owner_type = 1 AND b.block_id = o.owner_id"
     )
 }
@@ -327,21 +297,19 @@ fn collect_page_metadata_row(
     row: &[PhysicalQueryValue],
     pages: &mut PageRegistryMetadata,
 ) -> Result<(), String> {
-    let requested_id = blob16(row, 11, "requested.page_id")?;
+    let requested_path = text(row, 11, "requested.path")?;
     if is_null(row, 12) {
         if !is_null(row, 0) {
             return Err("registry property names an absent page".into());
         }
         return Ok(());
     }
-    if blob16(row, 12, "pages.page_id")? != requested_id {
-        return Err("registry page identity mismatch".into());
-    }
+    let page_id = integer(row, 12, "pages.page_id")?;
     let meta = decode_page_meta(row, 8, 9, 10)?;
     let page = pages
-        .entry(requested_id)
+        .entry(requested_path)
         .or_insert_with(|| RegistryPageMetadata {
-            page_id: requested_id,
+            page_id,
             page: meta.clone(),
             properties: Vec::new(),
         });
@@ -350,40 +318,18 @@ fn collect_page_metadata_row(
     }
     if !is_null(row, 0) {
         let decoded = decode_owner_row(row)?;
-        let page_id = blob16(row, 2, "properties.page_id")?;
-        if page_id != requested_id {
+        let property_page_id = integer(row, 2, "properties.page_id")?;
+        if property_page_id != page_id {
             return Err("registry property page identity mismatch".into());
         }
         page.properties.push(RegistryPropertyMetadata {
             owner_type: decoded.owner_type,
-            owner_id: blob16(row, 1, "properties.owner_id")?,
-            page_id,
+            owner_id: integer(row, 1, "properties.owner_id")?,
+            page_id: property_page_id,
             source_name: decoded.source_name,
             normalized_name: decoded.normalized_name,
             value: decoded.value,
             ordinal: decoded.ordinal,
-        });
-    }
-    Ok(())
-}
-
-fn append_physical_properties(
-    out: &mut Vec<RegistryPropertyMetadata>,
-    owner_type: OwnerType,
-    owner_id: [u8; 16],
-    page_id: [u8; 16],
-    properties: &[tine_storage::sqlite::PhysicalProperty],
-) -> Result<(), String> {
-    for (ordinal, property) in properties.iter().enumerate() {
-        out.push(RegistryPropertyMetadata {
-            owner_type,
-            owner_id,
-            page_id,
-            source_name: property.name.clone(),
-            normalized_name: property.normalized_name.clone(),
-            value: property.value.clone(),
-            ordinal: u32::try_from(ordinal)
-                .map_err(|_| "physical property ordinal overflowed".to_owned())?,
         });
     }
     Ok(())
@@ -452,16 +398,16 @@ fn collect_joined_row(
 /// streams. Ownership validation lives here once so neither adapter can omit
 /// an absent block, mismatched page owner, or invalid ordinal.
 fn decode_owner_row(row: &[PhysicalQueryValue]) -> Result<OwnerRow, String> {
-    let owner_id = blob16(row, 1, "properties.owner_id")?;
-    let page_id = blob16(row, 2, "properties.page_id")?;
+    let owner_id = integer(row, 1, "properties.owner_id")?;
+    let page_id = integer(row, 2, "properties.page_id")?;
     let (owner_type, prefix) = match integer(row, 0, "properties.owner_type")? {
         0 if owner_id == page_id => (OwnerType::Page, "p"),
-        1 if blob16(row, 7, "blocks.page_id")? == page_id => (OwnerType::Block, "b"),
+        1 if integer(row, 7, "blocks.page_id")? == page_id => (OwnerType::Block, "b"),
         _ => return Err("invalid registry property ownership".into()),
     };
     Ok(OwnerRow {
         owner_type,
-        owner_id: format!("{prefix}:{}", hex16(owner_id)),
+        owner_id: format!("{prefix}:{owner_id}"),
         page_id: page_key(page_id),
         source_name: text(row, 3, "properties.name")?,
         normalized_name: text(row, 4, "properties.normalized_name")?,
@@ -489,19 +435,8 @@ fn decode_page_meta(
 }
 
 /// The projection registry's opaque snapshot-scoped page identity.
-pub(crate) fn page_key(id: [u8; 16]) -> String {
-    format!("page:{}", hex16(id))
-}
-
-/// The opaque physical-id spelling shared by the SQL reader and the retained
-/// Direct facet adapter until that older adapter is retired.
-pub(crate) fn hex16(id: [u8; 16]) -> String {
-    let mut out = String::with_capacity(32);
-    for byte in id {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+pub(crate) fn page_key(id: i64) -> String {
+    format!("page:{id}")
 }
 
 fn text(row: &[PhysicalQueryValue], at: usize, field: &str) -> Result<String, String> {
@@ -514,15 +449,6 @@ fn text(row: &[PhysicalQueryValue], at: usize, field: &str) -> Result<String, St
 fn integer(row: &[PhysicalQueryValue], at: usize, field: &str) -> Result<i64, String> {
     match row.get(at) {
         Some(PhysicalQueryValue::Integer(value)) => Ok(*value),
-        _ => Err(format!("invalid {field}")),
-    }
-}
-
-fn blob16(row: &[PhysicalQueryValue], at: usize, field: &str) -> Result<[u8; 16], String> {
-    match row.get(at) {
-        Some(PhysicalQueryValue::Blob(bytes)) if bytes.len() == 16 => {
-            Ok(bytes.as_slice().try_into().expect("a checked 16-byte id"))
-        }
         _ => Err(format!("invalid {field}")),
     }
 }
@@ -572,7 +498,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use tine_storage::sqlite::{
-        PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase, PhysicalProperty,
+        PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase, PhysicalPage,
+        PhysicalProperty,
     };
     use uuid::Uuid;
 
@@ -659,19 +586,48 @@ mod tests {
     }
 
     fn metadata_of(pages: &[PhysicalPage]) -> PageRegistryMetadata {
-        pages
-            .iter()
-            .map(|page| {
-                (
-                    page.page_id,
-                    registry_metadata_from_physical_page(page).unwrap(),
-                )
-            })
-            .collect()
+        let mut next_id = i64::try_from(pages.len()).unwrap() + 1;
+        let mut metadata = PageRegistryMetadata::new();
+        for (page_index, page) in pages.iter().enumerate() {
+            let page_id = i64::try_from(page_index).unwrap() + 1;
+            let mut properties = Vec::new();
+            let mut append = |owner_type, owner_id, rows: &[PhysicalProperty]| {
+                for (ordinal, property) in rows.iter().enumerate() {
+                    properties.push(RegistryPropertyMetadata {
+                        owner_type,
+                        owner_id,
+                        page_id,
+                        source_name: property.name.clone(),
+                        normalized_name: property.normalized_name.clone(),
+                        value: property.value.clone(),
+                        ordinal: ordinal as u32,
+                    });
+                }
+            };
+            append(OwnerType::Page, page_id, &page.properties);
+            for block in &page.blocks {
+                let block_id = next_id;
+                next_id += 1;
+                append(OwnerType::Block, block_id, &block.properties);
+            }
+            properties.sort();
+            metadata.insert(
+                page.path.clone(),
+                RegistryPageMetadata {
+                    page_id,
+                    page: PageMeta {
+                        format: crate::vocab::Format::from_path(Path::new(&page.path)).into(),
+                        name: page.name.clone(),
+                    },
+                    properties,
+                },
+            );
+        }
+        metadata
     }
 
-    fn requested(pages: &[PhysicalPage]) -> BTreeSet<[u8; 16]> {
-        pages.iter().map(|page| page.page_id).collect()
+    fn requested(pages: &[PhysicalPage]) -> BTreeSet<String> {
+        pages.iter().map(|page| page.path.clone()).collect()
     }
 
     fn affected(names: &[&str]) -> BTreeSet<String> {
@@ -697,11 +653,11 @@ mod tests {
         let expected = metadata_of(&pages);
         assert_eq!(actual, expected);
         assert_eq!(
-            actual[&pages[0].page_id].page.format,
+            actual[&pages[0].path].page.format,
             crate::query::atom::AtomFormat::Markdown
         );
         assert_eq!(
-            actual[&pages[1].page_id].page.format,
+            actual[&pages[1].path].page.format,
             crate::query::atom::AtomFormat::Org
         );
         assert!(actual.values().all(|page| {
@@ -742,7 +698,7 @@ mod tests {
         ] {
             let mut after = before.clone();
             let property = after
-                .get_mut(&old_page.page_id)
+                .get_mut(&old_page.path)
                 .unwrap()
                 .properties
                 .iter_mut()
@@ -757,7 +713,7 @@ mod tests {
 
         let mut removed = before.clone();
         removed
-            .get_mut(&old_page.page_id)
+            .get_mut(&old_page.path)
             .unwrap()
             .properties
             .retain(|property| metadata_key(property) != "beta");
@@ -788,14 +744,14 @@ mod tests {
         );
 
         let mut renamed = before.clone();
-        renamed.get_mut(&old_page.page_id).unwrap().page.name = "Renamed".into();
+        renamed.get_mut(&old_page.path).unwrap().page.name = "Renamed".into();
         assert_eq!(
             registry_changes(&before, &renamed),
             RegistryChanges::default()
         );
 
         let mut reformatted = before.clone();
-        reformatted.get_mut(&old_page.page_id).unwrap().page.format =
+        reformatted.get_mut(&old_page.path).unwrap().page.format =
             crate::query::atom::AtomFormat::Org;
         assert_eq!(
             registry_changes(&before, &reformatted).normalized_keys,
@@ -821,7 +777,7 @@ mod tests {
         );
 
         let mut renamed = changed_metadata.clone();
-        renamed.get_mut(&declaration.page_id).unwrap().page.name = "Points".into();
+        renamed.get_mut(&declaration.path).unwrap().page.name = "Points".into();
         assert_eq!(
             registry_changes(&changed_metadata, &renamed).declaration_page_names,
             affected(&["score", "Points"])
@@ -899,22 +855,22 @@ mod tests {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
-                "UPDATE properties SET value = '99' WHERE normalized_name = 'score' AND value = '1'",
+                "UPDATE properties SET value = '99' WHERE name_id IN (SELECT name_id FROM names WHERE key = 'score') AND value = '1'",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "UPDATE properties SET value = 'gamma, delta' WHERE normalized_name = 'mixed' AND value = 'alpha, beta'",
+                "UPDATE properties SET value = 'gamma, delta' WHERE name_id IN (SELECT name_id FROM names WHERE key = 'mixed') AND value = 'alpha, beta'",
                 [],
             )
             .unwrap();
         connection
-            .execute("DELETE FROM properties WHERE normalized_name = 'gone'", [])
+            .execute("DELETE FROM properties WHERE name_id IN (SELECT name_id FROM names WHERE key = 'gone')", [])
             .unwrap();
         connection
             .execute(
-                "UPDATE pages SET name = 'score' WHERE path IN ('pages/Declaration A.md', 'pages/Declaration B.md')",
+                "UPDATE pages SET name_id = (SELECT name_id FROM names WHERE key = 'score' ORDER BY name_id LIMIT 1) WHERE path IN ('pages/Declaration A.md', 'pages/Declaration B.md')",
                 [],
             )
             .unwrap();
@@ -980,7 +936,7 @@ mod tests {
         assert_eq!(
             connection
                 .execute(
-                    "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'unchanged'",
+                    "UPDATE properties SET ordinal = -1 WHERE name_id IN (SELECT name_id FROM names WHERE key = 'unchanged')",
                     [],
                 )
                 .unwrap(),
@@ -1076,15 +1032,15 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         assert_patch_rejects_damage(
             "missing-block",
-            "DELETE FROM blocks WHERE block_id IN (SELECT owner_id FROM properties WHERE owner_type = 1 AND normalized_name = 'score');",
+            "DELETE FROM blocks WHERE block_id IN (SELECT owner_id FROM properties WHERE owner_type = 1 AND name_id IN (SELECT name_id FROM names WHERE key = 'score'));",
         );
         assert_patch_rejects_damage(
             "missing-page",
-            "DELETE FROM pages WHERE page_id IN (SELECT page_id FROM properties WHERE normalized_name = 'score');",
+            "DELETE FROM pages WHERE page_id IN (SELECT page_id FROM properties WHERE name_id IN (SELECT name_id FROM names WHERE key = 'score'));",
         );
         assert_patch_rejects_damage(
             "invalid-ordinal",
-            "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'score';",
+            "UPDATE properties SET ordinal = -1 WHERE name_id IN (SELECT name_id FROM names WHERE key = 'score');",
         );
     }
 
@@ -1094,7 +1050,7 @@ mod tests {
             &format!("pages/{tag}.md"),
             "Score:: page\n\n- block\n  Score:: block\n",
         );
-        let page_id = page.page_id;
+        let page_path = page.path.clone();
         let (root, database) = store_pages(tag, &[page]);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
@@ -1103,7 +1059,7 @@ mod tests {
         connection.execute_batch(damage).unwrap();
         drop(connection);
         assert!(matches!(
-            read_page_registry_metadata(&mut open(&database), &BTreeSet::from([page_id])),
+            read_page_registry_metadata(&mut open(&database), &BTreeSet::from([page_path])),
             Err(QueryExecutionError::Unavailable(
                 QueryUnavailableReason::InvalidSnapshot
             ))
@@ -1116,15 +1072,15 @@ mod tests {
         let _serial = SERIAL.lock().unwrap();
         assert_metadata_rejects_damage(
             "metadata-owner",
-            "UPDATE properties SET owner_id = randomblob(16) WHERE owner_type = 0;",
+            "UPDATE properties SET owner_id = -999 WHERE owner_type = 0;",
         );
         assert_metadata_rejects_damage(
             "metadata-page",
-            "DELETE FROM pages WHERE page_id IN (SELECT page_id FROM properties LIMIT 1);",
+            "UPDATE blocks SET page_id = -999 WHERE block_id IN (SELECT owner_id FROM properties WHERE owner_type = 1 LIMIT 1);",
         );
         assert_metadata_rejects_damage(
             "metadata-ordinal",
-            "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'score';",
+            "UPDATE properties SET ordinal = -1 WHERE name_id IN (SELECT name_id FROM names WHERE key = 'score');",
         );
     }
 
@@ -1140,7 +1096,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "UPDATE properties SET ordinal = -1 WHERE normalized_name = 'broken'",
+                "UPDATE properties SET ordinal = -1 WHERE name_id IN (SELECT name_id FROM names WHERE key = 'broken')",
                 [],
             )
             .unwrap();
@@ -1149,7 +1105,7 @@ mod tests {
         reset_statement_count();
         let rows = read_page_registry_metadata(
             &mut open(&database),
-            &BTreeSet::from([wanted.page_id, [0xff; 16]]),
+            &BTreeSet::from([wanted.path.clone(), "pages/missing.md".into()]),
         )
         .unwrap();
         assert_eq!(rows, metadata_of(std::slice::from_ref(&wanted)));

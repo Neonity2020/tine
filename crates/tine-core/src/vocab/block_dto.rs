@@ -55,20 +55,6 @@ pub(crate) fn doc_has_content(blocks: &[DocBlock]) -> bool {
 const FILE_BLOCK_RUNTIME_NAMESPACE_V1: Uuid =
     Uuid::from_u128(0x1e0c_5a13_9b42_5da4_a73c_0be5_8f6a_2320);
 
-/// Versioned namespace for the projection key of a live runtime id that is not
-/// itself a UUID. A block created in the editor is saved with the frontend's
-/// own id (`src/store.ts` `freshId()`: `b<base36 time>-<counter>`), and the
-/// in-memory save path deliberately keeps it so the editor can go on addressing
-/// the block. Such an id is a store/UI key exactly like a structural one; the
-/// projection needs a 16-byte key for it, never a refusal.
-const LIVE_RUNTIME_ID_KEY_NAMESPACE_V1: Uuid =
-    Uuid::from_u128(0x7c2d_4b9e_31a6_4f08_9d15_6e3a_b0c4_5d71);
-
-/// The deterministic 16-byte projection key of a live, non-UUID runtime id.
-pub(crate) fn live_runtime_id_key(runtime_id: &str) -> Uuid {
-    deterministic_runtime_uuid(LIVE_RUNTIME_ID_KEY_NAMESPACE_V1, runtime_id.as_bytes())
-}
-
 fn normalized_runtime_owner(owner: &str) -> io::Result<String> {
     let owner = owner.replace('\\', "/");
     let mut parts = Vec::new();

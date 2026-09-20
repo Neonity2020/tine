@@ -69,7 +69,7 @@ fn two_property_conjuncts_lower_to_two_undecomposed_subqueries() {
     for fragment in statement.sql.split("FROM property_atoms").skip(1) {
         let head = fragment.split(')').next().unwrap_or_default();
         assert!(
-            head.contains(".normalized_name = ") && head.contains(".atom_key = "),
+            head.contains(".key = ") && head.contains(".atom_key = "),
             "a property subquery carries key and value together: {head}"
         );
     }
@@ -729,8 +729,10 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     let statement = lower_query(&query, &inputs(&registry));
     // The nested row contributes ONLY its own refs.
     assert!(
-        statement.sql.contains("block_own_refs or2")
-            && statement.sql.contains("or2.block_id = c1.block_id"),
+        statement.sql.contains("reference_postings or2")
+            && statement.sql.contains("or2.source_entity_id = c1.block_id")
+            && statement.sql.contains("or2.own = 1")
+            && statement.sql.contains("orn3.key = ?1"),
         "{}",
         statement.sql
     );
@@ -739,8 +741,9 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     assert!(
         statement.sql.contains(
             "(b.parent_block_id IS NOT NULL AND b.parent_block_id IN \
-                 (SELECT ar3.block_id FROM block_path_refs ar3 \
-                 WHERE (ar3.block_id = b.parent_block_id AND ar3.normalized_name = ?2)))"
+                 (SELECT ar4.block_id FROM block_path_refs ar4 \
+                 JOIN names arn5 ON arn5.name_id = ar4.name_id \
+                 WHERE (ar4.block_id = b.parent_block_id AND arn5.key = ?2)))"
         ),
         "{}",
         statement.sql
@@ -749,8 +752,9 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     // to carry it.
     assert!(
         statement.sql.contains(
-            "b.page_id IN (SELECT pr4.page_id FROM pages pr4 \
-             WHERE (pr4.page_id = b.page_id AND pr4.name_key <> '' AND pr4.name_key = ?3))"
+            "b.page_id IN (SELECT pr6.page_id FROM pages pr6 \
+             JOIN names prn7 ON prn7.name_id = pr6.name_id \
+             WHERE (pr6.page_id = b.page_id AND prn7.key <> '' AND prn7.key = ?3))"
         ),
         "{}",
         statement.sql
@@ -783,9 +787,9 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     );
     let statement = lower_query(&deep, &inputs(&registry));
     assert!(
-        statement.sql.contains("or3.block_id = c2.block_id")
-            && statement.sql.contains("ar4.block_id = b.parent_block_id")
-            && statement.sql.contains("pr5.page_id = b.page_id"),
+        statement.sql.contains("or3.source_entity_id = c2.block_id")
+            && statement.sql.contains("ar5.block_id = b.parent_block_id")
+            && statement.sql.contains("pr7.page_id = b.page_id"),
         "the grandchild's context is the anchor's, not its parent's: {}",
         statement.sql
     );
@@ -800,7 +804,7 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
         statement.sql
     );
     assert!(
-        !statement.sql.contains("block_own_refs"),
+        !statement.sql.contains("reference_postings"),
         "the anchor needs no union: {}",
         statement.sql
     );

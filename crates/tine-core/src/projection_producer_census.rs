@@ -1512,9 +1512,14 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-20: native linked-reference filtering adds one PhysicalQueryValue
     // import in model/direct_query.rs, twelve Text and one Integer patterns or
     // bindings for scoped read-only queries. No other inventory row changed.
+    // 2026-09-20: compact-projection P3a adapted projection DTO imports and
+    // calls from physical hash coordinates to public paths/result IDs and
+    // integer private coordinates, moved SQL bind sites from blobs to
+    // integers, and removed the retired blob decoder. The read/write call
+    // ownership and the write crossings asserted above are unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "18b4ec3437158fa690aec71843fcc63485a014fc8992f4fe925f8db2f45ba597",
+        "b973d94f09f9937ad98b0fa1f325cc282052744c3c9497e0b827aa3a7a9a345f",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

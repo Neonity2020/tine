@@ -80,13 +80,13 @@ const OWNER_BLOCK: i64 = 1;
 /// reproducible STRUCTURAL runtime ids, so its rows resolve through
 /// `doc_runtime_id_for_order(path, order_key)` — no document, no traversal. A
 /// page this session DID edit kept its live ids at an exact revision, so its
-/// rows use the stored `query_block_results.result_id`.
+/// rows use the stored `blocks.result_id`.
 ///
 /// The set is captured by the caller together with the snapshot; nothing here
 /// reads live state. `all_session` is the whole-graph shortcut for a session
 /// that owns every page's identity.
 pub(crate) struct ResultIdentity {
-    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    pub(crate) session_pages: Arc<HashSet<String>>,
     pub(crate) all_session: bool,
 }
 
@@ -116,8 +116,8 @@ impl ResultIdentity {
 /// snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ResultLocator {
-    pub(crate) page_id: [u8; 16],
-    pub(crate) block_id: [u8; 16],
+    pub(crate) page_id: i64,
+    pub(crate) block_id: i64,
 }
 
 /// What one admitted row is stored AS in its group.
@@ -518,7 +518,7 @@ pub(crate) fn read_page_results(
 /// One decoded `@page` descriptor, including the physical and census fields
 /// validated before its public payload is hydrated.
 pub(crate) struct PageResultDescriptor {
-    pub(crate) page_id: [u8; 16],
+    pub(crate) page_id: i64,
     pub(crate) name: String,
     pub(crate) kind: PageKind,
     pub(crate) journal_day: Option<i64>,
@@ -554,7 +554,7 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
             column::COLUMNS
         ));
     }
-    let page_id = blob16(row, column::PAGE_ID, "page row page_id")?;
+    let page_id = integer(row, column::PAGE_ID, "page row page_id")?;
     let name = text(row, column::NAME, "pages.name")?;
     let text_kind = integer(row, column::TEXT_KIND, "pages.text_kind")?;
     let Some(kind) = page_kind_from_sql(text_kind) else {
@@ -562,10 +562,10 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
     };
     let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
     let path = text(row, column::PATH, "pages.path")?;
-    let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
+    let position = opt_integer(row, column::POSITION, "pages.position")?;
     // Direct Files' page order IS this column (see `decode_descriptor`).
     if position.is_none() {
-        return Err("query_page_order has no position for a matched page".to_string());
+        return Err("pages.position is absent for a matched page".to_string());
     }
     Ok(PageResultDescriptor {
         page_id,
@@ -573,16 +573,8 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
         kind,
         journal_day,
         path,
-        estimated_bytes: count(
-            row,
-            column::ESTIMATED_BYTES,
-            "query_page_results.estimated_bytes",
-        )?,
-        property_count: count(
-            row,
-            column::PROPERTY_COUNT,
-            "query_page_results.property_count",
-        )?,
+        estimated_bytes: count(row, column::ESTIMATED_BYTES, "pages.estimated_bytes")?,
+        property_count: count(row, column::PROPERTY_COUNT, "pages.property_count")?,
         matched_total: count(row, column::MATCHED_TOTAL, "page matched count")?,
     })
 }
@@ -604,12 +596,13 @@ pub(crate) fn hydrate_page_rows(
         }
         let ids = batch
             .iter()
-            .map(|row| PhysicalQueryValue::Blob(row.page_id.to_vec()))
+            .map(|row| PhysicalQueryValue::Integer(row.page_id))
             .collect::<Vec<_>>();
         let sql = format!(
-            "SELECT owner_id, page_id, name, value, ordinal FROM properties \
-             WHERE owner_type = 0 AND owner_id IN ({}) \
-             ORDER BY owner_id, ordinal, name",
+            "SELECT property.owner_id, property.page_id, name.raw, property.value, property.ordinal \
+             FROM properties property JOIN names name ON name.name_id = property.name_id \
+             WHERE property.owner_type = 0 AND property.owner_id IN ({}) \
+             ORDER BY property.owner_id, property.ordinal, property.name_id",
             placeholders(ids.len())
         );
         #[cfg(test)]
@@ -617,17 +610,18 @@ pub(crate) fn hydrate_page_rows(
         let rows = crate::query::projection_sql::run(snapshot, &sql, &ids)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         let admitted = batch.iter().map(|row| row.page_id).collect::<HashSet<_>>();
-        let mut properties: HashMap<[u8; 16], Vec<(usize, String, String)>> = HashMap::new();
+        let mut properties: HashMap<i64, Vec<(usize, String, String)>> = HashMap::new();
         for row in &rows {
             #[cfg(test)]
             note(|census| census.page_payload_property_rows += 1);
-            let owner = blob16(row, 0, "properties.owner_id").map_err(ResultReadError::Corrupt)?;
+            let owner = integer(row, 0, "properties.owner_id").map_err(ResultReadError::Corrupt)?;
             if !admitted.contains(&owner) {
                 return Err(ResultReadError::Corrupt(
                     "a page property belongs to no admitted page".into(),
                 ));
             }
-            let page_id = blob16(row, 1, "properties.page_id").map_err(ResultReadError::Corrupt)?;
+            let page_id =
+                integer(row, 1, "properties.page_id").map_err(ResultReadError::Corrupt)?;
             if page_id != owner {
                 return Err(ResultReadError::Corrupt(
                     "an admitted page property names a different page".into(),
@@ -726,12 +720,12 @@ pub(crate) fn sql_or_cancelled(
 /// One selected block, as the descriptor read describes it. No payload: the raw
 /// text, tags and properties of a row nobody admits are never read.
 struct Descriptor {
-    block_id: [u8; 16],
+    block_id: i64,
     /// The PHYSICAL page this row's block belongs to. Beside `page` (the
     /// group's index), not instead of it: the payload's ownership check and
     /// the export locator both name the physical id, while the group index is
     /// where the DTO is pushed.
-    page_id: [u8; 16],
+    page_id: i64,
     page: usize,
     /// The public id this row will carry, already resolved through the captured
     /// identity policy.
@@ -762,7 +756,7 @@ struct PageGroups<C: ResultCarrier> {
     adjacent: bool,
     coalesce_names: bool,
     order: Vec<PageGroup<C>>,
-    by_page: HashMap<[u8; 16], usize>,
+    by_page: HashMap<i64, usize>,
 }
 
 // Derived `Default` would demand `C: Default`, which no carrier is: the
@@ -783,7 +777,7 @@ impl<C: ResultCarrier> PageGroups<C> {
     /// is the descriptor order.
     fn slot(
         &mut self,
-        page_id: [u8; 16],
+        page_id: i64,
         name: &str,
         kind: PageKind,
         journal_day: Option<i64>,
@@ -998,7 +992,7 @@ fn fold_statistics_row(
 /// What one descriptor row says about its page, dropped immediately after the
 /// row is offered to the budget.
 struct DescriptorPage {
-    page_id: [u8; 16],
+    page_id: i64,
     name: String,
     kind: PageKind,
     journal_day: Option<i64>,
@@ -1010,7 +1004,7 @@ struct DescriptorPage {
 /// `blocks.order_key` and the stored id, which [`resolve_identity`] folded into
 /// `result_id` and `estimated_bytes`.
 struct DecodedDescriptor {
-    block_id: [u8; 16],
+    block_id: i64,
     result_id: String,
     estimated_bytes: usize,
     tag_count: usize,
@@ -1031,8 +1025,8 @@ fn decode_descriptor(
             column::COLUMNS
         ));
     }
-    let block_id = blob16(row, column::BLOCK_ID, "descriptor block_id")?;
-    let page_id = blob16(row, column::PAGE_ID, "descriptor page_id")?;
+    let block_id = integer(row, column::BLOCK_ID, "descriptor block_id")?;
+    let page_id = integer(row, column::PAGE_ID, "descriptor page_id")?;
     // A LEFT JOIN that found nothing is the shape this read exists to catch:
     // the selected block IS in the answer, so its missing metadata is damage
     // and never a dropped row (D-3).
@@ -1043,36 +1037,28 @@ fn decode_descriptor(
     };
     let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
     let path = text(row, column::PATH, "pages.path")?;
-    let result_page = blob16(row, column::RESULT_PAGE_ID, "query_block_results.page_id")?;
+    let result_page = integer(row, column::RESULT_PAGE_ID, "blocks.page_id")?;
     if result_page != page_id {
-        return Err("query_block_results.page_id does not own its block's page".to_string());
+        return Err("blocks.page_id does not own its block's page".to_string());
     }
-    let preorder = integer(row, column::PREORDER, "query_block_results.preorder")?;
+    let preorder = integer(row, column::PREORDER, "blocks.preorder")?;
     if preorder < 0 {
-        return Err("query_block_results.preorder is negative".to_string());
+        return Err("blocks.preorder is negative".to_string());
     }
-    let stored_id = text(row, column::RESULT_ID, "query_block_results.result_id")?;
+    let stored_id = text(row, column::RESULT_ID, "blocks.result_id")?;
     if stored_id.is_empty() {
-        return Err("query_block_results.result_id is empty".to_string());
+        return Err("blocks.result_id is empty".to_string());
     }
-    let stored_estimate = count(
-        row,
-        column::ESTIMATED_BYTES,
-        "query_block_results.estimated_bytes",
-    )?;
-    let tag_count = count(row, column::TAG_COUNT, "query_block_results.tag_count")?;
-    let property_count = count(
-        row,
-        column::PROPERTY_COUNT,
-        "query_block_results.property_count",
-    )?;
+    let stored_estimate = count(row, column::ESTIMATED_BYTES, "blocks.estimated_bytes")?;
+    let tag_count = count(row, column::TAG_COUNT, "blocks.tag_count")?;
+    let property_count = count(row, column::PROPERTY_COUNT, "blocks.property_count")?;
     let order_key = text(row, column::ORDER_KEY, "blocks.order_key")?;
-    let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
+    let position = opt_integer(row, column::POSITION, "pages.position")?;
     // Direct Files' cross-page order IS this column; a NULL would silently
     // sort a page to one end of the answer, which changes which rows survive a
     // truncated budget.
     if position.is_none() {
-        return Err("query_page_order has no position for a result page".to_string());
+        return Err("pages.position is absent for a result page".to_string());
     }
     let (result_id, estimated_bytes) = resolve_identity(
         inputs.identity,
@@ -1157,13 +1143,13 @@ fn admit_decoded<C: ResultCarrier>(
 /// contradiction, and a saturating subtraction would hide it.
 pub(crate) fn resolve_identity(
     identity: &ResultIdentity,
-    page_id: [u8; 16],
+    _page_id: i64,
     path: &str,
     order_key: &str,
     stored_id: &str,
     stored_estimate: usize,
 ) -> Result<(String, usize), String> {
-    let structural = !identity.all_session && !identity.session_pages.contains(&page_id);
+    let structural = !identity.all_session && !identity.session_pages.contains(path);
     if !structural {
         return Ok((stored_id.to_owned(), stored_estimate));
     }
@@ -1195,8 +1181,8 @@ pub(crate) enum PayloadChannel {
 /// Borrowed rather than owned: an ordinary read already holds these six facts
 /// on its `Descriptor` and must not pay a second `String` for them.
 pub(crate) struct PayloadFacts<'a> {
-    pub(crate) block_id: [u8; 16],
-    pub(crate) page_id: [u8; 16],
+    pub(crate) block_id: i64,
+    pub(crate) page_id: i64,
     pub(crate) result_id: &'a str,
     pub(crate) estimated_bytes: usize,
     pub(crate) tag_count: usize,
@@ -1235,7 +1221,7 @@ pub(crate) fn read_admitted_payload<R>(
         }
         let ids = batch
             .iter()
-            .map(|row| PhysicalQueryValue::Blob(facts(row).block_id.to_vec()))
+            .map(|row| PhysicalQueryValue::Integer(facts(row).block_id))
             .collect::<Vec<_>>();
         let block_facets = read_block_facets(snapshot, &ids, channel)?;
         let tags = read_owner_strings(
@@ -1243,19 +1229,21 @@ pub(crate) fn read_admitted_payload<R>(
             &ids,
             OwnerList::Tags,
             channel,
-            "SELECT owner_id, tag FROM tags \
-             WHERE owner_type = {owner} AND owner_id IN ({ids}) \
-             ORDER BY owner_id, ordinal",
-            |row| text(row, 1, "tags.tag"),
+            "SELECT tag.owner_id, name.raw FROM tags tag \
+             JOIN names name ON name.name_id = tag.name_id \
+             WHERE tag.owner_type = {owner} AND tag.owner_id IN ({ids}) \
+             ORDER BY tag.owner_id, tag.ordinal",
+            |row| text(row, 1, "names.raw"),
         )?;
         let properties = read_owner_strings(
             snapshot,
             &ids,
             OwnerList::Properties,
             channel,
-            "SELECT owner_id, name, value FROM properties \
-             WHERE owner_type = {owner} AND owner_id IN ({ids}) \
-             ORDER BY owner_id, ordinal",
+            "SELECT property.owner_id, name.raw, property.value FROM properties property \
+             JOIN names name ON name.name_id = property.name_id \
+             WHERE property.owner_type = {owner} AND property.owner_id IN ({ids}) \
+             ORDER BY property.owner_id, property.ordinal",
             |row| {
                 Ok((
                     text(row, 1, "properties.name")?,
@@ -1324,7 +1312,7 @@ enum OwnerList {
 /// One admitted block's non-list facets: the block row, its required text, and
 /// the two optional facet rows beside them.
 struct BlockFacets {
-    page_id: [u8; 16],
+    page_id: i64,
     collapsed: bool,
     heading_level: Option<u8>,
     raw: String,
@@ -1348,7 +1336,7 @@ fn read_block_facets(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     ids: &[PhysicalQueryValue],
     channel: PayloadChannel,
-) -> Result<HashMap<[u8; 16], BlockFacets>, ResultReadError> {
+) -> Result<HashMap<i64, BlockFacets>, ResultReadError> {
     let sql = format!(
         "SELECT b.block_id, b.page_id, b.collapsed, b.heading_level, t.content, \
          k.marker, pl.priority, pl.scheduled, pl.deadline \
@@ -1379,17 +1367,15 @@ fn read_block_facets(
     Ok(facets)
 }
 
-fn decode_block_facets(
-    row: &[PhysicalQueryValue],
-) -> Result<([u8; 16], BlockFacets), ResultReadError> {
-    let decode = || -> Result<([u8; 16], BlockFacets), String> {
+fn decode_block_facets(row: &[PhysicalQueryValue]) -> Result<(i64, BlockFacets), ResultReadError> {
+    let decode = || -> Result<(i64, BlockFacets), String> {
         if row.len() != 9 {
             return Err(format!(
                 "block payload row has {} columns, expected 9",
                 row.len()
             ));
         }
-        let block_id = blob16(row, 0, "blocks.block_id")?;
+        let block_id = integer(row, 0, "blocks.block_id")?;
         let collapsed = match integer(row, 2, "blocks.collapsed")? {
             0 => false,
             1 => true,
@@ -1403,7 +1389,7 @@ fn decode_block_facets(
         Ok((
             block_id,
             BlockFacets {
-                page_id: blob16(row, 1, "blocks.page_id")?,
+                page_id: integer(row, 1, "blocks.page_id")?,
                 collapsed,
                 heading_level,
                 raw: text(row, 4, "block_text.content")?,
@@ -1430,7 +1416,7 @@ fn read_owner_strings<T>(
     channel: PayloadChannel,
     shape: &str,
     decode: impl Fn(&[PhysicalQueryValue]) -> Result<T, String>,
-) -> Result<HashMap<[u8; 16], Vec<T>>, ResultReadError> {
+) -> Result<HashMap<i64, Vec<T>>, ResultReadError> {
     let sql = shape
         .replace("{owner}", &OWNER_BLOCK.to_string())
         .replace("{ids}", &placeholders(ids.len()));
@@ -1440,7 +1426,7 @@ fn read_owner_strings<T>(
     let _ = (list, channel);
     let rows = crate::query::projection_sql::run(snapshot, &sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
-    let mut owners: HashMap<[u8; 16], Vec<T>> = HashMap::new();
+    let mut owners: HashMap<i64, Vec<T>> = HashMap::new();
     for row in &rows {
         #[cfg(test)]
         note(|census| match list {
@@ -1448,7 +1434,7 @@ fn read_owner_strings<T>(
             OwnerList::Properties => *payload_property_rows(census, channel) += 1,
         });
         let decoded = (|| {
-            let owner = blob16(row, 0, "owner_id")?;
+            let owner = integer(row, 0, "owner_id")?;
             Ok::<_, String>((owner, decode(row)?))
         })()
         .map_err(ResultReadError::Corrupt)?;
@@ -1471,9 +1457,9 @@ fn emit_batch<R>(
     first: usize,
     facts: &impl for<'r> Fn(&'r R) -> PayloadFacts<'r>,
     emit: &mut impl FnMut(usize, BlockDto),
-    mut block_facets: HashMap<[u8; 16], BlockFacets>,
-    mut tags: HashMap<[u8; 16], Vec<String>>,
-    mut properties: HashMap<[u8; 16], Vec<(String, String)>>,
+    mut block_facets: HashMap<i64, BlockFacets>,
+    mut tags: HashMap<i64, Vec<String>>,
+    mut properties: HashMap<i64, Vec<(String, String)>>,
 ) -> Result<(), String> {
     for (at, row) in batch.iter().enumerate() {
         let descriptor = facts(row);
@@ -1539,22 +1525,6 @@ pub(crate) fn placeholders(count: usize) -> String {
 // Every accessor names the COLUMN and the type it found and never the value:
 // a decode failure message travels into a receipt and a log, and a projection
 // row is user content.
-
-pub(crate) fn blob16(
-    row: &[PhysicalQueryValue],
-    at: usize,
-    what: &str,
-) -> Result<[u8; 16], String> {
-    match row.get(at) {
-        Some(PhysicalQueryValue::Blob(bytes)) if bytes.len() == 16 => {
-            Ok(bytes.as_slice().try_into().expect("a checked 16-byte id"))
-        }
-        Some(PhysicalQueryValue::Blob(bytes)) => {
-            Err(format!("{what} is {} bytes, expected 16", bytes.len()))
-        }
-        other => Err(format!("{what} is {}, expected a blob", spell(other))),
-    }
-}
 
 pub(crate) fn text(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<String, String> {
     match row.get(at) {
