@@ -766,12 +766,21 @@ mod measure {
                     "projection did not settle for {needle}"
                 )));
             }
-            if graph.query_index_progress().is_some() {
+            if graph.query_registry_snapshot_ready().is_err() {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
             let found = graph
-                .run_graph_search_latest("measure", needle, 4, 4, false)
+                .run_graph_search_latest_displayed_for(
+                    "measure",
+                    needle,
+                    4,
+                    4,
+                    None,
+                    false,
+                    Default::default(),
+                    tine_core::query_plan::FriendlyConsumer::CtrlK,
+                )
                 .map(|execution| !execution.hits.is_empty())
                 .unwrap_or(false);
             if !found {
@@ -890,7 +899,14 @@ mod measure {
         let graph = Graph::open(&graph_root);
         graph.attach_direct_projection(projection.clone())?;
         graph.warm_cache();
-        while graph.query_index_progress().is_some() {
+        // Registry readiness is projection-only; Ctrl-K may legitimately answer
+        // from the parsed cache before the complete projection is published.
+        while graph.query_registry_snapshot_ready().is_err() {
+            if started.elapsed() > Duration::from_secs(900) {
+                return Err(io::Error::other(
+                    "projection build did not become ready within 900 seconds",
+                ));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         let build_ms = ms(started.elapsed());
@@ -915,7 +931,16 @@ mod measure {
             for _ in 0..SEARCH_RUNS {
                 let started = Instant::now();
                 let execution = graph
-                    .run_graph_search_latest("measure", needle, 12, 12, false)
+                    .run_graph_search_latest_displayed_for(
+                        "measure",
+                        needle,
+                        12,
+                        12,
+                        None,
+                        false,
+                        Default::default(),
+                        tine_core::query_plan::FriendlyConsumer::CtrlK,
+                    )
                     .map_err(|error| io::Error::other(format!("search {needle}: {error:?}")))?;
                 durations.push(started.elapsed());
                 hits = execution.hits.len();
