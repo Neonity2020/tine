@@ -1218,6 +1218,65 @@ fn the_walk_and_the_lowering_answer_every_shape_identically() {
     );
 }
 
+#[test]
+fn page_like_identity_patterns_agree_between_walk_and_lowering() {
+    let _serial = serialize();
+    let root = scratch("page-like-identity-patterns");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    std::fs::create_dir_all(root.join("journals")).expect("journals");
+    for (file, body) in [
+        ("Cafe.md", "- ascii\n"),
+        ("Café.md", "- accent\n"),
+        ("Ｃａｆｅ.md", "- fullwidth\n"),
+        ("100%25 Real.md", "- escaped percent\n"),
+        ("under_score.md", "- escaped underscore\n"),
+    ] {
+        std::fs::write(root.join("pages").join(file), body).expect("page");
+    }
+    let corpus = Corpus::open(root, true);
+    let cases: &[(&str, &[&str])] = &[
+        ("@page and name like 'cafe'", &["cafe"]),
+        ("@page and name like 'caf_'", &["cafe", "café"]),
+        ("@page and name like 'ｃａｆｅ'", &["ｃａｆｅ"]),
+        ("@page and name like '100\\%%'", &["100% real"]),
+        ("@page and name like 'under\\_score'", &["under_score"]),
+        ("@page and name like '/cafe/'", &[]),
+        ("@page and name like ' cafe '", &[]),
+    ];
+
+    for (source, expected) in cases {
+        let walk = corpus.walk_page_names(source);
+        let sql = corpus.sql_page_names(source);
+        assert_eq!(walk, sql, "walk/lowering parity: {source}");
+        assert_eq!(walk, *expected, "identity-pattern semantics: {source}");
+    }
+}
+
+#[test]
+fn a6_erased_match_terms_agree_between_walk_and_lowering() {
+    let _serial = serialize();
+    let root = scratch("a6-erased-match");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let mark = "\u{301}";
+    for source in [
+        format!("content match '{mark}'"),
+        format!("not content match '{mark}'"),
+        format!("content match '{mark} alpha'"),
+        format!("content match '{mark} OR alpha'"),
+        format!("content match 'alpha -{mark}'"),
+    ] {
+        assert_eq!(
+            corpus.walk(&source, QueryDialect::Tql),
+            corpus.sql(&source, QueryDialect::Tql),
+            "{source}"
+        );
+    }
+    assert!(corpus
+        .sql(&format!("content match '{mark}'"), QueryDialect::Tql)
+        .is_empty());
+}
+
 /// The same gate over the anonymized graph (AGENTS §4 tier 2). A disagreement
 /// here is a CORPUS DEFECT in the fixture above: extract the minimal shape into
 /// `write_fast_corpus`, never weaken the gate. Only shape sources and counts are

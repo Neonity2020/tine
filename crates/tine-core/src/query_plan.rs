@@ -16,14 +16,12 @@ use crate::model::Graph;
 use crate::query::graph::QueryGraph;
 #[cfg(test)]
 use crate::refs;
-use crate::search_query::{canonical_fold, Matcher, Term};
+use crate::search_query::{canonical_fold, canonical_fold_with_map, Matcher, Term};
 use crate::vocab::{BlockDto, PageEntry, PageKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use unicode_normalization::UnicodeNormalization;
-use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_EVIDENCE_SPANS: usize = 32;
 
@@ -347,9 +345,10 @@ pub struct QueryPlan {
     page_scope: Option<QueryPageScope>,
     display: FriendlyDisplayOptions,
     // Ctrl-K keeps the literal trimmed launcher source so a multi-word page
-    // title/alias can retain the objective Exact class. The parsed AND terms
-    // alone would otherwise downgrade `Foo Bar` to Prefix/Substring and make
-    // the frontend offer a duplicate Create row beside the existing page.
+    // title/alias can retain the objective search Exact class. The parsed AND
+    // terms alone would otherwise downgrade `Foo Bar` to Prefix/Substring.
+    // This is search relevance, not page identity; Create suppression compares
+    // frontend pageIdentityKey values at its own boundary.
     page_exact: Option<String>,
     regexes: HashMap<u32, Regex>,
 }
@@ -472,15 +471,24 @@ impl QueryPlan {
     /// default behavior of existing block queries.
     pub fn page_name_fuzzy(value: impl Into<String>, limit: usize) -> Self {
         let value = value.into();
+        let folded = canonical_fold(&value);
+        // The legacy picker intentionally lists every page for a truly empty
+        // raw query. A nonempty query erased by A6 is a different state and
+        // must never become that match-all sentinel.
+        let predicate = if !value.is_empty() && folded.is_empty() {
+            QueryExpr::Never
+        } else {
+            QueryExpr::Text(TextPredicate {
+                clause_id: 1,
+                field: TextField::PageName,
+                mode: TextMatchMode::Fuzzy,
+                value: folded,
+            })
+        };
         Self {
             branches: vec![QueryBranch {
                 target: QueryTarget::Pages,
-                predicate: QueryExpr::Text(TextPredicate {
-                    clause_id: 1,
-                    field: TextField::PageName,
-                    mode: TextMatchMode::Fuzzy,
-                    value: canonical_fold(&value),
-                }),
+                predicate,
                 limit,
             }],
             diagnostics: Vec::new(),
@@ -538,14 +546,19 @@ impl QueryPlan {
         let branches = if query.is_empty() {
             Vec::new()
         } else {
+            let folded = canonical_fold(query);
             vec![QueryBranch {
                 target: QueryTarget::Blocks,
-                predicate: QueryExpr::Text(TextPredicate {
-                    clause_id: 1,
-                    field: TextField::VisibleContent,
-                    mode: TextMatchMode::Fuzzy,
-                    value: canonical_fold(query),
-                }),
+                predicate: if folded.is_empty() {
+                    QueryExpr::Never
+                } else {
+                    QueryExpr::Text(TextPredicate {
+                        clause_id: 1,
+                        field: TextField::VisibleContent,
+                        mode: TextMatchMode::Fuzzy,
+                        value: folded,
+                    })
+                },
                 limit,
             }]
         };
@@ -708,16 +721,22 @@ fn expr_from_matcher(
 }
 
 fn expr_from_term(term: &Term, field: TextField, next_id: &mut u32) -> QueryExpr {
-    let text = QueryExpr::Text(TextPredicate {
-        clause_id: take_id(next_id),
-        field,
-        mode: if term.quoted {
-            TextMatchMode::Phrase
-        } else {
-            TextMatchMode::Contains
-        },
-        value: term.text.clone(),
-    });
+    let text = if term.text.is_empty() {
+        // Transcribe Matcher::group_matches: a folded-empty positive is false,
+        // while negation of that same predicate is true.
+        QueryExpr::Never
+    } else {
+        QueryExpr::Text(TextPredicate {
+            clause_id: take_id(next_id),
+            field,
+            mode: if term.quoted {
+                TextMatchMode::Phrase
+            } else {
+                TextMatchMode::Contains
+            },
+            value: term.text.clone(),
+        })
+    };
     if term.negated {
         QueryExpr::Not(Box::new(text))
     } else {
@@ -813,7 +832,9 @@ fn eval_expr_fast(
         QueryExpr::Never => false,
         QueryExpr::Text(pred) if pred.field != expected_field => false,
         QueryExpr::Text(pred) => match pred.mode {
-            TextMatchMode::Contains | TextMatchMode::Phrase => lower.contains(&pred.value),
+            TextMatchMode::Contains | TextMatchMode::Phrase => {
+                !pred.value.is_empty() && lower.contains(&pred.value)
+            }
             TextMatchMode::Regex => plan
                 .regexes
                 .get(&pred.clause_id)
@@ -835,7 +856,7 @@ fn match_text(plan: &QueryPlan, pred: &TextPredicate, original: &str) -> Option<
     TEXT_EVIDENCE_EVALUATIONS.with(|count| count.set(count.get().saturating_add(1)));
     match pred.mode {
         TextMatchMode::Contains | TextMatchMode::Phrase => {
-            let spans = casefold_substring_spans(original, &pred.value);
+            let spans = folded_substring_spans(original, &pred.value);
             (!spans.is_empty()).then_some(MatchEvidence {
                 clause_id: pred.clause_id,
                 field: pred.field,
@@ -866,62 +887,38 @@ fn match_text(plan: &QueryPlan, pred: &TextPredicate, original: &str) -> Option<
     }
 }
 
-/// Lowercase-plus-NFC text plus one original UTF-16 span per folded scalar.
-/// Normalization is performed per extended grapheme cluster, which is the
-/// boundary across which canonical composition cannot contribute. Every output
-/// scalar maps to the full union of original scalars that formed that grapheme,
-/// including lowercase expansions, reordered marks, and Hangul Jamo.
+/// A6-folded text plus one original UTF-16 span per folded scalar. Both the
+/// text-only and mapped paths are owned by `search_query`; this adapter only
+/// changes the map's internal range type into the public evidence type.
 fn folded_with_map(original: &str) -> (Vec<char>, Vec<MatchSpan>) {
-    let lowered = original.to_lowercase();
-    let mut lowered_sources = Vec::new();
-    let mut original_utf16 = 0;
-    for ch in original.chars() {
-        let start = original_utf16;
-        original_utf16 += ch.len_utf16();
-        for _ in ch.to_lowercase() {
-            lowered_sources.push(MatchSpan {
-                start,
-                end: original_utf16,
-            });
-        }
-    }
-    // Rust's whole-string lowercase differs from scalar lowercase only by
-    // contextual substitutions such as final sigma, never by scalar count.
-    debug_assert_eq!(lowered.chars().count(), lowered_sources.len());
-
-    let mut folded = Vec::new();
-    let mut map = Vec::new();
-    let mut source_at = 0;
-    for grapheme in lowered.graphemes(true) {
-        let scalar_count = grapheme.chars().count();
-        let contributors = &lowered_sources[source_at..source_at + scalar_count];
-        source_at += scalar_count;
-        let source = MatchSpan {
-            start: contributors.first().map_or(0, |span| span.start),
-            end: contributors.last().map_or(0, |span| span.end),
-        };
-        for normalized in grapheme.nfc() {
-            folded.push(normalized);
-            map.push(source);
-        }
-    }
-    debug_assert_eq!(folded.iter().collect::<String>(), canonical_fold(original));
+    let mapped = canonical_fold_with_map(original);
+    let folded = mapped.text.chars().collect();
+    let map = mapped
+        .sources
+        .into_iter()
+        .map(|source| MatchSpan {
+            start: source.start,
+            end: source.end,
+        })
+        .collect();
     (folded, map)
 }
 
-fn folded_chars(value: &str) -> Vec<char> {
-    canonical_fold(value).chars().collect()
+/// Predicates store their needles already folded exactly once by the parser or
+/// typed-plan constructor. A6 is not idempotent, so this boundary must never
+/// call `canonical_fold` again.
+fn folded_needle_chars(folded_needle: &str) -> Vec<char> {
+    folded_needle.chars().collect()
 }
 
 fn merge_spans(spans: impl IntoIterator<Item = MatchSpan>) -> Vec<MatchSpan> {
+    let mut spans = spans.into_iter().collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start, span.end));
     let mut out: Vec<MatchSpan> = Vec::new();
     for span in spans {
         if let Some(last) = out.last_mut() {
-            if last.end == span.start {
-                last.end = span.end;
-                continue;
-            }
-            if *last == span {
+            if span.start <= last.end {
+                last.end = last.end.max(span.end);
                 continue;
             }
         }
@@ -933,20 +930,19 @@ fn merge_spans(spans: impl IntoIterator<Item = MatchSpan>) -> Vec<MatchSpan> {
     out
 }
 
-fn casefold_substring_spans(original: &str, needle: &str) -> Vec<MatchSpan> {
+fn folded_substring_spans(original: &str, folded_needle: &str) -> Vec<MatchSpan> {
     let (hay, map) = folded_with_map(original);
-    let needle = folded_chars(needle);
+    let needle = folded_needle_chars(folded_needle);
     if needle.is_empty() || needle.len() > hay.len() {
         return Vec::new();
     }
     let mut spans = Vec::new();
     for start in 0..=hay.len() - needle.len() {
         if hay[start..start + needle.len()] == needle {
-            let first = map[start];
-            let last = map[start + needle.len() - 1];
+            let matched = &map[start..start + needle.len()];
             spans.push(MatchSpan {
-                start: first.start,
-                end: last.end,
+                start: matched.iter().map(|span| span.start).min().unwrap(),
+                end: matched.iter().map(|span| span.end).max().unwrap(),
             });
             if spans.len() == MAX_EVIDENCE_SPANS {
                 break;
@@ -958,7 +954,7 @@ fn casefold_substring_spans(original: &str, needle: &str) -> Vec<MatchSpan> {
 
 fn fuzzy_evidence(pred: &TextPredicate, original: &str) -> Option<MatchEvidence> {
     let (hay, map) = folded_with_map(original);
-    let needle = folded_chars(&pred.value);
+    let needle = folded_needle_chars(&pred.value);
     if needle.is_empty() {
         return Some(MatchEvidence {
             clause_id: pred.clause_id,
@@ -971,15 +967,14 @@ fn fuzzy_evidence(pred: &TextPredicate, original: &str) -> Option<MatchEvidence>
     if needle.len() <= hay.len() {
         for start in 0..=hay.len() - needle.len() {
             if hay[start..start + needle.len()] == needle {
-                let first = map[start];
-                let last = map[start + needle.len() - 1];
+                let matched = &map[start..start + needle.len()];
                 return Some(MatchEvidence {
                     clause_id: pred.clause_id,
                     field: pred.field,
                     mode: pred.mode,
                     spans: vec![MatchSpan {
-                        start: first.start,
-                        end: last.end,
+                        start: matched.iter().map(|span| span.start).min().unwrap(),
+                        end: matched.iter().map(|span| span.end).max().unwrap(),
                     }],
                     score: Some(if start == 0 { 1000 } else { 500 }),
                 });
@@ -1353,6 +1348,9 @@ fn text_predicate_relevance(
     let text_len = original.encode_utf16().count();
     let (match_class, word_boundary, first_offset, occurrences) = match pred.mode {
         TextMatchMode::Contains | TextMatchMode::Phrase => {
+            if pred.value.is_empty() {
+                return None;
+            }
             let mut matches = lower.match_indices(&pred.value);
             let (first, _) = matches.next()?;
             let occurrences = 1 + matches.count();
@@ -1552,7 +1550,9 @@ fn page_base_score(
                 .is_some_and(|regex| regex.is_match(original))
                 .then_some((500, ObjectiveMatchClass::Substring)),
             TextMatchMode::Contains | TextMatchMode::Phrase => {
-                if lower == pred.value {
+                if pred.value.is_empty() {
+                    None
+                } else if lower == pred.value {
                     Some((1500, ObjectiveMatchClass::Exact))
                 } else if lower.starts_with(&pred.value) {
                     Some((1000, ObjectiveMatchClass::Prefix))
@@ -1799,7 +1799,7 @@ fn execute_page_candidates(
     }
     let mut have: HashSet<String> = file_pages
         .iter()
-        .map(|page| canonical_fold(&page.name))
+        .map(|page| crate::refs::page_key(&page.name))
         .collect();
     // GH #353: an alias of a file page names THAT page — the owner carries the
     // identity (with `matched_alias` as display context). The alias text must
@@ -1807,14 +1807,14 @@ fn execute_page_candidates(
     // selecting that phantom row navigated to a standalone alias-named page.
     for owner_aliases in aliases_by_owner.values() {
         for alias in owner_aliases {
-            have.insert(canonical_fold(alias));
+            have.insert(crate::refs::page_key(alias));
         }
     }
     for name in referenced {
         if cancelled() {
             return None;
         }
-        let key = canonical_fold(&name);
+        let key = crate::refs::page_key(&name);
         if have.contains(&key) {
             continue;
         }
@@ -2283,6 +2283,158 @@ mod tests {
     }
 
     #[test]
+    fn folded_empty_text_predicates_never_match_rank_or_emit_evidence() {
+        for mode in [TextMatchMode::Contains, TextMatchMode::Phrase] {
+            let pred = TextPredicate {
+                clause_id: 1,
+                field: TextField::VisibleContent,
+                mode,
+                value: String::new(),
+            };
+            let expr = QueryExpr::Text(pred.clone());
+            let plan = QueryPlan {
+                branches: Vec::new(),
+                diagnostics: Vec::new(),
+                page_scope: None,
+                display: FriendlyDisplayOptions::default(),
+                page_exact: None,
+                regexes: HashMap::new(),
+            };
+            assert!(!eval_expr_fast(
+                &plan,
+                &expr,
+                TextField::VisibleContent,
+                "anything",
+                "anything",
+            ));
+            assert!(match_text(&plan, &pred, "anything").is_none());
+            assert!(text_predicate_relevance(&plan, &pred, "anything", "anything").is_none());
+
+            let page_pred = TextPredicate {
+                field: TextField::PageName,
+                ..pred
+            };
+            assert!(
+                page_base_score(&plan, &QueryExpr::Text(page_pred), "anything", "anything",)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_queries_erased_by_a6_never_become_picker_match_all() {
+        let mark = "\u{301}";
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tine-query-plan-empty-fold-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(dir.join("pages/Foo.md"), "- foo body\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        for query in [mark.to_string(), format!("{mark} foo")] {
+            assert!(QueryPlan::friendly(&query, 8, 8)
+                .execute(&graph, || false)
+                .hits
+                .is_empty());
+        }
+        for query in [format!("{mark} OR foo"), format!("foo -{mark}")] {
+            let hits = QueryPlan::friendly(&query, 8, 8)
+                .execute(&graph, || false)
+                .hits;
+            assert!(
+                hits.iter().any(|hit| matches!(hit, QueryHit::Page { .. })),
+                "{query}"
+            );
+            assert!(
+                hits.iter().any(|hit| matches!(hit, QueryHit::Block { .. })),
+                "{query}"
+            );
+        }
+        assert!(QueryPlan::friendly(&format!("-{mark}"), 8, 8)
+            .branches
+            .is_empty());
+
+        let raw_empty = QueryPlan::legacy_page_search("", 8).execute(&graph, || false);
+        assert!(raw_empty
+            .hits
+            .iter()
+            .any(|hit| matches!(hit, QueryHit::Page { .. })));
+        assert!(QueryPlan::legacy_page_search(mark, 8)
+            .execute(&graph, || false)
+            .hits
+            .is_empty());
+        assert!(QueryPlan::block_search_literal(mark, 8)
+            .execute(&graph, || false)
+            .hits
+            .is_empty());
+        assert!(QueryPlan::block_search_literal("", 8).branches.is_empty());
+
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a6_search_equivalence_does_not_collapse_page_candidate_identity() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tine-query-plan-page-identity-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(dir.join("pages/Café.md"), "- real page\n").unwrap();
+        fs::write(
+            dir.join("pages/References.md"),
+            "- [[Cafe]] [[Cafe\u{301}]] [[Ｃａｆｅ]]\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut pages = QueryPlan::friendly("cafe", 20, 0)
+            .execute(&graph, || false)
+            .hits
+            .into_iter()
+            .filter_map(|hit| match hit {
+                QueryHit::Page {
+                    page, match_class, ..
+                } => Some((page.name, page.rel_path, match_class)),
+                QueryHit::Block { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        pages.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(pages.len(), 3, "{pages:#?}");
+        assert!(pages
+            .iter()
+            .any(|(name, path, _)| name == "Café" && !path.is_empty()));
+        assert!(pages
+            .iter()
+            .any(|(name, path, _)| name == "Cafe" && path.is_empty()));
+        assert!(pages
+            .iter()
+            .any(|(name, path, _)| name == "Ｃａｆｅ" && path.is_empty()));
+        assert!(!pages
+            .iter()
+            .any(|(name, path, _)| name == "Cafe\u{301}" && path.is_empty()));
+        assert!(pages
+            .iter()
+            .all(|(_, _, class)| *class == ObjectiveMatchClass::Exact));
+
+        crate::test_support::remove_dir_all(dir);
+    }
+
+    #[test]
     fn graph_search_reports_per_category_truncation() {
         let (dir, graph) = fixture();
 
@@ -2420,14 +2572,15 @@ mod tests {
         .unwrap();
         assert_eq!(hit.evidence[0].spans, vec![MatchSpan { start: 0, end: 3 }]);
 
-        let negative = QueryPlan::block_search("cafe", 8);
-        assert!(eval_expr(
-            &negative,
-            &negative.branches[0].predicate,
+        let accent_fold = QueryPlan::block_search("cafe", 8);
+        let hit = eval_expr(
+            &accent_fold,
+            &accent_fold.branches[0].predicate,
             TextField::VisibleContent,
             "café",
         )
-        .is_none());
+        .unwrap();
+        assert_eq!(hit.evidence[0].spans, vec![MatchSpan { start: 0, end: 4 }]);
 
         let expansion = QueryPlan::block_search("i\u{307}", 8);
         let hit = eval_expr(
@@ -2438,6 +2591,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hit.evidence[0].spans, vec![MatchSpan { start: 0, end: 1 }]);
+    }
+
+    #[test]
+    fn a6_evidence_maps_compatibility_and_removed_marks_to_raw_utf16() {
+        let cases = [
+            ("f", "😀aﬁx tail", MatchSpan { start: 3, end: 4 }),
+            ("tine", "😀Ｔｉｎｅ tail", MatchSpan { start: 2, end: 6 }),
+            ("ガイド", "ｶﾞｲﾄﾞ", MatchSpan { start: 0, end: 5 }),
+            (
+                "\"prilis zlutoucky kun\"",
+                "Příliš žluťoučký kůň",
+                MatchSpan { start: 0, end: 20 },
+            ),
+            ("가", "ㄱ\u{301}ㅏ", MatchSpan { start: 0, end: 3 }),
+            (
+                "\u{1715}\u{302e}",
+                "😀a\u{302e}\u{034f}\u{1715}z",
+                MatchSpan { start: 3, end: 6 },
+            ),
+            ("\"ος σ\"", "ΟΣ Σ", MatchSpan { start: 0, end: 4 }),
+        ];
+
+        for (needle, original, expected) in cases {
+            let plan = QueryPlan::block_search(needle, 8);
+            let hit = eval_expr(
+                &plan,
+                &plan.branches[0].predicate,
+                TextField::VisibleContent,
+                original,
+            )
+            .unwrap_or_else(|| panic!("{needle:?} must match {original:?}"));
+            assert_eq!(hit.evidence[0].spans, vec![expected], "needle={needle:?}");
+        }
+    }
+
+    #[test]
+    fn mapped_evidence_consumes_the_already_folded_needle_exactly_once() {
+        let plan = QueryPlan::block_search("𝐀", 8);
+        let QueryExpr::Text(pred) = &plan.branches[0].predicate else {
+            panic!("one literal term must remain one predicate");
+        };
+        assert_eq!(pred.value, "A");
+        let hit = eval_expr(
+            &plan,
+            &plan.branches[0].predicate,
+            TextField::VisibleContent,
+            "𝐀",
+        )
+        .unwrap();
+        assert_eq!(hit.evidence[0].spans, vec![MatchSpan { start: 0, end: 2 }]);
+        assert!(eval_expr(
+            &QueryPlan::block_search("a", 8),
+            &QueryPlan::block_search("a", 8).branches[0].predicate,
+            TextField::VisibleContent,
+            "𝐀",
+        )
+        .is_none());
     }
 
     #[test]
@@ -3710,7 +3920,7 @@ mod tests {
         crate::test_support::remove_dir_all(dir);
     }
 
-    /// Casefold + NFC + UTF-16 offsets, computed from visible text alone. The
+    /// A6 fold + UTF-16 offsets, computed from visible text alone. The
     /// leading musical symbol is two UTF-16 units but one scalar, so a
     /// char-counting encoder would report offset 2 rather than 3.
     #[test]
@@ -3719,8 +3929,8 @@ mod tests {
         let text = "\u{1D11E} CAFE\u{301} note";
         let plan = QueryPlan::friendly("caf\u{e9}", 8, 8);
         let branch = block_branch(&plan).expect("a bare term plans a block branch");
-        let rank = rank_block_text(&plan, branch, text)
-            .expect("casefold + NFC must admit the decomposed block text");
+        let rank =
+            rank_block_text(&plan, branch, text).expect("A6 must admit the decomposed block text");
         assert_eq!(rank.match_class(), ObjectiveMatchClass::Substring);
         assert_eq!(
             decode_rank_key(&rank.order_key()),
@@ -3746,7 +3956,13 @@ mod tests {
             composed_rank.order_key() < rank.order_key(),
             "the shorter original text is the better tuple"
         );
-        assert!(rank_block_text(&plan, branch, "\u{1D11E} cafe note").is_none());
+        let unaccented_rank = rank_block_text(&plan, branch, "\u{1D11E} cafe note")
+            .expect("A6 removes Mn accents from both spellings");
+        assert_eq!(
+            decode_rank_key(&unaccented_rank.order_key()),
+            (ObjectiveMatchClass::Substring.rank(), true, 3, 12, 1)
+        );
+        assert_eq!(unaccented_rank.order_key(), composed_rank.order_key());
     }
 
     /// Selection is rank-only: it constructs no match evidence. The optional

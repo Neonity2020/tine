@@ -696,7 +696,7 @@
       }
     },
     {
-      "name": "decomposed accent folds to NFC",
+      "name": "decomposed accent folds by A6",
       "query": "café",
       "tokens": [
         {
@@ -711,17 +711,17 @@
         "groups": [
           [
             {
-              "text": "café",
+              "text": "cafe",
               "negated": false,
               "quoted": false
             }
           ]
         ],
-        "simpleTerm": "café"
+        "simpleTerm": "cafe"
       }
     },
     {
-      "name": "precomposed accent",
+      "name": "precomposed accent folds by A6",
       "query": "café",
       "tokens": [
         {
@@ -736,13 +736,13 @@
         "groups": [
           [
             {
-              "text": "café",
+              "text": "cafe",
               "negated": false,
               "quoted": false
             }
           ]
         ],
-        "simpleTerm": "café"
+        "simpleTerm": "cafe"
       }
     },
     {

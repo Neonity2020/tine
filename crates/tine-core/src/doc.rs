@@ -157,8 +157,8 @@ pub struct BlockProjection {
     /// for breadcrumb labels / display. `raw` minus the byte ranges lsdoc
     /// recognized as `Properties` blocks (see `visible_minus_properties`).
     pub visible: String,
-    /// `visible`, lowercased then NFC-normalized — for `search` / `(content …)`
-    /// (hot path, pre-folded without compatibility/accent folding).
+    /// `visible`, folded by the native A6 search owner — for `search` /
+    /// `(content …)` (hot path, pre-folded once).
     pub visible_lower: String,
     /// Normalized page references (`[[..]]` / `#tag`) — for backlinks / `(page-ref)`.
     pub refs_norm: Vec<String>,
@@ -257,11 +257,11 @@ impl DocBlock {
         block
     }
 
-    /// Lazily-computed, memoized projection of `raw` (visible lowercased text +
-    /// normalized refs). Safe to memoize because it's a pure function of `raw`
-    /// and a cached DocBlock is REPLACED wholesale (a fresh, empty cell) whenever
-    /// its content changes — cached blocks are never mutated in place — so the
-    /// memo can't outlive the `raw` it was derived from.
+    /// Lazily-computed, memoized projection of `raw` (visible search-folded text
+    /// + normalized refs). Safe to memoize because it's a pure function of
+    /// `raw` and a cached DocBlock is REPLACED wholesale (a fresh, empty cell)
+    /// whenever its content changes — cached blocks are never mutated in place
+    /// — so the memo can't outlive the `raw` it was derived from.
     pub fn projection(&self) -> &BlockProjection {
         self.proj.get_or_init(|| {
             // ONE lsdoc parse of the block body yields every header facet (marker,
@@ -2296,7 +2296,7 @@ mod projection_tests {
         // mapping (`span - 2 + lead`) must land on char boundaries, not split UTF-8.
         let b = DocBlock::new("Über café résumé\nid:: 123\nkey:: v");
         assert_eq!(b.visible_text(), "Über café résumé");
-        assert_eq!(b.projection().visible_lower, "über café résumé");
+        assert_eq!(b.projection().visible_lower, "uber cafe resume");
         // leading whitespace in raw (lead > 0) still maps correctly.
         let b2 = DocBlock::new("  héllo\nid:: 9");
         assert_eq!(b2.visible_text().trim(), "héllo");

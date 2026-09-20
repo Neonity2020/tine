@@ -19,6 +19,7 @@ import { createLongPress } from "../render/longPress";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { graphBinding } from "../persistence";
 import { captureGraphScope, landAsyncOrToast } from "../landAsync";
+import { pageIdentityKey } from "../pageIdentity";
 
 // One selectable result row.
 type Item =
@@ -251,9 +252,15 @@ export function QuickSwitcher(): JSX.Element {
         truncated: graphResults()?.has_more?.pages ? "pages" : undefined,
       });
 
-    // Create page (when no exact match exists).
-    const exact = pageItems.some((p) => p.t === "page" && p.adaptiveClass === "exact");
-    if (!currentPageOnly() && !exact) out.push({ header: "Create", items: [{ t: "create", name: q }] });
+    // Create page only when the whole launcher query is not an existing page
+    // name or matched alias. Search Exact is deliberately broader under A6
+    // (for example `cafe` ranks `café` as Exact), so rank is not identity.
+    const queryIdentity = pageIdentityKey(q);
+    const existingIdentity = allPages.some((page) => page.t === "page" && (
+      pageIdentityKey(page.name) === queryIdentity
+      || (page.matchedAlias !== undefined && pageIdentityKey(page.matchedAlias) === queryIdentity)
+    ));
+    if (!currentPageOnly() && !existingIdentity) out.push({ header: "Create", items: [{ t: "create", name: q }] });
 
     // Commands matching the query.
     const cmds = embryoPane || currentPageOnly() ? [] : commandItems(q);

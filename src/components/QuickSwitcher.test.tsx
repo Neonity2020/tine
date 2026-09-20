@@ -497,12 +497,15 @@ describe("QuickSwitcher search syntax help", () => {
       const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
       input.value = "needle";
       input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-      const rows = await vi.waitFor(() => {
+      const { pageRow, blockRow } = await vi.waitFor(() => {
         const found = [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')];
-        expect(found).toHaveLength(2);
-        return found;
+        const pageRow = found.find((row) => row.textContent?.includes("Twin"));
+        const blockRow = found.find((row) => row.textContent?.includes("owned needle"));
+        expect(pageRow).toBeDefined();
+        expect(blockRow).toBeDefined();
+        return { pageRow: pageRow!, blockRow: blockRow! };
       });
-      return { input, pageRow: rows[0], blockRow: rows[1] };
+      return { input, pageRow, blockRow };
     };
 
     try {
@@ -596,12 +599,17 @@ describe("QuickSwitcher search syntax help", () => {
     dispose();
   });
 
-  it("suppresses Create when the backend classifies a canonical-equivalent page as exact", async () => {
+  it.each([
+    ["cafe", "Café", true],
+    ["Café", "Cafe\u{301}", false],
+    ["Cafe\u{301}", "Café", false],
+    ["Ｃａｆｅ", "Cafe", true],
+  ] as const)("keeps search rank separate from page identity for %j", async (query, pageName, permitsCreate) => {
     vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
       hits: [{
         entity: "page",
-        page: { name: "Cafe\u0301", kind: "page", date_key: null, path: "pages/cafe.md" },
-        display_text: "Cafe\u0301",
+        page: { name: pageName, kind: "page", date_key: null, path: "pages/cafe.md" },
+        display_text: pageName,
         evidence: [{ clause_id: 1, field: "page_name", mode: "fuzzy", spans: [{ start: 0, end: 5 }] }],
         score: 1500,
         match_class: "exact",
@@ -612,10 +620,10 @@ describe("QuickSwitcher search syntax help", () => {
     const dispose = render(() => <QuickSwitcher />, root);
     openSwitcher();
     const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
-    input.value = "Café";
+    input.value = query;
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await vi.waitFor(() => expect(root.textContent).toContain("Cafe\u0301"));
-    expect(root.textContent).not.toContain("Create page:");
+    await vi.waitFor(() => expect(root.textContent).toContain(pageName));
+    expect(root.textContent?.includes("Create page:")).toBe(permitsCreate);
     dispose();
   });
 

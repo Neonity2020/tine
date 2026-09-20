@@ -20,7 +20,6 @@ use tine_storage::sqlite::{
     PhysicalProjectionQuerySnapshot, PhysicalProperty, PhysicalQueryValue,
     PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
-use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
@@ -3630,7 +3629,7 @@ fn physical_page(
             text_kind: page_kind_to_sql(entry.kind),
             journal_day: journal_days.day(&entry.rel_path, entry.kind == PageKind::Journal),
             preamble: document.pre_block.clone(),
-            normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
+            normalized_searchable_text: crate::search_query::canonical_fold(&searchable_text),
             searchable_text,
             properties,
             tags: crate::query::derived::tag_rows(&tags),
@@ -3748,7 +3747,7 @@ fn lower_blocks(
             parent,
             order,
             content: block.raw.clone(),
-            normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
+            normalized_searchable_text: crate::search_query::canonical_fold(&searchable_text),
             searchable_text,
             query_visible,
             query_visible_folded,
