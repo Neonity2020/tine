@@ -3115,6 +3115,55 @@ fn fake_app_bundle() -> Arc<app_export::PublishedAppBundle> {
         })
 }
 
+#[test]
+fn graph_publication_ships_the_app_with_a_real_page_as_home() {
+    let dir = std::env::temp_dir().join(format!("tine-publish-graph-app-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    fs::write(
+        dir.join("pages/Welcome to Tine.md"),
+        "public:: true\n- Welcome\n- {{query (task TODO)}}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/Other.md"),
+        "public:: true\n- TODO selected task\n",
+    )
+    .unwrap();
+    fs::write(dir.join("pages/Private.md"), "- private\n").unwrap();
+
+    let graph = Graph::open(&dir);
+    let _projection = prepare_publication_graph(&graph);
+    let outcome =
+        publish_graph_app(&graph, fake_app_bundle(), "Tine Guide", "Welcome to Tine").unwrap();
+    assert_eq!(outcome.pages, 2);
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    let out = PathBuf::from(&outcome.path);
+    let app_index = fs::read_to_string(out.join("app/index.html")).unwrap();
+    assert!(app_index.contains("tine-published"), "{app_index}");
+    assert!(
+        app_index.contains("<title>Tine Guide</title>"),
+        "{app_index}"
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("app/snapshot.json")).unwrap()).unwrap();
+    assert_eq!(snapshot["home"], "Welcome to Tine");
+    let names: Vec<&str> = snapshot["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| page["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Other", "Welcome to Tine"]);
+    assert!(!names.contains(&"Tine Guide"), "no synthetic query home");
+    assert_eq!(snapshot["queries"].as_array().unwrap().len(), 1);
+    assert!(!snapshot.to_string().contains("Private"));
+    assert!(out.join("app-redirect.js").is_file());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Stage 2: a query export with an embedded bundle ships the read-only
 /// app beside the static site, over a snapshot computed from the selected
 /// pages and nothing else, keyed exactly as the app will ask.
