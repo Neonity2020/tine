@@ -11,8 +11,8 @@ use crate::query::ir::{
 };
 use crate::query::registry::Registry;
 use crate::query::results::{
-    probe_fts_ready, read_located_results, RecencyPage, ResultIdentity, ResultLocator,
-    ResultReadError, ResultReadInputs,
+    read_located_results, RecencyPage, ResultIdentity, ResultLocator, ResultReadError,
+    ResultReadInputs,
 };
 use crate::query::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use crate::query::{
@@ -81,7 +81,6 @@ pub(crate) struct SubtreeSelectionInputs<'a> {
     pub(crate) identity: &'a ResultIdentity,
     pub(crate) recency: &'a dyn Fn(RecencyPage<'_>) -> i64,
     pub(crate) today: crate::date::JournalDate,
-    pub(crate) fts_ready: bool,
 }
 
 pub(crate) struct SubtreeQueryResult {
@@ -179,7 +178,6 @@ fn select_subtree_roots(
             registry: inputs.registry,
             cutoff: None,
             compiled: &compiled,
-            fts_ready: inputs.fts_ready,
             result_set_rule: RESULT_SET_RULE,
             relation_rule: RELATION_RULE,
         },
@@ -287,7 +285,6 @@ impl PreparedExportBatch {
         if let Some(result) = self.all_refused_result(inputs.max_roots) {
             return Ok(result);
         }
-        let fts_ready = probe_fts_ready(snapshot)?;
         let (_, selected) = self.select(inputs.max_roots, |item| {
             let Some(execution) = item.execution.as_ref() else {
                 return Ok(empty_selection());
@@ -305,7 +302,6 @@ impl PreparedExportBatch {
                     identity: inputs.identity,
                     recency: inputs.recency,
                     today: self.today,
-                    fts_ready,
                 },
             )
         })?;

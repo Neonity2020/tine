@@ -13,7 +13,6 @@ fn inputs<'a>(registry: &'a Registry) -> LoweringInputs<'a> {
         registry,
         cutoff: None,
         compiled: &NO_COMPILED_LEAVES,
-        fts_ready: true,
         result_set_rule: RESULT_SET_RULE,
         relation_rule: RELATION_RULE,
     }
@@ -21,20 +20,19 @@ fn inputs<'a>(registry: &'a Registry) -> LoweringInputs<'a> {
 
 /// The lowering of one filter, with the shared Match parse the walk would
 /// build for it — never a second parse (I-12).
-fn lower_with(filter: Filter, anchor: Anchor, fts_ready: bool) -> SqlQuery {
+fn lower_with(filter: Filter, anchor: Anchor) -> SqlQuery {
     let registry = Registry::none().clone();
     let compiled = CompiledLeaves::for_query(&filter);
     let query = Query::new(anchor, filter, Source::Builder);
     let inputs = LoweringInputs {
         compiled: &compiled,
-        fts_ready,
         ..inputs(&registry)
     };
     lower_query(&query, &inputs)
 }
 
 fn lower(filter: Filter, anchor: Anchor) -> SqlQuery {
-    lower_with(filter, anchor, true)
+    lower_with(filter, anchor)
 }
 
 fn og(source: &str) -> (Query, ViewSettings) {
@@ -378,8 +376,8 @@ fn content_match(text: &str) -> Filter {
     Filter::attr(Attr::Content, CmpOp::Match, Value::text(text))
 }
 
-fn match_sql(text: &str, fts_ready: bool) -> SqlQuery {
-    lower_with(content_match(text), Anchor::Block, fts_ready)
+fn match_sql(text: &str) -> SqlQuery {
+    lower_with(content_match(text), Anchor::Block)
 }
 
 /// The one rule that decides this packet: the exact `instr` predicates are
@@ -388,7 +386,7 @@ fn match_sql(text: &str, fts_ready: bool) -> SqlQuery {
 /// "different results, faster".
 #[test]
 fn the_candidate_bound_narrows_and_never_replaces_the_exact_predicate() {
-    let bounded = match_sql("alpha", true);
+    let bounded = match_sql("alpha");
     assert!(
         bounded.sql.contains("search_substring_fts")
             && bounded.sql.contains("MATCH ?")
@@ -414,11 +412,11 @@ fn the_candidate_bound_narrows_and_never_replaces_the_exact_predicate() {
 #[test]
 fn a_two_scalar_term_is_unbounded_rather_than_unanswered() {
     for needle in ["foo", "oob"] {
-        let statement = match_sql(needle, true);
+        let statement = match_sql(needle);
         assert!(statement.sql.contains("search_substring_fts"), "{needle}");
         assert_eq!(statement.content_plans, vec![ContentPlan::Fts]);
     }
-    let short = match_sql("oo", true);
+    let short = match_sql("oo");
     assert!(
         !short.sql.contains("search_substring_fts")
             && short.sql.contains("instr(b.query_visible_folded, ?"),
@@ -433,13 +431,13 @@ fn a_two_scalar_term_is_unbounded_rather_than_unanswered() {
 /// to work around: the anchor is reached once per arm.
 #[test]
 fn one_unbounded_or_arm_unbounds_the_whole_leaf() {
-    let mixed = match_sql("oo OR alpha", true);
+    let mixed = match_sql("oo OR alpha");
     assert!(!mixed.positively_bounded);
     assert_eq!(mixed.content_plans, vec![ContentPlan::ShortUnindexable]);
     // The bounded arm still gets its bound — bounds are per-arm. One
     // occurrence, because §5.3's CTE spelling compiles the filter once.
     assert_eq!(mixed.sql.matches("search_substring_fts").count(), 1);
-    assert!(match_sql("beta OR alpha", true).positively_bounded);
+    assert!(match_sql("beta OR alpha").positively_bounded);
 }
 
 /// §5.10: emptiness comes from the parsed `Term`, not from SQLite.
@@ -449,7 +447,7 @@ fn one_unbounded_or_arm_unbounds_the_whole_leaf() {
 fn an_empty_term_is_false_and_an_empty_negative_term_is_true() {
     // A whitespace-only quoted phrase is NOT empty: it is a real needle the
     // exact column can hold and the collapsed FTS text cannot.
-    let spaces = match_sql("\"   \"", true);
+    let spaces = match_sql("\"   \"");
     assert!(!spaces.matches_nothing && !spaces.sql.contains("search_substring_fts"));
     assert!(spaces
         .params
@@ -509,38 +507,12 @@ fn exclusion_only_and_invalid_regex_lower_to_a_false_leaf_under_not_too() {
         // classes — it just needs no engine to answer false.
         ("/[unclosed/", &[ContentPlan::Regex][..]),
     ] {
-        let statement = match_sql(source, true);
+        let statement = match_sql(source);
         assert!(statement.matches_nothing, "{source}: {}", statement.sql);
         assert_eq!(statement.content_plans, plans, "{source}");
-        let negated = lower_with(Filter::not(content_match(source)), Anchor::Block, true);
+        let negated = lower_with(Filter::not(content_match(source)), Anchor::Block);
         assert!(!negated.matches_nothing, "{source}: {}", negated.sql);
         assert!(!negated.positively_bounded, "{source}");
-    }
-}
-
-/// The `fts-building` class (§5.10): the SAME exact predicates on the ready
-/// block columns, with no bound anywhere — never empty results, an error, a
-/// new walk route, or a rebuild request (I-13).
-#[test]
-fn a_building_index_omits_the_bounds_and_keeps_the_exact_predicates() {
-    let building = match_sql("alpha beta OR gamma", false);
-    assert!(
-        !building.sql.contains("search_substring_fts")
-            && !building.sql.contains("search_fts_owners")
-            && !building.sql.contains("MATCH"),
-        "{}",
-        building.sql
-    );
-    // Three terms, compiled once (§5.3's CTE spelling).
-    assert_eq!(building.sql.matches("instr(").count(), 3);
-    assert!(!building.positively_bounded);
-    assert_eq!(building.content_plans, vec![ContentPlan::FtsBuilding]);
-    // Same predicates, same bound needles, as the ready lowering: only the
-    // candidate bound differs.
-    let ready = match_sql("alpha beta OR gamma", true);
-    for term in ["alpha", "beta", "gamma"] {
-        let value = PhysicalQueryValue::Text(term.to_string());
-        assert!(building.params.contains(&value) && ready.params.contains(&value));
     }
 }
 
@@ -548,7 +520,7 @@ fn a_building_index_omits_the_bounds_and_keeps_the_exact_predicates() {
 /// it, so using it as a candidate would select exactly the rejected rows.
 #[test]
 fn a_negative_term_is_negated_and_never_becomes_the_candidate() {
-    let statement = match_sql("oo -draft", true);
+    let statement = match_sql("oo -draft");
     assert!(
         statement
             .sql
@@ -613,7 +585,7 @@ fn the_fts_needle_is_quoted_as_one_literal_with_doubled_quotes() {
 fn a_valid_regex_lowers_to_the_bound_predicate_over_the_exact_visible_text() {
     for source in ["content regexp '[a-z]+'", "content match '/[a-z]+/'"] {
         let (query, _) = tql(source);
-        let statement = lower_with(query.evaluable_filter(), Anchor::Block, true);
+        let statement = lower_with(query.evaluable_filter(), Anchor::Block);
         assert!(
             statement.sql.contains(
                 "tine_query_regex(?1, (SELECT bt1.query_visible FROM block_text bt1 \
@@ -649,7 +621,6 @@ fn a_valid_regex_lowers_to_the_bound_predicate_over_the_exact_visible_text() {
     let invalid = lower_with(
         Filter::attr(Attr::Content, CmpOp::Regex, Value::text("[unclosed")),
         Anchor::Block,
-        true,
     );
     assert!(invalid.matches_nothing);
     assert_eq!(invalid.content_plans, vec![ContentPlan::Regex]);
@@ -672,7 +643,6 @@ fn manager_regex_syntaxes_with_equal_source_keep_distinct_programs() {
             Filter::attr(Attr::Content, CmpOp::Regex, Value::text("/needle/")),
         ]),
         Anchor::Block,
-        true,
     );
     assert_eq!(statement.regexes.bindings.len(), 2);
     let predicate = statement.regexes.predicate();
@@ -727,8 +697,8 @@ fn one_pattern_is_one_binding_however_many_times_it_is_compiled() {
 fn the_regex_program_compares_by_pattern_and_never_prints_one() {
     let (query, _) = tql("content regexp 'secret-\\d+'");
     let filter = query.evaluable_filter();
-    let first = lower_with(filter.clone(), Anchor::Block, true);
-    let second = lower_with(filter, Anchor::Block, true);
+    let first = lower_with(filter.clone(), Anchor::Block);
+    let second = lower_with(filter, Anchor::Block);
     assert_eq!(first, second, "two lowerings of one filter are equal");
     assert_eq!(
         format!("{:?}", first.regexes),

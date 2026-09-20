@@ -90,7 +90,7 @@ writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transa
 transaction commits are not authority or individual durability barriers, because
 the file is a disposable cache (§3 invariant 3).
 
-**Tables of the projection (schema 29).** This list is the schema of record:
+**Tables of the projection (schema 30).** This list is the schema of record:
 `crates/tine-core/tests/contract_docs.rs` asserts it equals `sqlite_master`
 of a freshly initialized projection, so a table cannot appear or disappear
 without this contract saying so. FTS5 shadow tables are listed with their
@@ -117,8 +117,14 @@ virtual table.
 - `search_fts`, `search_fts_config`, `search_fts_content`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the token FTS5 table and its shadow tables.
 - `search_substring_fts`, `search_substring_fts_config`, `search_substring_fts_content`, `search_substring_fts_data`, `search_substring_fts_docsize`, `search_substring_fts_idx` — the trigram FTS5 table and its shadow tables.
 - `search_fts_owners` — FTS rowid to owner (page or block) map.
-- `search_fts_build` — the FTS build phase singleton (`phase` is 1 in every Direct file).
-- `block_home_claims`, `logseq_uuid_introductions`, `page_name_identity_records`, `page_portable_path_claims`, `portable_path_identity_records`, `reference_alias_bindings`, `search_fts_outbox`, `refs` — Managed Storage residue: created by the shared DDL, never written in Direct, always empty. Their removal is packet P2 of the compact-projection campaign (`tine-agents/specs/campaigns/2026-09-compact-projection/SPEC.md`).
+
+**Index completeness belongs to projection publication.** An admitted projection
+snapshot contains the search index maintained in the same page transaction as
+its source rows. There is no separate FTS build phase or outbox. The graph's
+projection-readiness boundary remains responsible for admitting snapshots;
+removing the redundant index-phase probe does not admit an incomplete graph.
+Aliases are represented by `reference_alias_declarations`; the redundant
+alias-binding table and the remaining Managed identity tables are absent.
 
 **Path refs and property atoms are one producer, not two.** `block_path_refs`
 holds each block's reference closure — its own normalized refs, every

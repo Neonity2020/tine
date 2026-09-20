@@ -145,7 +145,7 @@ fn database_page_answer(
     max_rows: usize,
     max_bytes: usize,
 ) -> Result<crate::query::results::PageAnswer, ResultReadError> {
-    let (anchor, statement) = corpus.lower(source, QueryDialect::Tql, corpus.fts_ready());
+    let (anchor, statement) = corpus.lower(source, QueryDialect::Tql);
     assert_eq!(
         anchor,
         Anchor::Page,
@@ -1521,11 +1521,7 @@ fn direct_page_recency_uses_file_mtime_for_undated_journals_and_ordinary_pages()
             )
             .expect("the accepted undated-journal shape is installed");
     }
-    let (anchor, statement) = corpus.lower(
-        "@page and name like '%'",
-        QueryDialect::Tql,
-        corpus.fts_ready(),
-    );
+    let (anchor, statement) = corpus.lower("@page and name like '%'", QueryDialect::Tql);
     assert_eq!(anchor, Anchor::Page);
     let view = ViewSettings {
         sort: vec![(Field::new("modified"), SortDir::Asc)],
@@ -1645,11 +1641,7 @@ fn cancelling_page_selection_or_a_later_payload_batch_returns_no_partial_answer(
     let root = scratch("s3-page-cancellation");
     write_page_result_corpus(&root, PAYLOAD_BATCH + 1);
     let corpus = Corpus::open(root, true);
-    let (anchor, statement) = corpus.lower(
-        "@page and journal = false",
-        QueryDialect::Tql,
-        corpus.fts_ready(),
-    );
+    let (anchor, statement) = corpus.lower("@page and journal = false", QueryDialect::Tql);
     assert_eq!(anchor, Anchor::Page);
     let view = ViewSettings {
         sort: vec![(Field::new("modified"), SortDir::Asc)],
@@ -1946,11 +1938,7 @@ fn read_damaged_page(
             "the damage statement changed nothing: {damage}"
         );
     }
-    let (anchor, statement) = corpus.lower(
-        "@page and journal = false",
-        QueryDialect::Tql,
-        corpus.fts_ready(),
-    );
+    let (anchor, statement) = corpus.lower("@page and journal = false", QueryDialect::Tql);
     assert_eq!(anchor, Anchor::Page);
     let recency = page_recency_for(&corpus.root);
     let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
@@ -2508,8 +2496,7 @@ fn a_page_anchored_statement_has_no_block_descriptor() {
     let root = scratch("r3-page-anchor");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let (anchor, statement) =
-        corpus.lower("@page and name like 'proj/%'", QueryDialect::Tql, false);
+    let (anchor, statement) = corpus.lower("@page and name like 'proj/%'", QueryDialect::Tql);
     assert_eq!(anchor, crate::query::ir::Anchor::Page);
     assert!(
         descriptor_view_statement(&statement, None).is_err(),
@@ -3428,30 +3415,4 @@ fn the_public_ir_route_refuses_without_walking_and_keeps_its_report() {
             "{label}: the refusal differs from the walk's"
         );
     }
-}
-
-#[test]
-fn fts_readiness_uses_owned_image_and_propagates_cancellation() {
-    let root = scratch("fts-owned-image");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("projection.sqlite");
-    let writer = rusqlite::Connection::open(&path).unwrap();
-    writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE search_fts_build(singleton INTEGER PRIMARY KEY, phase INTEGER); INSERT INTO search_fts_build VALUES(1, 1);").unwrap();
-    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-    assert!(crate::query::results::probe_fts_ready(&mut snapshot).unwrap());
-    writer
-        .execute("UPDATE search_fts_build SET phase = 0", [])
-        .unwrap();
-    assert!(crate::query::results::probe_fts_ready(&mut snapshot).unwrap());
-    let mut newer = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
-    assert!(!crate::query::results::probe_fts_ready(&mut newer).unwrap());
-    snapshot.cancellation().cancel();
-    assert!(matches!(
-        crate::query::results::probe_fts_ready(&mut snapshot),
-        Err(ResultReadError::Cancelled)
-    ));
-    drop(newer);
-    drop(snapshot);
-    drop(writer);
-    std::fs::remove_dir_all(root).unwrap();
 }

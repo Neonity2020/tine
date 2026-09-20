@@ -12,8 +12,7 @@ use super::ir::{Anchor, Bounds, ExecutionContext, Query, QueryResult, QueryRows,
 use super::rank::PageRecencyPrograms;
 use super::registry::Registry;
 use super::results::{
-    probe_fts_ready, read_page_results, PageReadInputs, RecencyPage, ResultIdentity,
-    ResultReadInputs,
+    read_page_results, PageReadInputs, RecencyPage, ResultIdentity, ResultReadInputs,
 };
 use super::sql::{lower_query, LoweringInputs, RELATION_RULE, RESULT_SET_RULE};
 use super::{
@@ -56,7 +55,6 @@ pub(crate) struct SnapshotQueryInputs<'a> {
 pub(crate) struct SnapshotQueryReader<'a> {
     snapshot: RefCell<&'a mut PhysicalProjectionQuerySnapshot>,
     inputs: SnapshotQueryInputs<'a>,
-    fts_ready: bool,
 }
 
 impl<'a> SnapshotQueryReader<'a> {
@@ -79,7 +77,6 @@ impl<'a> SnapshotQueryReader<'a> {
                 identity: self.inputs.identity,
                 recency: self.inputs.recency,
                 today: self.inputs.today,
-                fts_ready: self.fts_ready,
             },
         )?;
         self.ensure_current()?;
@@ -90,11 +87,9 @@ impl<'a> SnapshotQueryReader<'a> {
         snapshot: &'a mut PhysicalProjectionQuerySnapshot,
         inputs: SnapshotQueryInputs<'a>,
     ) -> Result<Self, QueryExecutionError> {
-        let fts_ready = probe_fts_ready(snapshot)?;
         Ok(Self {
             snapshot: RefCell::new(snapshot),
             inputs,
-            fts_ready,
         })
     }
 
@@ -145,7 +140,6 @@ impl<'a> SnapshotQueryReader<'a> {
                 registry: self.inputs.registry,
                 cutoff: None,
                 compiled: &compiled,
-                fts_ready: self.fts_ready,
                 result_set_rule: RESULT_SET_RULE,
                 relation_rule: RELATION_RULE,
             },

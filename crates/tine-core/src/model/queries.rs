@@ -52,10 +52,10 @@ impl Graph {
         _source_generation: u64,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         self.dispatch_direct_query(|request| {
-            self.direct_projection_query_job(
+            self.direct_projection_read_job(
                 request,
                 crate::direct_projection::RegistrySensitivity::Required,
-                |job, _| self.query_property_registry_at(job),
+                |job| self.query_property_registry_at(job),
             )
         })
     }

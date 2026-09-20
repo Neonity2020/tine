@@ -273,10 +273,6 @@ impl Graph {
             Arc::new(crate::query::registry::Registry::empty(&config))
         };
         let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
-        let fts_ready = match crate::query::results::probe_fts_ready(&mut job.snapshot) {
-            Ok(ready) => ready,
-            Err(error) => return direct_attempt_from_read(Err(error.into())),
-        };
         let inputs = LoweringInputs {
             today,
             registry: &registry,
@@ -287,7 +283,6 @@ impl Graph {
             // `ConstructionBudget` the walk charges.
             cutoff: None,
             compiled: &compiled,
-            fts_ready,
             result_set_rule: RESULT_SET_RULE,
             relation_rule: RELATION_RULE,
         };
@@ -614,28 +609,6 @@ impl Graph {
         })
     }
 
-    /// The statement half of [`Graph::direct_page_rows`], and of
-    /// [`Graph::direct_ir_explain_empty`]'s counting: ONE query job, then the
-    /// caller's reads over its snapshot.
-    ///
-    /// It performs no repair of its own — it reports which §5.9 state it
-    /// reached, exactly as `direct_projection_statement_pre_view` does, so the
-    /// classification and the recovery stay in `dispatch_direct_query`.
-    pub(super) fn direct_projection_query_job<T>(
-        &self,
-        request: &DirectQueryRequest,
-        registry_sensitivity: crate::direct_projection::RegistrySensitivity,
-        read: impl FnOnce(
-            &mut crate::direct_projection::DirectQueryJob,
-            bool,
-        ) -> Result<T, crate::query::QueryExecutionError>,
-    ) -> DirectAttempt<T> {
-        self.direct_projection_read_job(request, registry_sensitivity, |job| {
-            let fts_ready = crate::query::results::probe_fts_ready(&mut job.snapshot)?;
-            read(job, fts_ready)
-        })
-    }
-
     /// Own admission and one current read job; callers supply only their reads.
     pub(super) fn direct_projection_read_job<T>(
         &self,
@@ -698,7 +671,7 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
+        self.direct_projection_read_job(request, registry_sensitivity, |job| {
             let registry = self.direct_lowering_registry(query.filter.has_props_leaf(), job)?;
             let compiled =
                 crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
@@ -711,7 +684,6 @@ impl Graph {
                     // post-order limit and `COUNT(*) OVER()` exact count.
                     cutoff: None,
                     compiled: &compiled,
-                    fts_ready,
                     result_set_rule: RESULT_SET_RULE,
                     relation_rule: RELATION_RULE,
                 },
@@ -761,7 +733,7 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
+        self.direct_projection_read_job(request, registry_sensitivity, |job| {
             let profile = crate::query::ConstructionProfile::from_view(view);
             // One lowering per probe, all under ONE registry snapshot: a probe that
             // read a different effective type than its siblings would explain a
@@ -791,7 +763,6 @@ impl Graph {
                             registry: &registry,
                             cutoff: None,
                             compiled: &compiled,
-                            fts_ready,
                             result_set_rule: RESULT_SET_RULE,
                             relation_rule: RELATION_RULE,
                         },

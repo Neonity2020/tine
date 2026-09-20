@@ -258,20 +258,14 @@ impl std::fmt::Debug for QueryRegexProgram {
 /// How ONE content leaf reaches its rows (SPEC §5.10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentPlan {
-    /// Every retained OR arm supplied a trigram candidate needle and the FTS
-    /// index is ready: the leaf bounds the anchor.
+    /// Every retained OR arm supplied a trigram candidate needle, so the leaf
+    /// bounds the anchor through the snapshot's complete FTS index.
     Fts,
     /// At least one retained OR arm has no positive term yielding a
     /// three-scalar whitespace-free run (or its only candidates bear a NUL), so
     /// that arm is an explicitly unbounded SQL content predicate. `foobar`
     /// queried by `oo` lands here, correctly, and is still found.
     ShortUnindexable,
-    /// The transient state: the FTS index is still building on this
-    /// materialized read, so the SAME exact predicates are evaluated on the
-    /// ready block columns with no candidate bounds. Not empty results, not an
-    /// error, not a new walk route, and never a rebuild request or a wait
-    /// inside a query (I-13) — the existing index owner finishes the build.
-    FtsBuilding,
     /// A regex leaf. §4.3.2 makes it an explicitly unindexed content predicate;
     /// regex can never claim an FTS bound. Only the INVALID-pattern form
     /// reaches a statement in this wave (it is a constant-false leaf); a valid
@@ -390,12 +384,6 @@ pub(crate) struct LoweringInputs<'a> {
     /// prevent: `content match` and legacy `(search …)` would stop meaning the
     /// same thing the moment the two parses disagreed (I-12, D-14).
     pub(crate) compiled: &'a CompiledLeaves,
-    /// The EXISTING FTS-building signal, read on the SAME materialized
-    /// read/generation as the query and separately from projection readiness
-    /// (§5.10). `false` is the transient `fts-building` class: the same exact
-    /// predicates, evaluated on the ready block columns, with no candidate
-    /// bounds anywhere in the statement.
-    pub(crate) fts_ready: bool,
     /// Which spelling of §5.3's result-set rule to emit. Production passes
     /// [`RESULT_SET_RULE`]; the measurement gate passes both so the choice
     /// stays reproducible rather than remembered.
@@ -1617,9 +1605,6 @@ impl Compiler<'_> {
     /// leading, repeated or line-breaking whitespace does not survive the
     /// collapse, and a bound that required it to would exclude a true match.
     fn fts_bound(&mut self, group: &AndGroup, b: &str) -> Option<String> {
-        if !self.inputs.fts_ready {
-            return None;
-        }
         let needle = fts_candidate_needle(group)?;
         let literal = self.bind(PhysicalQueryValue::Text(fts_phrase_literal(needle)));
         let fts = self.alias("sf");
@@ -2919,16 +2904,16 @@ fn content_plans(filter: &Filter, inputs: &LoweringInputs<'_>) -> Vec<ContentPla
             CmpOp::Match => match match_program(inputs.compiled, text) {
                 MatchProgram::AlwaysFalse => {}
                 MatchProgram::Regex { .. } => out.push(ContentPlan::Regex),
-                MatchProgram::Boolean(groups) => out.push(if !inputs.fts_ready {
-                    ContentPlan::FtsBuilding
-                } else if groups
-                    .iter()
-                    .all(|group| fts_candidate_needle(group).is_some())
-                {
-                    ContentPlan::Fts
-                } else {
-                    ContentPlan::ShortUnindexable
-                }),
+                MatchProgram::Boolean(groups) => out.push(
+                    if groups
+                        .iter()
+                        .all(|group| fts_candidate_needle(group).is_some())
+                    {
+                        ContentPlan::Fts
+                    } else {
+                        ContentPlan::ShortUnindexable
+                    },
+                ),
             },
             // No other content leaf is a plan class.
             CmpOp::Eq
@@ -3063,14 +3048,13 @@ fn leaf_bounds(leaf: &Leaf, row: BoundRow, inputs: &LoweringInputs<'_>) -> bool 
             // `match` is unbounded: `starts_with` on `content` is not
             // range-lowerable, and regex is explicitly unindexed (§4.3.2).
             //
-            // `match` bounds the anchor when the FTS index is READY and EVERY
-            // retained OR arm supplies a candidate needle. One unbounded arm
+            // `match` bounds the anchor when EVERY retained OR arm supplies a
+            // candidate needle. One unbounded arm
             // makes the whole leaf unbounded — the arms are OR-ed, so the
             // anchor is reached once per arm and a single unbounded arm
             // enumerates it (§5.10, §5.7's `Or` rule).
             (BoundRow::Block, Attr::Content) => {
                 *op == CmpOp::Match
-                    && inputs.fts_ready
                     && matches!(value, Value::Text { text }
                     if match match_program(inputs.compiled, text) {
                         MatchProgram::Boolean(groups) => groups

@@ -980,9 +980,6 @@ fn indexed_block_source(
     let Some(needle) = block_candidate_needle(predicate) else {
         return Ok(UNBOUNDED.to_string());
     };
-    if !crate::query::results::probe_fts_ready(snapshot)? {
-        return Ok(UNBOUNDED.to_string());
-    }
     let literal = crate::query::sql::fts_phrase_literal(needle);
     if !candidate_count_within_cap(snapshot, &literal)? {
         return Ok(UNBOUNDED.to_string());

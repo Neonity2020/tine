@@ -944,9 +944,8 @@ fn a_selective_needle_ranks_only_its_candidates() {
     let root = scratch("friendly-candidate-bound");
     write_candidate_bound_corpus(&root, 200);
     let corpus = Corpus::open(root, true);
-    // A ready path over an EMPTY index would pass this test while proving
-    // nothing, so both preconditions are asserted, not assumed.
-    assert!(corpus.fts_ready(), "the substring index must be built");
+    // A path over an EMPTY index would pass this test while proving nothing,
+    // so the precondition is asserted, not assumed.
     assert!(
         corpus.substring_fts_rows() > 0,
         "the substring index must hold block rows"
@@ -977,7 +976,7 @@ fn the_candidate_bound_drops_no_block_the_exact_predicate_admits() {
     let root = scratch("friendly-bound-correctness");
     write_candidate_bound_corpus(&root, 8);
     let corpus = Corpus::open(root, true);
-    assert!(corpus.fts_ready() && corpus.substring_fts_rows() > 0);
+    assert!(corpus.substring_fts_rows() > 0);
     for (query, expected) in [
         // The query's case differs from the block's: both sides fold.
         ("zqxwood", 1),

@@ -3632,7 +3632,6 @@ fn physical_page(
             preamble: document.pre_block.clone(),
             normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
             searchable_text,
-            references: Vec::new(),
             properties,
             tags: crate::query::derived::tag_rows(&tags),
             property_atoms: page_property_atoms,
@@ -3757,7 +3756,6 @@ fn lower_blocks(
             collapsed: block.collapsed(),
             logseq_uuid,
             logseq_identity_origin: logseq_uuid.map(|_| 0),
-            references: Vec::new(),
             properties,
             tags: crate::query::derived::tag_rows(&projection.tags),
             task: projection.marker.as_ref().map(|marker| PhysicalTask {
