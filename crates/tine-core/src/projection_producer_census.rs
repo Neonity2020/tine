@@ -1531,9 +1531,15 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // projection read, including alias ownership, through one mutex-held
     // admission helper. This changes only the counted receiver-call shape;
     // it adds no storage import or authority crossing.
+    // 2026-09-20: the P4 streaming-build correction replaces the per-chunk
+    // `apply_with_source_revisions_and_aliases` call plus final page-order,
+    // optimize and staged-replacement calls with append, finish and finalized-
+    // token publication. Schema initialization and one pre-publication schema
+    // validation moved inside storage; the ordinary apply call remains. No
+    // authority crossing or dependency pin changed.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "33416e871cfdb1ca0a68655052b8c42f37d01333cedb0846745d5e3fa017c856",
+        "9e53e9b52a57fb8df5174cc77fed32859109168ed79e554a3bd451eac91aba53",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
