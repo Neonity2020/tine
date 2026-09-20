@@ -94,3 +94,4 @@ see the project `CLAUDE.md`.
 | [0065](0065-published-query-export-bakes-the-app.md) | A published query export ships the read-only frontend over a snapshot baked by the native engine at export time; `parseQuery`/`queryRun` are the two seams a browser-side engine would replace | Accepted |
 | [0066](0066-remove-managed-storage.md) | Managed Storage is removed; Direct Files is the only storage mode, and any future sync is specified afresh under code, performance, and space budgets | Accepted |
 | [0067](0067-public-guide-is-a-live-export.md) | Build the public Guide through the read-only app exporter, retain the static HTML fallback, and enforce reproducible live output in CI | Accepted |
+| [0068](0068-bounded-desktop-cli.md) | The desktop binary uses one typed schema for help/version, GUI launch, static/live export, and read-only graph checks | Accepted |

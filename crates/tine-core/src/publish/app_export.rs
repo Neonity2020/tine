@@ -190,6 +190,9 @@ pub struct AppPublication {
 pub enum AppHome {
     Query(HomeQuery),
     Page(String),
+    /// Prefer the graph's configured home when it is selected, then
+    /// `Welcome to Tine`, then the first selected page alphabetically.
+    Auto,
 }
 
 /// The execution-side parse of a `<% current page %>` macro: the substituted

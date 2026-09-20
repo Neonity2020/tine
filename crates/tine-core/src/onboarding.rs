@@ -132,6 +132,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Platforms and mobile",
         markdown: include_str!("templates/platforms-and-mobile.md"),
     },
+    GuideTemplate {
+        title: "Reference/Command line",
+        markdown: include_str!("templates/command-line.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -1926,6 +1930,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_line_reference_covers_the_shipped_surface_and_safety_defaults() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Command line")
+            .expect("command-line reference is registered")
+            .markdown;
+        for promised in [
+            "tine --help",
+            "tine --version",
+            "tine open GRAPH",
+            "tine capture",
+            "tine export static GRAPH",
+            "tine export live GRAPH",
+            "tine doctor GRAPH",
+            "--replace",
+            "graph-relative",
+        ] {
+            assert!(page.contains(promised), "Guide omitted {promised}");
+        }
     }
 
     #[cfg(unix)]

@@ -41,6 +41,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- Tine's desktop binary now has a documented command-line interface: `--help`
+  and `--version`; explicit `open` and `capture` commands; create-only static
+  and live graph exports with graph-relative output and an explicit `--replace`;
+  and a read-only `doctor` check. Existing `tine GRAPH` and `--capture`
+  invocations remain compatible. Linux packages install a generated `man tine`
+  page (GH #567).
 - Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's
   lifecycle: when a validation starts reading the graph, how long that read
   took, how many pages it queued, each worker turn's duration and rows, and when

@@ -3230,9 +3230,32 @@ fn path_rel(root: &Path, path: &Path) -> PathBuf {
 /// Only pages with `public:: true` are published, unless
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
+    publish_graph_to(
+        graph,
+        PublicationOutput {
+            parent: PathBuf::new(),
+            leaf: "publish".to_string(),
+            replace: true,
+        },
+    )
+    .map(|outcome| (outcome.path, outcome.pages))
+}
+
+/// Export public pages to a caller-selected directory under the graph root.
+/// The output capability remains graph-relative and uses the same staged,
+/// recoverable commit as the in-app publisher.
+pub fn publish_graph_to(graph: &Graph, output: PublicationOutput) -> io::Result<PublishOutcome> {
     let (pages, sources) = capture_direct_publication_sources(graph)?;
+    let mut target = PublicationTarget::graph_site();
+    // A nested output cannot keep the graph site's historical `../assets/`
+    // links: its pages sit more than one level below the graph. Make that
+    // portable case self-contained through the existing bounded asset copier.
+    if !output.parent.as_os_str().is_empty() {
+        target.asset_budget_bytes = Some(QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES);
+    }
+    target.output = output;
     graph.with_publication_query_reader(&sources, |reader| {
-        publish_graph_documents_with_queries(graph, pages, reader)
+        publish_graph_documents_inner(graph, pages, Some(reader), &target)
     })
 }
 
@@ -3245,12 +3268,37 @@ pub fn publish_graph_app(
     name: &str,
     home_page: &str,
 ) -> io::Result<PublishOutcome> {
+    publish_graph_app_to(
+        graph,
+        bundle,
+        name,
+        app_export::AppHome::Page(home_page.to_string()),
+        PublicationOutput {
+            parent: PathBuf::new(),
+            leaf: "publish".to_string(),
+            replace: true,
+        },
+    )
+}
+
+/// Export the read-only app to a caller-selected directory under the graph.
+pub fn publish_graph_app_to(
+    graph: &Graph,
+    bundle: std::sync::Arc<app_export::PublishedAppBundle>,
+    name: &str,
+    home: app_export::AppHome,
+    output: PublicationOutput,
+) -> io::Result<PublishOutcome> {
     let (pages, sources) = capture_direct_publication_sources(graph)?;
     let mut target = PublicationTarget::graph_site();
+    if !output.parent.as_os_str().is_empty() {
+        target.asset_budget_bytes = Some(QUERY_EXPORT_DEFAULT_ASSET_BUDGET_BYTES);
+    }
+    target.output = output;
     target.app = Some(app_export::AppPublication {
         name: name.to_string(),
         bundle,
-        home: app_export::AppHome::Page(home_page.to_string()),
+        home,
     });
     graph.with_publication_query_reader(&sources, |reader| {
         publish_graph_documents_inner(graph, pages, Some(reader), &target)
@@ -3327,9 +3375,10 @@ fn publish_graph_documents(
         .map(|outcome| (outcome.path, outcome.pages))
 }
 
-/// Render one already-authoritative document capture while every query surface
-/// reads the supplied coherent current-main snapshot.
-pub(crate) fn publish_graph_documents_with_queries(
+/// Render one test capture while every query reads the supplied coherent
+/// snapshot. Production callers capture directly through the public entrypoints.
+#[cfg(test)]
+fn publish_graph_documents_with_queries(
     graph: &Graph,
     pages: Vec<(crate::model::PageEntry, doc::Document)>,
     queries: &dyn PublicationQueryRead,
@@ -3764,6 +3813,29 @@ pub(crate) fn publish_graph_documents_inner(
                             ));
                         };
                         ((*name).to_string(), None)
+                    }
+                    app_export::AppHome::Auto => {
+                        let configured = graph.config.default_home.as_deref();
+                        let selected = configured
+                            .and_then(|requested| {
+                                let wanted = crate::refs::page_key(requested);
+                                public
+                                    .iter()
+                                    .find(|(name, _, _)| crate::refs::page_key(name) == wanted)
+                            })
+                            .or_else(|| {
+                                public.iter().find(|(name, _, _)| {
+                                    crate::refs::page_key(name) == "welcome to tine"
+                                })
+                            })
+                            .or_else(|| public.first())
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "The published app has no public page to use as its home.",
+                                )
+                            })?;
+                        (selected.0.to_string(), None)
                     }
                 };
                 // The closed sub-graph: every graph-shaped answer the app

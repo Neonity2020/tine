@@ -3122,6 +3122,8 @@ fn graph_publication_ships_the_app_with_a_real_page_as_home() {
     fs::create_dir_all(dir.join("journals")).unwrap();
     fs::create_dir_all(dir.join("pages")).unwrap();
     fs::create_dir_all(dir.join("logseq")).unwrap();
+    fs::create_dir_all(dir.join("assets")).unwrap();
+    fs::write(dir.join("assets/pic.png"), b"picture").unwrap();
     fs::write(
         dir.join("pages/Welcome to Tine.md"),
         "public:: true\n- Welcome\n- {{query (task TODO)}}\n",
@@ -3129,12 +3131,13 @@ fn graph_publication_ships_the_app_with_a_real_page_as_home() {
     .unwrap();
     fs::write(
         dir.join("pages/Other.md"),
-        "public:: true\n- TODO selected task\n",
+        "public:: true\n- TODO selected task ![pic](../assets/pic.png)\n",
     )
     .unwrap();
     fs::write(dir.join("pages/Private.md"), "- private\n").unwrap();
 
-    let graph = Graph::open(&dir);
+    let mut graph = Graph::open(&dir);
+    graph.config.default_home = Some("Other".to_string());
     let _projection = prepare_publication_graph(&graph);
     let outcome =
         publish_graph_app(&graph, fake_app_bundle(), "Tine Guide", "Welcome to Tine").unwrap();
@@ -3161,6 +3164,39 @@ fn graph_publication_ships_the_app_with_a_real_page_as_home() {
     assert_eq!(snapshot["queries"].as_array().unwrap().len(), 1);
     assert!(!snapshot.to_string().contains("Private"));
     assert!(out.join("app-redirect.js").is_file());
+
+    let cli_output = PublicationOutput {
+        parent: PathBuf::from("exports"),
+        leaf: "live".to_string(),
+        replace: false,
+    };
+    let cli_outcome = publish_graph_app_to(
+        &graph,
+        fake_app_bundle(),
+        "CLI export",
+        app_export::AppHome::Auto,
+        cli_output.clone(),
+    )
+    .unwrap();
+    let cli_snapshot: serde_json::Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(&cli_outcome.path).join("app/snapshot.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cli_snapshot["home"], "Other");
+    let cli_out = PathBuf::from(&cli_outcome.path);
+    assert_eq!(
+        fs::read(cli_out.join("assets/pic.png")).unwrap(),
+        b"picture"
+    );
+    assert!(cli_snapshot.to_string().contains("assets/pic.png"));
+    assert!(publish_graph_app_to(
+        &graph,
+        fake_app_bundle(),
+        "CLI export",
+        app_export::AppHome::Auto,
+        cli_output,
+    )
+    .is_err());
     let _ = fs::remove_dir_all(&dir);
 }
 

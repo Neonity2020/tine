@@ -31,6 +31,8 @@ tauri-plugin-process = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+tempfile = "3"
 notify = "6"
 # Asset write commands receive bytes as base64 (a single compact string) instead
 # of a JSON number[] (~4-5x payload + a giant per-element parse on the UI thread).
@@ -50,7 +52,7 @@ tine-core = { path = "../crates/tine-core" }
 tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.27.0" }
 
 [dev-dependencies]
-tempfile = "3"
+clap_mangen = "0.2"
 
 # Mobile + Windows: open http/mailto URLs via the OS — an ACTION_VIEW Intent on
 # Android (GH #49), ShellExecute on Windows (GH #215; `explorer <url>` opens a
@@ -77,6 +79,7 @@ clipboard-rs = { version = "0.3.5", default-features = false }
 # latest.json on a reporter's otherwise-online Windows 11 system (GH #241).
 [target.'cfg(target_os = "windows")'.dependencies]
 tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 # `tauri-plugin-updater` disables Reqwest defaults and selects only its TLS
 # feature above. Opt back into Reqwest's separate Windows system-proxy reader so
 # the native updater follows the same configured network route as WebView2 and
