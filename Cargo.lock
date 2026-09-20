@@ -5195,9 +5195,9 @@ dependencies = [
  "sqlparser",
  "syn 2.0.117",
  "tempfile",
+ "tine-search",
  "tine-storage",
  "unicode-normalization",
- "unicode-segmentation",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -5216,6 +5216,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tine-search"
+version = "0.6.984"
+dependencies = [
+ "regex",
+ "serde_json",
+ "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]

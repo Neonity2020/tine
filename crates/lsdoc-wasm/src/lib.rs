@@ -9,10 +9,10 @@ use wasm_bindgen::prelude::*;
 
 #[path = "../../tine-core/src/logbook.rs"]
 mod logbook;
-#[path = "../../tine-core/src/property_line.rs"]
-mod property_line;
 #[path = "../../lsdoc-block-parse.rs"]
 mod lsdoc_block_parse;
+#[path = "../../tine-core/src/property_line.rs"]
+mod property_line;
 
 /// Parse one de-bulleted block body into lsdoc's render AST, serialized to JSON.
 ///
@@ -33,8 +33,7 @@ pub fn parse_block_json(raw: &str, is_org: bool) -> String {
 #[wasm_bindgen]
 pub fn parse_document_json(text: &str, is_org: bool) -> String {
     let fmt = if is_org { "org" } else { "md" };
-    lsdoc::projection_to_json(&lsdoc::parse_format(text, fmt))
-        .unwrap_or_else(|_| "{}".to_string())
+    lsdoc::projection_to_json(&lsdoc::parse_format(text, fmt)).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Render one de-bulleted block body to lsdoc's CANONICAL HTML skeleton (M3 render
@@ -56,6 +55,77 @@ pub fn render_block_html(raw: &str, is_org: bool) -> String {
     };
     let blocks = lsdoc_block_parse::parse_block(raw, is_org);
     lsdoc::render_html(&blocks, &lsdoc::RenderOpts { format: rfmt })
+}
+
+/// Fold text with Tine's exact A6 search transform.
+///
+/// This is whole-string lowercase plus compatibility decomposition, removal of
+/// Unicode nonspacing marks, canonical reorder and composition. It deliberately
+/// is not full Unicode casefold and is not idempotent for every compatibility
+/// character, so callers must pass raw text and invoke it exactly once.
+#[wasm_bindgen]
+pub fn search_fold(text: &str) -> String {
+    tine_search::canonical_fold(text)
+}
+
+/// Fold raw text once and serialize its provenance as
+/// `{text, sources: [{start, end}]}`. Each source range uses raw UTF-16 offsets,
+/// and there is exactly one range per output Unicode scalar (not per UTF-16 code
+/// unit).
+#[wasm_bindgen]
+pub fn search_fold_map_json(text: &str) -> String {
+    let mapped = tine_search::canonical_fold_with_map(text);
+    let sources = mapped
+        .sources
+        .into_iter()
+        .map(|source| {
+            serde_json::json!({
+                "start": source.start,
+                "end": source.end,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "text": mapped.text,
+        "sources": sources,
+    })
+    .to_string()
+}
+
+fn match_batch_json(query: &str, texts_json: &str) -> Result<String, String> {
+    let texts: Vec<String> = serde_json::from_str(texts_json)
+        .map_err(|error| format!("search texts must be a JSON string array: {error}"))?;
+    let matcher = tine_search::Matcher::parse(query);
+    let search_error = match &matcher {
+        tine_search::Matcher::InvalidRegex(error) => Some(error.as_str()),
+        _ => None,
+    };
+    let matches = texts
+        .iter()
+        .map(|text| match &matcher {
+            tine_search::Matcher::Boolean(_) => {
+                matcher.matches(&tine_search::canonical_fold(text), text)
+            }
+            tine_search::Matcher::Regex(_) => matcher.matches("", text),
+            tine_search::Matcher::Empty | tine_search::Matcher::InvalidRegex(_) => true,
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "matches": matches,
+        "search_error": search_error,
+    })
+    .to_string())
+}
+
+/// Parse one shared search matcher and apply it to a JSON string array.
+///
+/// Boolean queries fold each raw candidate exactly once; regex queries see raw
+/// text only. Empty and invalid-regex queries retain every candidate, with the
+/// latter returning its diagnostic in `search_error`. Malformed JSON is a bridge
+/// error rather than a fabricated match-all result.
+#[wasm_bindgen]
+pub fn search_match_batch_json(query: &str, texts_json: &str) -> Result<String, JsValue> {
+    match_batch_json(query, texts_json).map_err(|error| JsValue::from_str(&error))
 }
 
 #[wasm_bindgen]

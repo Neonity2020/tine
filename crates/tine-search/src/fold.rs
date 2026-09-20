@@ -6,9 +6,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// A6-folded text and one raw UTF-16 source range for every output scalar.
 #[derive(Clone, Debug)]
-pub(crate) struct MappedFold {
-    pub(crate) text: String,
-    pub(crate) sources: Vec<Range<usize>>,
+pub struct MappedFold {
+    pub text: String,
+    pub sources: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +19,7 @@ struct TaggedScalar {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct RemovalWork {
     input_scalars: usize,
     work_units: usize,

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/tine-core",
+    "crates/tine-search",
     "plugin-sdk/rust",
     "src-tauri",
     "src-tauri/ios-folder-picker-native",
