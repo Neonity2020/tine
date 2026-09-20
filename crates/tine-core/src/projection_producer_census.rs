@@ -1509,9 +1509,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // PhysicalQueryValue::Integer pattern in query/results.rs. Restoring that
     // single inventory row reproduces the previous digest exactly; no write
     // crossing or storage dependency pin changed. P3 native folding adds none.
+    // 2026-09-20: native linked-reference filtering adds one PhysicalQueryValue
+    // import in model/direct_query.rs, twelve Text and one Integer patterns or
+    // bindings for scoped read-only queries. No other inventory row changed.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "114fc8795670d46ae23f077a41b645fa07339772ea58937ba68ea383e5e36751",
+        "18b4ec3437158fa690aec71843fcc63485a014fc8992f4fe925f8db2f45ba597",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }
