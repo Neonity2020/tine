@@ -610,7 +610,11 @@ fn backlink_filter_scoped_journal_names_match_effective_title_resolver() {
 
 #[test]
 fn backlink_filter_context_source_keeps_projection_setup_scoped() {
-    let query_source = include_str!("query.rs");
+    let query_source = crate::test_support::rust_module_production_files("query.rs")
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     let start = query_source.find("pub fn backlink_filter_context").unwrap();
     let body = &query_source[start
         ..query_source[start..]

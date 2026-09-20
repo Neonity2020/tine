@@ -457,7 +457,17 @@ mod tests {
     #[test]
     fn native_search_fold_has_one_explicit_owner() {
         let owner = include_str!("search_query/fold.rs");
-        let parser = include_str!("search_query.rs");
+        let parser = crate::projection_producer_census::production_rust()
+            .iter()
+            .filter(|file| {
+                file.relative == "crates/tine-core/src/search_query.rs"
+                    || file
+                        .relative
+                        .starts_with("crates/tine-core/src/search_query/")
+            })
+            .map(|file| file.code.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let planner = include_str!("query_plan.rs");
         let sql = include_str!("query/sql.rs");
         let eval = include_str!("query/eval.rs");
