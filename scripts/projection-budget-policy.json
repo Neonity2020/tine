@@ -199,7 +199,57 @@
         "m1_multiplier": 1,
         "u1_multiplier": 1
       },
-      "baseline": null
+      "baseline": {
+        "recorded": "2026-09-20",
+        "t1_build_ms": 3077.9812340000003,
+        "m1_peak_rss_delta_kb": 79260,
+        "u1": {
+          "one_block": {
+            "wchar": 221920
+          },
+          "sixty_block": {
+            "wchar": 1929054
+          }
+        },
+        "t2_search": [
+          {
+            "chars": 3,
+            "p95_ms": 21.953079
+          },
+          {
+            "chars": 4,
+            "p95_ms": 18.972870999999998
+          },
+          {
+            "chars": 9,
+            "p95_ms": 18.697107000000003
+          }
+        ],
+        "t3_queries": [
+          {
+            "query": "(task TODO)",
+            "p95_ms": 1.156055
+          },
+          {
+            "query": "(task DONE)",
+            "p95_ms": 0.644085
+          },
+          {
+            "query": "(between -3650d today)",
+            "p95_ms": 0.8946
+          },
+          {
+            "query": "(all-page-tags)",
+            "p95_ms": 20.358241
+          },
+          {
+            "query": "(and (task TODO) (between -3650d today))",
+            "p95_ms": 1.1952180000000001
+          }
+        ],
+        "s1_ratio": 31.27061470389721,
+        "s2_write_ratio": 6.531004723367542
+      }
     },
     "synthetic10k": {
       "description": "The 10k-page synthetic graph graph_scale_bench generates (49 MB).",
@@ -213,7 +263,57 @@
         "m1_multiplier": 1,
         "u1_multiplier": 1
       },
-      "baseline": null
+      "baseline": {
+        "recorded": "2026-09-20",
+        "t1_build_ms": 64451.679654,
+        "m1_peak_rss_delta_kb": 671556,
+        "u1": {
+          "one_block": {
+            "wchar": 53012176
+          },
+          "sixty_block": {
+            "wchar": 54200490
+          }
+        },
+        "t2_search": [
+          {
+            "chars": 3,
+            "p95_ms": 3678.1699630000003
+          },
+          {
+            "chars": 5,
+            "p95_ms": 4050.566051
+          },
+          {
+            "chars": 8,
+            "p95_ms": 3826.516944
+          }
+        ],
+        "t3_queries": [
+          {
+            "query": "(task TODO)",
+            "p95_ms": 1.458628
+          },
+          {
+            "query": "(task DONE)",
+            "p95_ms": 0.802971
+          },
+          {
+            "query": "(between -3650d today)",
+            "p95_ms": 0.43105
+          },
+          {
+            "query": "(all-page-tags)",
+            "p95_ms": 1.236765
+          },
+          {
+            "query": "(and (task TODO) (between -3650d today))",
+            "p95_ms": 0.683419
+          }
+        ],
+        "s1_ratio": 36.13472422139306,
+        "s2_write_ratio": 19.52067424884684
+      }
     }
   }
 }
