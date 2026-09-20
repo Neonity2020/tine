@@ -9,16 +9,20 @@
 //   1. Read the lsdoc git tag from crates/tine-core/Cargo.toml (the single source
 //      of truth) and from crates/lsdoc-wasm/Cargo.toml; REFUSE if they differ
 //      (the stale-wasm / forgot-to-bump guard, plan §7D).
-//   2. wasm-pack build --target web (release), LSDOC_TAG stamped in.
-//   3. Base64-encode the .wasm into src/render/wasm/lsdoc_wasm_bytes.ts and copy
-//      the wasm-bindgen JS glue + .d.ts. These committed files are what the app
-//      and CI consume — no fetch, no wasm toolchain at app-build time.
+//   2. Refuse native/standalone shared-search lock drift, then wasm-pack build
+//      --target web (release), with LSDOC_TAG stamped in.
+//   3. Fingerprint the resolved search dependency closure plus its local leaf
+//      and wrapper sources, then stamp it beside the base64-encoded .wasm in
+//      src/render/wasm/lsdoc_wasm_bytes.ts. Copy the wasm-bindgen JS glue + .d.ts.
+//      These committed files are what the app and CI consume — no fetch, no wasm
+//      toolchain at app-build time.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdtempSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { searchLockAlignmentProblems, searchSourceFingerprint } from "./wasm-search-guard-lib.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = join(root, "src", "render", "wasm");
@@ -43,6 +47,25 @@ if (coreTag !== wrapTag) {
 }
 console.log(`lsdoc pin: ${coreTag} (tine-core == lsdoc-wasm ✓)`);
 
+function requireSearchLockAlignment() {
+  const problems = searchLockAlignmentProblems(root);
+  if (problems.length) {
+    console.error(
+      `\n  Native/Wasm shared-search dependency mismatch (build aborted):\n` +
+        problems.map((problem) => `    - ${problem}\n`).join("") +
+        `  Align crates/lsdoc-wasm/Cargo.lock with Cargo.lock before regenerating the Wasm.\n`,
+    );
+    process.exit(1);
+  }
+}
+
+// A first build has no standalone lock to compare yet. Once present, reject a
+// known split before paying for wasm-pack; verify again afterward in case Cargo
+// resolved a new version during this build.
+if (existsSync(join(root, "crates", "lsdoc-wasm", "Cargo.lock"))) {
+  requireSearchLockAlignment();
+}
+
 const tmp = mkdtempSync(join(tmpdir(), "lsdoc-wasm-"));
 console.log(`wasm-pack build → ${tmp}`);
 execFileSync(
@@ -50,6 +73,9 @@ execFileSync(
   ["build", "crates/lsdoc-wasm", "--target", "web", "--release", "--out-dir", tmp, "--out-name", "lsdoc_wasm"],
   { cwd: root, stdio: "inherit", env: { ...process.env, LSDOC_TAG: coreTag } },
 );
+
+requireSearchLockAlignment();
+const searchSourceSha256 = searchSourceFingerprint(root);
 
 mkdirSync(outDir, { recursive: true });
 
@@ -62,6 +88,7 @@ const bytesTs =
   `// Base64-inlined so the parser loads with NO fetch (works under Tauri's custom\n` +
   `// protocol + offline). Regenerate via \`npm run build:wasm\`.\n` +
   `export const LSDOC_TAG = ${JSON.stringify(coreTag)};\n` +
+  `export const SEARCH_SOURCE_SHA256 = ${JSON.stringify(searchSourceSha256)};\n` +
   `export const WASM_B64 = ${JSON.stringify(b64)};\n`;
 writeFileSync(join(outDir, "lsdoc_wasm_bytes.ts"), bytesTs);
 
