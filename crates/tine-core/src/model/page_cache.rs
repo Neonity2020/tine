@@ -1197,7 +1197,7 @@ impl Graph {
                             candidate,
                         )
                     }),
-                    Some(("U", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|target| {
+                    Some(("U" | "UI", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|target| {
                         crate::query::page_affects_unlinked(
                             &real_pages,
                             &aliases,

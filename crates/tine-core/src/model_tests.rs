@@ -8800,6 +8800,297 @@ fn bounded_reference_memos_survive_unrelated_edits_and_recompute_all_families() 
 }
 
 #[test]
+fn bounded_unlinked_reference_memo_keeps_interactive_and_exhaustive_membership_distinct() {
+    let dir = scratch("bounded-unlinked-memo-mode");
+    let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
+    let match_count = window + 25;
+    let mut source = String::new();
+    for ordinal in 0..match_count {
+        source.push_str(&format!("- target occurrence {ordinal}\n"));
+    }
+    fs::write(dir.join("pages").join("Source.md"), source).unwrap();
+    fs::write(dir.join("pages").join("Target.md"), "- owner\n").unwrap();
+    let g = ready_graph(&dir);
+    let generation = g.cache_generation();
+    let limits = (match_count + 10, 16 * 1024 * 1024);
+    let membership = |groups: &[RefGroup]| {
+        groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let exhaustive_expected =
+        crate::query::unlinked_refs_bounded(&g, "Target", limits.0, limits.1);
+    let interactive_expected =
+        crate::query::unlinked_refs_bounded_indexed(&g, "Target", limits.0, limits.1)
+            .expect("the ready interactive reference route answers");
+    assert_eq!(exhaustive_expected.total, match_count);
+    assert_eq!(interactive_expected.total, window);
+    let exhaustive_expected = membership(&exhaustive_expected.groups);
+    let interactive_expected = membership(&interactive_expected.groups);
+
+    let interactive_first = g
+        .unlinked_refs_bounded_indexed("Target", limits.0, limits.1)
+        .expect("interactive first");
+    assert_eq!(interactive_first.total, window);
+    assert_eq!(
+        membership(interactive_first.groups.as_ref()),
+        interactive_expected
+    );
+    let exhaustive_second = g.unlinked_refs_bounded("Target", limits.0, limits.1);
+    assert_eq!(exhaustive_second.total, match_count);
+    assert_eq!(
+        membership(exhaustive_second.groups.as_ref()),
+        exhaustive_expected,
+        "an Interactive memo entry must not truncate the Exhaustive route"
+    );
+
+    // Exercise the reverse order without changing the graph generation,
+    // target, or limits. This clears only the existing derived memo, not any
+    // source or projection state.
+    *g.derived_cache.write().unwrap() = None;
+    assert_eq!(g.cache_generation(), generation);
+    let exhaustive_first = g.unlinked_refs_bounded("Target", limits.0, limits.1);
+    assert_eq!(exhaustive_first.total, match_count);
+    assert_eq!(
+        membership(exhaustive_first.groups.as_ref()),
+        exhaustive_expected
+    );
+    let interactive_second = g
+        .unlinked_refs_bounded_indexed("Target", limits.0, limits.1)
+        .expect("interactive second");
+    assert_eq!(interactive_second.total, window);
+    assert_eq!(
+        membership(interactive_second.groups.as_ref()),
+        interactive_expected,
+        "an Exhaustive memo entry must not widen the Interactive route"
+    );
+    assert_eq!(g.cache_generation(), generation);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Deterministically models the ready-race branch in
+/// `reference_candidate_pages_indexed`: the Interactive lookup declined, but
+/// its existing Exhaustive SQL fallback succeeded. All other graph behavior
+/// stays on the real implementation.
+struct ExhaustiveReferenceCandidateGraph<'a>(&'a Graph);
+
+impl crate::query::graph::QueryGraph for ExhaustiveReferenceCandidateGraph<'_> {
+    fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
+        self.0.with_pages(f)
+    }
+
+    fn page_aliases(&self) -> Vec<(String, String)> {
+        self.0.page_aliases()
+    }
+
+    fn block_page_hint(&self, uuid: &str) -> Option<String> {
+        self.0.block_page_hint(uuid)
+    }
+
+    fn reference_candidate_pages(
+        &self,
+        names_norm: &[String],
+        self_page: &str,
+        kind: ReferenceKind,
+    ) -> ReferenceCandidatePages {
+        self.0
+            .reference_candidate_pages(names_norm, self_page, kind)
+    }
+
+    fn reference_candidate_pages_indexed(
+        &self,
+        names_norm: &[String],
+        self_page: &str,
+        kind: ReferenceKind,
+    ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
+        let candidates = self
+            .0
+            .reference_candidate_pages(names_norm, self_page, kind);
+        assert!(
+            candidates.indexed,
+            "the deterministic fallback must come from Exhaustive SQL"
+        );
+        assert!(
+            candidates.page_owners.is_none(),
+            "Exhaustive candidates must not claim Interactive provenance"
+        );
+        Ok(candidates)
+    }
+
+    fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<crate::query::BacklinkFilterScope, crate::query::QueryExecutionError> {
+        self.0.backlink_filter_scope(target, requested_pages)
+    }
+
+    fn direct_projection_block_referrer_candidate_pages(
+        &self,
+        uuid: &str,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        self.0
+            .direct_projection_block_referrer_candidate_pages(uuid)
+    }
+
+    fn list_pages(&self) -> Vec<PageEntry> {
+        self.0.list_pages()
+    }
+
+    fn page_aliases_with_owners(&self) -> Vec<(String, String, String)> {
+        self.0.page_aliases_with_owners()
+    }
+
+    fn referenced_page_names(&self) -> Vec<String> {
+        self.0.referenced_page_names()
+    }
+
+    fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {
+        self.0.reference_real_page_names()
+    }
+
+    fn direct_ir_query_result(
+        &self,
+        resolved: &crate::query::ResolvedQuery,
+        view: &crate::query::ir::ViewSettings,
+        bounds: crate::query::ir::Bounds,
+    ) -> Result<crate::query::ir::QueryResult, crate::query::QueryExecutionError> {
+        self.0.direct_ir_query_result(resolved, view, bounds)
+    }
+
+    fn direct_ir_explain_empty(
+        &self,
+        resolved: &crate::query::ResolvedQuery,
+        view: &crate::query::ir::ViewSettings,
+        bounds: crate::query::ir::Bounds,
+    ) -> Result<crate::query::ir::ExplainEmptyResult, crate::query::QueryExecutionError> {
+        self.0.direct_ir_explain_empty(resolved, view, bounds)
+    }
+
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RefGroup>, crate::query::QueryExecutionError> {
+        self.0.search(query, limit)
+    }
+
+    fn direct_projection_recover_after_failed_read(&self) {
+        self.0.direct_projection_recover_after_failed_read();
+    }
+
+    fn cache_generation(&self) -> u64 {
+        self.0.cache_generation()
+    }
+
+    fn config(&self) -> &Config {
+        &self.0.config
+    }
+
+    fn direct_projection_test(&self) -> Option<Arc<crate::direct_projection::DirectProjection>> {
+        self.0.direct_projection_test()
+    }
+
+    fn direct_projection_ready_test(&self) -> bool {
+        self.0.direct_projection_ready_test()
+    }
+}
+
+#[test]
+fn indexed_exhaustive_fallback_is_not_eligible_for_interactive_memo() {
+    let dir = scratch("bounded-unlinked-memo-exhaustive-fallback");
+    fs::write(
+        dir.join("pages").join("Source.md"),
+        "- target occurrence\n",
+    )
+    .unwrap();
+    fs::write(dir.join("pages").join("Target.md"), "- owner\n").unwrap();
+    let graph = ready_graph(&dir);
+
+    let interactive = crate::query::unlinked_refs_bounded_indexed_with_source(
+        &graph,
+        "Target",
+        20_000,
+        32 * 1024 * 1024,
+    )
+    .expect("the verified Interactive candidates answer normally");
+    assert_eq!(interactive.groups.total, 1);
+    assert!(
+        interactive.memo_eligible,
+        "verified Interactive provenance remains eligible for the UI memo"
+    );
+
+    let answer = crate::query::unlinked_refs_bounded_indexed_with_source(
+        &ExhaustiveReferenceCandidateGraph(&graph),
+        "Target",
+        20_000,
+        32 * 1024 * 1024,
+    )
+    .expect("the indexed Exhaustive fallback answers normally");
+
+    assert_eq!(answer.groups.total, 1);
+    assert!(
+        !answer.memo_eligible,
+        "indexed Exhaustive provenance must not enter the Interactive memo"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn indexed_unlinked_fallback_is_not_reused_after_same_generation_becomes_ready() {
+    let dir = scratch("bounded-unlinked-memo-readiness");
+    let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
+    let match_count = window + 25;
+    let mut source = String::new();
+    for ordinal in 0..match_count {
+        source.push_str(&format!("- target occurrence {ordinal}\n"));
+    }
+    fs::write(dir.join("pages").join("Source.md"), source).unwrap();
+    fs::write(dir.join("pages").join("Target.md"), "- owner\n").unwrap();
+
+    let g = Graph::open(&dir);
+    g.warm_cache();
+    let generation = g.cache_generation();
+    let limits = (match_count + 10, 16 * 1024 * 1024);
+    let fallback = g
+        .unlinked_refs_bounded_indexed("Target", limits.0, limits.1)
+        .expect("no projection keeps the established parser fallback");
+    assert_eq!(fallback.total, match_count);
+    let fallback_membership = fallback
+        .groups
+        .iter()
+        .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    g.attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    wait_for_direct_query_projection(&g);
+    assert_eq!(
+        g.cache_generation(),
+        generation,
+        "projection readiness alone must not need a source generation change"
+    );
+    let indexed = g
+        .unlinked_refs_bounded_indexed("Target", limits.0, limits.1)
+        .expect("the ready projection answers the same request");
+    assert_eq!(
+        indexed.total, window,
+        "the parser fallback must not become the ready Interactive memo answer"
+    );
+    let indexed_membership = indexed
+        .groups
+        .iter()
+        .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(indexed_membership.is_subset(&fallback_membership));
+    assert_ne!(indexed_membership, fallback_membership);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scoped_reference_invalidation_uses_real_page_before_colliding_alias() {
     let dir = scratch("reference-invalidation-real-page-first");
     fs::write(dir.join("pages").join("X.md"), "alias:: Q\n\n- real X\n").unwrap();

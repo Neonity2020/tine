@@ -150,6 +150,17 @@ pub struct BoundedGroups {
     pub exceeded: bool,
 }
 
+/// An indexed-panel answer plus the source that actually produced it.
+///
+/// The panel deliberately falls back to the parser when no projection can
+/// become ready. That answer is correct for the current source generation,
+/// but it is not interchangeable with the Interactive verified window once
+/// the projection becomes ready at that same generation.
+pub(crate) struct IndexedReferenceGroups {
+    pub(crate) groups: BoundedGroups,
+    pub(crate) memo_eligible: bool,
+}
+
 /// The ONE result-construction accounting rule.
 ///
 /// It exists as a type rather than as an open-coded pair of counters because
@@ -1677,11 +1688,27 @@ pub fn unlinked_refs_bounded_indexed<G: QueryGraph>(
     max_rows: usize,
     max_bytes: usize,
 ) -> Result<BoundedGroups, QueryExecutionError> {
+    let answer = unlinked_refs_bounded_indexed_with_source(graph, target, max_rows, max_bytes)?;
+    Ok(answer.groups)
+}
+
+pub(crate) fn unlinked_refs_bounded_indexed_with_source<G: QueryGraph>(
+    graph: &G,
+    target: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<IndexedReferenceGroups, QueryExecutionError> {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let candidate_pages =
         graph.reference_candidate_pages_indexed(&names_norm, &self_page, ReferenceKind::Plain)?;
-    Ok(collect_reference_occurrences_in(
+    // `indexed` also describes the Exhaustive SQL fallback used after an
+    // Interactive read declines or loses a readiness race. Only Interactive
+    // plain candidates carry page-owner provenance (including `Some(empty)`),
+    // so admission follows that actual source rather than the broader index
+    // bit.
+    let memo_eligible = candidate_pages.indexed && candidate_pages.page_owners.is_some();
+    let groups = collect_reference_occurrences_in(
         graph,
         &canonical,
         &self_page,
@@ -1690,7 +1717,11 @@ pub fn unlinked_refs_bounded_indexed<G: QueryGraph>(
         &candidate_pages,
         max_rows,
         max_bytes,
-    ))
+    );
+    Ok(IndexedReferenceGroups {
+        groups,
+        memo_eligible,
+    })
 }
 
 /// Target-scoped trace for bug reports. Membership comes from the exact same
