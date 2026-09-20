@@ -10,7 +10,8 @@
 //   - src/render/wasm/lsdoc_wasm_bytes.ts  LSDOC_TAG (what the vendored bytes were built from)
 // It also rejects native/standalone shared-search lock drift and requires the
 // vendored bytes' source stamp to match the current local search leaf, wrapper,
-// and Wasm-resolved dependency closure.
+// and Wasm-resolved dependency closure. The same guard rejects a decoded raw
+// Wasm payload above the separately checked-in measured size ceiling.
 
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -48,4 +49,7 @@ if (core !== wrap || core !== vendored || searchProblems.length) {
   );
   process.exit(1);
 }
-console.log(`wasm pin OK: lsdoc ${core}; shared-search source and dependency closure match vendored bytes`);
+console.log(
+  `wasm pin OK: lsdoc ${core}; shared-search source and dependency closure match vendored bytes; ` +
+    `decoded raw Wasm is within its checked-in ceiling`,
+);

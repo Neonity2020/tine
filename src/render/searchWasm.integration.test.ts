@@ -97,6 +97,15 @@ describe("actual lsdoc Wasm search exports", () => {
       matches: [false, false, true, false],
       search_error: null,
     });
+    const unicodePropertyTexts = ["café", "123", "Καλημέρα", "東京"];
+    expect(searchMatchBatch(String.raw`/\p{L}+/`, unicodePropertyTexts)).toEqual({
+      matches: [true, false, true, true],
+      search_error: null,
+    });
+    expect(searchMatchBatch(String.raw`/\p{Script=Greek}+/`, unicodePropertyTexts)).toEqual({
+      matches: [false, false, true, false],
+      search_error: null,
+    });
     expect(searchMatchBatch("", texts)).toEqual({
       matches: [true, true, true, true],
       search_error: null,

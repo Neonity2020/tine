@@ -16,6 +16,9 @@
 //      src/render/wasm/lsdoc_wasm_bytes.ts. Copy the wasm-bindgen JS glue + .d.ts.
 //      These committed files are what the app and CI consume — no fetch, no wasm
 //      toolchain at app-build time.
+//
+// This generator intentionally does not update scripts/wasm-size-ceiling.json:
+// that ceiling is an independently reviewed measurement, not generated output.
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, existsSync } from "node:fs";

@@ -61,14 +61,30 @@ write("crates/lsdoc-wasm/Cargo.toml", "[dependencies]\ntine-search = { path = \"
 write("crates/lsdoc-wasm/src/lib.rs", "pub fn search_fold(value: &str) -> String { tine_search::canonical_fold(value) }\n");
 write("crates/lsdoc-wasm/Cargo.lock", lock());
 write("Cargo.lock", lock({ dev: true }));
+write("scripts/wasm-size-ceiling.json", '{"maxDecodedRawBytes": 4}\n');
 
 const fingerprint = searchSourceFingerprint(root);
 write(
   "src/render/wasm/lsdoc_wasm_bytes.ts",
-  `export const SEARCH_SOURCE_SHA256 = ${JSON.stringify(fingerprint)};\nexport const WASM_B64 = \"fixture\";\n`,
+  `export const SEARCH_SOURCE_SHA256 = ${JSON.stringify(fingerprint)};\nexport const WASM_B64 = \"Zm91cg==\";\n`,
 );
 assert.deepEqual(wasmSearchGuardProblems(root), [], "matching source and lock closure should pass");
 assert.equal(searchSourceFingerprint(root), fingerprint, "regeneration stamp should be deterministic");
+
+write(
+  "src/render/wasm/lsdoc_wasm_bytes.ts",
+  `export const SEARCH_SOURCE_SHA256 = ${JSON.stringify(fingerprint)};\nexport const WASM_B64 = \"Zml2ZXM=\";\n`,
+);
+assert.ok(
+  wasmSearchGuardProblems(root).some((problem) =>
+    problem.includes("decoded raw size is 5 bytes; ceiling is 4 bytes"),
+  ),
+  "a decoded Wasm payload over the checked-in raw-byte ceiling should fail",
+);
+write(
+  "src/render/wasm/lsdoc_wasm_bytes.ts",
+  `export const SEARCH_SOURCE_SHA256 = ${JSON.stringify(fingerprint)};\nexport const WASM_B64 = \"Zm91cg==\";\n`,
+);
 
 const leaf = fs.readFileSync(path.join(root, "crates/tine-search/src/fold.rs"), "utf8");
 write("crates/tine-search/src/fold.rs", `${leaf}// changed\n`);

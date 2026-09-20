@@ -6,6 +6,7 @@ const SEARCH_PACKAGE = "tine-search";
 const WASM_LOCK = "crates/lsdoc-wasm/Cargo.lock";
 const NATIVE_LOCK = "Cargo.lock";
 const VENDORED_BYTES = "src/render/wasm/lsdoc_wasm_bytes.ts";
+const WASM_SIZE_CEILING = "scripts/wasm-size-ceiling.json";
 
 function field(block, name) {
   return block.match(new RegExp(`^${name} = "([^"]*)"$`, "m"))?.[1];
@@ -202,8 +203,39 @@ function vendoredStamp(root) {
   return bytes.match(/SEARCH_SOURCE_SHA256\s*=\s*"([0-9a-f]{64})"/)?.[1];
 }
 
+function wasmSizeCeiling(root) {
+  const value = JSON.parse(fs.readFileSync(path.join(root, WASM_SIZE_CEILING), "utf8"))?.maxDecodedRawBytes;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${WASM_SIZE_CEILING} maxDecodedRawBytes must be a positive integer`);
+  }
+  return value;
+}
+
+function vendoredWasmRawBytes(root) {
+  const source = fs.readFileSync(path.join(root, VENDORED_BYTES), "utf8");
+  const encoded = source.match(/WASM_B64\s*=\s*"([A-Za-z0-9+/]*={0,2})"/)?.[1];
+  if (!encoded) throw new Error(`${VENDORED_BYTES} has no decodable WASM_B64 payload`);
+  const decoded = Buffer.from(encoded, "base64");
+  if (decoded.toString("base64") !== encoded) {
+    throw new Error(`${VENDORED_BYTES} WASM_B64 payload is not canonical base64`);
+  }
+  return decoded.length;
+}
+
+export function vendoredWasmSizeProblems(root) {
+  try {
+    const ceiling = wasmSizeCeiling(root);
+    const actual = vendoredWasmRawBytes(root);
+    return actual > ceiling
+      ? [`vendored Wasm decoded raw size is ${actual} bytes; ceiling is ${ceiling} bytes from ${WASM_SIZE_CEILING}`]
+      : [];
+  } catch (error) {
+    return [error.message];
+  }
+}
+
 export function wasmSearchGuardProblems(root) {
-  const problems = searchLockAlignmentProblems(root);
+  const problems = [...searchLockAlignmentProblems(root), ...vendoredWasmSizeProblems(root)];
   let expected;
   try {
     expected = searchSourceFingerprint(root);
