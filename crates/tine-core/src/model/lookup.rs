@@ -230,7 +230,7 @@ impl Graph {
         self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        if let Some((pages, blocks)) = self.direct_projection_reference_candidate_pages(
+        if let Some((pages, blocks, page_owners)) = self.direct_projection_reference_candidate_pages(
             names_norm,
             self_page,
             kind,
@@ -242,6 +242,7 @@ impl Graph {
             return ReferenceCandidatePages {
                 pages,
                 blocks,
+                page_owners,
                 indexed: true,
                 full_page_count,
             };
@@ -251,6 +252,7 @@ impl Graph {
             full_page_count: pages.len(),
             pages,
             blocks: None,
+            page_owners: None,
             indexed: false,
         }
     }
@@ -285,7 +287,7 @@ impl Graph {
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
-        if let Some((pages, blocks)) = self.direct_projection_reference_candidate_pages(
+        if let Some((pages, blocks, page_owners)) = self.direct_projection_reference_candidate_pages(
             names_norm,
             self_page,
             kind,
@@ -299,6 +301,7 @@ impl Graph {
             return Ok(ReferenceCandidatePages {
                 pages,
                 blocks,
+                page_owners,
                 indexed: true,
                 full_page_count,
             });

@@ -2692,6 +2692,153 @@ fn interactive_plain_reference_window_counts_verified_page_and_block_owners_toge
         candidates.blocks.as_ref().map(std::collections::HashSet::len),
         Some(block_matches)
     );
+    assert_eq!(
+        candidates
+            .page_owners
+            .as_ref()
+            .map(std::collections::HashSet::len),
+        Some(window - block_matches),
+        "only page entities that survived the shared page/block window admit preambles"
+    );
+    let answer = graph
+        .unlinked_refs_bounded_indexed("target", window + 10, 16 * 1024 * 1024)
+        .expect("mixed page/block reference answer");
+    assert_eq!(
+        answer
+            .groups
+            .iter()
+            .map(|group| group.blocks.len())
+            .sum::<usize>(),
+        window,
+        "surviving page preambles and blocks must both reach public evidence"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interactive_short_plain_reference_scan_bounds_exact_callback_work() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-short-scan-work");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
+    // Each source contributes one qualifying page-preamble entity and one
+    // qualifying block entity: more than 2W exact matches for a short needle
+    // whose candidate plan must scan rather than use FTS.
+    for ordinal in 0..=window {
+        std::fs::write(
+            root.join("pages").join(format!("source-{ordinal:04}.md")),
+            "note:: go\n\n- go\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("pages/go.md"), "- owner\n").unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    reset_plain_reference_query_instrumentation();
+    graph
+        .reference_candidate_pages_indexed(
+            &[crate::refs::page_key("go")],
+            "go",
+            ReferenceKind::Plain,
+        )
+        .expect("short-scan interactive candidates");
+    let (callbacks, plans) = plain_reference_query_instrumentation();
+    assert_eq!(
+        callbacks,
+        window + 1,
+        "a >2W qualifying scan must do exactly W plus one merge-lookahead callback; plans={plans:?}"
+    );
+    assert!(
+        plans.iter().flatten().any(|step| step.contains("MERGE (UNION ALL)")),
+        "the production scan statement must be a mergeable top-level compound: {plans:?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .flatten()
+            .all(|step| !step.contains("USE TEMP B-TREE FOR ORDER BY")),
+        "the scan must not materialize the whole union before LIMIT: {plans:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interactive_indexed_plain_reference_keeps_exact_callback_work_bounded() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-indexed-work");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
+    let mut source = String::new();
+    for ordinal in 0..=(window * 2) {
+        source.push_str(&format!("- indexed target {ordinal}\n"));
+    }
+    std::fs::write(root.join("pages/source.md"), source).unwrap();
+    std::fs::write(root.join("pages/indexed target.md"), "- owner\n").unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    reset_plain_reference_query_instrumentation();
+    graph
+        .reference_candidate_pages_indexed(
+            &[crate::refs::page_key("indexed target")],
+            "indexed target",
+            ReferenceKind::Plain,
+        )
+        .expect("indexed interactive candidates");
+    let (callbacks, plans) = plain_reference_query_instrumentation();
+    assert_eq!(
+        callbacks, window,
+        "the indexed candidate cursor must stop exact work at W; plans={plans:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interactive_block_owner_does_not_admit_unwindowed_page_preamble() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-block-owner-preamble");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
+    let mut source = String::from("note:: target\n\n");
+    for ordinal in 0..window {
+        source.push_str(&format!("- target body {ordinal}\n"));
+    }
+    std::fs::write(root.join("pages/source.md"), source).unwrap();
+    std::fs::write(root.join("pages/target.md"), "- owner\n").unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    let answer = graph
+        .unlinked_refs_bounded_indexed("target", window + 10, 16 * 1024 * 1024)
+        .expect("interactive reference answer");
+    let rows = answer
+        .groups
+        .iter()
+        .map(|group| group.blocks.len())
+        .sum::<usize>();
+    assert_eq!(
+        rows, window,
+        "a path admitted by W selected blocks must not also admit its unselected preamble"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

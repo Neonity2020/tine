@@ -1319,6 +1319,7 @@ impl Graph {
     ) -> Option<(
         Vec<(PageEntry, Arc<Document>)>,
         Option<std::collections::HashSet<String>>,
+        Option<std::collections::HashSet<PathBuf>>,
     )> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let projection = self
@@ -1340,7 +1341,7 @@ impl Graph {
                 &self.config,
             )?;
         let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
-        Some((pages, candidates.blocks))
+        Some((pages, candidates.blocks, candidates.page_owners))
     }
 
     pub(super) fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {

@@ -1141,9 +1141,13 @@ fn collect_reference_occurrences_in<G: QueryGraph>(
             continue;
         }
         let slot = accumulator.page(&entry.rel_path, &entry.name, entry.kind, entry.date_key);
-        if let Some(mut block) = doc
-            .pre_block
-            .as_deref()
+        let page_owner_admitted = candidate_pages
+            .page_owners
+            .as_ref()
+            .is_none_or(|owners| owners.contains(std::path::Path::new(&entry.rel_path)));
+        if let Some(mut block) = page_owner_admitted
+            .then(|| doc.pre_block.as_deref())
+            .flatten()
             .and_then(|pre| page_property_block(entry, pre))
         {
             if accumulator.closed() {
