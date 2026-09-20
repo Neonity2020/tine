@@ -751,7 +751,12 @@ fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
     let root = mk("page-icons-cache");
     std::fs::write(
         root.join("pages").join("IconPage.md"),
-        "icon:: star\nalias:: Icon Alias\n- body\n",
+        "icon:: star\nalias:: Icon Alias, MiXeD Alias, Shadow Name\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages").join("shadow name.md"),
+        "icon:: moon\n- real page wins over alias identity\n",
     )
     .unwrap();
     std::fs::write(root.join("pages").join("NoIcon.md"), "- body\n").unwrap();
@@ -762,13 +767,30 @@ fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
     let icons = g.page_icons(&[
         "iconpage".to_string(),
         "Icon Alias".to_string(),
+        "mixed alias".to_string(),
+        "SHADOW NAME".to_string(),
         "NoIcon".to_string(),
         "Missing".to_string(),
     ]);
     assert_eq!(icons.get("iconpage").map(String::as_str), Some("star"));
     assert_eq!(icons.get("Icon Alias").map(String::as_str), Some("star"));
+    assert_eq!(icons.get("mixed alias").map(String::as_str), Some("star"));
+    assert_eq!(
+        icons.get("SHADOW NAME").map(String::as_str),
+        Some("moon"),
+        "a real page identity must take precedence over an alias owner"
+    );
     assert!(!icons.contains_key("NoIcon"));
     assert!(!icons.contains_key("Missing"));
+    assert_eq!(
+        g.existing_page_names(&[
+            "MIXED ALIAS".to_string(),
+            "shadow NAME".to_string(),
+            "missing".to_string(),
+        ]),
+        vec!["MIXED ALIAS".to_string(), "shadow NAME".to_string()],
+        "raw alias spelling must be normalized at identity consumers"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -227,10 +227,12 @@ impl Graph {
     pub(crate) fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
         if let Some((pages, blocks)) = self.direct_projection_reference_candidate_pages(
             names_norm,
+            self_page,
             kind,
             crate::query::candidate::CandidateMode::Exhaustive,
         ) {
@@ -279,11 +281,13 @@ impl Graph {
     pub(crate) fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
         if let Some((pages, blocks)) = self.direct_projection_reference_candidate_pages(
             names_norm,
+            self_page,
             kind,
             if kind == ReferenceKind::Plain {
                 crate::query::candidate::CandidateMode::interactive()
@@ -304,7 +308,7 @@ impl Graph {
                 return Err(crate::query::QueryExecutionError::NotReady(reason));
             }
         }
-        Ok(self.reference_candidate_pages(names_norm, kind))
+        Ok(self.reference_candidate_pages(names_norm, self_page, kind))
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {

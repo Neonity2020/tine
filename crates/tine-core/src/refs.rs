@@ -70,6 +70,12 @@ impl ReferenceSourceExclusions {
         // At most two entries; a linear scan beats hashing.
         self.keys.iter().any(|candidate| candidate == key)
     }
+
+    /// The already-normalized keys for a projection query that must apply the
+    /// same source exclusions before an interactive match window is counted.
+    pub(crate) fn keys(&self) -> &[String] {
+        &self.keys
+    }
 }
 
 pub fn page_key(name: &str) -> String {

@@ -1313,6 +1313,7 @@ impl Graph {
     pub(super) fn direct_projection_reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
         mode: crate::query::candidate::CandidateMode,
     ) -> Option<(
@@ -1330,7 +1331,14 @@ impl Graph {
             return None;
         }
         let candidates =
-            projection.reference_candidates(generation, names_norm, kind, mode, &self.config)?;
+            projection.reference_candidates(
+                generation,
+                names_norm,
+                self_page,
+                kind,
+                mode,
+                &self.config,
+            )?;
         let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
         Some((pages, candidates.blocks))
     }

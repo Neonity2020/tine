@@ -1006,6 +1006,67 @@ fn quick_switch_includes_referenced_pages() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn quick_switch_offers_each_matching_authored_alias_before_and_after_readiness() {
+    let dir = std::env::temp_dir().join(format!(
+        "tine-gh482-alias-suggestions-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::write(
+        dir.join("pages/Welcome to Tine.md"),
+        "alias:: Welcome-To-Tine, Tine greet\n\n- home\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/mentions.md"),
+        "- [[Welcome-To-Tine]] and [[Tine greet]]\n",
+    )
+    .unwrap();
+
+    let graph = Graph::open(&dir);
+    graph.warm_cache();
+    let assert_suggestions = |phase: &str| {
+        let w = graph.quick_switch("W", 20);
+        for spelling in ["Welcome to Tine", "Welcome-To-Tine"] {
+            assert!(
+                w.iter().any(|entry| {
+                    entry.name == spelling
+                        && entry.rel_path == "pages/Welcome to Tine.md"
+                }),
+                "{phase}: W must offer {spelling:?} on its real owner: {w:?}"
+            );
+        }
+        let t = graph.quick_switch("T", 20);
+        assert!(
+            t.iter().any(|entry| {
+                entry.name == "Tine greet"
+                    && entry.rel_path == "pages/Welcome to Tine.md"
+            }),
+            "{phase}: T must offer the authored alias: {t:?}"
+        );
+        assert!(
+            w.iter().chain(&t).all(|entry| {
+                !matches!(entry.name.as_str(), "Welcome-To-Tine" | "Tine greet")
+                    || !entry.rel_path.is_empty()
+            }),
+            "{phase}: no alias suggestion may be a pathless phantom"
+        );
+    };
+
+    assert_suggestions("pre-ready fallback");
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_for_direct_query_projection(&graph);
+    assert_suggestions("ready projection");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Open a fixture graph the way the app opens a Direct graph: with its
 /// disposable SQLite projection attached and initialized.
 ///
@@ -13216,7 +13277,11 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     );
     let target_names = vec![crate::refs::page_key("Deep target")];
     let accepted_candidates =
-        accepted_snapshot.reference_candidate_pages(&target_names, ReferenceKind::Explicit);
+        accepted_snapshot.reference_candidate_pages(
+            &target_names,
+            "Deep target",
+            ReferenceKind::Explicit,
+        );
     assert!(!accepted_candidates.indexed);
     assert_eq!(
             candidate_paths(&accepted_candidates),
@@ -13262,7 +13327,11 @@ fn cached_reference_and_dto_depth_boundaries_are_iterative_and_contained() {
     );
     for _ in 0..2 {
         let candidates =
-            rejected_snapshot.reference_candidate_pages(&target_names, ReferenceKind::Explicit);
+            rejected_snapshot.reference_candidate_pages(
+                &target_names,
+                "Deep target",
+                ReferenceKind::Explicit,
+            );
         assert!(!candidates.indexed);
         assert_eq!(candidates.pages.len(), candidates.full_page_count);
         assert!(

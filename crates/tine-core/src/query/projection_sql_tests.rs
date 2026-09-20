@@ -91,6 +91,35 @@ fn exercise_every_surface(graph: &Graph) {
             )
             .expect("friendly scoped");
     }
+    // Explicit Ctrl-K production routes: one indexed needle, one short scan,
+    // and page-by-content under the interactive verified window.
+    for source in ["alpha", "al"] {
+        graph
+            .run_graph_search_displayed_for(
+                source,
+                12,
+                12,
+                None,
+                false,
+                FriendlyDisplayOptions::default(),
+                crate::query_plan::FriendlyConsumer::CtrlK,
+            )
+            .expect("interactive Ctrl-K");
+    }
+    graph
+        .run_graph_search_displayed_for(
+            "alpha",
+            12,
+            12,
+            None,
+            false,
+            FriendlyDisplayOptions {
+                page_match_scope: Some(FriendlyPageMatchScope::Content),
+                ..FriendlyDisplayOptions::default()
+            },
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        )
+        .expect("interactive page-by-content");
     // Macro queries, one per lowering family the compiler emits, hydrated
     // through the results reader (descriptor + payload batches).
     for query in [
@@ -152,6 +181,14 @@ fn exercise_every_surface(graph: &Graph) {
         .expect("backlink filter context");
     crate::query::backlink_filter_context(graph, "2026-09-18", &[], "")
         .expect("journal backlink filter context");
+    graph
+        .unlinked_refs_bounded_indexed("Beta", 100, 1 << 20)
+        .expect("windowed unlinked narrowing");
+    let exhaustive_unlinked = graph.unlinked_refs_bounded("Beta", 100, 1 << 20);
+    assert!(
+        exhaustive_unlinked.total > 0,
+        "exhaustive unlinked narrowing answered nothing"
+    );
     // Live export: a top-level root and a nested root (the nested one runs the
     // boundary-parent check).
     let export = graph

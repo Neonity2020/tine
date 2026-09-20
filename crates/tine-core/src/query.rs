@@ -973,6 +973,22 @@ fn page_property_block_parts(
     Some(block)
 }
 
+/// Verify a reference occurrence in the authored raw page preamble using the
+/// same page-property projection as the eventual reference walk. The SQLite
+/// candidate reader uses this before admitting a page row to an interactive
+/// window, so title tokens, prose preambles, and explicit-link syntax cannot
+/// consume a plain-occurrence slot that the walk would later reject.
+pub(crate) fn page_preamble_has_reference(
+    raw: &str,
+    is_org: bool,
+    names_norm: &[String],
+    kind: ReferenceKind,
+    config: &crate::config::Config,
+) -> bool {
+    page_property_block_parts("", PageKind::Page, is_org, raw)
+        .is_some_and(|block| block_has_reference(&block, names_norm, kind, config))
+}
+
 fn block_reference_evidence(
     block: &DocBlock,
     canonical: &str,
@@ -1039,7 +1055,7 @@ fn collect_reference_occurrences_bounded<G: QueryGraph>(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
-    let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
+    let candidate_pages = graph.reference_candidate_pages(names_norm, self_page, kind);
     collect_reference_occurrences_in(
         graph,
         canonical,
@@ -1216,7 +1232,7 @@ pub(crate) fn reference_occurrences_narrowed_and_walked<G: QueryGraph>(
 ) -> (BoundedGroups, BoundedGroups, NarrowingReceipt) {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
-    let mut candidates = graph.reference_candidate_pages(&names_norm, kind);
+    let mut candidates = graph.reference_candidate_pages(&names_norm, &self_page, kind);
     reset_reference_classifications();
     let narrowed = collect_reference_occurrences_in(
         graph,
@@ -1306,7 +1322,11 @@ pub fn backlinks_bounded_indexed<G: QueryGraph>(
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let candidate_pages =
-        graph.reference_candidate_pages_indexed(&names_norm, ReferenceKind::Explicit)?;
+        graph.reference_candidate_pages_indexed(
+            &names_norm,
+            &self_page,
+            ReferenceKind::Explicit,
+        )?;
     Ok(collect_reference_occurrences_in(
         graph,
         &canonical,
@@ -1657,7 +1677,7 @@ pub fn unlinked_refs_bounded_indexed<G: QueryGraph>(
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let candidate_pages =
-        graph.reference_candidate_pages_indexed(&names_norm, ReferenceKind::Plain)?;
+        graph.reference_candidate_pages_indexed(&names_norm, &self_page, ReferenceKind::Plain)?;
     Ok(collect_reference_occurrences_in(
         graph,
         &canonical,

@@ -19,17 +19,19 @@ impl QueryGraph for Graph {
     fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        Graph::reference_candidate_pages(self, names_norm, kind)
+        Graph::reference_candidate_pages(self, names_norm, self_page, kind)
     }
 
     fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
-        Graph::reference_candidate_pages_indexed(self, names_norm, kind)
+        Graph::reference_candidate_pages_indexed(self, names_norm, self_page, kind)
     }
 
     fn backlink_filter_scope(

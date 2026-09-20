@@ -591,6 +591,19 @@ fn read_pages(
     // `reference_postings_navigation_names_idx` (tine-storage v0.24.0), which
     // carries no path and no page id, that coincidence broke. Keep both sides
     // keyed on `raw_name` or the two lists will disagree again.
+    let owner_partition = if plan.page_name_suggestions() {
+        // Autocomplete keeps every distinct authored spelling for an owner so
+        // an alias is selectable even when the canonical title also matches.
+        "r.page_id, r.matched_text"
+    } else {
+        // Friendly search remains one coherent row per physical owner.
+        "r.page_id"
+    };
+    let physical_tie_key = if plan.page_name_suggestions() {
+        "w.path || char(0) || w.matched_text"
+    } else {
+        "w.path"
+    };
     let names_ctes = if want_names {
         let reference_choices = VIRTUAL_REFERENCE_CHOICES_CTE;
         format!(
@@ -612,14 +625,15 @@ fn read_pages(
              FROM page_text_candidates c\
          ), choices AS (\
              SELECT r.*, ROW_NUMBER() OVER (\
-                 PARTITION BY r.page_id \
+                 PARTITION BY {owner_partition} \
                  ORDER BY r.owner_key, r.source_kind, r.source_ordinal\
              ) AS owner_choice \
              FROM ranked r WHERE r.owner_key IS NOT NULL\
          ), physical AS MATERIALIZED (\
              SELECT 0 AS match_source, 0 AS candidate_kind, w.page_id, w.name, w.text_kind, \
                     w.journal_day, w.path, w.matched_text, w.source_kind, \
-                    tine_query_rank(?2, {framed_physical}) AS global_key, w.path AS tie_key \
+                    tine_query_rank(?2, {framed_physical}) AS global_key, \
+                    {physical_tie_key} AS tie_key \
              FROM choices w WHERE w.owner_choice = 1\
          ), real_identities(name_key) AS (\
              SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
@@ -794,7 +808,7 @@ fn read_pages(
     let mut hits = Vec::with_capacity(descriptors.len());
     for mut descriptor in descriptors {
         check_lane(snapshot, lane)?;
-        if let Some(page_id) = descriptor.page_id {
+        if let Some(page_id) = descriptor.page_id.filter(|_| !plan.page_name_suggestions()) {
             if !seen_physical.insert(page_id) {
                 return Err(ResultReadError::Corrupt(
                     "one physical page appears twice in Friendly results".into(),

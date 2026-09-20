@@ -14,11 +14,13 @@ pub(crate) trait QueryGraph {
     fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages;
     fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, super::QueryExecutionError>;
     fn backlink_filter_scope(
@@ -80,17 +82,19 @@ impl<G: QueryGraph> QueryGraph for Arc<G> {
     fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        (**self).reference_candidate_pages(names_norm, kind)
+        (**self).reference_candidate_pages(names_norm, self_page, kind)
     }
 
     fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, super::QueryExecutionError> {
-        (**self).reference_candidate_pages_indexed(names_norm, kind)
+        (**self).reference_candidate_pages_indexed(names_norm, self_page, kind)
     }
 
     fn backlink_filter_scope(

@@ -1098,6 +1098,11 @@ layer applies the fallback.
   tie-breaking is preserved.
 - The owner-local exact-name/alias override still runs before global ranking; the
   physical owner is returned once, keeping its winning alias and evidence.
+- Navigation/autocomplete is the deliberate presentation exception: it may
+  return the same physical owner once for its matching title and once per
+  distinct matching authored alias, so each spelling remains selectable. Every
+  such row retains the owner's physical path; ordinary Friendly results remain
+  one row per owner.
 - `content` never concatenates blocks and never matches separate terms across
   unrelated blocks. One block satisfies the predicate, or the page does not
   qualify by content.

@@ -392,6 +392,9 @@ pub struct QueryPlan {
     page_exact: Option<String>,
     regexes: HashMap<u32, Regex>,
     candidate_mode: crate::query::candidate::CandidateMode,
+    // Navigation/autocomplete exposes every matching authored spelling for an
+    // owner; ordinary Friendly search keeps one coherent winner per owner.
+    page_name_suggestions: bool,
 }
 
 impl QueryPlan {
@@ -477,6 +480,7 @@ impl QueryPlan {
             page_exact: (!query.trim().is_empty()).then(|| canonical_fold(query.trim())),
             regexes,
             candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
+            page_name_suggestions: false,
         }
     }
 
@@ -539,6 +543,7 @@ impl QueryPlan {
             page_exact: None,
             regexes: HashMap::new(),
             candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
+            page_name_suggestions: true,
         }
     }
 
@@ -580,6 +585,7 @@ impl QueryPlan {
             page_exact: None,
             regexes,
             candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
+            page_name_suggestions: false,
         }
     }
 
@@ -626,6 +632,7 @@ impl QueryPlan {
             page_exact: None,
             regexes: HashMap::new(),
             candidate_mode: crate::query::candidate::CandidateMode::interactive(),
+            page_name_suggestions: false,
         }
     }
 
@@ -640,6 +647,10 @@ impl QueryPlan {
 
     pub(crate) const fn candidate_mode(&self) -> crate::query::candidate::CandidateMode {
         self.candidate_mode
+    }
+
+    pub(crate) const fn page_name_suggestions(&self) -> bool {
+        self.page_name_suggestions
     }
 
     pub fn explanation(&self) -> QueryExplanation {
@@ -1839,7 +1850,32 @@ fn execute_page_candidates(
             .get(&page.rel_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        if let Some((base_score, match_class, matched_text, matched_alias)) =
+        if plan.page_name_suggestions() {
+            let mut seen = HashSet::new();
+            for (text, matched_alias) in std::iter::once((&page.name, None))
+                .chain(aliases.iter().map(|alias| (alias, Some(alias.clone()))))
+            {
+                if !seen.insert(text.as_str()) {
+                    continue;
+                }
+                let Some(rank) = rank_page_text_expr(plan, &branch.predicate, text) else {
+                    continue;
+                };
+                has_more |= heap.len() >= branch.limit;
+                push_page(
+                    &mut heap,
+                    branch.limit,
+                    ScoredPage {
+                        score: rank.global_score(&page.name),
+                        match_class: rank.match_class(),
+                        matched_text: text.clone(),
+                        matched_alias,
+                        tie_key: format!("{}\0{text}", page.rel_path),
+                        candidate: PageCandidate::File(index),
+                    },
+                );
+            }
+        } else if let Some((base_score, match_class, matched_text, matched_alias)) =
             best_page_match(plan, &branch.predicate, &page.name, aliases)
         {
             has_more |= heap.len() >= branch.limit;

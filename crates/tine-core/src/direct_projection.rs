@@ -2078,6 +2078,7 @@ impl DirectProjection {
         &self,
         cache_generation: u64,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
         mode: crate::query::candidate::CandidateMode,
         config: &crate::config::Config,
@@ -2141,102 +2142,130 @@ impl DirectProjection {
                 ReferenceKind::Plain => {
                     let folded = crate::search_query::canonical_fold(name);
                     let plan = crate::query::candidate::scalar_trigram_expression(&folded);
-                    let (block_source, page_source, mut params) = match plan {
+                    let (candidate_source, mut params) = match plan {
                         Some(expression) => {
                             let params = vec![PhysicalQueryValue::Text(expression)];
                             (
-                                "(SELECT rowid FROM search_fts \
-                                    WHERE search_fts MATCH ?1 ORDER BY rowid DESC) c \
-                                  JOIN blocks b ON b.block_id = c.rowid"
-                                    .to_string(),
-                                "(SELECT rowid FROM search_fts \
-                                    WHERE search_fts MATCH ?1 ORDER BY rowid DESC) c \
-                                  JOIN pages p ON p.page_id = c.rowid"
+                                "(SELECT c.rowid AS entity_id, \
+                                         CASE WHEN ep.page_id IS NOT NULL THEN 0 ELSE 1 END AS entity_type, \
+                                         owner.path, b.result_id, \
+                                         CASE WHEN ep.page_id IS NOT NULL \
+                                              THEN COALESCE(pt.preamble, '') ELSE bt.content END AS raw, \
+                                         owner_name.key AS owner_key \
+                                  FROM (SELECT rowid FROM search_fts \
+                                        WHERE search_fts MATCH ?1 ORDER BY rowid DESC) c \
+                                  LEFT JOIN pages ep ON ep.page_id = c.rowid \
+                                  LEFT JOIN blocks b ON b.block_id = c.rowid \
+                                  JOIN pages owner ON owner.page_id = COALESCE(ep.page_id, b.page_id) \
+                                  JOIN names owner_name ON owner_name.name_id = owner.name_id \
+                                  LEFT JOIN page_text pt ON pt.page_id = ep.page_id \
+                                  LEFT JOIN block_text bt ON bt.block_id = b.block_id \
+                                  WHERE ep.page_id IS NOT NULL OR b.block_id IS NOT NULL) candidates"
                                     .to_string(),
                                 params,
                             )
                         }
-                        None => ("blocks b".to_string(), "pages p".to_string(), Vec::new()),
+                        None => (
+                            "(SELECT p.page_id AS entity_id, 0 AS entity_type, p.path, \
+                                     NULL AS result_id, COALESCE(pt.preamble, '') AS raw, \
+                                     n.key AS owner_key \
+                              FROM pages p JOIN names n ON n.name_id = p.name_id \
+                              LEFT JOIN page_text pt ON pt.page_id = p.page_id \
+                              UNION ALL \
+                              SELECT b.block_id, 1, p.path, b.result_id, bt.content, n.key \
+                              FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id \
+                              JOIN pages p ON p.page_id = b.page_id \
+                              JOIN names n ON n.name_id = p.name_id) candidates"
+                                .to_string(),
+                            Vec::new(),
+                        ),
                     };
                     let snapshot = plain_snapshot.as_mut()?;
-
-                    // Page rows remain candidates because the accepted compact
-                    // schema retains visible preamble rather than its authored
-                    // raw syntax. The existing parser verifier below this seam
-                    // remains the only authority for page-property occurrences.
-                    let page_sql = format!(
-                        "SELECT p.path, NULL, p.page_id FROM {page_source} ORDER BY p.page_id DESC"
+                    let exclusions = crate::refs::ReferenceSourceExclusions::new(
+                        self_page,
+                        config.favorites_page.as_deref(),
                     );
-                    crate::query::projection_sql::visit(snapshot, &page_sql, &params, |row| {
-                        let Some(PhysicalQueryValue::Text(path)) = row.first() else {
-                            return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
-                                "plain-reference candidate has no page path".into(),
-                            ));
-                        };
-                        paths.insert(PathBuf::from(path));
-                        Ok(std::ops::ControlFlow::Continue(()))
-                    })
-                    .ok()?;
-
-                    let exact = match mode {
-                        crate::query::candidate::CandidateMode::Exhaustive => String::new(),
+                    let mut filters = Vec::new();
+                    for key in exclusions.keys() {
+                        params.push(PhysicalQueryValue::Text(key.clone()));
+                        filters.push(format!("owner_key <> ?{}", params.len()));
+                    }
+                    let mut where_sql = if filters.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" WHERE {}", filters.join(" AND "))
+                    };
+                    let mut limit_sql = String::new();
+                    match mode {
+                        crate::query::candidate::CandidateMode::Exhaustive => {}
                         crate::query::candidate::CandidateMode::Interactive { window } => {
                             let needle = vec![name.clone()];
                             let config = config.clone();
                             snapshot
-                                .set_query_rank_function(move |_id, framed| {
+                                .set_query_rank_function(move |entity_type, framed| {
                                     let (raw, path) = crate::query::rank::decode_pair(framed)?;
                                     let is_org = Format::from_path(Path::new(path)) == Format::Org;
-                                    let block = DocBlock::preamble(raw, is_org);
-                                    let projection = block.projection();
-                                    Ok(crate::reference_evidence::has_occurrence_kind(
-                                        raw,
-                                        &projection.reference_source,
-                                        &needle,
-                                        ReferenceKind::Plain,
-                                        &config,
-                                    )
-                                    .then(Vec::new))
+                                    let matched = if entity_type == 0 {
+                                        crate::query::page_preamble_has_reference(
+                                            raw,
+                                            is_org,
+                                            &needle,
+                                            ReferenceKind::Plain,
+                                            &config,
+                                        )
+                                    } else {
+                                        let block = DocBlock::preamble(raw, is_org);
+                                        let projection = block.projection();
+                                        crate::reference_evidence::has_occurrence_kind(
+                                            raw,
+                                            &projection.reference_source,
+                                            &needle,
+                                            ReferenceKind::Plain,
+                                            &config,
+                                        )
+                                    };
+                                    Ok(matched.then(Vec::new))
                                 })
                                 .ok()?;
+                            where_sql.push_str(if where_sql.is_empty() {
+                                " WHERE "
+                            } else {
+                                " AND "
+                            });
+                            let frame = crate::query::text::framed_pair_sql("raw", "path");
+                            where_sql.push_str(&format!(
+                                "tine_query_rank(entity_type, {frame}) IS NOT NULL"
+                            ));
                             params.push(PhysicalQueryValue::Integer(
                                 i64::try_from(window).unwrap_or(i64::MAX),
                             ));
-                            let frame = crate::query::text::framed_pair_sql("bt.content", "p.path");
-                            format!(
-                                " WHERE tine_query_rank(1, {frame}) IS NOT NULL \
-                                  ORDER BY b.block_id DESC LIMIT ?{}",
-                                params.len()
-                            )
+                            limit_sql = format!(" LIMIT ?{}", params.len());
                         }
-                    };
-                    let block_sql = if exact.is_empty() {
-                        format!(
-                            "SELECT p.path, b.result_id, b.block_id \
-                             FROM {block_source} JOIN pages p ON p.page_id = b.page_id \
-                             ORDER BY b.block_id DESC"
-                        )
-                    } else {
-                        format!(
-                            "SELECT p.path, b.result_id, b.block_id \
-                             FROM {block_source} \
-                             JOIN block_text bt ON bt.block_id = b.block_id \
-                             JOIN pages p ON p.page_id = b.page_id{exact}"
-                        )
-                    };
-                    crate::query::projection_sql::visit(snapshot, &block_sql, &params, |row| {
+                    }
+                    let sql = format!(
+                        "SELECT path, result_id, entity_id FROM {candidate_source}{where_sql} \
+                         ORDER BY entity_id DESC{limit_sql}"
+                    );
+                    crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
                         let Some(PhysicalQueryValue::Text(path)) = row.first() else {
                             return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
                                 "plain-reference candidate has no page path".into(),
                             ));
                         };
-                        let Some(PhysicalQueryValue::Text(result_id)) = row.get(1) else {
-                            return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
-                                "plain-reference candidate has an invalid block identity".into(),
-                            ));
-                        };
                         paths.insert(PathBuf::from(path));
-                        blocks.insert(result_id.clone());
+                        match row.get(1) {
+                            Some(PhysicalQueryValue::Text(result_id)) => {
+                                blocks.insert(result_id.clone());
+                            }
+                            Some(PhysicalQueryValue::Null) => {}
+                            _ => {
+                                return Err(
+                                    tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                        "plain-reference candidate has an invalid identity".into(),
+                                    ),
+                                );
+                            }
+                        }
                         Ok(std::ops::ControlFlow::Continue(()))
                     })
                     .ok()?;

@@ -246,6 +246,7 @@ fn folded_empty_text_predicates_never_match_rank_or_emit_evidence() {
             page_exact: None,
             regexes: HashMap::new(),
             candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
+            page_name_suggestions: false,
         };
         assert!(!eval_expr_fast(
             &plan,

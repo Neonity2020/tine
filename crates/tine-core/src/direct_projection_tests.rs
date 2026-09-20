@@ -2205,6 +2205,7 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
             crate::refs::page_key("target"),
             crate::refs::page_key("Alias Target"),
         ],
+        "target",
         ReferenceKind::Explicit,
     );
     assert!(explicit_candidates.indexed);
@@ -2396,7 +2397,11 @@ fn reference_lookup_waits_for_an_inflight_one_page_projection_delta() {
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let candidates = reader
-            .reference_candidate_pages(&[crate::refs::page_key("target")], ReferenceKind::Plain);
+            .reference_candidate_pages(
+                &[crate::refs::page_key("target")],
+                "target",
+                ReferenceKind::Plain,
+            );
         result_tx.send(candidates.indexed).unwrap();
     });
 
@@ -2473,8 +2478,9 @@ fn a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_eve
     let reader = Arc::clone(&graph);
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let walked = reader.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        let indexed = reader.reference_candidate_pages_indexed(&names, ReferenceKind::Explicit);
+        let walked = reader.reference_candidate_pages(&names, "target", ReferenceKind::Explicit);
+        let indexed =
+            reader.reference_candidate_pages_indexed(&names, "target", ReferenceKind::Explicit);
         result_tx
             .send((
                 walked.indexed,
@@ -2535,6 +2541,7 @@ fn interactive_plain_reference_windows_are_independent_per_title_and_alias() {
                 crate::refs::page_key("primary needle"),
                 crate::refs::page_key("authored alias"),
             ],
+            "target owner",
             ReferenceKind::Plain,
         )
         .expect("interactive plain-reference candidates");
@@ -2546,6 +2553,179 @@ fn interactive_plain_reference_windows_are_independent_per_title_and_alias() {
         Some(600),
         "each resolved spelling must receive its own 300-match verified window before union"
     );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interactive_plain_reference_window_verifies_raw_page_preambles() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-raw-page-preamble");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("pages/plain target source.md"),
+        "note:: target\n\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages/explicit target source.md"),
+        "note:: [[target]]\n\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pages/target.md"), "- owner\n").unwrap();
+    std::fs::write(
+        root.join("pages/plain go source.md"),
+        "note:: go\n\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages/explicit go source.md"),
+        "note:: [[go]]\n\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pages/go.md"), "- owner\n").unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    let groups = graph
+        .unlinked_refs_bounded_indexed("target", 100, 4 * 1024 * 1024)
+        .expect("interactive raw-preamble reference read")
+        .groups;
+    assert!(groups
+        .iter()
+        .any(|group| group.page == "plain target source"));
+    assert!(
+        groups
+            .iter()
+            .all(|group| group.page != "explicit target source"),
+        "explicit page-property syntax is not an unlinked occurrence: {groups:?}"
+    );
+    let short_groups = graph
+        .unlinked_refs_bounded_indexed("go", 100, 4 * 1024 * 1024)
+        .expect("short-scan raw-preamble reference read")
+        .groups;
+    assert!(short_groups
+        .iter()
+        .any(|group| group.page == "plain go source"));
+    assert!(
+        short_groups
+            .iter()
+            .all(|group| group.page != "explicit go source"),
+        "short scans retain the same plain-vs-explicit semantics: {short_groups:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interactive_plain_reference_window_counts_verified_page_and_block_owners_together() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-mixed-owner-window");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let window = crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW;
+    // These pages satisfy every target trigram but not the exact occurrence.
+    // Their paths sort after the real hits, so their entity ids are newer and
+    // the candidate cursor must pass more than W false positives first.
+    for ordinal in 0..=window {
+        std::fs::write(
+            root.join("pages")
+                .join(format!("zz-false-target-{ordinal:04}.md")),
+            "note:: tar arg rge get\n",
+        )
+        .unwrap();
+    }
+    // More than W page-level exact matches prove page owners participate in
+    // the same bound instead of being appended as an unbounded side channel.
+    for ordinal in 0..=window {
+        std::fs::write(
+            root.join("pages")
+                .join(format!("aa-hit-target-{ordinal:04}.md")),
+            "note:: target\n",
+        )
+        .unwrap();
+    }
+    let block_matches = 25;
+    let mut block_source = String::new();
+    for ordinal in 0..block_matches {
+        block_source.push_str(&format!("- target block {ordinal}\n"));
+    }
+    std::fs::write(
+        root.join("pages/zz-block-target-source.md"),
+        block_source,
+    )
+    .unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    let candidates = graph
+        .reference_candidate_pages_indexed(
+            &[crate::refs::page_key("target")],
+            "target owner",
+            ReferenceKind::Plain,
+        )
+        .expect("mixed page/block verified window");
+    assert_eq!(
+        candidates.pages.len(),
+        window - block_matches + 1,
+        "25 block entities share one owner path; the remaining window slots are page entities"
+    );
+    assert!(candidates
+        .pages
+        .iter()
+        .all(|(entry, _)| entry.name.starts_with("aa-hit-")
+            || entry.name == "zz-block-target-source"));
+    assert!(candidates
+        .pages
+        .iter()
+        .all(|(entry, _)| !entry.name.starts_with("zz-false-")));
+    assert_eq!(
+        candidates.blocks.as_ref().map(std::collections::HashSet::len),
+        Some(block_matches)
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn interactive_plain_reference_excludes_self_before_window_admission() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-self-before-window");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("pages/aaa-other.md"),
+        "- older eligible target mention\n",
+    )
+    .unwrap();
+    let mut own = String::from("title:: target\n\n");
+    for ordinal in 0..=crate::query::candidate::INTERACTIVE_VERIFIED_WINDOW {
+        own.push_str(&format!("- newer self-page target mention {ordinal}\n"));
+    }
+    std::fs::write(root.join("pages/zzz-self.md"), own).unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    let groups = graph
+        .unlinked_refs_bounded_indexed("target", 100, 4 * 1024 * 1024)
+        .expect("self-excluded interactive reference read")
+        .groups;
+    assert_eq!(groups.len(), 1, "the self page must not consume W: {groups:?}");
+    assert_eq!(groups[0].page, "aaa-other");
+    assert_eq!(groups[0].blocks.len(), 1);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -5687,7 +5867,11 @@ fn real_corpus_reference_family_matches_parser_oracle() {
             signature(oracle_unlinked.as_deref().unwrap())
         );
         let candidates = graph
-            .reference_candidate_pages(&[crate::refs::page_key(target)], ReferenceKind::Explicit);
+            .reference_candidate_pages(
+                &[crate::refs::page_key(target)],
+                target,
+                ReferenceKind::Explicit,
+            );
         assert!(candidates.indexed);
         eprintln!(
                 "real-corpus-reference explicit_candidates={} full_pages={} parser_unlinked_us={} indexed_unlinked_us={}",
