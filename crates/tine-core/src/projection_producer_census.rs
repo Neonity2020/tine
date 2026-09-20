@@ -1505,9 +1505,13 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // (35 public methods on exported types deleted). Nothing Tine imports or
     // calls moved, so the pin string above moved v0.25.0 → v0.26.0 and the
     // digest is unchanged.
+    // 2026-09-20: compact-projection P2 removed probe_fts_ready and its one
+    // PhysicalQueryValue::Integer pattern in query/results.rs. Restoring that
+    // single inventory row reproduces the previous digest exactly; no write
+    // crossing or storage dependency pin changed. P3 native folding adds none.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "a5a486d6bb83e5f7f3dcfaed306afccd3a21b7ffccc2f54b5dc690ccfcc53fb4",
+        "114fc8795670d46ae23f077a41b645fa07339772ea58937ba68ea383e5e36751",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

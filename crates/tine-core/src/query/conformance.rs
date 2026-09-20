@@ -2195,16 +2195,15 @@ fn match_carries_the_whole_search_grammar_onto_the_leaf() {
     // the whole query is Empty — which is a FALSE leaf, not "everything".
     assert!(match_rows(&graph, "@block and content match '-draft'").is_empty());
 
-    // Unicode: folding is lowercase-then-NFC, so a composed and a decomposed
-    // spelling of the same accent are the same needle, and accents are NOT
-    // stripped.
+    // Unicode: A6 folds composed/decomposed accents and unaccented spellings to
+    // the same search needle.
     assert_eq!(
         match_rows(&graph, "@block and content match 'CAFE\u{301}'"),
         vec!["über café résumé"]
     );
-    assert!(
-        match_rows(&graph, "@block and content match 'cafe'").is_empty(),
-        "NFC folding does not strip accents"
+    assert_eq!(
+        match_rows(&graph, "@block and content match 'cafe'"),
+        vec!["über café résumé"]
     );
 
     // A regex tests the ORIGINAL visible text, so it is case-sensitive.
@@ -2239,6 +2238,30 @@ fn an_empty_or_invalid_match_is_a_false_leaf_including_under_not() {
             "negating a false leaf is true for every row: {tql}"
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_nonempty_match_erased_by_a6_keeps_boolean_leaf_semantics() {
+    let (graph, dir) = match_graph("a6-erased");
+    let mark = "\u{301}";
+    let all = match_rows(&graph, "@block and content like '%'");
+
+    assert!(match_rows(&graph, &format!("@block and content match '{mark}'")).is_empty());
+    assert_eq!(
+        match_rows(&graph, &format!("@block and not (content match '{mark}')")),
+        all
+    );
+    assert!(match_rows(&graph, &format!("@block and content match '{mark} foo'")).is_empty());
+    assert_eq!(
+        match_rows(&graph, &format!("@block and content match '{mark} OR foo'")),
+        match_rows(&graph, "@block and content match 'foo'")
+    );
+    assert_eq!(
+        match_rows(&graph, &format!("@block and content match 'foo -{mark}'")),
+        match_rows(&graph, "@block and content match 'foo'")
+    );
+
     let _ = fs::remove_dir_all(&dir);
 }
 

@@ -840,7 +840,9 @@ fn eval_page_name(op: CmpOp, value: &Value, page_name: &str) -> bool {
         CmpOp::Eq => text.is_some_and(|text| key == refs::page_key(text)),
         CmpOp::NotEq => text.is_some_and(|text| key != refs::page_key(text)),
         CmpOp::StartsWith => text.is_some_and(|text| key.starts_with(&page_prefix_key(text))),
-        CmpOp::Like => text.is_some_and(|text| like_matches(&key, &canonical_fold(text))),
+        CmpOp::Like => {
+            text.is_some_and(|text| like_matches(&key, &refs::page_identity_pattern(text)))
+        }
         CmpOp::In => listed().unwrap_or(false),
         CmpOp::NotIn => listed().is_some_and(|hit| !hit),
         CmpOp::Lt

@@ -18,7 +18,9 @@
 //! quick switcher uses to keep today's fuzzy page-name ranking; any second
 //! term / operator / regex switches both pages and blocks to this grammar.
 
-use unicode_normalization::UnicodeNormalization;
+mod fold;
+
+pub(crate) use fold::MappedFold;
 
 fn is_search_whitespace(char: char) -> bool {
     matches!(
@@ -71,18 +73,22 @@ fn common_regex_pattern(pattern: &str) -> bool {
     true
 }
 
-/// Canonical comparison representation for non-regex search. Lowercasing is
-/// locale-independent; NFC makes canonically equivalent spellings compare
-/// alike without compatibility folding or removing accents.
+/// Canonical comparison representation for non-regex search: whole-string
+/// lowercase, NFKC, NFD/drop Unicode Mn, then NFC.
 pub fn canonical_fold(value: &str) -> String {
-    value.to_lowercase().nfc().collect()
+    fold::fold(value).text
+}
+
+/// The same canonical fold with one raw UTF-16 range per output scalar.
+pub(crate) fn canonical_fold_with_map(value: &str) -> MappedFold {
+    fold::fold(value)
 }
 
 /// One AND-term: a substring to test (already canonically folded) plus whether it is
 /// negated (`-term` → must NOT be present).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Term {
-    /// Lowercase-plus-NFC needle for `visible_lower.contains(..)`.
+    /// Canonically folded needle for `visible_lower.contains(..)`.
     pub text: String,
     pub negated: bool,
     /// The term came from a `"quoted phrase"` — an explicit opt-in to the
@@ -157,7 +163,7 @@ impl Matcher {
         }
     }
 
-    /// Does `visible` match? `lower` is the pre-folded lowercase-plus-NFC body
+    /// Does `visible` match? `lower` is the pre-folded A6 search body
     /// (hot path for boolean terms); `orig` is the original body (needed by regex).
     pub fn matches(&self, lower: &str, orig: &str) -> bool {
         match self {
@@ -173,13 +179,13 @@ impl Matcher {
         match self {
             Matcher::Boolean(groups) if groups.len() == 1 && groups[0].len() == 1 => {
                 let t = &groups[0][0];
-                (!t.negated && !t.quoted).then_some(t.text.as_str())
+                (!t.negated && !t.quoted && !t.text.is_empty()).then_some(t.text.as_str())
             }
             _ => None,
         }
     }
 
-    /// Rank a page name (already lowercase-plus-NFC in `lower`, original in `orig`) for
+    /// Rank a page name (already A6-folded in `lower`, original in `orig`) for
     /// the non-simple path: prefix > substring, else `None` if it doesn't match.
     pub fn score_name(&self, lower: &str, orig: &str) -> Option<i32> {
         match self {
@@ -393,6 +399,20 @@ mod tests {
     }
 
     #[test]
+    fn a6_erased_terms_keep_positive_false_and_negative_true_semantics() {
+        let mark = "\u{301}";
+        let positive = m(mark);
+        assert_eq!(positive.simple_term(), None);
+        assert!(!hit(mark, "anything"));
+        assert!(!hit(&format!("{mark} alpha"), "alpha"));
+        assert!(hit(&format!("{mark} OR alpha"), "alpha"));
+        assert!(hit(&format!("alpha -{mark}"), "alpha"));
+        assert!(!hit(&format!("alpha -{mark}"), "anything"));
+        assert!(matches!(m(&format!("-{mark}")), Matcher::Empty));
+        assert!(!hit(&format!("\"{mark}\""), "anything"));
+    }
+
+    #[test]
     fn score_name_prefers_prefix() {
         let mt = m("foo bar");
         // "foobar…" — a positive term prefixes the name → 1000.
@@ -410,14 +430,96 @@ mod tests {
     }
 
     #[test]
-    fn canonical_unicode_equivalence_does_not_fold_accents() {
+    fn a6_search_fold_applies_compatibility_and_removes_only_mn() {
         assert!(hit("café", "a cafe\u{301} here"));
         assert!(hit("cafe\u{301}", "a café here"));
         assert!(hit("\u{ac00}", "Hangul \u{1100}\u{1161}"));
         assert!(hit("i\u{307}", "\u{130}"));
-        assert!(!hit("cafe", "café"));
+        assert!(hit("cafe", "café"));
+        assert!(hit("tine", "Ｔｉｎｅ"));
+        assert!(hit("office", "ofﬁce"));
+        assert!(hit("prilis zlutoucky kun", "Příliš žluťoučký kůň"));
+        assert!(!hit("का", "क"), "Mc must remain significant");
+        assert!(!hit("a⃝", "a"), "Me must remain significant");
+        assert!(!hit("STRASSE", "Straße"), "this is not full casefold");
         // Regular expressions retain their original-text semantics.
         assert!(!hit("/café/", "cafe\u{301}"));
+    }
+
+    #[test]
+    fn already_folded_terms_are_not_folded_a_second_time() {
+        assert_eq!(canonical_fold("𝐀"), "A");
+        assert_eq!(canonical_fold(&canonical_fold("𝐀")), "a");
+        assert!(hit("𝐀", "𝐀"));
+        assert!(!hit("a", "𝐀"));
+    }
+
+    #[test]
+    fn native_search_fold_has_one_explicit_owner() {
+        let owner = include_str!("search_query/fold.rs");
+        let parser = include_str!("search_query.rs");
+        let planner = include_str!("query_plan.rs");
+        let sql = include_str!("query/sql.rs");
+        let eval = include_str!("query/eval.rs");
+        let refs = include_str!("refs.rs");
+        let projection = include_str!("direct_projection.rs");
+        let document = include_str!("doc.rs");
+        let quick_switcher = include_str!("../../../src/components/QuickSwitcher.tsx");
+
+        assert!(parser.contains("mod fold;"));
+        assert!(owner.contains("decompose_compatible"));
+        assert!(!planner.contains("unicode_normalization"));
+        assert!(!planner.contains("unicode_segmentation"));
+        let folded_needle_boundary = planner
+            .split_once("fn folded_needle_chars")
+            .unwrap()
+            .1
+            .split_once("fn merge_spans")
+            .unwrap()
+            .0;
+        assert!(!folded_needle_boundary.contains("canonical_fold"));
+        let sql_term_boundary = sql
+            .split_once("fn match_term")
+            .unwrap()
+            .1
+            .split_once("fn fts_bound")
+            .unwrap()
+            .0;
+        assert!(sql_term_boundary.contains("term.text.clone()"));
+        assert!(!sql_term_boundary.contains("canonical_fold(term"));
+
+        let page_candidates = planner
+            .split_once("fn execute_page_candidates")
+            .unwrap()
+            .1
+            .split_once("fn walk_blocks")
+            .unwrap()
+            .0;
+        assert!(page_candidates.contains("crate::refs::page_key(&page.name)"));
+        assert!(page_candidates.contains("crate::refs::page_key(alias)"));
+        assert!(page_candidates.contains("crate::refs::page_key(&name)"));
+        assert!(!page_candidates.contains("canonical_fold(&page.name)"));
+        assert!(!page_candidates.contains("canonical_fold(alias)"));
+        assert!(refs.contains("fn page_identity_pattern(pattern: &str)"));
+        assert!(eval.contains("refs::page_identity_pattern(text)"));
+        assert!(sql.contains("refs::page_identity_pattern(text)"));
+        assert!(quick_switcher.contains("pageIdentityKey(page.name) === queryIdentity"));
+        assert!(quick_switcher.contains("pageIdentityKey(page.matchedAlias) === queryIdentity"));
+        assert!(!quick_switcher.contains("p.adaptiveClass === \"exact\""));
+
+        let search_rows = projection
+            .lines()
+            .filter(|line| line.contains("normalized_searchable_text:"))
+            .collect::<Vec<_>>();
+        assert_eq!(search_rows.len(), 2);
+        assert!(search_rows
+            .iter()
+            .all(|line| line.contains("crate::search_query::canonical_fold(&searchable_text)")));
+        assert!(
+            document.contains("let visible_lower = crate::search_query::canonical_fold(&visible);")
+        );
+        // Page identity (`graph_text_path`/`refs`) and property/sort programs
+        // deliberately live outside this guard: they own different contracts.
     }
 }
 

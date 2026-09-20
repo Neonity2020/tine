@@ -2155,7 +2155,8 @@ impl Compiler<'_> {
                 let Some(text) = value.as_text() else {
                     return "0".to_string();
                 };
-                let pattern = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
+                let pattern =
+                    self.bind(PhysicalQueryValue::Text(refs::page_identity_pattern(text)));
                 format!("{column} LIKE {pattern} ESCAPE '\\'")
             }
             CmpOp::In | CmpOp::NotIn => {

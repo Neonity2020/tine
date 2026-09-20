@@ -82,6 +82,16 @@ pub fn page_key(name: &str) -> String {
     without_boundaries.nfc().collect()
 }
 
+/// Fold a `page.name LIKE` pattern under the page-identity comparison rules.
+///
+/// Unlike [`page_key`], a pattern is not a page name: surrounding whitespace,
+/// wildcard escapes, and literal boundary slashes are authored matching syntax
+/// and must survive. This is therefore the historical lowercase + NFC portion
+/// of the identity fold, owned beside the identity key it is matched against.
+pub(crate) fn page_identity_pattern(pattern: &str) -> String {
+    pattern.to_lowercase().nfc().collect()
+}
+
 /// Comparison form for page identity. NFC composition requires allocation; this
 /// deliberately delegates to the canonical key so cache scans cannot drift.
 pub fn same_page(a: &str, b: &str) -> bool {
@@ -761,6 +771,18 @@ mod tests {
         // `str::to_lowercase` applies Unicode's contextual final-sigma rule.
         // The frontend navigation key mirrors this exact result.
         assert_eq!(page_key(" ΟΣ "), "ος");
+    }
+
+    #[test]
+    fn page_identity_pattern_preserves_pattern_syntax_without_search_folding() {
+        assert_eq!(
+            page_identity_pattern(" /CAFÉ\\_%/ "),
+            " /café\\_%/ ",
+            "whitespace, escapes, wildcards, and boundary slashes are literal pattern syntax"
+        );
+        assert_eq!(page_identity_pattern("Cafe\u{301}"), "café");
+        assert_ne!(page_identity_pattern("Cafe"), page_identity_pattern("Café"));
+        assert_ne!(page_identity_pattern("Ｃａｆｅ"), "cafe");
     }
 
     #[test]

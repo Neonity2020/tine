@@ -1279,11 +1279,11 @@ fn autocomplete_property_facets_follow_og_visibility_sources_and_budget() {
 }
 
 #[test]
-fn content_predicate_uses_canonical_unicode_without_accent_folding() {
+fn content_predicate_uses_the_a6_search_fold() {
     let none = ctx_named();
     let block = DocBlock::new("Re\u{301}sume\u{301}");
     assert!(pred("\"Résumé\"").eval(&block, &none));
-    assert!(!pred("\"Resume\"").eval(&block, &none));
+    assert!(pred("\"Resume\"").eval(&block, &none));
 }
 
 #[test]
