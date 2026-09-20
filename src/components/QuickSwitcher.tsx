@@ -100,39 +100,6 @@ export function QuickSwitcher(): JSX.Element {
   const [searchPending, setSearchPending] = createSignal<string | null>(null);
   const [searchError, setSearchError] = createSignal<string | null>(null);
   const [searchRetry, setSearchRetry] = createSignal(0);
-  // GH #543: while the query index is still being built, search answers over
-  // the partial index. Poll the build while the switcher is open so the user
-  // sees that results are incomplete, and re-run the query once it finishes.
-  const [indexProgress, setIndexProgress] = createSignal<[number, number] | null>(null);
-  createEffect(() => {
-    if (!switcherOpen()) { setIndexProgress(null); return; }
-    let live = true;
-    let building = false;
-    // Two guards, because `null` here means "the build finished, re-run the
-    // query" and both of these turned something else into that claim (GH #543).
-    // A poll that THREW said the build had finished; and two polls in flight
-    // could land out of order, so an older answer could overwrite a newer one.
-    let issued = 0;
-    let answered = 0;
-    const poll = async () => {
-      const ticket = ++issued;
-      let progress: [number, number] | null = null;
-      try {
-        progress = await backend().queryIndexProgress();
-      } catch {
-        // Unknown, not finished. Leave the last known state alone.
-        return;
-      }
-      if (!live || ticket <= answered) return;
-      answered = ticket;
-      if (progress) building = true;
-      else if (building) { building = false; setSearchRetry((n) => n + 1); }
-      setIndexProgress(progress);
-    };
-    void poll();
-    const timer = setInterval(() => { void poll(); }, 750);
-    onCleanup(() => { live = false; clearInterval(timer); });
-  });
   let searchRequest = 0;
   createEffect(() => {
     searchRetry();
@@ -681,21 +648,6 @@ export function QuickSwitcher(): JSX.Element {
               <div class="switcher-empty switcher-error">
                 {graphResults()!.diagnostics.map((diagnostic) => diagnostic.message).join(" · ")}
               </div>
-            </Show>
-            {/* The ternary, not `&&`: `&&` widens the accessor to `string | [number,
-                    number]`, so `progress()[1]` types as `string | number`. */}
-            <Show when={query().trim() && !commandsOnly() ? indexProgress() : null}>
-              {(progress) => (
-                <div class="switcher-empty" role="status" data-testid="switcher-index-progress">
-                  {/* A total of 0 means the build is still counting the graph
-                      (the warm's inventory read, the longest phase on a large
-                      graph). It is indexing, with no page count to give yet —
-                      saying "0 of 0" would read as a finished empty graph. */}
-                  {progress()[1] > 0
-                    ? `Indexing ${progress()[0].toLocaleString()} of ${progress()[1].toLocaleString()} pages — results may be incomplete`
-                    : "Indexing — results may be incomplete"}
-                </div>
-              )}
             </Show>
             <Show when={searchPending()}><div class="switcher-empty" role="status">{searchPending()}</div></Show>
             <Show when={searchError()}><div class="switcher-empty switcher-error" role="alert">{searchError()} <button onClick={() => setSearchRetry((n) => n + 1)}>Retry search</button></div></Show>

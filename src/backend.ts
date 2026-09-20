@@ -567,10 +567,6 @@ export interface Backend {
   getUnlinkedRefs(name: string): Promise<RefGroup[]>;
   /** True once the background whole-graph warm has built derived graph-open caches. */
   warmDone(): Promise<boolean>;
-  /** `[indexed, total]` pages while the query index is still being built for
-   * this graph, `null` when no build is in flight. Search answers over the
-   * partial index during a build; surfaces poll this to say so (GH #543). */
-  queryIndexProgress(): Promise<[number, number] | null>;
   /** Map of block uuid → number of blocks that reference it (the count badge). */
   getBlockRefCounts(): Promise<Record<string, number>>;
   /** Blocks that reference block `uuid`, grouped by page (the referrers panel). */
@@ -1483,9 +1479,6 @@ class TauriBackend implements Backend {
   }
   warmDone() {
     return this.call<boolean>("warm_done");
-  }
-  queryIndexProgress() {
-    return this.call<[number, number] | null>("query_index_progress", {});
   }
   getBlockRefCounts() {
     return this.call<Record<string, number>>("block_ref_counts", {});
