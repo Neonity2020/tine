@@ -461,7 +461,6 @@ struct ProjectionShared {
     #[cfg(test)]
     referenced_name_reads: AtomicU64,
     #[cfg(test)]
-    fuzzy_candidate_reads: AtomicU64,
     /// GH #543: worker turns that switched the writer INTO the stream's
     /// build settings, and turns that restored the ordinary ones.
     #[cfg(test)]
@@ -899,7 +898,6 @@ impl DirectProjection {
             #[cfg(test)]
             referenced_name_reads: AtomicU64::new(0),
             #[cfg(test)]
-            fuzzy_candidate_reads: AtomicU64::new(0),
             #[cfg(test)]
             build_relaxed_turns: AtomicU64::new(0),
             #[cfg(test)]
@@ -1981,20 +1979,37 @@ impl DirectProjection {
         if !self.ready_at(cache_generation) {
             return None;
         }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
         let mut aliases = Vec::new();
-        drain_after(
-            |after: Option<(i64, i64)>, batch| read.navigation_aliases_after(after, batch),
-            |row| (row.cursor, row.name_cursor),
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?;
+        crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT alias.raw, owner.raw, p.path \
+             FROM reference_alias_declarations d \
+             JOIN pages p ON p.page_id = d.source_page_id \
+             JOIN names owner ON owner.name_id = p.name_id \
+             JOIN names alias ON alias.name_id = d.alias_name_id \
+             WHERE d.source_entity_type = 0 AND d.source_entity_id = d.source_page_id \
+             ORDER BY d.source_page_id, d.ordinal, alias.raw",
+            &[],
             |row| {
-                aliases.push((row.normalized_alias, row.owner_name, row.owner_path));
-                Ok(())
+                let values = row
+                    .iter()
+                    .map(|value| match value {
+                        PhysicalQueryValue::Text(text) => Ok(text.clone()),
+                        _ => Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                            "page alias ownership row contains non-text data".into(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if values.len() != 3 {
+                    return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                        "page alias ownership row has the wrong width".into(),
+                    ));
+                }
+                aliases.push((values[0].clone(), values[1].clone(), values[2].clone()));
+                Ok(std::ops::ControlFlow::Continue(()))
             },
-            |_, _| None,
         )
         .ok()?;
         self.ready_at(cache_generation).then_some(aliases)
@@ -2064,6 +2079,8 @@ impl DirectProjection {
         cache_generation: u64,
         names_norm: &[String],
         kind: ReferenceKind,
+        mode: crate::query::candidate::CandidateMode,
+        config: &crate::config::Config,
     ) -> Option<ReferenceCandidateIndex> {
         if !self.ready_at(cache_generation) {
             return None;
@@ -2075,10 +2092,17 @@ impl DirectProjection {
         if reader.is_none() {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
-        let read = reader.as_ref()?.read();
         let mut paths = std::collections::BTreeSet::new();
         let mut blocks = std::collections::HashSet::new();
-        let mut blocks_are_complete = true;
+        let read = reader.as_ref()?.read();
+        // All title/alias needles observe one committed image. Reopening per
+        // spelling could otherwise union candidates from opposite sides of an
+        // edit even though each individual query was coherent.
+        let mut plain_snapshot = if kind == ReferenceKind::Plain {
+            Some(PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(())).ok()?)
+        } else {
+            None
+        };
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
@@ -2115,20 +2139,106 @@ impl DirectProjection {
                     .ok()?;
                 }
                 ReferenceKind::Plain => {
-                    // FTS narrows to pages here; `plain_text_candidate_pages_after`
-                    // projects `owner.page_id` and does not expose the owning
-                    // entity, so the walk still classifies every block of a
-                    // candidate page.
-                    blocks_are_complete = false;
-                    drain_after(
-                        |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
-                        |row| row.cursor,
-                        |row| {
-                            paths.insert(PathBuf::from(row.page_path));
-                            Ok(())
-                        },
-                        |_, _| None,
-                    )
+                    let folded = crate::search_query::canonical_fold(name);
+                    let plan = crate::query::candidate::scalar_trigram_expression(&folded);
+                    let (block_source, page_source, mut params) = match plan {
+                        Some(expression) => {
+                            let params = vec![PhysicalQueryValue::Text(expression)];
+                            (
+                                "(SELECT rowid FROM search_fts \
+                                    WHERE search_fts MATCH ?1 ORDER BY rowid DESC) c \
+                                  JOIN blocks b ON b.block_id = c.rowid"
+                                    .to_string(),
+                                "(SELECT rowid FROM search_fts \
+                                    WHERE search_fts MATCH ?1 ORDER BY rowid DESC) c \
+                                  JOIN pages p ON p.page_id = c.rowid"
+                                    .to_string(),
+                                params,
+                            )
+                        }
+                        None => ("blocks b".to_string(), "pages p".to_string(), Vec::new()),
+                    };
+                    let snapshot = plain_snapshot.as_mut()?;
+
+                    // Page rows remain candidates because the accepted compact
+                    // schema retains visible preamble rather than its authored
+                    // raw syntax. The existing parser verifier below this seam
+                    // remains the only authority for page-property occurrences.
+                    let page_sql = format!(
+                        "SELECT p.path, NULL, p.page_id FROM {page_source} ORDER BY p.page_id DESC"
+                    );
+                    crate::query::projection_sql::visit(snapshot, &page_sql, &params, |row| {
+                        let Some(PhysicalQueryValue::Text(path)) = row.first() else {
+                            return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                "plain-reference candidate has no page path".into(),
+                            ));
+                        };
+                        paths.insert(PathBuf::from(path));
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    })
+                    .ok()?;
+
+                    let exact = match mode {
+                        crate::query::candidate::CandidateMode::Exhaustive => String::new(),
+                        crate::query::candidate::CandidateMode::Interactive { window } => {
+                            let needle = vec![name.clone()];
+                            let config = config.clone();
+                            snapshot
+                                .set_query_rank_function(move |_id, framed| {
+                                    let (raw, path) = crate::query::rank::decode_pair(framed)?;
+                                    let is_org = Format::from_path(Path::new(path)) == Format::Org;
+                                    let block = DocBlock::preamble(raw, is_org);
+                                    let projection = block.projection();
+                                    Ok(crate::reference_evidence::has_occurrence_kind(
+                                        raw,
+                                        &projection.reference_source,
+                                        &needle,
+                                        ReferenceKind::Plain,
+                                        &config,
+                                    )
+                                    .then(Vec::new))
+                                })
+                                .ok()?;
+                            params.push(PhysicalQueryValue::Integer(
+                                i64::try_from(window).unwrap_or(i64::MAX),
+                            ));
+                            let frame = crate::query::text::framed_pair_sql("bt.content", "p.path");
+                            format!(
+                                " WHERE tine_query_rank(1, {frame}) IS NOT NULL \
+                                  ORDER BY b.block_id DESC LIMIT ?{}",
+                                params.len()
+                            )
+                        }
+                    };
+                    let block_sql = if exact.is_empty() {
+                        format!(
+                            "SELECT p.path, b.result_id, b.block_id \
+                             FROM {block_source} JOIN pages p ON p.page_id = b.page_id \
+                             ORDER BY b.block_id DESC"
+                        )
+                    } else {
+                        format!(
+                            "SELECT p.path, b.result_id, b.block_id \
+                             FROM {block_source} \
+                             JOIN block_text bt ON bt.block_id = b.block_id \
+                             JOIN pages p ON p.page_id = b.page_id{exact}"
+                        )
+                    };
+                    crate::query::projection_sql::visit(snapshot, &block_sql, &params, |row| {
+                        let Some(PhysicalQueryValue::Text(path)) = row.first() else {
+                            return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                "plain-reference candidate has no page path".into(),
+                            ));
+                        };
+                        let Some(PhysicalQueryValue::Text(result_id)) = row.get(1) else {
+                            return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                "plain-reference candidate has an invalid block identity".into(),
+                            ));
+                        };
+                        paths.insert(PathBuf::from(path));
+                        blocks.insert(result_id.clone());
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    })
                     .ok()?;
                 }
             }
@@ -2136,7 +2246,7 @@ impl DirectProjection {
         self.ready_at(cache_generation)
             .then_some(ReferenceCandidateIndex {
                 paths,
-                blocks: blocks_are_complete.then_some(blocks),
+                blocks: Some(blocks),
             })
     }
 
@@ -2362,11 +2472,6 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn referenced_name_reads(&self) -> u64 {
         self.shared.referenced_name_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fuzzy_candidate_reads(&self) -> u64 {
-        self.shared.fuzzy_candidate_reads.load(Ordering::Relaxed)
     }
 
     /// R3: refuse new jobs, interrupt the active ones and wait for their slots
@@ -3492,12 +3597,12 @@ fn projected_text_bytes(pages: &[tine_storage::sqlite::PhysicalPage]) -> u64 {
     pages
         .iter()
         .map(|page| {
-            let own = page.searchable_text.len() as u64
+            let own = page.search_tokens.len() as u64
                 + page.preamble.as_ref().map_or(0, |text| text.len() as u64);
             own + page
                 .blocks
                 .iter()
-                .map(|block| block.content.len() as u64)
+                .map(|block| (block.content.len() + block.search_tokens.len()) as u64)
                 .sum::<u64>()
         })
         .sum()
@@ -3548,15 +3653,15 @@ fn physical_page(
     // case-sensitive `ends_with(".org")` and would type an `Outline.ORG` page
     // Markdown here while Direct Files types it Org (§5.8 E4).
     let atom_format = crate::query::atom::AtomFormat::from(format);
-    let (preamble_search, properties, tags) = document
+    let (preamble_visible, properties, tags) = document
         .pre_block
         .as_deref()
         .map(|raw| facets(raw, is_org))
         .unwrap_or_default();
-    let searchable_text = if preamble_search.is_empty() {
+    let visible_search_text = if preamble_visible.is_empty() {
         entry.name.clone()
     } else {
-        format!("{} {preamble_search}", entry.name)
+        format!("{} {preamble_visible}", entry.name)
     };
     let mut blocks = Vec::new();
     let mut reference_postings = Vec::new();
@@ -3649,8 +3754,7 @@ fn physical_page(
             text_kind: page_kind_to_sql(entry.kind),
             journal_day: journal_days.day(&entry.rel_path, entry.kind == PageKind::Journal),
             preamble: document.pre_block.clone(),
-            normalized_searchable_text: crate::search_query::canonical_fold(&searchable_text),
-            searchable_text,
+            search_tokens: crate::search_query::canonical_fold(&visible_search_text),
             properties,
             tags: crate::query::derived::tag_rows(&tags),
             property_atoms: page_property_atoms,
@@ -3707,16 +3811,6 @@ fn lower_blocks(
                 },
             });
         }
-        let searchable_text = projection
-            .visible
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        // The query columns are the EXACT visible text and its fold, never the
-        // whitespace-collapsed `searchable_text` beside them (§5.10).
-        // `visible_lower` is exactly `search_query::canonical_fold(visible)`.
-        let (query_visible, query_visible_folded) =
-            (projection.visible.clone(), projection.visible_lower.clone());
         let properties = projection
             .properties
             .iter()
@@ -3749,10 +3843,7 @@ fn lower_blocks(
             parent: parent.map(str::to_owned),
             order,
             content: block.raw.clone(),
-            normalized_searchable_text: crate::search_query::canonical_fold(&searchable_text),
-            searchable_text,
-            query_visible,
-            query_visible_folded,
+            search_tokens: projection.visible_lower.clone(),
             heading_level: projection.heading_level,
             collapsed: block.collapsed(),
             logseq_uuid,
@@ -3827,11 +3918,7 @@ fn append_reference_postings(
 
 fn facets(raw: &str, is_org: bool) -> (String, Vec<PhysicalProperty>, Vec<String>) {
     let block = DocBlock::preamble(raw, is_org);
-    let searchable = block
-        .visible_text()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let searchable = block.visible_text().to_owned();
     let properties = block
         .projection()
         .properties

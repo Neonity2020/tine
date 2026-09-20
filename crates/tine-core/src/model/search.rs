@@ -61,12 +61,35 @@ impl Graph {
         explain: bool,
         display: crate::query_plan::FriendlyDisplayOptions,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
-        let plan = crate::query_plan::friendly_search_plan(
+        self.run_graph_search_displayed_for(
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+            display,
+            crate::query_plan::FriendlyConsumer::NonInteractive,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_graph_search_displayed_for(
+        &self,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        display: crate::query_plan::FriendlyDisplayOptions,
+        consumer: crate::query_plan::FriendlyConsumer,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        let plan = crate::query_plan::friendly_search_plan_for(
             source,
             page_limit,
             block_limit,
             scope,
             display,
+            consumer,
         );
         self.read_friendly_plan(&plan, explain, None)
     }
@@ -144,6 +167,30 @@ impl Graph {
         explain: bool,
         display: crate::query_plan::FriendlyDisplayOptions,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        self.run_graph_search_latest_displayed_for(
+            lane,
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+            display,
+            crate::query_plan::FriendlyConsumer::NonInteractive,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_graph_search_latest_displayed_for(
+        &self,
+        lane: &str,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        display: crate::query_plan::FriendlyDisplayOptions,
+        consumer: crate::query_plan::FriendlyConsumer,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         use std::sync::atomic::Ordering;
         let epoch = {
             let mut lanes = self.search_lanes.lock().unwrap();
@@ -153,12 +200,13 @@ impl Graph {
                 .clone()
         };
         let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let plan = crate::query_plan::friendly_search_plan(
+        let plan = crate::query_plan::friendly_search_plan_for(
             source,
             page_limit,
             block_limit,
             scope,
             display,
+            consumer,
         );
         self.read_friendly_plan(
             &plan,
@@ -210,13 +258,18 @@ impl Graph {
 
     /// Fuzzy page-name matches for the quick switcher.
     pub fn quick_switch(&self, query: &str, limit: usize) -> Vec<PageEntry> {
-        crate::query_plan::legacy_page_search_entries(
-            self.list_pages(),
-            self.page_aliases_with_owners(),
-            self.referenced_page_names(),
-            query,
-            limit,
-        )
+        let plan = crate::query_plan::QueryPlan::page_name_fuzzy(query, limit);
+        self.read_friendly_plan(&plan, false, None)
+            .map(|answer| crate::query_plan::page_hits_to_entries(answer.hits))
+            .unwrap_or_else(|_| {
+                crate::query_plan::pre_ready_page_search_entries(
+                    self.list_pages(),
+                    self.page_aliases_with_owners(),
+                    self.referenced_page_names(),
+                    query,
+                    limit,
+                )
+            })
     }
 
     /// All `template:: <name>` templates across the graph, with the blocks to

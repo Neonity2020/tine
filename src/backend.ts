@@ -5,7 +5,7 @@
 import { createSignal } from "solid-js";
 import { notifyGraphRebound } from "./modeHooks";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
-import type { GraphSearchDisplayOptions } from "./editor/queryIr";
+import type { GraphSearchConsumer, GraphSearchDisplayOptions } from "./editor/queryIr";
 import type {
   Diagnostic,
   DiagnosticKind,
@@ -886,7 +886,8 @@ export interface Backend {
     lane?: string,
     explain?: boolean,
     scope?: QueryPageScope,
-    options?: GraphSearchDisplayOptions
+    options?: GraphSearchDisplayOptions,
+    consumer?: GraphSearchConsumer,
   ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   /** Capture-only page/tag completion capability. It is intentionally not the
@@ -1623,7 +1624,7 @@ class TauriBackend implements Backend {
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
   }
-  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope, options?: GraphSearchDisplayOptions) {
+  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope, options?: GraphSearchDisplayOptions, consumer: GraphSearchConsumer = "non_interactive") {
     const execution = await this.call<QueryExecution>("run_graph_search", {
       source, pageLimit, blockLimit, lane, explain,
       scope: scope ?? null,
@@ -1637,6 +1638,7 @@ class TauriBackend implements Backend {
           blockView: options.blockView ?? null,
         }
         : null,
+      consumer,
     });
     return {
       ...execution,

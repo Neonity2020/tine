@@ -1314,6 +1314,7 @@ impl Graph {
         &self,
         names_norm: &[String],
         kind: ReferenceKind,
+        mode: crate::query::candidate::CandidateMode,
     ) -> Option<(
         Vec<(PageEntry, Arc<Document>)>,
         Option<std::collections::HashSet<String>>,
@@ -1328,7 +1329,8 @@ impl Graph {
         if !projection.wait_for_reference_generation(generation) {
             return None;
         }
-        let candidates = projection.reference_candidates(generation, names_norm, kind)?;
+        let candidates =
+            projection.reference_candidates(generation, names_norm, kind, mode, &self.config)?;
         let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
         Some((pages, candidates.blocks))
     }
@@ -1494,14 +1496,5 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map_or(0, |projection| projection.referenced_name_reads())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_projection_fuzzy_candidate_reads_test(&self) -> u64 {
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map_or(0, |projection| projection.fuzzy_candidate_reads())
     }
 }

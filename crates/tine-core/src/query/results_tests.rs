@@ -2452,23 +2452,23 @@ fn the_descriptor_statement_wraps_every_lowered_shape() {
     for (source, dialect) in every_shape() {
         let (_query, statement) = corpus.lower_block_anchored(source, dialect);
         let descriptor = descriptor_view_statement(&statement, None)
-            .map(|ranked| ranked.query)
             .unwrap_or_else(|error| panic!("{source}: {error}"));
         assert_eq!(
-            descriptor.params, statement.params,
+            descriptor.query.params, statement.params,
             "{source}: the wrapper binds nothing of its own"
         );
         assert!(
-            descriptor.sql.starts_with("WITH "),
+            descriptor.query.sql.starts_with("WITH "),
             "{source}: the descriptor names its selected relation"
         );
         assert!(
-            !descriptor.sql.contains("FROM blocks b JOIN pages p")
-                && !descriptor.sql.contains("FROM m JOIN pages p"),
+            !descriptor.query.sql.contains("FROM blocks b JOIN pages p")
+                && !descriptor.query.sql.contains("FROM m JOIN pages p"),
             "{source}: the routing INNER JOIN must be replaced by a LEFT JOIN"
         );
         assert!(
             descriptor
+                .query
                 .sql
                 .contains("LEFT JOIN qe_order_pages p ON p.page_id = r.page_id"),
             "{source}: the descriptor read re-joins pages itself, LEFT"
@@ -2477,7 +2477,10 @@ fn the_descriptor_statement_wraps_every_lowered_shape() {
             .set_query_regex_predicate(statement.regexes.predicate())
             .expect("the regex table installs");
         snapshot
-            .run_projection_query(&descriptor.sql, &descriptor.params)
+            .set_query_rank_function(descriptor.ranks.function(snapshot.cancellation()))
+            .expect("the rank table installs");
+        snapshot
+            .run_projection_query(&descriptor.query.sql, &descriptor.query.params)
             .unwrap_or_else(|error| panic!("{source}: the descriptor statement must run: {error}"));
     }
     snapshot.finish();

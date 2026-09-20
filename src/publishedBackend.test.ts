@@ -279,19 +279,19 @@ describe("published backend: the two query seams", () => {
     expect(second.groups).toHaveLength(1);
   });
 
-  it("answers the Quick Switcher's lanes by substring and refuses a query-language search", async () => {
+  it("answers the explicitly routed Ctrl-K consumer and refuses a query-language search", async () => {
     const backend = publishedBackend(load);
-    const answer = await backend.runGraphSearch("dash", 10, 10, "quick-switch");
+    const answer = await backend.runGraphSearch("dash", 10, 10, "quick-switch", false, undefined, undefined, "ctrl_k");
     expect(answer.hits.map((hit) => hit.entity)).toEqual(["page", "block"]);
     expect(answer.hits[0]).toMatchObject({ entity: "page", display_text: "Dashboard", match_class: "prefix" });
     expect(answer.hits[1]).toMatchObject({ entity: "block", page: "Sep 13th, 2026", display_text: "TODO call [[Dashboard]]" });
     expect(answer.has_more).toEqual({ pages: false, blocks: false });
     // Scoped to one page: only that page's blocks, no page rows.
-    const scoped = await backend.runGraphSearch("child", 10, 10, "quick-switch:current-page", false, { name: "Dashboard", pageKind: "page", path: "pages/Dashboard.md" });
+    const scoped = await backend.runGraphSearch("child", 10, 10, "quick-switch:current-page", false, { name: "Dashboard", pageKind: "page", path: "pages/Dashboard.md" }, undefined, "ctrl_k");
     expect(scoped.hits.map((hit) => (hit.entity === "block" ? hit.block.id : hit.entity))).toEqual(["d2"]);
     // An alias row names the page it stands for.
-    expect((await backend.runGraphSearch("dash", 10, 0, "quick-switch")).hits[0]).toMatchObject({ entity: "page", page: { name: "Dashboard" } });
-    expect((await backend.runGraphSearch("", 10, 10, "quick-switch")).hits).toEqual([]);
+    expect((await backend.runGraphSearch("dash", 10, 0, "quick-switch", false, undefined, undefined, "ctrl_k")).hits[0]).toMatchObject({ entity: "page", page: { name: "Dashboard" } });
+    expect((await backend.runGraphSearch("", 10, 10, "quick-switch", false, undefined, undefined, "ctrl_k")).hits).toEqual([]);
     // The query workspace and inline friendly search are query-language runs.
     await expect(backend.runGraphSearch("(task TODO)", 10, 10, "query-workspace:1:materialize")).rejects.toMatchObject({ reasonCode: PUBLISHED_QUERY_REASON });
     await expect(backend.runGraphSearch("dash", 10, 10)).rejects.toBeInstanceOf(QueryUnavailableError);
@@ -432,7 +432,7 @@ describe("published backend: pages and references", () => {
     snapshot.entries.push({ name: "😀 𝐀lpha", kind: "page", date_key: null, path: "pages/math.md" });
     const backend = publishedBackend(() => Promise.resolve(snapshot));
 
-    const answer = await backend.runGraphSearch("𝐀", 20, 0, "quick-switch");
+    const answer = await backend.runGraphSearch("𝐀", 20, 0, "quick-switch", false, undefined, undefined, "ctrl_k");
     const hit = answer.hits.find((candidate) => candidate.entity === "page" && candidate.page.name === "😀 𝐀lpha");
     expect(hit?.evidence).toEqual([
       { clause_id: 0, field: "page_name", mode: "contains", spans: [{ start: 3, end: 5 }] },
@@ -444,7 +444,7 @@ describe("published backend: pages and references", () => {
     const erased = "\u0301";
     expect(await backend.search(erased, 10)).toEqual([]);
     expect(await backend.quickSwitch(erased, 10)).toEqual([]);
-    expect((await backend.runGraphSearch(erased, 10, 10, "quick-switch")).hits).toEqual([]);
+    expect((await backend.runGraphSearch(erased, 10, 10, "quick-switch", false, undefined, undefined, "ctrl_k")).hits).toEqual([]);
     expect(await backend.quickSwitch("", 10)).toHaveLength(fixture().entries.length);
   });
 

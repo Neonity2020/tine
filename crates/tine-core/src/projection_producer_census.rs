@@ -1519,7 +1519,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // ownership and the write crossings asserted above are unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "b973d94f09f9937ad98b0fa1f325cc282052744c3c9497e0b827aa3a7a9a345f",
+        "05b9d361cc3643470e43e4b46f1d595c8bc249a4963c6497389cfa8d99e4b02d",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

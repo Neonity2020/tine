@@ -63,14 +63,14 @@
 //! producer applied to the dictionary key (`refs::page_key` for page/tag
 //! names, `refs::normalize` for path-reference names,
 //! `doc::property_key_norm` for property names, `atom::atom_key` for
-//! `atom_key`, `search_query::canonical_fold` for `query_visible_folded`) —
+//! `atom_key`, `search_query::canonical_fold` for exact visible text) —
 //! never a second normalizer that agrees by inspection.
 //!
 //! **`content match` (§5.10).** The compiler consumes the SAME parsed
 //! [`search_query::Matcher`] the walk consumes — [`crate::query::compiled::CompiledLeaves`],
 //! keyed by [`Filter::match_sources`] — and never re-parses the payload
 //! (I-12, D-14). Each retained OR arm becomes an `AND` of `instr` predicates on
-//! `blocks.query_visible_folded`, and, when the FTS index is READY, gains a
+//! exact visible text derived from raw content, and, when the FTS index is READY, gains a
 //! trigram CANDIDATE BOUND that may only ever OVER-approximate: the exact
 //! `instr` predicates stay as the final conditions on every path, so a bound
 //! that admitted too many rows costs time and a bound that excluded one would
@@ -122,7 +122,9 @@ use crate::query::ir::{Anchor, Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Q
 use crate::query::rank::{PageRecencyPrograms, QueryRankPrograms};
 use crate::query::registry::Registry;
 use crate::refs;
-use crate::search_query::{canonical_fold, AndGroup, Matcher, Term};
+#[cfg(test)]
+use crate::search_query::Term;
+use crate::search_query::{canonical_fold, AndGroup, Matcher};
 
 /// `owner_type` as the projection spells it (`PhysicalEntityId::sql_parts`).
 const OWNER_PAGE: i64 = 0;
@@ -161,6 +163,9 @@ pub(crate) struct SqlQuery {
     /// the overwhelming majority of statements; the executor installs it on the
     /// connection before the statement runs (see [`QueryRegexProgram`]).
     pub(crate) regexes: QueryRegexProgram,
+    /// Exact-visible predicate programs owned by this lowering. Wrappers clone
+    /// this table before appending their sort/recency programs.
+    pub(crate) ranks: QueryRankPrograms,
 }
 
 /// §4.3.2's compiled-regex table, owned by ONE lowered statement.
@@ -217,7 +222,10 @@ impl QueryRegexProgram {
                 .collect(),
         );
         move |id, text| match table.get(&id) {
-            Some(regex) => Ok(regex.is_match(text)),
+            Some(regex) => {
+                let (raw, path) = crate::query::rank::decode_pair(text)?;
+                Ok(regex.is_match(&crate::query::text::visible_from_raw_path(raw, path)))
+            }
             // The message names the ID and never the pattern or the row's text.
             None => Err(MaterializationError::InvalidQuery(format!(
                 "query regex id {id} is not bound by this statement"
@@ -433,6 +441,8 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         next_alias: 0,
         probe: false,
         regexes: Vec::new(),
+        ranks: QueryRankPrograms::default(),
+        content_rank_ids: HashMap::new(),
         needs_child_map: false,
     };
     // An invalid query returns zero results plus its diagnostics (§3.5); the
@@ -578,6 +588,7 @@ pub(crate) fn lower_query(query: &Query, inputs: &LoweringInputs<'_>) -> SqlQuer
         regexes: QueryRegexProgram {
             bindings: compiler.regexes,
         },
+        ranks: compiler.ranks,
     }
 }
 
@@ -631,17 +642,19 @@ pub(crate) fn descriptor_view_statement(
     };
     let base = "p.position";
     let mut params = statement.params.clone();
-    let mut ranks = QueryRankPrograms::default();
+    let mut ranks = statement.ranks.clone();
     let mut terms = Vec::new();
     let mut extra = String::new();
     let mut recency_expression = None;
     if let Some((view, recency)) = ordered {
         let mut lower = None;
+        let mut visible_lower = None;
         let mut property_keys = HashMap::<String, String>::new();
         let mut binder = StatementSortBinder {
             ranks: &mut ranks,
             params: &mut params,
             lowercase: &mut lower,
+            visible_lowercase: &mut visible_lower,
             property_keys: &mut property_keys,
             recency: Some(recency),
         };
@@ -698,6 +711,7 @@ pub(crate) fn descriptor_view_statement(
             matches_nothing: statement.matches_nothing,
             content_plans: statement.content_plans.clone(),
             regexes: statement.regexes.clone(),
+            ranks: ranks.clone(),
         },
         ranks,
     })
@@ -723,6 +737,8 @@ pub(crate) trait SortBinder {
     /// A `?N` parameter holding one normalized property key, reused per key so
     /// two sorts on the same property bind it once.
     fn property_key(&mut self, key: String) -> String;
+    /// Projection-aware lowercase first visible line for a block fallback.
+    fn visible_lowercase(&mut self, block_alias: &str, page_alias: &str) -> String;
     /// Whether this read can order by page recency at all. A read that captured
     /// no `PageRecencyPrograms` answers `false`, and a recency field then
     /// contributes NO order term rather than a silently different one.
@@ -734,6 +750,7 @@ struct StatementSortBinder<'a> {
     ranks: &'a mut QueryRankPrograms,
     params: &'a mut Vec<PhysicalQueryValue>,
     lowercase: &'a mut Option<String>,
+    visible_lowercase: &'a mut Option<String>,
     property_keys: &'a mut HashMap<String, String>,
     recency: Option<&'a PageRecencyPrograms>,
 }
@@ -757,6 +774,28 @@ impl SortBinder for StatementSortBinder<'_> {
         let bound = format!("?{}", self.params.len());
         self.property_keys.insert(key, bound.clone());
         bound
+    }
+
+    fn visible_lowercase(&mut self, block_alias: &str, page_alias: &str) -> String {
+        let program = self
+            .visible_lowercase
+            .get_or_insert_with(|| {
+                let id = self.ranks.bind_pair(|raw, path| {
+                    let visible = crate::query::text::visible_from_raw_path(raw, path);
+                    let first = visible
+                        .split('\n')
+                        .next()
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    Ok(Some(first.into_bytes()))
+                });
+                self.params.push(PhysicalQueryValue::Integer(id as i64));
+                format!("?{}", self.params.len())
+            })
+            .clone();
+        format!(
+            "tine_query_rank({program}, (SELECT CAST(length(CAST(bt.content AS BLOB)) AS TEXT) || ':' || bt.content || {page_alias}.path FROM block_text bt WHERE bt.block_id={block_alias}.block_id))"
+        )
     }
 
     fn has_recency(&self) -> bool {
@@ -846,9 +885,10 @@ pub(crate) fn block_sort_expression(
             binder.has_recency().then(|| recency_column.to_string())
         }
         _ => {
-            let lowercase = binder.lowercase();
             let key = binder.property_key(property_key_norm(field));
-            Some(format!("tine_query_rank({lowercase}, COALESCE((SELECT property.value FROM properties property JOIN names property_name ON property_name.name_id=property.name_id WHERE property.owner_type=1 AND property.owner_id={block_alias}.block_id AND property.page_id={block_alias}.page_id AND property_name.key={key} ORDER BY property.ordinal, property.name_id LIMIT 1), (SELECT CASE WHEN instr(query_visible, char(10))=0 THEN query_visible ELSE substr(query_visible, 1, instr(query_visible, char(10))-1) END FROM block_text WHERE block_id={block_alias}.block_id)))"))
+            let fallback = binder.visible_lowercase(block_alias, page_alias);
+            let lowercase = binder.lowercase();
+            Some(format!("COALESCE(tine_query_rank({lowercase}, (SELECT property.value FROM properties property JOIN names property_name ON property_name.name_id=property.name_id WHERE property.owner_type=1 AND property.owner_id={block_alias}.block_id AND property.page_id={block_alias}.page_id AND property_name.key={key} ORDER BY property.ordinal, property.name_id LIMIT 1)), {fallback})"))
         }
     }
 }
@@ -959,14 +999,16 @@ pub(crate) fn page_statement(
     };
     let base = "stored.position";
     let mut params = statement.params.clone();
-    let mut ranks = QueryRankPrograms::default();
+    let mut ranks = statement.ranks.clone();
     let mut lowercase = None;
+    let mut visible_lowercase = None;
     let mut property_keys = HashMap::<String, String>::new();
     let mut order_terms = Vec::new();
     let mut binder = StatementSortBinder {
         ranks: &mut ranks,
         params: &mut params,
         lowercase: &mut lowercase,
+        visible_lowercase: &mut visible_lowercase,
         property_keys: &mut property_keys,
         recency: Some(recency),
     };
@@ -1025,6 +1067,7 @@ pub(crate) fn page_statement(
             matches_nothing: statement.matches_nothing,
             content_plans: statement.content_plans.clone(),
             regexes: statement.regexes.clone(),
+            ranks: ranks.clone(),
         },
         ranks,
     })
@@ -1139,6 +1182,8 @@ struct Compiler<'a> {
     /// text so §5.3's second compilation pass reuses the FIRST pass's IDs
     /// rather than growing a parallel table.
     regexes: Vec<QueryRegexBinding>,
+    ranks: QueryRankPrograms,
+    content_rank_ids: HashMap<Vec<u8>, u64>,
     needs_child_map: bool,
 }
 
@@ -1443,44 +1488,18 @@ impl Compiler<'_> {
         }
     }
 
-    /// `content` predicates read `blocks.query_visible_folded` — the EXACT
-    /// visible text folded once at write time (§5.8), never the
-    /// whitespace-collapsed `block_text.searchable_text` payload. The walk compares
-    /// `BlockProjection::visible_lower`, which is the same fold of the same
-    /// text.
+    /// `content` predicates derive the EXACT visible text and its fold from
+    /// `block_text.content` plus the owning page path. The trigram relation is
+    /// only a candidate superset; the callback below decides membership with
+    /// the same projection and matcher as the walk.
     fn content(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
-        let column = format!("{b}.query_visible_folded");
         match op {
-            CmpOp::In | CmpOp::NotIn => {
-                let Some(items) = value.as_list() else {
-                    return "0".to_string();
-                };
-                let membership = if op == CmpOp::In { "IN" } else { "NOT IN" };
-                // No text operand: `in` is false and `not in` true, as in the walk.
-                match self.text_list(items, canonical_fold) {
-                    Some(list) => format!("{column} {membership} ({list})"),
-                    None if op == CmpOp::In => "0".to_string(),
-                    None => "1".to_string(),
-                }
-            }
-            CmpOp::Like | CmpOp::StartsWith => {
-                let Some(text) = value.as_text() else {
-                    return "0".to_string();
-                };
-                let pattern = self.bind(PhysicalQueryValue::Text(like_pattern(
-                    op,
-                    &canonical_fold(text),
-                )));
-                format!("{column} LIKE {pattern} ESCAPE '\\'")
-            }
-            CmpOp::Eq | CmpOp::NotEq => {
-                let Some(text) = value.as_text() else {
-                    return "0".to_string();
-                };
-                let literal = self.bind(PhysicalQueryValue::Text(canonical_fold(text)));
-                let comparison = if op == CmpOp::Eq { "=" } else { "<>" };
-                format!("{column} {comparison} {literal}")
-            }
+            CmpOp::In
+            | CmpOp::NotIn
+            | CmpOp::Like
+            | CmpOp::StartsWith
+            | CmpOp::Eq
+            | CmpOp::NotEq => self.content_exact(op, value, b),
             CmpOp::Match => match value.as_text() {
                 Some(text) => self.content_match(text, b),
                 None => "0".to_string(),
@@ -1494,6 +1513,109 @@ impl Compiler<'_> {
             | CmpOp::Gt
             | CmpOp::Ge
             | CmpOp::Between
+            | CmpOp::IsSet
+            | CmpOp::IsNotSet
+            | CmpOp::IsBlank => "0".to_string(),
+        }
+    }
+
+    fn content_frame(&mut self, b: &str) -> String {
+        let text = self.alias("bt");
+        let page = self.alias("vp");
+        let frame = crate::query::text::framed_pair_sql(
+            &format!("{text}.content"),
+            &format!("{page}.path"),
+        );
+        format!(
+            "(SELECT {frame} \
+              FROM block_text {text} JOIN pages {page} ON {page}.page_id = {b}.page_id \
+              WHERE {text}.block_id = {b}.block_id)"
+        )
+    }
+
+    fn bind_content_rank(
+        &mut self,
+        identity: Vec<u8>,
+        predicate: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+    ) -> u64 {
+        if let Some(id) = self.content_rank_ids.get(&identity) {
+            return *id;
+        }
+        let id = self
+            .ranks
+            .bind_pair_named(identity.clone(), move |raw, path| {
+                let visible = crate::query::text::visible_from_raw_path(raw, path);
+                let folded = canonical_fold(&visible);
+                Ok(predicate(&folded, &visible).then(Vec::new))
+            });
+        self.content_rank_ids.insert(identity, id);
+        id
+    }
+
+    fn content_rank_predicate(
+        &mut self,
+        b: &str,
+        identity: Vec<u8>,
+        predicate: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+    ) -> String {
+        let id = self.bind_content_rank(identity, predicate);
+        let id = self.bind(PhysicalQueryValue::Integer(id as i64));
+        let frame = self.content_frame(b);
+        format!("tine_query_rank({id}, {frame}) IS NOT NULL")
+    }
+
+    fn content_exact(&mut self, op: CmpOp, value: &Value, b: &str) -> String {
+        let identity = format!("content:{op:?}:{value:?}").into_bytes();
+        match op {
+            CmpOp::Eq | CmpOp::NotEq | CmpOp::Like | CmpOp::StartsWith => {
+                let Some(text) = value.as_text() else {
+                    return "0".to_string();
+                };
+                let operand = canonical_fold(text);
+                self.content_rank_predicate(b, identity, move |folded, _| match op {
+                    CmpOp::Eq => folded == operand,
+                    CmpOp::NotEq => folded != operand,
+                    CmpOp::Like => crate::query::text::like_matches(folded, &operand),
+                    CmpOp::StartsWith => folded.starts_with(&operand),
+                    CmpOp::Lt
+                    | CmpOp::Le
+                    | CmpOp::Gt
+                    | CmpOp::Ge
+                    | CmpOp::Between
+                    | CmpOp::In
+                    | CmpOp::NotIn
+                    | CmpOp::Match
+                    | CmpOp::Regex
+                    | CmpOp::IsSet
+                    | CmpOp::IsNotSet
+                    | CmpOp::IsBlank => false,
+                })
+            }
+            CmpOp::In | CmpOp::NotIn => {
+                let Some(items) = value.as_list() else {
+                    return "0".to_string();
+                };
+                let operands = items
+                    .iter()
+                    .filter_map(Value::as_text)
+                    .map(canonical_fold)
+                    .collect::<Vec<_>>();
+                self.content_rank_predicate(b, identity, move |folded, _| {
+                    let listed = operands.iter().any(|item| item == folded);
+                    if op == CmpOp::In {
+                        listed
+                    } else {
+                        !listed
+                    }
+                })
+            }
+            CmpOp::Lt
+            | CmpOp::Le
+            | CmpOp::Gt
+            | CmpOp::Ge
+            | CmpOp::Between
+            | CmpOp::Match
+            | CmpOp::Regex
             | CmpOp::IsSet
             | CmpOp::IsNotSet
             | CmpOp::IsBlank => "0".to_string(),
@@ -1524,93 +1646,25 @@ impl Compiler<'_> {
                 compiled: Some(regex),
             } => self.content_regex_predicate(source, &regex, b),
             MatchProgram::Boolean(groups) => {
-                let arms = groups
-                    .iter()
-                    .map(|group| self.match_group(group, b))
-                    .collect();
-                fold_or(arms)
+                let matcher = Matcher::Boolean(groups);
+                let exact_matcher = matcher.clone();
+                let exact = self.content_rank_predicate(
+                    b,
+                    format!("content-match:{source:?}").into_bytes(),
+                    move |folded, visible| exact_matcher.matches(folded, visible),
+                );
+                match crate::query::candidate::matcher_plan(&matcher) {
+                    crate::query::candidate::CandidatePlan::Scan => exact,
+                    crate::query::candidate::CandidatePlan::Index { match_expression } => {
+                        let expression = self.bind(PhysicalQueryValue::Text(match_expression));
+                        fold_and(vec![
+                            format!("{b}.block_id IN (SELECT rowid FROM search_fts WHERE search_fts MATCH {expression})"),
+                            exact,
+                        ])
+                    }
+                }
             }
         }
-    }
-
-    /// One retained OR arm: the exact `instr` conjunction, plus — only when the
-    /// FTS index is ready and the arm offers a needle — a candidate bound in
-    /// front of it.
-    ///
-    /// **The exact predicates are never replaced by the bound, on any path.**
-    /// That is what makes the bound safe to be a superset and fatal to be a
-    /// subset, and it is why `search_fts`'s word tokens are not substituted for
-    /// substrings (§5.10, CLOSURE §4).
-    fn match_group(&mut self, group: &AndGroup, b: &str) -> String {
-        let exact = fold_and(
-            group
-                .iter()
-                .map(|term| self.match_term(term, b))
-                .collect::<Vec<_>>(),
-        );
-        // An arm that provably matches nothing is not worth asking the index
-        // for, and `AND 0` inside the bound subquery would be planned as a scan.
-        if exact == "0" {
-            return exact;
-        }
-        match self.fts_bound(group, b) {
-            Some(bound) => fold_and(vec![bound, exact]),
-            None => exact,
-        }
-    }
-
-    /// One term of an AND group, transcribing `search_query::group_matches`
-    /// verbatim: `present = !text.is_empty() && lower.contains(text)`, then
-    /// `present != negated`.
-    ///
-    /// **Emptiness is decided in the parsed [`Term`], never in SQLite.**
-    /// `instr(text, '')` is 1 and would make an empty positive term true, and
-    /// `length()` stops at the first NUL so it cannot even measure the string —
-    /// so the two engines can only agree if the Rust side answers (§5.10).
-    fn match_term(&mut self, term: &Term, b: &str) -> String {
-        if term.text.is_empty() {
-            // `present` is false, so the term is satisfied exactly when it is a
-            // negative one. (A group of only negative terms never reaches here:
-            // `Matcher::parse` discards it.)
-            return if term.negated { "1" } else { "0" }.to_string();
-        }
-        // The needle is the parser's own canonically folded text and the column
-        // is `canonical_fold(visible)` written by both producers — the same
-        // fold on both sides, never a second normalizer that agrees by
-        // inspection.
-        let needle = self.bind(PhysicalQueryValue::Text(term.text.clone()));
-        let present = format!("(instr({b}.query_visible_folded, {needle}) > 0)");
-        if term.negated {
-            fold_not(present)
-        } else {
-            present
-        }
-    }
-
-    /// The trigram candidate bound for one OR arm, or `None` when the arm
-    /// supplies none — which makes the arm an explicitly unbounded SQL content
-    /// predicate rather than a defect to work around (§5.10).
-    ///
-    /// `search_substring_fts` is a `tokenize = 'trigram'` FTS5 table over
-    /// `normalized_searchable_text`, associated to its owner through
-    /// `search_fts_owners.rowid`; both producers write that column as
-    /// `canonical_fold(searchable_text)`, i.e. the SAME fold as the exact
-    /// column over WHITESPACE-COLLAPSED text. That is the whole reason the
-    /// needle is a whitespace-free run and not the phrase: a phrase with
-    /// leading, repeated or line-breaking whitespace does not survive the
-    /// collapse, and a bound that required it to would exclude a true match.
-    fn fts_bound(&mut self, group: &AndGroup, b: &str) -> Option<String> {
-        let needle = fts_candidate_needle(group)?;
-        let literal = self.bind(PhysicalQueryValue::Text(fts_phrase_literal(needle)));
-        let fts = self.alias("sf");
-        let owners = self.alias("fo");
-        Some(format!(
-            "{b}.block_id IN (SELECT {owners}.entity_id \
-             FROM search_substring_fts {fts} \
-             JOIN search_fts_owners {owners} ON {owners}.rowid = {fts}.rowid \
-             WHERE {fts}.normalized_text MATCH {literal} \
-             AND {owners}.entity_type = {OWNER_BLOCK})"
-        ))
     }
 
     /// One legacy `content regexp <pattern>` leaf (§4.3.2).
@@ -1629,11 +1683,10 @@ impl Compiler<'_> {
 
     /// §4.3.2's fixed SQL predicate, shared by both regex spellings.
     ///
-    /// **The text is `block_text.query_visible`, not `blocks.query_visible_folded`.**
-    /// Both walk arms match against `BlockProjection::visible` — the EXACT
-    /// visible text — and the folded column is lower-cased and NFC-normalized,
-    /// so a case-sensitive or accent-sensitive pattern would answer differently
-    /// there. §5.8's producers write `query_visible` as that same exact string.
+    /// The callback receives a frame containing raw block text and physical
+    /// page path, then derives `BlockProjection::visible`. A case-sensitive or
+    /// accent-sensitive pattern therefore sees the exact text, never its fold
+    /// or the lossy trigram payload.
     ///
     /// The subquery is CORRELATED on `block_text`'s primary key, so the regex
     /// runs once per candidate row that reaches the leaf — the walk's own cost
@@ -1647,12 +1700,9 @@ impl Compiler<'_> {
     /// fixed storage predicate rejects it as a read error rather than changing
     /// the match set silently.
     fn content_regex_predicate(&mut self, source: &str, regex: &regex::Regex, b: &str) -> String {
-        let alias = self.alias("bt");
         let id = self.bind_regex(source, regex);
-        format!(
-            "tine_query_regex({id}, (SELECT {alias}.query_visible FROM block_text {alias} \
-             WHERE {alias}.block_id = {b}.block_id))"
-        )
+        let frame = self.content_frame(b);
+        format!("tine_query_regex({id}, {frame})")
     }
 
     /// `task` reads `tasks.marker`. Both producers write the marker
@@ -2861,49 +2911,6 @@ fn match_program(compiled: &CompiledLeaves, source: &str) -> MatchProgram {
     }
 }
 
-/// The FTS candidate needle for one OR arm, or `None` when the arm has none
-/// (SPEC §5.10, verbatim):
-///
-/// > scan positive folded terms in order, excluding NUL-bearing terms, split
-/// > each with Rust `str::split_whitespace` (the producers' rule), and take its
-/// > first whitespace-free run of at least three Unicode scalars. Use the first
-/// > such run as the candidate needle, not the entire phrase.
-///
-/// **Never a negative term.** A negative term says the text does NOT contain
-/// it; using it as a candidate bound would select exactly the rows the arm
-/// rejects. Three scalars is the trigram tokenizer's own floor, not a tuning
-/// constant: a shorter needle produces no token and would match nothing.
-/// The one answer to "which part of a needle can the trigram index see?": its
-/// first whitespace-free run of at least three characters, or `None`.
-///
-/// Three because the index tokenizes trigrams. Whitespace-free because the
-/// indexed text is whitespace-COLLAPSED while the exact columns are not, so a
-/// run spanning a space can be absent from the index and present in the block,
-/// and a bound requiring it would exclude a true match. A NUL-bearing needle is
-/// not indexable at all. The legacy content lowering and the Friendly block read
-/// both ask this function, so "indexable needle" has ONE definition.
-pub(crate) fn fts_indexable_run(text: &str) -> Option<&str> {
-    if text.contains('\0') {
-        return None;
-    }
-    text.split_whitespace().find(|run| run.chars().count() >= 3)
-}
-
-fn fts_candidate_needle(group: &AndGroup) -> Option<&str> {
-    group
-        .iter()
-        .filter(|term| !term.negated)
-        .find_map(|term| fts_indexable_run(&term.text))
-}
-
-/// One FTS5 string literal holding `needle` as a single phrase: FTS5 quotes
-/// with `"` and escapes an embedded `"` by doubling it. Quoting is what keeps
-/// the needle a LITERAL rather than an expression — `-`, `*`, `(`, `:` and the
-/// bare words `AND`/`OR`/`NOT` are query syntax outside quotes.
-pub(crate) fn fts_phrase_literal(needle: &str) -> String {
-    format!("\"{}\"", needle.replace('"', "\"\""))
-}
-
 /// §5.10's plan classes for every content leaf of one filter, depth-first.
 ///
 /// A leaf that folds to the constant false contributes nothing: it reads no
@@ -2927,16 +2934,17 @@ fn content_plans(filter: &Filter, inputs: &LoweringInputs<'_>) -> Vec<ContentPla
             CmpOp::Match => match match_program(inputs.compiled, text) {
                 MatchProgram::AlwaysFalse => {}
                 MatchProgram::Regex { .. } => out.push(ContentPlan::Regex),
-                MatchProgram::Boolean(groups) => out.push(
-                    if groups
-                        .iter()
-                        .all(|group| fts_candidate_needle(group).is_some())
-                    {
+                MatchProgram::Boolean(groups) => out.push({
+                    let matcher = Matcher::Boolean(groups);
+                    if matches!(
+                        crate::query::candidate::matcher_plan(&matcher),
+                        crate::query::candidate::CandidatePlan::Index { .. }
+                    ) {
                         ContentPlan::Fts
                     } else {
                         ContentPlan::ShortUnindexable
-                    },
-                ),
+                    }
+                }),
             },
             // No other content leaf is a plan class.
             CmpOp::Eq
@@ -3080,9 +3088,10 @@ fn leaf_bounds(leaf: &Leaf, row: BoundRow, inputs: &LoweringInputs<'_>) -> bool 
                 *op == CmpOp::Match
                     && matches!(value, Value::Text { text }
                     if match match_program(inputs.compiled, text) {
-                        MatchProgram::Boolean(groups) => groups
-                            .iter()
-                            .all(|group| fts_candidate_needle(group).is_some()),
+                        MatchProgram::Boolean(groups) => matches!(
+                            crate::query::candidate::matcher_plan(&Matcher::Boolean(groups)),
+                            crate::query::candidate::CandidatePlan::Index { .. }
+                        ),
                         _ => false,
                     })
             }

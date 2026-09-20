@@ -32,7 +32,7 @@
 mod production_source;
 
 use production_source::{
-    compiled_source, erase_cfg_test_regions, model_module_files, module_source,
+    compiled_source, erase_cfg_test_regions, model_module_files, module_raw_source, module_source,
     production_source_files, relative_path, repo_root,
 };
 use regex::Regex;
@@ -59,7 +59,8 @@ fn public_quick_switch_routes_bypass_query_quick_switch() {
         .split("\n    }")
         .next()
         .unwrap();
-    assert!(body.contains("query_plan::legacy_page_search_entries("));
+    assert!(body.contains("QueryPlan::page_name_fuzzy("));
+    assert!(body.contains("read_friendly_plan("));
     assert!(!body.contains("query::quick_switch("));
     assert!(!body.contains(".execute("));
     let commands = module_source(&root, "src-tauri/src/commands.rs");
@@ -73,6 +74,11 @@ fn public_quick_switch_routes_bypass_query_quick_switch() {
     assert!(body.contains(".quick_switch("));
     assert!(!body.contains("query::quick_switch("));
     let query = module_source(&root, "crates/tine-core/src/query.rs");
+    assert!(
+        !query.contains("pub fn quick_switch("),
+        "the retired query quick-switch reader must remain test-only"
+    );
+    let query = module_raw_source(&root, "crates/tine-core/src/query.rs");
     let body = query
         .split("pub fn quick_switch(")
         .nth(1)
@@ -80,7 +86,7 @@ fn public_quick_switch_routes_bypass_query_quick_switch() {
         .split("\n}")
         .next()
         .unwrap();
-    assert!(body.contains("query_plan::legacy_page_search_entries("));
+    assert!(body.contains("query_plan::pre_ready_page_search_entries("));
     assert!(!body.contains(".execute("));
 }
 

@@ -14,6 +14,7 @@ mod export_select;
 pub use export_select::*;
 mod facets;
 pub use facets::*;
+pub(crate) mod candidate;
 pub(crate) mod compiled;
 #[cfg(test)]
 mod conformance;
@@ -48,6 +49,7 @@ pub(crate) mod read_execute;
 pub(crate) mod results;
 pub(crate) mod sql;
 pub(crate) mod statistics;
+pub(crate) mod text;
 // Database-owned export subtree construction: located selection over the
 // shared result collector, and bounded subtree hydration over the SAME
 // caller-owned snapshots.
@@ -735,7 +737,7 @@ pub fn page_aliases<G: QueryGraph>(graph: &G) -> Vec<(String, String)> {
     graph.with_pages(|pages| {
         let mut owned = Vec::new();
         for (entry, doc) in pages {
-            for alias in document_aliases(doc) {
+            for (alias, _) in document_alias_spellings(doc) {
                 owned.push((entry.path.clone(), alias, entry.name.clone()));
             }
         }
@@ -747,7 +749,7 @@ pub(crate) fn page_aliases_with_owners<G: QueryGraph>(graph: &G) -> Vec<(String,
     graph.with_pages(|pages| {
         let mut owned = Vec::new();
         for (entry, doc) in pages {
-            for alias in document_aliases(doc) {
+            for (alias, _) in document_alias_spellings(doc) {
                 owned.push((
                     entry.path.clone(),
                     alias,
@@ -3448,8 +3450,9 @@ fn finish_quick_switch_top(
 
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
+#[cfg(test)]
 pub fn quick_switch(graph: &impl QueryGraph, query: &str, limit: usize) -> Vec<PageEntry> {
-    crate::query_plan::legacy_page_search_entries(
+    crate::query_plan::pre_ready_page_search_entries(
         graph.list_pages(),
         graph.page_aliases_with_owners(),
         graph.referenced_page_names(),

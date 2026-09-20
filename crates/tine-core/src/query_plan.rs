@@ -144,6 +144,26 @@ pub struct QueryBranch {
     pub limit: usize,
 }
 
+/// The product surface asking Friendly search to execute. Cancellation lanes
+/// are deliberately absent: supersession and candidate semantics are separate
+/// facts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FriendlyConsumer {
+    #[default]
+    NonInteractive,
+    CtrlK,
+}
+
+impl FriendlyConsumer {
+    pub(crate) const fn candidate_mode(self) -> crate::query::candidate::CandidateMode {
+        match self {
+            Self::NonInteractive => crate::query::candidate::CandidateMode::Exhaustive,
+            Self::CtrlK => crate::query::candidate::CandidateMode::interactive(),
+        }
+    }
+}
+
 impl QueryPlan {
     /// Captured current-page scope for projection-backed Friendly execution.
     /// A physical path, when present, remains authoritative over display name.
@@ -326,14 +346,34 @@ pub fn friendly_search_plan(
     scope: Option<QueryPageScope>,
     display: FriendlyDisplayOptions,
 ) -> QueryPlan {
-    match scope {
+    friendly_search_plan_for(
+        source,
+        page_limit,
+        block_limit,
+        scope,
+        display,
+        FriendlyConsumer::NonInteractive,
+    )
+}
+
+pub fn friendly_search_plan_for(
+    source: &str,
+    page_limit: usize,
+    block_limit: usize,
+    scope: Option<QueryPageScope>,
+    display: FriendlyDisplayOptions,
+    consumer: FriendlyConsumer,
+) -> QueryPlan {
+    let mut plan = match scope {
         // A routed search selects blocks inside ONE physical page, so it has no
         // Pages section and page membership scope does not apply to it.
         Some(scope) => {
             QueryPlan::friendly_for_page_with_display(source, block_limit, scope, display)
         }
         None => QueryPlan::friendly_with_display(source, page_limit, block_limit, display),
-    }
+    };
+    plan.candidate_mode = consumer.candidate_mode();
+    plan
 }
 
 /// Compiled friendly graph-search plan.  Regexes are compiled once and kept off
@@ -351,6 +391,7 @@ pub struct QueryPlan {
     // frontend pageIdentityKey values at its own boundary.
     page_exact: Option<String>,
     regexes: HashMap<u32, Regex>,
+    candidate_mode: crate::query::candidate::CandidateMode,
 }
 
 impl QueryPlan {
@@ -435,6 +476,7 @@ impl QueryPlan {
             display: FriendlyDisplayOptions::default(),
             page_exact: (!query.trim().is_empty()).then(|| canonical_fold(query.trim())),
             regexes,
+            candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
         }
     }
 
@@ -496,6 +538,7 @@ impl QueryPlan {
             display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
+            candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
         }
     }
 
@@ -536,28 +579,41 @@ impl QueryPlan {
             display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes,
+            candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
         }
     }
 
-    /// Literal block autocomplete for the `((` picker. OG rev 6e7afa8eb's
-    /// `search.cljs:block-search`/`fuzzy-search` normalizes the whole query as
-    /// one literal term. Blank input has no candidates.
+    /// Literal block autocomplete for the `((` picker. Whitespace separates
+    /// required fragments; every other character remains literal and fragment
+    /// order is irrelevant. Blank input has no candidates.
     pub fn block_search_literal(query: &str, limit: usize) -> Self {
-        let branches = if query.is_empty() {
+        let folded_fragments = query
+            .split_whitespace()
+            .map(canonical_fold)
+            .filter(|fragment| !fragment.is_empty())
+            .collect::<Vec<_>>();
+        let branches = if query.is_empty() || folded_fragments.is_empty() {
             Vec::new()
         } else {
-            let folded = canonical_fold(query);
+            let mut next_id = 1;
+            let mut fragments = folded_fragments
+                .into_iter()
+                .map(|value| {
+                    let clause_id = take_id(&mut next_id);
+                    QueryExpr::Text(TextPredicate {
+                        clause_id,
+                        field: TextField::VisibleContent,
+                        mode: TextMatchMode::Contains,
+                        value,
+                    })
+                })
+                .collect::<Vec<_>>();
             vec![QueryBranch {
                 target: QueryTarget::Blocks,
-                predicate: if folded.is_empty() {
-                    QueryExpr::Never
+                predicate: if fragments.len() == 1 {
+                    fragments.pop().unwrap()
                 } else {
-                    QueryExpr::Text(TextPredicate {
-                        clause_id: 1,
-                        field: TextField::VisibleContent,
-                        mode: TextMatchMode::Fuzzy,
-                        value: folded,
-                    })
+                    QueryExpr::And(fragments)
                 },
                 limit,
             }]
@@ -569,6 +625,7 @@ impl QueryPlan {
             display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
+            candidate_mode: crate::query::candidate::CandidateMode::interactive(),
         }
     }
 
@@ -579,6 +636,10 @@ impl QueryPlan {
     /// Blank input therefore keeps the established all-pages candidate listing.
     pub fn legacy_page_search(query: &str, limit: usize) -> Self {
         Self::page_name_fuzzy(query, limit)
+    }
+
+    pub(crate) const fn candidate_mode(&self) -> crate::query::candidate::CandidateMode {
+        self.candidate_mode
     }
 
     pub fn explanation(&self) -> QueryExplanation {
@@ -1140,7 +1201,7 @@ impl BlockRelevance {
 /// Width of [`BlockRelevance::order_key`]: `cmp_quality`'s five components at
 /// fixed width -- class rank, boundary, first offset, UTF-16 text length,
 /// occurrences.
-const BLOCK_RANK_KEY_LEN: usize = 4 + 1 + 8 + 8 + 8;
+pub(crate) const BLOCK_RANK_KEY_LEN: usize = 4 + 1 + 8 + 8 + 8;
 
 /// The key widens `usize` into `u64`. Every shipped target is 32- or 64-bit, so
 /// that widening is exact; this assertion is what makes "no truncation" a build
@@ -1224,11 +1285,10 @@ pub(crate) fn rank_block_text(
 /// `folded` MUST be exactly `canonical_fold(visible)`; every ranking property
 /// of [`rank_block_text`] is preserved only under that equality, and passing
 /// any other string silently changes which blocks a search admits. The
-/// projection stores the pair in adjacent columns -- `block_text.query_visible`
-/// and `blocks.query_visible_folded`, written together from one
-/// `BlockProjection` -- and that they satisfy this equality on real rows is
-/// pinned by `the_projection_stores_the_exact_fold_of_every_visible_text`, not
-/// by this comment.
+/// The projection stores raw authored block text. Every database executor
+/// derives this exact pair from `block_text.content` plus `pages.path` through
+/// `DocBlock::preamble`, so candidate indexing can remain lossy while the
+/// verifier stays byte-faithful.
 ///
 /// `visible` is still required in EVERY mode: the rank key's `text_len`
 /// component counts UTF-16 units of the original, and a regex predicate matches
@@ -1879,7 +1939,7 @@ fn execute_page_candidates(
 
 /// Execute the established literal page autocomplete/quick-switch semantics
 /// over an explicitly supplied candidate set.
-pub(crate) fn legacy_page_search_entries(
+pub(crate) fn pre_ready_page_search_entries(
     file_pages: Vec<PageEntry>,
     aliases: Vec<(String, String, String)>,
     referenced: Vec<String>,
@@ -2092,7 +2152,16 @@ pub(crate) fn block_hits_to_groups(hits: Vec<QueryHit>) -> Vec<crate::vocab::Ref
 pub(crate) fn page_hits_to_entries(hits: Vec<QueryHit>) -> Vec<PageEntry> {
     hits.into_iter()
         .filter_map(|hit| match hit {
-            QueryHit::Page { page, .. } => Some(page),
+            QueryHit::Page {
+                mut page,
+                matched_alias,
+                ..
+            } => {
+                if let Some(alias) = matched_alias {
+                    page.name = alias;
+                }
+                Some(page)
+            }
             QueryHit::Block { .. } => None,
         })
         .collect()

@@ -330,7 +330,7 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
             "missing",
             "DELETE FROM block_text WHERE block_id = (\
                 SELECT b.block_id FROM blocks b JOIN block_text t USING (block_id) \
-                WHERE instr(t.query_visible, 'alpha') > 0 LIMIT 1)",
+                WHERE instr(t.content, 'alpha') > 0 LIMIT 1)",
         ),
         (
             "cross-owner",
@@ -339,7 +339,7 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
              WHERE block_id = (SELECT b.block_id FROM blocks b \
                 JOIN pages p USING (page_id) JOIN block_text t USING (block_id) \
                 WHERE p.path = 'pages/Owner.md' \
-                  AND instr(t.query_visible, 'alpha') > 0 LIMIT 1)",
+                  AND instr(t.content, 'alpha') > 0 LIMIT 1)",
         ),
     ] {
         let path = copy_projection(&corpus, tag);
@@ -376,7 +376,7 @@ fn compiled_plan_branches_are_served_without_restoring_a_walk_specific_filter() 
     // ordering is unchanged, and a compiled branch is still served straight
     // from the projection rather than by restoring a walk-specific filter.
     assert!(source.contains("ORDER BY r.missing_text DESC, {order}"));
-    assert!(source.contains("r.rank_key, r.path COLLATE BINARY, r.preorder"));
+    assert!(source.contains("substr(r.rank_key, 1, {}), r.path COLLATE BINARY, r.preorder"));
     assert!(!source.contains("matched_parent"));
     assert!(!source.contains("ConstructionBudget"));
     assert_eq!(
@@ -947,7 +947,7 @@ fn a_selective_needle_ranks_only_its_candidates() {
     // A path over an EMPTY index would pass this test while proving nothing,
     // so the precondition is asserted, not assumed.
     assert!(
-        corpus.substring_fts_rows() > 0,
+        corpus.trigram_fts_rows() > 0,
         "the substring index must hold block rows"
     );
     reset_friendly_read_census();
@@ -976,7 +976,7 @@ fn the_candidate_bound_drops_no_block_the_exact_predicate_admits() {
     let root = scratch("friendly-bound-correctness");
     write_candidate_bound_corpus(&root, 8);
     let corpus = Corpus::open(root, true);
-    assert!(corpus.substring_fts_rows() > 0);
+    assert!(corpus.trigram_fts_rows() > 0);
     for (query, expected) in [
         // The query's case differs from the block's: both sides fold.
         ("zqxwood", 1),
@@ -1000,4 +1000,55 @@ fn the_candidate_bound_drops_no_block_the_exact_predicate_admits() {
         .unwrap_or_else(|error| panic!("{query} read failed: {error}"));
         assert_eq!(block_hits(&answer), expected, "query {query}");
     }
+}
+
+#[test]
+fn ctrl_k_ranks_only_the_newest_verified_window_but_inline_remains_exhaustive() {
+    let _serial = serialize();
+    let root = scratch("friendly-verified-window");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = String::from("- needle\n");
+    for at in 0..350 {
+        body.push_str(&format!("- needle filler {at}\n"));
+    }
+    std::fs::write(root.join("pages/Window.md"), body).expect("window page");
+    let corpus = Corpus::open(root, true);
+
+    let exhaustive = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::NonInteractive,
+    );
+    let interactive = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+    let exhaustive =
+        read(&corpus, &exhaustive, &ResultIdentity::session_owned()).expect("exhaustive read");
+    reset_friendly_read_census();
+    let interactive =
+        read(&corpus, &interactive, &ResultIdentity::session_owned()).expect("interactive read");
+    let interactive_census = friendly_read_census();
+
+    assert!(matches!(
+        exhaustive.hits.first(),
+        Some(QueryHit::Block { display_text, .. }) if display_text == "needle"
+    ));
+    assert!(matches!(
+        interactive.hits.first(),
+        Some(QueryHit::Block { display_text, .. }) if display_text.starts_with("needle filler ")
+    ));
+    assert!(interactive.has_more.blocks);
+    assert!(
+        interactive_census.block_rank_evaluations <= 610,
+        "both interactive reads must stop near their 300 verified matches, got {} rank calls",
+        interactive_census.block_rank_evaluations
+    );
 }

@@ -1993,7 +1993,7 @@ fn b4_corpus_page_ref_and_facets_match_oracle_with_route_evidence() {
 }
 
 #[test]
-fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
+fn direct_projection_matches_literal_search_and_virtual_reference_names() {
     let _serial = serialize_projection_tests();
     let root = scratch("search-reference-parity");
     std::fs::create_dir_all(root.join("pages")).unwrap();
@@ -2005,20 +2005,19 @@ fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
     std::fs::write(root.join("pages/two.md"), "- unrelated content\n").unwrap();
     let graph = Graph::open(&root);
     graph.warm_cache();
-    let oracle = crate::query::search_cancellable(&graph, "cly", 20, || false);
+    let oracle = crate::query::search_cancellable(&graph, "characteristically", 20, || false);
     graph
         .attach_direct_projection(root.join("private/projection.sqlite"))
         .unwrap();
     wait_ready(&graph);
 
-    let selected = graph.search("cly", 20).unwrap();
+    let selected = graph.search("characteristically", 20).unwrap();
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].page, "one");
     assert_eq!(
-        signature(&graph.search("cly", 20).unwrap()),
+        signature(&graph.search("characteristically", 20).unwrap()),
         signature(&oracle)
     );
-    assert_eq!(graph.direct_projection_fuzzy_candidate_reads_test(), 0);
     let names = graph
         .referenced_page_names()
         .into_iter()
@@ -2040,11 +2039,10 @@ fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
     );
     assert!(graph.direct_projection_referenced_name_reads_test() > 0);
 
-    let fuzzy_reads = graph.direct_projection_fuzzy_candidate_reads_test();
     let name_reads = graph.direct_projection_referenced_name_reads_test();
     graph.direct_projection_mark_stale_test();
     assert_eq!(
-        signature(&graph.search("cly", 20).unwrap()),
+        signature(&graph.search("characteristically", 20).unwrap()),
         signature(&oracle)
     );
     assert_eq!(
@@ -2054,11 +2052,6 @@ fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
             .map(|name| crate::refs::page_key(&name))
             .collect::<std::collections::BTreeSet<_>>(),
         names
-    );
-    assert_eq!(
-        graph.direct_projection_fuzzy_candidate_reads_test(),
-        fuzzy_reads,
-        "a stale generation must use the parser fallback"
     );
     assert_eq!(
         graph.direct_projection_referenced_name_reads_test(),
@@ -2092,7 +2085,7 @@ fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
     .unwrap();
     graph.sync_file_checked(&root.join("pages/one.md")).unwrap();
     wait_ready(&graph);
-    assert!(!graph.search("ecf", 20).unwrap().is_empty());
+    assert!(!graph.search("externally changed", 20).unwrap().is_empty());
     let names = graph
         .referenced_page_names()
         .into_iter()
@@ -2180,13 +2173,13 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
     std::fs::create_dir_all(root.join("pages")).unwrap();
     std::fs::write(
         root.join("pages/target.md"),
-        format!("alias:: Alias Target\n\n- target\n  id:: {target_id}\n"),
+        format!("alias:: Alias Target, TT\n\n- target\n  id:: {target_id}\n"),
     )
     .unwrap();
     std::fs::write(
             root.join("pages/referrer.md"),
             format!(
-                "- [[Alias Target]] and plain Alias Target and (({target_id})) (({target_id}))\n- another (({target_id}))\n"
+                "- [[Alias Target]] and plain Alias Target and plain TT and (({target_id})) (({target_id}))\n- another (({target_id}))\n"
             ),
         )
         .unwrap();
@@ -2223,6 +2216,16 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
     assert_eq!(
         signature(&crate::query::unlinked_refs(&graph, "target")),
         signature(&parser_unlinked)
+    );
+    assert_eq!(
+        signature(
+            &graph
+                .unlinked_refs_bounded_indexed("target", 100, 4 * 1024 * 1024)
+                .expect("interactive title/alias windows answer")
+                .groups
+        ),
+        signature(&parser_unlinked),
+        "the independently planned long and short alias needles union before exact dedupe"
     );
     assert_eq!(
         signature(&crate::query::block_referrers(&graph, target_id)),
@@ -2279,17 +2282,17 @@ fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
     let changed_aliases = graph.page_aliases_with_owners();
     assert!(changed_aliases
         .iter()
-        .any(|(alias, owner, _)| alias == "changed alias" && owner == "target"));
+        .any(|(alias, owner, _)| alias == "Changed Alias" && owner == "target"));
     assert!(!changed_aliases
         .iter()
-        .any(|(alias, _, _)| alias == "alias target"));
+        .any(|(alias, _, _)| alias == "Alias Target"));
 
     graph.delete_page("target", PageKind::Page).unwrap();
     wait_ready(&graph);
     assert!(!graph
         .page_aliases_with_owners()
         .iter()
-        .any(|(alias, _, _)| alias == "changed alias"));
+        .any(|(alias, _, _)| alias == "Changed Alias"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2506,6 +2509,48 @@ fn a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_eve
 }
 
 #[test]
+fn interactive_plain_reference_windows_are_independent_per_title_and_alias() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("plain-reference-independent-windows");
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let mut body = String::new();
+    for ordinal in 0..350 {
+        body.push_str(&format!("- primary needle occurrence {ordinal}\n"));
+    }
+    for ordinal in 0..350 {
+        body.push_str(&format!("- authored alias occurrence {ordinal}\n"));
+    }
+    std::fs::write(root.join("pages/source.md"), body).unwrap();
+
+    let graph = Graph::open(&root);
+    graph.warm_cache();
+    graph
+        .attach_direct_projection(root.join("private/projection.sqlite"))
+        .unwrap();
+    wait_ready(&graph);
+
+    let candidates = graph
+        .reference_candidate_pages_indexed(
+            &[
+                crate::refs::page_key("primary needle"),
+                crate::refs::page_key("authored alias"),
+            ],
+            ReferenceKind::Plain,
+        )
+        .expect("interactive plain-reference candidates");
+    assert_eq!(
+        candidates
+            .blocks
+            .as_ref()
+            .map(std::collections::HashSet::len),
+        Some(600),
+        "each resolved spelling must receive its own 300-match verified window before union"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn reference_wait_is_zero_cost_when_no_projection_work_exists() {
     let _serial = serialize_projection_tests();
     let root = scratch("reference-no-work-wait");
@@ -2716,7 +2761,9 @@ fn unavailable_projection_refuses_the_public_query_and_keeps_other_semantics() {
         "the refusal must not traverse the graph"
     );
     assert_eq!(graph.direct_projection_indexed_reads_test(), 0);
-    assert!(!crate::query::search_cancellable(&graph, "cly", 20, || false).is_empty());
+    assert!(
+        !crate::query::search_cancellable(&graph, "characteristically", 20, || false).is_empty()
+    );
     assert!(matches!(
         graph.search("cly", 20),
         Err(crate::query::QueryExecutionError::Unavailable(
@@ -2730,7 +2777,6 @@ fn unavailable_projection_refuses_the_public_query_and_keeps_other_semantics() {
         .collect::<std::collections::BTreeSet<_>>();
     assert!(names.contains("inline only"));
     assert!(names.contains("alias only"));
-    assert_eq!(graph.direct_projection_fuzzy_candidate_reads_test(), 0);
     assert_eq!(graph.direct_projection_referenced_name_reads_test(), 0);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -3418,7 +3464,6 @@ fn real_corpus_projection_converges_and_matches_task_query() {
         normalize_names(oracle_graph.referenced_page_names()),
         "real-corpus referenced-page inventory diverged"
     );
-    assert!(graph.direct_projection_fuzzy_candidate_reads_test() > 0);
     assert!(graph.direct_projection_referenced_name_reads_test() > 0);
     let task_candidates = PhysicalGraphProjectionDatabase::open_read_only(&database)
         .unwrap()
@@ -5203,7 +5248,6 @@ fn empty_projection_shared() -> ProjectionShared {
         inject_read_failure: AtomicBool::new(false),
         fallback_reads: AtomicU64::new(0),
         referenced_name_reads: AtomicU64::new(0),
-        fuzzy_candidate_reads: AtomicU64::new(0),
         stream_indexed: AtomicU64::new(0),
         stream_total: AtomicU64::new(0),
         build_relaxed_turns: AtomicU64::new(0),
@@ -6129,12 +6173,9 @@ fn read_latency_probe_reports_per_surface_timings() {
         Box::new(|| graph.page_icons(&names).len()),
     );
 
-    // Q9: the quick-switch candidate PRODUCERS, timed apart from the ranking
-    // they feed. `quick_switch` costs the same ~1.4 s for every needle and every
-    // hit count, so the cost cannot live in the match loop; it must be in the
-    // three whole-graph reads `legacy_page_search_entries` takes BY VALUE, all
-    // evaluated before the needle is consulted. Split them so the fix targets
-    // the one that actually pays.
+    // Q9's historical quick-switch producer probes remain separate from the
+    // dictionary-backed executor. They detect a regression that reconnects a
+    // whole-graph inventory/alias/reference read ahead of needle planning.
     measure(
         "producer:list_pages",
         "-",
@@ -6369,11 +6410,9 @@ fn warm_scale_probe_with_switcher_polling() {
 }
 
 /// Manual cost probe for GH #543: how much of one search's per-block work is
-/// `canonical_fold` (which the projection ALREADY stores as
-/// `blocks.query_visible_folded`) versus the relevance scan itself. The answer
-/// decides the fix: if folding dominates, passing the stored fold through
-/// `QueryRankPrograms::bind_pair` is a semantics-free win; if the scan
-/// dominates, the fix must instead reduce how many blocks are ranked at all.
+/// `canonical_fold` versus the relevance scan itself. The compact projection
+/// intentionally stores no fold; this probe remains useful for measuring the
+/// derivation cost paid only by exact candidate verification.
 ///
 /// `block_relevance` is module-private, so this times fold-only and
 /// fold+relevance (`rank_block_text`) and reports the difference rather than

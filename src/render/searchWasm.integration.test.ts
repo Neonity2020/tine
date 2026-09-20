@@ -49,7 +49,7 @@ describe("actual lsdoc Wasm search exports", () => {
     } as PublishedSnapshot;
     const backend = publishedBackend(() => Promise.resolve(snapshot));
 
-    const answer = await backend.runGraphSearch("\u1715\u302e", 20, 0, "quick-switch");
+    const answer = await backend.runGraphSearch("\u1715\u302e", 20, 0, "quick-switch", false, undefined, undefined, "ctrl_k");
     expect(answer.hits[0]?.evidence).toEqual([
       { clause_id: 0, field: "page_name", mode: "contains", spans: [{ start: 3, end: 6 }] },
     ]);

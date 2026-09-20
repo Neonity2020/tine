@@ -247,6 +247,8 @@ export interface GraphSearchDisplayOptions {
   blockView?: ViewSettings;
 }
 
+export type GraphSearchConsumer = "non_interactive" | "ctrl_k";
+
 /** `query_parse`'s answer. `Query` and `ViewSettings` are SEPARATE values: the
  * filter never contains presentation (§3.1). Scoped display state is flattened
  * beside that unchanged pair. */

@@ -985,14 +985,17 @@ fn quick_switch_includes_referenced_pages() {
         has("linear ip", "Linear IP"),
         "bracketed tags:: value should appear"
     );
-    assert!(
-        has("lp survey", "paper"),
-        "alias:: query should navigate to its owning page"
-    );
-    assert!(
-        has("paper notes", "paper"),
-        "aliases:: query should navigate to its owning page"
-    );
+    for alias in ["LP Survey", "Paper Notes"] {
+        let hit = g
+            .quick_switch(alias, 8)
+            .into_iter()
+            .find(|entry| crate::refs::same_page(&entry.name, alias));
+        assert_eq!(
+            hit.as_ref().map(|entry| entry.rel_path.as_str()),
+            Some("pages/paper.md"),
+            "an authored alias should be inserted while retaining its owning page identity"
+        );
+    }
     assert!(
         !has("private", "Private"),
         "quoted custom value stays literal"
