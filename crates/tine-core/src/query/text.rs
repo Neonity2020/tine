@@ -5,9 +5,29 @@ use std::path::Path;
 use crate::doc::DocBlock;
 use crate::vocab::Format;
 
-pub(crate) fn visible_from_raw_path(raw: &str, path: &str) -> String {
+/// The two exact visible-text forms one `DocBlock::projection` derives.
+/// Keeping them together lets candidate verification reuse the fold instead
+/// of parsing once and then folding the returned visible text again.
+pub(crate) struct VisibleTextProjection {
+    pub(crate) visible: String,
+    pub(crate) visible_lower: String,
+}
+
+pub(crate) fn visible_projection_from_raw_path(
+    raw: &str,
+    path: &str,
+) -> VisibleTextProjection {
     let is_org = Format::from_path(Path::new(path)) == Format::Org;
-    DocBlock::preamble(raw, is_org).projection().visible.clone()
+    let block = DocBlock::preamble(raw, is_org);
+    let projection = block.projection();
+    VisibleTextProjection {
+        visible: projection.visible.clone(),
+        visible_lower: projection.visible_lower.clone(),
+    }
+}
+
+pub(crate) fn visible_from_raw_path(raw: &str, path: &str) -> String {
+    visible_projection_from_raw_path(raw, path).visible
 }
 
 /// SQL frame consumed by `QueryRankPrograms::bind_pair` and other fixed
@@ -33,9 +53,12 @@ pub(crate) fn like_matches(haystack: &str, pattern: &str) -> bool {
     while let Some(ch) = chars.next() {
         match ch {
             '\\' => {
-                if let Some(next) = chars.next() {
-                    literal.push(next);
-                }
+                let Some(next) = chars.next() else {
+                    // SQLite `LIKE ... ESCAPE '\\'` rejects an unpaired
+                    // trailing escape instead of discarding it.
+                    return false;
+                };
+                literal.push(next);
             }
             '%' | '_' => {
                 if !literal.is_empty() {
@@ -66,4 +89,19 @@ pub(crate) fn like_matches(haystack: &str, pattern: &str) -> bool {
         }
     }
     matches(&parts, &haystack, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::like_matches;
+
+    #[test]
+    fn like_matches_sql_escape_semantics() {
+        assert!(!like_matches("abc", "abc\\"));
+        assert!(!like_matches("", "\\"));
+        assert!(like_matches("a_b", "a\\_b"));
+        assert!(!like_matches("axb", "a\\_b"));
+        assert!(like_matches("100%", "100\\%"));
+        assert!(!like_matches("1000", "100\\%"));
+    }
 }

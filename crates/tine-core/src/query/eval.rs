@@ -26,6 +26,7 @@ use crate::query::atom::{atom_key, format_number, Atom, AtomFormat};
 use crate::query::compiled::CompiledLeaves;
 use crate::query::ir::{Attr, CmpOp, Filter, Leaf, ObservedType, Quant, Rel, Value};
 use crate::query::registry::Registry;
+use crate::query::text::like_matches;
 use crate::refs;
 use crate::search_query::canonical_fold;
 
@@ -943,56 +944,6 @@ fn compare_day(op: CmpOp, value: &Value, day: i64, today: JournalDate) -> bool {
     }
 }
 
-/// SQL `LIKE` over an already-folded haystack: `%` matches any run, `_` any one
-/// character, and `\` escapes either (the lowering emits `LIKE ? ESCAPE '\'`).
-pub(crate) fn like_matches(haystack: &str, pattern: &str) -> bool {
-    #[derive(Debug)]
-    enum Part {
-        Literal(String),
-        Any,
-        One,
-    }
-    let mut parts: Vec<Part> = Vec::new();
-    let mut literal = String::new();
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    literal.push(next);
-                }
-            }
-            '%' | '_' => {
-                if !literal.is_empty() {
-                    parts.push(Part::Literal(std::mem::take(&mut literal)));
-                }
-                parts.push(if ch == '%' { Part::Any } else { Part::One });
-            }
-            other => literal.push(other),
-        }
-    }
-    if !literal.is_empty() {
-        parts.push(Part::Literal(literal));
-    }
-    let haystack: Vec<char> = haystack.chars().collect();
-    fn matches(parts: &[Part], haystack: &[char], at: usize) -> bool {
-        match parts.first() {
-            None => at == haystack.len(),
-            Some(Part::One) => at < haystack.len() && matches(&parts[1..], haystack, at + 1),
-            Some(Part::Any) => {
-                (at..=haystack.len()).any(|next| matches(&parts[1..], haystack, next))
-            }
-            Some(Part::Literal(text)) => {
-                let literal: Vec<char> = text.chars().collect();
-                at + literal.len() <= haystack.len()
-                    && haystack[at..at + literal.len()] == literal[..]
-                    && matches(&parts[1..], haystack, at + literal.len())
-            }
-        }
-    }
-    matches(&parts, &haystack, 0)
-}
-
 /// Does this page row satisfy a `@page`-anchored query? Page attributes and
 /// properties read the index facets; a `blocks` relation traverses the borrowed
 /// roots supplied by the page source without constructing another document.
@@ -1041,5 +992,11 @@ mod tests {
         assert!(like_matches("100%", "%\\%"));
         assert!(like_matches("abc", "abc"));
         assert!(!like_matches("abcd", "abc"));
+        assert!(!like_matches("abc", "abc\\"));
+        assert!(!like_matches("", "\\"));
+        assert!(like_matches("a_b", "a\\_b"));
+        assert!(!like_matches("axb", "a\\_b"));
+        assert!(like_matches("100%", "100\\%"));
+        assert!(!like_matches("1000", "100\\%"));
     }
 }

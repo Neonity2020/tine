@@ -324,7 +324,6 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
     let root = scratch("friendly-main-damage");
     write_friendly_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let plan = QueryPlan::friendly("alpha", 0, 16);
     for (tag, damage) in [
         (
             "missing",
@@ -342,28 +341,44 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
                   AND instr(t.content, 'alpha') > 0 LIMIT 1)",
         ),
     ] {
-        let path = copy_projection(&corpus, tag);
-        let writer = rusqlite::Connection::open(&path).expect("damage copy opens");
-        writer
-            .pragma_update(None, "foreign_keys", false)
-            .expect("foreign keys disabled for damage fixture");
-        assert!(writer.execute(damage, []).expect("damage applies") > 0);
-        drop(writer);
-        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
-            .expect("damaged snapshot opens");
-        let answer = read_friendly_results(
-            &mut snapshot,
-            &FriendlyReadInputs {
-                plan: &plan,
-                graph_root: &corpus.root,
-                identity: &ResultIdentity::session_owned(),
-                explain: true,
-                lane: None,
-            },
-        );
-        assert!(matches!(answer, Err(ResultReadError::Corrupt(_))));
-        snapshot.finish();
-        let _ = std::fs::remove_file(path);
+        for consumer in [
+            crate::query_plan::FriendlyConsumer::NonInteractive,
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        ] {
+            let plan = crate::query_plan::friendly_search_plan_for(
+                "alpha",
+                0,
+                16,
+                None,
+                crate::query_plan::FriendlyDisplayOptions::default(),
+                consumer,
+            );
+            let path = copy_projection(&corpus, tag);
+            let writer = rusqlite::Connection::open(&path).expect("damage copy opens");
+            writer
+                .pragma_update(None, "foreign_keys", false)
+                .expect("foreign keys disabled for damage fixture");
+            assert!(writer.execute(damage, []).expect("damage applies") > 0);
+            drop(writer);
+            let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
+                .expect("damaged snapshot opens");
+            let answer = read_friendly_results(
+                &mut snapshot,
+                &FriendlyReadInputs {
+                    plan: &plan,
+                    graph_root: &corpus.root,
+                    identity: &ResultIdentity::session_owned(),
+                    explain: true,
+                    lane: None,
+                },
+            );
+            assert!(
+                matches!(answer, Err(ResultReadError::Corrupt(_))),
+                "{tag} damage must fail the {consumer:?} read"
+            );
+            snapshot.finish();
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -1008,7 +1023,7 @@ fn ctrl_k_ranks_only_the_newest_verified_window_but_inline_remains_exhaustive() 
     let root = scratch("friendly-verified-window");
     std::fs::create_dir_all(root.join("pages")).expect("pages");
     let mut body = String::from("- needle\n");
-    for at in 0..350 {
+    for at in 0..700 {
         body.push_str(&format!("- needle filler {at}\n"));
     }
     std::fs::write(root.join("pages/Window.md"), body).expect("window page");
@@ -1046,9 +1061,129 @@ fn ctrl_k_ranks_only_the_newest_verified_window_but_inline_remains_exhaustive() 
         Some(QueryHit::Block { display_text, .. }) if display_text.starts_with("needle filler ")
     ));
     assert!(interactive.has_more.blocks);
+    assert_eq!(interactive_census.block_candidate_visits, 300);
+    assert_eq!(interactive_census.block_candidate_verifications, 300);
     assert!(
-        interactive_census.block_rank_evaluations <= 610,
-        "both interactive reads must stop near their 300 verified matches, got {} rank calls",
+        interactive_census.block_rank_evaluations <= 305,
+        "the retained interactive window must rank only its 300 members, got {} rank calls",
         interactive_census.block_rank_evaluations
     );
+}
+
+fn interactive_block_ids(corpus: &Corpus, plan: &QueryPlan) -> Vec<i64> {
+    let branch = plan
+        .branches
+        .iter()
+        .find(|branch| branch.target == QueryTarget::Blocks)
+        .expect("interactive plan has a block branch");
+    let CandidateMode::Interactive { window } = plan.candidate_mode() else {
+        panic!("test plan must be interactive");
+    };
+    let mut snapshot = corpus.snapshot();
+    let ids = interactive_verified_block_ids(&mut snapshot, plan, branch, window, &None)
+        .expect("interactive candidate cursor answers");
+    snapshot.finish();
+    ids
+}
+
+#[test]
+fn broad_scan_and_index_cursors_stop_at_w_verified_rows_in_descending_membership_order() {
+    let _serial = serialize();
+    let root = scratch("friendly-broad-streams");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let body = (0..701)
+        .map(|at| format!("- needle oo broad {at}\n"))
+        .collect::<String>();
+    std::fs::write(root.join("pages/Broad.md"), body).expect("broad page");
+    let corpus = Corpus::open(root, true);
+
+    for needle in ["needle", "oo"] {
+        let plan = crate::query_plan::friendly_search_plan_for(
+            needle,
+            0,
+            1,
+            None,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        );
+        reset_friendly_read_census();
+        let ids = interactive_block_ids(&corpus, &plan);
+        let census = friendly_read_census();
+        assert_eq!(ids.len(), 300, "{needle} retains exactly W members");
+        assert!(
+            ids.windows(2).all(|pair| pair[0] > pair[1]),
+            "{needle} membership remains rowid-descending"
+        );
+        assert_eq!(census.block_candidate_visits, 300, "{needle} visits");
+        assert_eq!(
+            census.block_candidate_verifications, 300,
+            "{needle} verifications"
+        );
+    }
+}
+
+#[test]
+fn sparse_false_positive_candidates_stream_to_exhaustion_before_the_old_match() {
+    let _serial = serialize();
+    let root = scratch("friendly-sparse-stream");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = String::from("- exact abcd survivor\n");
+    for at in 0..650 {
+        body.push_str(&format!("- false abc gap bcd candidate {at}\n"));
+    }
+    std::fs::write(root.join("pages/Sparse.md"), body).expect("sparse page");
+    let corpus = Corpus::open(root, true);
+    let plan = crate::query_plan::friendly_search_plan_for(
+        "abcd",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+
+    reset_friendly_read_census();
+    let ids = interactive_block_ids(&corpus, &plan);
+    let census = friendly_read_census();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(census.block_candidate_visits, 651);
+    assert_eq!(census.block_candidate_verifications, 651);
+}
+
+#[test]
+fn interactive_page_scope_is_applied_before_the_verified_window() {
+    let _serial = serialize();
+    let root = scratch("friendly-scoped-window");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    std::fs::write(root.join("pages/A-InScope.md"), "- needle old scoped\n")
+        .expect("scoped page");
+    let outside = (0..650)
+        .map(|at| format!("- needle newer outside {at}\n"))
+        .collect::<String>();
+    std::fs::write(root.join("pages/Z-Outside.md"), outside).expect("outside page");
+    let corpus = Corpus::open(root, true);
+    let plan = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        Some(QueryPageScope {
+            name: "A-InScope".into(),
+            page_kind: PageKind::Page,
+            path: Some("pages/A-InScope.md".into()),
+        }),
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+
+    reset_friendly_read_census();
+    let answer = read(&corpus, &plan, &ResultIdentity::session_owned())
+        .expect("scoped interactive read");
+    let census = friendly_read_census();
+    assert!(matches!(
+        answer.hits.first(),
+        Some(QueryHit::Block { path, display_text, .. })
+            if path == "pages/A-InScope.md" && display_text == "needle old scoped"
+    ));
+    assert_eq!(census.block_candidate_visits, 1);
+    assert_eq!(census.block_candidate_verifications, 1);
 }

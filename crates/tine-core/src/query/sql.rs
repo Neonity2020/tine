@@ -1544,9 +1544,9 @@ impl Compiler<'_> {
         let id = self
             .ranks
             .bind_pair_named(identity.clone(), move |raw, path| {
-                let visible = crate::query::text::visible_from_raw_path(raw, path);
-                let folded = canonical_fold(&visible);
-                Ok(predicate(&folded, &visible).then(Vec::new))
+                let projection =
+                    crate::query::text::visible_projection_from_raw_path(raw, path);
+                Ok(predicate(&projection.visible_lower, &projection.visible).then(Vec::new))
             });
         self.content_rank_ids.insert(identity, id);
         id

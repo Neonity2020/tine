@@ -24,7 +24,7 @@ use crate::query::results::{
 use crate::query::sql::{block_sort_expression, page_sort_expression, SortBinder};
 use crate::query::text::framed_pair_sql;
 use crate::query_plan::{
-    admitted_block_evidence, admitted_page_evidence, rank_block_text, rank_page_text,
+    admitted_block_evidence, admitted_page_evidence, rank_block_text_folded, rank_page_text,
     ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation, QueryHasMore, QueryHit,
     QueryPlan, QueryTarget,
 };
@@ -81,6 +81,10 @@ fn check_lane(
 pub(crate) struct FriendlyReadCensus {
     pub(crate) page_descriptors: usize,
     pub(crate) block_descriptors: usize,
+    /// Rows yielded by the streamed interactive candidate statement.
+    pub(crate) block_candidate_visits: usize,
+    /// Candidate rows passed to the exact Rust verifier.
+    pub(crate) block_candidate_verifications: usize,
     /// Rows the block statement actually ranked (see the rank program).
     pub(crate) block_rank_evaluations: usize,
     pub(crate) ancestor_statements: usize,
@@ -93,6 +97,8 @@ thread_local! {
         const { std::cell::Cell::new(FriendlyReadCensus {
             page_descriptors: 0,
             block_descriptors: 0,
+            block_candidate_visits: 0,
+            block_candidate_verifications: 0,
             block_rank_evaluations: 0,
             ancestor_statements: 0,
             ancestor_rows: 0,
@@ -222,14 +228,19 @@ pub(crate) fn read_friendly_results(
                     // the same rows and rank wildly different numbers of them.
                     #[cfg(test)]
                     note_friendly(|census| census.block_rank_evaluations += 1);
-                    let visible = crate::query::text::visible_from_raw_path(raw, path);
-                    Ok(
-                        rank_block_text(&rank_plan, &rank_branch, &visible).map(|rank| {
-                            let mut key = rank.order_key().to_vec();
-                            key.extend_from_slice(visible.as_bytes());
-                            key
-                        }),
+                    let projection =
+                        crate::query::text::visible_projection_from_raw_path(raw, path);
+                    Ok(rank_block_text_folded(
+                        &rank_plan,
+                        &rank_branch,
+                        &projection.visible,
+                        &projection.visible_lower,
                     )
+                    .map(|rank| {
+                            let mut key = rank.order_key().to_vec();
+                            key.extend_from_slice(projection.visible.as_bytes());
+                            key
+                        }))
                 });
                 branches.push(BoundBranch::Blocks {
                     branch: branch.clone(),
@@ -494,6 +505,9 @@ struct PageDescriptor {
     journal_day: Option<i64>,
     path: String,
     matched_text: String,
+    /// Present only for content-derived page candidates, from the same
+    /// operation-local projection as `matched_text`.
+    matched_text_lower: Option<String>,
     matched_alias: bool,
     rank_key: Vec<u8>,
     /// The producer's stored payload facts, selected only on the
@@ -784,8 +798,18 @@ fn read_pages(
                     "a content page candidate arrived without a block branch".into(),
                 )
             })?;
-            let rank =
-                rank_block_text(plan, block_branch, &descriptor.matched_text).ok_or_else(|| {
+            let matched_text_lower = descriptor.matched_text_lower.as_deref().ok_or_else(|| {
+                ResultReadError::Corrupt(
+                    "a selected content page has no folded block text".into(),
+                )
+            })?;
+            let rank = rank_block_text_folded(
+                plan,
+                block_branch,
+                &descriptor.matched_text,
+                matched_text_lower,
+            )
+            .ok_or_else(|| {
                     ResultReadError::Corrupt(
                         "a selected page's block no longer satisfies its rank program".into(),
                     )
@@ -922,10 +946,11 @@ fn decode_page_descriptor(
         None
     };
     let matched = text(row, 7, "Friendly matched page text")?;
-    let matched_text = if from_content {
-        crate::query::text::visible_from_raw_path(&matched, &path)
+    let (matched_text, matched_text_lower) = if from_content {
+        let projection = crate::query::text::visible_projection_from_raw_path(&matched, &path);
+        (projection.visible, Some(projection.visible_lower))
     } else {
-        matched
+        (matched, None)
     };
     Ok(PageDescriptor {
         from_content,
@@ -935,6 +960,7 @@ fn decode_page_descriptor(
         journal_day,
         path,
         matched_text,
+        matched_text_lower,
         matched_alias,
         rank_key,
         payload,
@@ -949,6 +975,7 @@ struct BlockDescriptor {
     kind: PageKind,
     path: String,
     visible: String,
+    visible_lower: String,
     result_id: String,
     estimated_bytes: usize,
     tag_count: usize,
@@ -1004,90 +1031,16 @@ fn verified_id_block_source(params: &mut Vec<PhysicalQueryValue>, ids: &[i64]) -
     )
 }
 
-/// Consume rowid-descending candidates until `window` exact matches survive.
-/// This is deliberately a Rust cursor: putting the exact callback in a
-/// materialized SQL CTE evaluates the complete candidate set before LIMIT and
-/// turns a verified-match window back into graph-sized work.
-fn interactive_verified_block_ids(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
+/// Bind the one established current-page membership rule for any block
+/// candidate statement. The interactive cursor must apply it before counting
+/// verified matches; applying it only to the later ranked winners lets newer
+/// out-of-scope rows consume the whole window.
+fn block_scope_conditions(
+    params: &mut Vec<PhysicalQueryValue>,
     plan: &QueryPlan,
-    branch: &QueryBranch,
-    window: usize,
-    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> Result<Vec<i64>, ResultReadError> {
-    let mut params = Vec::new();
-    let source = indexed_block_source(&mut params, &branch.predicate);
-    let sql = format!(
-        "SELECT b.block_id, bt.content, p.path \
-         FROM {source} \
-         JOIN block_text bt ON bt.block_id = b.block_id \
-         JOIN pages p ON p.page_id = b.page_id \
-         ORDER BY b.block_id DESC"
-    );
-    let mut ids = Vec::with_capacity(window);
-    let cancellation = snapshot.cancellation();
-    crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
-        if lane.as_ref().is_some_and(|cancelled| cancelled()) {
-            cancellation.cancel();
-        }
-        if cancellation.is_cancelled() {
-            return Err(tine_storage::sqlite::MaterializationError::Incomplete(
-                "Friendly candidate read cancelled".into(),
-            ));
-        }
-        let block_id = match row.first() {
-            Some(PhysicalQueryValue::Integer(id)) => *id,
-            _ => {
-                return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
-                    "interactive candidate has no block coordinate".into(),
-                ));
-            }
-        };
-        let raw = match row.get(1) {
-            Some(PhysicalQueryValue::Text(raw)) => raw,
-            _ => {
-                return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
-                    "interactive candidate has no raw text".into(),
-                ));
-            }
-        };
-        let path = match row.get(2) {
-            Some(PhysicalQueryValue::Text(path)) => path,
-            _ => {
-                return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
-                    "interactive candidate has no page path".into(),
-                ));
-            }
-        };
-        let visible = crate::query::text::visible_from_raw_path(raw, path);
-        if rank_block_text(plan, branch, &visible).is_some() {
-            ids.push(block_id);
-            if ids.len() == window {
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        }
-        Ok(std::ops::ControlFlow::Continue(()))
-    })
-    .map_err(|error| sql_or_cancelled(snapshot, error))?;
-    Ok(ids)
-}
-
-fn read_blocks(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
-    identity: &ResultIdentity,
-    plan: &QueryPlan,
-    branch: &QueryBranch,
-    rank_program: u64,
-    sort_program: Option<FriendlySortPrograms>,
-    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
-    if branch.limit == 0 {
-        return Ok((Vec::new(), false));
-    }
-    let mut params = vec![PhysicalQueryValue::Integer(rank_program as i64)];
-    let scope = plan.page_scope();
-    let mut conditions: Vec<String> = Vec::new();
-    match scope {
+) -> Vec<String> {
+    let mut conditions = Vec::new();
+    match plan.page_scope() {
         Some(scope) if scope.path.is_some() => {
             params.push(PhysicalQueryValue::Text(scope.path.clone().unwrap()));
             conditions.push(format!("p.path = ?{}", params.len()));
@@ -1106,6 +1059,114 @@ fn read_blocks(
         }
         None => {}
     }
+    conditions
+}
+
+/// Consume rowid-descending candidates until `window` exact matches survive.
+/// This is deliberately a Rust cursor: putting the exact callback in a
+/// materialized SQL CTE evaluates the complete candidate set before LIMIT and
+/// turns a verified-match window back into graph-sized work.
+fn interactive_verified_block_ids(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    window: usize,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<Vec<i64>, ResultReadError> {
+    let mut params = Vec::new();
+    let source = indexed_block_source(&mut params, &branch.predicate);
+    let conditions = block_scope_conditions(&mut params, plan);
+    let scope_sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT b.block_id, bt.content, p.path \
+         FROM {source} \
+         LEFT JOIN block_text bt ON bt.block_id = b.block_id \
+         LEFT JOIN pages p ON p.page_id = b.page_id \
+         LEFT JOIN names p_name ON p_name.name_id = p.name_id{scope_sql} \
+         ORDER BY b.block_id DESC"
+    );
+    let mut ids = Vec::with_capacity(window);
+    let mut damage = None;
+    let cancellation = snapshot.cancellation();
+    crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
+        #[cfg(test)]
+        note_friendly(|census| census.block_candidate_visits += 1);
+        if lane.as_ref().is_some_and(|cancelled| cancelled()) {
+            cancellation.cancel();
+        }
+        if cancellation.is_cancelled() {
+            return Err(tine_storage::sqlite::MaterializationError::Incomplete(
+                "Friendly candidate read cancelled".into(),
+            ));
+        }
+        let block_id = match row.first() {
+            Some(PhysicalQueryValue::Integer(id)) => *id,
+            _ => {
+                damage = Some("interactive candidate has no block coordinate".into());
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        };
+        let raw = match row.get(1) {
+            Some(PhysicalQueryValue::Text(raw)) => raw,
+            _ => {
+                damage = Some(format!(
+                    "interactive candidate block {block_id} has no raw text"
+                ));
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        };
+        let path = match row.get(2) {
+            Some(PhysicalQueryValue::Text(path)) => path,
+            _ => {
+                damage = Some(format!(
+                    "interactive candidate block {block_id} has no page path"
+                ));
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        };
+        #[cfg(test)]
+        note_friendly(|census| census.block_candidate_verifications += 1);
+        let projection = crate::query::text::visible_projection_from_raw_path(raw, path);
+        if rank_block_text_folded(
+            plan,
+            branch,
+            &projection.visible,
+            &projection.visible_lower,
+        )
+        .is_some()
+        {
+            ids.push(block_id);
+            if ids.len() == window {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })
+    .map_err(|error| sql_or_cancelled(snapshot, error))?;
+    if let Some(message) = damage {
+        return Err(ResultReadError::Corrupt(message));
+    }
+    Ok(ids)
+}
+
+fn read_blocks(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    identity: &ResultIdentity,
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    rank_program: u64,
+    sort_program: Option<FriendlySortPrograms>,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
+    if branch.limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let mut params = vec![PhysicalQueryValue::Integer(rank_program as i64)];
+    let conditions = block_scope_conditions(&mut params, plan);
     // Drive the read from the trigram index instead of filtering a full scan
     // with it. The difference is the whole point: as a WHERE clause the index
     // only skips the rank call, so SQLite still scans every block in scope and
@@ -1118,12 +1179,10 @@ fn read_blocks(
     // the read remain the exact predicate on both paths, so a needle that is
     // wrong shows up as a MISSING result, never as a wrong one.
     //
-    // ONE behaviour differs from the scan, deliberately: a block whose text row
-    // has vanished is not in the index either, so the driven read omits it
-    // rather than surfacing it through `missing_text = 1`. The scan path below
-    // still carries that arm. The Friendly damage contract
-    // (`friendly_tests.rs`) deletes a result row and cross-owns a page — both
-    // leave the block's text, so both still reach their checks here.
+    // Candidate narrowing never weakens the damage contract. The streamed
+    // interactive cursor LEFT-joins and validates text/page rows before it
+    // counts W; this ranked statement likewise keeps its LEFT joins and orders
+    // `missing_text` first so descriptor decoding fails the whole read.
     let block_source = match plan.candidate_mode() {
         CandidateMode::Exhaustive => indexed_block_source(&mut params, &branch.predicate),
         CandidateMode::Interactive { window } => {
@@ -1199,7 +1258,13 @@ fn read_blocks(
                 "one physical block appears twice in Friendly results".into(),
             ));
         }
-        let expected = rank_block_text(plan, branch, &descriptor.visible).ok_or_else(|| {
+        let expected = rank_block_text_folded(
+            plan,
+            branch,
+            &descriptor.visible,
+            &descriptor.visible_lower,
+        )
+        .ok_or_else(|| {
             ResultReadError::Corrupt("a selected block no longer satisfies its rank program".into())
         })?;
         if descriptor.rank_key != expected.order_key() {
@@ -1244,7 +1309,13 @@ fn read_blocks(
             ResultReadError::Corrupt("an admitted Friendly block has no payload".into())
         })?;
         block.breadcrumb = breadcrumb;
-        let rank = rank_block_text(plan, branch, &descriptor.visible).ok_or_else(|| {
+        let rank = rank_block_text_folded(
+            plan,
+            branch,
+            &descriptor.visible,
+            &descriptor.visible_lower,
+        )
+        .ok_or_else(|| {
             ResultReadError::Corrupt(
                 "an admitted block no longer satisfies its rank program".into(),
             )
@@ -1290,7 +1361,7 @@ fn decode_block_descriptor(
     let kind = page_kind_from_sql(kind_value)
         .ok_or_else(|| format!("pages.text_kind {kind_value} is not a page kind"))?;
     let path = text(row, 7, "pages.path")?;
-    let visible = crate::query::text::visible_from_raw_path(&raw, &path);
+    let projection = crate::query::text::visible_projection_from_raw_path(&raw, &path);
     let result_page = integer(row, 8, "blocks.page_id")?;
     if result_page != page_id {
         return Err("blocks.page_id does not own its block's page".into());
@@ -1323,7 +1394,8 @@ fn decode_block_descriptor(
         page,
         kind,
         path,
-        visible,
+        visible: projection.visible,
+        visible_lower: projection.visible_lower,
         result_id,
         estimated_bytes,
         tag_count: count(row, 12, "blocks.tag_count")?,
