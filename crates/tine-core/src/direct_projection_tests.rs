@@ -2400,7 +2400,7 @@ fn a_working_projection_refuses_an_indexed_reference_read_instead_of_parsing_eve
 }
 
 #[test]
-fn interactive_plain_reference_windows_are_independent_per_title_and_alias() {
+fn interactive_plain_reference_recency_is_independent_per_title_and_alias() {
     let _serial = serialize_projection_tests();
     let root = scratch("plain-reference-independent-windows");
     std::fs::create_dir_all(root.join("pages")).unwrap();
