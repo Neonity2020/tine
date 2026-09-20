@@ -188,6 +188,88 @@ export function render_block_html(raw, is_org) {
         wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
     }
 }
+
+/**
+ * Fold text with Tine's exact A6 search transform.
+ *
+ * This is whole-string lowercase plus compatibility decomposition, removal of
+ * Unicode nonspacing marks, canonical reorder and composition. It deliberately
+ * is not full Unicode casefold and is not idempotent for every compatibility
+ * character, so callers must pass raw text and invoke it exactly once.
+ * @param {string} text
+ * @returns {string}
+ */
+export function search_fold(text) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.search_fold(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Fold raw text once and serialize its provenance as
+ * `{text, sources: [{start, end}]}`. Each source range uses raw UTF-16 offsets,
+ * and there is exactly one range per output Unicode scalar (not per UTF-16 code
+ * unit).
+ * @param {string} text
+ * @returns {string}
+ */
+export function search_fold_map_json(text) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.search_fold_map_json(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Parse one shared search matcher and apply it to a JSON string array.
+ *
+ * Boolean queries fold each raw candidate exactly once; regex queries see raw
+ * text only. Empty and invalid-regex queries retain every candidate, with the
+ * latter returning its diagnostic in `search_error`. Malformed JSON is a bridge
+ * error rather than a fabricated match-all result.
+ * @param {string} query
+ * @param {string} texts_json
+ * @returns {string}
+ */
+export function search_match_batch_json(query, texts_json) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passStringToWasm0(query, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(texts_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.search_match_batch_json(ptr0, len0, ptr1, len1);
+        var ptr3 = ret[0];
+        var len3 = ret[1];
+        if (ret[3]) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -224,6 +306,11 @@ function __wbg_get_imports() {
         },
         __wbg_new_0_3da9e97f24fc69be: function() {
             const ret = new Date();
+            return ret;
+        },
+        __wbindgen_cast_0000000000000001: function(arg0, arg1) {
+            // Cast intrinsic for `Ref(String) -> Externref`.
+            const ret = getStringFromWasm0(arg0, arg1);
             return ret;
         },
         __wbindgen_init_externref_table: function() {
@@ -289,6 +376,12 @@ function passStringToWasm0(arg, malloc, realloc) {
 
     WASM_VECTOR_LEN = offset;
     return ptr;
+}
+
+function takeFromExternrefTable0(idx) {
+    const value = wasm.__wbindgen_externrefs.get(idx);
+    wasm.__externref_table_dealloc(idx);
+    return value;
 }
 
 let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
