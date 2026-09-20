@@ -76,7 +76,7 @@ fn common_regex_pattern(pattern: &str) -> bool {
 /// Canonical comparison representation for non-regex search: whole-string
 /// lowercase, NFKC, NFD/drop Unicode Mn, then NFC.
 pub fn canonical_fold(value: &str) -> String {
-    fold::fold(value).text
+    fold::fold_text(value)
 }
 
 /// The same canonical fold with one raw UTF-16 range per output scalar.

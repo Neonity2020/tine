@@ -11,11 +11,20 @@ pub struct MappedFold {
     pub sources: Vec<Range<usize>>,
 }
 
-#[derive(Clone, Debug)]
-struct TaggedScalar {
-    ch: char,
-    source: Range<usize>,
-    cluster: usize,
+struct FoldBuffer {
+    chars: Vec<char>,
+    sources: Option<Vec<Range<usize>>>,
+    clusters: Option<Vec<usize>>,
+}
+
+impl FoldBuffer {
+    fn new(with_provenance: bool, capacity: usize) -> Self {
+        Self {
+            chars: Vec::with_capacity(capacity),
+            sources: with_provenance.then(|| Vec::with_capacity(capacity)),
+            clusters: with_provenance.then(|| Vec::with_capacity(capacity)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +32,8 @@ struct TaggedScalar {
 struct RemovalWork {
     input_scalars: usize,
     work_units: usize,
+    raw_graphemes: usize,
+    provenance_scalars: usize,
 }
 
 fn mn_regex() -> &'static Regex {
@@ -40,60 +51,121 @@ fn is_mn(ch: char) -> bool {
 ///
 /// Whole-string lowercase supplies contextual forms such as final sigma. The
 /// raw UTF-16 range attached to each scalar follows it through every later
-/// step, and composition unions all contributors. Text-only callers use this
-/// same mapped algorithm and discard the map.
+/// step, and composition unions all contributors. The provenance sidecars are
+/// optional, so text-only callers use the same normalization stages without
+/// segmenting raw graphemes or constructing source-map state.
 pub(crate) fn fold(raw: &str) -> MappedFold {
     fold_with_removal_work(raw).0
 }
 
-fn fold_with_removal_work(raw: &str) -> (MappedFold, RemovalWork) {
-    let lowered = raw.to_lowercase();
-    let mut lowered_scalars = lowered.chars();
-    let mut decomposed = Vec::new();
-    let mut original_utf16 = 0;
-
-    for (cluster_index, cluster) in raw.graphemes(true).enumerate() {
-        for original in cluster.chars() {
-            let scalar_start = original_utf16;
-            original_utf16 += original.len_utf16();
-            for _ in original.to_lowercase() {
-                let contextual = lowered_scalars
-                    .next()
-                    .expect("whole-string lowercase preserves scalar partition length");
-                decompose_compatible(contextual, |ch| {
-                    decomposed.push(TaggedScalar {
-                        ch,
-                        source: scalar_start..original_utf16,
-                        cluster: cluster_index,
-                    });
-                });
-            }
-        }
-    }
-    assert!(
-        lowered_scalars.next().is_none(),
-        "whole-string lowercase preserves scalar partition length"
-    );
-
-    let (retained, removal_work) = remove_mn_with_provenance(decomposed);
-    let composed = canonical_compose(canonical_reorder(retained));
-    let text = composed.iter().map(|tagged| tagged.ch).collect();
-    let sources = composed.into_iter().map(|tagged| tagged.source).collect();
-    (MappedFold { text, sources }, removal_work)
+pub(crate) fn fold_text(raw: &str) -> String {
+    fold_text_with_removal_work(raw).0
 }
 
-fn source_distance(mark: &TaggedScalar, retained: &TaggedScalar) -> (usize, bool) {
-    if retained.source.end <= mark.source.start {
-        (mark.source.start - retained.source.end, false)
-    } else if mark.source.end <= retained.source.start {
-        (retained.source.start - mark.source.end, true)
+fn fold_with_removal_work(raw: &str) -> (MappedFold, RemovalWork) {
+    let (text, sources, work) = fold_pipeline(raw, true);
+    (
+        MappedFold {
+            text,
+            sources: sources.expect("mapped fold requests provenance"),
+        },
+        work,
+    )
+}
+
+fn fold_text_with_removal_work(raw: &str) -> (String, RemovalWork) {
+    let (text, sources, work) = fold_pipeline(raw, false);
+    debug_assert!(sources.is_none());
+    (text, work)
+}
+
+fn fold_pipeline(
+    raw: &str,
+    with_provenance: bool,
+) -> (String, Option<Vec<Range<usize>>>, RemovalWork) {
+    let lowered = raw.to_lowercase();
+    let mut decomposed = FoldBuffer::new(with_provenance, lowered.chars().count());
+    let raw_graphemes = if with_provenance {
+        let mut lowered_scalars = lowered.chars();
+        let mut original_utf16 = 0;
+        let mut raw_graphemes = 0;
+        let sources = decomposed
+            .sources
+            .as_mut()
+            .expect("mapped fold has source storage");
+        let clusters = decomposed
+            .clusters
+            .as_mut()
+            .expect("mapped fold has cluster storage");
+
+        for (cluster_index, cluster) in raw.graphemes(true).enumerate() {
+            raw_graphemes = cluster_index + 1;
+            for original in cluster.chars() {
+                let scalar_start = original_utf16;
+                original_utf16 += original.len_utf16();
+                for _ in original.to_lowercase() {
+                    let contextual = lowered_scalars
+                        .next()
+                        .expect("whole-string lowercase preserves scalar partition length");
+                    decompose_compatible(contextual, |ch| {
+                        decomposed.chars.push(ch);
+                        sources.push(scalar_start..original_utf16);
+                        clusters.push(cluster_index);
+                    });
+                }
+            }
+        }
+        assert!(
+            lowered_scalars.next().is_none(),
+            "whole-string lowercase preserves scalar partition length"
+        );
+        raw_graphemes
+    } else {
+        for contextual in lowered.chars() {
+            decompose_compatible(contextual, |ch| decomposed.chars.push(ch));
+        }
+        0
+    };
+
+    let (retained, mut removal_work) = remove_mn(decomposed);
+    removal_work.raw_graphemes = raw_graphemes;
+    removal_work.provenance_scalars = if with_provenance {
+        removal_work.input_scalars
+    } else {
+        0
+    };
+    let composed = canonical_compose(canonical_reorder(retained));
+    let text = composed.chars.into_iter().collect();
+    (text, composed.sources, removal_work)
+}
+
+fn source_distance(mark: &Range<usize>, retained: &Range<usize>) -> (usize, bool) {
+    if retained.end <= mark.start {
+        (mark.start - retained.end, false)
+    } else if mark.end <= retained.start {
+        (retained.start - mark.end, true)
     } else {
         (0, false)
     }
 }
 
-fn remove_mn_with_provenance(input: Vec<TaggedScalar>) -> (Vec<TaggedScalar>, RemovalWork) {
-    let input_scalars = input.len();
+fn remove_mn(mut input: FoldBuffer) -> (FoldBuffer, RemovalWork) {
+    let input_scalars = input.chars.len();
+    if input.sources.is_none() {
+        input.chars.retain(|ch| !is_mn(*ch));
+        return (
+            input,
+            RemovalWork {
+                input_scalars,
+                work_units: input_scalars,
+                raw_graphemes: 0,
+                provenance_scalars: 0,
+            },
+        );
+    }
+
+    let sources = input.sources.take().expect("mapped fold has sources");
+    let clusters = input.clusters.take().expect("mapped fold has clusters");
     let mut work_units = 0;
 
     // Tags are still in raw source order. The closest retained contributor in
@@ -102,13 +174,13 @@ fn remove_mn_with_provenance(input: Vec<TaggedScalar>) -> (Vec<TaggedScalar>, Re
     let mut removed = vec![false; input_scalars];
     let mut previous = vec![None; input_scalars];
     let mut previous_retained = None;
-    for (at, tagged) in input.iter().enumerate() {
+    for (at, ch) in input.chars.iter().enumerate() {
         work_units += 1;
-        if previous_retained.is_some_and(|before: usize| input[before].cluster != tagged.cluster) {
+        if previous_retained.is_some_and(|before: usize| clusters[before] != clusters[at]) {
             previous_retained = None;
         }
         previous[at] = previous_retained;
-        removed[at] = is_mn(tagged.ch);
+        removed[at] = is_mn(*ch);
         if !removed[at] {
             previous_retained = Some(at);
         }
@@ -116,9 +188,9 @@ fn remove_mn_with_provenance(input: Vec<TaggedScalar>) -> (Vec<TaggedScalar>, Re
 
     let mut next = vec![None; input_scalars];
     let mut next_retained = None;
-    for (at, tagged) in input.iter().enumerate().rev() {
+    for at in (0..input_scalars).rev() {
         work_units += 1;
-        if next_retained.is_some_and(|after: usize| input[after].cluster != tagged.cluster) {
+        if next_retained.is_some_and(|after: usize| clusters[after] != clusters[at]) {
             next_retained = None;
         }
         next[at] = next_retained;
@@ -128,14 +200,15 @@ fn remove_mn_with_provenance(input: Vec<TaggedScalar>) -> (Vec<TaggedScalar>, Re
     }
 
     let mut provenance: Vec<Option<Range<usize>>> = vec![None; input_scalars];
-    for (at, mark) in input.iter().enumerate() {
+    for (at, mark) in sources.iter().enumerate() {
         work_units += 1;
         if !removed[at] {
             continue;
         }
         let nearest = match (previous[at], next[at]) {
             (Some(before), Some(after)) => {
-                if source_distance(mark, &input[before]) <= source_distance(mark, &input[after]) {
+                if source_distance(mark, &sources[before]) <= source_distance(mark, &sources[after])
+                {
                     Some(before)
                 } else {
                     Some(after)
@@ -146,97 +219,158 @@ fn remove_mn_with_provenance(input: Vec<TaggedScalar>) -> (Vec<TaggedScalar>, Re
             (None, None) => None,
         };
         if let Some(nearest) = nearest {
-            let span = provenance[nearest].get_or_insert_with(|| input[nearest].source.clone());
-            span.start = span.start.min(mark.source.start);
-            span.end = span.end.max(mark.source.end);
+            let span = provenance[nearest].get_or_insert_with(|| sources[nearest].clone());
+            span.start = span.start.min(mark.start);
+            span.end = span.end.max(mark.end);
         }
     }
 
-    let mut retained = Vec::with_capacity(input_scalars);
-    for (at, mut tagged) in input.into_iter().enumerate() {
+    let mut retained = FoldBuffer {
+        chars: Vec::with_capacity(input_scalars),
+        sources: Some(Vec::with_capacity(input_scalars)),
+        clusters: None,
+    };
+    for (at, ch) in input.chars.into_iter().enumerate() {
         work_units += 1;
         if removed[at] {
             continue;
         }
+        let mut source = sources[at].clone();
         if let Some(span) = provenance[at].take() {
-            tagged.source.start = tagged.source.start.min(span.start);
-            tagged.source.end = tagged.source.end.max(span.end);
+            source.start = source.start.min(span.start);
+            source.end = source.end.max(span.end);
         }
-        retained.push(tagged);
+        retained.chars.push(ch);
+        retained
+            .sources
+            .as_mut()
+            .expect("mapped fold has retained sources")
+            .push(source);
     }
     (
         retained,
         RemovalWork {
             input_scalars,
             work_units,
+            raw_graphemes: 0,
+            provenance_scalars: input_scalars,
         },
     )
 }
 
-fn canonical_reorder(input: Vec<TaggedScalar>) -> Vec<TaggedScalar> {
-    fn flush(segment: &mut Vec<TaggedScalar>, output: &mut Vec<TaggedScalar>) {
-        if segment.len() <= 1 {
-            output.append(segment);
+fn canonical_reorder(input: FoldBuffer) -> FoldBuffer {
+    fn push_index(input: &FoldBuffer, at: usize, output: &mut FoldBuffer) {
+        output.chars.push(input.chars[at]);
+        if let (Some(input_sources), Some(output_sources)) =
+            (input.sources.as_ref(), output.sources.as_mut())
+        {
+            output_sources.push(input_sources[at].clone());
+        }
+    }
+
+    fn flush(
+        input: &FoldBuffer,
+        start: usize,
+        end: usize,
+        order: &mut Vec<usize>,
+        output: &mut FoldBuffer,
+    ) {
+        if end - start <= 1 {
+            if start < end {
+                push_index(input, start, output);
+            }
             return;
         }
 
         // Stable counting sort by canonical combining class. CCC is one byte,
         // so this is linear with a fixed-size table.
         let mut counts = [0_usize; 256];
-        for tagged in segment.iter() {
-            counts[canonical_combining_class(tagged.ch) as usize] += 1;
+        for ch in &input.chars[start..end] {
+            counts[canonical_combining_class(*ch) as usize] += 1;
         }
         let mut positions = [0_usize; 256];
         for class in 1..positions.len() {
             positions[class] = positions[class - 1] + counts[class - 1];
         }
-        let mut ordered = vec![None; segment.len()];
-        for tagged in segment.drain(..) {
-            let class = canonical_combining_class(tagged.ch) as usize;
-            let at = positions[class];
-            ordered[at] = Some(tagged);
+        order.clear();
+        order.resize(end - start, 0);
+        for input_at in start..end {
+            let class = canonical_combining_class(input.chars[input_at]) as usize;
+            let output_at = positions[class];
+            order[output_at] = input_at;
             positions[class] += 1;
         }
-        output.extend(ordered.into_iter().map(Option::unwrap));
+        for at in order.iter().copied() {
+            push_index(input, at, output);
+        }
     }
 
-    let mut output = Vec::with_capacity(input.len());
-    let mut segment = Vec::new();
-    for tagged in input {
-        if canonical_combining_class(tagged.ch) == 0 && !segment.is_empty() {
-            flush(&mut segment, &mut output);
+    let mut output = FoldBuffer {
+        chars: Vec::with_capacity(input.chars.len()),
+        sources: input
+            .sources
+            .as_ref()
+            .map(|_| Vec::with_capacity(input.chars.len())),
+        clusters: None,
+    };
+    let mut order = Vec::new();
+    let mut segment_start = 0;
+    for at in 1..input.chars.len() {
+        if canonical_combining_class(input.chars[at]) == 0 {
+            flush(&input, segment_start, at, &mut order, &mut output);
+            segment_start = at;
         }
-        segment.push(tagged);
     }
-    flush(&mut segment, &mut output);
+    flush(
+        &input,
+        segment_start,
+        input.chars.len(),
+        &mut order,
+        &mut output,
+    );
     output
 }
 
-fn canonical_compose(input: Vec<TaggedScalar>) -> Vec<TaggedScalar> {
-    let mut output: Vec<TaggedScalar> = Vec::with_capacity(input.len());
+fn canonical_compose(input: FoldBuffer) -> FoldBuffer {
+    let mut output = FoldBuffer {
+        chars: Vec::with_capacity(input.chars.len()),
+        sources: input
+            .sources
+            .as_ref()
+            .map(|_| Vec::with_capacity(input.chars.len())),
+        clusters: None,
+    };
     let mut starter = None;
     let mut last_class = 0_u8;
 
-    for tagged in input {
-        let class = canonical_combining_class(tagged.ch);
-        let composite = starter.and_then(|at: usize| {
-            (last_class < class || last_class == 0)
-                .then(|| compose(output[at].ch, tagged.ch))
-                .flatten()
-                .map(|ch| (at, ch))
-        });
+    for (input_at, ch) in input.chars.into_iter().enumerate() {
+        let class = canonical_combining_class(ch);
+        let composed = starter
+            .filter(|_| last_class < class || last_class == 0)
+            .and_then(|at: usize| compose(output.chars[at], ch));
+        let composite = starter.zip(composed);
         if let Some((at, ch)) = composite {
-            output[at].ch = ch;
-            output[at].source.start = output[at].source.start.min(tagged.source.start);
-            output[at].source.end = output[at].source.end.max(tagged.source.end);
+            output.chars[at] = ch;
+            if let (Some(input_sources), Some(output_sources)) =
+                (input.sources.as_ref(), output.sources.as_mut())
+            {
+                output_sources[at].start =
+                    output_sources[at].start.min(input_sources[input_at].start);
+                output_sources[at].end = output_sources[at].end.max(input_sources[input_at].end);
+            }
             continue;
         }
 
         if class == 0 {
-            starter = Some(output.len());
+            starter = Some(output.chars.len());
         }
         last_class = class;
-        output.push(tagged);
+        output.chars.push(ch);
+        if let (Some(input_sources), Some(output_sources)) =
+            (input.sources.as_ref(), output.sources.as_mut())
+        {
+            output_sources.push(input_sources[input_at].clone());
+        }
     }
     output
 }
@@ -330,6 +464,51 @@ mod tests {
         let (mapped, work) = fold_with_removal_work(&raw);
         assert!(work.work_units <= work.input_scalars * 4);
         assert_eq!(mapped.text, format!("a{}", "\u{1715}".repeat(repetitions)));
+    }
+
+    #[test]
+    fn text_only_and_mapped_text_share_broad_fold_semantics() {
+        let mut fixtures = vec![
+            String::new(),
+            "Project Alpha 2026 / Planning".to_owned(),
+            "東京計画／開発ノート頁面検索".to_owned(),
+            "Ｐｒｏｊｅｃｔ ｶﾞｲﾄﾞ 豈".to_owned(),
+            "Příliš žluťoučký kůň".to_owned(),
+            "Cafe\u{301} déjà vu İstanbul".to_owned(),
+            "한글 한글 ㄱㅏ".to_owned(),
+            "ΟΣ Σ ΟΣΑ ΟΣ.".to_owned(),
+            "ofﬁce Straße 𝐀 Kelvin".to_owned(),
+            "\u{301}\u{342}a\u{315}\u{300}z".to_owned(),
+            "\u{301}\u{342}".to_owned(),
+            "का a⃝ 😀".to_owned(),
+        ];
+        fixtures.push(format!("a{}", "\u{301}\u{034f}\u{1715}".repeat(1_000)));
+
+        for raw in fixtures {
+            let text_only = fold_text(&raw);
+            let mapped = fold(&raw);
+            assert_eq!(text_only, mapped.text, "raw={raw:?}");
+            assert_eq!(text_only, oracle(&raw), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn text_only_pipeline_constructs_no_mapping_state() {
+        let raw = format!(
+            "Příliš İstanbul 한글 ΟΣ Σ a{}",
+            "\u{301}\u{034f}".repeat(1_000)
+        );
+        let (text, sources, text_work) = fold_pipeline(&raw, false);
+        let (mapped, mapped_work) = fold_with_removal_work(&raw);
+
+        assert_eq!(text, mapped.text);
+        assert!(sources.is_none());
+        assert_eq!(text_work.raw_graphemes, 0);
+        assert_eq!(text_work.provenance_scalars, 0);
+        assert_eq!(text_work.work_units, text_work.input_scalars);
+        assert!(mapped_work.raw_graphemes > 0);
+        assert_eq!(mapped_work.provenance_scalars, mapped_work.input_scalars);
+        assert_eq!(mapped.sources.len(), mapped.text.chars().count());
     }
 
     #[test]
