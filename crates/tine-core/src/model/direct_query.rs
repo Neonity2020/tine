@@ -1313,10 +1313,13 @@ impl Graph {
     pub(super) fn direct_projection_reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
+        mode: crate::query::candidate::CandidateMode,
     ) -> Option<(
         Vec<(PageEntry, Arc<Document>)>,
         Option<std::collections::HashSet<String>>,
+        Option<std::collections::HashSet<PathBuf>>,
     )> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let projection = self
@@ -1328,9 +1331,16 @@ impl Graph {
         if !projection.wait_for_reference_generation(generation) {
             return None;
         }
-        let candidates = projection.reference_candidates(generation, names_norm, kind)?;
+        let candidates = projection.reference_candidates(
+            generation,
+            names_norm,
+            self_page,
+            kind,
+            mode,
+            &self.config,
+        )?;
         let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
-        Some((pages, candidates.blocks))
+        Some((pages, candidates.blocks, candidates.page_owners))
     }
 
     pub(super) fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
@@ -1494,14 +1504,5 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map_or(0, |projection| projection.referenced_name_reads())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_projection_fuzzy_candidate_reads_test(&self) -> u64 {
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map_or(0, |projection| projection.fuzzy_candidate_reads())
     }
 }

@@ -60,11 +60,13 @@ fn projection_statement_sites_are_pinned() {
         }
     }
     let expected: BTreeMap<String, usize> = [
-        ("crates/tine-core/src/direct_projection.rs", 1),
+        // P3B unified the page/block plain-reference candidates at one statement site.
+        ("crates/tine-core/src/direct_projection.rs", 3),
+        ("crates/tine-core/src/model/direct_query.rs", 3),
         ("crates/tine-core/src/query/export_results.rs", 5),
         ("crates/tine-core/src/query/friendly.rs", 4),
         ("crates/tine-core/src/query/registry_sql.rs", 1),
-        ("crates/tine-core/src/query/results.rs", 6),
+        ("crates/tine-core/src/query/results.rs", 5),
     ]
     .into_iter()
     .map(|(file, count)| (file.to_owned(), count))

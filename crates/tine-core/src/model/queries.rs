@@ -94,6 +94,23 @@ impl Graph {
             .result)
     }
 
+    fn derived_memo_bounded_fallible_if_eligible<E>(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Result<(crate::query::BoundedGroups, bool), E>,
+    ) -> Result<BoundedRefGroups, E> {
+        Ok(self
+            .derived_memo_entry_fallible_if_eligible(key, || {
+                compute().map(|(computed, memo_eligible)| {
+                    (
+                        DerivedEntry::plain(bounded_ref_groups(computed)),
+                        memo_eligible,
+                    )
+                })
+            })?
+            .result)
+    }
+
     /// Execute the selection into operation-scoped PRE-VIEW groups, apply this
     /// request's view, and wrap the final groups at the public transport edge.
     pub(super) fn direct_query_view(
@@ -146,6 +163,18 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> Result<DerivedEntry, E>,
     ) -> Result<DerivedEntry, E> {
+        self.derived_memo_entry_fallible_if_eligible(key, || compute().map(|result| (result, true)))
+    }
+
+    /// The existing memo boundary with result-derived admission. A successful
+    /// answer may still be ineligible when it came from a transient fallback;
+    /// decide that from the source the query actually used, after the read,
+    /// rather than from a racy readiness observation before it.
+    fn derived_memo_entry_fallible_if_eligible<E>(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Result<(DerivedEntry, bool), E>,
+    ) -> Result<DerivedEntry, E> {
         use std::sync::atomic::Ordering;
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
@@ -162,7 +191,10 @@ impl Graph {
                 }
             }
         }
-        let result = compute()?;
+        let (result, memo_eligible) = compute()?;
+        if !memo_eligible {
+            return Ok(result);
+        }
         let result_bytes = ref_groups_estimated_bytes(result.result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
@@ -421,9 +453,14 @@ impl Graph {
         max_bytes: usize,
     ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
         let normalized = crate::refs::normalize(target);
-        self.derived_memo_bounded_fallible(
-            format!("U\0{max_rows}\0{max_bytes}\0{normalized}"),
-            || crate::query::unlinked_refs_bounded_indexed(self, target, max_rows, max_bytes),
+        self.derived_memo_bounded_fallible_if_eligible(
+            format!("UI\0{max_rows}\0{max_bytes}\0{normalized}"),
+            || {
+                crate::query::unlinked_refs_bounded_indexed_with_source(
+                    self, target, max_rows, max_bytes,
+                )
+                .map(|answer| (answer.groups, answer.memo_eligible))
+            },
         )
     }
 

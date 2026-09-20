@@ -395,8 +395,8 @@ pub struct Graph {
     /// page, referenced name) pair and folding it down to distinct names: on a
     /// 10,000-page graph that is 110,000 rows for 10,010 names, measured at
     /// 1.29 s — essentially the whole 1.41 s a `[[ ]]` autocomplete keystroke
-    /// used to cost, since `legacy_page_search_entries` takes this set BY VALUE
-    /// before the needle is looked at. Within one generation every later
+    /// used to cost before page-name autocomplete moved to the dictionary-backed
+    /// executor. Within one generation every later
     /// keystroke, and every other caller of this set, then answers from here.
     /// The first lookup after a save still pays the drain, because a save bumps
     /// `cache_gen`; priming the memo at generation publish would only move that

@@ -98,9 +98,9 @@ virtual table.
 
 - `names` — dictionary spelling/key pairs shared by named graph facts.
 - `pages` — page identity, routing, session position and page-result metadata.
-- `page_text` — page preamble and search text, keyed by `page_id`.
-- `blocks` — block structure, public result identity, ordering/result metadata and folded query text.
-- `block_text` — a block's source content, query-visible text and search text.
+- `page_text` — raw visible page preamble, keyed by `page_id`.
+- `blocks` — block structure, public result identity and ordering/result metadata.
+- `block_text` — a block's raw source content.
 - `block_planning` — `[#A]`, `SCHEDULED:` and `DEADLINE:` facets, never conditioned on a task marker.
 - `tasks` — the task marker of every block that has one.
 - `properties` — property rows per owner (page or block), by ordinal.
@@ -111,9 +111,7 @@ virtual table.
 - `reference_alias_declarations` — `alias::` declarations per source page.
 - `query_projection_state` — the image revision a query snapshot validates (`query_revision`).
 - `direct_source_revisions` — the source revision keyed by the public path each page's rows were lowered from.
-- `search_fts`, `search_fts_config`, `search_fts_content`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the token FTS5 table and its shadow tables.
-- `search_substring_fts`, `search_substring_fts_config`, `search_substring_fts_content`, `search_substring_fts_data`, `search_substring_fts_docsize`, `search_substring_fts_idx` — the trigram FTS5 table and its shadow tables.
-- `search_fts_owners` — FTS rowid to owner (page or block) map.
+- `search_fts`, `search_fts_config`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the one contentless trigram FTS5 table and its shadow tables. Its rowid is the disjoint page/block entity coordinate, so no owner map exists.
 
 **Index completeness belongs to projection publication.** An admitted projection
 snapshot contains the search index maintained in the same page transaction as
@@ -142,13 +140,17 @@ the tree walk still evaluates its date. The `scheduled_day`/`deadline_day`
 columns hold the `yyyymmdd` ordinal and are NULL when the timestamp text is not
 a calendar day, so a malformed date keeps its presence and loses only its day.
 
-**The query columns are the exact visible text.** `block_text.query_visible` is the
-block's visible text byte for byte and `blocks.query_visible_folded` is that
-text canonically folded. Content predicates read the folded query text. The
-`searchable_text` and its FTS stay whitespace-collapsed for the existing search
-consumers and are not a substitute: a phrase query has to be able to tell `a  b`
-from `a b`. Both columns are populated at WRITE time by the producer, never by
-parsing or hydrating rows during a query.
+**Raw text is the exact-query authority; the index is only a candidate
+superset.** `block_text.content` and `page_text.preamble` are the only retained
+text copies. The producer feeds `canonical_fold(exact visible text)` (with
+whitespace preserved) into the contentless, case-sensitive trigram
+`search_fts`; no folded or visible text body is stored beside the raw input.
+Block predicates frame `(block_text.content, pages.path)` and derive exact
+visible text through `DocBlock::preamble` inside an operation-owned callback.
+Candidate membership can therefore be lossy, while equality, LIKE, regex,
+Friendly ranking, evidence, and sort fallbacks all use one exact projection.
+Page rows remain in the same disjoint entity-rowid space so preamble and title
+candidates are never lost.
 
 **Query metadata stays on its physical owner (schema 30).** `blocks` stores
 public result identity, tree preorder, construction estimate and tag/property

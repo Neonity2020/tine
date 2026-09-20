@@ -129,6 +129,9 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
 - Values of `tags::`, `alias::`, and `aliases::` render as navigable page links,
   including comma-separated bare values; quoted and custom property values stay
   literal unless they contain explicit page-reference syntax.
+- `[[`, `#`, and page-name search offer every matching authored alias even when
+  the canonical title matches too. Choosing one inserts that alias spelling and
+  still opens the real owning page; it never creates a pathless alias page.
 - The `((` popup full-text-searches blocks and inserts a **durable** reference
   (writes a stable `id::` first).
 - **Page references lead the bare `/` menu.** `/` then Enter inserts `[[]]`,

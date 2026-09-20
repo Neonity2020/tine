@@ -84,10 +84,13 @@ fn hand_written_cursor_drains_are_pinned() {
     // 11 → 9: K2 made `property_owner_rows` test-only. It fed the editor
     // registry, whose only reader was the query walk; the walk is the test-only
     // oracle now and the product reads the projection's committed registry.
+    // 9 → 7: P3b deleted the fuzzy-candidate cursor and moved authored alias
+    // rows through the shared projection statement door. The seven surviving
+    // storage cursor consumers still delegate to `drain_after`.
     assert_eq!(
         direct.matches("drain_after(").count(),
-        9,
-        "I-12: the nine owned Direct cursor consumers must each delegate to drain_after"
+        7,
+        "I-12: the seven owned Direct cursor consumers must each delegate to drain_after"
     );
 }
 

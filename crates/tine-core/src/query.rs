@@ -14,6 +14,7 @@ mod export_select;
 pub use export_select::*;
 mod facets;
 pub use facets::*;
+pub(crate) mod candidate;
 pub(crate) mod compiled;
 #[cfg(test)]
 mod conformance;
@@ -48,6 +49,7 @@ pub(crate) mod read_execute;
 pub(crate) mod results;
 pub(crate) mod sql;
 pub(crate) mod statistics;
+pub(crate) mod text;
 // Database-owned export subtree construction: located selection over the
 // shared result collector, and bounded subtree hydration over the SAME
 // caller-owned snapshots.
@@ -146,6 +148,17 @@ pub struct BoundedGroups {
     pub groups: Vec<RefGroup>,
     pub total: usize,
     pub exceeded: bool,
+}
+
+/// An indexed-panel answer plus the source that actually produced it.
+///
+/// The panel deliberately falls back to the parser when no projection can
+/// become ready. That answer is correct for the current source generation,
+/// but it is not interchangeable with the Interactive verified window once
+/// the projection becomes ready at that same generation.
+pub(crate) struct IndexedReferenceGroups {
+    pub(crate) groups: BoundedGroups,
+    pub(crate) memo_eligible: bool,
 }
 
 /// The ONE result-construction accounting rule.
@@ -735,7 +748,7 @@ pub fn page_aliases<G: QueryGraph>(graph: &G) -> Vec<(String, String)> {
     graph.with_pages(|pages| {
         let mut owned = Vec::new();
         for (entry, doc) in pages {
-            for alias in document_aliases(doc) {
+            for (alias, _) in document_alias_spellings(doc) {
                 owned.push((entry.path.clone(), alias, entry.name.clone()));
             }
         }
@@ -747,7 +760,7 @@ pub(crate) fn page_aliases_with_owners<G: QueryGraph>(graph: &G) -> Vec<(String,
     graph.with_pages(|pages| {
         let mut owned = Vec::new();
         for (entry, doc) in pages {
-            for alias in document_aliases(doc) {
+            for (alias, _) in document_alias_spellings(doc) {
                 owned.push((
                     entry.path.clone(),
                     alias,
@@ -971,6 +984,22 @@ fn page_property_block_parts(
     Some(block)
 }
 
+/// Verify a reference occurrence in the authored raw page preamble using the
+/// same page-property projection as the eventual reference walk. The SQLite
+/// candidate reader uses this before admitting a page row to an interactive
+/// window, so title tokens, prose preambles, and explicit-link syntax cannot
+/// consume a plain-occurrence slot that the walk would later reject.
+pub(crate) fn page_preamble_has_reference(
+    raw: &str,
+    is_org: bool,
+    names_norm: &[String],
+    kind: ReferenceKind,
+    config: &crate::config::Config,
+) -> bool {
+    page_property_block_parts("", PageKind::Page, is_org, raw)
+        .is_some_and(|block| block_has_reference(&block, names_norm, kind, config))
+}
+
 fn block_reference_evidence(
     block: &DocBlock,
     canonical: &str,
@@ -1037,7 +1066,7 @@ fn collect_reference_occurrences_bounded<G: QueryGraph>(
     max_rows: usize,
     max_bytes: usize,
 ) -> BoundedGroups {
-    let candidate_pages = graph.reference_candidate_pages(names_norm, kind);
+    let candidate_pages = graph.reference_candidate_pages(names_norm, self_page, kind);
     collect_reference_occurrences_in(
         graph,
         canonical,
@@ -1123,9 +1152,13 @@ fn collect_reference_occurrences_in<G: QueryGraph>(
             continue;
         }
         let slot = accumulator.page(&entry.rel_path, &entry.name, entry.kind, entry.date_key);
-        if let Some(mut block) = doc
-            .pre_block
-            .as_deref()
+        let page_owner_admitted = candidate_pages
+            .page_owners
+            .as_ref()
+            .is_none_or(|owners| owners.contains(std::path::Path::new(&entry.rel_path)));
+        if let Some(mut block) = page_owner_admitted
+            .then(|| doc.pre_block.as_deref())
+            .flatten()
             .and_then(|pre| page_property_block(entry, pre))
         {
             if accumulator.closed() {
@@ -1214,7 +1247,7 @@ pub(crate) fn reference_occurrences_narrowed_and_walked<G: QueryGraph>(
 ) -> (BoundedGroups, BoundedGroups, NarrowingReceipt) {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
-    let mut candidates = graph.reference_candidate_pages(&names_norm, kind);
+    let mut candidates = graph.reference_candidate_pages(&names_norm, &self_page, kind);
     reset_reference_classifications();
     let narrowed = collect_reference_occurrences_in(
         graph,
@@ -1303,8 +1336,11 @@ pub fn backlinks_bounded_indexed<G: QueryGraph>(
 ) -> Result<BoundedGroups, QueryExecutionError> {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
-    let candidate_pages =
-        graph.reference_candidate_pages_indexed(&names_norm, ReferenceKind::Explicit)?;
+    let candidate_pages = graph.reference_candidate_pages_indexed(
+        &names_norm,
+        &self_page,
+        ReferenceKind::Explicit,
+    )?;
     Ok(collect_reference_occurrences_in(
         graph,
         &canonical,
@@ -1652,11 +1688,27 @@ pub fn unlinked_refs_bounded_indexed<G: QueryGraph>(
     max_rows: usize,
     max_bytes: usize,
 ) -> Result<BoundedGroups, QueryExecutionError> {
+    let answer = unlinked_refs_bounded_indexed_with_source(graph, target, max_rows, max_bytes)?;
+    Ok(answer.groups)
+}
+
+pub(crate) fn unlinked_refs_bounded_indexed_with_source<G: QueryGraph>(
+    graph: &G,
+    target: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<IndexedReferenceGroups, QueryExecutionError> {
     let aliases = graph.page_aliases();
     let (canonical, names_norm, self_page) = graph_equivalent_page_names(graph, &aliases, target);
     let candidate_pages =
-        graph.reference_candidate_pages_indexed(&names_norm, ReferenceKind::Plain)?;
-    Ok(collect_reference_occurrences_in(
+        graph.reference_candidate_pages_indexed(&names_norm, &self_page, ReferenceKind::Plain)?;
+    // `indexed` also describes the Exhaustive SQL fallback used after an
+    // Interactive read declines or loses a readiness race. Only Interactive
+    // plain candidates carry page-owner provenance (including `Some(empty)`),
+    // so admission follows that actual source rather than the broader index
+    // bit.
+    let memo_eligible = candidate_pages.indexed && candidate_pages.page_owners.is_some();
+    let groups = collect_reference_occurrences_in(
         graph,
         &canonical,
         &self_page,
@@ -1665,7 +1717,11 @@ pub fn unlinked_refs_bounded_indexed<G: QueryGraph>(
         &candidate_pages,
         max_rows,
         max_bytes,
-    ))
+    );
+    Ok(IndexedReferenceGroups {
+        groups,
+        memo_eligible,
+    })
 }
 
 /// Target-scoped trace for bug reports. Membership comes from the exact same
@@ -3448,8 +3504,9 @@ fn finish_quick_switch_top(
 
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
+#[cfg(test)]
 pub fn quick_switch(graph: &impl QueryGraph, query: &str, limit: usize) -> Vec<PageEntry> {
-    crate::query_plan::legacy_page_search_entries(
+    crate::query_plan::pre_ready_page_search_entries(
         graph.list_pages(),
         graph.page_aliases_with_owners(),
         graph.referenced_page_names(),

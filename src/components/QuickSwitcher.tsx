@@ -164,6 +164,8 @@ export function QuickSwitcher(): JSX.Element {
           s.scope ? "quick-switch:current-page" : "quick-switch",
           false,
           s.scope ?? undefined,
+          undefined,
+          "ctrl_k",
         ), {
       signal: controller.signal,
       isCurrent,

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
 
 use crate::direct_projection::page_kind_from_sql;
+use crate::query::candidate::{expression_plan, CandidateMode, CandidatePlan};
 use crate::query::ir::FriendlyPageMatchScope;
 use crate::query::rank::QueryRankPrograms;
 use crate::query::results::{
@@ -21,10 +22,11 @@ use crate::query::results::{
     PAYLOAD_BATCH,
 };
 use crate::query::sql::{block_sort_expression, page_sort_expression, SortBinder};
+use crate::query::text::{framed_byte_len_and_text_sql, framed_pair_sql};
 use crate::query_plan::{
-    admitted_block_evidence, admitted_page_evidence, rank_block_text, rank_block_text_folded,
-    rank_page_text, ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation,
-    QueryHasMore, QueryHit, QueryPlan, QueryTarget,
+    admitted_block_evidence, admitted_page_evidence, rank_block_text_folded, rank_page_text,
+    ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation, QueryHasMore, QueryHit,
+    QueryPlan, QueryTarget, PAGE_OWNER_RANK_KEY_LEN, PAGE_RANK_KEY_LEN,
 };
 use crate::vocab::{BlockDto, PageEntry, PageKind};
 
@@ -79,8 +81,15 @@ fn check_lane(
 pub(crate) struct FriendlyReadCensus {
     pub(crate) page_descriptors: usize,
     pub(crate) block_descriptors: usize,
+    /// Rows yielded by the streamed interactive candidate statement.
+    pub(crate) block_candidate_visits: usize,
+    /// Candidate rows passed to the exact Rust verifier.
+    pub(crate) block_candidate_verifications: usize,
     /// Rows the block statement actually ranked (see the rank program).
     pub(crate) block_rank_evaluations: usize,
+    /// Physical title/alias and virtual-name candidates passed to the page
+    /// rank program. Each candidate produces both owner and global keys.
+    pub(crate) page_rank_evaluations: usize,
     pub(crate) ancestor_statements: usize,
     pub(crate) ancestor_rows: usize,
 }
@@ -91,7 +100,10 @@ thread_local! {
         const { std::cell::Cell::new(FriendlyReadCensus {
             page_descriptors: 0,
             block_descriptors: 0,
+            block_candidate_visits: 0,
+            block_candidate_verifications: 0,
             block_rank_evaluations: 0,
+            page_rank_evaluations: 0,
             ancestor_statements: 0,
             ancestor_rows: 0,
         }) };
@@ -141,15 +153,8 @@ fn note_friendly(update: impl FnOnce(&mut FriendlyReadCensus)) {
 }
 
 enum BoundBranch {
-    Pages {
-        branch: QueryBranch,
-        owner_rank: u64,
-        global_rank: u64,
-    },
-    Blocks {
-        branch: QueryBranch,
-        rank: u64,
-    },
+    Pages { branch: QueryBranch, rank: u64 },
+    Blocks { branch: QueryBranch, rank: u64 },
 }
 
 /// Execute the compiled Friendly plan on one immutable main projection image.
@@ -185,36 +190,32 @@ pub(crate) fn read_friendly_results(
     for branch in &plan.branches {
         match branch.target {
             QueryTarget::Pages => {
-                let owner_plan = Arc::clone(&plan);
-                let owner_branch = branch.clone();
-                let owner_rank = programs.bind(move |candidate| {
+                let rank_plan = Arc::clone(&plan);
+                let rank_branch = branch.clone();
+                let rank = programs.bind_byte_len_and_text(move |physical_name_len, candidate| {
                     #[cfg(test)]
                     run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
-                    Ok(rank_page_text(&owner_plan, &owner_branch, candidate)
-                        .map(|rank| rank.owner_order_key().to_vec()))
-                });
-                let global_plan = Arc::clone(&plan);
-                let global_branch = branch.clone();
-                let global_rank = programs.bind_pair(move |physical_name, winning_text| {
                     #[cfg(test)]
-                    run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
-                    Ok(rank_page_text(&global_plan, &global_branch, winning_text)
-                        .map(|rank| rank.global_order_key(physical_name).to_vec()))
+                    note_friendly(|census| census.page_rank_evaluations += 1);
+                    Ok(
+                        rank_page_text(&rank_plan, &rank_branch, candidate).map(|rank| {
+                            let mut key = rank.owner_order_key().to_vec();
+                            key.extend_from_slice(
+                                &rank.global_order_key_for_name_len(physical_name_len),
+                            );
+                            key
+                        }),
+                    )
                 });
                 branches.push(BoundBranch::Pages {
                     branch: branch.clone(),
-                    owner_rank,
-                    global_rank,
+                    rank,
                 });
             }
             QueryTarget::Blocks => {
                 let rank_plan = Arc::clone(&plan);
                 let rank_branch = branch.clone();
-                // The fold arrives from the projection's own
-                // `blocks.query_visible_folded` rather than being recomputed for
-                // every candidate row: on a 605k-block graph the per-row
-                // `canonical_fold` was 72-77% of total search time.
-                let rank = programs.bind_pair(move |visible, folded| {
+                let rank = programs.bind_pair(move |raw, path| {
                     #[cfg(test)]
                     run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
                     // One per ROW the statement ranked, which is the size of the
@@ -224,10 +225,19 @@ pub(crate) fn read_friendly_results(
                     // the same rows and rank wildly different numbers of them.
                     #[cfg(test)]
                     note_friendly(|census| census.block_rank_evaluations += 1);
-                    Ok(
-                        rank_block_text_folded(&rank_plan, &rank_branch, visible, folded)
-                            .map(|rank| rank.order_key().to_vec()),
+                    let projection =
+                        crate::query::text::visible_projection_from_raw_path(raw, path);
+                    Ok(rank_block_text_folded(
+                        &rank_plan,
+                        &rank_branch,
+                        &projection.visible,
+                        &projection.visible_lower,
                     )
+                    .map(|rank| {
+                        let mut key = rank.order_key().to_vec();
+                        key.extend_from_slice(projection.visible.as_bytes());
+                        key
+                    }))
                 });
                 branches.push(BoundBranch::Blocks {
                     branch: branch.clone(),
@@ -243,11 +253,37 @@ pub(crate) fn read_friendly_results(
     let page_sort_program = plan
         .page_view()
         .filter(|view| !view.sort.is_empty())
-        .map(|_| programs.bind_unicode_lowercase());
+        .map(|_| FriendlySortPrograms {
+            lowercase: programs.bind_unicode_lowercase(),
+            visible: programs.bind_pair(|raw, path| {
+                let visible = crate::query::text::visible_from_raw_path(raw, path);
+                Ok(Some(
+                    visible
+                        .split('\n')
+                        .next()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .into_bytes(),
+                ))
+            }),
+        });
     let block_sort_program = plan
         .block_view()
         .filter(|view| !view.sort.is_empty())
-        .map(|_| programs.bind_unicode_lowercase());
+        .map(|_| FriendlySortPrograms {
+            lowercase: programs.bind_unicode_lowercase(),
+            visible: programs.bind_pair(|raw, path| {
+                let visible = crate::query::text::visible_from_raw_path(raw, path);
+                Ok(Some(
+                    visible
+                        .split('\n')
+                        .next()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .into_bytes(),
+                ))
+            }),
+        });
     // Page membership by CONTENT asks the Blocks section's own predicate of a
     // page's blocks, so it reuses that branch's already-bound rank program
     // rather than compiling a second copy of the same predicate.
@@ -283,18 +319,13 @@ pub(crate) fn read_friendly_results(
         }) {
             check_lane(snapshot, &inputs.lane)?;
             match bound {
-                BoundBranch::Pages {
-                    branch,
-                    owner_rank,
-                    global_rank,
-                } => {
+                BoundBranch::Pages { branch, rank } => {
                     let (mut section, more) = read_pages(
                         snapshot,
                         inputs.graph_root,
                         &plan,
                         branch,
-                        *owner_rank,
-                        *global_rank,
+                        *rank,
                         content.as_ref().map(|(branch, rank)| (branch, *rank)),
                         page_sort_program,
                         &inputs.lane,
@@ -344,16 +375,22 @@ pub(crate) fn read_friendly_results(
 /// vocabulary (`sheet/fields.ts::querySortFieldName`) does not include recency
 /// for either family.
 struct FriendlySortBinder<'a> {
-    program: u64,
+    programs: FriendlySortPrograms,
     params: &'a mut Vec<PhysicalQueryValue>,
     lowercase: Option<String>,
     keys: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy)]
+struct FriendlySortPrograms {
+    lowercase: u64,
+    visible: u64,
+}
+
 impl<'a> FriendlySortBinder<'a> {
-    fn new(program: u64, params: &'a mut Vec<PhysicalQueryValue>) -> Self {
+    fn new(programs: FriendlySortPrograms, params: &'a mut Vec<PhysicalQueryValue>) -> Self {
         Self {
-            program,
+            programs,
             params,
             lowercase: None,
             keys: HashMap::new(),
@@ -367,7 +404,7 @@ impl SortBinder for FriendlySortBinder<'_> {
             return bound.clone();
         }
         self.params
-            .push(PhysicalQueryValue::Integer(self.program as i64));
+            .push(PhysicalQueryValue::Integer(self.programs.lowercase as i64));
         let bound = format!("?{}", self.params.len());
         self.lowercase = Some(bound.clone());
         bound
@@ -383,6 +420,17 @@ impl SortBinder for FriendlySortBinder<'_> {
         bound
     }
 
+    fn visible_lowercase(&mut self, block_alias: &str, _page_alias: &str) -> String {
+        self.params
+            .push(PhysicalQueryValue::Integer(self.programs.visible as i64));
+        let program = self.params.len();
+        let framed = framed_pair_sql(
+            &format!("{block_alias}.raw_content"),
+            &format!("{block_alias}.path"),
+        );
+        format!("tine_query_rank(?{program}, {framed})")
+    }
+
     fn has_recency(&self) -> bool {
         false
     }
@@ -393,7 +441,7 @@ impl SortBinder for FriendlySortBinder<'_> {
 /// its established relevance order.
 fn sort_terms(
     view: Option<&crate::query::ir::ViewSettings>,
-    program: Option<u64>,
+    program: Option<FriendlySortPrograms>,
     params: &mut Vec<PhysicalQueryValue>,
     mut expression: impl FnMut(&str, &mut dyn SortBinder) -> Option<String>,
 ) -> Vec<String> {
@@ -436,11 +484,6 @@ fn limit_clause(limit: usize, params: &mut Vec<PhysicalQueryValue>) -> String {
     format!(" LIMIT ?{}", params.len())
 }
 
-/// SQL expression consumed by `QueryRankPrograms::bind_pair`.
-fn framed_pair_sql(left: &str, right: &str) -> String {
-    format!("CAST(length(CAST({left} AS BLOB)) AS TEXT) || ':' || {left} || {right}")
-}
-
 /// One admitted page candidate, before its evidence and payload are built.
 struct PageDescriptor {
     /// Which membership source admitted it: names/aliases, or contained block
@@ -454,6 +497,9 @@ struct PageDescriptor {
     journal_day: Option<i64>,
     path: String,
     matched_text: String,
+    /// Present only for content-derived page candidates, from the same
+    /// operation-local projection as `matched_text`.
+    matched_text_lower: Option<String>,
     matched_alias: bool,
     rank_key: Vec<u8>,
     /// The producer's stored payload facts, selected only on the
@@ -461,16 +507,33 @@ struct PageDescriptor {
     payload: Option<(usize, usize)>,
 }
 
+const VIRTUAL_REFERENCE_CHOICES_CTE: &str = "reference_choices AS (\
+         SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
+             PARTITION BY n.key ORDER BY n.raw, n.key, n.name_id\
+         ) AS name_choice \
+         FROM names n WHERE EXISTS (\
+             SELECT 1 FROM reference_postings r \
+             INDEXED BY reference_postings_navigation_names_idx \
+             WHERE r.target_name_id = n.name_id \
+               AND r.target_type = 0 AND r.reference_kind <= 4\
+         ) AND NOT EXISTS (SELECT 1 FROM real_identities i \
+                           WHERE i.name_key = n.key)\
+     )";
+
+// `names` is UNIQUE(key, raw), so `name_id` can only break a tie between rows
+// already identical for the user-visible spelling and identity. It replaces
+// the old occurrence-row `source_page_id` tie without changing which spelling
+// wins, while the indexed EXISTS stops after the first eligible occurrence.
+
 #[allow(clippy::too_many_arguments)]
 fn read_pages(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     graph_root: &Path,
     plan: &QueryPlan,
     branch: &QueryBranch,
-    owner_rank: u64,
-    global_rank: u64,
+    rank: u64,
     content: Option<(&QueryBranch, u64)>,
-    sort_program: Option<u64>,
+    sort_program: Option<FriendlySortPrograms>,
     lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
     if branch.limit == 0 {
@@ -494,12 +557,9 @@ fn read_pages(
         return Ok((Vec::new(), false));
     }
     let hydrate = plan.page_view().is_some();
-    let mut params = vec![
-        PhysicalQueryValue::Integer(owner_rank as i64),
-        PhysicalQueryValue::Integer(global_rank as i64),
-    ];
-    let framed_physical = framed_pair_sql("w.name", "w.matched_text");
-    let framed_virtual = framed_pair_sql("v.raw_name", "v.raw_name");
+    let mut params = vec![PhysicalQueryValue::Integer(rank as i64)];
+    let framed_physical = framed_byte_len_and_text_sql("c.name", "c.matched_text");
+    let framed_virtual = framed_byte_len_and_text_sql("v.raw_name", "v.raw_name");
     // Names and aliases: unchanged selection, ranking, owner-local override and
     // virtual reference-name suggestions. `match_source` is a constant 0 here,
     // so a Names search orders exactly as it did before this packet.
@@ -519,7 +579,21 @@ fn read_pages(
     // `reference_postings_navigation_names_idx` (tine-storage v0.24.0), which
     // carries no path and no page id, that coincidence broke. Keep both sides
     // keyed on `raw_name` or the two lists will disagree again.
+    let owner_partition = if plan.page_name_suggestions() {
+        // Autocomplete keeps every distinct authored spelling for an owner so
+        // an alias is selectable even when the canonical title also matches.
+        "r.page_id, r.matched_text"
+    } else {
+        // Friendly search remains one coherent row per physical owner.
+        "r.page_id"
+    };
+    let physical_tie_key = if plan.page_name_suggestions() {
+        "w.path || char(0) || w.matched_text"
+    } else {
+        "w.path"
+    };
     let names_ctes = if want_names {
+        let reference_choices = VIRTUAL_REFERENCE_CHOICES_CTE;
         format!(
             "page_text_candidates(page_id, name, text_kind, journal_day, path, \
                   matched_text, source_kind, source_ordinal) AS (\
@@ -527,49 +601,45 @@ fn read_pages(
                     pn.raw, 0, -1 FROM pages p JOIN names pn ON pn.name_id = p.name_id \
              UNION ALL \
              SELECT p.page_id, pn.raw, p.text_kind, p.journal_day, p.path, \
-                    an.key, 1, MIN(a.ordinal) \
+                    an.raw, 1, MIN(a.ordinal) \
              FROM reference_alias_declarations a \
              JOIN pages p ON p.page_id = a.source_page_id \
              JOIN names pn ON pn.name_id = p.name_id \
              JOIN names an ON an.name_id = a.alias_name_id \
              WHERE a.source_entity_type = 0 AND a.source_entity_id = a.source_page_id \
-             GROUP BY p.page_id, a.alias_name_id\
+             GROUP BY p.page_id, a.alias_name_id, an.raw\
          ), ranked AS MATERIALIZED (\
-             SELECT c.*, tine_query_rank(?1, c.matched_text) AS owner_key \
+             SELECT c.*, tine_query_rank(?1, {framed_physical}) AS rank_key \
              FROM page_text_candidates c\
          ), choices AS (\
              SELECT r.*, ROW_NUMBER() OVER (\
-                 PARTITION BY r.page_id \
-                 ORDER BY r.owner_key, r.source_kind, r.source_ordinal\
+                 PARTITION BY {owner_partition} \
+                 ORDER BY substr(r.rank_key, 1, {owner_rank_len}), \
+                          r.source_kind, r.source_ordinal\
              ) AS owner_choice \
-             FROM ranked r WHERE r.owner_key IS NOT NULL\
+             FROM ranked r WHERE r.rank_key IS NOT NULL\
          ), physical AS MATERIALIZED (\
              SELECT 0 AS match_source, 0 AS candidate_kind, w.page_id, w.name, w.text_kind, \
                     w.journal_day, w.path, w.matched_text, w.source_kind, \
-                    tine_query_rank(?2, {framed_physical}) AS global_key, w.path AS tie_key \
+                    substr(w.rank_key, {global_rank_at}, {global_rank_len}) AS global_key, \
+                    {physical_tie_key} AS tie_key \
              FROM choices w WHERE w.owner_choice = 1\
          ), real_identities(name_key) AS (\
              SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
              UNION SELECT n.key FROM reference_alias_declarations a \
              JOIN names n ON n.name_id = a.alias_name_id\
-         ), reference_choices AS (\
-             SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
-                 PARTITION BY n.key \
-                 ORDER BY n.raw, n.key, r.source_page_id\
-             ) AS name_choice \
-             FROM reference_postings r \
-             JOIN names n ON n.name_id = r.target_name_id \
-             WHERE r.target_type = 0 AND r.reference_kind <= 4 \
-               AND NOT EXISTS (SELECT 1 FROM real_identities i \
-                               WHERE i.name_key = n.key)\
-         ), virtual AS MATERIALIZED (\
+         ), {reference_choices}, virtual AS MATERIALIZED (\
              SELECT 0 AS match_source, 1 AS candidate_kind, NULL AS page_id, v.raw_name AS name, \
                     0 AS text_kind, NULL AS journal_day, '' AS path, \
                     v.raw_name AS matched_text, 0 AS source_kind, \
-                    tine_query_rank(?2, {framed_virtual}) AS global_key, \
+                    substr(tine_query_rank(?1, {framed_virtual}), \
+                           {global_rank_at}, {global_rank_len}) AS global_key, \
                     v.normalized_name AS tie_key \
              FROM reference_choices v WHERE v.name_choice = 1\
-         )"
+         )",
+            owner_rank_len = PAGE_OWNER_RANK_KEY_LEN,
+            global_rank_at = PAGE_OWNER_RANK_KEY_LEN + 1,
+            global_rank_len = PAGE_RANK_KEY_LEN,
         )
     } else {
         String::new()
@@ -586,10 +656,17 @@ fn read_pages(
     // blocks and the same candidate set is sound for it. Unlike the Blocks
     // statement this join is INNER, so it never carried a textless arm and
     // driving it changes no result at all.
+    let interactive_content_ids = match (content, plan.candidate_mode()) {
+        (Some((content_branch, _)), CandidateMode::Interactive { window }) => Some(
+            interactive_verified_block_ids(snapshot, plan, content_branch, window, lane)?,
+        ),
+        _ => None,
+    };
     let content_block_source = match content {
-        Some((content_branch, _)) => {
-            indexed_block_source(snapshot, &mut params, &content_branch.predicate)?
-        }
+        Some((content_branch, _)) => match interactive_content_ids.as_deref() {
+            Some(ids) => verified_id_block_source(&mut params, ids),
+            None => indexed_block_source(&mut params, &content_branch.predicate),
+        },
         None => "blocks b".to_string(),
     };
     let content_ctes = content.map(|(_, rank)| {
@@ -597,7 +674,9 @@ fn read_pages(
         let program = params.len();
         // Page-by-content reuses the Blocks branch's already-bound program, so
         // it must frame its pair exactly as that statement does.
-        let framed_block_text = framed_pair_sql("bt.query_visible", "b.query_visible_folded");
+        let framed_block_text = crate::query::text::framed_pair_sql("bt.content", "p.path");
+        let verified_window = String::new();
+        let ranked_hint = " MATERIALIZED";
         // In Both, a page that also matched by name keeps its NAMES winner:
         // the union is by physical identity, and the name evidence is the
         // stronger statement about why the page is in the answer.
@@ -607,23 +686,27 @@ fn read_pages(
             ""
         };
         format!(
-            "content_ranked AS MATERIALIZED (\
-                 SELECT b.page_id, bt.query_visible AS matched_text, \
+            "content_ranked AS{ranked_hint} (\
+                 SELECT b.block_id, b.page_id, bt.content AS matched_text, p.path AS matched_path, \
                         tine_query_rank(?{program}, {framed_block_text}) AS content_key \
-                 FROM {content_block_source} JOIN block_text bt ON bt.block_id = b.block_id\
+                 FROM {content_block_source} JOIN block_text bt ON bt.block_id = b.block_id \
+                 JOIN pages p ON p.page_id = b.page_id\
+             ), content_verified AS MATERIALIZED (\
+                 SELECT * FROM content_ranked WHERE content_key IS NOT NULL{verified_window}\
              ), content_choices AS (\
                  SELECT k.*, ROW_NUMBER() OVER (\
-                     PARTITION BY k.page_id ORDER BY k.content_key, k.matched_text\
+                     PARTITION BY k.page_id ORDER BY k.content_key\
                  ) AS content_choice \
-                 FROM content_ranked k WHERE k.content_key IS NOT NULL{dedupe}\
+                 FROM content_verified k WHERE 1{dedupe}\
              ), content AS MATERIALIZED (\
                  SELECT 1 AS match_source, 0 AS candidate_kind, p.page_id, pn.raw AS name, p.text_kind, \
                         p.journal_day, p.path, k.matched_text, 0 AS source_kind, \
-                        k.content_key AS global_key, p.path AS tie_key \
+                        substr(k.content_key, 1, {rank_len}) AS global_key, k.content_key AS tie_key \
                  FROM content_choices k JOIN pages p ON p.page_id = k.page_id \
                  JOIN names pn ON pn.name_id = p.name_id \
                  WHERE k.content_choice = 1\
-             )"
+             )",
+            rank_len = crate::query_plan::BLOCK_RANK_KEY_LEN,
         )
     });
     let mut ctes = Vec::new();
@@ -718,7 +801,7 @@ fn read_pages(
     let mut hits = Vec::with_capacity(descriptors.len());
     for mut descriptor in descriptors {
         check_lane(snapshot, lane)?;
-        if let Some(page_id) = descriptor.page_id {
+        if let Some(page_id) = descriptor.page_id.filter(|_| !plan.page_name_suggestions()) {
             if !seen_physical.insert(page_id) {
                 return Err(ResultReadError::Corrupt(
                     "one physical page appears twice in Friendly results".into(),
@@ -731,12 +814,20 @@ fn read_pages(
                     "a content page candidate arrived without a block branch".into(),
                 )
             })?;
-            let rank =
-                rank_block_text(plan, block_branch, &descriptor.matched_text).ok_or_else(|| {
-                    ResultReadError::Corrupt(
-                        "a selected page's block no longer satisfies its rank program".into(),
-                    )
-                })?;
+            let matched_text_lower = descriptor.matched_text_lower.as_deref().ok_or_else(|| {
+                ResultReadError::Corrupt("a selected content page has no folded block text".into())
+            })?;
+            let rank = rank_block_text_folded(
+                plan,
+                block_branch,
+                &descriptor.matched_text,
+                matched_text_lower,
+            )
+            .ok_or_else(|| {
+                ResultReadError::Corrupt(
+                    "a selected page's block no longer satisfies its rank program".into(),
+                )
+            })?;
             if descriptor.rank_key != rank.order_key() {
                 return Err(ResultReadError::Corrupt(
                     "a selected content page rank disagrees with its compiled plan".into(),
@@ -868,6 +959,13 @@ fn decode_page_descriptor(
     } else {
         None
     };
+    let matched = text(row, 7, "Friendly matched page text")?;
+    let (matched_text, matched_text_lower) = if from_content {
+        let projection = crate::query::text::visible_projection_from_raw_path(&matched, &path);
+        (projection.visible, Some(projection.visible_lower))
+    } else {
+        (matched, None)
+    };
     Ok(PageDescriptor {
         from_content,
         page_id,
@@ -875,7 +973,8 @@ fn decode_page_descriptor(
         kind,
         journal_day,
         path,
-        matched_text: text(row, 7, "Friendly matched page text")?,
+        matched_text,
+        matched_text_lower,
         matched_alias,
         rank_key,
         payload,
@@ -890,77 +989,12 @@ struct BlockDescriptor {
     kind: PageKind,
     path: String,
     visible: String,
+    visible_lower: String,
     result_id: String,
     estimated_bytes: usize,
     tag_count: usize,
     property_count: usize,
     rank_key: Vec<u8>,
-}
-
-/// The trigram candidate needle for one Friendly BLOCK branch, or `None` when
-/// the branch supplies none — which leaves the read unbounded, exactly as every
-/// Friendly block read was before this bound existed.
-///
-/// Soundness, in one line per arm: a block matches only through
-/// `TextField::VisibleContent` (`block_relevance` returns `None` for any other
-/// field), `Contains` and `Phrase` both require the predicate's whole value to
-/// appear in the folded visible text, and the needle is a run OF that value —
-/// so every block the exact predicate admits contains the needle too. `And`
-/// requires every child, so bounding by one child can drop no match. `Or`,
-/// `Not`, `Regex`, `Fuzzy` and `Never` supply nothing and stay unbounded: the
-/// fallback direction is the one that cannot lose a row.
-fn block_candidate_needle(expr: &crate::query_plan::QueryExpr) -> Option<&str> {
-    use crate::query_plan::{QueryExpr, TextField, TextMatchMode};
-    match expr {
-        QueryExpr::Text(pred)
-            if pred.field == TextField::VisibleContent
-                && matches!(pred.mode, TextMatchMode::Contains | TextMatchMode::Phrase) =>
-        {
-            crate::query::sql::fts_indexable_run(&pred.value)
-        }
-        QueryExpr::And(children) => children.iter().find_map(block_candidate_needle),
-        _ => None,
-    }
-}
-
-/// How many candidate blocks still make the trigram index worth driving from.
-///
-/// Above this the index stops being a shortcut: the driven plan re-reads most
-/// of the table one indexed row at a time instead of scanning it once, which
-/// is SLOWER than the scan it replaced. Measured on a 600k-block projection —
-/// a needle matching 660 blocks reads in 6 ms driven against 1243 ms scanned,
-/// and a needle EVERY block contains costs 2045 ms driven against 1246 ms
-/// scanned. The capped probe that chooses between them costs 1-4 ms at every
-/// selectivity, including the run that hits the cap.
-const BLOCK_CANDIDATE_CAP: usize = 20_000;
-
-/// `true` when the trigram index admits at most [`BLOCK_CANDIDATE_CAP`] blocks
-/// for `literal`. The `LIMIT` is what keeps this cheap on the needle that
-/// matches everything: it stops counting at the cap instead of walking the
-/// whole index to learn a number we would only compare against the cap.
-fn candidate_count_within_cap(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
-    literal: &str,
-) -> Result<bool, ResultReadError> {
-    let sql = format!(
-        "SELECT COUNT(*) FROM (\
-           SELECT fo.entity_id FROM search_substring_fts sf \
-           JOIN search_fts_owners fo ON fo.rowid = sf.rowid \
-           WHERE sf.normalized_text MATCH ?1 AND fo.entity_type = {} LIMIT ?2)",
-        crate::query::sql::OWNER_BLOCK
-    );
-    let params = [
-        PhysicalQueryValue::Text(literal.to_owned()),
-        PhysicalQueryValue::Integer(BLOCK_CANDIDATE_CAP as i64 + 1),
-    ];
-    let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
-        .map_err(|error| sql_or_cancelled(snapshot, error))?;
-    Ok(match rows.first().and_then(|row| row.first()) {
-        Some(PhysicalQueryValue::Integer(count)) => {
-            *count >= 0 && (*count as usize) <= BLOCK_CANDIDATE_CAP
-        }
-        _ => false,
-    })
 }
 
 /// `blocks b`, or the trigram index driving it, for one block predicate.
@@ -976,45 +1010,48 @@ fn candidate_count_within_cap(
 /// `WHERE` clause the index only skips the rank call, so SQLite still walks
 /// every row; as the driving table it reads the candidates and nothing else.
 fn indexed_block_source(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
     params: &mut Vec<PhysicalQueryValue>,
     predicate: &crate::query_plan::QueryExpr,
-) -> Result<String, ResultReadError> {
-    const UNBOUNDED: &str = "blocks b";
-    let Some(needle) = block_candidate_needle(predicate) else {
-        return Ok(UNBOUNDED.to_string());
-    };
-    let literal = crate::query::sql::fts_phrase_literal(needle);
-    if !candidate_count_within_cap(snapshot, &literal)? {
-        return Ok(UNBOUNDED.to_string());
+) -> String {
+    match expression_plan(predicate) {
+        CandidatePlan::Scan => "blocks b".to_string(),
+        CandidatePlan::Index { match_expression } => {
+            params.push(PhysicalQueryValue::Text(match_expression));
+            format!(
+                "(SELECT rowid AS block_id FROM search_fts \
+                   WHERE search_fts MATCH ?{} ORDER BY rowid DESC) c \
+                 JOIN blocks b ON b.block_id = c.block_id",
+                params.len()
+            )
+        }
     }
-    params.push(PhysicalQueryValue::Text(literal));
-    Ok(format!(
-        "(SELECT fo.entity_id AS block_id FROM search_substring_fts sf \
-           JOIN search_fts_owners fo ON fo.rowid = sf.rowid \
-           WHERE sf.normalized_text MATCH ?{} AND fo.entity_type = {}) c \
-         JOIN blocks b ON b.block_id = c.block_id",
-        params.len(),
-        crate::query::sql::OWNER_BLOCK
-    ))
 }
 
-fn read_blocks(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
-    identity: &ResultIdentity,
-    plan: &QueryPlan,
-    branch: &QueryBranch,
-    rank_program: u64,
-    sort_program: Option<u64>,
-    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
-    if branch.limit == 0 {
-        return Ok((Vec::new(), false));
+fn verified_id_block_source(params: &mut Vec<PhysicalQueryValue>, ids: &[i64]) -> String {
+    if ids.is_empty() {
+        return "(SELECT block_id FROM blocks WHERE 0) c \
+                JOIN blocks b ON b.block_id = c.block_id"
+            .to_string();
     }
-    let mut params = vec![PhysicalQueryValue::Integer(rank_program as i64)];
-    let scope = plan.page_scope();
-    let mut conditions: Vec<String> = Vec::new();
-    match scope {
+    let mut placeholders = Vec::with_capacity(ids.len());
+    for id in ids {
+        params.push(PhysicalQueryValue::Integer(*id));
+        placeholders.push(format!("?{}", params.len()));
+    }
+    format!(
+        "(SELECT block_id FROM blocks WHERE block_id IN ({})) c \
+         JOIN blocks b ON b.block_id = c.block_id",
+        placeholders.join(", ")
+    )
+}
+
+/// Bind the one established current-page membership rule for any block
+/// candidate statement. The interactive cursor must apply it before counting
+/// verified matches; applying it only to the later ranked winners lets newer
+/// out-of-scope rows consume the whole window.
+fn block_scope_conditions(params: &mut Vec<PhysicalQueryValue>, plan: &QueryPlan) -> Vec<String> {
+    let mut conditions = Vec::new();
+    match plan.page_scope() {
         Some(scope) if scope.path.is_some() => {
             params.push(PhysicalQueryValue::Text(scope.path.clone().unwrap()));
             conditions.push(format!("p.path = ?{}", params.len()));
@@ -1033,6 +1070,109 @@ fn read_blocks(
         }
         None => {}
     }
+    conditions
+}
+
+/// Consume rowid-descending candidates until `window` exact matches survive.
+/// This is deliberately a Rust cursor: putting the exact callback in a
+/// materialized SQL CTE evaluates the complete candidate set before LIMIT and
+/// turns a verified-match window back into graph-sized work.
+fn interactive_verified_block_ids(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    window: usize,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<Vec<i64>, ResultReadError> {
+    let mut params = Vec::new();
+    let source = indexed_block_source(&mut params, &branch.predicate);
+    let conditions = block_scope_conditions(&mut params, plan);
+    let scope_sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT b.block_id, bt.content, p.path \
+         FROM {source} \
+         LEFT JOIN block_text bt ON bt.block_id = b.block_id \
+         LEFT JOIN pages p ON p.page_id = b.page_id \
+         LEFT JOIN names p_name ON p_name.name_id = p.name_id{scope_sql} \
+         ORDER BY b.block_id DESC"
+    );
+    let mut ids = Vec::with_capacity(window);
+    let mut damage = None;
+    let cancellation = snapshot.cancellation();
+    crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
+        #[cfg(test)]
+        note_friendly(|census| census.block_candidate_visits += 1);
+        if lane.as_ref().is_some_and(|cancelled| cancelled()) {
+            cancellation.cancel();
+        }
+        if cancellation.is_cancelled() {
+            return Err(tine_storage::sqlite::MaterializationError::Incomplete(
+                "Friendly candidate read cancelled".into(),
+            ));
+        }
+        let block_id = match row.first() {
+            Some(PhysicalQueryValue::Integer(id)) => *id,
+            _ => {
+                damage = Some("interactive candidate has no block coordinate".into());
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        };
+        let raw = match row.get(1) {
+            Some(PhysicalQueryValue::Text(raw)) => raw,
+            _ => {
+                damage = Some(format!(
+                    "interactive candidate block {block_id} has no raw text"
+                ));
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        };
+        let path = match row.get(2) {
+            Some(PhysicalQueryValue::Text(path)) => path,
+            _ => {
+                damage = Some(format!(
+                    "interactive candidate block {block_id} has no page path"
+                ));
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        };
+        #[cfg(test)]
+        note_friendly(|census| census.block_candidate_verifications += 1);
+        let projection = crate::query::text::visible_projection_from_raw_path(raw, path);
+        if rank_block_text_folded(plan, branch, &projection.visible, &projection.visible_lower)
+            .is_some()
+        {
+            ids.push(block_id);
+            if ids.len() == window {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })
+    .map_err(|error| sql_or_cancelled(snapshot, error))?;
+    if let Some(message) = damage {
+        return Err(ResultReadError::Corrupt(message));
+    }
+    Ok(ids)
+}
+
+fn read_blocks(
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+    identity: &ResultIdentity,
+    plan: &QueryPlan,
+    branch: &QueryBranch,
+    rank_program: u64,
+    sort_program: Option<FriendlySortPrograms>,
+    lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<(Vec<QueryHit>, bool), ResultReadError> {
+    if branch.limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let mut params = vec![PhysicalQueryValue::Integer(rank_program as i64)];
+    let conditions = block_scope_conditions(&mut params, plan);
     // Drive the read from the trigram index instead of filtering a full scan
     // with it. The difference is the whole point: as a WHERE clause the index
     // only skips the rank call, so SQLite still scans every block in scope and
@@ -1045,13 +1185,17 @@ fn read_blocks(
     // the read remain the exact predicate on both paths, so a needle that is
     // wrong shows up as a MISSING result, never as a wrong one.
     //
-    // ONE behaviour differs from the scan, deliberately: a block whose text row
-    // has vanished is not in the index either, so the driven read omits it
-    // rather than surfacing it through `missing_text = 1`. The scan path below
-    // still carries that arm. The Friendly damage contract
-    // (`friendly_tests.rs`) deletes a result row and cross-owns a page — both
-    // leave the block's text, so both still reach their checks here.
-    let block_source = indexed_block_source(snapshot, &mut params, &branch.predicate)?;
+    // Candidate narrowing never weakens the damage contract. The streamed
+    // interactive cursor LEFT-joins and validates text/page rows before it
+    // counts W; this ranked statement likewise keeps its LEFT joins and orders
+    // `missing_text` first so descriptor decoding fails the whole read.
+    let block_source = match plan.candidate_mode() {
+        CandidateMode::Exhaustive => indexed_block_source(&mut params, &branch.predicate),
+        CandidateMode::Interactive { window } => {
+            let ids = interactive_verified_block_ids(snapshot, plan, branch, window, lane)?;
+            verified_id_block_source(&mut params, &ids)
+        }
+    };
     let scope_sql = if conditions.is_empty() {
         String::new()
     } else {
@@ -1066,36 +1210,40 @@ fn read_blocks(
         |field, binder| block_sort_expression(field, "r", "r", "", binder),
     );
     let order = if authored.is_empty() {
-        "r.rank_key, r.path COLLATE BINARY, r.preorder".to_string()
+        format!(
+            "substr(r.rank_key, 1, {}), r.path COLLATE BINARY, r.preorder",
+            crate::query_plan::BLOCK_RANK_KEY_LEN
+        )
     } else {
         format!("{}, r.path COLLATE BINARY, r.preorder", authored.join(", "))
     };
     let limit = limit_clause(branch.limit, &mut params);
-    // `(exact visible text, its stored fold)` framed for `bind_pair`, so ranking
-    // this statement's candidate rows does not recompute the fold per row. Both
-    // columns are `TEXT NOT NULL` and `b` is the driving table here, so the
-    // framing can never see a NULL operand and silently drop a row; the
-    // `bt.block_id IS NULL` arm below keeps textless blocks out of the call.
-    let framed_block_text = framed_pair_sql("bt.query_visible", "b.query_visible_folded");
+    let framed_block_text = crate::query::text::framed_pair_sql("bt.content", "p.path");
+    let verified_window = String::new();
+    let ranked_hint = " MATERIALIZED";
     let sql = format!(
-        "WITH ranked AS MATERIALIZED (\
+        "WITH ranked AS{ranked_hint} (\
              SELECT b.block_id, b.page_id, b.parent_block_id, b.order_key, \
-                    bt.query_visible, p_name.raw AS name, p.text_kind, p.path, \
+                    bt.content AS raw_content, p_name.raw AS name, p.text_kind, p.path, \
                     b.page_id AS result_page_id, b.preorder, b.result_id, b.estimated_bytes, b.tag_count, \
                     b.property_count, \
-                    CASE WHEN bt.block_id IS NULL THEN zeroblob(1) \
+                    CASE WHEN bt.block_id IS NULL OR p.page_id IS NULL THEN zeroblob(1) \
                          ELSE tine_query_rank(?1, {framed_block_text}) END AS rank_key, \
-                    CASE WHEN bt.block_id IS NULL THEN 1 ELSE 0 END AS missing_text \
+                    CASE WHEN bt.block_id IS NULL OR p.page_id IS NULL THEN 1 ELSE 0 END AS missing_text \
              FROM {block_source} \
              LEFT JOIN block_text bt ON bt.block_id = b.block_id \
              LEFT JOIN pages p ON p.page_id = b.page_id \
              LEFT JOIN names p_name ON p_name.name_id = p.name_id{scope_sql}\
+         ), verified AS MATERIALIZED (\
+             SELECT * FROM ranked r WHERE r.missing_text = 1 OR r.rank_key IS NOT NULL{verified_window}\
          ) \
-         SELECT r.block_id, r.page_id, r.parent_block_id, r.order_key, r.query_visible, \
+         SELECT r.block_id, r.page_id, r.parent_block_id, r.order_key, r.raw_content, \
                 r.name, r.text_kind, r.path, r.result_page_id, r.preorder, r.result_id, \
-                r.estimated_bytes, r.tag_count, r.property_count, r.rank_key \
-         FROM ranked r WHERE r.missing_text = 1 OR r.rank_key IS NOT NULL \
+                r.estimated_bytes, r.tag_count, r.property_count, \
+                substr(r.rank_key, 1, {rank_len}) \
+         FROM verified r \
          ORDER BY r.missing_text DESC, {order}{limit}"
+        , rank_len = crate::query_plan::BLOCK_RANK_KEY_LEN
     );
     let rows = crate::query::projection_sql::run(snapshot, &sql, &params)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
@@ -1116,9 +1264,13 @@ fn read_blocks(
                 "one physical block appears twice in Friendly results".into(),
             ));
         }
-        let expected = rank_block_text(plan, branch, &descriptor.visible).ok_or_else(|| {
-            ResultReadError::Corrupt("a selected block no longer satisfies its rank program".into())
-        })?;
+        let expected =
+            rank_block_text_folded(plan, branch, &descriptor.visible, &descriptor.visible_lower)
+                .ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "a selected block no longer satisfies its rank program".into(),
+                    )
+                })?;
         if descriptor.rank_key != expected.order_key() {
             return Err(ResultReadError::Corrupt(
                 "a selected block rank disagrees with its compiled plan".into(),
@@ -1161,11 +1313,13 @@ fn read_blocks(
             ResultReadError::Corrupt("an admitted Friendly block has no payload".into())
         })?;
         block.breadcrumb = breadcrumb;
-        let rank = rank_block_text(plan, branch, &descriptor.visible).ok_or_else(|| {
-            ResultReadError::Corrupt(
-                "an admitted block no longer satisfies its rank program".into(),
-            )
-        })?;
+        let rank =
+            rank_block_text_folded(plan, branch, &descriptor.visible, &descriptor.visible_lower)
+                .ok_or_else(|| {
+                    ResultReadError::Corrupt(
+                        "an admitted block no longer satisfies its rank program".into(),
+                    )
+                })?;
         let evidence =
             admitted_block_evidence(plan, branch, &descriptor.visible).ok_or_else(|| {
                 ResultReadError::Corrupt(
@@ -1201,12 +1355,13 @@ fn decode_block_descriptor(
     let page_id = integer(row, 1, "blocks.page_id")?;
     let parent_id = optional_integer(row, 2, "blocks.parent_block_id")?;
     let order_key = text(row, 3, "blocks.order_key")?;
-    let visible = text(row, 4, "block_text.query_visible")?;
+    let raw = text(row, 4, "block_text.content")?;
     let page = text(row, 5, "pages.name")?;
     let kind_value = integer(row, 6, "pages.text_kind")?;
     let kind = page_kind_from_sql(kind_value)
         .ok_or_else(|| format!("pages.text_kind {kind_value} is not a page kind"))?;
     let path = text(row, 7, "pages.path")?;
+    let projection = crate::query::text::visible_projection_from_raw_path(&raw, &path);
     let result_page = integer(row, 8, "blocks.page_id")?;
     if result_page != page_id {
         return Err("blocks.page_id does not own its block's page".into());
@@ -1239,7 +1394,8 @@ fn decode_block_descriptor(
         page,
         kind,
         path,
-        visible,
+        visible: projection.visible,
+        visible_lower: projection.visible_lower,
         result_id,
         estimated_bytes,
         tag_count: count(row, 12, "blocks.tag_count")?,
@@ -1292,8 +1448,9 @@ fn read_breadcrumbs(
                 .map(|id| PhysicalQueryValue::Integer(*id))
                 .collect::<Vec<_>>();
             let sql = format!(
-                "SELECT b.block_id, b.page_id, b.parent_block_id, bt.query_visible \
+                "SELECT b.block_id, b.page_id, b.parent_block_id, bt.content, p.path \
                  FROM blocks b LEFT JOIN block_text bt ON bt.block_id = b.block_id \
+                 LEFT JOIN pages p ON p.page_id = b.page_id \
                  WHERE b.block_id IN ({})",
                 crate::query::results::placeholders(params.len())
             );
@@ -1305,9 +1462,9 @@ fn read_breadcrumbs(
                 census.ancestor_rows += rows.len();
             });
             for row in &rows {
-                if row.len() != 4 {
+                if row.len() != 5 {
                     return Err(ResultReadError::Corrupt(format!(
-                        "Friendly ancestor row has {} columns, expected 4",
+                        "Friendly ancestor row has {} columns, expected 5",
                         row.len()
                     )));
                 }
@@ -1323,8 +1480,11 @@ fn read_breadcrumbs(
                         .map_err(ResultReadError::Corrupt)?,
                     parent_id: optional_integer(row, 2, "ancestor blocks.parent_block_id")
                         .map_err(ResultReadError::Corrupt)?,
-                    visible: text(row, 3, "ancestor block_text.query_visible")
-                        .map_err(ResultReadError::Corrupt)?,
+                    visible: crate::query::text::visible_from_raw_path(
+                        &text(row, 3, "ancestor block_text.content")
+                            .map_err(ResultReadError::Corrupt)?,
+                        &text(row, 4, "ancestor pages.path").map_err(ResultReadError::Corrupt)?,
+                    ),
                 };
                 if ancestors.insert(id, ancestor).is_some() {
                     return Err(ResultReadError::Corrupt(

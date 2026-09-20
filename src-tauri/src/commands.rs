@@ -941,9 +941,11 @@ pub(crate) async fn run_graph_search(
     explain: bool,
     scope: Option<tine_core::query_plan::QueryPageScope>,
     options: Option<GraphSearchDisplayOptions>,
+    consumer: Option<tine_core::query_plan::FriendlyConsumer>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, CommandError> {
     let display: tine_core::query_plan::FriendlyDisplayOptions = options.unwrap_or_default().into();
+    let consumer = consumer.unwrap_or_default();
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -951,7 +953,7 @@ pub(crate) async fn run_graph_search(
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
         (match lane.as_deref() {
-            Some(lane) => slot.graph().run_graph_search_latest_displayed(
+            Some(lane) => slot.graph().run_graph_search_latest_displayed_for(
                 lane,
                 &source,
                 page_limit,
@@ -959,14 +961,16 @@ pub(crate) async fn run_graph_search(
                 scope,
                 explain,
                 display,
+                consumer,
             ),
-            None => slot.graph().run_graph_search_displayed(
+            None => slot.graph().run_graph_search_displayed_for(
                 &source,
                 page_limit,
                 block_limit,
                 scope,
                 explain,
                 display,
+                consumer,
             ),
         })
         .map_err(CommandError::from)

@@ -3,7 +3,7 @@ icon:: 🔗
 - # Pages, links, references, and search
   - The precise rules behind the moving parts: pages and aliases, links and tags, block references and embeds, the two reference panels on every page, and every search surface from the switcher to the saved-search page. [[Workflows/Find and revisit]] walks through using them in order; [[Feature showcase]] shows each construct rendered.
 - ## Pages and namespaces
-  - A page is any name you link to. Type `[[` while editing and completion offers existing pages; whether **Enter** prefers the strongest existing match or exactly what you typed is Settings → **Editor** → Advanced → **Link autocomplete default**, and an exact existing name always wins.
+  - A page is any name you link to. Type `[[` while editing and completion offers existing pages and their aliases; choosing an alias inserts that authored alias spelling while still opening its real owner page. Whether **Enter** prefers the strongest existing match or exactly what you typed is Settings → **Editor** → Advanced → **Link autocomplete default**, and an exact existing name always wins.
   - A link to a page that does not exist yet renders muted with a dotted underline. It isn't broken — opening it creates the page. (Logseq draws missing and live links identically; Tine marks the difference on purpose.)
   - A name with slashes, like [[Project/Roadmap]], is a namespace: it nests under `Project` in the sidebar's collapsible namespace tree, and a namespaced page gains an automatic **Hierarchy** section with the breadcrumb paths of its descendant pages.
   - Journals are pages too — one per day, reachable from **Journals** in the sidebar. Their formats, templates, tasks, and agenda are mapped in [[Reference/Journals, tasks, and scheduling]].
@@ -22,7 +22,7 @@ icon:: 🔗
   - A key does not have to be plain ASCII. `klíč:: hodnota` is an ordinary property: it can be added, changed, and removed again like any other.
   - A read-only page — a bundled Guide page, or one Tine cannot safely rewrite — offers no property editing at all, rather than a form whose writes would be dropped.
 - ## Block references and embeds
-  - Type `((` while editing: the popup full-text-searches blocks, and choosing one inserts a durable `((reference))` — Tine first writes a stable `id::` on the source block, so the reference survives renames, reloads, and restarts.
+  - Type `((` while editing: the popup full-text-searches blocks, and choosing one inserts a durable `((reference))` — whitespace-separated words are required anywhere in the block, in any order, while punctuation such as `OR`, `-`, and `/` stays literal. Tine first writes a stable `id::` on the source block, so the reference survives renames, reloads, and restarts.
   - The reference renders as a link-styled copy of the source text — not a grey chip — and stays in sync: edit the source and every reference updates. A per-block reference-count badge reveals the referencing blocks, grouped by page with ancestor breadcrumbs.
   - Right-click an inline reference for **open in sidebar**, **go to block**, **copy ref**, and **copy embed**; **Mod+C** with nothing selected copies a reference to the block you're editing.
   - Copying a block to the clipboard strips its `id::`, like Logseq, so an internal id never leaks into a paste; the id stays in your file.

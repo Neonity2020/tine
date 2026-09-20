@@ -16,6 +16,7 @@ mod tests {
         let core = include_str!("search_query.rs");
         let bridge = include_str!("../../lsdoc-wasm/src/lib.rs");
         let planner = include_str!("query_plan.rs");
+        let candidates = include_str!("query/candidate.rs");
         let sql = include_str!("query/sql.rs");
         let eval = include_str!("query/eval.rs");
         let refs = include_str!("refs.rs");
@@ -43,15 +44,16 @@ mod tests {
             .unwrap()
             .0;
         assert!(!folded_needle_boundary.contains("canonical_fold"));
-        let sql_term_boundary = sql
-            .split_once("fn match_term")
+        let trigram_builder = candidates
+            .split_once("fn scalar_trigram_expression")
             .unwrap()
             .1
-            .split_once("fn fts_bound")
+            .split_once("fn and_group_expression")
             .unwrap()
             .0;
-        assert!(sql_term_boundary.contains("term.text.clone()"));
-        assert!(!sql_term_boundary.contains("canonical_fold(term"));
+        assert!(!trigram_builder.contains("canonical_fold"));
+        assert!(sql.contains("candidate::matcher_plan(&matcher)"));
+        assert!(!sql.contains("CandidateMode::Interactive"));
 
         let page_candidates = planner
             .split_once("fn execute_page_candidates")
@@ -72,14 +74,10 @@ mod tests {
         assert!(quick_switcher.contains("pageIdentityKey(page.matchedAlias) === queryIdentity"));
         assert!(!quick_switcher.contains("p.adaptiveClass === \"exact\""));
 
-        let search_rows = projection
-            .lines()
-            .filter(|line| line.contains("normalized_searchable_text:"))
-            .collect::<Vec<_>>();
-        assert_eq!(search_rows.len(), 2);
-        assert!(search_rows
-            .iter()
-            .all(|line| line.contains("crate::search_query::canonical_fold(&searchable_text)")));
+        assert!(projection
+            .contains("search_tokens: crate::search_query::canonical_fold(&visible_search_text)"));
+        assert!(projection.contains("search_tokens: projection.visible_lower.clone()"));
+        assert!(quick_switcher.contains("\"ctrl_k\""));
         assert!(
             document.contains("let visible_lower = crate::search_query::canonical_fold(&visible);")
         );

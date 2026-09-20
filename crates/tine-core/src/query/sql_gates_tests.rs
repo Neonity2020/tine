@@ -202,14 +202,14 @@ impl Corpus {
         names
     }
 
-    /// How many block rows the substring FTS holds. An indexed path that measured
+    /// How many rows the unified trigram FTS holds. An indexed path that measured
     /// an EMPTY index would prove nothing, so the gates assert this is nonzero
     /// before trusting a candidate bound.
-    pub(crate) fn substring_fts_rows(&self) -> i64 {
+    pub(crate) fn trigram_fts_rows(&self) -> i64 {
         let rows = self
             .reader
-            .run_projection_query("SELECT COUNT(*) FROM search_substring_fts", &[])
-            .expect("the substring FTS is readable through the seam");
+            .run_projection_query("SELECT COUNT(*) FROM search_fts", &[])
+            .expect("the trigram FTS is readable through the seam");
         match rows.first().and_then(|row| row.first()) {
             Some(PhysicalQueryValue::Integer(count)) => *count,
             other => panic!("COUNT(*) is an integer, got {other:?}"),
@@ -309,6 +309,12 @@ impl Corpus {
             .expect("the regex predicate installs on the read-only seam");
     }
 
+    fn bind_ranks(&self, ranks: &crate::query::rank::QueryRankPrograms) {
+        self.reader
+            .set_query_rank_function(ranks.uncancelled_function())
+            .expect("the rank function installs on the read-only seam");
+    }
+
     /// The lowering's answer over the same graph, through the D-15 seam.
     fn sql(&self, source: &str, dialect: QueryDialect) -> BTreeSet<String> {
         self.sql_as(source, dialect, RESULT_SET_RULE, RELATION_RULE)
@@ -342,6 +348,7 @@ impl Corpus {
         };
         let statement = lower_query(query, &inputs);
         self.bind_regexes(&statement.regexes);
+        self.bind_ranks(&statement.ranks);
         let rows = self
             .reader
             .run_projection_query(&statement.sql, &statement.params)
@@ -368,6 +375,7 @@ impl Corpus {
     ) -> BTreeSet<String> {
         let (anchor, statement) = self.lower_as(source, dialect, result_set_rule, relation_rule);
         self.bind_regexes(&statement.regexes);
+        self.bind_ranks(&statement.ranks);
         let rows = self
             .reader
             .run_projection_query(&statement.sql, &statement.params)
@@ -429,6 +437,7 @@ impl Corpus {
     fn explain(&self, source: &str, dialect: QueryDialect) -> (Vec<String>, bool, bool) {
         let (_anchor, statement) = self.lower(source, dialect);
         self.bind_regexes(&statement.regexes);
+        self.bind_ranks(&statement.ranks);
         // The parameters are bound for the EXPLAIN too: with `sqlite_stat4`
         // present the planner may choose differently for a bound value than for
         // an unbound one, and an explain that left them out would measure a
@@ -513,8 +522,8 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     )
     .expect("Proj/Alpha/Deep");
 
-    // Content: repeated whitespace and a line break, which `searchable_text`
-    // collapses and `query_visible` does not.
+    // Content: repeated whitespace, retained by both the exact projection and
+    // the scalar-trigram candidate payload.
     std::fs::write(
         root.join("pages/content.md"),
         "- alpha  beta\n- alpha beta\n- ALPHA BETA gamma\n- 100% literal_underscore\n",
@@ -528,10 +537,9 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     // * `foobar` must be found by `foo` (a trigram), by `oob` (a trigram that
     //   crosses no token boundary the word tokenizer would respect) and by `oo`
     //   (no trigram at all, so no bound and the exact predicate alone);
-    // * three consecutive spaces and a mid-line tab survive in
-    //   `query_visible_folded` and do NOT survive the FTS producers' whitespace
-    //   collapsing, so a phrase term must be matched exactly and bounded by a
-    //   whitespace-free RUN of itself;
+    // * three consecutive spaces and a mid-line tab survive in exact visible
+    //   text; candidate membership remains only a superset and exact matching
+    //   decides the result;
     // * punctuation, an embedded double quote and an embedded control character
     //   must not turn a candidate needle into FTS query syntax or drop it;
     // * the precomposed and decomposed spellings of `Café` are the same string
@@ -603,11 +611,8 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     .expect("nested refs page");
 
     // §4.3.2's regex predicate, over the EXACT visible text. Every line here
-    // exists to separate `block_text.query_visible` from the two columns beside
-    // it: `blocks.query_visible_folded` is lower-cased and NFC-folded, and
-    // `searchable_text` collapses runs of whitespace and line breaks. A regex
-    // answered from either of those would disagree with the walk, which reads
-    // `BlockProjection::visible`.
+    // exists to separate raw authored text and its folded trigram payload from
+    // the exact `BlockProjection::visible` text the verifier reconstructs.
     std::fs::write(
         root.join("pages/regex.md"),
         "- SHOUTING case survives here\n\
@@ -1432,7 +1437,7 @@ pub(crate) const CONTENT_PLAN_SHAPES: &[(&str, QueryDialect, ContentPlan)] = &[
     (
         "content match '\"   \"'",
         QueryDialect::Tql,
-        ContentPlan::ShortUnindexable,
+        ContentPlan::Fts,
     ),
     // One unbounded OR arm unbounds the leaf; the other arm keeps its bound.
     (
@@ -1520,7 +1525,7 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
     let corpus = Corpus::open(root, true);
     // An indexed path measured against an EMPTY index would prove nothing.
     assert!(
-        corpus.substring_fts_rows() > 0,
+        corpus.trigram_fts_rows() > 0,
         "the substring FTS must actually hold rows, or the bound is vacuous"
     );
     let mut differences = Vec::new();
@@ -1537,7 +1542,7 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
             ));
         }
         let (_anchor, statement) = corpus.lower(source, *dialect);
-        if statement.sql.contains("search_substring_fts") {
+        if statement.sql.contains("search_fts MATCH") {
             bounded_shapes += 1;
         }
     }
@@ -1570,7 +1575,7 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
         return;
     };
     let corpus = Corpus::open(PathBuf::from(&root), false);
-    let fts_rows = corpus.substring_fts_rows();
+    let fts_rows = corpus.trigram_fts_rows();
     assert!(fts_rows > 0, "the real corpus substring FTS is empty");
     let mut differences = Vec::new();
     let mut bounded = 0usize;
@@ -1599,7 +1604,7 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
     }
     eprintln!(
         "content_identity_over_a_real_corpus shapes={} bounded={bounded} matched_rows={rows} \
-         substring_fts_rows={fts_rows} plan_classes={classes:?} disagreements={}",
+         trigram_fts_rows={fts_rows} plan_classes={classes:?} disagreements={}",
         CONTENT_SHAPES.len(),
         differences.len()
     );
@@ -2013,10 +2018,9 @@ fn a_nested_refs_leaf_reads_the_anchor_context_and_never_a_subtraction() {
 /// §4.3.2's regex predicate, on REAL ROWS: the text it sees is the EXACT
 /// visible text, and the compiled-regex table is scoped to ONE statement.
 ///
-/// The three columns a regex could plausibly read differ on this fixture —
-/// `query_visible` keeps case, accents and whitespace runs; `query_visible_folded`
-/// lower-cases and NFC-folds; `searchable_text` collapses whitespace — so each
-/// assertion here fails for a lowering that read the wrong one.
+/// Raw authored text and the exact visible projection differ on this fixture,
+/// so the test also refuses a verifier that matches the storage payload
+/// directly instead of applying `DocBlock::preamble`.
 #[test]
 fn manager_regex_missing_payload_is_a_read_error() {
     let _serial = serialize();
@@ -2025,6 +2029,7 @@ fn manager_regex_missing_payload_is_a_read_error() {
     let corpus = Corpus::open(root, true);
     let (_, statement) = corpus.lower("content regexp '.'", QueryDialect::Tql);
     corpus.bind_regexes(&statement.regexes);
+    corpus.bind_ranks(&statement.ranks);
     let damage =
         rusqlite::Connection::open(corpus.projection_dir().join("projection.sqlite")).unwrap();
     damage.execute("DELETE FROM block_text", []).unwrap();
@@ -2037,26 +2042,11 @@ fn manager_regex_missing_payload_is_a_read_error() {
     );
 }
 
-/// The projection stores each block's exact visible text and its fold in
-/// adjacent columns, and `blocks.query_visible_folded` is EXACTLY
-/// `canonical_fold(block_text.query_visible)` on real rows.
-///
-/// This is a correctness precondition of ranking, not an implementation note.
-/// `read_friendly_plan`'s block rank program reads the STORED fold through
-/// `framed_pair_sql` rather than folding every candidate row, because that
-/// per-row `canonical_fold` measured 72-77% of total search time on a
-/// 605k-block graph (GH #543). If any producer wrote something else into that
-/// column, every search would silently admit the wrong blocks -- and the only
-/// thing standing behind the substitution would be a comment in
-/// `direct_projection.rs` saying the pair is written together from one
-/// `BlockProjection`.
-///
-/// `write_fast_corpus` is deliberately the fixture rather than a new one:
-/// `SHOUTING case`, `Uppercase\u{c9}clair`, the decomposed `Cafe\u{301}` and the
-/// three-space and tab runs each separate the fold from the raw spelling, which
-/// is what lets the final assertion below refuse a vacuous pass.
+/// The projection retains the raw authored bytes and physical path needed to
+/// reconstruct exact visible text. Search/index text is deliberately not an
+/// exact-text authority; all exact predicates derive through this pair.
 #[test]
-fn the_projection_stores_the_exact_fold_of_every_visible_text() {
+fn the_projection_stores_the_raw_inputs_for_exact_visible_text() {
     let _serial = serialize();
     let root = scratch("stored-fold-producer");
     write_fast_corpus(&root);
@@ -2064,8 +2054,9 @@ fn the_projection_stores_the_exact_fold_of_every_visible_text() {
     let rows = corpus
         .reader
         .run_projection_query(
-            "SELECT bt.query_visible, b.query_visible_folded \
-             FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id",
+            "SELECT bt.content, p.path \
+             FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id \
+             JOIN pages p ON p.page_id = b.page_id",
             &[],
         )
         .expect("the projection answers the stored-fold query");
@@ -2073,27 +2064,22 @@ fn the_projection_stores_the_exact_fold_of_every_visible_text() {
         !rows.is_empty(),
         "the fixture must project blocks for this gate to say anything at all"
     );
-    let mut differing = 0usize;
+    let mut syntax_was_projected = 0usize;
     for row in &rows {
-        let (visible, folded) = match (row.first(), row.get(1)) {
-            (Some(PhysicalQueryValue::Text(visible)), Some(PhysicalQueryValue::Text(folded))) => {
-                (visible, folded)
+        let (raw, path) = match (row.first(), row.get(1)) {
+            (Some(PhysicalQueryValue::Text(raw)), Some(PhysicalQueryValue::Text(path))) => {
+                (raw, path)
             }
             other => panic!("both columns are TEXT NOT NULL, got {other:?}"),
         };
-        assert_eq!(
-            folded,
-            &crate::search_query::canonical_fold(visible),
-            "blocks.query_visible_folded must be canonical_fold(block_text.query_visible)"
-        );
-        if folded != visible {
-            differing += 1;
+        let visible = crate::query::text::visible_from_raw_path(raw, path);
+        if visible != *raw {
+            syntax_was_projected += 1;
         }
     }
     assert!(
-        differing > 0,
-        "this fixture must hold text whose fold DIFFERS from its visible spelling, \
-         or a producer that stored the raw text would satisfy this gate vacuously"
+        syntax_was_projected > 0,
+        "the fixture must contain syntax whose authored and visible forms differ"
     );
 }
 
@@ -2129,7 +2115,7 @@ fn a_regex_predicate_reads_the_exact_visible_text_through_a_statement_scoped_tab
         BTreeSet::from([block("clair accented")])
     );
     assert!(here("content regexp 'uppercase\u{e9}clair'", QueryDialect::Tql).is_empty());
-    // …and whitespace runs, which `searchable_text` collapses.
+    // …and whitespace runs reconstructed from raw authored text.
     assert_eq!(
         here("content regexp 'spaced\\s{3}out'", QueryDialect::Tql),
         BTreeSet::from([block("spaced   out")])
@@ -3340,10 +3326,9 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
 /// requires that narrowing actually applied somewhere, so a corpus where the
 /// index never named a block cannot pass the gate by doing nothing.
 /// `narrowed_classifications` / `walked_classifications` count EXPLICIT targets
-/// only. Plain (unlinked) references are narrowed to pages by FTS and not to
-/// blocks — `plain_text_candidate_pages_after` projects the owning page and not
-/// the owning entity — so folding them in would dilute the one number this
-/// change is supposed to move.
+/// only. Plain (unlinked) references now have their own exact per-needle
+/// interactive window, while this historical ratio measures the posting
+/// relation's explicit-reference block narrowing.
 struct NarrowingComparison {
     differences: Vec<String>,
     narrowed_targets: usize,

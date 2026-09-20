@@ -117,13 +117,20 @@ fn reference_literal_search<G: QueryGraph>(
     if limit == 0 || query.is_empty() {
         return Vec::new();
     }
-    let query = canonical_fold(query);
+    let fragments = query
+        .split_whitespace()
+        .map(canonical_fold)
+        .filter(|fragment| !fragment.is_empty())
+        .collect::<Vec<_>>();
+    if fragments.is_empty() {
+        return Vec::new();
+    }
     graph.with_pages(|pages| {
         let mut out = Vec::new();
         fn visit(
             page: &str,
             blocks: &[DocBlock],
-            query: &str,
+            fragments: &[String],
             remaining: &mut usize,
             out: &mut Vec<(String, String)>,
         ) {
@@ -132,11 +139,14 @@ fn reference_literal_search<G: QueryGraph>(
                     return;
                 }
                 let projection = block.projection();
-                if fuzzy_name_score(&projection.visible_lower, query).is_some() {
+                if fragments
+                    .iter()
+                    .all(|fragment| projection.visible_lower.contains(fragment))
+                {
                     out.push((page.to_string(), block.raw.clone()));
                     *remaining -= 1;
                 }
-                visit(page, &block.children, query, remaining, out);
+                visit(page, &block.children, fragments, remaining, out);
             }
         }
         let mut remaining = limit;
@@ -144,7 +154,7 @@ fn reference_literal_search<G: QueryGraph>(
             visit(
                 &entry.name,
                 &document.roots,
-                &query,
+                &fragments,
                 &mut remaining,
                 &mut out,
             );
@@ -180,6 +190,45 @@ fn friendly_simple_term_is_fuzzy_only_for_page_names() {
 }
 
 #[test]
+fn only_explicit_interactive_consumers_receive_the_verified_window() {
+    use crate::query::candidate::{CandidateMode, INTERACTIVE_VERIFIED_WINDOW};
+
+    let non_interactive = friendly_search_plan_for(
+        "needle",
+        8,
+        50,
+        None,
+        FriendlyDisplayOptions::default(),
+        FriendlyConsumer::NonInteractive,
+    );
+    let ctrl_k = friendly_search_plan_for(
+        "needle",
+        8,
+        50,
+        None,
+        FriendlyDisplayOptions::default(),
+        FriendlyConsumer::CtrlK,
+    );
+    assert_eq!(non_interactive.candidate_mode(), CandidateMode::Exhaustive);
+    assert_eq!(
+        ctrl_k.candidate_mode(),
+        CandidateMode::Interactive {
+            window: INTERACTIVE_VERIFIED_WINDOW,
+        }
+    );
+    assert_eq!(
+        QueryPlan::block_search_literal("needle words", 50).candidate_mode(),
+        CandidateMode::Interactive {
+            window: INTERACTIVE_VERIFIED_WINDOW,
+        }
+    );
+    assert_eq!(
+        QueryPlan::page_name_fuzzy("needle", 50).candidate_mode(),
+        CandidateMode::Exhaustive
+    );
+}
+
+#[test]
 fn folded_empty_text_predicates_never_match_rank_or_emit_evidence() {
     for mode in [TextMatchMode::Contains, TextMatchMode::Phrase] {
         let pred = TextPredicate {
@@ -196,6 +245,8 @@ fn folded_empty_text_predicates_never_match_rank_or_emit_evidence() {
             display: FriendlyDisplayOptions::default(),
             page_exact: None,
             regexes: HashMap::new(),
+            candidate_mode: crate::query::candidate::CandidateMode::Exhaustive,
+            page_name_suggestions: false,
         };
         assert!(!eval_expr_fast(
             &plan,
@@ -587,7 +638,7 @@ fn canonical_unicode_executes_through_real_page_alias_and_block_projections() {
                 match_class: ObjectiveMatchClass::Exact,
                 matched_alias: Some(name),
                 ..
-            }) if page.name == "Cafe\u{301}" && name == "résumé"
+            }) if page.name == "Cafe\u{301}" && name == "Re\u{301}sume\u{301}"
         ),
         "{:#?}",
         alias.hits
@@ -781,18 +832,23 @@ fn alias_reference_is_never_a_phantom_alias_page() {
             shelf.contains(&"Book Shelf".to_string()),
             "a referenced page with no alias owner still surfaces: {shelf:?}"
         );
-        // The legacy quick-switch pool (the `#` / `[[` autocomplete source)
-        // shares the same candidate boundary.
-        let switch_names: Vec<String> = graph
-            .quick_switch(query, 100)
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
+        // Ctrl-K inserts the authored alias spelling, while the entry's path
+        // retains the owning page identity. That is distinct from a path-less
+        // virtual page which merely happens to have the alias's name.
+        let switch_entries = graph.quick_switch(query, 100);
         assert!(
-            !switch_names
-                .iter()
-                .any(|name| canonical_fold(name) == "book" || canonical_fold(name) == "reading"),
-            "quick_switch must not offer the alias-named phantom: {switch_names:?}"
+            switch_entries.iter().all(|entry| {
+                let folded = canonical_fold(&entry.name);
+                !entry.rel_path.is_empty() || (folded != "book" && folded != "reading")
+            }),
+            "quick_switch must not offer an alias-named phantom: {switch_entries:?}"
+        );
+        assert!(
+            switch_entries.iter().any(|entry| {
+                matches!(canonical_fold(&entry.name).as_str(), "book" | "reading")
+                    && entry.rel_path == "pages/Research Hub.md"
+            }),
+            "quick_switch must retain alias ownership: {switch_entries:?}"
         );
     }
 
@@ -989,7 +1045,7 @@ fn page_hits_expose_objective_classes_and_alias_evidence() {
             match_class: ObjectiveMatchClass::Exact,
             matched_alias: Some(matched_alias),
             ..
-        }) if display_text == "research hub" && matched_alias == "research hub"
+        }) if display_text == "Research Hub" && matched_alias == "Research Hub"
     ));
     crate::test_support::remove_dir_all(dir);
 }
@@ -1017,7 +1073,7 @@ fn regex_evidence_is_authoritative_and_bounded_to_projected_text() {
 }
 
 #[test]
-fn literal_block_search_adapter_preserves_fuzzy_membership_and_ranked_topk() {
+fn literal_block_search_adapter_requires_whitespace_fragments_and_preserves_ranked_topk() {
     let (dir, graph) = fixture();
     for query in [
         "",
@@ -1460,10 +1516,10 @@ fn page_rank_bridge_handles_zero_limits_actual_alias_hits_and_virtual_names() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(alias_hit.1, "research hub");
+    assert_eq!(alias_hit.1, "Research Hub");
     assert_eq!(alias_hit.2, alias_rank.global_score(&alias_hit.0.name));
     assert_eq!(alias_hit.3, alias_rank.match_class());
-    assert_eq!(alias_hit.4.as_deref(), Some("research hub"));
+    assert_eq!(alias_hit.4.as_deref(), Some("Research Hub"));
 
     let virtual_plan = QueryPlan::friendly("Virtual Opdf", 10, 0);
     let virtual_branch = page_branch(&virtual_plan).unwrap();

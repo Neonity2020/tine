@@ -324,13 +324,12 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
     let root = scratch("friendly-main-damage");
     write_friendly_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let plan = QueryPlan::friendly("alpha", 0, 16);
     for (tag, damage) in [
         (
             "missing",
             "DELETE FROM block_text WHERE block_id = (\
                 SELECT b.block_id FROM blocks b JOIN block_text t USING (block_id) \
-                WHERE instr(t.query_visible, 'alpha') > 0 LIMIT 1)",
+                WHERE instr(t.content, 'alpha') > 0 LIMIT 1)",
         ),
         (
             "cross-owner",
@@ -339,31 +338,47 @@ fn missing_and_cross_owner_result_metadata_fail_the_whole_read() {
              WHERE block_id = (SELECT b.block_id FROM blocks b \
                 JOIN pages p USING (page_id) JOIN block_text t USING (block_id) \
                 WHERE p.path = 'pages/Owner.md' \
-                  AND instr(t.query_visible, 'alpha') > 0 LIMIT 1)",
+                  AND instr(t.content, 'alpha') > 0 LIMIT 1)",
         ),
     ] {
-        let path = copy_projection(&corpus, tag);
-        let writer = rusqlite::Connection::open(&path).expect("damage copy opens");
-        writer
-            .pragma_update(None, "foreign_keys", false)
-            .expect("foreign keys disabled for damage fixture");
-        assert!(writer.execute(damage, []).expect("damage applies") > 0);
-        drop(writer);
-        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
-            .expect("damaged snapshot opens");
-        let answer = read_friendly_results(
-            &mut snapshot,
-            &FriendlyReadInputs {
-                plan: &plan,
-                graph_root: &corpus.root,
-                identity: &ResultIdentity::session_owned(),
-                explain: true,
-                lane: None,
-            },
-        );
-        assert!(matches!(answer, Err(ResultReadError::Corrupt(_))));
-        snapshot.finish();
-        let _ = std::fs::remove_file(path);
+        for consumer in [
+            crate::query_plan::FriendlyConsumer::NonInteractive,
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        ] {
+            let plan = crate::query_plan::friendly_search_plan_for(
+                "alpha",
+                0,
+                16,
+                None,
+                crate::query_plan::FriendlyDisplayOptions::default(),
+                consumer,
+            );
+            let path = copy_projection(&corpus, tag);
+            let writer = rusqlite::Connection::open(&path).expect("damage copy opens");
+            writer
+                .pragma_update(None, "foreign_keys", false)
+                .expect("foreign keys disabled for damage fixture");
+            assert!(writer.execute(damage, []).expect("damage applies") > 0);
+            drop(writer);
+            let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
+                .expect("damaged snapshot opens");
+            let answer = read_friendly_results(
+                &mut snapshot,
+                &FriendlyReadInputs {
+                    plan: &plan,
+                    graph_root: &corpus.root,
+                    identity: &ResultIdentity::session_owned(),
+                    explain: true,
+                    lane: None,
+                },
+            );
+            assert!(
+                matches!(answer, Err(ResultReadError::Corrupt(_))),
+                "{tag} damage must fail the {consumer:?} read"
+            );
+            snapshot.finish();
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -376,7 +391,7 @@ fn compiled_plan_branches_are_served_without_restoring_a_walk_specific_filter() 
     // ordering is unchanged, and a compiled branch is still served straight
     // from the projection rather than by restoring a walk-specific filter.
     assert!(source.contains("ORDER BY r.missing_text DESC, {order}"));
-    assert!(source.contains("r.rank_key, r.path COLLATE BINARY, r.preorder"));
+    assert!(source.contains("substr(r.rank_key, 1, {}), r.path COLLATE BINARY, r.preorder"));
     assert!(!source.contains("matched_parent"));
     assert!(!source.contains("ConstructionBudget"));
     assert_eq!(
@@ -947,7 +962,7 @@ fn a_selective_needle_ranks_only_its_candidates() {
     // A path over an EMPTY index would pass this test while proving nothing,
     // so the precondition is asserted, not assumed.
     assert!(
-        corpus.substring_fts_rows() > 0,
+        corpus.trigram_fts_rows() > 0,
         "the substring index must hold block rows"
     );
     reset_friendly_read_census();
@@ -976,7 +991,7 @@ fn the_candidate_bound_drops_no_block_the_exact_predicate_admits() {
     let root = scratch("friendly-bound-correctness");
     write_candidate_bound_corpus(&root, 8);
     let corpus = Corpus::open(root, true);
-    assert!(corpus.substring_fts_rows() > 0);
+    assert!(corpus.trigram_fts_rows() > 0);
     for (query, expected) in [
         // The query's case differs from the block's: both sides fold.
         ("zqxwood", 1),
@@ -999,5 +1014,468 @@ fn the_candidate_bound_drops_no_block_the_exact_predicate_admits() {
         )
         .unwrap_or_else(|error| panic!("{query} read failed: {error}"));
         assert_eq!(block_hits(&answer), expected, "query {query}");
+    }
+}
+
+#[test]
+fn ctrl_k_ranks_only_the_newest_verified_window_but_inline_remains_exhaustive() {
+    let _serial = serialize();
+    let root = scratch("friendly-verified-window");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = String::from("- needle\n");
+    for at in 0..700 {
+        body.push_str(&format!("- needle filler {at}\n"));
+    }
+    std::fs::write(root.join("pages/Window.md"), body).expect("window page");
+    let corpus = Corpus::open(root, true);
+
+    let exhaustive = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::NonInteractive,
+    );
+    let interactive = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+    let exhaustive =
+        read(&corpus, &exhaustive, &ResultIdentity::session_owned()).expect("exhaustive read");
+    reset_friendly_read_census();
+    let interactive =
+        read(&corpus, &interactive, &ResultIdentity::session_owned()).expect("interactive read");
+    let interactive_census = friendly_read_census();
+
+    assert!(matches!(
+        exhaustive.hits.first(),
+        Some(QueryHit::Block { display_text, .. }) if display_text == "needle"
+    ));
+    assert!(matches!(
+        interactive.hits.first(),
+        Some(QueryHit::Block { display_text, .. }) if display_text.starts_with("needle filler ")
+    ));
+    assert!(interactive.has_more.blocks);
+    assert_eq!(interactive_census.block_candidate_visits, 300);
+    assert_eq!(interactive_census.block_candidate_verifications, 300);
+    assert!(
+        interactive_census.block_rank_evaluations <= 305,
+        "the retained interactive window must rank only its 300 members, got {} rank calls",
+        interactive_census.block_rank_evaluations
+    );
+}
+
+fn interactive_block_ids(corpus: &Corpus, plan: &QueryPlan) -> Vec<i64> {
+    let branch = plan
+        .branches
+        .iter()
+        .find(|branch| branch.target == QueryTarget::Blocks)
+        .expect("interactive plan has a block branch");
+    let CandidateMode::Interactive { window } = plan.candidate_mode() else {
+        panic!("test plan must be interactive");
+    };
+    let mut snapshot = corpus.snapshot();
+    let ids = interactive_verified_block_ids(&mut snapshot, plan, branch, window, &None)
+        .expect("interactive candidate cursor answers");
+    snapshot.finish();
+    ids
+}
+
+#[test]
+fn broad_scan_and_index_cursors_stop_at_w_verified_rows_in_descending_membership_order() {
+    let _serial = serialize();
+    let root = scratch("friendly-broad-streams");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let body = (0..701)
+        .map(|at| format!("- needle oo broad {at}\n"))
+        .collect::<String>();
+    std::fs::write(root.join("pages/Broad.md"), body).expect("broad page");
+    let corpus = Corpus::open(root, true);
+
+    for needle in ["needle", "oo"] {
+        let plan = crate::query_plan::friendly_search_plan_for(
+            needle,
+            0,
+            1,
+            None,
+            crate::query_plan::FriendlyDisplayOptions::default(),
+            crate::query_plan::FriendlyConsumer::CtrlK,
+        );
+        reset_friendly_read_census();
+        let ids = interactive_block_ids(&corpus, &plan);
+        let census = friendly_read_census();
+        assert_eq!(ids.len(), 300, "{needle} retains exactly W members");
+        assert!(
+            ids.windows(2).all(|pair| pair[0] > pair[1]),
+            "{needle} membership remains rowid-descending"
+        );
+        assert_eq!(census.block_candidate_visits, 300, "{needle} visits");
+        assert_eq!(
+            census.block_candidate_verifications, 300,
+            "{needle} verifications"
+        );
+    }
+}
+
+#[test]
+fn sparse_false_positive_candidates_stream_to_exhaustion_before_the_old_match() {
+    let _serial = serialize();
+    let root = scratch("friendly-sparse-stream");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    let mut body = String::from("- exact abcd survivor\n");
+    for at in 0..650 {
+        body.push_str(&format!("- false abc gap bcd candidate {at}\n"));
+    }
+    std::fs::write(root.join("pages/Sparse.md"), body).expect("sparse page");
+    let corpus = Corpus::open(root, true);
+    let plan = crate::query_plan::friendly_search_plan_for(
+        "abcd",
+        0,
+        1,
+        None,
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+
+    reset_friendly_read_census();
+    let ids = interactive_block_ids(&corpus, &plan);
+    let census = friendly_read_census();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(census.block_candidate_visits, 651);
+    assert_eq!(census.block_candidate_verifications, 651);
+}
+
+#[test]
+fn interactive_page_scope_is_applied_before_the_verified_window() {
+    let _serial = serialize();
+    let root = scratch("friendly-scoped-window");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    std::fs::write(root.join("pages/A-InScope.md"), "- needle old scoped\n").expect("scoped page");
+    let outside = (0..650)
+        .map(|at| format!("- needle newer outside {at}\n"))
+        .collect::<String>();
+    std::fs::write(root.join("pages/Z-Outside.md"), outside).expect("outside page");
+    let corpus = Corpus::open(root, true);
+    let plan = crate::query_plan::friendly_search_plan_for(
+        "needle",
+        0,
+        1,
+        Some(QueryPageScope {
+            name: "A-InScope".into(),
+            page_kind: PageKind::Page,
+            path: Some("pages/A-InScope.md".into()),
+        }),
+        crate::query_plan::FriendlyDisplayOptions::default(),
+        crate::query_plan::FriendlyConsumer::CtrlK,
+    );
+
+    reset_friendly_read_census();
+    let answer =
+        read(&corpus, &plan, &ResultIdentity::session_owned()).expect("scoped interactive read");
+    let census = friendly_read_census();
+    assert!(matches!(
+        answer.hits.first(),
+        Some(QueryHit::Block { path, display_text, .. })
+            if path == "pages/A-InScope.md" && display_text == "needle old scoped"
+    ));
+    assert_eq!(census.block_candidate_visits, 1);
+    assert_eq!(census.block_candidate_verifications, 1);
+}
+
+#[test]
+fn virtual_name_candidates_are_dictionary_membership_not_posting_occurrences() {
+    let source = include_str!("friendly.rs");
+    assert!(source.contains("FROM names n WHERE EXISTS"));
+    assert!(source.contains("INDEXED BY reference_postings_navigation_names_idx"));
+    assert!(!source.contains("JOIN names n ON n.name_id = r.target_name_id"));
+}
+
+mod virtual_name_candidate_cost_tests {
+    use rusqlite::{Connection, OpenFlags, StatementStatus};
+
+    use super::*;
+
+    fn candidate_statement() -> String {
+        format!(
+            "WITH real_identities(name_key) AS (\
+                 SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
+                 UNION SELECT n.key FROM reference_alias_declarations a \
+                 JOIN names n ON n.name_id = a.alias_name_id\
+             ), {} \
+             SELECT raw_name, normalized_name FROM reference_choices \
+             WHERE name_choice = 1 ORDER BY normalized_name",
+            VIRTUAL_REFERENCE_CHOICES_CTE
+        )
+    }
+
+    fn legacy_occurrence_statement() -> &'static str {
+        "WITH real_identities(name_key) AS (\
+             SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
+             UNION SELECT n.key FROM reference_alias_declarations a \
+             JOIN names n ON n.name_id = a.alias_name_id\
+         ), reference_choices AS (\
+             SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
+                 PARTITION BY n.key ORDER BY n.raw, n.key, r.source_page_id\
+             ) AS name_choice \
+             FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id \
+             WHERE r.target_type = 0 AND r.reference_kind <= 4 \
+               AND NOT EXISTS (SELECT 1 FROM real_identities i WHERE i.name_key = n.key)\
+         ) SELECT raw_name, normalized_name FROM reference_choices \
+         WHERE name_choice = 1 ORDER BY normalized_name"
+    }
+
+    #[derive(Debug)]
+    struct CandidateWork {
+        names: i64,
+        postings: i64,
+        candidates: Vec<(String, String)>,
+        vm_steps: i32,
+        fullscan_steps: i32,
+        sorts: i32,
+        plan: Vec<String>,
+        legacy_vm_steps: i32,
+    }
+
+    fn statement_work(
+        connection: &Connection,
+        sql: &str,
+    ) -> (Vec<(String, String)>, i32, i32, i32) {
+        let mut statement = connection
+            .prepare(sql)
+            .expect("candidate statement prepares");
+        let candidates = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("candidate rows execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("candidate rows decode");
+        (
+            candidates,
+            statement.get_status(StatementStatus::VmStep),
+            statement.get_status(StatementStatus::FullscanStep),
+            statement.get_status(StatementStatus::Sort),
+        )
+    }
+
+    fn measure_candidate_work(corpus: &Corpus) -> CandidateWork {
+        let connection =
+            Connection::open_with_flags(corpus.projection_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("the projection opens read-only");
+        let names = connection
+            .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
+            .expect("names count");
+        let postings = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reference_postings \
+                 WHERE target_type = 0 AND reference_kind <= 4",
+                [],
+                |row| row.get(0),
+            )
+            .expect("eligible postings count");
+        let sql = candidate_statement();
+        let (candidates, vm_steps, fullscan_steps, sorts) = statement_work(&connection, &sql);
+        let (_, legacy_vm_steps, _, _) = statement_work(&connection, legacy_occurrence_statement());
+        let mut explain = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("candidate explain prepares");
+        let plan = explain
+            .query_map([], |row| row.get(3))
+            .expect("candidate explain executes")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("candidate explain decodes");
+        CandidateWork {
+            names,
+            postings,
+            candidates,
+            vm_steps,
+            fullscan_steps,
+            sorts,
+            plan,
+            legacy_vm_steps,
+        }
+    }
+
+    fn write_cost_corpus(root: &Path, repetitions: usize) {
+        std::fs::create_dir_all(root.join("pages")).expect("pages");
+        let mut body = String::from("orphanproperty:: value\n\n");
+        for _ in 0..repetitions {
+            body.push_str("- [[Ghost One]] [[ghost one]] [[Ghost Two]]\n");
+        }
+        std::fs::write(root.join("pages/Owner.md"), body).expect("owner page");
+    }
+
+    #[test]
+    fn virtual_name_membership_work_is_independent_of_reference_occurrences() {
+        let _serial = serialize();
+        let measure = |tag, repetitions| {
+            let root = scratch(tag);
+            write_cost_corpus(&root, repetitions);
+            let corpus = Corpus::open(root, true);
+            measure_candidate_work(&corpus)
+        };
+        let sparse = measure("friendly-virtual-name-cost-sparse", 1);
+        let repeated = measure("friendly-virtual-name-cost-repeated", 2_000);
+        eprintln!("virtual-name work sparse={sparse:?} repeated={repeated:?}");
+
+        assert_eq!(sparse.names, repeated.names, "the name inventories match");
+        assert!(
+            repeated.postings > sparse.postings * 1_000,
+            "the fixture must materially increase occurrences: {sparse:?} vs {repeated:?}"
+        );
+        assert_eq!(sparse.candidates, repeated.candidates);
+        assert_eq!(sparse.fullscan_steps, repeated.fullscan_steps);
+        assert_eq!(sparse.sorts, repeated.sorts);
+        assert!(
+            repeated.vm_steps <= sparse.vm_steps + 16,
+            "indexed membership must stop at the first posting: {sparse:?} vs {repeated:?}"
+        );
+        assert!(
+            repeated.legacy_vm_steps > sparse.legacy_vm_steps * 100,
+            "the occurrence-enumerating counterexample must detect the old work: \
+             {sparse:?} vs {repeated:?}"
+        );
+        assert!(
+            repeated.plan.iter().any(|step| step
+                .contains("SEARCH r USING COVERING INDEX reference_postings_navigation_names_idx")),
+            "eligible membership must use the covering target-name index: {:?}",
+            repeated.plan
+        );
+        assert!(
+            !repeated
+                .plan
+                .iter()
+                .any(|step| step == "SCAN r" || step.starts_with("SCAN r ")),
+            "the candidate relation must not enumerate postings: {:?}",
+            repeated.plan
+        );
+    }
+
+    #[test]
+    fn virtual_name_results_keep_spelling_and_identity_suppression() {
+        let _serial = serialize();
+        let root = scratch("friendly-virtual-name-semantics");
+        std::fs::create_dir_all(root.join("pages")).expect("pages");
+        std::fs::write(
+            root.join("pages/Known.md"),
+            "alias:: Known Alias\n\n- stored owner\n",
+        )
+        .expect("known page");
+        std::fs::write(
+            root.join("pages/Owner.md"),
+            "orphanproperty:: value\n\n\
+             - [[ghost name]] [[Ghost Name]] [[GHOST NAME]]\n\
+             - [[Ghost Name]] [[Known]] [[Known Alias]]\n",
+        )
+        .expect("reference owner");
+        let corpus = Corpus::open(root, true);
+
+        let work = measure_candidate_work(&corpus);
+        assert_eq!(
+            work.candidates,
+            vec![(
+                "GHOST NAME".to_string(),
+                crate::refs::page_key("ghost name")
+            )],
+            "one lexicographically chosen raw spelling survives; repeated references, \
+             property names, physical titles and aliases do not add virtual rows"
+        );
+
+        let ghosts = read(
+            &corpus,
+            &QueryPlan::friendly("ghost name", 16, 0),
+            &ResultIdentity::session_owned(),
+        )
+        .expect("virtual name read");
+        let virtual_ghosts = ghosts
+            .hits
+            .iter()
+            .filter_map(|hit| match hit {
+                QueryHit::Page { page, .. } if page.rel_path.is_empty() => Some(page.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(virtual_ghosts, ["GHOST NAME"]);
+
+        for query in ["known", "known alias"] {
+            let answer = read(
+                &corpus,
+                &QueryPlan::friendly(query, 16, 0),
+                &ResultIdentity::session_owned(),
+            )
+            .unwrap_or_else(|error| panic!("{query} read failed: {error}"));
+            assert!(
+                answer.hits.iter().all(|hit| matches!(
+                    hit,
+                    QueryHit::Page { page, .. } if !page.rel_path.is_empty()
+                )),
+                "a physical title/alias identity suppresses its virtual suggestion: {query}"
+            );
+        }
+        let property = read(
+            &corpus,
+            &QueryPlan::friendly("orphanproperty", 16, 0),
+            &ResultIdentity::session_owned(),
+        )
+        .expect("property-name read");
+        assert!(
+            property.hits.is_empty(),
+            "a property name is not a virtual page"
+        );
+    }
+}
+
+#[test]
+fn page_rank_composite_key_preserves_candidates_and_ranks_each_once() {
+    let _serial = serialize();
+    let root = scratch("friendly-page-composite-rank");
+    write_friendly_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let identity = ResultIdentity::session_owned();
+
+    reset_friendly_read_census();
+    let broad_plan = QueryPlan::friendly("a", 16, 0);
+    let broad = read(&corpus, &broad_plan, &identity).expect("broad page read");
+    assert_same_execution(
+        &broad_plan.execute_with_explain(&corpus.graph, || false, true),
+        &broad,
+    );
+    assert_eq!(
+        friendly_read_census().page_rank_evaluations,
+        8,
+        "three titles, four authored aliases and one chosen virtual name are ranked once each"
+    );
+
+    let cases = [
+        ("foo later", "pages/Owner.md", "foo later", true),
+        ("foo", "pages/Owner.md", "foo OR bar", true),
+        ("café", "pages/Café.md", "Café", false),
+        ("ghost page", "", "Ghost Page", false),
+    ];
+    for (query, path, display, matched_alias) in cases {
+        let plan = QueryPlan::friendly(query, 16, 0);
+        let answer = read(&corpus, &plan, &identity)
+            .unwrap_or_else(|error| panic!("{query} page read failed: {error}"));
+        assert_same_execution(
+            &plan.execute_with_explain(&corpus.graph, || false, true),
+            &answer,
+        );
+        assert!(
+            answer.hits.iter().any(|hit| matches!(
+                hit,
+                QueryHit::Page {
+                    page,
+                    display_text,
+                    matched_alias: alias,
+                    ..
+                } if page.rel_path == path
+                    && display_text == display
+                    && alias.is_some() == matched_alias
+            )),
+            "{query} must retain its title/alias/virtual winner and tie behavior: {answer:#?}"
+        );
     }
 }

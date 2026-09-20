@@ -13,7 +13,7 @@
  *  Classification of every method is pinned by `publishedBackend.guard.test.ts`.
  */
 import type { Backend, LoadGraphResult } from "./backend";
-import type { ExecutionContext, ParsedQuery, Query, QueryResult, QueryTextDialect, ViewSettings } from "./editor/queryIr";
+import type { ExecutionContext, GraphSearchConsumer, GraphSearchDisplayOptions, ParsedQuery, Query, QueryResult, QueryTextDialect, ViewSettings } from "./editor/queryIr";
 import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, MatchEvidence, PageDto, PageEntry, QueryExecution, QueryHit, QueryPageScope, RefGroup } from "./types";
 import { backlinkFilterFacets } from "./lib/backlinkFilterFacets";
 import { searchFold, searchFoldMap, searchMatchBatch } from "./render/parse";
@@ -546,13 +546,13 @@ export function publishedBackend(load: () => Promise<PublishedSnapshot> = loadPu
       if (hit) return structuredClone(hit.result);
       throw await staticQueryRefusal();
     },
-    /** The Quick Switcher's lanes get a plain substring match over page names,
+    /** The explicitly routed Ctrl-K consumer gets a plain substring match over page names,
      *  aliases and block text from the snapshot — navigation, not a query. A
-     *  query-language search (any other lane) is refused: the export holds
+     *  query-language search (any other consumer) is refused: the export holds
      *  answers, not an index. */
-    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane?: string, _explain?: boolean, scope?: QueryPageScope): Promise<QueryExecution> {
+    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, _explain?: boolean, scope?: QueryPageScope, _options?: GraphSearchDisplayOptions, consumer: GraphSearchConsumer = "non_interactive"): Promise<QueryExecution> {
       const snapshot = await load();
-      if (!lane?.startsWith("quick-switch")) throw await staticQueryRefusal();
+      if (consumer !== "ctrl_k") throw await staticQueryRefusal();
       const wanted = literalNeedle(source);
       const hits: QueryHit[] = [];
       const empty = { hits, diagnostics: [], explanation: { branches: [] }, has_more: { pages: false, blocks: false }, cancelled: false };

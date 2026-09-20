@@ -117,11 +117,12 @@ impl Graph {
             (icons, real)
         });
         for (alias, canon) in self.page_aliases() {
-            if real_page_names.contains(&alias) {
+            let alias_key = crate::refs::page_key(&alias);
+            if real_page_names.contains(&alias_key) {
                 continue; // `load_named` prefers a real page over an alias fallback.
             }
             if let Some(icon) = icons_by_name.get(&crate::refs::page_key(&canon)).cloned() {
-                icons_by_name.entry(alias).or_insert(icon);
+                icons_by_name.entry(alias_key).or_insert(icon);
             }
         }
         let mut out = std::collections::HashMap::new();
@@ -155,7 +156,7 @@ impl Graph {
             .map(|entry| crate::refs::page_key(&entry.name))
             .collect();
         for (alias, _canonical) in self.page_aliases() {
-            known.insert(alias);
+            known.insert(crate::refs::page_key(&alias));
         }
         names
             .iter()
@@ -226,10 +227,16 @@ impl Graph {
     pub(crate) fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        if let Some((pages, blocks)) =
-            self.direct_projection_reference_candidate_pages(names_norm, kind)
+        if let Some((pages, blocks, page_owners)) = self
+            .direct_projection_reference_candidate_pages(
+                names_norm,
+                self_page,
+                kind,
+                crate::query::candidate::CandidateMode::Exhaustive,
+            )
         {
             // R6: the inventory is the projection's (memoized), never a reason
             // to build the whole parsed graph.
@@ -237,6 +244,7 @@ impl Graph {
             return ReferenceCandidatePages {
                 pages,
                 blocks,
+                page_owners,
                 indexed: true,
                 full_page_count,
             };
@@ -246,6 +254,7 @@ impl Graph {
             full_page_count: pages.len(),
             pages,
             blocks: None,
+            page_owners: None,
             indexed: false,
         }
     }
@@ -276,16 +285,27 @@ impl Graph {
     pub(crate) fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
-        if let Some((pages, blocks)) =
-            self.direct_projection_reference_candidate_pages(names_norm, kind)
+        if let Some((pages, blocks, page_owners)) = self
+            .direct_projection_reference_candidate_pages(
+                names_norm,
+                self_page,
+                kind,
+                if kind == ReferenceKind::Plain {
+                    crate::query::candidate::CandidateMode::interactive()
+                } else {
+                    crate::query::candidate::CandidateMode::Exhaustive
+                },
+            )
         {
             let full_page_count = self.list_pages().len();
             return Ok(ReferenceCandidatePages {
                 pages,
                 blocks,
+                page_owners,
                 indexed: true,
                 full_page_count,
             });
@@ -295,7 +315,7 @@ impl Graph {
                 return Err(crate::query::QueryExecutionError::NotReady(reason));
             }
         }
-        Ok(self.reference_candidate_pages(names_norm, kind))
+        Ok(self.reference_candidate_pages(names_norm, self_page, kind))
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {

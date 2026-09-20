@@ -1473,7 +1473,7 @@ export function mockBackend(): Backend {
       }
       return groups.filter((g) => g.blocks.length > 0);
     },
-    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false, scope?: import("./types").QueryPageScope): Promise<QueryExecution> {
+    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false, scope?: import("./types").QueryPageScope, _options?: import("./editor/queryIr").GraphSearchDisplayOptions, _consumer?: import("./editor/queryIr").GraphSearchConsumer): Promise<QueryExecution> {
       // Browser-preview approximation only (ADR 0016). Production matching,
       // diagnostics, and UTF-16 evidence come from Rust's QueryPlan evaluator.
       const matcher = parseSearchQuery(source);

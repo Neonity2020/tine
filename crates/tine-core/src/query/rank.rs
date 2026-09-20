@@ -16,6 +16,13 @@ type RankProgram =
 #[derive(Clone, Default)]
 pub(crate) struct QueryRankPrograms {
     bindings: Vec<Arc<RankProgram>>,
+    identities: Vec<Vec<u8>>,
+}
+
+impl PartialEq for QueryRankPrograms {
+    fn eq(&self, other: &Self) -> bool {
+        self.identities == other.identities
+    }
 }
 
 /// The two existing recency producers captured into owned statement inputs.
@@ -68,7 +75,16 @@ impl QueryRankPrograms {
         &mut self,
         program: impl Fn(&str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + Sync + 'static,
     ) -> u64 {
+        self.bind_named(Vec::new(), program)
+    }
+
+    pub(crate) fn bind_named(
+        &mut self,
+        identity: Vec<u8>,
+        program: impl Fn(&str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + Sync + 'static,
+    ) -> u64 {
         self.bindings.push(Arc::new(program));
+        self.identities.push(identity);
         self.bindings.len() as u64
     }
 
@@ -87,37 +103,37 @@ impl QueryRankPrograms {
             + Sync
             + 'static,
     ) -> u64 {
-        self.bind(move |framed| {
-            let bytes = framed.as_bytes();
-            let Some(colon) = bytes.iter().position(|byte| *byte == b':') else {
-                return Err(MaterializationError::InvalidQuery(
-                    "query rank pair has no length separator".into(),
-                ));
-            };
-            let length = std::str::from_utf8(&bytes[..colon])
-                .ok()
-                .and_then(|digits| digits.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    MaterializationError::InvalidQuery(
-                        "query rank pair has an invalid length".into(),
-                    )
-                })?;
-            let start = colon + 1;
-            let end = start
-                .checked_add(length)
-                .filter(|end| *end <= bytes.len())
-                .ok_or_else(|| {
-                    MaterializationError::InvalidQuery(
-                        "query rank pair length exceeds its payload".into(),
-                    )
-                })?;
-            let left = std::str::from_utf8(&bytes[start..end]).map_err(|_| {
-                MaterializationError::InvalidQuery("query rank pair left text is invalid".into())
-            })?;
-            let right = std::str::from_utf8(&bytes[end..]).map_err(|_| {
-                MaterializationError::InvalidQuery("query rank pair right text is invalid".into())
-            })?;
+        self.bind_pair_named(Vec::new(), program)
+    }
+
+    pub(crate) fn bind_pair_named(
+        &mut self,
+        identity: Vec<u8>,
+        program: impl Fn(&str, &str) -> Result<Option<Vec<u8>>, MaterializationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> u64 {
+        self.bind_named(identity, move |framed| {
+            let (left, right) = decode_pair(framed)?;
             program(left, right)
+        })
+    }
+
+    /// Bind a byte length plus one text through the fixed one-text callback.
+    /// SQL frames the values as `<byte length>:<text>`; unlike `bind_pair`, the
+    /// left text itself is not copied because this consumer needs only its
+    /// length.
+    pub(crate) fn bind_byte_len_and_text(
+        &mut self,
+        program: impl Fn(usize, &str) -> Result<Option<Vec<u8>>, MaterializationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> u64 {
+        self.bind(move |framed| {
+            let (byte_len, text) = decode_byte_len_and_text(framed)?;
+            program(byte_len, text)
         })
     }
 
@@ -147,6 +163,67 @@ impl QueryRankPrograms {
             Ok(ranked)
         }
     }
+
+    /// Test-corpus readers predate owned snapshots and therefore have no
+    /// cancellation handle. They still install the statement-owned table so
+    /// semantic parity tests exercise the production callback path.
+    #[cfg(test)]
+    pub(crate) fn uncancelled_function(
+        &self,
+    ) -> impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static {
+        let bindings = self.bindings.clone();
+        move |id, text| {
+            let Some(program) = id.checked_sub(1).and_then(|at| bindings.get(at as usize)) else {
+                return Err(MaterializationError::InvalidQuery(format!(
+                    "query rank id {id} is not bound by this statement"
+                )));
+            };
+            program(text)
+        }
+    }
+}
+
+pub(crate) fn decode_pair(framed: &str) -> Result<(&str, &str), MaterializationError> {
+    let bytes = framed.as_bytes();
+    let Some(colon) = bytes.iter().position(|byte| *byte == b':') else {
+        return Err(MaterializationError::InvalidQuery(
+            "query rank pair has no length separator".into(),
+        ));
+    };
+    let length = std::str::from_utf8(&bytes[..colon])
+        .ok()
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .ok_or_else(|| {
+            MaterializationError::InvalidQuery("query rank pair has an invalid length".into())
+        })?;
+    let start = colon + 1;
+    let end = start
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| {
+            MaterializationError::InvalidQuery("query rank pair length exceeds its payload".into())
+        })?;
+    let left = std::str::from_utf8(&bytes[start..end]).map_err(|_| {
+        MaterializationError::InvalidQuery("query rank pair left text is invalid".into())
+    })?;
+    let right = std::str::from_utf8(&bytes[end..]).map_err(|_| {
+        MaterializationError::InvalidQuery("query rank pair right text is invalid".into())
+    })?;
+    Ok((left, right))
+}
+
+fn decode_byte_len_and_text(framed: &str) -> Result<(usize, &str), MaterializationError> {
+    let Some((digits, text)) = framed.split_once(':') else {
+        return Err(MaterializationError::InvalidQuery(
+            "query rank byte-length frame has no separator".into(),
+        ));
+    };
+    let byte_len = digits.parse::<usize>().map_err(|_| {
+        MaterializationError::InvalidQuery(
+            "query rank byte-length frame has an invalid length".into(),
+        )
+    })?;
+    Ok((byte_len, text))
 }
 
 impl std::fmt::Debug for QueryRankPrograms {

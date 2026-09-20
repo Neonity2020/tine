@@ -189,6 +189,9 @@ pub(crate) struct ReferenceCandidatePages {
     /// before this field existed, so the walk is the behaviour a partial or
     /// absent index falls back to rather than a lossy shortcut.
     pub blocks: Option<std::collections::HashSet<String>>,
+    /// Interactive page entities that survived the verified window. `None`
+    /// means page-preamble admission is unrestricted (Exhaustive or fallback).
+    pub page_owners: Option<std::collections::HashSet<std::path::PathBuf>>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub indexed: bool,
     #[cfg_attr(not(test), allow(dead_code))]
