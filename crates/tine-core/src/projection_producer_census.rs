@@ -1523,9 +1523,12 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // decodes the page/block entity discriminator in the shared unlinked
     // candidate read. These alter read-only value/error inventory rows; no
     // storage write crossing or public storage dependency pin changed.
+    // 2026-09-20: one-pass page ranking removes one read-only Integer bind;
+    // the byte-length/text callback frame adds two InvalidQuery error sites.
+    // No write crossing or dependency pin changes.
     assert_eq!(
         inventory_digest(&dependency_surface),
-        "1ba3e4144d2cc21a391cb8489b6ae8011240da2ecb9210f45daf127b1af51bbd",
+        "03f575d87919a1decf7bf559f56440eedc3c4d4f652e05cca6883d2133c65e63",
         "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
     );
 }

@@ -1680,10 +1680,10 @@ pub(crate) struct PageTextRank {
 
 /// Width of [`PageTextRank::global_order_key`]: signed match-class rank followed
 /// by signed length-adjusted score, both in the existing comparator's order.
-const PAGE_RANK_KEY_LEN: usize = 4 + 4;
+pub(crate) const PAGE_RANK_KEY_LEN: usize = 4 + 4;
 /// Width of [`PageTextRank::owner_order_key`]: exact-override bit, match class,
 /// then the unadjusted score used while choosing one text for an owner.
-const PAGE_OWNER_RANK_KEY_LEN: usize = 1 + 4 + 4;
+pub(crate) const PAGE_OWNER_RANK_KEY_LEN: usize = 1 + 4 + 4;
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl PageTextRank {
@@ -1727,7 +1727,11 @@ impl PageTextRank {
     /// physical name's UTF-8 byte length even when the winning text is an alias,
     /// exactly as [`execute_page_candidates`] has always done.
     pub(crate) fn global_score(&self, physical_page_name: &str) -> i32 {
-        self.base_score - physical_page_name.len() as i32
+        self.global_score_for_name_len(physical_page_name.len())
+    }
+
+    pub(crate) fn global_score_for_name_len(&self, physical_page_name_len: usize) -> i32 {
+        self.base_score - physical_page_name_len as i32
     }
 
     /// Lossless global page-rank key. Ascending byte order is best first and is
@@ -1735,9 +1739,18 @@ impl PageTextRank {
     /// exact bit and the consumer-owned path/reference-name tie key are omitted
     /// deliberately; neither is a global rank term.
     pub(crate) fn global_order_key(&self, physical_page_name: &str) -> [u8; PAGE_RANK_KEY_LEN] {
+        self.global_order_key_for_name_len(physical_page_name.len())
+    }
+
+    pub(crate) fn global_order_key_for_name_len(
+        &self,
+        physical_page_name_len: usize,
+    ) -> [u8; PAGE_RANK_KEY_LEN] {
         let mut key = [0u8; PAGE_RANK_KEY_LEN];
         key[0..4].copy_from_slice(&descending_i32_key(self.match_class.rank()));
-        key[4..8].copy_from_slice(&descending_i32_key(self.global_score(physical_page_name)));
+        key[4..8].copy_from_slice(&descending_i32_key(
+            self.global_score_for_name_len(physical_page_name_len),
+        ));
         key
     }
 }

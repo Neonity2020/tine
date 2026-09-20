@@ -22,11 +22,11 @@ use crate::query::results::{
     PAYLOAD_BATCH,
 };
 use crate::query::sql::{block_sort_expression, page_sort_expression, SortBinder};
-use crate::query::text::framed_pair_sql;
+use crate::query::text::{framed_byte_len_and_text_sql, framed_pair_sql};
 use crate::query_plan::{
     admitted_block_evidence, admitted_page_evidence, rank_block_text_folded, rank_page_text,
     ObjectiveMatchClass, QueryBranch, QueryExecution, QueryExplanation, QueryHasMore, QueryHit,
-    QueryPlan, QueryTarget,
+    QueryPlan, QueryTarget, PAGE_OWNER_RANK_KEY_LEN, PAGE_RANK_KEY_LEN,
 };
 use crate::vocab::{BlockDto, PageEntry, PageKind};
 
@@ -87,6 +87,9 @@ pub(crate) struct FriendlyReadCensus {
     pub(crate) block_candidate_verifications: usize,
     /// Rows the block statement actually ranked (see the rank program).
     pub(crate) block_rank_evaluations: usize,
+    /// Physical title/alias and virtual-name candidates passed to the page
+    /// rank program. Each candidate produces both owner and global keys.
+    pub(crate) page_rank_evaluations: usize,
     pub(crate) ancestor_statements: usize,
     pub(crate) ancestor_rows: usize,
 }
@@ -100,6 +103,7 @@ thread_local! {
             block_candidate_visits: 0,
             block_candidate_verifications: 0,
             block_rank_evaluations: 0,
+            page_rank_evaluations: 0,
             ancestor_statements: 0,
             ancestor_rows: 0,
         }) };
@@ -149,15 +153,8 @@ fn note_friendly(update: impl FnOnce(&mut FriendlyReadCensus)) {
 }
 
 enum BoundBranch {
-    Pages {
-        branch: QueryBranch,
-        owner_rank: u64,
-        global_rank: u64,
-    },
-    Blocks {
-        branch: QueryBranch,
-        rank: u64,
-    },
+    Pages { branch: QueryBranch, rank: u64 },
+    Blocks { branch: QueryBranch, rank: u64 },
 }
 
 /// Execute the compiled Friendly plan on one immutable main projection image.
@@ -193,26 +190,26 @@ pub(crate) fn read_friendly_results(
     for branch in &plan.branches {
         match branch.target {
             QueryTarget::Pages => {
-                let owner_plan = Arc::clone(&plan);
-                let owner_branch = branch.clone();
-                let owner_rank = programs.bind(move |candidate| {
+                let rank_plan = Arc::clone(&plan);
+                let rank_branch = branch.clone();
+                let rank = programs.bind_byte_len_and_text(move |physical_name_len, candidate| {
                     #[cfg(test)]
                     run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
-                    Ok(rank_page_text(&owner_plan, &owner_branch, candidate)
-                        .map(|rank| rank.owner_order_key().to_vec()))
-                });
-                let global_plan = Arc::clone(&plan);
-                let global_branch = branch.clone();
-                let global_rank = programs.bind_pair(move |physical_name, winning_text| {
                     #[cfg(test)]
-                    run_one_shot_hook(&BEFORE_FRIENDLY_RANK);
-                    Ok(rank_page_text(&global_plan, &global_branch, winning_text)
-                        .map(|rank| rank.global_order_key(physical_name).to_vec()))
+                    note_friendly(|census| census.page_rank_evaluations += 1);
+                    Ok(
+                        rank_page_text(&rank_plan, &rank_branch, candidate).map(|rank| {
+                            let mut key = rank.owner_order_key().to_vec();
+                            key.extend_from_slice(
+                                &rank.global_order_key_for_name_len(physical_name_len),
+                            );
+                            key
+                        }),
+                    )
                 });
                 branches.push(BoundBranch::Pages {
                     branch: branch.clone(),
-                    owner_rank,
-                    global_rank,
+                    rank,
                 });
             }
             QueryTarget::Blocks => {
@@ -322,18 +319,13 @@ pub(crate) fn read_friendly_results(
         }) {
             check_lane(snapshot, &inputs.lane)?;
             match bound {
-                BoundBranch::Pages {
-                    branch,
-                    owner_rank,
-                    global_rank,
-                } => {
+                BoundBranch::Pages { branch, rank } => {
                     let (mut section, more) = read_pages(
                         snapshot,
                         inputs.graph_root,
                         &plan,
                         branch,
-                        *owner_rank,
-                        *global_rank,
+                        *rank,
                         content.as_ref().map(|(branch, rank)| (branch, *rank)),
                         page_sort_program,
                         &inputs.lane,
@@ -539,8 +531,7 @@ fn read_pages(
     graph_root: &Path,
     plan: &QueryPlan,
     branch: &QueryBranch,
-    owner_rank: u64,
-    global_rank: u64,
+    rank: u64,
     content: Option<(&QueryBranch, u64)>,
     sort_program: Option<FriendlySortPrograms>,
     lane: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -566,12 +557,9 @@ fn read_pages(
         return Ok((Vec::new(), false));
     }
     let hydrate = plan.page_view().is_some();
-    let mut params = vec![
-        PhysicalQueryValue::Integer(owner_rank as i64),
-        PhysicalQueryValue::Integer(global_rank as i64),
-    ];
-    let framed_physical = framed_pair_sql("w.name", "w.matched_text");
-    let framed_virtual = framed_pair_sql("v.raw_name", "v.raw_name");
+    let mut params = vec![PhysicalQueryValue::Integer(rank as i64)];
+    let framed_physical = framed_byte_len_and_text_sql("c.name", "c.matched_text");
+    let framed_virtual = framed_byte_len_and_text_sql("v.raw_name", "v.raw_name");
     // Names and aliases: unchanged selection, ranking, owner-local override and
     // virtual reference-name suggestions. `match_source` is a constant 0 here,
     // so a Names search orders exactly as it did before this packet.
@@ -621,18 +609,19 @@ fn read_pages(
              WHERE a.source_entity_type = 0 AND a.source_entity_id = a.source_page_id \
              GROUP BY p.page_id, a.alias_name_id, an.raw\
          ), ranked AS MATERIALIZED (\
-             SELECT c.*, tine_query_rank(?1, c.matched_text) AS owner_key \
+             SELECT c.*, tine_query_rank(?1, {framed_physical}) AS rank_key \
              FROM page_text_candidates c\
          ), choices AS (\
              SELECT r.*, ROW_NUMBER() OVER (\
                  PARTITION BY {owner_partition} \
-                 ORDER BY r.owner_key, r.source_kind, r.source_ordinal\
+                 ORDER BY substr(r.rank_key, 1, {owner_rank_len}), \
+                          r.source_kind, r.source_ordinal\
              ) AS owner_choice \
-             FROM ranked r WHERE r.owner_key IS NOT NULL\
+             FROM ranked r WHERE r.rank_key IS NOT NULL\
          ), physical AS MATERIALIZED (\
              SELECT 0 AS match_source, 0 AS candidate_kind, w.page_id, w.name, w.text_kind, \
                     w.journal_day, w.path, w.matched_text, w.source_kind, \
-                    tine_query_rank(?2, {framed_physical}) AS global_key, \
+                    substr(w.rank_key, {global_rank_at}, {global_rank_len}) AS global_key, \
                     {physical_tie_key} AS tie_key \
              FROM choices w WHERE w.owner_choice = 1\
          ), real_identities(name_key) AS (\
@@ -643,10 +632,14 @@ fn read_pages(
              SELECT 0 AS match_source, 1 AS candidate_kind, NULL AS page_id, v.raw_name AS name, \
                     0 AS text_kind, NULL AS journal_day, '' AS path, \
                     v.raw_name AS matched_text, 0 AS source_kind, \
-                    tine_query_rank(?2, {framed_virtual}) AS global_key, \
+                    substr(tine_query_rank(?1, {framed_virtual}), \
+                           {global_rank_at}, {global_rank_len}) AS global_key, \
                     v.normalized_name AS tie_key \
              FROM reference_choices v WHERE v.name_choice = 1\
-         )"
+         )",
+            owner_rank_len = PAGE_OWNER_RANK_KEY_LEN,
+            global_rank_at = PAGE_OWNER_RANK_KEY_LEN + 1,
+            global_rank_len = PAGE_RANK_KEY_LEN,
         )
     } else {
         String::new()

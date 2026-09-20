@@ -120,6 +120,23 @@ impl QueryRankPrograms {
         })
     }
 
+    /// Bind a byte length plus one text through the fixed one-text callback.
+    /// SQL frames the values as `<byte length>:<text>`; unlike `bind_pair`, the
+    /// left text itself is not copied because this consumer needs only its
+    /// length.
+    pub(crate) fn bind_byte_len_and_text(
+        &mut self,
+        program: impl Fn(usize, &str) -> Result<Option<Vec<u8>>, MaterializationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> u64 {
+        self.bind(move |framed| {
+            let (byte_len, text) = decode_byte_len_and_text(framed)?;
+            program(byte_len, text)
+        })
+    }
+
     /// The single callback installed for this statement's whole program table.
     pub(crate) fn function(
         &self,
@@ -193,6 +210,20 @@ pub(crate) fn decode_pair(framed: &str) -> Result<(&str, &str), MaterializationE
         MaterializationError::InvalidQuery("query rank pair right text is invalid".into())
     })?;
     Ok((left, right))
+}
+
+fn decode_byte_len_and_text(framed: &str) -> Result<(usize, &str), MaterializationError> {
+    let Some((digits, text)) = framed.split_once(':') else {
+        return Err(MaterializationError::InvalidQuery(
+            "query rank byte-length frame has no separator".into(),
+        ));
+    };
+    let byte_len = digits.parse::<usize>().map_err(|_| {
+        MaterializationError::InvalidQuery(
+            "query rank byte-length frame has an invalid length".into(),
+        )
+    })?;
+    Ok((byte_len, text))
 }
 
 impl std::fmt::Debug for QueryRankPrograms {

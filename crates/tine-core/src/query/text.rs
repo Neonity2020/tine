@@ -34,6 +34,12 @@ pub(crate) fn framed_pair_sql(left: &str, right: &str) -> String {
     format!("CAST(length(CAST({left} AS BLOB)) AS TEXT) || ':' || {left} || {right}")
 }
 
+/// SQL frame consumed by `QueryRankPrograms::bind_byte_len_and_text` when a
+/// callback needs the left text's UTF-8 byte length but not the text itself.
+pub(crate) fn framed_byte_len_and_text_sql(left: &str, right: &str) -> String {
+    format!("CAST(length(CAST({left} AS BLOB)) AS TEXT) || ':' || {right}")
+}
+
 /// SQL `LIKE` over an already-folded haystack. `%` matches any run, `_` one
 /// scalar, and `\` escapes the following scalar.
 pub(crate) fn like_matches(haystack: &str, pattern: &str) -> bool {

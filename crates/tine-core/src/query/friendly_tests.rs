@@ -1427,3 +1427,55 @@ mod virtual_name_candidate_cost_tests {
         );
     }
 }
+
+#[test]
+fn page_rank_composite_key_preserves_candidates_and_ranks_each_once() {
+    let _serial = serialize();
+    let root = scratch("friendly-page-composite-rank");
+    write_friendly_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let identity = ResultIdentity::session_owned();
+
+    reset_friendly_read_census();
+    let broad_plan = QueryPlan::friendly("a", 16, 0);
+    let broad = read(&corpus, &broad_plan, &identity).expect("broad page read");
+    assert_same_execution(
+        &broad_plan.execute_with_explain(&corpus.graph, || false, true),
+        &broad,
+    );
+    assert_eq!(
+        friendly_read_census().page_rank_evaluations,
+        8,
+        "three titles, four authored aliases and one chosen virtual name are ranked once each"
+    );
+
+    let cases = [
+        ("foo later", "pages/Owner.md", "foo later", true),
+        ("foo", "pages/Owner.md", "foo OR bar", true),
+        ("café", "pages/Café.md", "Café", false),
+        ("ghost page", "", "Ghost Page", false),
+    ];
+    for (query, path, display, matched_alias) in cases {
+        let plan = QueryPlan::friendly(query, 16, 0);
+        let answer = read(&corpus, &plan, &identity)
+            .unwrap_or_else(|error| panic!("{query} page read failed: {error}"));
+        assert_same_execution(
+            &plan.execute_with_explain(&corpus.graph, || false, true),
+            &answer,
+        );
+        assert!(
+            answer.hits.iter().any(|hit| matches!(
+                hit,
+                QueryHit::Page {
+                    page,
+                    display_text,
+                    matched_alias: alias,
+                    ..
+                } if page.rel_path == path
+                    && display_text == display
+                    && alias.is_some() == matched_alias
+            )),
+            "{query} must retain its title/alias/virtual winner and tie behavior: {answer:#?}"
+        );
+    }
+}
