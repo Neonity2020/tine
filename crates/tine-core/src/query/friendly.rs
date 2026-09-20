@@ -515,6 +515,25 @@ struct PageDescriptor {
     payload: Option<(usize, usize)>,
 }
 
+const VIRTUAL_REFERENCE_CHOICES_CTE: &str =
+    "reference_choices AS (\
+         SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
+             PARTITION BY n.key ORDER BY n.raw, n.key, n.name_id\
+         ) AS name_choice \
+         FROM names n WHERE EXISTS (\
+             SELECT 1 FROM reference_postings r \
+             INDEXED BY reference_postings_navigation_names_idx \
+             WHERE r.target_name_id = n.name_id \
+               AND r.target_type = 0 AND r.reference_kind <= 4\
+         ) AND NOT EXISTS (SELECT 1 FROM real_identities i \
+                           WHERE i.name_key = n.key)\
+     )";
+
+// `names` is UNIQUE(key, raw), so `name_id` can only break a tie between rows
+// already identical for the user-visible spelling and identity. It replaces
+// the old occurrence-row `source_page_id` tie without changing which spelling
+// wins, while the indexed EXISTS stops after the first eligible occurrence.
+
 #[allow(clippy::too_many_arguments)]
 fn read_pages(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
@@ -574,6 +593,7 @@ fn read_pages(
     // carries no path and no page id, that coincidence broke. Keep both sides
     // keyed on `raw_name` or the two lists will disagree again.
     let names_ctes = if want_names {
+        let reference_choices = VIRTUAL_REFERENCE_CHOICES_CTE;
         format!(
             "page_text_candidates(page_id, name, text_kind, journal_day, path, \
                   matched_text, source_kind, source_ordinal) AS (\
@@ -606,17 +626,7 @@ fn read_pages(
              SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
              UNION SELECT n.key FROM reference_alias_declarations a \
              JOIN names n ON n.name_id = a.alias_name_id\
-         ), reference_choices AS (\
-             SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
-                 PARTITION BY n.key \
-                 ORDER BY n.raw, n.key, r.source_page_id\
-             ) AS name_choice \
-             FROM reference_postings r \
-             JOIN names n ON n.name_id = r.target_name_id \
-             WHERE r.target_type = 0 AND r.reference_kind <= 4 \
-               AND NOT EXISTS (SELECT 1 FROM real_identities i \
-                               WHERE i.name_key = n.key)\
-         ), virtual AS MATERIALIZED (\
+         ), {reference_choices}, virtual AS MATERIALIZED (\
              SELECT 0 AS match_source, 1 AS candidate_kind, NULL AS page_id, v.raw_name AS name, \
                     0 AS text_kind, NULL AS journal_day, '' AS path, \
                     v.raw_name AS matched_text, 0 AS source_kind, \

@@ -1187,3 +1187,240 @@ fn interactive_page_scope_is_applied_before_the_verified_window() {
     assert_eq!(census.block_candidate_visits, 1);
     assert_eq!(census.block_candidate_verifications, 1);
 }
+
+#[test]
+fn virtual_name_candidates_are_dictionary_membership_not_posting_occurrences() {
+    let source = include_str!("friendly.rs");
+    assert!(source.contains("FROM names n WHERE EXISTS"));
+    assert!(source.contains("INDEXED BY reference_postings_navigation_names_idx"));
+    assert!(!source.contains("JOIN names n ON n.name_id = r.target_name_id"));
+}
+
+mod virtual_name_candidate_cost_tests {
+    use rusqlite::{Connection, OpenFlags, StatementStatus};
+
+    use super::*;
+
+    fn candidate_statement() -> String {
+        format!(
+            "WITH real_identities(name_key) AS (\
+                 SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
+                 UNION SELECT n.key FROM reference_alias_declarations a \
+                 JOIN names n ON n.name_id = a.alias_name_id\
+             ), {} \
+             SELECT raw_name, normalized_name FROM reference_choices \
+             WHERE name_choice = 1 ORDER BY normalized_name",
+            VIRTUAL_REFERENCE_CHOICES_CTE
+        )
+    }
+
+    fn legacy_occurrence_statement() -> &'static str {
+        "WITH real_identities(name_key) AS (\
+             SELECT n.key FROM pages p JOIN names n ON n.name_id = p.name_id \
+             UNION SELECT n.key FROM reference_alias_declarations a \
+             JOIN names n ON n.name_id = a.alias_name_id\
+         ), reference_choices AS (\
+             SELECT n.raw AS raw_name, n.key AS normalized_name, ROW_NUMBER() OVER (\
+                 PARTITION BY n.key ORDER BY n.raw, n.key, r.source_page_id\
+             ) AS name_choice \
+             FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id \
+             WHERE r.target_type = 0 AND r.reference_kind <= 4 \
+               AND NOT EXISTS (SELECT 1 FROM real_identities i WHERE i.name_key = n.key)\
+         ) SELECT raw_name, normalized_name FROM reference_choices \
+         WHERE name_choice = 1 ORDER BY normalized_name"
+    }
+
+    #[derive(Debug)]
+    struct CandidateWork {
+        names: i64,
+        postings: i64,
+        candidates: Vec<(String, String)>,
+        vm_steps: i32,
+        fullscan_steps: i32,
+        sorts: i32,
+        plan: Vec<String>,
+        legacy_vm_steps: i32,
+    }
+
+    fn statement_work(
+        connection: &Connection,
+        sql: &str,
+    ) -> (Vec<(String, String)>, i32, i32, i32) {
+        let mut statement = connection.prepare(sql).expect("candidate statement prepares");
+        let candidates = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("candidate rows execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("candidate rows decode");
+        (
+            candidates,
+            statement.get_status(StatementStatus::VmStep),
+            statement.get_status(StatementStatus::FullscanStep),
+            statement.get_status(StatementStatus::Sort),
+        )
+    }
+
+    fn measure_candidate_work(corpus: &Corpus) -> CandidateWork {
+        let connection = Connection::open_with_flags(
+            corpus.projection_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("the projection opens read-only");
+        let names = connection
+            .query_row("SELECT COUNT(*) FROM names", [], |row| row.get(0))
+            .expect("names count");
+        let postings = connection
+            .query_row(
+                "SELECT COUNT(*) FROM reference_postings \
+                 WHERE target_type = 0 AND reference_kind <= 4",
+                [],
+                |row| row.get(0),
+            )
+            .expect("eligible postings count");
+        let sql = candidate_statement();
+        let (candidates, vm_steps, fullscan_steps, sorts) = statement_work(&connection, &sql);
+        let (_, legacy_vm_steps, _, _) =
+            statement_work(&connection, legacy_occurrence_statement());
+        let mut explain = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("candidate explain prepares");
+        let plan = explain
+            .query_map([], |row| row.get(3))
+            .expect("candidate explain executes")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("candidate explain decodes");
+        CandidateWork {
+            names,
+            postings,
+            candidates,
+            vm_steps,
+            fullscan_steps,
+            sorts,
+            plan,
+            legacy_vm_steps,
+        }
+    }
+
+    fn write_cost_corpus(root: &Path, repetitions: usize) {
+        std::fs::create_dir_all(root.join("pages")).expect("pages");
+        let mut body = String::from("orphanproperty:: value\n\n");
+        for _ in 0..repetitions {
+            body.push_str("- [[Ghost One]] [[ghost one]] [[Ghost Two]]\n");
+        }
+        std::fs::write(root.join("pages/Owner.md"), body).expect("owner page");
+    }
+
+    #[test]
+    fn virtual_name_membership_work_is_independent_of_reference_occurrences() {
+        let _serial = serialize();
+        let measure = |tag, repetitions| {
+            let root = scratch(tag);
+            write_cost_corpus(&root, repetitions);
+            let corpus = Corpus::open(root, true);
+            measure_candidate_work(&corpus)
+        };
+        let sparse = measure("friendly-virtual-name-cost-sparse", 1);
+        let repeated = measure("friendly-virtual-name-cost-repeated", 2_000);
+        eprintln!("virtual-name work sparse={sparse:?} repeated={repeated:?}");
+
+        assert_eq!(sparse.names, repeated.names, "the name inventories match");
+        assert!(
+            repeated.postings > sparse.postings * 1_000,
+            "the fixture must materially increase occurrences: {sparse:?} vs {repeated:?}"
+        );
+        assert_eq!(sparse.candidates, repeated.candidates);
+        assert_eq!(sparse.fullscan_steps, repeated.fullscan_steps);
+        assert_eq!(sparse.sorts, repeated.sorts);
+        assert!(
+            repeated.vm_steps <= sparse.vm_steps + 16,
+            "indexed membership must stop at the first posting: {sparse:?} vs {repeated:?}"
+        );
+        assert!(
+            repeated.legacy_vm_steps > sparse.legacy_vm_steps * 100,
+            "the occurrence-enumerating counterexample must detect the old work: \
+             {sparse:?} vs {repeated:?}"
+        );
+        assert!(
+            repeated.plan.iter().any(|step| step.contains(
+                "SEARCH r USING COVERING INDEX reference_postings_navigation_names_idx"
+            )),
+            "eligible membership must use the covering target-name index: {:?}",
+            repeated.plan
+        );
+        assert!(
+            !repeated
+                .plan
+                .iter()
+                .any(|step| step == "SCAN r" || step.starts_with("SCAN r ")),
+            "the candidate relation must not enumerate postings: {:?}",
+            repeated.plan
+        );
+    }
+
+    #[test]
+    fn virtual_name_results_keep_spelling_and_identity_suppression() {
+        let _serial = serialize();
+        let root = scratch("friendly-virtual-name-semantics");
+        std::fs::create_dir_all(root.join("pages")).expect("pages");
+        std::fs::write(
+            root.join("pages/Known.md"),
+            "alias:: Known Alias\n\n- stored owner\n",
+        )
+        .expect("known page");
+        std::fs::write(
+            root.join("pages/Owner.md"),
+            "orphanproperty:: value\n\n\
+             - [[ghost name]] [[Ghost Name]] [[GHOST NAME]]\n\
+             - [[Ghost Name]] [[Known]] [[Known Alias]]\n",
+        )
+        .expect("reference owner");
+        let corpus = Corpus::open(root, true);
+
+        let work = measure_candidate_work(&corpus);
+        assert_eq!(
+            work.candidates,
+            vec![("GHOST NAME".to_string(), crate::refs::page_key("ghost name"))],
+            "one lexicographically chosen raw spelling survives; repeated references, \
+             property names, physical titles and aliases do not add virtual rows"
+        );
+
+        let ghosts = read(
+            &corpus,
+            &QueryPlan::friendly("ghost name", 16, 0),
+            &ResultIdentity::session_owned(),
+        )
+        .expect("virtual name read");
+        let virtual_ghosts = ghosts
+            .hits
+            .iter()
+            .filter_map(|hit| match hit {
+                QueryHit::Page { page, .. } if page.rel_path.is_empty() => Some(page.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(virtual_ghosts, ["GHOST NAME"]);
+
+        for query in ["known", "known alias"] {
+            let answer = read(
+                &corpus,
+                &QueryPlan::friendly(query, 16, 0),
+                &ResultIdentity::session_owned(),
+            )
+            .unwrap_or_else(|error| panic!("{query} read failed: {error}"));
+            assert!(
+                answer.hits.iter().all(|hit| matches!(
+                    hit,
+                    QueryHit::Page { page, .. } if !page.rel_path.is_empty()
+                )),
+                "a physical title/alias identity suppresses its virtual suggestion: {query}"
+            );
+        }
+        let property = read(
+            &corpus,
+            &QueryPlan::friendly("orphanproperty", 16, 0),
+            &ResultIdentity::session_owned(),
+        )
+        .expect("property-name read");
+        assert!(property.hits.is_empty(), "a property name is not a virtual page");
+    }
+}
