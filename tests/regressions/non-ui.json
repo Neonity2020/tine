@@ -5097,6 +5097,34 @@
   "failBefore": "proven"
  },
  "notes": "GH #543 warm-reopen follow-up. The launch-time warm validation reads every page to confirm the stored index is current (5.6 s for 10,000 pages on the Windows verify runner). Opening today's journal meanwhile publishes the page even when its bytes are unchanged; that moved the cache generation, the warm abandoned on drift, and every warm reopen fell back to a whole-graph parse (16 s to a working search, run 35643784742). A generation move made only of one-page publications whose session revisions equal what the warm read no longer discards it: removals and whole-cache invalidations move a separate structural counter and still count as drift. gh543_a_page_opened_during_the_warm_read_keeps_the_warm fails on the old any-move rule (unchanged case parses the whole graph) and checks that an edit or a new page written during the warm is indexed. Windows re-measure pending."
+},
+{
+ "id": "REG-WARM-REOPEN-DERIVED-READ-PARSE-543",
+ "title": "Whole-graph views opened during the launch-time index check wait for it instead of parsing every page",
+ "family": "direct-files-performance",
+ "sources": {
+  "issues": [
+   543
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "linux",
+  "windows",
+  "macos",
+  "ios"
+ ],
+ "layer": "rust-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_whole_graph_reads_during_the_warm_read_wait_instead_of_parsing"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "GH #543 warm-reopen follow-up (Windows verify run 35648984084: 10k warm reopen 24.9 s vs 16.0 s before). During the warm validation read the projection queue is idle and the worker not busy, so the 250 ms readiness wait returned false at once and the launch-time page list and alias reads parsed the whole graph; that installed a full snapshot which outranked the warm and was indexed after it. Page inventory, aliases, property owner rows and block ref counts now wait while the projection reports the warm in flight and no parsed cache exists. The test fails on the old immediate fallback (whole graph parsed during the warm read) and checks the answers after release with zero parses. Evidence: tine-agents/evidence/gh550-batch/gh543-derived-wait/."
 }
 ]
 }

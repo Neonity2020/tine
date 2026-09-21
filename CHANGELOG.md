@@ -75,6 +75,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   journal during that check used to discard it and parse the whole graph,
   which on 10,000 pages delayed a working search by several seconds on each
   launch (GH #543).
+- Reopening a large graph no longer parses every page to show the page
+  list, aliases, property values or reference counts while Tine is still
+  checking its search index. Those views now wait for the check, which reads
+  the pages anyway, instead of starting a second whole-graph pass that then
+  delayed the index further; on Windows this doubled the time to a working
+  search on 10,000 pages (GH #543).
 - Advanced queries written the way Logseq's documentation and many
   `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
   or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or

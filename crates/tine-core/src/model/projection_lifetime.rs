@@ -310,6 +310,42 @@ impl Graph {
         }
     }
 
+    /// Readiness for a whole-graph derived read (page list, aliases, property
+    /// owners, block-ref counts). Beyond the short delta wait, a read that
+    /// finds a warm validation in flight and no parsed cache keeps waiting
+    /// for that warm: its only alternative is parsing every page, and on a
+    /// warm reopen that parse queued a full snapshot which outranked the warm
+    /// and doubled the time to a working search (GH #543). The warm finishes
+    /// no later than such a parse would; if it gives up, the read falls back
+    /// as before. With a parsed cache present the fallback is cheap, so no
+    /// extra wait (this also keeps the warm thread from waiting on itself).
+    pub(super) fn wait_for_derived_read(
+        &self,
+        projection: &crate::direct_projection::DirectProjection,
+        generation: u64,
+    ) -> bool {
+        use crate::direct_projection::ProjectionProgress;
+        use crate::query::QueryReadinessReason as Reason;
+        loop {
+            if projection.wait_ready_at(generation) {
+                return true;
+            }
+            let warming = matches!(
+                projection.progress_at(generation),
+                // `Busy`: the worker has taken the queued warm and is
+                // applying it.
+                ProjectionProgress::Working(Reason::Indexing | Reason::Busy)
+            );
+            if !warming
+                || self.cache.read().unwrap().is_some()
+                || self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation
+            {
+                return projection.ready_at(generation);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// R6: the page inventory from the ready projection, rebuilt into the
     /// walk's `PageEntry` shape. `pages.name` is the effective (title::-aware)
     /// name because the producer lowers the effective entry; kind comes from
@@ -324,7 +360,7 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !projection.wait_ready_at(generation) {
+        if !self.wait_for_derived_read(&projection, generation) {
             return None;
         }
         let rows = projection.page_inventory(generation)?;
@@ -466,7 +502,7 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !projection.wait_ready_at(generation) {
+        if !self.wait_for_derived_read(&projection, generation) {
             return None;
         }
         let result = projection.property_owner_rows(generation)?;

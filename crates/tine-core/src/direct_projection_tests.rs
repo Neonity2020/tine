@@ -8596,3 +8596,57 @@ fn gh543_indexing_progress_counts_each_whole_graph_pass() {
     release_projection(&graph);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// GH #543: on a warm reopen the frontend asks for the page list and aliases
+/// while the warm is still reading files. Those reads used to give up after a
+/// short wait and parse every page; the parse queued a full snapshot that
+/// outranked the warm. They now wait for the warm and read the index.
+#[test]
+fn gh543_whole_graph_reads_during_the_warm_read_wait_instead_of_parsing() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-derived-reads-wait");
+    for index in 0..40 {
+        std::fs::write(
+            root.join("pages").join(format!("bulk-{index:03}.md")),
+            format!("alias:: bulk alias {index}\n\n- TODO bulk-{index:03}\n"),
+        )
+        .unwrap();
+    }
+    let database = scratch("gh543-derived-reads-wait-db").join("projection.sqlite");
+    let (expected_pages, expected_aliases) = {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let answer = (graph.list_pages().len(), graph.page_aliases().len());
+        release_projection(&graph);
+        answer
+    };
+    assert!(expected_aliases >= 40);
+    std::thread::sleep(Duration::from_millis(20));
+
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    let reads = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || (graph.list_pages().len(), graph.page_aliases().len()))
+    };
+    // Longer than the short delta wait: the reads must still be waiting.
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        !graph.has_parsed_cache_test() && graph.page_build_parses_test() == 0,
+        "a whole-graph read during the warm read parsed every page instead of waiting"
+    );
+    pause.release.wait();
+    warm.join().unwrap();
+    assert_eq!(reads.join().unwrap(), (expected_pages, expected_aliases));
+    assert_eq!(graph.page_build_parses_test(), 0);
+    release_projection(&graph);
+    std::fs::remove_dir_all(root).unwrap();
+}

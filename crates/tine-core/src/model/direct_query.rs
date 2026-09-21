@@ -1287,7 +1287,7 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !projection.wait_ready_at(generation) {
+        if !self.wait_for_derived_read(&projection, generation) {
             return None;
         }
         let aliases = projection.page_aliases_with_owners(generation)?;
@@ -1364,7 +1364,7 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !projection.wait_ready_at(generation) {
+        if !self.wait_for_derived_read(&projection, generation) {
             return None;
         }
         let counts = projection.block_ref_counts(generation)?;
