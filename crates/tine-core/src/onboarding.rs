@@ -661,6 +661,10 @@ mod tests {
         assert!(page.markdown.contains("published-queries/<name>/"));
         assert!(page.markdown.contains("exports **whole pages**"));
         assert!(page.markdown.contains("Query export size limit"));
+        // PDF export is desktop-only and HTML export is not; the Export
+        // section has to say which, or a mobile user reads absence as
+        // breakage (GH #560).
+        assert!(page.markdown.contains("It is offered on desktop only"));
         assert!(page.markdown.contains("Copy complete recovery data"));
         assert!(page.markdown.contains("Try opening again"));
 
@@ -1656,6 +1660,9 @@ mod tests {
         assert!(page
             .markdown
             .contains("Hardware Back to return first to the PDF"));
+        // A control the mobile build does not offer has to be named here, or
+        // it reads as broken rather than absent (GH #560).
+        assert!(page.markdown.contains("Export to PDF is desktop-only"));
         assert!(page.markdown.contains("experimental 32-bit Windows"));
         assert!(page.markdown.contains("no public iOS app"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));

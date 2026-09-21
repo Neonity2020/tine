@@ -23,6 +23,7 @@ icon:: 📱
   - **One route at a time** — pages and PDF readers share one history, with no tab strip, split panes, or second windows; the desktop multi-window model does not exist here.
   - **Context menus open from the bullet affordance** rather than a right-click anywhere; long-press on text stays with the system, so text selection works natively.
   - In the PDF reader, highlight recolor and remove work, but the highlight menu's **Copy ref** and **Linked references** entries appear only on desktop.
+  - **Export to PDF is desktop-only** — printing is unavailable inside a mobile WebView, so the page menu does not offer it here. **Export graph to HTML** (Settings → **Graph**) works on Android just as on desktop, publishing the pages you marked `public:: true`.
   - **Updates come from you.** The in-app update checker and installer are off on mobile; take each new release-signed APK from the GitHub releases page and sideload it. Distribution today is a sideloaded, release-signed APK attached to each GitHub release; Play Store and F-Droid are planned, and the F-Droid build will omit the network plugin/theme catalogue while keeping local sideloading.
 - ## On desktop (Linux, macOS, Windows)
   - Everything the phone skips is here: tabs with pin, reorder, and reopen, split panes, saved workspaces, multiple windows, the modifier-click gestures, and global quick capture.

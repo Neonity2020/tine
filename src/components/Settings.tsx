@@ -319,7 +319,13 @@ export function Settings(): JSX.Element {
     setPublishMsg("Exporting…");
     try {
       const [dir, n] = await backend().publishHtml();
-      setPublishMsg(`Exported ${n} pages to ${dir}`);
+      // A zero is a successful export of nothing, which reads as a broken
+      // button (GH #560). Publication is the public-page capability, so say so.
+      setPublishMsg(
+        n === 0
+          ? `Exported 0 pages to ${dir} — only pages with “public:: true” are exported.`
+          : `Exported ${n} pages to ${dir}`,
+      );
     } catch (e) {
       setPublishMsg(`Failed: ${String(e)}`);
     }

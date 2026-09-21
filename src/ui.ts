@@ -23,6 +23,7 @@ import {
 } from "./backend";
 import { pageIdentityKey } from "./pageIdentity";
 import { failureShape } from "./failureShape";
+import { isMobilePlatform } from "./nativeChrome";
 import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
 import { reconcileLayout } from "./favoritesLayout";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
@@ -2186,6 +2187,18 @@ export function closeSwitcher() {
 // collects options and calls exportPagePdf.
 export const [pdfExportPage, setPdfExportPage] = createSignal<string | null>(null);
 export function openPdfExport(name: string) {
+  // A mobile WebView cannot print, so the export silently did nothing (GH #560).
+  // Android's renderer disables scripted printing outright
+  // (AwPrintRenderFrameHelperDelegate::IsScriptedPrintEnabled returns false);
+  // on iOS WebKit does forward window.print() to the UI process, but only into
+  // the private WKUIDelegate SPI `_webView:printFrame:`, which wry does not
+  // implement. Neither path throws, so print.ts's `win.print()` returned
+  // normally, `afterprint` never fired, and the dialog led nowhere. This is the
+  // one funnel for every entry point (page context menu, command, keybinding).
+  if (isMobilePlatform) {
+    pushToast("PDF export needs the desktop app: a mobile WebView cannot print.", "info");
+    return;
+  }
   setPdfExportPage(name);
 }
 export function closePdfExport() {

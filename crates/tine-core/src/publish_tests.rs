@@ -1573,6 +1573,44 @@ fn publish_graph_with_main_reader(graph: &Graph) -> io::Result<(String, usize)> 
     publish_graph(graph)
 }
 
+/// GH #560's "0 pages exported" is the ordinary outcome for a graph whose
+/// pages are not marked `public:: true`, on every platform.
+///
+/// The report reached us as an Android defect, but `publishHtml` RESOLVED
+/// there — the UI renders `Exported ${n} pages` only on success and
+/// `Failed: …` on error. A successful zero cannot come from an unavailable or
+/// still-building projection (those are `ProjectionUnavailable` and
+/// `NotReady`, both errors); it means the capture honestly found nothing
+/// publishable. Publication is the public-page capability, so a graph with no
+/// public page exports zero pages and writes the bare index/pages templates
+/// the reporter saw.
+#[test]
+fn publish_exports_zero_pages_and_bare_templates_when_no_page_is_public() {
+    let dir = std::env::temp_dir().join(format!("tine-publish-nonpublic-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    // Ordinary pages: real content, no `public::` property anywhere.
+    fs::write(dir.join("pages/Alpha.md"), "- alpha body\n").unwrap();
+    fs::write(dir.join("pages/Beta.md"), "- beta body\n").unwrap();
+
+    let graph = Graph::open(&dir);
+    let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
+
+    assert_eq!(
+        count, 0,
+        "publication is the public-page capability: nothing is public here"
+    );
+    let index = fs::read_to_string(Path::new(&outdir).join("index.html")).unwrap();
+    assert!(
+        !index.contains("alpha body") && !index.contains("beta body"),
+        "a non-public page must not reach the export: {index}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The renderer routes TQL through its supplied reader and filters only
 /// after that reader has answered over the complete capture.
 ///

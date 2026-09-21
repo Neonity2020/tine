@@ -4583,6 +4583,57 @@
   "failBefore": "a_hard_link_outside_graph_text_scope_does_not_block_a_save on the pre-fix tree: 'annex: graph text files alias one physical resource: pages/Target.md has link count 2'. The refusal fired at save_page, not at load, so reading an annexed graph always worked and only editing was blocked."
  },
  "notes": "Every Direct save refused when the target file had more than one link. The rule (validate_graph_text_single_link) compared the raw link count to 1, which cannot distinguish the case it meant to catch - two GRAPH-TEXT paths on one inode, where temp+rename publication leaves the other page holding stale bytes - from links Tine has no interest in: git-annex annex.thin links every page into .git/annex/objects/..., which graph-text scope never descends into, and users hard-link or deduplicate pages outside the graph. Martin decided (2026-09-20) to allow hard links and keep the in-graph alias refusal. Implementation note: the precise check needs the complete identity index, and an ordinary resave must never build one (GH #267 keeps saves target-local, O(1) not O(graph)), so the refusal now lives on page creation, where the index is already in hand (validate_graph_text_resource_alias), and the rename transaction's move source plus editor recovery keep the raw link count as an interim rule. Accepted consequence, asserted in an_in_graph_alias_no_longer_blocks_a_resave: if two graph pages really do share an inode, editing one leaves the other with its old bytes rather than refusing. Remaining gap: an annexed graph can save but still cannot rename, tracked with the rename work (GH #406, GH #535)."
+},
+{
+ "id": "REG-PDF-EXPORT-MOBILE-560",
+ "title": "Export to PDF is not offered on Android or iOS, and explains itself when reached by command, instead of silently doing nothing",
+ "family": "android-platform-lifecycle",
+ "sources": {
+  "issues": [
+   560
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "android",
+  "ios"
+ ],
+ "layer": "frontend",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "src/pdfExportPlatform.test.ts::opens the export dialog on desktop",
+   "src/pdfExportPlatform.test.ts::explains itself instead of opening a dead dialog on android",
+   "src/pdfExportPlatform.test.ts::explains itself instead of opening a dead dialog on ios"
+  ],
+  "scenario": null,
+  "failBefore": "Both mobile cases fail on the pre-fix tree: openPdfExport set pdfExportPage to 'Alpha' on android and ios (expected null) and raised no toast, so the dialog opened and the export then did nothing. The desktop case passes before and after."
+ },
+ "notes": "A mobile WebView cannot print, so print.ts's win.print() returned normally and nothing happened: no throw, hence no error toast, afterprint never fired, and the hidden frame was reclaimed by the 60 s fallback. The cause differs per platform and was read from upstream source, not inferred from behaviour. Android: AwPrintRenderFrameHelperDelegate::IsScriptedPrintEnabled returns false, so scripted printing is disabled in the WebView renderer (Chromium issue 40342444 tracks enabling it). iOS: WebKit does not guard printing - WebChromeClient::print has no PLATFORM(IOS_FAMILY) guard and UIDelegate::UIClient::printFrame has no PLATFORM(MAC) guard - but it forwards only into the private WKUIDelegate SPI _webView:printFrame:, which wry 0.55.1 does not implement (its own print() uses macOS-only printOperationWithPrintInfo:). So iOS is unimplemented rather than impossible, and a future host-side print path would lift the gate. Martin decided (2026-09-21) to gate mobile and explain, rather than implement Android printing now. The gate lives in openPdfExport, the single funnel for the page context menu, the Export current page to PDF command and its keybinding; the context-menu item is additionally hidden so no dead control is offered. Not verified on a device: no Android or iOS hardware here, so the platform claims rest on upstream source plus the jsdom gate test."
+},
+{
+ "id": "REG-PUBLISH-ZERO-PUBLIC-560",
+ "title": "Exporting a graph with no public pages says why nothing was exported instead of reporting a bare zero",
+ "family": "publication",
+ "sources": {
+  "issues": [
+   560
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "frontend-and-core",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/src/publish_tests.rs::publish_exports_zero_pages_and_bare_templates_when_no_page_is_public"
+  ],
+  "scenario": null,
+  "failBefore": "Not a behaviour fix: the export was already correct, and the Rust test characterises it rather than failing before. The defect was the report - Settings showed 'Exported 0 pages to <dir>' with no reason, which reads as a broken button. The message change itself is not pinned by a test; the core behaviour it describes is."
+ },
+ "notes": "Reported as an Android failure, but it is neither Android-specific nor a fault. Publication is the public-page capability: only pages carrying public:: true are exported unless :publishing/all-pages-public? is set, matching Logseq (publish.rs, all_pages_public defaults to false). A graph with no public page therefore exports zero pages and writes the bare index/pages templates the reporter saw. The report was diagnosed by elimination: the UI renders 'Exported N pages' only when publishHtml RESOLVES, so a successful zero excludes both unready-projection paths, which raise errors instead - verified by running them, giving ProjectionUnavailable with no projection attached and NotReady(Busy) with a projection attached but not yet built. The Guide already documents the public:: rule (templates/research-document.md, templates/files-external-edits-backups.md); the gap was in-app, so the zero case now names the rule."
 }
 ]
 }

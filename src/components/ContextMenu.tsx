@@ -24,6 +24,7 @@ import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, open
 import { activePaneRoutes, removePageTargetAcrossPanes } from "../panes";
 import { refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
+import { isMobilePlatform } from "../nativeChrome";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
 import { BLOCK_COLOR_NAMES, BLOCK_COLOR_SWATCH } from "../blockColors";
@@ -1006,7 +1007,10 @@ function PageMenu(props: {
           });
       },
     },
-    { id: "export-pdf", label: "Export to PDF…", run: () => openPdfExport(props.name) },
+    // Not offered on mobile: no mobile WebView can print (GH #560, see openPdfExport).
+    ...(isMobilePlatform
+      ? []
+      : [{ id: "export-pdf", label: "Export to PDF…", run: () => openPdfExport(props.name) }]),
     ...(props.fileActions && !pageByName(props.name)?.guide
       ? [
           { id: "show-in-folder", label: "Show in folder", run: () => void runFileAction(true) },
