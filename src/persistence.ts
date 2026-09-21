@@ -1002,10 +1002,43 @@ async function doSave(
             { sticky: true },
           );
         }
-      } else {
+        markConflict(name);
+      } else if (conflictObjectFor(pageByName(name)?.path, name)) {
+        // No authority was minted, but a restored capsule already gives this
+        // page an answerable review, so the mark still has something to park
+        // behind. "Keep mine" stays disabled (there is no nameable epoch to
+        // present), while the resolver and "Use disk version" remain reachable.
         conflictObservation.set(name, { kind: "direct", epoch: null });
+        markConflict(name);
+      } else if (token === graphToken) {
+        // GH #535. The backend mints a conflict with NO epoch when there is no
+        // editor episode to anchor a review: editor_activation.rs:581-586 and
+        // :645-650 return `ConflictBaseRev` through `into_io`, not
+        // `into_io_with_conflict_epoch`. Nothing can review that refusal —
+        // `registerLiveSaveConflict` requires a numeric epoch, so no capsule and
+        // no queue entry are ever created for it.
+        //
+        // Marking the page conflicted anyway was the defect. It shut every exit
+        // at once: the ordinary save refuses a conflicted page, "Keep mine"
+        // requires a nameable epoch, and the in-page resolver renders only for a
+        // queue entry — while nothing on screen named the page. Only deleting it
+        // cleared the flag, which is exactly the workaround the reporter found.
+        // And because `flushAll` is graph-wide, ONE such page blocked EVERY
+        // rename in the graph for the rest of the session.
+        //
+        // So report it and leave the page unmarked. The edit stays dirty, so
+        // close protection stays armed and it saves on the next edit or flush;
+        // the backend's base-revision guard still refuses every clobber, so
+        // nothing here is less safe than before. The user simply keeps a way
+        // out. Deliberately no automatic retry: the divergence is real, and a
+        // retry re-runs the identical guarded write to the identical answer.
+        conflictObservation.delete(name);
+        dirty.add(name);
+        pushToast(
+          `“${name}” changed on disk, so Tine didn’t overwrite it. Your edit is still here — reopen the page to see the current file, then edit again to save.`,
+          "error",
+        );
       }
-      markConflict(name);
     } else if (saveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the

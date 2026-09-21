@@ -1506,8 +1506,16 @@ describe("page actions entry point", () => {
       await flushMicrotasks(); await flushMicrotasks();
       if (blocker === "save refusal") addDirty(dto.name);
       else if (blocker === "missing conflict review") {
-        save.mockRejectedValue({ kind: "save-conflict", reasonCode: "conflict.pinned_owner", epoch: null });
-        addDirty(dto.name);
+        // GH #535: the save path can no longer PRODUCE this state. A refusal
+        // that carries no observation epoch has no review to offer, and marking
+        // the page conflicted anyway was the defect — it blocked every rename in
+        // the graph, because the flush guard is graph-wide. Persistence now
+        // leaves such a page unmarked and dirty; src/store.test.ts ("never parks
+        // a page behind a conflict it cannot offer for review") is the guard.
+        // The diagnostic branch survives as the fallback should any future path
+        // mark without registering a review, so build that state directly
+        // instead of through a save that can no longer reach it.
+        markConflict(dto.name);
       } else if (blocker === "many conflicts") {
         for (const name of ["First", "Second", "Third", "Fourth"]) markConflict(name);
       } else {
@@ -1529,7 +1537,9 @@ describe("page actions entry point", () => {
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
         expect(warning.mock.calls[0][0]).not.toContain("conflict");
       } else if (blocker === "missing conflict review") {
-        expect(save).toHaveBeenCalled();
+        // Blocked by the unreviewable conflict itself, so the flush never even
+        // reaches a save — the same shape as the "other page conflict" case.
+        expect(save).not.toHaveBeenCalled();
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('“Rename me”'));
         expect(warning.mock.calls[0][0]).toContain("no conflict review");
         expect(warning.mock.calls[0][0]).not.toContain("Open that page");

@@ -95,6 +95,7 @@ import {
   isConflicted,
   conflicts,
   clearConflict,
+  conflictObjectFor,
   favorites,
   recentPages,
   setFavorites,
@@ -3119,9 +3120,48 @@ describe("save engine (persistence)", () => {
   it("a conflict marks the page (no clobber) and flushAll reports failure", async () => {
     load([blk("x")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
+    // An ANSWERABLE conflict: the backend minted an observation epoch, so a
+    // review is registered and the page is parked behind something the user can
+    // act on. The epoch-less refusal is a different case with its own test
+    // (GH #535) — it must not park the page at all.
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(42));
     expect(await flushAll()).toBe(false);
     expect(isConflicted("Test")).toBe(true);
+  });
+
+  // GH #535 — "Page rename is blocked by a false 'pending edits / conflict'
+  // error", where no conflict is visible anywhere and the only workaround the
+  // reporter found was deleting the page and recreating it.
+  //
+  // The backend mints a conflict with NO epoch when there is no editor episode
+  // to anchor a review: crates/tine-core/src/model/editor_activation.rs:581-586
+  // and :645-650 return `ConflictBaseRev` through `into_io` (not
+  // `into_io_with_conflict_epoch`). The frontend still marked the page
+  // conflicted for that refusal, and every exit is then shut: the ordinary save
+  // refuses while a page is conflicted, "Keep mine" requires a nameable epoch,
+  // and the in-page resolver renders only for a conflict-queue entry that was
+  // never registered. Nothing names the page, and because `flushAll` is
+  // graph-wide, ONE such page blocks every rename in the graph for the session.
+  //
+  // The invariant is about the user's exit, not about the epoch: a page may be
+  // parked as conflicted only when there is a review to park it behind.
+  it("never parks a page behind a conflict it cannot offer for review (GH #535)", async () => {
+    load([blk("x")]);
+    markDirty("Test");
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
+    expect(await flushPage("Test")).toBe(false);
+
+    // Marked conflicted AND unreviewable is the one combination with no way out.
+    if (isConflicted("Test")) {
+      expect(conflictObjectFor(pageByName("Test")?.path, "Test")).toBeDefined();
+    }
+
+    // …and whatever the refusal left behind, the page must still be saveable
+    // once the disk agrees again. Otherwise the edit is stranded for the rest
+    // of the session and only deleting the page clears it.
+    saveSpy.mockResolvedValue({ revision: "rev-after" });
+    markDirty("Test");
+    expect(await flushPage("Test")).toBe(true);
   });
 
   it("mints a snapshot-less save fallback so a diverged editor raises an answerable conflict", async () => {
@@ -3354,7 +3394,10 @@ describe("save engine (persistence)", () => {
   it("deletes a CONFLICTED page through the backend without flushing its retained draft", async () => {
     load([blk("x")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
+    // An answerable conflict, so the page really is parked as conflicted: this
+    // test is about DELETING a conflicted page, not about how the refusal was
+    // classified (GH #535 leaves the epoch-less case unmarked).
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(9));
     await flushPage("Test"); // the save is now refused until the conflict is resolved
     expect(isConflicted("Test")).toBe(true);
     const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
@@ -3369,7 +3412,8 @@ describe("save engine (persistence)", () => {
   it("retains a CONFLICTED draft when its backend delete fails", async () => {
     load([blk("retained conflict draft")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new SaveConflictError(null));
+    // Answerable, for the same reason as the delete test above (GH #535).
+    saveSpy.mockRejectedValueOnce(new SaveConflictError(9));
     await flushPage("Test");
     expect(isConflicted("Test")).toBe(true);
     const deleteSpy = vi.spyOn(backend(), "deletePage").mockRejectedValue(new Error("delete deferred"));

@@ -47,6 +47,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a staged build becomes ready. Without the flag nothing is recorded (GH #543).
 
 ### Fixed
+- Renaming a page no longer stops working for the whole graph until you delete
+  and recreate a page. When a save was refused because the file had changed on
+  disk, Tine could mark the page conflicted without being able to offer it for
+  review: no banner was drawn, so there was nothing to resolve, and since a
+  rename requires every page in the graph to be settled first, that one page
+  refused every rename for the rest of the session. Such a refusal now leaves
+  the page editable and says what happened, so you can reopen it, see the
+  current file and save again; conflicts that do have a review are unchanged
+  (GH #535).
 - Editing a page's properties no longer raises a save-failure toast while you
   are still typing them. Page properties written as the first bullet of a page
   are saved into the file's own header, but Tine kept treating them as an

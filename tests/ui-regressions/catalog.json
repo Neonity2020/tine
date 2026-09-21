@@ -11384,7 +11384,32 @@
         "scenario": "page-rename.actual-flush-blocker-preserves-drafts",
         "failBefore": "proven"
       },
-      "notes": "Partial GH #535: actual title DOM submission through real persistence with a typed non-conflict save failure and an unrelated conflict. Rename remains refused and pending body edits remain intact; message names the actual pending/conflicted page, caps listed names at three, and never directs the user to absent conflict review UI. Windows native save refusal and reporter-specific root cause remain unverified. Context-menu caller uses the identical read-only diagnostic; ContextMenu render suite passes."
+      "notes": "GH #535, message half: actual title DOM submission through real persistence with a typed non-conflict save failure and an unrelated conflict. Rename remains refused and pending body edits remain intact; message names the actual pending/conflicted page, caps listed names at three, and never directs the user to absent conflict review UI. Context-menu caller uses the identical read-only diagnostic; ContextMenu render suite passes. The reporter's root cause — a page parked behind a conflict that no review could answer, so no rename in the graph could ever proceed — is a separate user outcome covered by UI-PAGE-RENAME-UNREVIEWABLE-CONFLICT-535. Windows native save refusal remains unverified."
+    },
+    {
+      "id": "UI-PAGE-RENAME-UNREVIEWABLE-CONFLICT-535",
+      "title": "A save refused with no reviewable conflict does not block every rename in the graph",
+      "family": "page-rename",
+      "sources": {
+        "issues": [
+          535
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts",
+          "src/persistenceConflictRetry.test.ts"
+        ],
+        "scenario": "page-rename.unreviewable-conflict-never-parks-the-page",
+        "failBefore": "proven"
+      },
+      "notes": "Blocking core operation. The backend mints a conflict with NO observation epoch when no editor episode exists to anchor a review (editor_activation.rs:581-586, :645-650 return ConflictBaseRev through into_io, not into_io_with_conflict_epoch), and registerLiveSaveConflict requires a numeric epoch, so no queue entry can exist for it. Marking the page conflicted anyway closed every exit at once: the banner was never drawn, Keep mine had no epoch to spend, the transient retry refuses to run on a conflicted page, and because flushAll's verdict is graph-wide, that one page refused EVERY page rename in the graph for the rest of the session - matching the report that only deleting and recreating the page restored renaming. Now such a refusal leaves the page unmarked and dirty and raises one toast naming what happened; a refusal that DOES have a restored capsule to park behind still marks, so the review path is unchanged. Fail-before: the store assertion 'marked conflicted AND unreviewable' failed with 'expected undefined to be defined'. Deliberately no retry - the divergence is real and a retry repeats the identical guarded write."
     },
     {
       "id": "UI-EMBED-INPUT-OWNERSHIP-20260913",
