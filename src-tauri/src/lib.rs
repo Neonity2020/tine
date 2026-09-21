@@ -484,13 +484,15 @@ mod multi_window_tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    init_xlib_threads();
+    // First, before the CLI too: XInitThreads opens no display, so a headless
+    // CLI run pays nothing, and no later path can reach Xlib uninitialized.
+
     #[cfg(desktop)]
     if let cli::Startup::Exit(code) = cli::dispatch_env() {
         std::process::exit(code);
     }
-
-    #[cfg(target_os = "linux")]
-    init_xlib_threads();
 
     // Bring up debug logging FIRST (TINE_DEBUG=1 / --debug), so every later
     // milestone — and any panic — is captured to the log file from the very start.

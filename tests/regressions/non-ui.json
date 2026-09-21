@@ -3162,6 +3162,31 @@
    "notes": "The recorder writer accepts only fixed event names, catalogued IPC command names, enums, booleans, counts and durations; detailed debug strings never enter the report. Current/previous one-MiB segments, unclean-exit marker, private files and process lock are native-tested. Release tests pin line-level symbols, hidden maps copied outside dist, exact-SHA artifact naming and removal of maps from shipped assets."
   },
   {
+   "id": "REG-CLOSE-DISCARD-DIAGNOSTIC-540",
+   "title": "A close that discarded unsaved drafts is visible in the diagnostic report instead of reading as an ordinary clean exit",
+   "family": "diagnostic-observability",
+   "sources": {
+    "issues": [
+     540
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "unit",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/safeClose.test.ts::records a discard only when the user accepts losing work, and a failing record never blocks the close (GH #540)",
+     "src-tauri/src/debug.rs::a_close_that_discards_drafts_records_only_a_fixed_reason_and_a_count"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #540, DanTremonti: a session in which the user closed through the unsaved-changes warning and accepted discarding was still recorded as runtime.clean_shutdown, so the report could not tell it from a normal exit. The safe-close coordinator now records runtime.close_discarded_unsaved (fixed reason token failed|still-saving and a page count; never titles or paths) only after the user confirms discarding, bounded to 1 s and never blocking the close. The coordinator test fails on the pre-fix safeClose.ts. Layer: coordinator unit + Rust field filter; the Tauri invoke wiring in App.tsx is typechecked, not driven natively."
+  },
+  {
    "id": "REG-CONFIG-LIVE-RELOAD",
    "title": "An outside change to logseq/config.edn is picked up while Tine is running, instead of being ignored until the next graph open",
    "family": "graph-configuration",
@@ -4276,12 +4301,12 @@
   "tests": [
    "crates/tine-core/src/projection_budget.rs::small_graph_gets_the_floor_and_large_graph_the_ceiling",
    "crates/tine-core/src/projection_budget.rs::physical_memory_caps_the_budget_but_never_below_the_floor",
-   "crates/tine-core/src/direct_projection_tests.rs::a_full_build_sizes_the_writer_cache_and_hands_it_back"
+   "crates/tine-core/src/direct_projection_tests.rs::a_fresh_build_restores_the_serving_writer_cache_budget"
   ],
   "scenario": "query.projection-build-cost",
   "failBefore": "tine-agents/evidence/gh543-build-path/core-fail-before.log (a_full_build_sizes_the_writer_cache_and_hands_it_back against the pre-fix apply_pending: cache budget stayed at the 2,048,000-byte default; probe curves in probe-1k.log and probe-knee.log)"
  },
- "notes": "Blocking core operation: on a 10,000-page graph the first index build (fresh install, upgrade, or repair) never reached search-ready on Windows within 10 minutes and search stayed on the indexing notice. Root cause: the whole-graph build is one SQLite transaction inserting every row of every UUID-keyed index onto a random B-tree leaf while the connection ran at SQLite's ~2 MiB default page cache, so each dirty page was spilled to the WAL and read back (8.8M cache misses, 27 GB read / 19 GB written for 49 MB of Markdown); Windows makes each of those round trips ~10x dearer. Fix (tine-storage v0.20.1 + tine-core): the writer's page cache is sized to the build from the projected text bytes (`projection_budget`, RAM-capped, returned after commit), and a build into an empty projection creates its 35 secondary indexes once after the rows instead of maintaining them per row. Measured in tine-storage's `gh543_build_probe` (recorded in the packet record)."
+ "notes": "Blocking core operation: on a 10,000-page graph the first index build (fresh install, upgrade, or repair) never reached search-ready on Windows within 10 minutes and search stayed on the indexing notice. Root cause: the whole-graph build is one SQLite transaction inserting every row of every UUID-keyed index onto a random B-tree leaf while the connection ran at SQLite's ~2 MiB default page cache, so each dirty page was spilled to the WAL and read back (8.8M cache misses, 27 GB read / 19 GB written for 49 MB of Markdown); Windows makes each of those round trips ~10x dearer. Fix (tine-storage v0.20.1 + tine-core): the writer's page cache is sized to the build from the projected text bytes (`projection_budget`, RAM-capped, returned after commit), and a build into an empty projection creates its 35 secondary indexes once after the rows instead of maintaining them per row. Measured in tine-storage's `gh543_build_probe` (recorded in the packet record). Coverage update (2026-09-21): compact-projection P4 (1f80e35a) moved the full build into an unpublished stage and retired a_full_build_sizes_the_writer_cache_and_hands_it_back; the build budget is still computed by projection_budget (the two tests above), and a_fresh_build_restores_the_serving_writer_cache_budget proves the serving writer gets its budget back after publication. The fail-before evidence above is for the retired test and is historical."
 },
 {
  "id": "REG-QUERY-PROJECTION-REFERENCE-NAMES-543",
@@ -4301,17 +4326,17 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection_tests.rs::direct_projection_matches_fuzzy_search_and_virtual_reference_names",
+   "crates/tine-core/src/direct_projection_tests.rs::direct_projection_matches_literal_search_and_virtual_reference_names",
    "crates/tine-core/src/direct_projection_tests.rs::real_corpus_projection_converges_and_matches_task_query"
   ],
   "scenario": "query.projection-build-cost",
   "failBefore": "tine-agents/evidence/gh543-reader/fail-before.md (EXPLAIN QUERY PLAN of the v0.20.1 reader on the 10k projection: SCAN + TEMP B-TREE FOR ORDER BY, 1.37 s per 512-row batch, 65 s full drain; the plan guard rejects that exact query as its built-in counterexample; local-543-reopen-io.log shows the storm on a reopen with a finished index)"
  },
- "notes": "Blocking core operation, all platforms: every launch drains `navigation_reference_names_after` (tine-core `referenced_page_names`, called by page inventory / autocomplete) in 512-row keyset batches ordered by the joined page path, which no index serves, so each batch scanned and sorted all 600,000 postings (110,000 distinct rows at 10,000 pages): O(N^2), 215 batches x 1.3 s, ~11 GB of reads, 30-40 s on one tokio worker before Ctrl+K answered, on a reopen as well as after a cold build. Fix (tine-storage v0.20.2): both navigation readers page on the columns of an existing index with a row-value keyset; signatures and cursor tuples unchanged, only row order, and the one consumer builds an order-independent set. Full drain on that projection: 65 s -> 1.3 s. The plan-shape guard and the batch-edge paging test live in tine-storage (`paged_navigation_readers_use_an_index_range`, `navigation_reference_names_page_without_gaps_or_repeats`, certified with the v0.20.2 pin receipt); the tine-core tests listed here drive the real consumer against the reordered reader and the anonymized-corpus oracle, proving the answer is order-independent."
+ "notes": "Blocking core operation, all platforms: every launch drains `navigation_reference_names_after` (tine-core `referenced_page_names`, called by page inventory / autocomplete) in 512-row keyset batches ordered by the joined page path, which no index serves, so each batch scanned and sorted all 600,000 postings (110,000 distinct rows at 10,000 pages): O(N^2), 215 batches x 1.3 s, ~11 GB of reads, 30-40 s on one tokio worker before Ctrl+K answered, on a reopen as well as after a cold build. Fix (tine-storage v0.20.2): both navigation readers page on the columns of an existing index with a row-value keyset; signatures and cursor tuples unchanged, only row order, and the one consumer builds an order-independent set. Full drain on that projection: 65 s -> 1.3 s. The plan-shape guard and the batch-edge paging test live in tine-storage (`paged_navigation_readers_use_an_index_range`, `navigation_reference_names_page_without_gaps_or_repeats`, certified with the v0.20.2 pin receipt); the tine-core tests listed here drive the real consumer against the reordered reader and the anonymized-corpus oracle, proving the answer is order-independent. Coverage update (2026-09-21): the first test was renamed direct_projection_matches_literal_search_and_virtual_reference_names when search stopped being fuzzy (08ab3dfd); its reference-name assertions are unchanged in purpose."
 },
 {
  "id": "REG-QUERY-PROJECTION-PARTIAL-ADMISSION-543",
- "title": "Search answers over the pages indexed so far while a cold or changed graph's query index is still being built, and the build is never restarted by a parsed snapshot or an edit",
+ "title": "Ctrl+K and the (( picker answer while a cold or changed graph's query index is still being built, and the build is never restarted by a parsed snapshot or an edit",
  "family": "query-readiness",
  "sources": {
   "issues": [
@@ -4327,16 +4352,16 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection_tests.rs::a_query_is_admitted_over_the_partial_index_while_a_stream_is_open",
-   "crates/tine-core/src/direct_projection_tests.rs::a_parsed_snapshot_beside_an_open_stream_does_not_supersede_it",
-   "crates/tine-core/src/direct_projection_tests.rs::drift_during_the_stream_restarts_the_warm_without_parsing_the_graph",
-   "crates/tine-core/src/direct_projection_tests.rs::a_deferred_turn_is_silent_while_a_write_failure_is_reported",
-   "src/components/QuickSwitcher.test.tsx::shows how far the index build has got while search answers over the partial index (GH #543)"
+   "crates/tine-core/src/query_plan_tests.rs::pre_ready_fallback_is_limited_to_ctrl_k_and_block_picker_routes",
+   "crates/tine-core/src/query_plan_tests.rs::pre_ready_ctrl_k_ranks_all_page_names_and_aliases_before_limiting",
+   "crates/tine-core/src/direct_projection_tests.rs::a_fresh_build_has_one_atomic_publication_and_no_active_reset",
+   "crates/tine-core/src/direct_projection_tests.rs::edit_delete_and_rename_during_staged_build_reconcile_after_publication",
+   "src/components/QuickSwitcher.test.tsx::says a rebuild is a rebuild while search is not ready"
   ],
   "scenario": "query.projection-build-cost",
   "failBefore": "tine-agents/evidence/gh543-partial-admission/fail-before.md (the three tine-core tests against the pre-packet admission predicate and warm driver: NotReady(Indexing) during the stream, an empty snapshot erasing the streamed pages, and drift falling to the whole-graph parse; the master warm-scale probe log showing the stream superseded by its own derived-map parse at 10,000 pages)"
  },
- "notes": "Blocking core operation, all platforms: Ctrl+K and the `((` picker on a cold or changed graph refused with NotReady(Indexing) until the whole graph was lowered (minutes at 10,000 pages on Windows), and the build itself was restarted by every path that parsed the whole graph beside the stream (page inventory, reference names, the warm task's own derived maps) and by any save during the stream (abandon -> needs_full -> parse fallback -> one huge transaction on a half-filled file). Fix: query capture is admitted while a warm validation or stream is in flight (answer over the committed rows, labelled by `query_index_progress` = (indexed, total)); `enqueue_full` is a no-op while a stream is open unless a rebuild is requested; the warm task retries the validation on drift instead of parsing; a turn deferred for want of an inventory no longer marks the worker failed (so the retry warm applies without a reset); the streaming writer gets the build page-cache budget and relaxed durability (tine-storage v0.20.3 `set_build_durability`) restored when the stream closes. Readiness (`ready_at`) is unchanged and still waits for the complete inventory."
+ "notes": "Blocking core operation, all platforms: Ctrl+K and the `((` picker on a cold or changed graph refused with NotReady(Indexing) until the whole graph was lowered (minutes at 10,000 pages on Windows), and the build itself was restarted by every path that parsed the whole graph beside the stream (page inventory, reference names, the warm task's own derived maps) and by any save during the stream (abandon -> needs_full -> parse fallback -> one huge transaction on a half-filled file). Fix: query capture is admitted while a warm validation or stream is in flight (answer over the committed rows, labelled by `query_index_progress` = (indexed, total)); `enqueue_full` is a no-op while a stream is open unless a rebuild is requested; the warm task retries the validation on drift instead of parsing; a turn deferred for want of an inventory no longer marks the worker failed (so the retry warm applies without a reset); the streaming writer gets the build page-cache budget and relaxed durability (tine-storage v0.20.3 `set_build_durability`) restored when the stream closes. Readiness (`ready_at`) is unchanged and still waits for the complete inventory. Superseded mechanism (2026-09-21): compact-projection P4 (1f80e35a, 13239e6b) retired answering over a partly built SQLite image. The user outcome is kept by a different mechanism: before the index is ready, Ctrl+K and the (( picker search one loaded parsed snapshot and rerun against the complete index when it is published; a cold or replacement build runs in an unpublished stage with one atomic publication, and edits during it reconcile afterwards instead of restarting it. Coverage now points at those tests; the fail-before evidence above is for the retired mechanism and is historical."
 },
 {
  "id": "REG-QUERY-PROJECTION-WARM-ANNOUNCE-543",

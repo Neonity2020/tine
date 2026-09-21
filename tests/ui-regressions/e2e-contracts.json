@@ -716,6 +716,34 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-guide-site.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "The published Guide served over HTTP opens the read-only app on its home page, page links navigate, Copy page link copies the page's own address, and a block permalink opens that block in context.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Returning to the Guide tab raises no external-change or editing warning, since the read-only app can never edit (GH #549).",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "Adding ?static to the address shows the plain static site instead of redirecting to the app.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Page wording, Guide content order, layout and timing may change while the named pages and links exist.",
+    "The block highlight may be any visible in-context marker of the addressed block."
+   ],
+   "nonRequirements": [
+    "Exact pixels, fonts, theme, or DOM nesting of the app shell.",
+    "Behaviour of the Guide when opened straight from disk (file://)."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-publish-security.mjs": {
    "contracts": [
     {
