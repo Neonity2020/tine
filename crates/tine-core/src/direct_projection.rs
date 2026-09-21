@@ -145,6 +145,11 @@ struct PendingWarm {
     /// for them, but they still exist: validation must leave their existing
     /// rows alone instead of reading their omission as a deletion (GH #543).
     retained: Vec<PageEntry>,
+    /// Pages this session published after the walk read them, or created
+    /// after it: each has an update queued beside the warm that brings its
+    /// rows to the current bytes, so validation leaves the image's rows for
+    /// it alone instead of calling the whole image stale (audit IT-03).
+    published: Vec<String>,
     parse_config: Arc<ParseConfig>,
 }
 
@@ -212,6 +217,14 @@ struct PendingProjection {
     /// image already stores (`UNIQUE constraint failed: pages.position`), and
     /// that failure rebuilt the whole projection on every launch (GH #550).
     order_seeded: bool,
+    /// Updates for pages the reopened image does not hold, taken before the
+    /// order was seeded. They cannot be placed without an inventory, so they
+    /// wait here, outside `has_work`, and rejoin `deltas` the moment a warm or
+    /// full snapshot seeds it. Before that nothing is validated, so readiness
+    /// cannot be published without them. Refusing the turn instead latched a
+    /// fresh build, and a page created during the warm read parsed the whole
+    /// graph (GH #543, audit IT-03).
+    unplaced: BTreeMap<String, (u64, PageDelta)>,
     /// R6 warm validation queued for the worker.
     warm: Option<PendingWarm>,
     /// R6: the worker's verdict on the last warm validation.
@@ -271,6 +284,51 @@ impl PendingProjection {
             .enumerate()
             .map(|(position, rel_path)| (rel_path.to_owned(), position as u64))
             .collect();
+        for (path, parked) in std::mem::take(&mut self.unplaced) {
+            // A newer update for the page supersedes the parked one.
+            self.deltas.entry(path).or_insert(parked);
+        }
+    }
+
+    /// Park updates the worker could not place (see `unplaced`). If the order
+    /// was seeded while the worker held them, they are placed right away.
+    fn park_unplaced(&mut self, parked: BTreeMap<String, (u64, PageDelta)>) {
+        for (path, update) in parked {
+            if self.deltas.contains_key(&path) {
+                continue;
+            }
+            if self.order_seeded {
+                self.deltas.insert(path, update);
+            } else {
+                self.unplaced.entry(path).or_insert(update);
+            }
+        }
+        if self.order_seeded {
+            self.place_unseeded_deltas();
+        }
+    }
+
+    /// Give the updates queued before the order was seeded their positions.
+    /// A page the inventory lists keeps its place; a page created after the
+    /// inventory was read goes after it, as it would in a full snapshot.
+    fn place_unseeded_deltas(&mut self) {
+        for (key, (_, delta)) in self.deltas.iter_mut() {
+            if let PageDelta::Replace {
+                page_position: position @ None,
+                ..
+            } = delta
+            {
+                *position = Some(match self.page_order.get(key) {
+                    Some(position) => *position,
+                    None => {
+                        let position = self.next_page_order;
+                        self.next_page_order += 1;
+                        self.page_order.insert(key.clone(), position);
+                        position
+                    }
+                });
+            }
+        }
     }
 
     /// The queue's own page inventory in position order: the R6 order turn's
@@ -1046,6 +1104,8 @@ impl DirectProjection {
         generation: u64,
         sources: Vec<(PageEntry, String)>,
         retained: Vec<PageEntry>,
+        published: Vec<String>,
+        walk_order: Vec<String>,
         parse_config: Arc<ParseConfig>,
         _text_bytes: u64,
     ) -> Option<u64> {
@@ -1072,18 +1132,19 @@ impl DirectProjection {
         }
         let sources_len = sources.len();
         self.shared.ready.store(false, Ordering::Release);
-        let ordered = sources
-            .iter()
-            .map(|(entry, _)| entry.rel_path.as_str())
-            .chain(retained.iter().map(|entry| entry.rel_path.as_str()))
-            .collect::<Vec<_>>();
-        pending.seed_page_order(ordered.into_iter());
+        // The walk's own order, pages it could not read included: the image
+        // stores positions in that order, and appending the unreadable pages
+        // instead shifted every page after them onto a position another page
+        // still held (GH #543).
+        pending.seed_page_order(walk_order.iter().map(String::as_str));
+        pending.place_unseeded_deltas();
         pending.warm_outcome = None;
         pending.warm_attempt += 1;
         let attempt = pending.warm_attempt;
         pending.warm = Some(PendingWarm {
             sources,
             retained,
+            published,
             parse_config,
         });
         pending.latest_generation = generation;
@@ -2814,9 +2875,11 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 let database = writer_slot
                     .as_mut()
                     .ok_or(ProjectionRefusal::AwaitingFullInventory)?;
-                let deltas = settle_unseeded_deltas(database, deltas)
-                    .map_err(ProjectionRefusal::Failed)?
-                    .ok_or(ProjectionRefusal::AwaitingFullInventory)?;
+                let (deltas, unplaced) =
+                    settle_unseeded_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?;
+                if !unplaced.is_empty() {
+                    shared.pending.lock().unwrap().park_unplaced(unplaced);
+                }
                 apply_deltas(database, deltas).map_err(ProjectionRefusal::Failed)?
             };
 
@@ -3393,6 +3456,16 @@ fn validate_warm(
             .collect::<std::collections::BTreeSet<_>>();
         source_delta.deletions.retain(|id| !retained.contains(id));
     }
+    if !warm.published.is_empty() {
+        let published = warm
+            .published
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        source_delta.deletions.retain(|id| !published.contains(id));
+        source_delta
+            .replacements
+            .retain(|id| !published.contains(id));
+    }
     if source_delta.replacements.is_empty() && source_delta.deletions.is_empty() {
         return Ok(WarmOutcome::Clean);
     }
@@ -3409,13 +3482,19 @@ fn validate_warm(
 /// - A changed page the image holds is applied without a position, so it
 ///   keeps its stored one.
 /// - A page the image does not hold cannot be placed without the session's
-///   inventory. `None` asks for that inventory instead of inventing a
-///   position; the page set differs from the image, so the warm would have
-///   required a fresh build anyway.
+///   inventory. It is returned second, to wait for that inventory instead of
+///   inventing a position (`PendingProjection::unplaced`).
+#[allow(clippy::type_complexity)]
 fn settle_unseeded_deltas(
     database: &PhysicalGraphProjectionDatabase,
     mut deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<Option<BTreeMap<String, (u64, PageDelta)>>, String> {
+) -> Result<
+    (
+        BTreeMap<String, (u64, PageDelta)>,
+        BTreeMap<String, (u64, PageDelta)>,
+    ),
+    String,
+> {
     let unseeded = deltas
         .values()
         .filter_map(|(_, delta)| match delta {
@@ -3432,8 +3511,9 @@ fn settle_unseeded_deltas(
             _ => None,
         })
         .collect::<Vec<_>>();
+    let mut unplaced = BTreeMap::new();
     if unseeded.is_empty() {
-        return Ok(Some(deltas));
+        return Ok((deltas, unplaced));
     }
     // Against an empty inventory every stored page reads as a deletion: that
     // is the set of paths the image holds.
@@ -3451,13 +3531,16 @@ fn settle_unseeded_deltas(
         .collect::<std::collections::BTreeSet<_>>();
     for source in unseeded {
         if !stored.contains(&source.path) {
-            return Ok(None);
+            if let Some(update) = deltas.remove(&source.path) {
+                unplaced.insert(source.path, update);
+            }
+            continue;
         }
         if !changed.contains(&source.path) {
             deltas.remove(&source.path);
         }
     }
-    Ok(Some(deltas))
+    Ok((deltas, unplaced))
 }
 
 fn apply_deltas(

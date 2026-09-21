@@ -97,6 +97,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   launch are still waiting to be recorded in the search index as its check
   finishes. The check now completes, and those pages are recorded after it
   (GH #543).
+- Editing or creating a page while a large graph is being checked at launch
+  no longer throws the check away and parses every page: the change is
+  recorded in the search index after the check. An edit made after a page
+  the check could not read no longer breaks the index and forces a rebuild
+  (GH #543).
 - Advanced queries written the way Logseq's documentation and many
   `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
   or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or

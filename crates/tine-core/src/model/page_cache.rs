@@ -476,6 +476,10 @@ impl Graph {
         let Ok((entries, skipped)) = self.page_build_entries(&permit) else {
             return Outcome::Unavailable;
         };
+        let walk_order = entries
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>();
         let mut sources = Vec::with_capacity(entries.len());
         let mut retained = Vec::new();
         let mut failures = skipped;
@@ -535,17 +539,33 @@ impl Graph {
             });
             Outcome::Retry
         };
-        let Some(generation) = self.warm_generation_after_drift(read_at, structural, &sources)
+        let Some((generation, published)) =
+            self.warm_generation_after_drift(read_at, structural, &sources)
         else {
             return abandoned();
         };
+        // Validation leaves these pages as the image holds them, and the
+        // updates they published replace them after it (audit IT-03).
+        let mut published_pages = Vec::with_capacity(published.len());
+        for path in &published {
+            let rel_path = match sources.iter().find(|(entry, _)| &entry.path == path) {
+                Some((entry, _)) => entry.rel_path.clone(),
+                // A page created after the read: the walk never listed it.
+                None => match self.entry_for_path(path) {
+                    Some(entry) => entry.rel_path,
+                    None => return abandoned(),
+                },
+            };
+            published_pages.push(rel_path);
+        }
         if generation != read_at {
             // Each of those publications queued an update; the queue takes
             // the warm beside them and applies them after validating it.
             crate::direct_projection::projection_diag(|| {
                 format!(
-                    "warm kept across generations {read_at}..{generation}: \
-                     only pages it read were published, at the revisions it read"
+                    "warm kept across generations {read_at}..{generation}; \
+                     {} page(s) published since the read follow as updates",
+                    published.len()
                 )
             });
         }
@@ -564,6 +584,8 @@ impl Graph {
             generation,
             sources,
             retained,
+            published_pages,
+            walk_order,
             Arc::clone(&parse_config),
             text_bytes,
         );
@@ -610,25 +632,29 @@ impl Graph {
         }
     }
 
-    /// The generation a finished warm inventory read may be queued at, or
-    /// `None` when it must be read again.
+    /// The generation a finished warm inventory read may be queued at, and
+    /// the pages published since the read at other bytes than it saw; `None`
+    /// when it must be read again.
     ///
     /// Opening a page publishes it even when its bytes are unchanged, and a
     /// launch opens today's journal while the warm is still reading. On a
     /// 10,000-page Windows graph that read takes seconds, and throwing it away
     /// for that publication sent every warm reopen to a whole-graph parse
-    /// (GH #543). A move is harmless when nothing structural happened and
-    /// every page this session has published carries exactly the revision
-    /// and parse configuration the warm read for it: the warm then describes
-    /// the current state. Anything else, including a record the warm cannot
-    /// match (a page it did not read, or one published before an external
-    /// change it saw), is treated as drift, as before.
+    /// (GH #543). An edited or new page published during the read did the
+    /// same (audit IT-03), although its publication queued the update that
+    /// brings the index to its current bytes. So the read survives any move
+    /// that is not structural: a publication at the revision the warm read is
+    /// benign, and every other published page is returned for validation to
+    /// leave as the image holds it, with its update applied after. A removal
+    /// or invalidation (structural) still discards the read: nothing queued
+    /// describes what it took away.
     fn warm_generation_after_drift(
         &self,
         read_at: u64,
         structural: u64,
         sources: &[(PageEntry, String)],
-    ) -> Option<u64> {
+    ) -> Option<(u64, std::collections::HashSet<PathBuf>)> {
+        use std::sync::atomic::Ordering;
         let read: std::collections::HashMap<&Path, &str> = sources
             .iter()
             .map(|(entry, revision)| (entry.path.as_path(), revision.as_str()))
@@ -636,7 +662,25 @@ impl Graph {
         // Every mover publishes its session record and bumps both counters
         // under the cache write lock, so this read lock sees them together.
         let _cache = self.cache.read().unwrap();
-        self.generation_after_benign_drift(read_at, structural, |path| read.get(path).copied())
+        let current = self.cache_gen.load(Ordering::Acquire);
+        if current == read_at {
+            return Some((current, std::collections::HashSet::new()));
+        }
+        if self.cache_structural_gen.load(Ordering::Acquire) != structural {
+            return None;
+        }
+        let config = self.config.parse_config().digest();
+        let published = self
+            .session_page_ids
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(path, ids)| {
+                ids.config != config || read.get(path.as_path()) != Some(&ids.revision.as_str())
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        Some((current, published))
     }
 
     /// The shared rule behind `warm_generation_after_drift` and cold
@@ -831,6 +875,13 @@ impl Graph {
     /// GH #543 test hook: pause the NEXT warm validation after it has read
     /// every page and before it checks whether the generation moved.
     #[cfg(test)]
+    pub(crate) fn pause_next_page_publication_test(&self) -> Arc<PageBuildTestPause> {
+        let pause = Arc::new(PageBuildTestPause::new());
+        *self.page_build_test.upsert_published_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_next_warm_after_read_test(&self) -> Arc<PageBuildTestPause> {
         let pause = Arc::new(PageBuildTestPause::new());
         *self.page_build_test.warm_read_done_pause.lock().unwrap() = Some(Arc::clone(&pause));
@@ -902,6 +953,14 @@ impl Graph {
         let mut previous_doc: Option<Arc<Document>> = None;
         let mut is_new_page = false;
         let mut identity_changed = false;
+        // Taken before the cache lock: attaching holds the projection slot
+        // while it reads the cache, so the slot is never locked under it.
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone);
         let mut guard = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         self.session_page_ids.write().unwrap().insert(
@@ -1013,8 +1072,37 @@ impl Graph {
                 )
             });
         *failures_guard = resulting_failures;
+        // The update is queued before the new generation can be observed. A
+        // warm that reads this generation keeps its inventory and leaves this
+        // page to its update (audit IT-03); queued after the lock, the warm
+        // could publish readiness at this generation with the page's old
+        // rows, and an answer cached at it would outlive the update.
+        let queued_under_lock = recovered_projection_snapshot.is_none()
+            && projection.as_ref().is_some_and(|projection| {
+                projection.enqueue_replace(
+                    newgen,
+                    evict_entry.clone(),
+                    Arc::clone(&evict_doc),
+                    projection_revision.clone(),
+                    Arc::new(self.config.parse_config()),
+                );
+                true
+            });
         drop(failures_guard);
         drop(guard);
+        #[cfg(test)]
+        {
+            let pause = self
+                .page_build_test
+                .upsert_published_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
+        }
         // Same treatment for the physical page inventory, and for the same
         // reason as other generation-bound derived inventories. `list_pages` is keyed on raw
         // `cache_gen` equality, and its ONLY way to rebuild is to walk the graph
@@ -1087,7 +1175,7 @@ impl Graph {
         // session's inventory validated first (the projection's own rule).
         if let Some((pages, revisions)) = recovered_projection_snapshot {
             self.direct_projection_enqueue_full(newgen, pages, revisions, false, true);
-        } else {
+        } else if !queued_under_lock {
             self.direct_projection_enqueue_replace(
                 newgen,
                 evict_entry,
