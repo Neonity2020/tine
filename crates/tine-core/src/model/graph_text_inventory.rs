@@ -157,6 +157,25 @@ impl Graph {
                     return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                 }
                 let file_type = entry.file_type()?;
+                // The configured walk resolves page identities and rewrites
+                // page text; entries that can never be a page are not its
+                // business. Hidden entries (an Emacs `.#name.org` lock
+                // symlink, `.DS_Store`) and non-page files (images, PDFs, an
+                // iCloud file whose download is refused) used to be opened or
+                // refused here, which blanked the Journals view and failed
+                // today's journal on such graphs (GH #385). A symlink is not a
+                // graph-text document on any other path either (the save
+                // capture skips it since GH #267, `graph_inventory_entry` never
+                // admits one, and every write target is opened no-follow), so
+                // no in-scope scenario is defended by refusing it here. Two
+                // page files on one inode are still refused below.
+                if !graph_wide
+                    && (file_type.is_symlink()
+                        || (!file_type.is_dir()
+                            && (name_text.starts_with('.') || !is_page_file(&child_path))))
+                {
+                    continue;
+                }
                 if file_type.is_symlink() {
                     if graph_wide {
                         continue;

@@ -3204,12 +3204,41 @@
    "status": "covered",
    "coverage": {
     "tests": [
-     "crates/tine-core/src/model_tests.rs"
+     "crates/tine-core/src/model_tests_availability.rs"
     ],
     "scenario": null,
     "failBefore": "proven"
    },
    "notes": "GH #538 (Android, 0.6.982): after a failed write, the graph never opened again with a bare 'unsafe graph layout: Invalid argument (os error 22)'. atomic_replace_expected (the config.edn writer) retired the live file with a plain rename, then published with renameat2(RENAME_NOREPLACE); on storage that answers the flag with EINVAL both the publish and the no-replace undo failed, the undo error was ignored, and config.edn stayed stranded under .config.edn.<pid>.<seq>.retired. The open-time restore used the same refused primitive, so every open failed. The Android flag refusal is recorded from Android CI run 32091898520; it is device-dependent and was not reproduced on the reporter's device. Fix: prove the no-replace move on the staged temp before retiring the live name (refusal leaves config.edn untouched, with a named error); restore a vacated name by plain rename only when the storage refuses the flag AND the target is absent; name the step and file on recovery errors. Tests gh538_* inject an EINVAL mover; 3 of 4 fail on the old logic (the fourth covers error wording). Not covered: Direct page saves on such storage still fail (named error), a separate decision."
+  },
+  {
+   "id": "REG-JOURNALS-FEED-BLANK-ON-NON-PAGE-ENTRY-385",
+   "title": "A non-page entry in journals/ or pages/ (symlink, unreadable sidecar, hidden hard link) no longer blanks the Journals view or refuses today's journal and renames",
+   "family": "journals-feed",
+   "sources": {
+    "issues": [
+     385
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "macos",
+    "linux",
+    "windows",
+    "android",
+    "ios"
+   ],
+   "layer": "rust-core",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model_tests_availability.rs",
+     "src/activationNeighbors.test.ts"
+    ],
+    "scenario": null,
+    "failBefore": "proven"
+   },
+   "notes": "GH #385 (macOS, iCloud Drive graph): Journals showed 'No journal entries found' while All pages worked. Chain: the feed prepends an empty today placeholder; its activate_absent_editor(Journal) resolves through the configured walk of journals/+pages/, which (unlike the graph-wide inventory) refused any symlink, opened every non-page file (an unreadable .DS_Store, attachment, or refused iCloud download fails the open), and refused any two files on one inode. Since v0.6.94 loadFeed aborted the whole feed on one refused page and restartJournalFeed returned null, so the generic empty message showed and the retry loop repeated the failing call (5 activate_absent_editor failures in the reporter's diagnostic). Fix: the configured walk skips symlinks, hidden entries and non-page files before opening them (the save capture already skips symlinks since GH #267; write targets are opened no-follow); two page files on one inode are still refused. loadFeed leaves out a page whose activation failed and installs the rest; unsaved work and stale requests still defer the feed atomically. The same walk backs page rename, merge, PDF and journal migration, which are fixed too. The exact entry on the reporter's graph is not known; the test covers Emacs lock symlink, page symlink, unreadable .DS_Store and attachment, hidden hard link, hidden unparseable page name, and an iCloud placeholder. Not verified on macOS/iCloud."
   },
   {
    "id": "REG-CLOSE-DISCARD-DIAGNOSTIC-540",

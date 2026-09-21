@@ -253,6 +253,22 @@ describe("GH #254 increment 3 activation neighbours", () => {
     expect(doc.feed).not.toContain("Declined");
   });
 
+  it("GH #385: a refused today placeholder does not blank the older days", async () => {
+    const today = journalTitle(new Date());
+    vi.spyOn(backend(), "activateAbsentEditor").mockRejectedValueOnce(new Error("walk refused"));
+    vi.spyOn(backend(), "activateEditor").mockResolvedValueOnce({
+      activation: 90,
+      target: "journals/Older.md",
+      prospective: false,
+    });
+
+    expect(await loadFeed([emptyPage(today, "journal"), page("Older", "journals/Older.md", "older")])).toBe(true);
+
+    expect(doc.feed).toEqual(["Older"]);
+    expect(doc.feed).not.toContain(today);
+    expect(editorActivationFor("Older")).toBe(90);
+  });
+
   it("activates absent today placeholders before publishing both installation paths", async () => {
     const today = journalTitle(new Date());
     const first = deferred<EditorActivationHandle>();

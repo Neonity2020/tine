@@ -500,6 +500,7 @@ export async function loadFeed(
   // requested journal.
   const binding = opts.expectedGraphBinding ?? graphBinding();
   const installed: string[] = [];
+  let activationFailures = 0;
   for (const dto of dtos) {
     // Calendar rollover can add days without replacing or unmounting any live
     // feed page. In particular, even a clean active editor owns its exact nodes.
@@ -507,10 +508,19 @@ export async function loadFeed(
       installed.push(dto.name);
       continue;
     }
-    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding, isRequestLive: opts.isRequestLive })) return false;
+    const refusal = await ensurePageLoaded(dto, { expectedGraphBinding: binding, isRequestLive: opts.isRequestLive });
+    // One day the backend cannot activate (today's placeholder on a graph whose
+    // walk refused, GH #385) is left out; it must not blank every other day.
+    // Unsaved work and stale requests still defer the whole feed atomically.
+    if (refusal?.reason === "activation-failed") {
+      activationFailures += 1;
+      continue;
+    }
+    if (refusal) return false;
     installed.push(dto.name);
   }
   if (binding !== graphBinding() || opts.isRequestLive?.() === false) return false;
+  if (installed.length === 0 && activationFailures > 0) return false;
   setDoc("feed", opts.preserveExisting
     ? [...installed, ...doc.feed.filter((name) => !installed.includes(name))]
     : installed);

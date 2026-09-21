@@ -993,14 +993,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         (
+            // 9 and 3 since GH #538: the conditional replace removes its
+            // staged probe temp on refusal, and `restore_vacated_name` falls
+            // back to a plain rename of a vacated name when the storage
+            // refuses the no-replace flag.
             "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
             "fs.remove_file",
-            8,
+            9,
         ),
         (
             "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
             "fs.rename",
-            2,
+            3,
         ),
         (
             "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
@@ -1280,7 +1284,10 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("atomic_copy", 0),
         ("atomic_copy_new", 1),
         ("atomic_copy_file_new", 1),
-        ("move_file_noreplace", 18),
+        // 11 since GH #538: the conditional replace and the retired-file
+        // restore take the mover as a parameter (a test seam for storage that
+        // refuses the flag); production binds it to `move_file_noreplace`.
+        ("move_file_noreplace", 11),
         ("move_to_trash", 3),
         ("create_projection_chain_component", 1),
         ("empty_asset_trash", 1),

@@ -74,6 +74,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   name, after which the graph failed to open with "Invalid argument". Tine now
   checks the rename works before touching `config.edn`, and a graph already
   affected opens again with its settings restored (GH #538).
+- The Journals view no longer shows "No journal entries found" when the graph
+  folder holds something that is not a page, such as a symlink, an editor lock
+  file, or a file the system cannot read (for example an iCloud file that is
+  not downloaded). Such an entry also no longer stops today's journal from
+  being created or pages from being renamed, and a day that cannot be opened
+  no longer hides all the others (GH #385).
 
 - A save conflict no longer ends up with a comparison that can never load. If
   Tine lost track of the conflict in the split second after it happened (for
