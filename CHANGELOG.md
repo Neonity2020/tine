@@ -29,6 +29,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   compact schema removes redundant cache data and uses one integer coordinate
   space for pages and blocks; an existing schema-29 projection is rebuilt once
   from the Markdown/Org graph, without changing graph files.
+- Building the search index for a large graph the first time is about 45%
+  faster: tine-storage v0.27.1 reuses its prepared SQL statements and
+  resolves reference rows from the pages it is writing (10,000 synthetic
+  pages: 47.5 s to 26.2 s on Linux). Same schema; nothing is rebuilt
+  (GH #543). Performance-only.
 - Ctrl+K, the `((` picker and unlinked-reference search use a bounded recent-
   result window. Inline Friendly search shares their index, canonical folding
   and exact matcher, but remains exhaustive up to its 5,000-result limit and

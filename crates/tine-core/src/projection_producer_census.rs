@@ -1445,7 +1445,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.27.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.27.1\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1550,6 +1550,9 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // 2026-09-21: GH #550 settles pre-seed launch deltas against the reopened
     // image with two read-only `database.source_delta` calls in
     // `settle_unseeded_deltas`. No write crossing or dependency pin changed.
+    // 2026-09-21: GH #543 pins tine-storage v0.27.1 (fresh-build speedup:
+    // cached statements and coordinate-resolved postings inside storage). The
+    // production import and direct-call inventory is unchanged.
     assert_eq!(
         inventory_digest(&dependency_surface),
         "d36012ef2ed70ac4260dca081237bbbb5723d870a0dba599b0ce4f7b2261213c",
