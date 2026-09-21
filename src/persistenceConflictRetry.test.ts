@@ -74,6 +74,7 @@ vi.mock("./ui", () => ({
   bumpDataRev: () => {},
   bumpPageInventoryRev: () => {},
   pushToast: (message: string) => toasts.push(message),
+  dismissToast: () => {},
 }));
 
 const {

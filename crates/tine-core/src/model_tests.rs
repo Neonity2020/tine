@@ -9415,6 +9415,27 @@ fn direct_save_failure_codes_are_stable() {
     }
 }
 
+/// Every data-preservation refusal is one marker type, so one classifier arm
+/// types all its producers; the marker must win even over an ErrorKind that
+/// looks transient, because the verdict is on the draft's content and a resend
+/// of the same draft is refused again (GH #535, GH #546).
+#[test]
+fn a_data_preservation_refusal_has_its_own_no_retry_code() {
+    use std::io::ErrorKind;
+    for kind in [
+        ErrorKind::InvalidData,
+        ErrorKind::Interrupted,
+        ErrorKind::AlreadyExists,
+    ] {
+        let refusal =
+            projection_semantic_refusal(kind, "refusing to drop an existing page preamble");
+        assert_eq!(
+            direct_save_failure_code(&refusal),
+            "refused.data_preservation"
+        );
+    }
+}
+
 /// The site-to-code binding for the whole conflict vocabulary, driven through
 /// the REAL producers rather than through a stamped fixture.
 ///

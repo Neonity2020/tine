@@ -675,6 +675,8 @@ mod tests {
         assert!(page.markdown.contains("It is offered on desktop only"));
         assert!(page.markdown.contains("Copy complete recovery data"));
         assert!(page.markdown.contains("Try opening again"));
+        assert!(page.markdown.contains("If Tine refuses to save a page"));
+        assert!(page.markdown.contains("Review unsaved"));
 
         let index = GUIDE_TEMPLATES
             .iter()
@@ -1037,7 +1039,9 @@ mod tests {
             .markdown
             .contains("checked when you finish editing that header"));
         // An alias completion row names the page it belongs to (GH #558).
-        assert!(reference.markdown.contains("labelled **alias of** its page"));
+        assert!(reference
+            .markdown
+            .contains("labelled **alias of** its page"));
     }
 
     #[test]

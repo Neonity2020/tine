@@ -42,12 +42,14 @@ import {
   bumpDataRev,
   bumpPageInventoryRev,
   pushToast,
+  dismissToast,
   registerLiveSaveConflict,
   refreshLiveSaveConflictDraft,
 } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
 import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
+import { openUnsavedRecovery } from "./unsavedRecovery";
 
 // ---------------------------------------------------------------------------
 // Guard state (owned here; mutated only through the accessors below)
@@ -81,6 +83,11 @@ let graphBindingRev = 0;
 // concurrently) and each runs against the LATEST store state.
 const saveChain = new Map<string, Promise<boolean>>();
 const transientFailures = new Map<string, number>();
+// The one sticky toast per page that a no-retry refusal raised. Every later
+// edit re-runs the save and meets the same refusal, so it is deduplicated
+// rather than stacked, and it goes away once the page saves or leaves the
+// working set (GH #535).
+const refusedSaveToasts = new Map<string, { id: number; message: string }>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 // When the current run of edits first went dirty, so the debounce below can be
@@ -473,6 +480,8 @@ export function resetSaveState() {
   heldPageSaves.clear();
   heldSaveIntents.clear();
   transientFailures.clear();
+  for (const { id } of refusedSaveToasts.values()) dismissToast(id);
+  refusedSaveToasts.clear();
   for (const timer of retryTimers.values()) clearTimeout(timer);
   retryTimers.clear();
 }
@@ -493,6 +502,9 @@ function scheduleDataRev() {
 
 function clearTransientRetry(name: string) {
   transientFailures.delete(name);
+  const refused = refusedSaveToasts.get(name);
+  if (refused !== undefined) dismissToast(refused.id);
+  refusedSaveToasts.delete(name);
   const timer = retryTimers.get(name);
   if (timer) clearTimeout(timer);
   retryTimers.delete(name);
@@ -515,6 +527,9 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     "precheck.limit",
     "identity.owned_elsewhere",
     "identity.name_taken",
+    // The data-preservation firewall judged the draft's CONTENT; resending the
+    // same draft is refused again (GH #535, GH #546).
+    "refused.data_preservation",
   ].some((nonRetryable) => code === nonRetryable);
 }
 
@@ -568,7 +583,21 @@ export function isSaveConflictFailure(error: unknown): boolean {
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (!isRetryableSaveFailure(error)) {
     transientFailures.delete(name);
-    pushToast(`Couldn't save “${name}”. (${String(error)})`, "error");
+    // The page stays dirty, so the edits live on in this window, but no retry
+    // will ever write them. Say so once, keep saying it until it stops being
+    // true, and give the way to the draft (Copy draft / Open page) instead of
+    // a transient toast per keystroke that leaves the page silently stuck.
+    const message = saveFailureCode(error) === "refused.data_preservation"
+      ? `Tine did not save “${name}”, to protect what is already in its file. Your edits are kept in this window only. (${String(error)})`
+      : `Couldn't save “${name}”. Your edits are kept in this window only. (${String(error)})`;
+    const prior = refusedSaveToasts.get(name);
+    if (prior !== undefined && prior.message !== message) dismissToast(prior.id);
+    const id = pushToast(message, "error", {
+      sticky: true,
+      dedupe: true,
+      action: { label: "Review unsaved", run: openUnsavedRecovery },
+    });
+    refusedSaveToasts.set(name, { id, message });
     return;
   }
   const failures = (transientFailures.get(name) ?? 0) + 1;

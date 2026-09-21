@@ -11,13 +11,13 @@
 //! the GH #163 data-preservation firewall refuses.
 //!
 //! The refusal is correct and must stay: it is what keeps the preamble on disk.
-//! What this test pins is the part the user actually sees. The refusal is built
-//! by `projection_semantic_refusal`, which carries no typed `DirectSaveError`,
-//! so `direct_save_failure_code` falls through to its `unknown` default — and
-//! `unknown` is absent from the frontend's non-retryable denylist, so the save
-//! is retried at 100 ms and 300 ms and the third failure pushes
-//! `Couldn't save "…" after 3 tries … (reason code: unknown)` while the user is
-//! still typing in the block.
+//! What this test pins is the part the user actually sees. The refusal used to
+//! carry no typed code, so `direct_save_failure_code` fell through to its
+//! `unknown` default — which the frontend retries at 100 ms and 300 ms before
+//! the third failure pushes `Couldn't save "…" after 3 tries … (reason code:
+//! unknown)` while the user is still typing in the block. It now carries
+//! `refused.data_preservation`, which the frontend does not retry and reports
+//! once with a way to the draft (GH #535).
 
 use std::path::PathBuf;
 use tine_core::model::{direct_save_failure_code, BlockDto};
@@ -47,7 +47,7 @@ fn as_editor(graph: &Graph, dto: &mut PageDto) {
 }
 
 #[test]
-fn a_mid_edit_page_header_bullet_is_refused_with_the_untyped_unknown_code() {
+fn a_mid_edit_page_header_bullet_is_refused_with_the_typed_data_preservation_code() {
     let root = scratch("mid-edit");
     // What the GH #198 fold has already written on the previous save: the page
     // header lives on disk as a PREAMBLE, with no outline blocks at all.
@@ -79,10 +79,10 @@ fn a_mid_edit_page_header_bullet_is_refused_with_the_untyped_unknown_code() {
         .expect_err("the firewall must refuse a DTO that moves the header into the outline");
     assert_eq!(
         direct_save_failure_code(&error),
-        "unknown",
-        "the semantic refusal carries no typed DirectSaveError, so the code the \
-         user is shown is the Unknown fallthrough — this is the literal \
-         `reason code: unknown` in the reporter's screenshot"
+        "refused.data_preservation",
+        "the refusal is a verdict on the draft's content, so it must carry the \
+         no-retry code rather than the retried `unknown` fallthrough in the \
+         reporter's screenshot"
     );
     assert_eq!(
         std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),

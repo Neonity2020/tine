@@ -255,11 +255,12 @@ pub enum DirectSaveFailureCode {
     ConflictReplacePostPublication,
     ConflictPinnedOwner,
     ConflictBaseRev,
+    RefusedDataPreservation,
     Unknown,
 }
 
 impl DirectSaveFailureCode {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::PrecheckSymlink,
         Self::PrecheckInterrupted,
         Self::PrecheckPortableCollision,
@@ -294,6 +295,7 @@ impl DirectSaveFailureCode {
         Self::ConflictReplacePostPublication,
         Self::ConflictPinnedOwner,
         Self::ConflictBaseRev,
+        Self::RefusedDataPreservation,
         Self::Unknown,
     ];
 
@@ -337,6 +339,7 @@ impl DirectSaveFailureCode {
             Self::ConflictReplacePostPublication => "conflict.replace_post_publication",
             Self::ConflictPinnedOwner => "conflict.pinned_owner",
             Self::ConflictBaseRev => "conflict.base_rev",
+            Self::RefusedDataPreservation => "refused.data_preservation",
             Self::Unknown => "unknown",
         }
     }

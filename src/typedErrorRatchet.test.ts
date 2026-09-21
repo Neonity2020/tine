@@ -336,9 +336,9 @@ describe("I-9/I-11 typed backend error boundary", () => {
       vocab.indexOf("impl DirectSaveFailureCode"),
       vocab.indexOf("/// Typed inner error", vocab.indexOf("impl DirectSaveFailureCode")),
     );
-    const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority)\.[a-z_]+|unknown)"/g)]
+    const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority|refused)\.[a-z_]+|unknown)"/g)]
       .map((match) => match[1]);
-    expect(directCodes).toHaveLength(35);
+    expect(directCodes).toHaveLength(36);
 
     for (const code of directCodes) expect(contract).toContain(code);
 

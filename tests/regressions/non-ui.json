@@ -4653,7 +4653,7 @@
  "coverage": {
   "tests": [
    "src/store.test.ts::reconciles the store with the page header the save just wrote to disk",
-   "crates/tine-core/tests/gh546_page_header_mid_edit.rs::a_mid_edit_page_header_bullet_is_refused_with_the_untyped_unknown_code"
+   "crates/tine-core/tests/gh546_page_header_mid_edit.rs::a_mid_edit_page_header_bullet_is_refused_with_the_typed_data_preservation_code"
   ],
   "scenario": null,
   "failBefore": "proven"
@@ -4714,6 +4714,35 @@
   "failBefore": "proven"
  },
  "notes": "GH #540, DanTremonti's report (v0.6.984, Linux): a new namespaced page, first bullet made a numbered item, then its text typed; the file stayed the 32-byte `logseq.order-list-type:: number` and every later save was refused in 0-4 ms as `reason code: unknown` until restart. Cause: the numbered-list command leaves an empty first bullet whose raw is exactly that property line, and both the frontend fold (projectPageDto) and the Rust promotion (first_root_is_promotable_page_header) took a properties-only first bullet for page-header properties (the GH #198 canonicalization), writing it as the unbulleted preamble. The typed text then moved that 'header' property back into the outline, which the GH #163 firewall refuses with an untyped error. On this branch before the fix the GH #546 reconciliation made it worse: the store adopted the fold, so the typed text was never serialized at all. OG keeps such a bullet a bullet because the property sits under an empty title line and its serializer promotes only a first block whose first line holds `:: ` (file/core.cljs transform-content); Tine's raw has no empty title line, so a block-scoped key (id, heading, collapsed, background-color, logseq.order-list-type) now disqualifies promotion on both sides, kept identical by a source guard. Reproduced byte-for-byte in core before the fix; the Rust and store numbered-item tests each fail without their half of the fix (the alias test is the GH #198 neighbour and passes either way). Not addressed: the firewall refusal is still untyped (`unknown`) and retried, so any other route into it still reads as a stuck save; EllisMorrow's original multi-day report remains unexplained."
+},
+{
+ "id": "REG-REFUSED-SAVE-NO-RETRY-535",
+ "title": "A save the data-preservation firewall refuses is reported once, not retried, and offers the unsaved draft",
+ "family": "page-header-save",
+ "sources": {
+  "issues": [
+   535,
+   546,
+   540
+  ],
+  "commits": []
+ },
+ "platforms": [
+  "all"
+ ],
+ "layer": "native",
+ "status": "covered",
+ "coverage": {
+  "tests": [
+   "crates/tine-core/tests/gh546_page_header_mid_edit.rs::a_mid_edit_page_header_bullet_is_refused_with_the_typed_data_preservation_code",
+   "crates/tine-core/src/model_tests.rs::a_data_preservation_refusal_has_its_own_no_retry_code",
+   "src/store.test.ts::is not retried, says so once, offers the draft, and clears when the page saves",
+   "src/persistence.test.ts::does not retry failures a retry cannot change"
+  ],
+  "scenario": null,
+  "failBefore": "proven"
+ },
+ "notes": "Every ProjectionSemanticRefusal (merge markers, a dropped preamble, a page-header property moved into the outline, an Org file that cannot round-trip) reached the frontend as `reason code: unknown`: retried at 100/300 ms, then a transient 'after 3 tries' toast, then a page that silently never saved while each further edit repeated the cycle (GH #546 screenshot; DanTremonti's GH #540 report; the remaining gap after GH #535). The refusal is a verdict on the draft's content, so direct_save_failure_code now maps that marker type to `refused.data_preservation` (no retry) in one arm covering every producer, and the frontend shows one sticky, deduplicated message per page with a Review unsaved action (the close-path recovery panel: Copy draft, Open page), dismissed when the page saves or leaves the working set. Fail-before: the core tests return `unknown`; the store test sees 6 save attempts instead of 4 without the frontend policy change. The firewall itself is unchanged."
 }
 ]
 }

@@ -178,7 +178,19 @@ pub fn direct_save_conflict_epoch(error: &io::Error) -> Option<u64> {
 /// `direct_save_precheck_helpers_produce_their_own_codes` drives the free
 /// helpers, and `every_direct_save_failure_code_has_a_production_producer`
 /// scans shipped source for a construction site per variant.
+///
+/// A data-preservation refusal (`ProjectionSemanticRefusal`: merge markers,
+/// a preamble the DTO would drop, a header property moved into the outline, an
+/// Org file that cannot round-trip) is a verdict on the DTO's CONTENT, so
+/// resending the same draft can only be refused again. It used to fall through
+/// to `Unknown`, which the frontend retries twice and then reports as a failure
+/// "after 3 tries" while the user is still typing (GH #546, GH #535). It gets
+/// its own no-retry code here, in one place, so every producer of that marker
+/// type is covered without stamping each call site.
 pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
+    if super::is_projection_semantic_refusal(error) {
+        return DirectSaveFailureCode::RefusedDataPreservation.as_str();
+    }
     error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<DirectSaveError>())

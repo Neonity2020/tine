@@ -190,6 +190,8 @@ describe("save failure classification", () => {
       "identity.owned_elsewhere",
       // A name collision is real, but no number of retries frees the name.
       "identity.name_taken",
+      // The firewall refused the draft's content; the same draft is refused again.
+      "refused.data_preservation",
     ]) {
       expect(isRetryableSaveFailure(new DirectSaveFailureError(code, "Other"))).toBe(false);
     }

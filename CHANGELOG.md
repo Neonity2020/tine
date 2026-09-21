@@ -53,6 +53,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   later save of that page failing (`reason code: unknown`) until Tine was
   restarted. Tine had taken the empty numbered item for page properties; it now
   stays a list item (GH #540).
+- A save Tine refuses in order to protect what is already in a file (a page
+  header, merge-conflict markers, an Org file it cannot reproduce) is no longer
+  retried and reported as `reason code: unknown` "after 3 tries" while the page
+  silently stops saving. One message stays up until the page saves again, says
+  the edits are kept in this window, and **Review unsaved** opens the draft to
+  copy it or open the page (GH #535, GH #546).
 - Typing a page's alias after `[[` or `#` now offers it, and the row says
   which page it is an alias of. Choosing it inserts the alias as you wrote it,
   and the link opens the real page (GH #558, GH #482).

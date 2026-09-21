@@ -194,6 +194,7 @@ Banner-class conflicts use the existing tagged kind:
 | `ConflictReplacePostPublication` | `conflict.replace_post_publication` | banner | post-publish validation |
 | `ConflictPinnedOwner` | `conflict.pinned_owner` | banner | exact pinned owner |
 | `ConflictBaseRev` | `conflict.base_rev` | banner | base revision |
+| `RefusedDataPreservation` | `refused.data_preservation` | no retry | data-preservation firewall |
 | `Unknown` | `unknown` | retry | unclassified source failure |
 
 The frontend save-policy vocabulary (`isRetryableSaveFailure` in

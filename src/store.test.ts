@@ -90,7 +90,7 @@ import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
 import { splitProps, joinProps, isBuiltinHidden, hideAll } from "./editor/properties";
 import { setCopyIncludeSubtree, setCopyStripCollapsed } from "./copySettings";
-import { backend, SaveConflictError, type Backend } from "./backend";
+import { backend, DirectSaveFailureError, SaveConflictError, type Backend } from "./backend";
 import {
   isConflicted,
   conflicts,
@@ -3749,6 +3749,51 @@ describe("GH #546 — page-header properties saved while the user is still typin
     setRaw(doc.pages[0].roots[0], "alias:: book\ntag:: x");
     expect(pageToDto("Test")?.pre_block).toBe("alias:: book\ntag:: x");
     expect(pageToDto("Test")?.blocks).toEqual([]);
+  });
+});
+
+describe("GH #535 — a save the data-preservation firewall refuses", () => {
+  it("is not retried, says so once, offers the draft, and clears when the page saves", async () => {
+    // The firewall's verdict is on the draft's content, so resending it cannot
+    // succeed. It used to arrive as `unknown`: retried at 100 and 300 ms, then
+    // a transient "after 3 tries" toast, then a page that silently never
+    // saved while every further edit repeated the cycle.
+    setToasts([]);
+    load([blk("Dosa")]);
+    let refuse = true;
+    let calls = 0;
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async () => {
+      calls++;
+      if (refuse) throw new DirectSaveFailureError("refused.data_preservation", "InvalidData");
+      return { revision: "gh535-rev" };
+    });
+    try {
+      for (const text of ["Dosa a", "Dosa ab", "Dosa abc"]) {
+        setRaw(doc.pages[0].roots[0], text);
+        markDirty("Test");
+        await flushPage("Test");
+      }
+      // Past the 400 ms autosave debounce and the old 100/300 ms retry timers.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // One attempt per flush plus the one debounced autosave the edits armed;
+      // no timed retries of a draft the firewall has already judged.
+      expect(calls).toBe(4);
+      expect(isDirty("Test")).toBe(true); // the draft stays live in this window
+      const refused = toasts().filter((toast) => toast.message.includes("Test"));
+      expect(refused).toHaveLength(1);
+      expect(refused[0]).toMatchObject({ kind: "error", sticky: true, action: { label: "Review unsaved" } });
+      expect(refused[0].message).toContain("did not save");
+
+      refuse = false;
+      setRaw(doc.pages[0].roots[0], "Dosa abcd");
+      markDirty("Test");
+      await flushPage("Test");
+      expect(isDirty("Test")).toBe(false);
+      expect(toasts().filter((toast) => toast.message.includes("Test"))).toEqual([]);
+    } finally {
+      saveSpy.mockRestore();
+    }
   });
 });
 
