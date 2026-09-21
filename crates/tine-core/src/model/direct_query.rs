@@ -1287,9 +1287,7 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !self.wait_for_derived_read(&projection, generation) {
-            return None;
-        }
+        let generation = self.wait_for_derived_read(&projection, generation)?;
         let aliases = projection.page_aliases_with_owners(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(aliases)
     }
@@ -1364,9 +1362,7 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !self.wait_for_derived_read(&projection, generation) {
-            return None;
-        }
+        let generation = self.wait_for_derived_read(&projection, generation)?;
         let counts = projection.block_ref_counts(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(counts)
     }

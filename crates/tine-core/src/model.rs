@@ -100,6 +100,7 @@ mod write_gate;
 pub use dto::*;
 use write_gate::*;
 mod projection_lifetime;
+pub use projection_lifetime::LaunchWarmAnnouncement;
 mod retired_files;
 use retired_files::*;
 mod queries;

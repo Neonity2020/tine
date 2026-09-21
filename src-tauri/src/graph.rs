@@ -1036,7 +1036,12 @@ pub(crate) fn warm_cache_async(
     warm_generation: u64,
 ) -> Result<(), crate::command_error::CommandError> {
     let graph = slot.graph();
+    // Announced now, not after the delay below: the first paint's page list
+    // must see a warm coming and wait for it instead of parsing the whole
+    // graph itself (GH #543). Dropped when this thread ends, however it ends.
+    let announcement = graph.announce_launch_warm();
     std::thread::spawn(move || {
+        let _announcement = announcement;
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
         // background so the first search / query / `g j` agenda doesn't pay for

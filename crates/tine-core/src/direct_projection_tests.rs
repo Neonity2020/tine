@@ -8650,3 +8650,66 @@ fn gh543_whole_graph_reads_during_the_warm_read_wait_instead_of_parsing() {
     release_projection(&graph);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn gh543_a_page_list_before_the_scheduled_warm_starts_waits_for_it() {
+    let _serial = serialize_projection_tests();
+    let root = r6_graph("gh543-scheduled-warm");
+    for index in 0..40 {
+        std::fs::write(
+            root.join("pages").join(format!("bulk-{index:03}.md")),
+            format!("- bulk-{index:03}\n"),
+        )
+        .unwrap();
+    }
+    let database = scratch("gh543-scheduled-warm-db").join("projection.sqlite");
+    let expected_pages = {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        let answer = graph.list_pages().len();
+        release_projection(&graph);
+        answer
+    };
+    std::thread::sleep(Duration::from_millis(20));
+
+    // The app schedules the warm, then delays its thread so the first paint
+    // goes first; that paint lists pages inside the delay.
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database).unwrap();
+    let announcement = graph.announce_launch_warm();
+    let reads = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.list_pages().len())
+    };
+    // The same paint opens a page, which publishes it and moves the
+    // generation under the waiting list.
+    let before = graph.cache_generation();
+    let opened = graph
+        .entry_for_path(&root.join("pages/bulk-000.md"))
+        .expect("the page has an entry");
+    graph.load_page(&opened).expect("the page opens");
+    assert_ne!(
+        graph.cache_generation(),
+        before,
+        "opening a page is expected to move the generation"
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        !graph.has_parsed_cache_test() && graph.page_build_parses_test() == 0,
+        "a page list before the scheduled warm started parsed every page instead of waiting"
+    );
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || {
+            let _announcement = announcement;
+            graph.warm_cache()
+        })
+    };
+    warm.join().unwrap();
+    assert_eq!(reads.join().unwrap(), expected_pages);
+    assert_eq!(graph.page_build_parses_test(), 0);
+    release_projection(&graph);
+    std::fs::remove_dir_all(root).unwrap();
+}

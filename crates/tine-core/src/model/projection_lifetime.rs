@@ -310,6 +310,24 @@ impl Graph {
         }
     }
 
+    /// Announce the launch warm when it is scheduled rather than when its
+    /// thread reaches the first page read. The app delays that thread so the
+    /// first journal paint goes first, and the page list requested by that
+    /// same paint used to find no warm announced, parse every page, and queue
+    /// a full snapshot ahead of the warm (GH #543). Hold the returned value
+    /// for the life of the thread that runs `warm_cache_cancellable`; a
+    /// thread that is cancelled or finishes drops it, so a reader can never
+    /// wait on a warm nobody runs.
+    pub fn announce_launch_warm(&self) -> LaunchWarmAnnouncement {
+        LaunchWarmAnnouncement(
+            self.direct_projection
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|projection| projection.begin_warm()),
+        )
+    }
+
     /// Readiness for a whole-graph derived read (page list, aliases, property
     /// owners, block-ref counts). Beyond the short delta wait, a read that
     /// finds a warm validation in flight and no parsed cache keeps waiting
@@ -319,16 +337,18 @@ impl Graph {
     /// no later than such a parse would; if it gives up, the read falls back
     /// as before. With a parsed cache present the fallback is cheap, so no
     /// extra wait (this also keeps the warm thread from waiting on itself).
+    /// Returns the generation the projection is ready at, which is newer than
+    /// `generation` when a page was published during the wait.
     pub(super) fn wait_for_derived_read(
         &self,
         projection: &crate::direct_projection::DirectProjection,
-        generation: u64,
-    ) -> bool {
+        mut generation: u64,
+    ) -> Option<u64> {
         use crate::direct_projection::ProjectionProgress;
         use crate::query::QueryReadinessReason as Reason;
         loop {
             if projection.wait_ready_at(generation) {
-                return true;
+                return Some(generation);
             }
             let warming = matches!(
                 projection.progress_at(generation),
@@ -336,12 +356,12 @@ impl Graph {
                 // applying it.
                 ProjectionProgress::Working(Reason::Indexing | Reason::Busy)
             );
-            if !warming
-                || self.cache.read().unwrap().is_some()
-                || self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation
-            {
-                return projection.ready_at(generation);
+            if !warming || self.cache.read().unwrap().is_some() {
+                return projection.ready_at(generation).then_some(generation);
             }
+            // Opening today's journal publishes it and moves the generation;
+            // the warm keeps going across such moves, so follow it.
+            generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
@@ -353,16 +373,14 @@ impl Graph {
     pub(super) fn direct_projection_page_inventory(
         &self,
         generation: u64,
-    ) -> Option<Vec<PageEntry>> {
+    ) -> Option<(u64, Vec<PageEntry>)> {
         let projection = self
             .direct_projection
             .lock()
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !self.wait_for_derived_read(&projection, generation) {
-            return None;
-        }
+        let generation = self.wait_for_derived_read(&projection, generation)?;
         let rows = projection.page_inventory(generation)?;
         let mut entries = Vec::with_capacity(rows.len());
         for (name, rel_path, kind) in rows {
@@ -380,7 +398,8 @@ impl Graph {
             });
         }
         entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(entries)
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation)
+            .then_some((generation, entries))
     }
 
     /// R6: parse exactly the named pages for reference/fuzzy hydration when no
@@ -502,10 +521,13 @@ impl Graph {
             .unwrap()
             .as_ref()
             .map(Arc::clone)?;
-        if !self.wait_for_derived_read(&projection, generation) {
-            return None;
-        }
+        let generation = self.wait_for_derived_read(&projection, generation)?;
         let result = projection.property_owner_rows(generation)?;
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
 }
+
+/// A scheduled launch warm; see `Graph::announce_launch_warm`.
+pub struct LaunchWarmAnnouncement(
+    #[allow(dead_code)] Option<crate::direct_projection::WarmInFlight>,
+);

@@ -5119,12 +5119,13 @@
  "status": "covered",
  "coverage": {
   "tests": [
-   "crates/tine-core/src/direct_projection_tests.rs::gh543_whole_graph_reads_during_the_warm_read_wait_instead_of_parsing"
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_whole_graph_reads_during_the_warm_read_wait_instead_of_parsing",
+   "crates/tine-core/src/direct_projection_tests.rs::gh543_a_page_list_before_the_scheduled_warm_starts_waits_for_it"
   ],
   "scenario": null,
   "failBefore": "proven"
  },
- "notes": "GH #543 warm-reopen follow-up (Windows verify run 35648984084: 10k warm reopen 24.9 s vs 16.0 s before). During the warm validation read the projection queue is idle and the worker not busy, so the 250 ms readiness wait returned false at once and the launch-time page list and alias reads parsed the whole graph; that installed a full snapshot which outranked the warm and was indexed after it. Page inventory, aliases, property owner rows and block ref counts now wait while the projection reports the warm in flight and no parsed cache exists. The test fails on the old immediate fallback (whole graph parsed during the warm read) and checks the answers after release with zero parses. Evidence: tine-agents/evidence/gh550-batch/gh543-derived-wait/."
+ "notes": "GH #543 warm-reopen follow-up (Windows verify run 35648984084: 10k warm reopen 24.9 s vs 16.0 s before). During the warm validation read the projection queue is idle and the worker not busy, so the 250 ms readiness wait returned false at once and the launch-time page list and alias reads parsed the whole graph; that installed a full snapshot which outranked the warm and was indexed after it. Page inventory, aliases, property owner rows and block ref counts now wait while the projection reports the warm in flight and no parsed cache exists. Two launch gaps fed the same parse: the app delays its warm thread 250 ms so the first paint goes first, and that paint's page list found no warm announced; and opening today's journal moved the generation under a waiting read, which then gave up. The warm is now announced when it is scheduled (held for the life of its thread, so a read cannot wait on a warm nobody runs) and a waiting read follows generation moves. Local release app on a 10k-page graph: ready at 1.4 s with no full snapshot, previously 2.7 s with one. Both tests fail on the corresponding old behaviour and check the answers with zero parses. Evidence: tine-agents/evidence/gh550-batch/gh543-derived-wait/."
 }
 ]
 }
