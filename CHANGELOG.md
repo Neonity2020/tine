@@ -73,6 +73,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Android phone). Pages read at launch now keep
   their stored place, and unchanged ones are not re-indexed at all (GH #550).
 
+- Two more pieces of whole-graph work are off the path to the first journal
+  on every open. Today's journal is found from its date instead of by listing
+  every file in the graph first, and the automatic launch backup now waits
+  until startup has finished (the background indexing is done and the app has
+  been quiet for a few seconds) instead of copying the whole graph one second
+  after open, where it competed with the first page for the disk (GH #550).
+
 - On a Mac whose web engine is older than Safari 15.4 (for example Big Sur
   with Safari never updated), Tine now says so at startup and explains that
   updating Safari fixes it, instead of opening with every page failing to

@@ -20,23 +20,67 @@ const BACKUP_KEEP_DEFAULT: usize = 12;
 const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// GH #550: the launch snapshot copies the whole graph, so it waits until
+/// startup has gone idle — the background warm has finished (the same
+/// `warm-cache-done` signal that releases the frontend's held whole-graph
+/// fetches) and a quiet period has passed after it. On a phone the copy used to
+/// start one second after open and compete with the first journal paint and the
+/// warm for storage I/O. The deadline keeps the safety net if a warm never
+/// reports done. Edits made before the snapshot are still covered by the
+/// previous launch's snapshot, which the keep-count retains.
+const LAUNCH_BACKUP_QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+const LAUNCH_BACKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+const LAUNCH_BACKUP_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn launch_backup_due(
+    since_open: std::time::Duration,
+    since_warm_done: Option<std::time::Duration>,
+) -> bool {
+    since_warm_done.is_some_and(|quiet| quiet >= LAUNCH_BACKUP_QUIET)
+        || since_open >= LAUNCH_BACKUP_DEADLINE
+}
+
+/// `warm_done` of the window's CURRENT binding: a same-root config refresh
+/// replaces the slot, and the warm then reports on the replacement.
+fn launch_warm_done(app: &tauri::AppHandle, window_label: &str, slot: &GraphSlot) -> bool {
+    let state = app.state::<crate::state::AppState>();
+    let current = state.graphs.read().unwrap().slot(window_label);
+    match current {
+        Some(current)
+            if current.binding_generation == slot.binding_generation
+                && current.root_key == slot.root_key =>
+        {
+            current.warm_done.load(Ordering::Acquire)
+        }
+        _ => slot.warm_done.load(Ordering::Acquire),
+    }
+}
+
 pub(crate) fn backup_async(
     app: tauri::AppHandle,
+    window_label: String,
     slot: Arc<GraphSlot>,
 ) -> Result<(), crate::command_error::CommandError> {
     let graph = slot.graph();
     let source = BackupSource::from_graph(&graph);
     drop(graph);
     std::thread::spawn(move || {
-        // Defer the launch snapshot ~1s so its whole-graph file copy doesn't
-        // contend for disk I/O with first-journal paint and the warm-cache parse
-        // at open (felt on slow/NFS disks or a throttled laptop). Safe: the
-        // snapshot guards this session's edits, and the user hasn't edited yet in
-        // the first second — the on-disk files are still intact — so a crash in
-        // that window loses nothing the snapshot would have protected.
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        if slot.background_cancelled.load(Ordering::Acquire) {
-            return;
+        let opened = std::time::Instant::now();
+        let mut warm_done_at = None;
+        loop {
+            if slot.background_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            if warm_done_at.is_none() && launch_warm_done(&app, &window_label, &slot) {
+                warm_done_at = Some(std::time::Instant::now());
+            }
+            if launch_backup_due(
+                opened.elapsed(),
+                warm_done_at.map(|at: std::time::Instant| at.elapsed()),
+            ) {
+                break;
+            }
+            std::thread::sleep(LAUNCH_BACKUP_POLL);
         }
         // Bound whole-graph copying process-wide. Revoked bindings check again
         // after obtaining the permit and between directory entries/files.
@@ -2041,6 +2085,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn gh550_launch_backup_waits_for_startup_to_go_idle() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        // The old schedule copied the graph one second after open, whatever
+        // startup was still doing.
+        assert!(!launch_backup_due(s(1), None));
+        assert!(!launch_backup_due(s(60), None), "warm still running");
+        assert!(
+            !launch_backup_due(s(60), Some(s(1))),
+            "the frontend's released whole-graph fetches follow warm-done"
+        );
+        assert!(launch_backup_due(s(60), Some(LAUNCH_BACKUP_QUIET)));
+        assert!(
+            launch_backup_due(LAUNCH_BACKUP_DEADLINE, None),
+            "a warm that never reports done must not cost the safety net"
+        );
     }
 
     #[test]

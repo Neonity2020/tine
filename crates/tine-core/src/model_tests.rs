@@ -15892,3 +15892,6 @@ fn a_journal_filename_migration_serializes_against_other_writers() {
 
 #[path = "model_tests_availability.rs"]
 mod availability;
+
+#[path = "model_tests_journal_lookup.rs"]
+mod journal_lookup;

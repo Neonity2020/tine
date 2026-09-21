@@ -610,7 +610,7 @@ pub(crate) fn publish_prepared_direct_files(
     let (slot, warm_generation) = publish_direct_files_slot(state, window_label, graph, root_key)?;
     // Opening no longer mutates the tree, so the launch snapshot is never on a
     // rename's critical path: it stays the ordinary background backup.
-    backup_async(app.clone(), slot.clone())?;
+    backup_async(app.clone(), window_label.to_string(), slot.clone())?;
     remember_graph(app, &meta.root)?;
     if let Some(window) = app.get_webview_window(window_label) {
         let name = Path::new(&meta.root)

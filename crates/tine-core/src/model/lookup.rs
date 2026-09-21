@@ -77,6 +77,11 @@ impl Graph {
                 Err(e) => Err(e),
             }
         };
+        if kind == PageKind::Journal {
+            if let Some(page) = self.load_journal_by_date(name)? {
+                return Ok(Some(page));
+            }
+        }
         if let Some(entry) = self.find_entry(name, kind) {
             return load(&entry);
         }
@@ -93,6 +98,50 @@ impl Graph {
             }
         }
         Ok(None)
+    }
+
+    /// GH #550: open a journal day from its date, without the whole-graph
+    /// inventory `find_entry` builds. On a cold phone that inventory was most
+    /// of an 8 s `get_page` for today's journal at every launch.
+    ///
+    /// Answers only when the answer is the one `find_entry` would give: the
+    /// title parses as a date, exactly one date-stem file exists for it, and
+    /// the page loaded from it carries the requested name (a `title::` can
+    /// rename a journal file away from its date). A duplicate day, an absent
+    /// day, or a title-named stray returns `None`, and the caller falls back
+    /// to `find_entry`'s canonical-file rule.
+    fn load_journal_by_date(&self, name: &str) -> io::Result<Option<PageDto>> {
+        let Some(date) = self.journal_format.parse(name) else {
+            return Ok(None);
+        };
+        let stem = self.journal_format.file_stem(date);
+        let permit = self.admit_retained_graph_text_writer()?;
+        let mut found = None;
+        for path in configured_text_variant_paths(&self.journals_path(), &stem) {
+            if self.graph_text_exists(&permit, &path)? {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(path);
+            }
+        }
+        drop(permit);
+        let Some(entry) = found.and_then(|path| self.entry_for_path(&path)) else {
+            return Ok(None);
+        };
+        if entry.kind != PageKind::Journal {
+            return Ok(None);
+        }
+        let page = match self.load_page(&entry) {
+            Ok(page) => page,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let requested = crate::refs::page_key(name);
+        Ok(
+            (page.kind == PageKind::Journal && crate::refs::page_key(&page.name) == requested)
+                .then_some(page),
+        )
     }
 
     /// The `icon::` property value of each named page that has one (for rendering
