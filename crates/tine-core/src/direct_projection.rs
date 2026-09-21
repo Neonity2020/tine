@@ -1030,10 +1030,17 @@ impl DirectProjection {
     }
 
     /// R6 warm validation: hand the worker the walk inventory with exact
-    /// content revisions and nothing parsed. Refused (`false`) when a newer
-    /// mutation or queued work already outranks this generation — the caller
-    /// then leaves readiness to the parser fallback, exactly as
+    /// content revisions and nothing parsed. Refused (`None`) when a newer
+    /// mutation or a full snapshot already outranks this generation — the
+    /// caller then leaves readiness to the parser fallback, exactly as
     /// `install_built` does on generation drift.
+    ///
+    /// Queued page updates at or below this generation do not refuse it. The
+    /// caller accepted them as matching what it read, and the worker takes
+    /// them in the same turn, validating the warm first and applying the
+    /// updates after it. Refusing turned every page opened at launch into a
+    /// whole-graph parse whenever the worker had not yet taken its update
+    /// (GH #543, audit IT-03).
     pub(crate) fn enqueue_warm(
         &self,
         generation: u64,
@@ -1047,7 +1054,6 @@ impl DirectProjection {
         }
         let mut pending = self.shared.pending.lock().unwrap();
         if pending.full.is_some()
-            || !pending.deltas.is_empty()
             || pending.warm.is_some()
             || pending.latest_generation > generation
             || (self.shared.worker_failed.load(Ordering::Acquire) && !pending.rebuild)
@@ -2768,6 +2774,21 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                         .unwrap_or(WarmOutcome::FreshBuildRequired)
                 };
                 if matches!(outcome, WarmOutcome::FreshBuildRequired) {
+                    // The warm owns no image, so the updates taken beside it
+                    // are not applied. Put them back: the full snapshot that
+                    // follows clears them, and until then a later warm or
+                    // turn must not publish readiness without them.
+                    let mut pending = shared.pending.lock().unwrap();
+                    for (path, (generation, delta)) in deltas {
+                        match pending.deltas.entry(path) {
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert((generation, delta));
+                            }
+                            // A newer update for the page arrived meanwhile.
+                            std::collections::btree_map::Entry::Occupied(_) => {}
+                        }
+                    }
+                    drop(pending);
                     return Ok(AppliedTurn {
                         warm_outcome: Some(outcome),
                         ..AppliedTurn::default()

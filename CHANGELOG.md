@@ -93,6 +93,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   index, and wait for it while it is being checked. A page opened while one
   of them is reading no longer sends it back to parsing the whole graph
   (GH #543).
+- Reopening a large graph no longer parses every page when pages opened at
+  launch are still waiting to be recorded in the search index as its check
+  finishes. The check now completes, and those pages are recorded after it
+  (GH #543).
 - Advanced queries written the way Logseq's documentation and many
   `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
   or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or

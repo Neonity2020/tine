@@ -8865,6 +8865,96 @@ fn gh543_a_page_opened_during_the_warm_read_keeps_the_warm() {
     }
 }
 
+/// GH #543 (audit IT-03): pages opened at launch publish updates the index
+/// worker may not have taken yet when the warm check finishes reading. The
+/// warm used to be refused for any queued update and the whole graph parsed;
+/// the worker validates the warm and applies the updates after it in one turn.
+#[test]
+fn gh543_a_warm_is_queued_beside_pending_page_updates() {
+    let _serial = serialize_projection_tests();
+    let root = scratch("gh543-warm-beside-deltas");
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("journals/2026_09_21.md"), "- DONE today\n").unwrap();
+    for page in 0..8 {
+        std::fs::write(
+            root.join(format!("pages/p-{page}.md")),
+            format!("- TODO page {page}\n"),
+        )
+        .unwrap();
+    }
+    let database = scratch("gh543-warm-beside-deltas-db").join("projection.sqlite");
+    {
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        release_projection(&graph);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    let graph = Arc::new(Graph::open(&root));
+    graph.attach_direct_projection(database.clone()).unwrap();
+    let projection = graph.direct_projection_test().unwrap();
+    let pause = graph.pause_next_warm_after_read_test();
+    let warm = {
+        let graph = Arc::clone(&graph);
+        std::thread::spawn(move || graph.warm_cache())
+    };
+    pause.reached.wait();
+    // Hold the worker inside the turn for the first opened page, so the
+    // second page's update is still queued when the warm is handed over.
+    let (paused, observed) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel::<()>();
+    *BEFORE_APPLY_PENDING.lock().unwrap() = Some(Box::new(move || {
+        paused.send(()).unwrap();
+        resumed.recv().unwrap();
+    }));
+    let open = |path: &str| {
+        let entry = graph.entry_for_path(&root.join(path)).expect("entry");
+        graph.load_page(&entry).expect("the page opens");
+    };
+    open("journals/2026_09_21.md");
+    observed.recv_timeout(Duration::from_secs(3)).unwrap();
+    open("pages/p-0.md");
+    assert!(
+        !projection.shared.pending.lock().unwrap().deltas.is_empty(),
+        "the second update must still be queued: {}",
+        projection.debug_state_test()
+    );
+    pause.release.wait();
+    // Let the warm reach its hand-over before the worker moves on.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while projection.shared.pending.lock().unwrap().warm.is_none()
+        && graph.page_build_parses_test() == 0
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    resume.send(()).unwrap();
+    warm.join().unwrap();
+    wait_ready(&graph);
+
+    assert!(
+        !graph.has_parsed_cache_test() && graph.page_build_parses_test() == 0,
+        "queued page updates made the warm fall back to parsing the whole graph: {} parses",
+        graph.page_build_parses_test()
+    );
+    let projected = graph
+        .run_query_bounded("(task TODO)", 100, 1_000_000)
+        .expect("the ready projection answers")
+        .groups;
+    assert_eq!(
+        projected.len(),
+        8,
+        "the index still answers what the files say"
+    );
+    release_projection(graph.as_ref());
+    drop(graph);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(database.parent().unwrap());
+}
+
 /// GH #543 progress bar: each whole-graph pass reports how many pages it has
 /// finished, and the report ends once search is answered by a current index.
 #[test]

@@ -535,23 +535,13 @@ impl Graph {
             });
             Outcome::Retry
         };
-        let Some(mut generation) = self.warm_generation_after_drift(read_at, structural, &sources)
+        let Some(generation) = self.warm_generation_after_drift(read_at, structural, &sources)
         else {
             return abandoned();
         };
         if generation != read_at {
-            // Each of those publications queued a delta, and the queue does
-            // not take a warm beside them. Let the worker settle them (the
-            // image already holds these revisions, so they lower nothing),
-            // then check again at whatever generation that leaves.
-            if !projection.wait_for_queued_deltas(std::time::Duration::from_secs(2)) {
-                return abandoned();
-            }
-            let Some(settled) = self.warm_generation_after_drift(read_at, structural, &sources)
-            else {
-                return abandoned();
-            };
-            generation = settled;
+            // Each of those publications queued an update; the queue takes
+            // the warm beside them and applies them after validating it.
             crate::direct_projection::projection_diag(|| {
                 format!(
                     "warm kept across generations {read_at}..{generation}: \
@@ -582,7 +572,7 @@ impl Graph {
         let Some(attempt) = attempt else {
             // Refused: the worker is gone or failed without a rebuild queued
             // (nothing a retry changes), or the queue outranks this
-            // generation / still holds deltas (a retry sees them drained).
+            // generation.
             return if projection.worker_failed() || !projection.worker_available() {
                 Outcome::Unavailable
             } else {
