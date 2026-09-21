@@ -349,7 +349,7 @@ expectations, no obligations, either way. 🌱
 
 ## Unofficial Tine Resources
 
-* [Tana to Tine](https://github.com/mikob/tine/tree/tana-to-tine) - Convert Tana workspaces to Tine.
+* [Tana to Tine](https://github.com/mikob/tine/tree/converters) - Convert Tana workspaces to Tine.
 
 
 ## Acknowledgements
