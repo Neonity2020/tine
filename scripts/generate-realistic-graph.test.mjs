@@ -21,7 +21,7 @@ test("today's journal carries what renders at launch", async (t) => {
   assert.match(today, /\[\[[^\]]+\]\]/, "a page link");
   assert.match(today, /(^|\s)#tag\d+/m, "a tag");
   assert.match(today, /\(\([0-9a-f-]{36}\)\)/, "a block reference");
-  assert.match(today, /\{\{embed \(\(/, "a block embed");
+  assert.match(today, /\{\{embed /, "an embed");
   assert.match(today, /\{\{query /, "a query");
   assert.match(today, /^\s*- (TODO|DONE|LATER|NOW|DOING|WAITING|CANCELED) /m, "a task");
   assert.match(today, /sentinel543/, "the search sentinel");
@@ -38,6 +38,11 @@ test("links and references resolve to pages and blocks that exist", async (t) =>
   const all = texts.join("\n");
   const ids = new Set([...all.matchAll(/^\s*id:: ([0-9a-f-]{36})$/gm)].map((match) => match[1]));
   const links = [...all.matchAll(/\[\[([^\]]+)\]\]/g)].map((match) => match[1]);
+  // Real graphs link a few hub pages far more than the rest.
+  const counts = new Map();
+  for (const name of links) counts.set(name, (counts.get(name) ?? 0) + 1);
+  const top = Math.max(...counts.values());
+  assert.ok(top >= 10 * (links.length / counts.size), `a hub page collects many links (top ${top})`);
   const refs = [...all.matchAll(/\(\(([0-9a-f-]{36})\)\)/g)].map((match) => match[1]);
   assert.ok(links.length > 0 && refs.length > 0);
   assert.deepEqual(links.filter((name) => !pageNames.has(name)), []);
